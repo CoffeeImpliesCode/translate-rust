@@ -609,7 +609,7 @@ test "emit fnv golden" {
     const test_io = std.testing.io;
 
     // 1) Read and parse the wire input.
-    const json_bytes = try readFixture(allocator, test_io, "src/fixtures/model/fnv.json");
+    const json_bytes = try readFixture(allocator, test_io, "test/fnv.json");
     defer allocator.free(json_bytes);
 
     var g = try json.parse(allocator, json_bytes);

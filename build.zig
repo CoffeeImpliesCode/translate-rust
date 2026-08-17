@@ -71,13 +71,13 @@ pub fn build(b: *std.Build) void {
     // wire-format normalization is a later phase — P4+).
     const sidecar_step = b.step("sidecar", "Run the Rust sidecar (cargo +nightly rustdoc) on the mini fixture");
     const sidecar = b.addSystemCommand(&.{
-        "sh",                      "tools/sidecar/rustdoc-json.sh",
-        "src/fixtures/model/mini", "zig-out",
+        "sh",               "tools/sidecar/rustdoc-json.sh",
+        "test/crates/mini", "zig-out",
     });
     sidecar_step.dependOn(&sidecar.step);
 
     // ── translate: run the CLI on a wire-format JSON in `zig-out/` ─────
-    // `zig build translate -- src/fixtures/model/mini.json` → parses + emits.
+    // `zig build translate -- test/mini.json` → parses + emits.
     const translate_step = b.step("translate", "Run translate-rust --translate on a JSON dump");
     const translate_cmd = b.addRunArtifact(exe);
     translate_cmd.addArgs(&.{"--translate"});

@@ -1,0 +1,13 @@
+[package]
+name = "hex"
+version = "0.4.3"
+edition = "2018"
+publish = false
+
+# Source vendored from https://crates.io/crates/hex (KokaKiwi/rust-hex), MIT/Apache-2.0.
+# v1-dialect core: lib.rs + error.rs only. The upstream optional `serde` feature
+# (src/serde.rs) and dev-dependencies are trimmed out of the vendored copy.
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []

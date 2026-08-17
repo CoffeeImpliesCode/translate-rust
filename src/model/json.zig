@@ -2124,7 +2124,7 @@ fn miniJson(allocator: std.mem.Allocator) ![]const u8 {
     const test_io = std.testing.io;
     var io_buf: [4096]u8 = undefined;
     var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(test_io, "src/fixtures/model/mini.json", .{});
+    const file = try dir.openFile(test_io, "test/mini.json", .{});
     defer file.close(test_io);
     var reader = file.reader(test_io, &io_buf);
     return reader.interface.allocRemaining(allocator, .limited(1 << 20));
@@ -2259,7 +2259,7 @@ fn fnvJson(allocator: std.mem.Allocator) ![]const u8 {
     const test_io = std.testing.io;
     var io_buf: [4096]u8 = undefined;
     var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(test_io, "src/fixtures/model/fnv.json", .{});
+    const file = try dir.openFile(test_io, "test/fnv.json", .{});
     defer file.close(test_io);
     var reader = file.reader(test_io, &io_buf);
     return reader.interface.allocRemaining(allocator, .limited(1 << 22));

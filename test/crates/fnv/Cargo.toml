@@ -1,0 +1,14 @@
+[package]
+name = "fnv"
+version = "1.0.7"
+edition = "2018"
+publish = false
+
+# Source vendored from https://crates.io/crates/fnv (servo/rust-fnv), MIT/Apache-2.0.
+# Zero dependencies; no_std with optional `std` feature.
+[features]
+default = ["std"]
+std = []
+
+[lib]
+path = "lib.rs"

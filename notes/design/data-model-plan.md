@@ -59,6 +59,24 @@ Goal: translate function bodies for the v1 dialect.
 - Acceptance: fnv + hex + itoa hash/encode/decode bodies translate and pass
   their own vectors in `zig test`.
 
+## Naming convention — `ztr-<cratename>` (output + dependency translation)
+
+Established 2026-08-17. A translated crate `foo` is emitted as **`ztr-foo`**:
+
+- **Output file**: the translated Zig output is `ztr-<cratename>.zig` (e.g. `fnv` → `test/ztr-fnv.zig`, `hex` → `test/ztr-hex.zig`). The Zig file name IS the module name, so `@import("ztr-foo")` resolves it.
+- **Dependency translation**: when a translated crate depends on another translated crate `bar`, the dependency's Zig module/import name is **`ztr-bar`** — a `use bar::…;` translates to `@import("ztr-bar")` (or the build.zig module is named `ztr-bar`). The `ztr-` prefix is the systematic namespace for translated artifacts, kept distinct from hand-written Zig and from the crate's own name.
+
+**Test corpus layout** (top-level `test/`):
+
+```
+test/
+  crates/{mini,fnv,hex}/   # checked-in real Rust crate sources (no_std, zero required deps)
+  mini.json, fnv.json, mini-rustdoc.json   # wire-format models (inputs)
+  ztr-fnv.zig, ztr-hex.zig   # golden translated outputs (ztr-<cratename>.zig)
+```
+
+The crates are vendored from crates.io: `fnv` 1.0.7 (servo/rust-fnv), `hex` 0.4.3 (KokaKiwi/rust-hex, v1 core = lib.rs+error.rs, serde feature trimmed). All compile `--no-default-features` (no_std). `mini` was moved from `src/fixtures/model/`.
+
 ## P4 — full integration (PIPELINE LIVE, in progress)
 Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
 - ✅ `zig build sidecar` — drives `tools/sidecar/rustdoc-json.sh` (cargo +nightly rustdoc) on the mini fixture → `zig-out/crate-mini.json`.
