@@ -34,6 +34,24 @@
           "span": {"start_line": 8, "start_col": 1, "end_line": 14, "end_col": 1},
           "visibility": {"kind": "public"}, "parent": 0,
           "resolved": null, "renamed_to": null, "attributes": []
+        },
+        {
+          "id": 4, "kind": "field", "name": "data",
+          "span": {"start_line": 8, "start_col": 16, "end_line": 8, "end_col": 20},
+          "visibility": {"kind": "private"}, "parent": 3,
+          "resolved": null, "renamed_to": null, "attributes": []
+        },
+        {
+          "id": 5, "kind": "field", "name": "h",
+          "span": {"start_line": 9, "start_col": 9, "end_line": 9, "end_col": 10},
+          "visibility": {"kind": "private"}, "parent": 3,
+          "resolved": null, "renamed_to": null, "attributes": []
+        },
+        {
+          "id": 6, "kind": "field", "name": "byte",
+          "span": {"start_line": 10, "start_col": 10, "end_line": 10, "end_col": 14},
+          "visibility": {"kind": "private"}, "parent": 3,
+          "resolved": null, "renamed_to": null, "attributes": []
         }
       ],
       "modules": [
