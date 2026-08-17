@@ -16,4 +16,5 @@ test {
     _ = @import("json.zig");
     _ = @import("emit.zig");
     _ = @import("emit_fnv_test.zig");
+    _ = @import("emit_hex_test.zig");
 }

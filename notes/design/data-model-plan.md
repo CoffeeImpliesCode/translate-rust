@@ -59,10 +59,15 @@ Goal: translate function bodies for the v1 dialect.
 - Acceptance: fnv + hex + itoa hash/encode/decode bodies translate and pass
   their own vectors in `zig test`.
 
-## P4 — dead-lines only (do not start without the pipeline)
-- Align emission to `zig fmt` canonical output; port rename/`@"keyword"` from
-  step P1's model to the emitter; wire `build.zig` to orchestrate the sidecar
-  via `b.addSystemCommand` and link translated modules.
+## P4 — full integration (PIPELINE LIVE, in progress)
+Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
+- ✅ `zig build sidecar` — drives `tools/sidecar/rustdoc-json.sh` (cargo +nightly rustdoc) on the mini fixture → `zig-out/crate-mini.json`.
+- ✅ `zig build translate -- <wire-json>` — runs the CLI `--translate` on a wire-format dump.
+- ✅ Second v1-dialect corpus: `hex.zig` + `emit_hex_test.zig` golden (30/30 tests).
+- ⛳ (deferred) Align emission to `zig fmt` canonical output — the emitter output is hand-shaped; a `zig fmt` post-emit pass in the CLI is a small follow-up.
+- ⛳ (deferred) Port rename/`@"keyword"` from the model to the emitter — rust2zig's collect_renames; touches many name-emission sites in emit.zig; follow-up.
+- ⛳ (deferred) Wire format v2 (JSON carries bodies) — enables the CLI to emit full bodies from a `.json` file (currently bodies are in-memory only via emitRich, so the CLI emits stubs for wire v1 JSON). Two subagent attempts failed on this intricate decode edit; scoped as a dedicated phase.
+- ⛳ (deferred) Link translated modules into `build.zig` as a real compiled artifact (the emitted .zig compiles standalone today; wiring it as a build step producer is a follow-up).
 
 ## Verification strategy (throughout)
 - rust2zig-style: golden outputs (`test.sh`) + differential `zig test` against

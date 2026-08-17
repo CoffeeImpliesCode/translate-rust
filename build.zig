@@ -65,6 +65,25 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
+    // ── sidecar: drive the v0 Rust producer against a fixture crate ──────
+    // `zig build sidecar` runs tools/sidecar/rustdoc-json.sh on the mini
+    // fixture crate, emitting its raw rustdoc JSON to zig-out/ (the v1
+    // wire-format normalization is a later phase — P4+).
+    const sidecar_step = b.step("sidecar", "Run the Rust sidecar (cargo +nightly rustdoc) on the mini fixture");
+    const sidecar = b.addSystemCommand(&.{
+        "sh",                      "tools/sidecar/rustdoc-json.sh",
+        "src/fixtures/model/mini", "zig-out",
+    });
+    sidecar_step.dependOn(&sidecar.step);
+
+    // ── translate: run the CLI on a wire-format JSON in `zig-out/` ─────
+    // `zig build translate -- src/fixtures/model/mini.json` → parses + emits.
+    const translate_step = b.step("translate", "Run translate-rust --translate on a JSON dump");
+    const translate_cmd = b.addRunArtifact(exe);
+    translate_cmd.addArgs(&.{"--translate"});
+    if (b.args) |args| translate_cmd.addArgs(args);
+    translate_step.dependOn(&translate_cmd.step);
+
     // ── unit tests (one artifact per module, per house convention) ──
     const test_step = b.step("test", "Run unit tests");
 
