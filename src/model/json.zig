@@ -41,6 +41,11 @@ pub const wire_format_version: u32 = 2;
 pub const bodies_mod = @import("bodies.zig");
 pub const ConstBody = bodies_mod.ConstBody;
 pub const FnBody = bodies_mod.FnBody;
+pub const StructMethod = bodies_mod.StructMethod;
+pub const StructBody = bodies_mod.StructBody;
+pub const TraitMethodSig = bodies_mod.TraitMethodSig;
+pub const TraitBody = bodies_mod.TraitBody;
+pub const TypeAliasBody = bodies_mod.TypeAliasBody;
 pub const BodyKind = bodies_mod.BodyKind;
 pub const Bodies = bodies_mod.Bodies;
 
@@ -1016,6 +1021,18 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
             .ret = try decodeType(allocator, try req(fo, "ret")),
             .body = try reqU32(fo, "body"),
         } };
+    }
+    if (std.mem.eql(u8, kind_str, "struct_")) {
+        return .{ .struct_ = .{} };
+    }
+    if (std.mem.eql(u8, kind_str, "enum_")) {
+        return .{ .enum_ = .{} };
+    }
+    if (std.mem.eql(u8, kind_str, "trait_")) {
+        return .{ .trait_ = .{ .name = "" } };
+    }
+    if (std.mem.eql(u8, kind_str, "type_alias")) {
+        return .{ .type_alias = .{ .target = .{ .prim = .unit } } };
     }
     return error.BadWireFormat;
 }
@@ -2058,6 +2075,18 @@ fn encodeBodyKind(allocator: std.mem.Allocator, bk: BodyKind) !Json {
             try vo.put(allocator, "ret", try encodeType(allocator, fb.ret));
             try vo.put(allocator, "body", mkInt(fb.body));
             try o.put(allocator, "value", .{ .object = vo });
+        },
+        .struct_ => {
+            try o.put(allocator, "kind", .{ .string = "struct_" });
+        },
+        .enum_ => {
+            try o.put(allocator, "kind", .{ .string = "enum_" });
+        },
+        .trait_ => {
+            try o.put(allocator, "kind", .{ .string = "trait_" });
+        },
+        .type_alias => {
+            try o.put(allocator, "kind", .{ .string = "type_alias" });
         },
     }
     return .{ .object = o };

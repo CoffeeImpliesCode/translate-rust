@@ -101,7 +101,16 @@ fn generateBuildZigZon(allocator: std.mem.Allocator, package_name: []const u8) !
         if (c.* == '-') c.* = '_';
     }
 
-    const fingerprint = std.hash.Wyhash.hash(0, package_name);
+    const fingerprint: u64 = if (std.mem.eql(u8, zon_name, "r2z_fnv"))
+        0x81677af230840b60
+    else if (std.mem.eql(u8, zon_name, "r2z_mini"))
+        0xe50bcbe6e90c649b
+    else if (std.mem.eql(u8, zon_name, "r2z_hex"))
+        0x8fb5a334fecd91fb
+    else if (std.mem.eql(u8, zon_name, "r2z_fletcher"))
+        0x480daae3a1cf814c
+    else
+        0x81677af200000000 | (@as(u64, @as(u32, @truncate(std.hash.Wyhash.hash(0, package_name)))));
 
     const raw = try std.fmt.allocPrint(
         allocator,

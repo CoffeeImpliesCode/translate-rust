@@ -42,6 +42,11 @@ const exprs = @import("exprs.zig");
 pub const bodies_mod = @import("bodies.zig");
 pub const ConstBody = bodies_mod.ConstBody;
 pub const FnBody = bodies_mod.FnBody;
+pub const StructMethod = bodies_mod.StructMethod;
+pub const StructBody = bodies_mod.StructBody;
+pub const TraitMethodSig = bodies_mod.TraitMethodSig;
+pub const TraitBody = bodies_mod.TraitBody;
+pub const TypeAliasBody = bodies_mod.TypeAliasBody;
 pub const BodyKind = bodies_mod.BodyKind;
 pub const Bodies = bodies_mod.Bodies;
 
@@ -192,6 +197,15 @@ fn emitEntity(
             }
         },
         .struct_ => {
+            if (bodies) |bb| {
+                if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
+                    .struct_ => |sb| {
+                        try emitStructDef(allocator, buf, g, bb, e, sb);
+                        return;
+                    },
+                    else => {},
+                };
+            }
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "const ");
             try emitIdent(allocator, buf, entityName(e));
@@ -200,6 +214,15 @@ fn emitEntity(
             try buf.appendSlice(allocator, "\n};\n");
         },
         .enum_ => {
+            if (bodies) |bb| {
+                if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
+                    .enum_ => |eb| {
+                        try emitEnumDef(allocator, buf, e, eb);
+                        return;
+                    },
+                    else => {},
+                };
+            }
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "const ");
             try emitIdent(allocator, buf, entityName(e));
@@ -215,7 +238,7 @@ fn emitEntity(
             if (bodies) |bb| {
                 if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
                     .fn_ => |fb| {
-                        try emitFnSignature(allocator, buf, fb.params, fb.ret);
+                        try emitFnSignature(allocator, buf, fb.params, fb.ret, fb.is_allocating);
                         try buf.append(allocator, ' ');
                         try emitExpr(allocator, buf, g, bb, fb.body, 1);
                         try buf.append(allocator, '\n');
@@ -276,9 +299,36 @@ fn emitEntity(
         .crate_ => try unsupported(allocator, buf, e, "crate"),
         .union_ => try unsupported(allocator, buf, e, "union"),
         .static_ => try unsupported(allocator, buf, e, "static"),
-        .trait_ => try unsupported(allocator, buf, e, "trait"),
+        .trait_ => {
+            if (bodies) |bb| {
+                if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
+                    .trait_ => |tb| {
+                        try emitTraitDef(allocator, buf, g, bb, e, tb);
+                        return;
+                    },
+                    else => {},
+                };
+            }
+            try unsupported(allocator, buf, e, "trait");
+        },
         .impl_ => try unsupported(allocator, buf, e, "impl"),
-        .type_alias => try unsupported(allocator, buf, e, "type alias"),
+        .type_alias => {
+            if (bodies) |bb| {
+                if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
+                    .type_alias => |ab| {
+                        try buf.appendSlice(allocator, pub_);
+                        try buf.appendSlice(allocator, "const ");
+                        try emitIdent(allocator, buf, entityName(e));
+                        try buf.appendSlice(allocator, " = ");
+                        try emitType(allocator, buf, ab.target);
+                        try buf.appendSlice(allocator, ";\n");
+                        return;
+                    },
+                    else => {},
+                };
+            }
+            try unsupported(allocator, buf, e, "type alias");
+        },
         .extern_crate => try unsupported(allocator, buf, e, "extern crate"),
         .macro_ => try unsupported(allocator, buf, e, "macro"),
         .field => try unsupported(allocator, buf, e, "field"),
@@ -293,6 +343,14 @@ fn entityName(e: spine.Entity) []const u8 {
 }
 
 fn emitIdent(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), name: []const u8) !void {
+    if (std.mem.startsWith(u8, name, "error.")) {
+        try buf.appendSlice(allocator, "error.");
+        return emitIdent(allocator, buf, name["error.".len..]);
+    }
+    if (std.mem.indexOfScalar(u8, name, '(') != null) {
+        try buf.appendSlice(allocator, name);
+        return;
+    }
     const formatted = try std.fmt.allocPrint(allocator, "{f}", .{std.zig.fmtId(name)});
     defer allocator.free(formatted);
     try buf.appendSlice(allocator, formatted);
@@ -351,6 +409,95 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
             }
             try emitType(allocator, buf, r.pointee);
         },
+        .raw_ptr => |rp| {
+            if (rp.mut) {
+                try buf.appendSlice(allocator, "[*]");
+            } else {
+                try buf.appendSlice(allocator, "[*]const ");
+            }
+            try emitType(allocator, buf, rp.pointee);
+        },
+        .array => |a| {
+            try buf.append(allocator, '[');
+            switch (a.len) {
+                .literal => |lit| {
+                    const formatted = try std.fmt.allocPrint(allocator, "{d}", .{lit});
+                    defer allocator.free(formatted);
+                    try buf.appendSlice(allocator, formatted);
+                },
+                .generic => |idx| {
+                    const formatted = try std.fmt.allocPrint(allocator, "N{d}", .{idx});
+                    defer allocator.free(formatted);
+                    try buf.appendSlice(allocator, formatted);
+                },
+            }
+            try buf.append(allocator, ']');
+            try emitType(allocator, buf, a.elem);
+        },
+        .tuple => |tup| {
+            if (tup.len == 0) {
+                try buf.appendSlice(allocator, "void");
+                return;
+            }
+            try buf.appendSlice(allocator, "struct { ");
+            for (tup, 0..) |elem_ty, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                const fld_name = try std.fmt.allocPrint(allocator, "@{s}{d}{s}", .{ "\"", i, "\"" });
+                defer allocator.free(fld_name);
+                try buf.appendSlice(allocator, fld_name);
+                try buf.appendSlice(allocator, ": ");
+                try emitType(allocator, buf, elem_ty);
+            }
+            try buf.appendSlice(allocator, " }");
+        },
+        .result => |res| {
+            if (res.is_error_unionable) {
+                var is_anyerror = false;
+                switch (res.err) {
+                    .path => |p| {
+                        if (p.segments.len == 1 and std.mem.eql(u8, p.segments[0].name, "anyerror")) {
+                            is_anyerror = true;
+                        }
+                    },
+                    .prim => |p| {
+                        if (p == .unit) is_anyerror = true;
+                    },
+                    else => {},
+                }
+                if (!is_anyerror) {
+                    try emitType(allocator, buf, res.err);
+                }
+                try buf.append(allocator, '!');
+                try emitType(allocator, buf, res.ok);
+            } else {
+                try buf.appendSlice(allocator, "Result(");
+                try emitType(allocator, buf, res.ok);
+                try buf.appendSlice(allocator, ", ");
+                try emitType(allocator, buf, res.err);
+                try buf.append(allocator, ')');
+            }
+        },
+        .option => |opt| {
+            try buf.append(allocator, '?');
+            try emitType(allocator, buf, opt.*);
+        },
+        .generic_inst => |gi| {
+            _ = gi;
+            try buf.appendSlice(allocator, "Generic");
+        },
+        .fn_ptr => |fp| {
+            try buf.appendSlice(allocator, "*const fn (");
+            for (fp.params, 0..) |pt, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try emitType(allocator, buf, pt);
+            }
+            try buf.appendSlice(allocator, ") ");
+            try emitType(allocator, buf, fp.ret);
+        },
+        .boxed => |bx| {
+            try buf.append(allocator, '*');
+            try emitType(allocator, buf, bx.*);
+        },
         else => try buf.appendSlice(allocator, "/* unsupported type */"),
     }
 }
@@ -365,8 +512,483 @@ fn emitPattern(
     switch (p.kind) {
         .binding => |bd| try emitIdent(allocator, buf, bd.name),
         .wildcard => try buf.append(allocator, '_'),
+        .literal => |lit| switch (lit) {
+            .int => |i| try buf.appendSlice(allocator, i.text),
+            .character => |c| {
+                const formatted = try std.fmt.allocPrint(allocator, "'{c}'", .{@as(u8, @truncate(c.value))});
+                defer allocator.free(formatted);
+                try buf.appendSlice(allocator, formatted);
+            },
+            .string => |s| {
+                try buf.append(allocator, '"');
+                try buf.appendSlice(allocator, s.bytes);
+                try buf.append(allocator, '"');
+            },
+            .boolean => |v| try buf.appendSlice(allocator, if (v) "true" else "false"),
+            else => try buf.append(allocator, '_'),
+        },
+        .path => |pp| {
+            if (pp.variant) |vname| {
+                try buf.append(allocator, '.');
+                try emitIdent(allocator, buf, vname);
+            } else {
+                try buf.append(allocator, '_');
+            }
+        },
+        .range => |rp| {
+            if (rp.lo) |lo_id| {
+                const lo_expr = b.exprs[lo_id];
+                switch (lo_expr.kind) {
+                    .literal => |lit| switch (lit) {
+                        .int => |i| try buf.appendSlice(allocator, i.text),
+                        .character => |c| {
+                            const formatted = try std.fmt.allocPrint(allocator, "'{c}'", .{@as(u8, @truncate(c.value))});
+                            defer allocator.free(formatted);
+                            try buf.appendSlice(allocator, formatted);
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+            try buf.appendSlice(allocator, "...");
+            if (rp.hi) |hi_id| {
+                const hi_expr = b.exprs[hi_id];
+                switch (hi_expr.kind) {
+                    .literal => |lit| switch (lit) {
+                        .int => |i| try buf.appendSlice(allocator, i.text),
+                        .character => |c| {
+                            const formatted = try std.fmt.allocPrint(allocator, "'{c}'", .{@as(u8, @truncate(c.value))});
+                            defer allocator.free(formatted);
+                            try buf.appendSlice(allocator, formatted);
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+        },
+        .@"or" => |op| {
+            for (op.alternatives, 0..) |alt_id, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try emitPattern(allocator, buf, b, alt_id);
+            }
+        },
         else => try buf.append(allocator, '_'),
     }
+}
+
+fn emitStructDef(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    e: spine.Entity,
+    sb: bodies_mod.StructBody,
+) !void {
+    const pub_ = visPrefix(e.visibility);
+    const is_generic = sb.generic_params.len > 0;
+
+    if (is_generic) {
+        try buf.appendSlice(allocator, pub_);
+        try buf.appendSlice(allocator, "fn ");
+        try emitIdent(allocator, buf, entityName(e));
+        try buf.append(allocator, '(');
+        for (sb.generic_params, 0..) |gp, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try buf.appendSlice(allocator, "comptime ");
+            try emitIdent(allocator, buf, gp);
+            try buf.appendSlice(allocator, ": type");
+        }
+        try buf.appendSlice(allocator, ") type {\n");
+
+        if (sb.trait_bounds.len > 0) {
+            try buf.appendSlice(allocator, "    comptime {\n");
+            for (sb.trait_bounds) |tb| {
+                try buf.appendSlice(allocator, "        // bound: ");
+                try buf.appendSlice(allocator, tb);
+                try buf.append(allocator, '\n');
+            }
+            try buf.appendSlice(allocator, "    }\n");
+        }
+
+        try buf.appendSlice(allocator, "    return struct {\n");
+        try emitStructInner(allocator, buf, g, b, sb, 2);
+        try buf.appendSlice(allocator, "    };\n");
+        try buf.appendSlice(allocator, "}\n");
+    } else {
+        try buf.appendSlice(allocator, pub_);
+        try buf.appendSlice(allocator, "const ");
+        try emitIdent(allocator, buf, entityName(e));
+        try buf.appendSlice(allocator, " = struct {\n");
+        try emitStructInner(allocator, buf, g, b, sb, 1);
+        try buf.appendSlice(allocator, "};\n");
+    }
+}
+
+fn emitStructInner(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    sb: bodies_mod.StructBody,
+    depth: u32,
+) !void {
+    // 1. Fields
+    switch (sb.layout) {
+        .named => {
+            for (sb.fields) |f| {
+                try writeIndent(allocator, buf, depth);
+                const f_pub = visPrefix(f.visibility);
+                try buf.appendSlice(allocator, f_pub);
+                try emitIdent(allocator, buf, f.name);
+                try buf.appendSlice(allocator, ": ");
+                try emitType(allocator, buf, f.ty);
+                try buf.appendSlice(allocator, ",\n");
+            }
+        },
+        .tuple => {
+            for (sb.fields, 0..) |f, i| {
+                try writeIndent(allocator, buf, depth);
+                const f_pub = visPrefix(f.visibility);
+                try buf.appendSlice(allocator, f_pub);
+                const tuple_name = try std.fmt.allocPrint(allocator, "{d}", .{i});
+                defer allocator.free(tuple_name);
+                try emitIdent(allocator, buf, tuple_name);
+                try buf.appendSlice(allocator, ": ");
+                try emitType(allocator, buf, f.ty);
+                try buf.appendSlice(allocator, ",\n");
+            }
+        },
+        .unit => {},
+    }
+    if (sb.fields.len > 0 and (sb.methods.len > 0 or sb.has_dynamic_resources)) {
+        try buf.append(allocator, '\n');
+    }
+
+    // 2. Self type alias
+    if (sb.methods.len > 0 or sb.has_dynamic_resources) {
+        try writeIndent(allocator, buf, depth);
+        try buf.appendSlice(allocator, "pub const Self = @This();\n\n");
+    }
+
+    // 3. Dynamic resource init if needed
+    if (sb.has_dynamic_resources) {
+        try writeIndent(allocator, buf, depth);
+        try buf.appendSlice(allocator, "pub fn init(allocator: std.mem.Allocator) Self {\n");
+        try writeIndent(allocator, buf, depth + 1);
+        try buf.appendSlice(allocator, "return .{\n");
+        for (sb.fields) |f| {
+            try writeIndent(allocator, buf, depth + 2);
+            try buf.append(allocator, '.');
+            try emitIdent(allocator, buf, f.name);
+            if (std.mem.eql(u8, f.name, "allocator")) {
+                try buf.appendSlice(allocator, " = allocator,\n");
+            } else {
+                try buf.appendSlice(allocator, " = undefined,\n");
+            }
+        }
+        try writeIndent(allocator, buf, depth + 1);
+        try buf.appendSlice(allocator, "};\n");
+        try writeIndent(allocator, buf, depth);
+        try buf.appendSlice(allocator, "}\n\n");
+    }
+
+    // 4. Inherent methods
+    for (sb.methods, 0..) |m, i| {
+        if (i > 0) try buf.append(allocator, '\n');
+        try writeIndent(allocator, buf, depth);
+        const m_pub = visPrefix(m.visibility);
+        try buf.appendSlice(allocator, m_pub);
+        try buf.appendSlice(allocator, "fn ");
+        try emitIdent(allocator, buf, m.name);
+        try emitMethodSignature(allocator, buf, m.receiver, m.params, m.ret, m.is_allocating);
+        try buf.append(allocator, ' ');
+        try emitExpr(allocator, buf, g, b, m.body, depth + 1);
+        try buf.append(allocator, '\n');
+    }
+}
+
+fn emitTraitDef(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    e: spine.Entity,
+    tb: bodies_mod.TraitBody,
+) !void {
+    _ = g;
+    _ = b;
+    const pub_ = visPrefix(e.visibility);
+    const trait_name = entityName(e);
+
+    try buf.appendSlice(allocator, pub_);
+    try buf.appendSlice(allocator, "const ");
+    try emitIdent(allocator, buf, trait_name);
+    try buf.appendSlice(allocator, " = struct {\n");
+
+    // 1. VTable definition
+    try buf.appendSlice(allocator, "    pub const VTable = struct {\n");
+    for (tb.supertraits) |st| {
+        try buf.appendSlice(allocator, "        ");
+        try emitIdent(allocator, buf, st);
+        try buf.appendSlice(allocator, ": ");
+        try emitIdent(allocator, buf, st);
+        try buf.appendSlice(allocator, ".VTable,\n");
+    }
+    for (tb.methods) |m| {
+        try buf.appendSlice(allocator, "        ");
+        try emitIdent(allocator, buf, m.name);
+        try buf.appendSlice(allocator, ": *const fn (ctx: *anyopaque");
+        for (m.params) |p| {
+            try buf.appendSlice(allocator, ", ");
+            try emitIdent(allocator, buf, p.name);
+            try buf.appendSlice(allocator, ": ");
+            try emitType(allocator, buf, p.ty);
+        }
+        try buf.appendSlice(allocator, ") ");
+        try emitType(allocator, buf, m.ret);
+        try buf.appendSlice(allocator, ",\n");
+    }
+    try buf.appendSlice(allocator, "    };\n\n");
+
+    // 2. TraitObject fat pointer wrapper
+    try buf.appendSlice(allocator, "    pub const TraitObject = struct {\n");
+    try buf.appendSlice(allocator, "        ptr: *anyopaque,\n");
+    try buf.appendSlice(allocator, "        vtable: *const VTable,\n\n");
+
+    // Dispatch methods
+    for (tb.methods) |m| {
+        try buf.appendSlice(allocator, "        pub fn ");
+        try emitIdent(allocator, buf, m.name);
+        try buf.appendSlice(allocator, "(self: TraitObject");
+        for (m.params) |p| {
+            try buf.appendSlice(allocator, ", ");
+            try emitIdent(allocator, buf, p.name);
+            try buf.appendSlice(allocator, ": ");
+            try emitType(allocator, buf, p.ty);
+        }
+        try buf.appendSlice(allocator, ") ");
+        try emitType(allocator, buf, m.ret);
+        try buf.appendSlice(allocator, " {\n");
+        try buf.appendSlice(allocator, "            return self.vtable.");
+        try emitIdent(allocator, buf, m.name);
+        try buf.appendSlice(allocator, "(self.ptr");
+        for (m.params) |p| {
+            try buf.appendSlice(allocator, ", ");
+            try emitIdent(allocator, buf, p.name);
+        }
+        try buf.appendSlice(allocator, ");\n");
+        try buf.appendSlice(allocator, "        }\n");
+    }
+
+    // Supertrait upcasting helpers
+    for (tb.supertraits) |st| {
+        try buf.appendSlice(allocator, "        pub fn as");
+        try emitIdent(allocator, buf, st);
+        try buf.appendSlice(allocator, "(self: TraitObject) ");
+        try emitIdent(allocator, buf, st);
+        try buf.appendSlice(allocator, ".TraitObject {\n");
+        try buf.appendSlice(allocator, "            return .{\n");
+        try buf.appendSlice(allocator, "                .ptr = self.ptr,\n");
+        try buf.appendSlice(allocator, "                .vtable = &self.vtable.");
+        try emitIdent(allocator, buf, st);
+        try buf.appendSlice(allocator, ",\n");
+        try buf.appendSlice(allocator, "            };\n");
+        try buf.appendSlice(allocator, "        }\n");
+    }
+
+    try buf.appendSlice(allocator, "    };\n");
+    try buf.appendSlice(allocator, "};\n");
+}
+fn emitEnumDef(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    e: spine.Entity,
+    eb: bodies_mod.EnumBody,
+) !void {
+    const pub_ = visPrefix(e.visibility);
+    try buf.appendSlice(allocator, pub_);
+    try buf.appendSlice(allocator, "const ");
+    try emitIdent(allocator, buf, entityName(e));
+
+    if (eb.kind == .c_like) {
+        if (eb.repr_int) |r| {
+            const repr_name = switch (r) {
+                .i8 => "i8",
+                .i16 => "i16",
+                .i32 => "i32",
+                .i64 => "i64",
+                .i128 => "i128",
+                .u8 => "u8",
+                .u16 => "u16",
+                .u32 => "u32",
+                .u64 => "u64",
+                .u128 => "u128",
+                .isize => "isize",
+                .usize => "usize",
+            };
+            try buf.appendSlice(allocator, " = enum(");
+            try buf.appendSlice(allocator, repr_name);
+            try buf.appendSlice(allocator, ") {\n");
+        } else {
+            try buf.appendSlice(allocator, " = enum(u8) {\n");
+        }
+
+        for (eb.variants) |v| {
+            try writeIndent(allocator, buf, 1);
+            try emitIdent(allocator, buf, v.name);
+            if (v.discriminant) |disc| {
+                const disc_str = try std.fmt.allocPrint(allocator, " = {d}", .{disc});
+                defer allocator.free(disc_str);
+                try buf.appendSlice(allocator, disc_str);
+            }
+            try buf.appendSlice(allocator, ",\n");
+        }
+        try buf.appendSlice(allocator, "};\n");
+    } else {
+        // Data-carrying tagged union: `pub const Name = union(enum) { ... };`
+        try buf.appendSlice(allocator, " = union(enum) {\n");
+        for (eb.variants) |v| {
+            try writeIndent(allocator, buf, 1);
+            try emitIdent(allocator, buf, v.name);
+            switch (v.fields) {
+                .none => {
+                    try buf.appendSlice(allocator, ",\n");
+                },
+                .tuple => |tup| {
+                    if (tup.len == 1) {
+                        try buf.appendSlice(allocator, ": ");
+                        try emitType(allocator, buf, tup[0]);
+                        try buf.appendSlice(allocator, ",\n");
+                    } else {
+                        try buf.appendSlice(allocator, ": struct {\n");
+                        for (tup, 0..) |ty, i| {
+                            try writeIndent(allocator, buf, 2);
+                            const tuple_field_name = try std.fmt.allocPrint(allocator, "{d}", .{i});
+                            defer allocator.free(tuple_field_name);
+                            try emitIdent(allocator, buf, tuple_field_name);
+                            try buf.appendSlice(allocator, ": ");
+                            try emitType(allocator, buf, ty);
+                            try buf.appendSlice(allocator, ",\n");
+                        }
+                        try writeIndent(allocator, buf, 1);
+                        try buf.appendSlice(allocator, "},\n");
+                    }
+                },
+                .named => |nf| {
+                    try buf.appendSlice(allocator, ": struct {\n");
+                    for (nf) |f| {
+                        try writeIndent(allocator, buf, 2);
+                        try emitIdent(allocator, buf, f.name);
+                        try buf.appendSlice(allocator, ": ");
+                        try emitType(allocator, buf, f.ty);
+                        try buf.appendSlice(allocator, ",\n");
+                    }
+                    try writeIndent(allocator, buf, 1);
+                    try buf.appendSlice(allocator, "},\n");
+                },
+            }
+        }
+        try buf.appendSlice(allocator, "};\n");
+    }
+}
+
+fn emitMatch(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    m: exprs.MatchExpr,
+    depth: u32,
+) !void {
+    try buf.appendSlice(allocator, "switch (");
+    try emitExpr(allocator, buf, g, b, m.scrutinee, depth);
+    try buf.appendSlice(allocator, ") {\n");
+
+    for (m.arms) |arm| {
+        try writeIndent(allocator, buf, depth + 1);
+
+        var capture_name: ?[]const u8 = null;
+
+        for (arm.patterns, 0..) |pid, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            const pat = b.pats[pid];
+            switch (pat.kind) {
+                .wildcard => {
+                    try buf.appendSlice(allocator, "else");
+                },
+                .path => |pp| {
+                    if (pp.variant) |vname| {
+                        try buf.append(allocator, '.');
+                        try emitIdent(allocator, buf, vname);
+                    } else if (g.symbol_table.get(pp.def)) |ent| {
+                        if (ent.kind == .variant) {
+                            try buf.append(allocator, '.');
+                            try emitIdent(allocator, buf, entityName(ent));
+                        } else {
+                            try emitIdent(allocator, buf, entityName(ent));
+                        }
+                    } else {
+                        try buf.append(allocator, '_');
+                    }
+                },
+                .struct_pat => |sp| {
+                    if (g.symbol_table.get(sp.def)) |ent| {
+                        if (ent.kind == .variant) {
+                            try buf.append(allocator, '.');
+                            try emitIdent(allocator, buf, entityName(ent));
+                        } else {
+                            try emitIdent(allocator, buf, entityName(ent));
+                        }
+                    } else {
+                        try buf.append(allocator, '_');
+                    }
+                    if (sp.fields.len > 0) {
+                        capture_name = sp.fields[0].field;
+                    }
+                },
+                .tuple => |tp| {
+                    if (tp.elements.len > 0) {
+                        const first_pat = b.pats[tp.elements[0]];
+                        switch (first_pat.kind) {
+                            .binding => |bd| capture_name = bd.name,
+                            else => {},
+                        }
+                    }
+                },
+                .binding => |bd| {
+                    capture_name = bd.name;
+                    try emitIdent(allocator, buf, bd.name);
+                },
+                else => {
+                    try emitPattern(allocator, buf, b, pid);
+                },
+            }
+        }
+
+        try buf.appendSlice(allocator, " => ");
+
+        if (capture_name) |cap| {
+            try buf.append(allocator, '|');
+            try emitIdent(allocator, buf, cap);
+            try buf.appendSlice(allocator, "| ");
+        }
+
+        if (arm.guard) |gid| {
+            try buf.appendSlice(allocator, "if (");
+            try emitExpr(allocator, buf, g, b, gid, depth + 1);
+            try buf.appendSlice(allocator, ") ");
+            try emitExpr(allocator, buf, g, b, arm.body, depth + 1);
+            try buf.appendSlice(allocator, " else unreachable");
+        } else {
+            try emitExpr(allocator, buf, g, b, arm.body, depth + 1);
+        }
+        try buf.appendSlice(allocator, ",\n");
+    }
+
+    try writeIndent(allocator, buf, depth);
+    try buf.append(allocator, '}');
 }
 
 fn emitExpr(
@@ -386,12 +1008,25 @@ fn emitExpr(
                 try buf.appendSlice(allocator, s.bytes);
                 try buf.append(allocator, '"');
             },
+            .character => |c| {
+                const formatted = try std.fmt.allocPrint(allocator, "'{c}'", .{@as(u8, @truncate(c.value))});
+                defer allocator.free(formatted);
+                try buf.appendSlice(allocator, formatted);
+            },
             .boolean => |v| try buf.appendSlice(allocator, if (v) "true" else "false"),
             else => try buf.appendSlice(allocator, "/* unsupported literal */"),
         },
         .path => |pe| {
             if (g.symbol_table.get(pe.def)) |ent| {
-                try emitIdent(allocator, buf, entityName(ent));
+                const ename = entityName(ent);
+                if (std.mem.startsWith(u8, ename, "@")) {
+                    try buf.appendSlice(allocator, ename);
+                } else if (ent.kind == .variant) {
+                    try buf.append(allocator, '.');
+                    try emitIdent(allocator, buf, ename);
+                } else {
+                    try emitIdent(allocator, buf, ename);
+                }
             } else {
                 try buf.appendSlice(allocator, "/* unknown path */");
             }
@@ -399,8 +1034,6 @@ fn emitExpr(
         .block => |blk| try emitBlock(allocator, buf, g, b, blk, depth),
         .unit => {},
         .return_ => |ret| {
-            // Semicolon is added by the calling context (emitStmt or
-            // emitBlock tail), so return_ only emits the bare `return [val]`.
             try buf.appendSlice(allocator, "return");
             if (ret.value) |vid| {
                 try buf.append(allocator, ' ');
@@ -415,12 +1048,116 @@ fn emitExpr(
             try emitExpr(allocator, buf, g, b, asgn.value, depth);
         },
         .for_ => |fe| {
-            try buf.appendSlice(allocator, "for (");
-            try emitExpr(allocator, buf, g, b, fe.iterable, depth);
+            const iter_expr = b.exprs[fe.iterable];
+            var is_chunks = false;
+            var chunk_receiver: ?exprs.NodeId = null;
+            var chunk_size: ?exprs.NodeId = null;
+
+            if (iter_expr.kind == .method_call) {
+                const mc = iter_expr.kind.method_call;
+                if (mc.args.len >= 1) {
+                    const m_ent = g.symbol_table.get(mc.method);
+                    const m_name = if (m_ent) |me| me.name else "";
+                    if (std.mem.eql(u8, m_name, "chunks") or std.mem.indexOf(u8, m_name, "chunks") != null) {
+                        is_chunks = true;
+                        chunk_receiver = mc.receiver;
+                        chunk_size = mc.args[0];
+                    }
+                }
+            }
+
+            if (is_chunks) {
+                try buf.appendSlice(allocator, "{\n");
+                try writeIndent(allocator, buf, depth);
+                try buf.appendSlice(allocator, "var chunk_i: usize = 0;\n");
+                try writeIndent(allocator, buf, depth);
+                try buf.appendSlice(allocator, "while (chunk_i < ");
+                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth);
+                try buf.appendSlice(allocator, ".len) : (chunk_i += ");
+                try emitExpr(allocator, buf, g, b, chunk_size.?, depth);
+                try buf.appendSlice(allocator, ") {\n");
+                try writeIndent(allocator, buf, depth + 1);
+                try buf.appendSlice(allocator, "const ");
+                try emitPattern(allocator, buf, b, fe.pattern);
+                try buf.appendSlice(allocator, " = ");
+                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth);
+                try buf.appendSlice(allocator, "[chunk_i..@min(chunk_i + ");
+                try emitExpr(allocator, buf, g, b, chunk_size.?, depth);
+                try buf.appendSlice(allocator, ", ");
+                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth);
+                try buf.appendSlice(allocator, ".len)];\n");
+                try emitBlockBody(allocator, buf, g, b, fe.body, depth + 1);
+                try writeIndent(allocator, buf, depth);
+                try buf.appendSlice(allocator, "}\n");
+                if (depth > 0) try writeIndent(allocator, buf, depth - 1);
+                try buf.append(allocator, '}');
+            } else {
+                try buf.appendSlice(allocator, "for (");
+                try emitExpr(allocator, buf, g, b, fe.iterable, depth);
+                try buf.appendSlice(allocator, ") |");
+                try emitPattern(allocator, buf, b, fe.pattern);
+                try buf.appendSlice(allocator, "| ");
+                try emitBlock(allocator, buf, g, b, fe.body, depth + 1);
+            }
+        },
+        .while_ => |we| {
+            try buf.appendSlice(allocator, "while (");
+            try emitExpr(allocator, buf, g, b, we.cond, depth);
+            try buf.appendSlice(allocator, ") ");
+            try emitBlock(allocator, buf, g, b, we.body, depth + 1);
+        },
+        .if_else => |ie| {
+            try buf.appendSlice(allocator, "if (");
+            try emitExpr(allocator, buf, g, b, ie.cond, depth);
+            try buf.appendSlice(allocator, ") ");
+            try emitBlock(allocator, buf, g, b, ie.then_, depth);
+            switch (ie.@"else") {
+                .none => {},
+                .block => |blk| {
+                    try buf.appendSlice(allocator, " else ");
+                    try emitBlock(allocator, buf, g, b, blk, depth);
+                },
+                .chain => |cid| {
+                    try buf.appendSlice(allocator, " else ");
+                    try emitExpr(allocator, buf, g, b, cid, depth);
+                },
+            }
+        },
+        .if_let => |ile| {
+            try buf.appendSlice(allocator, "if (");
+            try emitExpr(allocator, buf, g, b, ile.scrutinee, depth);
             try buf.appendSlice(allocator, ") |");
-            try emitPattern(allocator, buf, b, fe.pattern);
+            try emitPattern(allocator, buf, b, ile.pattern);
             try buf.appendSlice(allocator, "| ");
-            try emitBlock(allocator, buf, g, b, fe.body, depth + 1);
+            try emitBlock(allocator, buf, g, b, ile.then_, depth);
+            switch (ile.@"else") {
+                .none => {},
+                .block => |blk| {
+                    try buf.appendSlice(allocator, " else ");
+                    try emitBlock(allocator, buf, g, b, blk, depth);
+                },
+                .chain => |cid| {
+                    try buf.appendSlice(allocator, " else ");
+                    try emitExpr(allocator, buf, g, b, cid, depth);
+                },
+            }
+        },
+        .match => |me| {
+            try emitMatch(allocator, buf, g, b, me, depth);
+        },
+        .break_ => |be| {
+            try buf.appendSlice(allocator, "break");
+            if (be.value) |vid| {
+                try buf.append(allocator, ' ');
+                try emitExpr(allocator, buf, g, b, vid, depth);
+            }
+        },
+        .continue_ => {
+            try buf.appendSlice(allocator, "continue");
+        },
+        .loop_ => |le| {
+            try buf.appendSlice(allocator, "while (true) ");
+            try emitBlock(allocator, buf, g, b, le.body, depth + 1);
         },
         .binary => |be| {
             try emitExpr(allocator, buf, g, b, be.lhs, depth);
@@ -428,6 +1165,140 @@ fn emitExpr(
             try buf.appendSlice(allocator, binaryOpString(be.op, be.overflow));
             try buf.append(allocator, ' ');
             try emitExpr(allocator, buf, g, b, be.rhs, depth);
+        },
+        .unary => |ue| {
+            switch (ue.op) {
+                .negate => {
+                    try buf.append(allocator, '-');
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth);
+                },
+                .logical_not => {
+                    try buf.append(allocator, '!');
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth);
+                },
+                .bit_not => {
+                    try buf.appendSlice(allocator, "~");
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth);
+                },
+                .deref => {
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth);
+                    try buf.appendSlice(allocator, ".*");
+                },
+                .ref => {
+                    try buf.append(allocator, '&');
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth);
+                },
+            }
+        },
+        .call => |c| {
+            switch (c.call_kind) {
+                .free => |def| {
+                    if (g.symbol_table.get(def)) |ent| {
+                        const ename = entityName(ent);
+                        if (std.mem.startsWith(u8, ename, "@")) {
+                            try buf.appendSlice(allocator, ename);
+                        } else {
+                            try emitIdent(allocator, buf, ename);
+                        }
+                    } else {
+                        try buf.appendSlice(allocator, "func");
+                    }
+                },
+                .associated, .constructor => |def| {
+                    if (g.symbol_table.get(def)) |ent| {
+                        if (ent.parent) |parent_id| {
+                            if (g.symbol_table.get(parent_id)) |parent_ent| {
+                                try emitIdent(allocator, buf, entityName(parent_ent));
+                                try buf.append(allocator, '.');
+                            }
+                        }
+                        try emitIdent(allocator, buf, entityName(ent));
+                    } else {
+                        try buf.appendSlice(allocator, "Self.func");
+                    }
+                },
+            }
+            try buf.append(allocator, '(');
+            for (c.args, 0..) |aid, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try emitExpr(allocator, buf, g, b, aid, depth);
+            }
+            try buf.append(allocator, ')');
+        },
+        .method_call => |mc| {
+            try emitExpr(allocator, buf, g, b, mc.receiver, depth);
+            try buf.append(allocator, '.');
+            if (g.symbol_table.get(mc.method)) |me| {
+                try emitIdent(allocator, buf, entityName(me));
+            } else {
+                try buf.appendSlice(allocator, "method");
+            }
+            try buf.append(allocator, '(');
+            for (mc.args, 0..) |aid, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try emitExpr(allocator, buf, g, b, aid, depth);
+            }
+            try buf.append(allocator, ')');
+        },
+        .field => |fe| {
+            try emitExpr(allocator, buf, g, b, fe.base, depth);
+            try buf.append(allocator, '.');
+            try emitIdent(allocator, buf, fe.field);
+        },
+        .index => |ie| {
+            try emitExpr(allocator, buf, g, b, ie.base, depth);
+            try buf.append(allocator, '[');
+            try emitExpr(allocator, buf, g, b, ie.index, depth);
+            try buf.append(allocator, ']');
+        },
+        .struct_lit => |sl| {
+            try buf.appendSlice(allocator, ".{");
+            if (sl.fields.len > 0) {
+                for (sl.fields, 0..) |fld, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    try buf.appendSlice(allocator, " .");
+                    try emitIdent(allocator, buf, fld.field);
+                    try buf.appendSlice(allocator, " = ");
+                    try emitExpr(allocator, buf, g, b, fld.value, depth);
+                }
+                try buf.appendSlice(allocator, " }");
+            } else {
+                try buf.append(allocator, '}');
+            }
+        },
+        .try_ => |te| {
+            try buf.appendSlice(allocator, "try ");
+            try emitExpr(allocator, buf, g, b, te.inner, depth);
+        },
+        .enum_variant => |ev| {
+            try buf.appendSlice(allocator, ".{ .");
+            try emitIdent(allocator, buf, ev.variant);
+            if (ev.tuple_fields.len == 1) {
+                try buf.appendSlice(allocator, " = ");
+                try emitExpr(allocator, buf, g, b, ev.tuple_fields[0], depth);
+            } else if (ev.tuple_fields.len > 1) {
+                try buf.appendSlice(allocator, " = .{ ");
+                for (ev.tuple_fields, 0..) |tf, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    const tf_name = try std.fmt.allocPrint(allocator, "@{s}{d}{s}", .{ "\"", i, "\"" });
+                    defer allocator.free(tf_name);
+                    try buf.appendSlice(allocator, tf_name);
+                    try buf.appendSlice(allocator, " = ");
+                    try emitExpr(allocator, buf, g, b, tf, depth);
+                }
+                try buf.appendSlice(allocator, " }");
+            } else if (ev.named_fields.len > 0) {
+                try buf.appendSlice(allocator, " = .{ ");
+                for (ev.named_fields, 0..) |nf, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    try buf.append(allocator, '.');
+                    try emitIdent(allocator, buf, nf.field);
+                    try buf.appendSlice(allocator, " = ");
+                    try emitExpr(allocator, buf, g, b, nf.value, depth);
+                }
+                try buf.appendSlice(allocator, " }");
+            }
+            try buf.appendSlice(allocator, " }");
         },
         else => try buf.appendSlice(allocator, "/* unsupported expr */"),
     }
@@ -541,13 +1412,54 @@ fn emitFnSignature(
     buf: *std.ArrayListUnmanaged(u8),
     params: []const items.Param,
     ret: types.Type,
+    is_allocating: bool,
 ) !void {
     try buf.append(allocator, '(');
-    for (params, 0..) |p, i| {
-        if (i > 0) try buf.appendSlice(allocator, ", ");
+    var count: usize = 0;
+    if (is_allocating) {
+        try buf.appendSlice(allocator, "allocator: std.mem.Allocator");
+        count += 1;
+    }
+    for (params) |p| {
+        if (count > 0) try buf.appendSlice(allocator, ", ");
         try emitIdent(allocator, buf, p.name);
         try buf.appendSlice(allocator, ": ");
         try emitType(allocator, buf, p.ty);
+        count += 1;
+    }
+    try buf.appendSlice(allocator, ") ");
+    try emitType(allocator, buf, ret);
+}
+
+fn emitMethodSignature(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    receiver: ?items.Receiver,
+    params: []const items.Param,
+    ret: types.Type,
+    is_allocating: bool,
+) !void {
+    try buf.append(allocator, '(');
+    var count: usize = 0;
+    if (is_allocating) {
+        try buf.appendSlice(allocator, "allocator: std.mem.Allocator");
+        count += 1;
+    }
+    if (receiver) |rec| {
+        if (count > 0) try buf.appendSlice(allocator, ", ");
+        switch (rec) {
+            .owned => try buf.appendSlice(allocator, "self: Self"),
+            .ref_ => try buf.appendSlice(allocator, "self: *const Self"),
+            .mut_ref => try buf.appendSlice(allocator, "self: *Self"),
+        }
+        count += 1;
+    }
+    for (params) |p| {
+        if (count > 0) try buf.appendSlice(allocator, ", ");
+        try emitIdent(allocator, buf, p.name);
+        try buf.appendSlice(allocator, ": ");
+        try emitType(allocator, buf, p.ty);
+        count += 1;
     }
     try buf.appendSlice(allocator, ") ");
     try emitType(allocator, buf, ret);
@@ -924,4 +1836,713 @@ test "formatZig: formats unformatted valid Zig into canonical style" {
     try std.testing.expect(
         std.mem.indexOf(u8, formatted, "pub fn add(a: u64, b: u64) u64 {\n    return a + b;\n}") != null,
     );
+}
+
+test "M1: struct fields (named, tuple, unit) and methods" {
+    const allocator = std.testing.allocator;
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    const named_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try allocator.dupe(u8, "Point"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const tuple_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try allocator.dupe(u8, "Pair"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const unit_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try allocator.dupe(u8, "Marker"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 3);
+    items_slice[0] = named_id;
+    items_slice[1] = tuple_id;
+    items_slice[2] = unit_id;
+    g.modules.items[root_id].items = items_slice;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "struct_test"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const named_fields = try allocator.alloc(items.Field, 2);
+    named_fields[0] = .{ .name = "x", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span };
+    named_fields[1] = .{ .name = "y", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span };
+
+    const tuple_fields = try allocator.alloc(items.Field, 2);
+    tuple_fields[0] = .{ .name = "0", .ty = .{ .prim = .u64 }, .visibility = .public, .span = span };
+    tuple_fields[1] = .{ .name = "1", .ty = .{ .prim = .bool }, .visibility = .public, .span = span };
+
+    const methods = try allocator.alloc(bodies_mod.StructMethod, 1);
+    methods[0] = .{
+        .name = "distance",
+        .visibility = .public,
+        .params = &.{},
+        .ret = .{ .prim = .f64 },
+        .body = 1,
+        .receiver = .ref_,
+    };
+
+    const exprs_store = try allocator.alloc(exprs.Expr, 2);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .float = .{ .text = "0.0", .value = 0.0 } } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 0, .labelled = null } },
+    };
+
+    const bodies_store = try allocator.alloc(bodies_mod.BodyKind, 4);
+    bodies_store[0] = .none;
+    bodies_store[named_id] = .{ .struct_ = .{
+        .layout = .named,
+        .fields = named_fields,
+        .methods = methods,
+    } };
+    bodies_store[tuple_id] = .{ .struct_ = .{
+        .layout = .tuple,
+        .fields = tuple_fields,
+    } };
+    bodies_store[unit_id] = .{ .struct_ = .{
+        .layout = .unit,
+        .fields = &.{},
+    } };
+
+    const bodies: Bodies = .{
+        .exprs = exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = bodies_store,
+    };
+    defer {
+        allocator.free(named_fields);
+        allocator.free(tuple_fields);
+        allocator.free(methods);
+        allocator.free(exprs_store);
+        allocator.free(bodies_store);
+    }
+
+    const out = try emitRich(allocator, &g, &bodies);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const Point = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub x: i32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub y: i32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn distance(self: *const Self) f64 {") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const Pair = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub @\"0\": u64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub @\"1\": bool,") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const Marker = struct {") != null);
+
+    const formatted = try formatZig(allocator, out);
+    defer allocator.free(formatted);
+    try std.testing.expect(formatted.len > 0);
+}
+
+test "M1: enum variants (C-like, data tagged union, discriminants)" {
+    const allocator = std.testing.allocator;
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    const clike_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .enum_,
+        .name = try allocator.dupe(u8, "Color"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const data_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .enum_,
+        .name = try allocator.dupe(u8, "Shape"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 2);
+    items_slice[0] = clike_id;
+    items_slice[1] = data_id;
+    g.modules.items[root_id].items = items_slice;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "enum_test"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const color_variants = try allocator.alloc(items.Variant, 3);
+    color_variants[0] = .{ .name = "red", .fields = .none, .discriminant = 0 };
+    color_variants[1] = .{ .name = "green", .fields = .none, .discriminant = 1 };
+    color_variants[2] = .{ .name = "blue", .fields = .none, .discriminant = 2 };
+
+    const rect_fields = try allocator.alloc(items.Field, 2);
+    rect_fields[0] = .{ .name = "width", .ty = .{ .prim = .f64 }, .visibility = .public, .span = span };
+    rect_fields[1] = .{ .name = "height", .ty = .{ .prim = .f64 }, .visibility = .public, .span = span };
+
+    const shape_variants = try allocator.alloc(items.Variant, 3);
+    shape_variants[0] = .{ .name = "circle", .fields = .{ .tuple = &.{.{ .prim = .f64 }} }, .discriminant = null };
+    shape_variants[1] = .{ .name = "rect", .fields = .{ .named = rect_fields }, .discriminant = null };
+    shape_variants[2] = .{ .name = "dot", .fields = .none, .discriminant = null };
+
+    const bodies_store = try allocator.alloc(bodies_mod.BodyKind, 3);
+    bodies_store[0] = .none;
+    bodies_store[clike_id] = .{ .enum_ = .{
+        .kind = .c_like,
+        .repr_int = .u8,
+        .variants = color_variants,
+    } };
+    bodies_store[data_id] = .{ .enum_ = .{
+        .kind = .data,
+        .variants = shape_variants,
+        .non_exhaustive = true,
+    } };
+
+    const bodies: Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = bodies_store,
+    };
+    defer {
+        allocator.free(color_variants);
+        allocator.free(rect_fields);
+        allocator.free(shape_variants);
+        allocator.free(bodies_store);
+    }
+
+    const out = try emitRich(allocator, &g, &bodies);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const Color = enum(u8) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "red = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "green = 1,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "blue = 2,") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const Shape = union(enum) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "circle: f64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "rect: struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "width: f64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "height: f64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "dot,") != null);
+
+    const formatted = try formatZig(allocator, out);
+    defer allocator.free(formatted);
+    try std.testing.expect(formatted.len > 0);
+}
+
+test "M2: match and switch lowering (tagged union, ranges, guards)" {
+    const allocator = std.testing.allocator;
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    const fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "eval_val"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const val_param_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try allocator.dupe(u8, "val"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 1);
+    items_slice[0] = fn_id;
+    g.modules.items[root_id].items = items_slice;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "match_test"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const exprs_store = try allocator.alloc(exprs.Expr, 9);
+    exprs_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .path = .{ .def = val_param_id, .generic_args = &.{} } } };
+    exprs_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "0", .value = 0, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "100", .value = 100, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[3] = .{ .id = 3, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[4] = .{ .id = 4, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "5", .value = 5, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "200", .value = 200, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[6] = .{ .id = 6, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "300", .value = 300, .base = .dec, .ty_suffix = null } } } };
+
+    const pats_store = try allocator.alloc(exprs.Pattern, 3);
+    pats_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "0", .value = 0, .base = .dec, .ty_suffix = null } } } };
+    pats_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .range = .{ .lo = 3, .hi = 4, .inclusive = true } } };
+    pats_store[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .wildcard = {} } };
+
+    const arms = try allocator.alloc(exprs.MatchArm, 3);
+    arms[0] = .{ .patterns = &.{0}, .guard = null, .body = 2 };
+    arms[1] = .{ .patterns = &.{1}, .guard = null, .body = 5 };
+    arms[2] = .{ .patterns = &.{2}, .guard = null, .body = 6 };
+
+    exprs_store[7] = .{ .id = 7, .span = span, .ty = null, .kind = .{ .match = .{ .scrutinee = 0, .arms = arms } } };
+    exprs_store[8] = .{ .id = 8, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{}, .tail = 7, .labelled = null } } };
+
+    const params = try allocator.alloc(items.Param, 1);
+    params[0] = .{ .name = "val", .ty = .{ .prim = .i32 }, .span = span };
+
+    const bodies_store = try allocator.alloc(bodies_mod.BodyKind, 2);
+    bodies_store[0] = .none;
+    bodies_store[fn_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = .{ .prim = .i32 },
+        .body = 8,
+    } };
+
+    const bodies: Bodies = .{
+        .exprs = exprs_store,
+        .stmts = &.{},
+        .pats = pats_store,
+        .types = &.{},
+        .bodies = bodies_store,
+    };
+    defer {
+        allocator.free(exprs_store);
+        allocator.free(pats_store);
+        allocator.free(arms);
+        allocator.free(params);
+        allocator.free(bodies_store);
+    }
+
+    const out = try emitRich(allocator, &g, &bodies);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn eval_val(val: i32) i32 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "switch (val) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "0 => 100,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1...5 => 200,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "else => 300,") != null);
+
+    const formatted = try formatZig(allocator, out);
+    defer allocator.free(formatted);
+    try std.testing.expect(formatted.len > 0);
+}
+
+test "M2: error handling, try expressions, and while loop stepping" {
+    const allocator = std.testing.allocator;
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    const parse_fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "parse_hex"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const i_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try allocator.dupe(u8, "i"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const len_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try allocator.dupe(u8, "len"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const err_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try allocator.dupe(u8, "error.InvalidHexCharacter"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 1);
+    items_slice[0] = parse_fn_id;
+    g.modules.items[root_id].items = items_slice;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "err_while_test"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const res_ptr = try allocator.create(types.Result);
+    res_ptr.* = .{
+        .ok = .{ .prim = .u8 },
+        .err = .{ .prim = .unit },
+        .is_error_unionable = true,
+    };
+    const res_type: types.Type = .{ .result = res_ptr };
+    defer allocator.destroy(res_ptr);
+
+    const exprs_store = try allocator.alloc(exprs.Expr, 10);
+    exprs_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .path = .{ .def = i_id, .generic_args = &.{} } } };
+    exprs_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .path = .{ .def = len_id, .generic_args = &.{} } } };
+    exprs_store[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .lt, .overflow = .checked, .lhs = 0, .rhs = 1 } } };
+    exprs_store[3] = .{ .id = 3, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "2", .value = 2, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[4] = .{ .id = 4, .span = span, .ty = null, .kind = .{ .assign = .{ .target = 0, .op = .add, .value = 3, .overflow = .checked } } };
+    exprs_store[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .path = .{ .def = err_id, .generic_args = &.{} } } };
+    exprs_store[6] = .{ .id = 6, .span = span, .ty = null, .kind = .{ .return_ = .{ .value = 5 } } };
+    exprs_store[7] = .{ .id = 7, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{}, .tail = 6, .labelled = null } } };
+    exprs_store[8] = .{ .id = 8, .span = span, .ty = null, .kind = .{ .while_ = .{ .cond = 2, .body = exprs_store[7].kind.block } } };
+    exprs_store[9] = .{ .id = 9, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{0}, .tail = null, .labelled = null } } };
+
+    const stmts_store = try allocator.alloc(exprs.Statement, 1);
+    stmts_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 8 } };
+
+    const params = try allocator.alloc(items.Param, 2);
+    params[0] = .{ .name = "i", .ty = .{ .prim = .usize }, .span = span };
+    params[1] = .{ .name = "len", .ty = .{ .prim = .usize }, .span = span };
+
+    const bodies_store = try allocator.alloc(bodies_mod.BodyKind, 6);
+    bodies_store[0] = .none;
+    bodies_store[parse_fn_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = res_type,
+        .body = 9,
+    } };
+
+    const bodies: Bodies = .{
+        .exprs = exprs_store,
+        .stmts = stmts_store,
+        .pats = &.{},
+        .types = &.{},
+        .bodies = bodies_store,
+    };
+    defer {
+        allocator.free(exprs_store);
+        allocator.free(stmts_store);
+        allocator.free(params);
+        allocator.free(bodies_store);
+    }
+
+    const out = try emitRich(allocator, &g, &bodies);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn parse_hex(i: usize, len: usize) !u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "while (i < len) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return error.InvalidHexCharacter;") != null);
+
+    const formatted = try formatZig(allocator, out);
+    defer allocator.free(formatted);
+    try std.testing.expect(formatted.len > 0);
+}
+
+test "M2: function calls, method calls, and builtin calls" {
+    const allocator = std.testing.allocator;
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    const caller_fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "call_demo"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const helper_fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "helper"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const as_builtin_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "@as"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const intcast_builtin_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "@intCast"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const obj_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try allocator.dupe(u8, "obj"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const method_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "process"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 2);
+    items_slice[0] = caller_fn_id;
+    items_slice[1] = helper_fn_id;
+    g.modules.items[root_id].items = items_slice;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "calls_test"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    // Expressions:
+    // 0: 42 (IntLit)
+    // 1: Call(free: helper_fn_id, args: [0])
+    // 2: PathExpr @as
+    // 3: PathExpr u64
+    // 4: Call(free: as_builtin_id, args: [0])
+    // 5: Call(free: intcast_builtin_id, args: [0])
+    // 6: PathExpr obj
+    // 7: MethodCall(receiver: 6, method: method_id, args: [0])
+    // 8: Block
+    const exprs_store = try allocator.alloc(exprs.Expr, 9);
+    exprs_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "42", .value = 42, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .call = .{ .call_kind = .{ .free = helper_fn_id }, .args = &.{0} } } };
+    exprs_store[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .path = .{ .def = as_builtin_id, .generic_args = &.{} } } };
+    exprs_store[3] = .{ .id = 3, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "u64", .value = 0, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[4] = .{ .id = 4, .span = span, .ty = null, .kind = .{ .call = .{ .call_kind = .{ .free = as_builtin_id }, .args = &.{ 3, 0 } } } };
+    exprs_store[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .call = .{ .call_kind = .{ .free = intcast_builtin_id }, .args = &.{0} } } };
+    exprs_store[6] = .{ .id = 6, .span = span, .ty = null, .kind = .{ .path = .{ .def = obj_id, .generic_args = &.{} } } };
+    exprs_store[7] = .{ .id = 7, .span = span, .ty = null, .kind = .{ .method_call = .{ .receiver = 6, .receiver_mode = .shared, .method = method_id, .args = &.{0} } } };
+    exprs_store[8] = .{ .id = 8, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{ 0, 1, 2, 3 }, .tail = null, .labelled = null } } };
+
+    const stmts_store = try allocator.alloc(exprs.Statement, 4);
+    stmts_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 1 } };
+    stmts_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 4 } };
+    stmts_store[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .expr = 5 } };
+    stmts_store[3] = .{ .id = 3, .span = span, .ty = null, .kind = .{ .expr = 7 } };
+
+    const bodies_store = try allocator.alloc(bodies_mod.BodyKind, 7);
+    bodies_store[0] = .none;
+    bodies_store[caller_fn_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 8,
+    } };
+    bodies_store[helper_fn_id] = .none;
+    bodies_store[as_builtin_id] = .none;
+    bodies_store[intcast_builtin_id] = .none;
+    bodies_store[obj_id] = .none;
+    bodies_store[method_id] = .none;
+
+    const bodies: Bodies = .{
+        .exprs = exprs_store,
+        .stmts = stmts_store,
+        .pats = &.{},
+        .types = &.{},
+        .bodies = bodies_store,
+    };
+    defer {
+        allocator.free(exprs_store);
+        allocator.free(stmts_store);
+        allocator.free(bodies_store);
+    }
+
+    const out = try emitRich(allocator, &g, &bodies);
+    defer allocator.free(out);
+
+    // Free function call
+    try std.testing.expect(std.mem.indexOf(u8, out, "helper(42);") != null);
+    // Builtin calls
+    try std.testing.expect(std.mem.indexOf(u8, out, "@as(u64, 42);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@intCast(42);") != null);
+    // Method call
+    try std.testing.expect(std.mem.indexOf(u8, out, "obj.process(42);") != null);
+
+    const formatted = try formatZig(allocator, out);
+    defer allocator.free(formatted);
+    try std.testing.expect(formatted.len > 0);
 }

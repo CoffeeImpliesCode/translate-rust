@@ -19,4 +19,5 @@ test {
     _ = @import("emit_fnv_test.zig");
     _ = @import("emit_hex_test.zig");
     _ = @import("package.zig");
+    _ = @import("emit_m3m4_test.zig");
 }
