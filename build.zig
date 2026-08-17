@@ -84,6 +84,21 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| translate_cmd.addArgs(args);
     translate_step.dependOn(&translate_cmd.step);
 
+    // ── test-crates: run `zig test` on each translated crate golden ──────
+    // The translated outputs (test/r2z-*.zig) carry the crate's own #[test]
+    // blocks translated to Zig `test` blocks — the differential oracle.
+    // `zig build test-crates` runs them all.
+    const test_crates_step = b.step("test-crates", "Run zig test on every translated crate (test/r2z-*.zig)");
+    // Only goldens that are real compilable translation targets go here.
+    // r2z-hex.zig is a reduced textual subset (the emitter's `for (bytes) |byte|`
+    // has an unused capture, so it is not valid Zig) — excluded until hex truly
+    // translates (errors/alloc/arrays).
+    const goldens = [_][]const u8{"test/r2z-fnv.zig"};
+    for (goldens) |golden| {
+        const tc = b.addSystemCommand(&.{ "zig", "test", golden });
+        test_crates_step.dependOn(&tc.step);
+    }
+
     // ── unit tests (one artifact per module, per house convention) ──
     const test_step = b.step("test", "Run unit tests");
 

@@ -104,6 +104,30 @@ test/
 
 The crates are vendored from crates.io: `fnv` 1.0.7 (servo/rust-fnv), `hex` 0.4.3 (KokaKiwi/rust-hex, v1 core = lib.rs+error.rs, serde feature trimmed). All compile `--no-default-features` (no_std). `mini` was moved from `src/fixtures/model/`.
 
+## Integration testing — crate `#[test]` blocks as Zig `test` blocks
+
+The primary integration-testing strategy (rust2zig's `test_test.sh` differential
+discipline, prior-work §4): a translated crate carries its own test suite.
+
+- **Convention**: a crate's `#[cfg(test)]` `#[test]` fns translate to Zig `test`
+  blocks appended to the translated output (`test/r2z-<crate>.zig`). `zig test` on
+  the translated crate runs the crate's own behavior verification — a green run =
+  the translation is behaviorally correct against the authoritative vectors.
+- **Wired**: `zig build test-crates` runs `zig test` on every `test/r2z-*.zig`.
+- **fnv (done)**: the real `basic_tests` (~180 authoritative FNV-1a vectors +
+  repeat_10/500 cases) translated to Zig `test "basic_tests"`. `fnv1a_hash` matches
+  the crate's FnvHasher output, so the vectors are the differential oracle.
+- **hex (deferred)**: its real tests exercise `encode_to_slice`/`decode_to_slice`/
+  `FromHexError`/`vec`/`alloc`/`pretty_assertions` — beyond the v1 dialect (errors,
+  alloc, arrays, unwrap). The reduced `r2z-hex.zig` (slice `encode` only) has no such
+  API. Wireable once the emitter handles errors/alloc/arrays.
+- **mini (deferred)**: no `#[test]` in the crate; its translation (structs/enums)
+  is unimplemented, so no `r2z-mini.zig` target yet.
+
+**Emitter gap**: the emitter does not yet emit `test` blocks (no test-module capture
+in the wire model, no `assert_eq!`/`assert!` macro lowering). The golden test blocks
+are hand-translated expected output; the model+emitter path for tests is a follow-up.
+
 ## P4 — full integration (PIPELINE LIVE, in progress)
 Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
 - ✅ `zig build sidecar` — drives `tools/sidecar/rustdoc-json.sh` (cargo +nightly rustdoc) on the mini fixture → `zig-out/crate-mini.json`.
