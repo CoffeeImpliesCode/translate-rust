@@ -2,7 +2,7 @@
 //!
 //! Builds a full hex model in memory (CrateGraph + Bodies), calls
 //! `emitRich`, and compares the output against the golden file
-//! `test/ztr-hex.zig`.
+//! `test/r2z-hex.zig`.
 //!
 //! The hex subset proves the emitter's slice-handling (a `for (bytes) |byte|`
 //! loop over a `[]const u8` param) and string-emission (`var out` initialized
@@ -487,7 +487,7 @@ test "emit hex with body golden" {
     const test_io = std.testing.io;
 
     // 1) Load and normalize the golden file.
-    const golden_raw = try readFixture(allocator, test_io, "test/ztr-hex.zig");
+    const golden_raw = try readFixture(allocator, test_io, "test/r2z-hex.zig");
     defer allocator.free(golden_raw);
     const golden_norm = try normalize(allocator, golden_raw);
     defer allocator.free(golden_norm);

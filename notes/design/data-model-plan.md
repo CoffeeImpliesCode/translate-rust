@@ -59,37 +59,37 @@ Goal: translate function bodies for the v1 dialect.
 - Acceptance: fnv + hex + itoa hash/encode/decode bodies translate and pass
   their own vectors in `zig test`.
 
-## Naming convention — `ztr-<cratename>` (translation PACKAGE target)
+## Naming convention — `r2z-<cratename>` (translation PACKAGE target)
 
 Established 2026-08-17, corrected same day. A translated crate `foo` is emitted as a
-**Zig package named `ztr-foo`** — a directory, NOT a single file. A single `ztr-foo.zig`
+**Zig package named `r2z-foo`** — a directory, NOT a single file. A single `r2z-foo.zig`
 file only works for a leaf crate; it breaks on modules and deps:
 
 - **Modules** (idiom-mapping §1): Rust `mod foo;` → `@import("foo.zig")` — each module is
   its own Zig file. A crate's translation is a `src/` tree mirroring the Rust mod graph,
   not one flat file.
 - **Deps**: a dependency must be a *package* with a manifest. For crate A to
-  `@import("ztr-B")`, B must be a Zig package A's build graph fetches.
+  `@import("r2z-B")`, B must be a Zig package A's build graph fetches.
 
 **Correct target shape** — each translated crate is a generated package dir:
 
 ```
-ztr-<crate>/
+r2z-<crate>/
   build.zig        # generated: declares the crate module(s) + test step
   build.zig.zon    # generated: package manifest
   src/
-    root.zig       # crate root (the ztr-<crate>.zig output becomes this)
+    root.zig       # crate root (the r2z-<crate>.zig output becomes this)
     util.zig       # mod util → own file
     ...
 ```
 
-**Dependency translation**: A depends on B → A's `build.zig.zon` lists `.@"ztr-B"` as a
-dependency; A's `build.zig` does `b.dependency("ztr-B", .{})` + exposes it as a module;
-A's translated code `@import("ztr-B")`. This mirrors c2rust's `--emit-build-files`
+**Dependency translation**: A depends on B → A's `build.zig.zon` lists `.@"r2z-B"` as a
+dependency; A's `build.zig` does `b.dependency("r2z-B", .{})` + exposes it as a module;
+A's translated code `@import("r2z-B")`. This mirrors c2rust's `--emit-build-files`
 (per-crate build skeleton, prior-work §3) — the P4 "link translated modules" bullet.
 
 **Current state / gap**: the emitter today emits a single flat file (module banner comments
-instead of a file tree) and no build.zig/.zon. The `test/ztr-*.zig` goldens are valid as
+instead of a file tree) and no build.zig/.zon. The `test/r2z-*.zig` goldens are valid as
 *expected source content* for a single module, but the real output must become a package
 dir (multi-file per module + generated build.zig + build.zig.zon) before deps work.
 
@@ -99,7 +99,7 @@ dir (multi-file per module + generated build.zig + build.zig.zon) before deps wo
 test/
   crates/{mini,fnv,hex}/   # checked-in real Rust crate sources (no_std, zero required deps)
   mini.json, fnv.json, mini-rustdoc.json   # wire-format models (inputs)
-  ztr-fnv.zig, ztr-hex.zig   # golden translated outputs (ztr-<cratename>.zig)
+  r2z-fnv.zig, r2z-hex.zig   # golden translated outputs (r2z-<cratename>.zig)
 ```
 
 The crates are vendored from crates.io: `fnv` 1.0.7 (servo/rust-fnv), `hex` 0.4.3 (KokaKiwi/rust-hex, v1 core = lib.rs+error.rs, serde feature trimmed). All compile `--no-default-features` (no_std). `mini` was moved from `src/fixtures/model/`.

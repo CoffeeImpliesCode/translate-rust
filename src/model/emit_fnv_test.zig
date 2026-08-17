@@ -2,7 +2,7 @@
 //!
 //! Builds a full fnv model in memory (CrateGraph + Bodies), calls
 //! `emitRich`, and compares the output against the golden file
-//! `test/ztr-fnv.zig`.
+//! `test/r2z-fnv.zig`.
 
 const std = @import("std");
 const spine = @import("spine.zig");
@@ -580,7 +580,7 @@ test "emit fnv with body golden" {
     const test_io = std.testing.io;
 
     // 1) Load and normalize the golden file.
-    const golden_raw = try readFixture(allocator, test_io, "test/ztr-fnv.zig");
+    const golden_raw = try readFixture(allocator, test_io, "test/r2z-fnv.zig");
     defer allocator.free(golden_raw);
     const golden_norm = try normalize(allocator, golden_raw);
     defer allocator.free(golden_norm);
