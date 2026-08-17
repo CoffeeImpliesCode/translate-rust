@@ -135,7 +135,7 @@ fn emitEntity(
         .struct_ => {
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "const ");
-            try buf.appendSlice(allocator, e.name);
+            try emitIdent(allocator, buf, entityName(e));
             try buf.appendSlice(allocator, " = struct { // unsupported: struct ");
             try buf.appendSlice(allocator, e.name);
             try buf.appendSlice(allocator, "\n};\n");
@@ -143,7 +143,7 @@ fn emitEntity(
         .enum_ => {
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "const ");
-            try buf.appendSlice(allocator, e.name);
+            try emitIdent(allocator, buf, entityName(e));
             try buf.appendSlice(allocator, " = enum(u8) { // unsupported: enum ");
             try buf.appendSlice(allocator, e.name);
             try buf.appendSlice(allocator, "\n};\n");
@@ -151,7 +151,7 @@ fn emitEntity(
         .fn_ => {
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "fn ");
-            try buf.appendSlice(allocator, e.name);
+            try emitIdent(allocator, buf, entityName(e));
             // P3: emit real signature + body when available.
             if (bodies) |bb| {
                 if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
@@ -174,7 +174,7 @@ fn emitEntity(
         .const_ => {
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "const ");
-            try buf.appendSlice(allocator, e.name);
+            try emitIdent(allocator, buf, entityName(e));
             // P3: emit real type + init when available.
             if (bodies) |bb| {
                 if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
@@ -209,9 +209,9 @@ fn emitEntity(
             }
             try buf.appendSlice(allocator, if (use_decl.is_pub_export) "pub " else "");
             try buf.appendSlice(allocator, "const ");
-            try buf.appendSlice(allocator, use_decl.local_name);
+            try emitIdent(allocator, buf, use_decl.local_name);
             try buf.appendSlice(allocator, " = ");
-            try buf.appendSlice(allocator, target.name);
+            try emitIdent(allocator, buf, entityName(target));
             try buf.appendSlice(allocator, ";\n");
         },
         .crate_ => try unsupported(allocator, buf, e, "crate"),
@@ -227,8 +227,19 @@ fn emitEntity(
     }
 }
 
-// ── P3 body emission helpers ──────────────────────────────────────────────
+// ── Identifier and keyword escaping helpers (P4) ──────────────────────────
 
+fn entityName(e: spine.Entity) []const u8 {
+    return e.renamed_to orelse e.name;
+}
+
+fn emitIdent(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), name: []const u8) !void {
+    const formatted = try std.fmt.allocPrint(allocator, "{f}", .{std.zig.fmtId(name)});
+    defer allocator.free(formatted);
+    try buf.appendSlice(allocator, formatted);
+}
+
+// ── P3 body emission helpers ──────────────────────────────────────────────
 fn writeIndent(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), depth: u32) !void {
     var i: u32 = 0;
     while (i < depth) : (i += 1) {
@@ -270,7 +281,7 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
         .path => |p| {
             for (p.segments, 0..) |seg, i| {
                 if (i > 0) try buf.append(allocator, '.');
-                try buf.appendSlice(allocator, seg.name);
+                try emitIdent(allocator, buf, seg.name);
             }
         },
         .reference => |r| {
@@ -293,7 +304,7 @@ fn emitPattern(
 ) !void {
     const p = b.pats[pat_id];
     switch (p.kind) {
-        .binding => |bd| try buf.appendSlice(allocator, bd.name),
+        .binding => |bd| try emitIdent(allocator, buf, bd.name),
         .wildcard => try buf.append(allocator, '_'),
         else => try buf.append(allocator, '_'),
     }
@@ -321,7 +332,7 @@ fn emitExpr(
         },
         .path => |pe| {
             if (g.symbol_table.get(pe.def)) |ent| {
-                try buf.appendSlice(allocator, ent.name);
+                try emitIdent(allocator, buf, entityName(ent));
             } else {
                 try buf.appendSlice(allocator, "/* unknown path */");
             }
@@ -475,7 +486,7 @@ fn emitFnSignature(
     try buf.append(allocator, '(');
     for (params, 0..) |p, i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.appendSlice(allocator, p.name);
+        try emitIdent(allocator, buf, p.name);
         try buf.appendSlice(allocator, ": ");
         try emitType(allocator, buf, p.ty);
     }
@@ -776,4 +787,71 @@ test "emit: dispatches every EntityKind without crashing" {
     try std.testing.expect(std.mem.indexOf(u8, out, "pub const Color = enum(u8) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "// unsupported: trait Greet") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "// body not yet lowered") != null);
+}
+
+test "emit: keyword escaping and renamed_to" {
+    const allocator = std.testing.allocator;
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    // Rust fn named "type" (a Zig keyword)
+    const type_fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "type"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // Rust const with explicit renamed_to="renamed_magic"
+    const renamed_const_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .const_,
+        .name = try allocator.dupe(u8, "orig_magic"),
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = try allocator.dupe(u8, "renamed_magic"),
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 2);
+    items_slice[0] = type_fn_id;
+    items_slice[1] = renamed_const_id;
+    g.modules.items[root_id].items = items_slice;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "keyword_smoke"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const out = try emit(allocator, &g);
+    defer allocator.free(out);
+    // "type" must be escaped as @"type"
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn @\"type\"() void {") != null);
+    // "orig_magic" with renamed_to="renamed_magic" must emit "renamed_magic"
+    try std.testing.expect(std.mem.indexOf(u8, out, "const renamed_magic: void =") != null);
 }
