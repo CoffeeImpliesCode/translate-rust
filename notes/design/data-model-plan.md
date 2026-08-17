@@ -1,7 +1,9 @@
-# Implementation plan — the crate data model (IR)
+# Implementation plan — the crate data model (IR) & Architecture
 
-Sequenced build-out of the Rust-crate IR defined in `data-model.md`, mapped to
-the v0/v1 roadmap in `research/approaches.md` §6. Every step must end green
+Sequenced build-out of the Rust-crate IR and full translation pipeline defined in
+`data-model.md` and the master architecture specification in `architecture.md`.
+For the crate-by-crate actionable roadmap (Milestones M1–M4), see `architecture.md` §8
+and `architecture/features-actionable.md` §2. Every step must end green
 (`zig fmt --check`, `zig build`, `zig build test`).
 
 ## P0 — design (this phase, done)

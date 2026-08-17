@@ -57,6 +57,17 @@ emits Zig from. Unified reference + four axis notes + implementation plan.
 | [design/data-model/ownership-mem.md](design/data-model/ownership-mem.md) | Ownership, Drop, allocator, unsoundness markers |
 | [design/data-model-plan.md](design/data-model-plan.md) | Implementation plan (P1–P4) + v1 target crate `fnv` |
 
+## Architecture & Strategic Design
+
+The full system architecture and translation engineering specifications:
+
+| Doc | Contents |
+|-----|----------|
+| [design/architecture.md](design/architecture.md) | **Master Architecture Specification** — Package generation, `r2z-core`, macros, structural fidelity, traits/vtables, allocation, and M1-M4 actionable roadmap |
+| [design/architecture/pkg-dep-macros.md](design/architecture/pkg-dep-macros.md) | Package emission, Cargo dependency graph mapping, and macro expansion pipeline |
+| [design/architecture/runtime-traits.md](design/architecture/runtime-traits.md) | `r2z-core` runtime library, static duck typing, dynamic `dyn Trait` vtables, and `@fieldParentPtr` supertrait upcasting |
+| [design/architecture/structure-memory.md](design/architecture/structure-memory.md) | 1:1 structural mapping, visibility, re-exports, allocator injection, and LIFO `defer`/`errdefer` RAII |
+| [design/architecture/features-actionable.md](design/architecture/features-actionable.md) | Enums/unions, dual-track error handling, match guards, raw pointers, and crate-by-crate actionable breakdown |
 ## Design-phase open questions (answered by the user, not the research)
 
 1. **dyn Trait**: synthesize a vtable struct, or exclude from v1 (rust2zig
