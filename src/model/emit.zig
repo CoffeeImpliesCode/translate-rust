@@ -41,37 +41,13 @@ const _ = @import("emit_fnv_test.zig");
 // ── P3 body data structures ───────────────────────────────────────────────
 
 /// Body of a `const` declaration (type + init expression).
-pub const ConstBody = struct {
-    ty: types.Type,
-    init: exprs.NodeId,
-};
-
-/// Body of a function (params + return type + block expression).
-pub const FnBody = struct {
-    params: []const items.Param,
-    ret: types.Type,
-    /// Expr-table index of the fn body block.
-    body: exprs.NodeId,
-};
-
-/// Per-entity body selector. Indexed by spine.EntityId.
-pub const BodyKind = union(enum) {
-    none,
-    const_: ConstBody,
-    fn_: FnBody,
-};
-
-/// Augmented model carrying expression-level data alongside the spine-level
-/// `CrateGraph`.  Required by `emitRich`; the plain `emit()` path ignores
-/// bodies and falls back to placeholder text.
-pub const Bodies = struct {
-    exprs: []const exprs.Expr,
-    stmts: []const exprs.Statement,
-    pats: []const exprs.Pattern,
-    types: []const types.Type,
-    /// Sparse: `bodies[entity_id]` → `.none` when the entity has no body.
-    bodies: []const BodyKind,
-};
+// Shared body tables live in bodies.zig (leaf) so json and emit do not
+// create an import cycle. Re-export as aliases — emit.Bodies == json.Bodies.
+pub const bodies_mod = @import("bodies.zig");
+pub const ConstBody = bodies_mod.ConstBody;
+pub const FnBody = bodies_mod.FnBody;
+pub const BodyKind = bodies_mod.BodyKind;
+pub const Bodies = bodies_mod.Bodies;
 
 // ── Public entry points ───────────────────────────────────────────────────
 

@@ -66,7 +66,9 @@ Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
 - ✅ Second v1-dialect corpus: `hex.zig` + `emit_hex_test.zig` golden (30/30 tests).
 - ⛳ (deferred) Align emission to `zig fmt` canonical output — the emitter output is hand-shaped; a `zig fmt` post-emit pass in the CLI is a small follow-up.
 - ⛳ (deferred) Port rename/`@"keyword"` from the model to the emitter — rust2zig's collect_renames; touches many name-emission sites in emit.zig; follow-up.
-- ⛳ (deferred) Wire format v2 (JSON carries bodies) — enables the CLI to emit full bodies from a `.json` file (currently bodies are in-memory only via emitRich, so the CLI emits stubs for wire v1 JSON). Two subagent attempts failed on this intricate decode edit; scoped as a dedicated phase.
+- ✅ Wire format v2 (JSON carries bodies) — `json.parseFull`/`encodeFull` decode/encode bodies; `src/fixtures/model/fnv.json` is v2; the CLI `--translate` now reads v2 and emits full bodies via `parseFull` → `emitRich` (previously stub-only). Bodies/`BodyKind`/`ConstBody`/`FnBody` unified into a leaf `src/model/bodies.zig` (emit.Bodies == json.Bodies; breaks the json↔emit import cycle).
+- ⛳ (follow-up) Local-binding resolution: path exprs referencing non-crate bindings (`h`, `byte`) emit `/* unknown path */` because locals (pats) aren't in the symbol table. Needs a locals table in `Bodies` or path→pat resolution.
+- ⛳ (follow-up) CLI teardown: `parseFull` dup's all bodies tables; the one-shot CLI frees only the graph, so DebugAllocator reports leaks at process exit (benign for a short-lived process; the test suite is leak-free).
 - ⛳ (deferred) Link translated modules into `build.zig` as a real compiled artifact (the emitted .zig compiles standalone today; wiring it as a build step producer is a follow-up).
 
 ## Verification strategy (throughout)

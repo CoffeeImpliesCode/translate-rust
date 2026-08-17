@@ -151,10 +151,21 @@ fn translateCrate(init: std.process.Init, io: std.Io, stdout: std.Io.File, arg_i
     const bytes = try reader.interface.allocRemaining(init.gpa, .limited(1 << 30));
     defer init.gpa.free(bytes);
 
-    var g = try translate_rust.model.json.parse(init.gpa, bytes);
-    defer g.deinit();
+    // Wire format v2 carries bodies; parseFull + emitRich produce full Zig.
+    var model = try translate_rust.model.json.parseFull(init.gpa, bytes);
+    defer model.graph.deinit();
 
-    const zig_source = try translate_rust.model.emit.emit(init.gpa, &g);
+    // json.Bodies and emit.Bodies are field-identical but distinct types;
+    // copy the slices across (no ownership change — the CLI process owns them).
+    const emit_bodies = translate_rust.model.emit.Bodies{
+        .exprs = model.bodies.exprs,
+        .stmts = model.bodies.stmts,
+        .pats = model.bodies.pats,
+        .types = model.bodies.types,
+        .bodies = model.bodies.bodies,
+    };
+
+    const zig_source = try translate_rust.model.emit.emitRich(init.gpa, &model.graph, &emit_bodies);
     defer init.gpa.free(zig_source);
 
     try stdout.writeStreamingAll(io, zig_source);

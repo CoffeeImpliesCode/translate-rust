@@ -1,5 +1,5 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "sidecar": "translate-rust-p2-fixture",
   "toolchain": "1.77.0",
   "crates": [
@@ -47,5 +47,62 @@
       ],
       "uses": []
     }
-  ]
+  ],
+  "bodies": {
+    "exprs": [
+      {
+        "id": 0, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null,
+        "kind": "literal",
+        "value": {"kind": "int", "value": {"text": "14695981039346656037", "value": "14695981039346656037", "base": "dec", "ty_suffix": null}}
+      },
+      {
+        "id": 1, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null,
+        "kind": "literal",
+        "value": {"kind": "int", "value": {"text": "1099511628211", "value": "1099511628211", "base": "dec", "ty_suffix": null}}
+      },
+      {"id": 2, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 1, "generic_args": []}},
+      {"id": 3, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 2, "generic_args": []}},
+      {"id": 4, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 4, "generic_args": []}},
+      {"id": 5, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 5, "generic_args": []}},
+      {"id": 6, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 6, "generic_args": []}},
+      {"id": 7, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "assign", "value": {"target": 5, "op": "bit_xor", "value": 6, "overflow": "checked"}},
+      {"id": 8, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "assign", "value": {"target": 5, "op": "mul", "value": 3, "overflow": "wrapping"}},
+      {"id": 9, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "block", "value": {"statements": [1, 2], "tail": null, "labelled": null}},
+      {"id": 10, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "for_", "value": {"pattern": 1, "iterable": 4, "body": {"statements": [1, 2], "tail": null, "labelled": null}, "iter_kind": {"kind": "slice"}}},
+      {"id": 11, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "return_", "value": {"value": 5}},
+      {"id": 12, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "block", "value": {"statements": [0, 3], "tail": 11, "labelled": null}}
+    ],
+    "stmts": [
+      {"id": 0, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "let", "value": {"pattern": 0, "init": 2, "ty": 0}},
+      {"id": 1, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "expr", "value": 7},
+      {"id": 2, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "expr", "value": 8},
+      {"id": 3, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "expr", "value": 10}
+    ],
+    "pats": [
+      {"id": 0, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "binding", "value": {"name": "h", "mode": "value", "mutable": true}},
+      {"id": 1, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "binding", "value": {"name": "byte", "mode": "value", "mutable": false}}
+    ],
+    "types": [
+      {"kind": "prim", "value": "u64"},
+      {"kind": "slice", "value": {"const_": true, "elem": {"kind": "prim", "value": "u8"}}}
+    ],
+    "bodies": [
+      {"kind": "none"},
+      {"kind": "const_", "value": {"ty": {"kind": "prim", "value": "u64"}, "init": 0}},
+      {"kind": "const_", "value": {"ty": {"kind": "prim", "value": "u64"}, "init": 1}},
+      {
+        "kind": "fn_",
+        "value": {
+          "params": [
+            {"name": "data", "ty": {"kind": "slice", "value": {"const_": true, "elem": {"kind": "prim", "value": "u8"}}}, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}}
+          ],
+          "ret": {"kind": "prim", "value": "u64"},
+          "body": 12
+        }
+      },
+      {"kind": "none"},
+      {"kind": "none"},
+      {"kind": "none"}
+    ]
+  }
 }
