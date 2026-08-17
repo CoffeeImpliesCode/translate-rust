@@ -59,12 +59,39 @@ Goal: translate function bodies for the v1 dialect.
 - Acceptance: fnv + hex + itoa hash/encode/decode bodies translate and pass
   their own vectors in `zig test`.
 
-## Naming convention — `ztr-<cratename>` (output + dependency translation)
+## Naming convention — `ztr-<cratename>` (translation PACKAGE target)
 
-Established 2026-08-17. A translated crate `foo` is emitted as **`ztr-foo`**:
+Established 2026-08-17, corrected same day. A translated crate `foo` is emitted as a
+**Zig package named `ztr-foo`** — a directory, NOT a single file. A single `ztr-foo.zig`
+file only works for a leaf crate; it breaks on modules and deps:
 
-- **Output file**: the translated Zig output is `ztr-<cratename>.zig` (e.g. `fnv` → `test/ztr-fnv.zig`, `hex` → `test/ztr-hex.zig`). The Zig file name IS the module name, so `@import("ztr-foo")` resolves it.
-- **Dependency translation**: when a translated crate depends on another translated crate `bar`, the dependency's Zig module/import name is **`ztr-bar`** — a `use bar::…;` translates to `@import("ztr-bar")` (or the build.zig module is named `ztr-bar`). The `ztr-` prefix is the systematic namespace for translated artifacts, kept distinct from hand-written Zig and from the crate's own name.
+- **Modules** (idiom-mapping §1): Rust `mod foo;` → `@import("foo.zig")` — each module is
+  its own Zig file. A crate's translation is a `src/` tree mirroring the Rust mod graph,
+  not one flat file.
+- **Deps**: a dependency must be a *package* with a manifest. For crate A to
+  `@import("ztr-B")`, B must be a Zig package A's build graph fetches.
+
+**Correct target shape** — each translated crate is a generated package dir:
+
+```
+ztr-<crate>/
+  build.zig        # generated: declares the crate module(s) + test step
+  build.zig.zon    # generated: package manifest
+  src/
+    root.zig       # crate root (the ztr-<crate>.zig output becomes this)
+    util.zig       # mod util → own file
+    ...
+```
+
+**Dependency translation**: A depends on B → A's `build.zig.zon` lists `.@"ztr-B"` as a
+dependency; A's `build.zig` does `b.dependency("ztr-B", .{})` + exposes it as a module;
+A's translated code `@import("ztr-B")`. This mirrors c2rust's `--emit-build-files`
+(per-crate build skeleton, prior-work §3) — the P4 "link translated modules" bullet.
+
+**Current state / gap**: the emitter today emits a single flat file (module banner comments
+instead of a file tree) and no build.zig/.zon. The `test/ztr-*.zig` goldens are valid as
+*expected source content* for a single module, but the real output must become a package
+dir (multi-file per module + generated build.zig + build.zig.zon) before deps work.
 
 **Test corpus layout** (top-level `test/`):
 
