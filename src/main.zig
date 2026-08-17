@@ -33,6 +33,10 @@ pub fn main(init: std.process.Init) !void {
         try dumpModel(init, io, stdout, &arg_it);
         return;
     }
+    if (std.mem.eql(u8, arg_slice, "--translate")) {
+        try translateCrate(init, io, stdout, &arg_it);
+        return;
+    }
 
     try stdout.writeStreamingAll(io,
         \\translate-rust: unrecognized argument; run with --help
@@ -136,13 +140,35 @@ fn entityKindName(k: translate_rust.model.spine.EntityKind) []const u8 {
     };
 }
 
+fn translateCrate(init: std.process.Init, io: std.Io, stdout: std.Io.File, arg_it: *std.process.Args.Iterator) !void {
+    const path = arg_it.next() orelse return error.UsageMissingJsonPath;
+
+    var dir = std.Io.Dir.cwd();
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    var io_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &io_buf);
+    const bytes = try reader.interface.allocRemaining(init.gpa, .limited(1 << 30));
+    defer init.gpa.free(bytes);
+
+    var g = try translate_rust.model.json.parse(init.gpa, bytes);
+    defer g.deinit();
+
+    const zig_source = try translate_rust.model.emit.emit(init.gpa, &g);
+    defer init.gpa.free(zig_source);
+
+    try stdout.writeStreamingAll(io, zig_source);
+}
+
 fn printUsage(io: std.Io, stdout: std.Io.File) !void {
     try stdout.writeStreamingAll(io,
-        \\translate-rust — Rust → Zig translation (research phase, no pipeline yet)
+        \\translate-rust — Rust → Zig translation (research phase, no full pipeline yet)
         \\
         \\usage: translate-rust <crate-path>          translate a Rust crate to Zig (not implemented)
         \\       translate-rust --dump model <file>   parse a sidecar wire-format JSON dump and print
         \\                                            the crate/module inventory
+        \\       translate-rust --translate <file>     parse a sidecar wire-format JSON dump and emit
+        \\                                            Zig source code (items only, P2)
         \\       translate-rust --version             print version
         \\       translate-rust --help                show this help
         \\

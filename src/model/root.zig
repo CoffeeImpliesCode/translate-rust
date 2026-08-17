@@ -8,9 +8,11 @@ const std = @import("std");
 pub const spine = @import("spine.zig");
 pub const graph = @import("graph.zig");
 pub const json = @import("json.zig");
+pub const emit = @import("emit.zig");
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("graph.zig"); // include the graph + json test blocks
+    _ = @import("graph.zig"); // include graph + json + emit test blocks
     _ = @import("json.zig");
+    _ = @import("emit.zig");
 }

@@ -1,0 +1,51 @@
+{
+  "format_version": 1,
+  "sidecar": "translate-rust-p2-fixture",
+  "toolchain": "1.77.0",
+  "crates": [
+    {
+      "name": "fnv",
+      "edition": 2021,
+      "kind": "lib",
+      "root": 0,
+      "is_translated": true,
+      "deps": [],
+      "entities": [
+        {
+          "id": 0, "kind": "module", "name": "",
+          "span": {"start_line": 1, "start_col": 1, "end_line": 13, "end_col": 1},
+          "visibility": {"kind": "public"}, "parent": null,
+          "resolved": null, "renamed_to": null, "attributes": []
+        },
+        {
+          "id": 1, "kind": "const_", "name": "FNV_OFFSET_BASIS",
+          "span": {"start_line": 5, "start_col": 1, "end_line": 5, "end_col": 44},
+          "visibility": {"kind": "private"}, "parent": 0,
+          "resolved": null, "renamed_to": null, "attributes": []
+        },
+        {
+          "id": 2, "kind": "const_", "name": "FNV_PRIME",
+          "span": {"start_line": 6, "start_col": 1, "end_line": 6, "end_col": 36},
+          "visibility": {"kind": "private"}, "parent": 0,
+          "resolved": null, "renamed_to": null, "attributes": []
+        },
+        {
+          "id": 3, "kind": "fn_", "name": "fnv1a_hash",
+          "span": {"start_line": 8, "start_col": 1, "end_line": 14, "end_col": 1},
+          "visibility": {"kind": "public"}, "parent": 0,
+          "resolved": null, "renamed_to": null, "attributes": []
+        }
+      ],
+      "modules": [
+        {
+          "id": 0, "kind": "root", "name": "",
+          "parent": null, "source_path": "src/lib.rs",
+          "is_crate": true, "is_extern": false,
+          "span": {"start_line": 1, "start_col": 1, "end_line": 13, "end_col": 1},
+          "items": [1, 2, 3], "attributes": []
+        }
+      ],
+      "uses": []
+    }
+  ]
+}
