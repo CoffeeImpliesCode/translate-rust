@@ -128,6 +128,22 @@ discipline, prior-work §4): a translated crate carries its own test suite.
 in the wire model, no `assert_eq!`/`assert!` macro lowering). The golden test blocks
 are hand-translated expected output; the model+emitter path for tests is a follow-up.
 
+## Corpus expansion — scouting more v1-dialect test crates
+
+Three parallel scouts (hashing/checksum, encoding, parsing/formatting) surveyed the
+crates.io ecosystem for more fnv-like targets. Honest finding: **no crate besides fnv
+is a pure free-fn v1 target** — every candidate wraps its compute in a streaming
+Hasher/struct with generics/methods, or uses macros/alloc/errors the emitter can't
+lower yet.
+
+- **fletcher** (chosen): `calc_fletcher16(&[u8]) -> u16`, no_std, zero deps, no macros,
+  578 LOC, real `#[test]` vectors. The algorithm (chunked `a+=el; b+=a`, one's-complement
+  `reduce`, `a | b<<8`) is lowered to a free fn in `test/r2z-fletcher.zig`, with the
+  crate's real vectors as the differential oracle.
+- Honest rejects: adler/wyhash (SIMD/struct core), seahash/xxhash (unsafe/macros),
+  base64/percent-encoding/data-encoding (struct+Iterator+alloc), leb128 (std::io),
+  itoa (sealed trait+macros), strsim/unicase (alloc). All are hex-like (partial) at best.
+
 ## P4 — full integration (PIPELINE LIVE, in progress)
 Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
 - ✅ `zig build sidecar` — drives `tools/sidecar/rustdoc-json.sh` (cargo +nightly rustdoc) on the mini fixture → `zig-out/crate-mini.json`.

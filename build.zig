@@ -93,7 +93,7 @@ pub fn build(b: *std.Build) void {
     // r2z-hex.zig is a reduced textual subset (the emitter's `for (bytes) |byte|`
     // has an unused capture, so it is not valid Zig) — excluded until hex truly
     // translates (errors/alloc/arrays).
-    const goldens = [_][]const u8{"test/r2z-fnv.zig"};
+    const goldens = [_][]const u8{ "test/r2z-fnv.zig", "test/r2z-fletcher.zig" };
     for (goldens) |golden| {
         const tc = b.addSystemCommand(&.{ "zig", "test", golden });
         test_crates_step.dependOn(&tc.step);

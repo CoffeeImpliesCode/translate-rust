@@ -1,0 +1,8 @@
+[package]
+name = "fletcher"
+version = "1.1.4"
+edition = "2018"
+publish = false
+
+# Source vendored from https://github.com/jbangelo/fletcher (crates.io fletcher 1.1.4),
+# MIT OR Apache-2.0. Zero dependencies; #![no_std].
