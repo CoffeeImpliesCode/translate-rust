@@ -231,6 +231,27 @@ fn emitEntity(
             try buf.appendSlice(allocator, "\n};\n");
         },
         .fn_ => {
+            const is_test = hasAttr(e, "test");
+            if (is_test) {
+                // Rust #[test] fn -> Zig `test "name" { body }` block.
+                if (bodies) |bb| {
+                    if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
+                        .fn_ => |fb| {
+                            try buf.appendSlice(allocator, "test \"");
+                            try buf.appendSlice(allocator, e.name);
+                            try buf.appendSlice(allocator, "\" {\n");
+                            try emitExpr(allocator, buf, g, bb, fb.body, 1);
+                            try buf.appendSlice(allocator, "}\n");
+                            return;
+                        },
+                        else => {},
+                    };
+                }
+                try buf.appendSlice(allocator, "test \"");
+                try buf.appendSlice(allocator, e.name);
+                try buf.appendSlice(allocator, "\" {}\n");
+                return;
+            }
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "fn ");
             try emitIdent(allocator, buf, entityName(e));
@@ -340,6 +361,14 @@ fn emitEntity(
 
 fn entityName(e: spine.Entity) []const u8 {
     return e.renamed_to orelse e.name;
+}
+
+/// True if the entity carries an attribute with the given name (e.g. "#[test]").
+fn hasAttr(e: spine.Entity, attr_name: []const u8) bool {
+    for (e.attributes) |a| {
+        if (std.mem.eql(u8, a.name, attr_name)) return true;
+    }
+    return false;
 }
 
 fn emitIdent(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), name: []const u8) !void {
@@ -1110,12 +1139,12 @@ fn emitExpr(
             try buf.appendSlice(allocator, "if (");
             try emitExpr(allocator, buf, g, b, ie.cond, depth);
             try buf.appendSlice(allocator, ") ");
-            try emitBlock(allocator, buf, g, b, ie.then_, depth);
+            try emitBranch(allocator, buf, g, b, ie.then_, depth);
             switch (ie.@"else") {
                 .none => {},
                 .block => |blk| {
                     try buf.appendSlice(allocator, " else ");
-                    try emitBlock(allocator, buf, g, b, blk, depth);
+                    try emitBranch(allocator, buf, g, b, blk, depth);
                 },
                 .chain => |cid| {
                     try buf.appendSlice(allocator, " else ");
@@ -1160,11 +1189,11 @@ fn emitExpr(
             try emitBlock(allocator, buf, g, b, le.body, depth + 1);
         },
         .binary => |be| {
-            try emitExpr(allocator, buf, g, b, be.lhs, depth);
+            try emitOperand(allocator, buf, g, b, be.lhs, depth);
             try buf.append(allocator, ' ');
             try buf.appendSlice(allocator, binaryOpString(be.op, be.overflow));
             try buf.append(allocator, ' ');
-            try emitExpr(allocator, buf, g, b, be.rhs, depth);
+            try emitOperand(allocator, buf, g, b, be.rhs, depth);
         },
         .unary => |ue| {
             switch (ue.op) {
@@ -1405,6 +1434,51 @@ fn emitBlock(
     // Closing brace at parent indentation.
     if (depth > 0) try writeIndent(allocator, buf, depth - 1);
     try buf.append(allocator, '}');
+}
+
+/// Emit an `if` branch. When the branch block is a pure value (statement-less
+/// with a tail expression), emit it as a bare value so the `if` reads as a
+/// value expression (`if (c) 0 else result`) rather than a discarding block.
+fn emitBranch(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    block: exprs.BlockExpr,
+    depth: u32,
+) !void {
+    if (block.statements.len == 0) {
+        if (block.tail) |tid| {
+            try emitExpr(allocator, buf, g, b, tid, depth);
+            return;
+        }
+        try buf.appendSlice(allocator, "{}");
+        return;
+    }
+    try emitBlock(allocator, buf, g, b, block, depth);
+}
+
+fn emitOperand(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    expr_id: exprs.NodeId,
+    depth: u32,
+) !void {
+    // Parenthesize nested operator expressions so Zig's precedence preserves
+    // the IR's AST grouping (e.g. `(a & b) + (c >> d)`).
+    const needs_paren = switch (b.exprs[expr_id].kind) {
+        .binary, .assign, .try_ => true,
+        else => false,
+    };
+    if (needs_paren) {
+        try buf.append(allocator, '(');
+        try emitExpr(allocator, buf, g, b, expr_id, depth);
+        try buf.append(allocator, ')');
+    } else {
+        try emitExpr(allocator, buf, g, b, expr_id, depth);
+    }
 }
 
 fn emitFnSignature(

@@ -191,7 +191,15 @@ pub fn generatePackage(
     // 3. src/root.zig (crate root module)
     const raw_root_source = try emit.emitModuleFile(allocator, g, b, c.root);
     defer allocator.free(raw_root_source);
-    const root_content = try emit.formatZig(allocator, raw_root_source);
+    // Inject the standard prelude so translated test fns can resolve
+    // `expectEqual` (mapped to `std.testing.expectEqual`) and `@import("std")`.
+    const raw_with_prelude = try std.fmt.allocPrint(
+        allocator,
+        "const std = @import(\"std\");\nconst expectEqual = std.testing.expectEqual;\n\n{s}",
+        .{raw_root_source},
+    );
+    defer allocator.free(raw_with_prelude);
+    const root_content = try emit.formatZig(allocator, raw_with_prelude);
     try file_list.append(allocator, .{
         .path = try allocator.dupe(u8, "src/root.zig"),
         .content = root_content,
@@ -296,6 +304,81 @@ test "generatePackage: fnv fixture generates single-module package with body low
     try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub fn fnv1a_hash") != null);
     try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "const FNV_OFFSET_BASIS:") != null);
     try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "const FNV_PRIME:") != null);
+}
+
+test "generatePackage: fletcher fixture generates standalone package with all 6 tests" {
+    const test_io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const fletcher_json_bytes = try readFixture(allocator, test_io, "test/fletcher.json");
+    const parsed = try json.parseFull(allocator, fletcher_json_bytes);
+    const pkg = try generatePackage(allocator, &parsed.graph, &parsed.bodies, 0);
+
+    try std.testing.expectEqualStrings("fletcher", pkg.crate_name);
+    try std.testing.expectEqualStrings("r2z-fletcher", pkg.package_name);
+
+    // Single-module package: build.zig, build.zig.zon, src/root.zig.
+    try std.testing.expectEqual(@as(usize, 3), pkg.files.len);
+    try std.testing.expectEqualStrings("src/root.zig", pkg.files[2].path);
+
+    // src/root.zig contains the checksum fns, constants, and all 6 test vectors.
+    const root = pkg.files[2].content;
+    try std.testing.expect(std.mem.indexOf(u8, root, "calc_fletcher16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "reduce") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "BIT_MASK") != null);
+    // The 6 translated test blocks and their expected checksum vectors.
+    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_ascii_data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_underflow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_overflow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_issue_8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_wiki_example") != null);
+    // The 6 expected checksum values appear as literals in the emitted tests.
+    try std.testing.expect(std.mem.indexOf(u8, root, "0xC8F0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "0x2057") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "0x0627") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "0x3FAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root, "0x0063") != null);
+}
+
+test "generatePackage: hex fixture generates multi-module package with error.zig" {
+    const test_io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const hex_json_bytes = try readFixture(allocator, test_io, "test/hex.json");
+    const parsed = try json.parseFull(allocator, hex_json_bytes);
+    const pkg = try generatePackage(allocator, &parsed.graph, &parsed.bodies, 0);
+
+    try std.testing.expectEqualStrings("hex", pkg.crate_name);
+    try std.testing.expectEqualStrings("r2z-hex", pkg.package_name);
+
+    // Multi-module: root + error submodule, plus the two build files.
+    try std.testing.expectEqual(@as(usize, 4), pkg.files.len);
+    var has_build = false;
+    var has_zon = false;
+    var has_root = false;
+    var has_error = false;
+    for (pkg.files) |f| {
+        if (std.mem.eql(u8, f.path, "build.zig")) has_build = true;
+        if (std.mem.eql(u8, f.path, "build.zig.zon")) has_zon = true;
+        if (std.mem.eql(u8, f.path, "src/root.zig")) has_root = true;
+        if (std.mem.eql(u8, f.path, "src/error.zig")) has_error = true;
+    }
+    try std.testing.expect(has_build);
+    try std.testing.expect(has_zon);
+    try std.testing.expect(has_root);
+    try std.testing.expect(has_error);
+
+    // Error enum lands in its own module file.
+    for (pkg.files) |f| {
+        if (std.mem.eql(u8, f.path, "src/error.zig")) {
+            try std.testing.expect(std.mem.indexOf(u8, f.content, "FromHexError") != null);
+        }
+    }
 }
 
 test "GeneratedPackage.writeToDisk writes files safely" {

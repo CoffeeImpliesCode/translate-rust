@@ -1,0 +1,11 @@
+.{
+    .name = .r2z_core,
+    .version = "0.1.0",
+    .fingerprint = 0xee98d111b85d2138,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

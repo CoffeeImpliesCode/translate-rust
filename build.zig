@@ -108,6 +108,11 @@ pub fn build(b: *std.Build) void {
     // blocks translated to Zig `test` blocks — the differential oracle.
     // `zig build test-crates` runs them all.
     const test_crates_step = b.step("test-crates", "Run zig test on every translated crate (test/r2z-*.zig)");
+    // 1. r2z-core runtime library (standalone package).
+    {
+        const tc = b.addSystemCommand(&.{ "sh", "-c", "cd r2z-core && zig build test --summary all" });
+        test_crates_step.dependOn(&tc.step);
+    }
     // Only goldens that are real compilable translation targets go here.
     // r2z-hex.zig is a reduced textual subset (the emitter's `for (bytes) |byte|`
     // has an unused capture, so it is not valid Zig) — excluded until hex truly
