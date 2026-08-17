@@ -165,9 +165,10 @@ fn translateCrate(init: std.process.Init, io: std.Io, stdout: std.Io.File, path:
     // Wire format v2 carries bodies; parseFull + emitRich produce full Zig.
     var model = try translate_rust.model.json.parseFull(allocator, bytes);
 
-    const zig_source = try translate_rust.model.emit.emitRich(allocator, &model.graph, &model.bodies);
+    const raw_source = try translate_rust.model.emit.emitRich(allocator, &model.graph, &model.bodies);
+    const formatted = try translate_rust.model.emit.formatZig(allocator, raw_source);
 
-    try stdout.writeStreamingAll(io, zig_source);
+    try stdout.writeStreamingAll(io, formatted);
 }
 
 fn printUsage(io: std.Io, stdout: std.Io.File) !void {

@@ -67,6 +67,21 @@ pub fn emitRich(
 ) ![]u8 {
     return emitImpl(allocator, g, bodies);
 }
+/// Format a Zig source buffer canonically using std.zig.Ast (identical to `zig fmt`).
+/// If there are syntax errors (e.g. placeholder comments), returns a copy of `source`.
+pub fn formatZig(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const src_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(src_z);
+
+    var tree = try std.zig.Ast.parse(allocator, src_z, .zig);
+    defer tree.deinit(allocator);
+
+    if (tree.errors.len == 0) {
+        return tree.renderAlloc(allocator);
+    } else {
+        return allocator.dupe(u8, source);
+    }
+}
 
 fn emitImpl(
     allocator: std.mem.Allocator,
@@ -854,4 +869,13 @@ test "emit: keyword escaping and renamed_to" {
     try std.testing.expect(std.mem.indexOf(u8, out, "pub fn @\"type\"() void {") != null);
     // "orig_magic" with renamed_to="renamed_magic" must emit "renamed_magic"
     try std.testing.expect(std.mem.indexOf(u8, out, "const renamed_magic: void =") != null);
+}
+
+test "formatZig: formats unformatted valid Zig into canonical style" {
+    const allocator = std.testing.allocator;
+    const unformatted = "pub fn add( a:u64, b:u64 )u64{return a+b;}";
+    const formatted = try formatZig(allocator, unformatted);
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "pub fn add(a: u64, b: u64) u64 {\n    return a + b;\n}") != null);
 }

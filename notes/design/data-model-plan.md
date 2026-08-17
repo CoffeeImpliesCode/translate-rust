@@ -149,7 +149,7 @@ Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
 - ✅ `zig build sidecar` — drives `tools/sidecar/rustdoc-json.sh` (cargo +nightly rustdoc) on the mini fixture → `zig-out/crate-mini.json`.
 - ✅ `zig build translate -- <wire-json>` — runs the CLI `--translate` on a wire-format dump.
 - ✅ Second v1-dialect corpus: `hex.zig` + `emit_hex_test.zig` golden (30/30 tests).
-- ⛳ (deferred) Align emission to `zig fmt` canonical output — the emitter output is hand-shaped; a `zig fmt` post-emit pass in the CLI is a small follow-up.
+- ✅ Align emission to `zig fmt` canonical output — in-process `std.zig.Ast` parsing and rendering (`formatZig`) runs on emitted source; produces canonical formatting with zero external processes.
 - ✅ Port rename/`@"keyword"` from the model to the emitter — `std.zig.fmtId` escaping across functions, types, constants, variables, and path segments + `entity.renamed_to` honored.
 - ✅ Wire format v2 (JSON carries bodies) — `json.parseFull`/`encodeFull` decode/encode bodies; `test/fnv.json` is v2; the CLI `--translate` and positional invocation now read v2 and emit full bodies via `parseFull` → `emitRich` (previously stub-only). Bodies/`BodyKind`/`ConstBody`/`FnBody` unified into a leaf `src/model/bodies.zig` (emit.Bodies == json.Bodies; breaks the json↔emit import cycle).
 - ✅ Local-binding resolution — `test/fnv.json` includes param/local entities (`data`, `h`, `byte`) so `PathExpr.def` resolves cleanly to entity names; no `/* unknown path */`.
