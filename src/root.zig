@@ -6,8 +6,9 @@ const std = @import("std");
 
 pub const version = "0.0.0";
 
-// Expose the syntax front-end under the project namespace for convenience.
+// Expose the syntax front-end and the semantic IR under the project namespace.
 pub const rust = @import("translate_rust.rust");
+pub const model = @import("translate_rust.model");
 
 test {
     std.testing.refAllDecls(@This());

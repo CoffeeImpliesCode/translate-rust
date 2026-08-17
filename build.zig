@@ -27,6 +27,13 @@ pub fn build(b: *std.Build) void {
     rust.addIncludePath(b.path("vendor/tree-sitter-rust"));
     rust.link_libc = true;
 
+    // ── translate_rust.model — the lossless semantic IR (P1) ─────────────
+    const model = b.addModule("translate_rust.model", .{
+        .root_source_file = b.path("src/model/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── translate_rust — library root ─────────────────────────
     const translate_rust = b.addModule("translate_rust", .{
         .root_source_file = b.path("src/root.zig"),
@@ -34,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "translate_rust.rust", .module = rust },
+            .{ .name = "translate_rust.model", .module = model },
         },
     });
 
@@ -65,4 +73,7 @@ pub fn build(b: *std.Build) void {
 
     const rust_tests = b.addTest(.{ .root_module = rust });
     test_step.dependOn(&b.addRunArtifact(rust_tests).step);
+
+    const model_tests = b.addTest(.{ .root_module = model });
+    test_step.dependOn(&b.addRunArtifact(model_tests).step);
 }

@@ -1,0 +1,165 @@
+{
+  "format_version": 1,
+  "sidecar": "rustdoc",
+  "toolchain": "nightly-2025-01-01",
+  "crates": [
+    {
+      "name": "mini",
+      "edition": 2021,
+      "kind": "lib",
+      "root": 0,
+      "is_translated": true,
+      "deps": [],
+      "entities": [
+        {
+          "id": 0,
+          "kind": "module",
+          "name": "",
+          "span": { "start_line": 1, "start_col": 1, "end_line": 7, "end_col": 1 },
+          "visibility": { "kind": "public" },
+          "parent": null,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 1,
+          "kind": "module",
+          "name": "util",
+          "span": { "start_line": 3, "start_col": 1, "end_line": 3, "end_col": 9 },
+          "visibility": { "kind": "public" },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 2,
+          "kind": "struct_",
+          "name": "Point",
+          "span": { "start_line": 5, "start_col": 1, "end_line": 8, "end_col": 2 },
+          "visibility": { "kind": "public" },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": [
+            { "name": "doc", "meta": "a point", "known": false }
+          ]
+        },
+        {
+          "id": 3,
+          "kind": "enum_",
+          "name": "Shape",
+          "span": { "start_line": 10, "start_col": 1, "end_line": 14, "end_col": 2 },
+          "visibility": { "kind": "public" },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 4,
+          "kind": "fn_",
+          "name": "area",
+          "span": { "start_line": 16, "start_col": 1, "end_line": 21, "end_col": 2 },
+          "visibility": { "kind": "public" },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 5,
+          "kind": "fn_",
+          "name": "origin",
+          "span": { "start_line": 23, "start_col": 1, "end_line": 25, "end_col": 2 },
+          "visibility": { "kind": "public" },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 6,
+          "kind": "use_",
+          "name": "helper",
+          "span": { "start_line": 27, "start_col": 1, "end_line": 27, "end_col": 22 },
+          "visibility": { "kind": "public" },
+          "parent": 0,
+          "resolved": 7,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 7,
+          "kind": "fn_",
+          "name": "helper",
+          "span": { "start_line": 1, "start_col": 1, "end_line": 3, "end_col": 2 },
+          "visibility": { "kind": "public" },
+          "parent": 1,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 8,
+          "kind": "variant",
+          "name": "Circle",
+          "span": { "start_line": 11, "start_col": 5, "end_line": 11, "end_col": 16 },
+          "visibility": { "kind": "public" },
+          "parent": 3,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 9,
+          "kind": "variant",
+          "name": "Rect",
+          "span": { "start_line": 12, "start_col": 5, "end_line": 13, "end_col": 17 },
+          "visibility": { "kind": "public" },
+          "parent": 3,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        }
+      ],
+      "modules": [
+        {
+          "id": 0,
+          "kind": "root",
+          "name": "",
+          "parent": null,
+          "source_path": "src/lib.rs",
+          "is_crate": true,
+          "is_extern": false,
+          "span": { "start_line": 1, "start_col": 1, "end_line": 7, "end_col": 1 },
+          "items": [1, 2, 3, 4, 5, 6],
+          "attributes": []
+        },
+        {
+          "id": 1,
+          "kind": "file",
+          "name": "util",
+          "parent": 0,
+          "source_path": "src/util.rs",
+          "is_crate": false,
+          "is_extern": false,
+          "span": { "start_line": 3, "start_col": 1, "end_line": 3, "end_col": 9 },
+          "items": [7],
+          "attributes": []
+        }
+      ],
+      "uses": [
+        {
+          "id": 6,
+          "kind": "alias",
+          "local_name": "helper",
+          "is_pub_export": true,
+          "target": 7,
+          "span": { "start_line": 27, "start_col": 1, "end_line": 27, "end_col": 22 }
+        }
+      ]
+    }
+  ]
+}
