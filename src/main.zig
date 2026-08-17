@@ -30,21 +30,33 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, arg_slice, "--dump")) {
-        try dumpModel(init, io, stdout, &arg_it);
+        try dumpModel(io, init, stdout, &arg_it);
         return;
     }
-    if (std.mem.eql(u8, arg_slice, "--translate")) {
+    if (std.mem.eql(u8, arg_slice, "--translate") or std.mem.eql(u8, arg_slice, "--emit-package")) {
         const path = arg_it.next() orelse {
             try printUsage(io, stdout);
             return;
         };
-        try translateCrate(init, io, stdout, path);
+        var out_dir: ?[]const u8 = null;
+        if (arg_it.next()) |next_arg| {
+            if (std.mem.eql(u8, next_arg, "-o") or std.mem.eql(u8, next_arg, "--output")) {
+                out_dir = arg_it.next();
+            }
+        }
+        try translateCrate(io, init, stdout, path, out_dir);
         return;
     }
 
     // Default positional behavior: if passed a .json file, translate it.
     if (std.mem.endsWith(u8, arg_slice, ".json")) {
-        try translateCrate(init, io, stdout, arg_slice);
+        var out_dir: ?[]const u8 = null;
+        if (arg_it.next()) |next_arg| {
+            if (std.mem.eql(u8, next_arg, "-o") or std.mem.eql(u8, next_arg, "--output")) {
+                out_dir = arg_it.next();
+            }
+        }
+        try translateCrate(io, init, stdout, arg_slice, out_dir);
         return;
     }
 
@@ -54,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     );
 }
 
-fn dumpModel(init: std.process.Init, io: std.Io, stdout: std.Io.File, arg_it: *std.process.Args.Iterator) !void {
+fn dumpModel(io: std.Io, init: std.process.Init, stdout: std.Io.File, arg_it: *std.process.Args.Iterator) !void {
     const mode = arg_it.next() orelse return error.UsageMissingDumpMode;
     if (!std.mem.eql(u8, mode, "model")) {
         return error.UnknownDumpMode;
@@ -87,7 +99,13 @@ fn dumpModel(init: std.process.Init, io: std.Io, stdout: std.Io.File, arg_it: *s
     try stdout.writeStreamingAll(io, buf.items);
 }
 
-fn dumpModule(gpa: std.mem.Allocator, g: *const translate_rust.model.graph.CrateGraph, buf: *std.ArrayListUnmanaged(u8), mod_id: translate_rust.model.spine.EntityId, depth: usize) !void {
+fn dumpModule(
+    gpa: std.mem.Allocator,
+    g: *const translate_rust.model.graph.CrateGraph,
+    buf: *std.ArrayListUnmanaged(u8),
+    mod_id: translate_rust.model.spine.EntityId,
+    depth: usize,
+) !void {
     const m = g.module(mod_id) orelse return;
 
     for (m.items) |item_id| {
@@ -150,7 +168,13 @@ fn entityKindName(k: translate_rust.model.spine.EntityKind) []const u8 {
     };
 }
 
-fn translateCrate(init: std.process.Init, io: std.Io, stdout: std.Io.File, path: []const u8) !void {
+fn translateCrate(
+    io: std.Io,
+    init: std.process.Init,
+    stdout: std.Io.File,
+    path: []const u8,
+    out_dir: ?[]const u8,
+) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -165,10 +189,29 @@ fn translateCrate(init: std.process.Init, io: std.Io, stdout: std.Io.File, path:
     // Wire format v2 carries bodies; parseFull + emitRich produce full Zig.
     var model = try translate_rust.model.json.parseFull(allocator, bytes);
 
-    const raw_source = try translate_rust.model.emit.emitRich(allocator, &model.graph, &model.bodies);
-    const formatted = try translate_rust.model.emit.formatZig(allocator, raw_source);
-
-    try stdout.writeStreamingAll(io, formatted);
+    if (out_dir) |dest| {
+        // Package emission mode: generate multi-file package directory
+        for (0..model.graph.crates.items.len) |crate_idx| {
+            const pkg = try translate_rust.model.package.generatePackage(
+                allocator,
+                &model.graph,
+                &model.bodies,
+                crate_idx,
+            );
+            try pkg.writeToDisk(io, dest);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "emitted package {s} to {s} ({d} files)\n",
+                .{ pkg.package_name, dest, pkg.files.len },
+            );
+            try stdout.writeStreamingAll(io, msg);
+        }
+    } else {
+        // Single-stream stdout emission mode
+        const raw_source = try translate_rust.model.emit.emitRich(allocator, &model.graph, &model.bodies);
+        const formatted = try translate_rust.model.emit.formatZig(allocator, raw_source);
+        try stdout.writeStreamingAll(io, formatted);
+    }
 }
 
 fn printUsage(io: std.Io, stdout: std.Io.File) !void {
@@ -176,10 +219,10 @@ fn printUsage(io: std.Io, stdout: std.Io.File) !void {
         \\translate-rust — Rust → Zig translation (research phase, no full pipeline yet)
         \\
         \\usage: translate-rust <crate-path>          translate a Rust crate to Zig (not implemented)
+        \\       translate-rust <file.json> [-o dir]  translate a wire-format JSON dump (stdout or package dir)
+        \\       translate-rust --emit-package <file.json> -o <dir>  emit standalone Zig package
         \\       translate-rust --dump model <file>   parse a sidecar wire-format JSON dump and print
         \\                                            the crate/module inventory
-        \\       translate-rust --translate <file>     parse a sidecar wire-format JSON dump and emit
-        \\                                            Zig source code (items only, P2)
         \\       translate-rust --version             print version
         \\       translate-rust --help                show this help
         \\

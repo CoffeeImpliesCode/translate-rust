@@ -11,7 +11,7 @@
 
 pub fn encode(bytes: []const u8) []const u8 {
     var out: []const u8 = "";
-    for (bytes) |byte| {
+    for (bytes) |_| {
         out = bytes;
     }
     return out;

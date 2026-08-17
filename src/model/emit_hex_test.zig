@@ -55,6 +55,7 @@ const Model = struct {
         }
         allocator.free(self.bodies.bodies);
         self.g.deinit();
+        self.* = undefined;
     }
 };
 
@@ -99,7 +100,7 @@ fn buildHexModel(allocator: std.mem.Allocator) !*Model {
     const m = try allocator.create(Model);
     errdefer allocator.destroy(m);
 
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     // ── CrateGraph ──────────────────────────────────────────────────────
     var g = graph.CrateGraph.init(allocator);
@@ -203,7 +204,7 @@ fn buildHexModel(allocator: std.mem.Allocator) !*Model {
 
     const slice_ptr = try allocator.create(types.Slice);
     slice_ptr.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
-    const byte_slice_type = types.Type{ .slice = slice_ptr };
+    const byte_slice_type: types.Type = .{ .slice = slice_ptr };
 
     const types_store = try allocator.alloc(types.Type, 1);
     types_store[0] = byte_slice_type;
@@ -234,11 +235,7 @@ fn buildHexModel(allocator: std.mem.Allocator) !*Model {
         .id = 1,
         .span = span,
         .ty = null,
-        .kind = .{ .binding = .{
-            .name = "byte",
-            .mode = .{ .value = {} },
-            .mutable = false,
-        } },
+        .kind = .{ .wildcard = {} },
     };
 
     // ── Exprs table ─────────────────────────────────────────────────────

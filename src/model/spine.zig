@@ -98,6 +98,7 @@ pub const SymbolTable = struct {
 
     pub fn deinit(self: *SymbolTable) void {
         self.entities.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Append an entity, assigning the next dense id (the caller-supplied
@@ -121,7 +122,7 @@ pub const SymbolTable = struct {
 };
 
 test "symbol table assigns dense ids" {
-    const span = Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 2 };
+    const span: Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 2 };
     var st = SymbolTable.init(std.testing.allocator);
     defer st.deinit();
 
@@ -157,7 +158,7 @@ test "symbol table assigns dense ids" {
 }
 
 test "visibility round trips through the union" {
-    const v = Visibility{ .in_path = "crate::foo" };
+    const v: Visibility = .{ .in_path = "crate::foo" };
     switch (v) {
         .in_path => |p| try std.testing.expectEqualStrings("crate::foo", p),
         else => @panic("expected in_path"),

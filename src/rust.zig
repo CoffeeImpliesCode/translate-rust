@@ -28,6 +28,7 @@ pub const Parser = struct {
 
     pub fn deinit(self: *Parser) void {
         self.parser.destroy();
+        self.* = undefined;
     }
 
     /// Parse `source` into a syntax tree. Caller destroys the tree. Returns

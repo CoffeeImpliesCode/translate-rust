@@ -40,7 +40,7 @@ pub const Bodies = struct {
 };
 
 test "bodies shapes instantiate" {
-    const b = Bodies{
+    const b: Bodies = .{
         .exprs = &.{},
         .stmts = &.{},
         .pats = &.{},
@@ -48,6 +48,6 @@ test "bodies shapes instantiate" {
         .bodies = &.{},
     };
     _ = b;
-    const k = BodyKind{ .none = {} };
+    const k: BodyKind = .{ .none = {} };
     _ = k;
 }

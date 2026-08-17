@@ -19,7 +19,6 @@
 //! `@"or"`. Trailing-underscore tags (`loop_`, `while_`, `for_`, `break_`,
 //! `continue_`, `try_`, `return_`) keep JSON discriminants valid Zig idents.
 
-const std = @import("std");
 const spine = @import("spine.zig");
 const types = @import("types.zig");
 
@@ -584,7 +583,7 @@ pub const LetElseStmt = struct {
 // =============================================================================
 
 test "exprs — every ExprKind / Literal / Operator variant compiles" {
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     // ── §1.1 every Literal variant ─────────────────────────────────────────
     const lit_int: Literal = .{ .int = .{ .text = "42", .value = 42, .base = .dec, .ty_suffix = null } };
@@ -606,7 +605,7 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     _ = block_with_stmt;
 
     // §1.2 — IfExpr / ElseBranch (all three variants)
-    const else_blk = BlockExpr{ .statements = &.{}, .tail = null, .labelled = null };
+    const else_blk: BlockExpr = .{ .statements = &.{}, .tail = null, .labelled = null };
     const if_full: IfExpr = .{ .cond = 5, .then_ = block_expr, .@"else" = .{ .block = else_blk } };
     const if_no_else: IfExpr = .{ .cond = 6, .then_ = block_expr, .@"else" = .{ .none = {} } };
     const else_chain: ElseBranch = .{ .chain = 7 };
@@ -791,35 +790,59 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const unsup: Unsupported = .{ .reason = "match guards", .suggested_version = .v2 };
 
     // ── Wrap every ExprKind arm into an Expr (final _ = block) ─────────────
-    _ = Expr{ .id = 1, .span = span, .ty = null, .kind = .{ .literal = lit_int } };
-    _ = Expr{ .id = 2, .span = span, .ty = null, .kind = .{ .path = path_expr } };
-    _ = Expr{ .id = 3, .span = span, .ty = null, .kind = .{ .block = block_expr } };
-    _ = Expr{ .id = 4, .span = span, .ty = null, .kind = .{ .unit = {} } };
-    _ = Expr{ .id = 5, .span = span, .ty = null, .kind = .{ .if_else = if_full } };
-    _ = Expr{ .id = 6, .span = span, .ty = null, .kind = .{ .if_let = if_let_expr } };
-    _ = Expr{ .id = 7, .span = span, .ty = null, .kind = .{ .match = match_expr } };
-    _ = Expr{ .id = 8, .span = span, .ty = null, .kind = .{ .loop_ = loop_expr } };
-    _ = Expr{ .id = 9, .span = span, .ty = null, .kind = .{ .while_ = while_expr } };
-    _ = Expr{ .id = 10, .span = span, .ty = null, .kind = .{ .for_ = for_range } };
-    _ = Expr{ .id = 11, .span = span, .ty = null, .kind = .{ .break_ = break_val } };
-    _ = Expr{ .id = 12, .span = span, .ty = null, .kind = .{ .continue_ = continue_expr } };
-    _ = Expr{ .id = 13, .span = span, .ty = null, .kind = .{ .call = call_free } };
-    _ = Expr{ .id = 14, .span = span, .ty = null, .kind = .{ .method_call = mc_value } };
-    _ = Expr{ .id = 15, .span = span, .ty = null, .kind = .{ .struct_lit = struct_lit } };
-    _ = Expr{ .id = 16, .span = span, .ty = null, .kind = .{ .enum_variant = enum_variant } };
-    _ = Expr{ .id = 17, .span = span, .ty = null, .kind = .{ .field = field_expr } };
-    _ = Expr{ .id = 18, .span = span, .ty = null, .kind = .{ .index = index_expr } };
-    _ = Expr{ .id = 19, .span = span, .ty = null, .kind = .{ .binary = bin_expr } };
-    _ = Expr{ .id = 20, .span = span, .ty = null, .kind = .{ .unary = unary_expr } };
-    _ = Expr{ .id = 21, .span = span, .ty = null, .kind = .{ .assign = assign_expr } };
-    _ = Expr{ .id = 22, .span = span, .ty = null, .kind = .{ .try_ = try_expr } };
-    _ = Expr{ .id = 23, .span = span, .ty = null, .kind = .{ .return_ = ret_val } };
-    _ = Expr{ .id = 25, .span = span, .ty = null, .kind = .{ .unsupported = unsup } };
+    const e_lit: Expr = .{ .id = 1, .span = span, .ty = null, .kind = .{ .literal = lit_int } };
+    const e_path: Expr = .{ .id = 2, .span = span, .ty = null, .kind = .{ .path = path_expr } };
+    const e_block: Expr = .{ .id = 3, .span = span, .ty = null, .kind = .{ .block = block_expr } };
+    const e_unit: Expr = .{ .id = 4, .span = span, .ty = null, .kind = .{ .unit = {} } };
+    const e_if: Expr = .{ .id = 5, .span = span, .ty = null, .kind = .{ .if_else = if_full } };
+    const e_if_let: Expr = .{ .id = 6, .span = span, .ty = null, .kind = .{ .if_let = if_let_expr } };
+    const e_match: Expr = .{ .id = 7, .span = span, .ty = null, .kind = .{ .match = match_expr } };
+    const e_loop: Expr = .{ .id = 8, .span = span, .ty = null, .kind = .{ .loop_ = loop_expr } };
+    const e_while: Expr = .{ .id = 9, .span = span, .ty = null, .kind = .{ .while_ = while_expr } };
+    const e_for: Expr = .{ .id = 10, .span = span, .ty = null, .kind = .{ .for_ = for_range } };
+    const e_break: Expr = .{ .id = 11, .span = span, .ty = null, .kind = .{ .break_ = break_val } };
+    const e_cont: Expr = .{ .id = 12, .span = span, .ty = null, .kind = .{ .continue_ = continue_expr } };
+    const e_call: Expr = .{ .id = 13, .span = span, .ty = null, .kind = .{ .call = call_free } };
+    const e_mc: Expr = .{ .id = 14, .span = span, .ty = null, .kind = .{ .method_call = mc_value } };
+    const e_struct: Expr = .{ .id = 15, .span = span, .ty = null, .kind = .{ .struct_lit = struct_lit } };
+    const e_enum: Expr = .{ .id = 16, .span = span, .ty = null, .kind = .{ .enum_variant = enum_variant } };
+    const e_field: Expr = .{ .id = 17, .span = span, .ty = null, .kind = .{ .field = field_expr } };
+    const e_index: Expr = .{ .id = 18, .span = span, .ty = null, .kind = .{ .index = index_expr } };
+    const e_bin: Expr = .{ .id = 19, .span = span, .ty = null, .kind = .{ .binary = bin_expr } };
+    const e_unary: Expr = .{ .id = 20, .span = span, .ty = null, .kind = .{ .unary = unary_expr } };
+    const e_assign: Expr = .{ .id = 21, .span = span, .ty = null, .kind = .{ .assign = assign_expr } };
+    const e_try: Expr = .{ .id = 22, .span = span, .ty = null, .kind = .{ .try_ = try_expr } };
+    const e_ret: Expr = .{ .id = 23, .span = span, .ty = null, .kind = .{ .return_ = ret_val } };
+    const e_unsup: Expr = .{ .id = 25, .span = span, .ty = null, .kind = .{ .unsupported = unsup } };
+    _ = e_lit;
+    _ = e_path;
+    _ = e_block;
+    _ = e_unit;
+    _ = e_if;
+    _ = e_if_let;
+    _ = e_match;
+    _ = e_loop;
+    _ = e_while;
+    _ = e_for;
+    _ = e_break;
+    _ = e_cont;
+    _ = e_call;
+    _ = e_mc;
+    _ = e_struct;
+    _ = e_enum;
+    _ = e_field;
+    _ = e_index;
+    _ = e_bin;
+    _ = e_unary;
+    _ = e_assign;
+    _ = e_try;
+    _ = e_ret;
+    _ = e_unsup;
     // closure / iterator_chain exercised in deferred test.
 }
 
 test "exprs — every PatternKind / StatementKind variant compiles" {
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     // §2 — Binding + BindMode (all three modes — consumed by patterns below)
     const bind_val: Binding = .{ .name = "x", .mode = .{ .value = {} }, .mutable = false };
@@ -831,18 +854,84 @@ test "exprs — every PatternKind / StatementKind variant compiles" {
     // §2 — every PatternKind arm (consumed by final _ = block)
     const pat_wild: Pattern = .{ .id = 1, .span = span, .ty = null, .kind = .{ .wildcard = {} } };
     const pat_bind: Pattern = .{ .id = 2, .span = span, .ty = null, .kind = .{ .binding = bind_val } };
-    const pat_lit: Pattern = .{ .id = 3, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null } } } };
-    const pat_path: Pattern = .{ .id = 4, .span = span, .ty = null, .kind = .{ .path = .{ .def = 10, .variant = "A" } } };
-    const pat_path_unit: Pattern = .{ .id = 5, .span = span, .ty = null, .kind = .{ .path = .{ .def = 11, .variant = null } } };
-    const pat_tuple: Pattern = .{ .id = 6, .span = span, .ty = null, .kind = .{ .tuple = .{ .elements = &.{1}, .rest = false } } };
-    const pat_tuple_rest: Pattern = .{ .id = 7, .span = span, .ty = null, .kind = .{ .tuple = .{ .elements = &.{}, .rest = true } } };
-    const pat_slice: Pattern = .{ .id = 8, .span = span, .ty = null, .kind = .{ .slice = .{ .elements = &.{2}, .rest = null } } };
-    const pat_slice_rest: Pattern = .{ .id = 9, .span = span, .ty = null, .kind = .{ .slice = .{ .elements = &.{}, .rest = 3 } } };
-    const pat_struct: Pattern = .{ .id = 10, .span = span, .ty = null, .kind = .{ .struct_pat = .{ .def = 12, .fields = &.{.{ .field = "x", .pat = 4, .shorthand = true }}, .rest = false } } };
-    const pat_ref: Pattern = .{ .id = 11, .span = span, .ty = null, .kind = .{ .reference = .{ .mode = .{ .shared_ref = {} }, .inner = 1 } } };
-    const pat_or: Pattern = .{ .id = 12, .span = span, .ty = null, .kind = .{ .@"or" = .{ .alternatives = &.{ 1, 2 } } } };
-    const pat_range: Pattern = .{ .id = 13, .span = span, .ty = null, .kind = .{ .range = .{ .lo = 5, .hi = 6, .inclusive = true } } };
-    const pat_range_open: Pattern = .{ .id = 14, .span = span, .ty = null, .kind = .{ .range = .{ .lo = null, .hi = null, .inclusive = false } } };
+    const pat_lit: Pattern = .{
+        .id = 3,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null } } },
+    };
+    const pat_path: Pattern = .{
+        .id = 4,
+        .span = span,
+        .ty = null,
+        .kind = .{ .path = .{ .def = 10, .variant = "A" } },
+    };
+    const pat_path_unit: Pattern = .{
+        .id = 5,
+        .span = span,
+        .ty = null,
+        .kind = .{ .path = .{ .def = 11, .variant = null } },
+    };
+    const pat_tuple: Pattern = .{
+        .id = 6,
+        .span = span,
+        .ty = null,
+        .kind = .{ .tuple = .{ .elements = &.{1}, .rest = false } },
+    };
+    const pat_tuple_rest: Pattern = .{
+        .id = 7,
+        .span = span,
+        .ty = null,
+        .kind = .{ .tuple = .{ .elements = &.{}, .rest = true } },
+    };
+    const pat_slice: Pattern = .{
+        .id = 8,
+        .span = span,
+        .ty = null,
+        .kind = .{ .slice = .{ .elements = &.{2}, .rest = null } },
+    };
+    const pat_slice_rest: Pattern = .{
+        .id = 9,
+        .span = span,
+        .ty = null,
+        .kind = .{ .slice = .{ .elements = &.{}, .rest = 3 } },
+    };
+    const pat_struct: Pattern = .{
+        .id = 10,
+        .span = span,
+        .ty = null,
+        .kind = .{
+            .struct_pat = .{
+                .def = 12,
+                .fields = &.{.{ .field = "x", .pat = 4, .shorthand = true }},
+                .rest = false,
+            },
+        },
+    };
+    const pat_ref: Pattern = .{
+        .id = 11,
+        .span = span,
+        .ty = null,
+        .kind = .{ .reference = .{ .mode = .{ .shared_ref = {} }, .inner = 1 } },
+    };
+    const pat_or: Pattern = .{
+        .id = 12,
+        .span = span,
+        .ty = null,
+        .kind = .{ .@"or" = .{ .alternatives = &.{ 1, 2 } } },
+    };
+    const pat_range: Pattern = .{
+        .id = 13,
+        .span = span,
+        .ty = null,
+        .kind = .{ .range = .{ .lo = 5, .hi = 6, .inclusive = true } },
+    };
+    const pat_range_open: Pattern = .{
+        .id = 14,
+        .span = span,
+        .ty = null,
+        .kind = .{ .range = .{ .lo = null, .hi = null, .inclusive = false } },
+    };
     _ = pat_wild;
     _ = pat_bind;
     _ = pat_lit;
@@ -901,8 +990,8 @@ test "exprs — every PatternKind / StatementKind variant compiles" {
 }
 
 test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter) compiles" {
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
-    const block = BlockExpr{ .statements = &.{}, .tail = null, .labelled = null };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const block: BlockExpr = .{ .statements = &.{}, .tail = null, .labelled = null };
 
     // ClosureTrait (all three)
     const ct_fn: ClosureTrait = .@"fn";
@@ -961,6 +1050,8 @@ test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter
     _ = ik_adapter;
 
     // Wrap closure & iterator_chain in their Expr arms
-    _ = Expr{ .id = 30, .span = span, .ty = null, .kind = .{ .closure = closure } };
-    _ = Expr{ .id = 31, .span = span, .ty = null, .kind = .{ .iterator_chain = chain } };
+    const e_closure: Expr = .{ .id = 30, .span = span, .ty = null, .kind = .{ .closure = closure } };
+    const e_chain: Expr = .{ .id = 31, .span = span, .ty = null, .kind = .{ .iterator_chain = chain } };
+    _ = e_closure;
+    _ = e_chain;
 }

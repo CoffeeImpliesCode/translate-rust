@@ -157,6 +157,7 @@ pub const CrateGraph = struct {
 
         if (self.sidecar) |s| a.free(s);
         if (self.toolchain) |t| a.free(t);
+        self.* = undefined;
     }
 
     pub fn addCrate(self: *CrateGraph, c: Crate) !void {
@@ -204,8 +205,8 @@ pub const CrateGraph = struct {
     /// refinement (this honors the surface walk's minimal contract).
     pub fn exportedSurface(
         self: *const CrateGraph,
-        mod_id: spine.EntityId,
         allocator: std.mem.Allocator,
+        mod_id: spine.EntityId,
     ) ![]spine.EntityId {
         const m = self.module(mod_id) orelse return error.UnknownModule;
         var out: std.ArrayListUnmanaged(spine.EntityId) = .empty;
@@ -235,7 +236,7 @@ test "addModule assigns dense ids mirroring the symbol table" {
     const allocator = std.testing.allocator;
     var g = CrateGraph.init(allocator);
     defer g.deinit();
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     const id0 = try g.addModule(.{
         .id = 0,
@@ -270,7 +271,7 @@ test "exportedSurface collects only public items" {
     const allocator = std.testing.allocator;
     var g = CrateGraph.init(allocator);
     defer g.deinit();
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     const foo_name = try allocator.dupe(u8, "foo");
     const bar_name = try allocator.dupe(u8, "bar");
@@ -312,7 +313,7 @@ test "exportedSurface collects only public items" {
         .attributes = &.{},
     });
 
-    const surface = try g.exportedSurface(root_id, allocator);
+    const surface = try g.exportedSurface(allocator, root_id);
     defer allocator.free(surface);
     try std.testing.expectEqual(@as(usize, 1), surface.len);
     try std.testing.expectEqual(foo_id, surface[0]);

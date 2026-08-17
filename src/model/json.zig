@@ -22,11 +22,6 @@ const items = @import("items.zig");
 const types = @import("types.zig");
 const exprs = @import("exprs.zig");
 
-// Keep json.zig compiling against the emit module (emit.zig → json.zig is a
-// one-way edge; this side-effect import closes the ring without any comptime
-// type dependency, so the cycle resolves lazily).
-const _ = @import("emit.zig");
-
 const Json = std.json.Value;
 const ObjectMap = std.json.ObjectMap; // unmanaged (allocator passed per call)
 const Array = std.json.Array; // managed (init(allocator))
@@ -243,7 +238,14 @@ fn decodeUseDecl(allocator: std.mem.Allocator, v: Json) !graph.UseDecl {
     const o = try getObj(v);
     const kind_str = try reqStr(o, "kind");
     const target: spine.EntityId = @intCast(try reqU32(o, "target"));
-    const kind: graph.UseKind = if (std.mem.eql(u8, kind_str, "plain")) .{ .plain = target } else if (std.mem.eql(u8, kind_str, "alias")) .{ .alias = target } else if (std.mem.eql(u8, kind_str, "glob")) .glob else return error.BadWireFormat;
+    const kind: graph.UseKind = if (std.mem.eql(u8, kind_str, "plain"))
+        .{ .plain = target }
+    else if (std.mem.eql(u8, kind_str, "alias"))
+        .{ .alias = target }
+    else if (std.mem.eql(u8, kind_str, "glob"))
+        .glob
+    else
+        return error.BadWireFormat;
     return .{
         .id = @intCast(try reqU32(o, "id")),
         .kind = kind,
@@ -325,8 +327,16 @@ fn decodeIdList(allocator: std.mem.Allocator, v: Json) ![]const exprs.NodeId {
 fn decodeIntLit(allocator: std.mem.Allocator, v: Json) !exprs.IntLit {
     const o = try getObj(v);
     const base_s = try reqStr(o, "base");
-    const base: @FieldType(exprs.IntLit, "base") =
-        if (std.mem.eql(u8, base_s, "dec")) .dec else if (std.mem.eql(u8, base_s, "hex")) .hex else if (std.mem.eql(u8, base_s, "oct")) .oct else if (std.mem.eql(u8, base_s, "bin")) .bin else return error.BadWireFormat;
+    const base: @FieldType(exprs.IntLit, "base") = if (std.mem.eql(u8, base_s, "dec"))
+        .dec
+    else if (std.mem.eql(u8, base_s, "hex"))
+        .hex
+    else if (std.mem.eql(u8, base_s, "oct"))
+        .oct
+    else if (std.mem.eql(u8, base_s, "bin"))
+        .bin
+    else
+        return error.BadWireFormat;
     const value: i128 = std.fmt.parseInt(i128, try reqStr(o, "value"), 10) catch return error.BadWireFormat;
     const suffix = try optStr(o, "ty_suffix");
     return .{
@@ -792,8 +802,18 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
                 .operand = try reqU32(q, "operand"),
             } };
         }
+        const unary_op: @FieldType(exprs.UnaryExpr, "op") = if (std.mem.eql(u8, op, "negate"))
+            .negate
+        else if (std.mem.eql(u8, op, "logical_not"))
+            .logical_not
+        else if (std.mem.eql(u8, op, "bit_not"))
+            .bit_not
+        else if (std.mem.eql(u8, op, "deref"))
+            .deref
+        else
+            return error.BadWireFormat;
         return .{ .unary = .{
-            .op = if (std.mem.eql(u8, op, "negate")) .negate else if (std.mem.eql(u8, op, "logical_not")) .logical_not else if (std.mem.eql(u8, op, "bit_not")) .bit_not else if (std.mem.eql(u8, op, "deref")) .deref else return error.BadWireFormat,
+            .op = unary_op,
             .operand = try reqU32(q, "operand"),
         } };
     }
@@ -1163,15 +1183,15 @@ pub fn parseFull(allocator: std.mem.Allocator, bytes: []const u8) !FullModel {
 // Encode helpers (build a Json value tree owned by `allocator`)
 // ---------------------------------------------------------------------------
 
-fn freeValue(v: *Json, allocator: std.mem.Allocator) void {
+fn freeValue(allocator: std.mem.Allocator, v: *Json) void {
     switch (v.*) {
         .object => |*o| {
             var it = o.iterator();
-            while (it.next()) |entry| freeValue(entry.value_ptr, allocator);
+            while (it.next()) |entry| freeValue(allocator, entry.value_ptr);
             o.deinit(allocator);
         },
         .array => |*ar| {
-            for (ar.items) |*item| freeValue(item, allocator);
+            for (ar.items) |*item| freeValue(allocator, item);
             ar.deinit();
         },
         else => {},
@@ -2092,9 +2112,8 @@ fn encodeRoot(
         try root_map.put(allocator, "bodies", try encodeBodies(allocator, b));
     }
 
-    var root_val = Json{ .object = root_map };
-    defer freeValue(&root_val, allocator);
-
+    var root_val: Json = .{ .object = root_map };
+    defer freeValue(allocator, &root_val);
     // Zig 0.16: std.json.stringify was replaced by Stringify.valueAlloc, which
     // owns and returns a []u8 buffer to be freed with the passed allocator.
     return std.json.Stringify.valueAlloc(allocator, root_val, .{});

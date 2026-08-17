@@ -9,6 +9,7 @@ pub const spine = @import("spine.zig");
 pub const graph = @import("graph.zig");
 pub const json = @import("json.zig");
 pub const emit = @import("emit.zig");
+pub const package = @import("package.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -17,4 +18,5 @@ test {
     _ = @import("emit.zig");
     _ = @import("emit_fnv_test.zig");
     _ = @import("emit_hex_test.zig");
+    _ = @import("package.zig");
 }

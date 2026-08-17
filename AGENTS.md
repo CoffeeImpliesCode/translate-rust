@@ -145,10 +145,10 @@ Use `edit`/`write` for all file changes — NEVER patch files with inline python
 ## Verification
 
 Before claiming completion:
-1. Run project's gates: `zig fmt --check .`, `zig build`, `zig build test`, `zlint` (or `gate`)
-2. Fix introduced errors
-3. Run formatter
-4. If a fix introduces new errors, retry — **stop after 3 attempts** and ask
+1. Always run the `gate` bash command as the required correctness gate: `gate` (runs `fmt --check`, `build`, `test`, `ast-check`, `ziglint`, `zlint`; `zbc` advisory).
+2. Fix introduced errors.
+3. Run formatter (`zig fmt`).
+4. If a fix introduces new errors, retry — **stop after 3 attempts** and ask.
 
 ### Scope Discipline
 

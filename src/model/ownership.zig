@@ -224,7 +224,7 @@ test "ownership — every enum variant compiles" {
 }
 
 test "ownership — every struct compiles" {
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     // Ownership (every ValueKind + optional owner)
     const own_move: Ownership = .{ .kind = .move, .owner = 1, .moved_across_boundary = false, .span = span };

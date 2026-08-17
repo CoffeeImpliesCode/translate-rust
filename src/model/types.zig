@@ -5,7 +5,6 @@
 //! Self-reference is bounded by `*const Type` / `[]const Type` (known-size), so
 //! `Type` is well-defined as a recursive tagged union.
 
-const std = @import("std");
 const spine = @import("spine.zig");
 
 /// §4 — The type tagged union every field/param/return references.

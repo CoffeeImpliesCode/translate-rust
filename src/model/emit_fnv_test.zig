@@ -49,6 +49,7 @@ const Model = struct {
         }
         allocator.free(self.bodies.bodies);
         self.g.deinit();
+        self.* = undefined;
     }
 };
 
@@ -100,7 +101,7 @@ fn buildFnvModel(allocator: std.mem.Allocator) !*Model {
     const m = try allocator.create(Model);
     errdefer allocator.destroy(m);
 
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     // ── CrateGraph ──────────────────────────────────────────────────────
     var g = graph.CrateGraph.init(allocator);
@@ -230,11 +231,11 @@ fn buildFnvModel(allocator: std.mem.Allocator) !*Model {
     // ── Types table ─────────────────────────────────────────────────────
     // 0 = u64, 1 = []const u8
 
-    const u64_type = types.Type{ .prim = .u64 };
+    const u64_type: types.Type = .{ .prim = .u64 };
 
     const slice_ptr = try allocator.create(types.Slice);
     slice_ptr.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
-    const byte_slice_type = types.Type{ .slice = slice_ptr };
+    const byte_slice_type: types.Type = .{ .slice = slice_ptr };
 
     const types_store = try allocator.alloc(types.Type, 2);
     types_store[0] = u64_type;

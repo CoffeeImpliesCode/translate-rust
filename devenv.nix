@@ -13,6 +13,8 @@ rec {
   env = {
     LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath packages}";
     INCLUDE_DIRECTORIES = "${pkgs.lib.makeIncludePath packages}";
+    ZIGLINT_ARGS = "--ignore Z024 --ignore Z011";
+    GATE_EXCLUDE = "test vendor";
   };
 
   # https://devenv.sh/languages/

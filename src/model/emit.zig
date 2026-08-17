@@ -34,10 +34,6 @@ const types = @import("types.zig");
 const json = @import("json.zig");
 const exprs = @import("exprs.zig");
 
-// The body-aware golden test is a sibling file; pulling it in here keeps
-// `zig build test` aware of it without editing build.zig or root.zig.
-const _ = @import("emit_fnv_test.zig");
-
 // ── P3 body data structures ───────────────────────────────────────────────
 
 /// Body of a `const` declaration (type + init expression).
@@ -66,6 +62,54 @@ pub fn emitRich(
     bodies: *const Bodies,
 ) ![]u8 {
     return emitImpl(allocator, g, bodies);
+}
+/// Translate a single module into Zig source text for multi-file package output.
+/// Child file/directory modules are emitted as `@import("<name>.zig")` statements.
+pub fn emitModuleFile(
+    allocator: std.mem.Allocator,
+    g: *const graph.CrateGraph,
+    bodies: ?*const Bodies,
+    mod_id: spine.EntityId,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    const m = g.module(mod_id) orelse return buf.toOwnedSlice(allocator);
+
+    // 1. Emit submodule imports for child modules that are files or directories.
+    for (m.items) |item_id| {
+        const e = g.symbol_table.get(item_id) orelse continue;
+        if (e.kind == .module) {
+            if (g.module(e.id)) |child_m| {
+                if (child_m.kind == .file or child_m.kind == .directory) {
+                    const child_name = if (child_m.name.len > 0) child_m.name else e.name;
+                    if (child_name.len > 0) {
+                        try buf.appendSlice(allocator, "pub const ");
+                        try emitIdent(allocator, &buf, child_name);
+                        try buf.appendSlice(allocator, " = @import(\"");
+                        try buf.appendSlice(allocator, child_name);
+                        try buf.appendSlice(allocator, ".zig\");\n");
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Emit this module's own items.
+    for (m.items) |item_id| {
+        const e = g.symbol_table.get(item_id) orelse continue;
+        if (e.kind == .module) {
+            if (g.module(e.id)) |child_m| {
+                if (child_m.kind == .file or child_m.kind == .directory) {
+                    // Handled as import above; do not duplicate items inline.
+                    continue;
+                }
+            }
+        }
+        try emitEntity(allocator, &buf, g, e, bodies);
+    }
+
+    return buf.toOwnedSlice(allocator);
 }
 /// Format a Zig source buffer canonically using std.zig.Ast (identical to `zig fmt`).
 /// If there are syntax errors (e.g. placeholder comments), returns a copy of `source`.
@@ -688,7 +732,7 @@ test "emit fnv golden" {
 
 test "emit: dispatches every EntityKind without crashing" {
     const allocator = std.testing.allocator;
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
     var g = graph.CrateGraph.init(allocator);
     defer g.deinit();
@@ -809,7 +853,7 @@ test "emit: keyword escaping and renamed_to" {
     var g = graph.CrateGraph.init(allocator);
     defer g.deinit();
 
-    const span = spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
     const root_id = try g.addModule(.{
         .id = 0,
         .kind = .root,
@@ -877,5 +921,7 @@ test "formatZig: formats unformatted valid Zig into canonical style" {
     const formatted = try formatZig(allocator, unformatted);
     defer allocator.free(formatted);
 
-    try std.testing.expect(std.mem.indexOf(u8, formatted, "pub fn add(a: u64, b: u64) u64 {\n    return a + b;\n}") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, formatted, "pub fn add(a: u64, b: u64) u64 {\n    return a + b;\n}") != null,
+    );
 }
