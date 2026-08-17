@@ -15,4 +15,5 @@ test {
     _ = @import("graph.zig"); // include graph + json + emit test blocks
     _ = @import("json.zig");
     _ = @import("emit.zig");
+    _ = @import("emit_fnv_test.zig");
 }

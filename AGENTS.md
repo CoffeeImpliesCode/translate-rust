@@ -41,6 +41,14 @@ Adhere to **Tiger Style** (TigerBeetle's Zig coding guidelines), which applies N
 - **Assertions** — at least 2 assertions per function. Every function documents its invariants.
 - **Static allocation preferred** — no dynamic allocation in hot paths. Know where every byte comes from.
 - **Explicit error handling** — every error must be handled or explicitly propagated. Never `catch unreachable` without justification.
+### Test-Driven Development (TDD)
+
+The translate-rust project runs on TDD as the default workflow (project-wide preference, 2026-08-17):
+
+- For any new, observable behavior, write the **failing test first**, observe it fail (red), then implement the smallest change to satisfy it (green), then refactor.
+- **Golden-file tests** (assert the output matches a checked-in expected file byte-for-byte or structurally) are an explicit, encouraged TDD pattern for this project — they define the emitter's expected Zig output, the sidecar's wire format, and the analyzer's normalized output. Existing golden examples: `src/fixtures/model/mini.json` / `mini-rustdoc.json` (P1), `src/fixtures/model/fnv.{json,zig}` (P2).
+- Pre-emptively read the existing test infrastructure (`zig build test`, the model module's `@import` test inclusion idiom, the `std.testing.io` + `Dir.cwd` runtime file-read pattern) before designing new tests — match the house style.
+- When the task is design without immediate code, the design doc itself is the test artifact for the next phase (e.g. `notes/design/data-model.md`); subsequent phases gate on it.
 
 ## Agent Identity
 

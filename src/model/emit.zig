@@ -1,4 +1,4 @@
-//! translate_rust.emit — P2 item-level emitter: translate a `CrateGraph`
+//! translate_rust.emit — P2/P3 item-level emitter: translate a `CrateGraph`
 //! into Zig source text.
 //!
 //! Scope (P2, deferred work called out explicitly):
@@ -6,11 +6,10 @@
 //!                  (no field lowering; type bodies are P3)
 //!   * `enum_`    → `pub const Name = enum(u8) { // unsupported: enum Name };`
 //!                  (C-like; data-carrying variants are P3)
-//!   * `fn_`      → `pub fn name() void { // body not yet lowered }`.
-//!                  The wire format does not carry params/return, so the
-//!                  signature is intentionally a placeholder. P3 will fill in.
-//!   * `const_`   → `pub const NAME: void = // init not yet lowered\n;`.
-//!                  Wire has no type or init; P3 will fill in.
+//!   * `fn_`      → `pub fn name() void { // body not yet lowered }` (no bodies)
+//!                  With bodies: `pub fn name(params) ret { block }`.
+//!   * `const_`   → `pub const NAME: void = // init not yet lowered\n;` (no bodies)
+//!                  With bodies: `pub const NAME: ty = init;`.
 //!   * `use_`     → `pub const local = target_name;` (pub iff `is_pub_export`),
 //!                  resolved through the symbol table.
 //!   * `module`   → a `// module: <name>` banner then the module's items.
@@ -33,25 +32,89 @@ const graph = @import("graph.zig");
 const items = @import("items.zig");
 const types = @import("types.zig");
 const json = @import("json.zig");
+const exprs = @import("exprs.zig");
 
-/// Translate `g` into Zig source text. The returned slice is owned by the
+// The body-aware golden test is a sibling file; pulling it in here keeps
+// `zig build test` aware of it without editing build.zig or root.zig.
+const _ = @import("emit_fnv_test.zig");
+
+// ── P3 body data structures ───────────────────────────────────────────────
+
+/// Body of a `const` declaration (type + init expression).
+pub const ConstBody = struct {
+    ty: types.Type,
+    init: exprs.NodeId,
+};
+
+/// Body of a function (params + return type + block expression).
+pub const FnBody = struct {
+    params: []const items.Param,
+    ret: types.Type,
+    /// Expr-table index of the fn body block.
+    body: exprs.NodeId,
+};
+
+/// Per-entity body selector. Indexed by spine.EntityId.
+pub const BodyKind = union(enum) {
+    none,
+    const_: ConstBody,
+    fn_: FnBody,
+};
+
+/// Augmented model carrying expression-level data alongside the spine-level
+/// `CrateGraph`.  Required by `emitRich`; the plain `emit()` path ignores
+/// bodies and falls back to placeholder text.
+pub const Bodies = struct {
+    exprs: []const exprs.Expr,
+    stmts: []const exprs.Statement,
+    pats: []const exprs.Pattern,
+    types: []const types.Type,
+    /// Sparse: `bodies[entity_id]` → `.none` when the entity has no body.
+    bodies: []const BodyKind,
+};
+
+// ── Public entry points ───────────────────────────────────────────────────
+
+/// Translate `g` into Zig source text.  The returned slice is owned by the
 /// caller and must be freed with `allocator`.
 pub fn emit(allocator: std.mem.Allocator, g: *const graph.CrateGraph) ![]u8 {
+    return emitImpl(allocator, g, null);
+}
+
+/// Translate `g` into Zig source text with full body lowering.
+/// `bodies` carries per-entity body data (expressions, statements, types)
+/// so that `const` and `fn` items emit their actual Zig rather than placeholders.
+pub fn emitRich(
+    allocator: std.mem.Allocator,
+    g: *const graph.CrateGraph,
+    bodies: *const Bodies,
+) ![]u8 {
+    return emitImpl(allocator, g, bodies);
+}
+
+fn emitImpl(
+    allocator: std.mem.Allocator,
+    g: *const graph.CrateGraph,
+    bodies: ?*const Bodies,
+) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     for (g.crates.items) |c| {
-        try emitModule(allocator, &buf, g, c.root);
+        try emitModule(allocator, &buf, g, c.root, bodies);
     }
 
     return buf.toOwnedSlice(allocator);
 }
+
+// ── Module / entity dispatch ──────────────────────────────────────────────
 
 fn emitModule(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     g: *const graph.CrateGraph,
     mod_id: spine.EntityId,
+    bodies: ?*const Bodies,
 ) !void {
     const m = g.module(mod_id) orelse return;
 
@@ -65,7 +128,7 @@ fn emitModule(
 
     for (m.items) |item_id| {
         const e = g.symbol_table.get(item_id) orelse continue;
-        try emitEntity(allocator, buf, g, e);
+        try emitEntity(allocator, buf, g, e, bodies);
     }
 }
 
@@ -74,14 +137,13 @@ fn emitEntity(
     buf: *std.ArrayListUnmanaged(u8),
     g: *const graph.CrateGraph,
     e: spine.Entity,
+    bodies: ?*const Bodies,
 ) !void {
     const pub_ = visPrefix(e.visibility);
 
     switch (e.kind) {
         .module => {
-            // Recurse into the submodule's items. (Caller emits the banner
-            // through the parent; here we only walk children.) Skip the
-            // crate-root module — `emit` already walks it via `c.root`.
+            // Recurse into the submodule's items.
             if (g.module(e.id)) |m| {
                 if (m.name.len > 0) {
                     try buf.appendSlice(allocator, "// module: ");
@@ -90,7 +152,7 @@ fn emitEntity(
                 }
                 for (m.items) |child_id| {
                     const child = g.symbol_table.get(child_id) orelse continue;
-                    try emitEntity(allocator, buf, g, child);
+                    try emitEntity(allocator, buf, g, child, bodies);
                 }
             }
         },
@@ -111,12 +173,23 @@ fn emitEntity(
             try buf.appendSlice(allocator, "\n};\n");
         },
         .fn_ => {
-            // Wire carries no params/return. P3 will replace this placeholder
-            // with the lowered signature; P2 keeps the structural shape so
-            // downstream passes (linker, type checker) can be exercised.
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "fn ");
             try buf.appendSlice(allocator, e.name);
+            // P3: emit real signature + body when available.
+            if (bodies) |bb| {
+                if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
+                    .fn_ => |fb| {
+                        try emitFnSignature(allocator, buf, fb.params, fb.ret);
+                        try buf.append(allocator, ' ');
+                        try emitExpr(allocator, buf, g, bb, fb.body, 1);
+                        try buf.append(allocator, '\n');
+                        return;
+                    },
+                    else => {},
+                };
+            }
+            // Fallback: P2 placeholder signature.
             try buf.appendSlice(allocator, "() void {\n");
             try buf.appendSlice(allocator, "    // body not yet lowered\n");
             try buf.append(allocator, '}');
@@ -126,6 +199,21 @@ fn emitEntity(
             try buf.appendSlice(allocator, pub_);
             try buf.appendSlice(allocator, "const ");
             try buf.appendSlice(allocator, e.name);
+            // P3: emit real type + init when available.
+            if (bodies) |bb| {
+                if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
+                    .const_ => |cb| {
+                        try buf.appendSlice(allocator, ": ");
+                        try emitType(allocator, buf, cb.ty);
+                        try buf.appendSlice(allocator, " = ");
+                        try emitExpr(allocator, buf, g, bb, cb.init, 0);
+                        try buf.appendSlice(allocator, ";\n");
+                        return;
+                    },
+                    else => {},
+                };
+            }
+            // Fallback: P2 placeholder.
             try buf.appendSlice(allocator, ": void = // init not yet lowered\n");
             try buf.append(allocator, ';');
             try buf.append(allocator, '\n');
@@ -163,6 +251,303 @@ fn emitEntity(
     }
 }
 
+// ── P3 body emission helpers ──────────────────────────────────────────────
+
+fn writeIndent(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), depth: u32) !void {
+    var i: u32 = 0;
+    while (i < depth) : (i += 1) {
+        try buf.appendSlice(allocator, "    ");
+    }
+}
+
+fn primName(p: types.Prim) []const u8 {
+    return switch (p) {
+        .i8 => "i8",
+        .i16 => "i16",
+        .i32 => "i32",
+        .i64 => "i64",
+        .i128 => "i128",
+        .u8 => "u8",
+        .u16 => "u16",
+        .u32 => "u32",
+        .u64 => "u64",
+        .u128 => "u128",
+        .isize => "isize",
+        .usize => "usize",
+        .f32 => "f32",
+        .f64 => "f64",
+        .bool => "bool",
+        .char => "u21",
+        .unit => "void",
+        .never => "noreturn",
+    };
+}
+
+fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: types.Type) !void {
+    switch (ty) {
+        .prim => |p| try buf.appendSlice(allocator, primName(p)),
+        .slice => |s| {
+            try buf.appendSlice(allocator, "[]");
+            if (s.const_) try buf.appendSlice(allocator, "const ");
+            try emitType(allocator, buf, s.elem);
+        },
+        .path => |p| {
+            for (p.segments, 0..) |seg, i| {
+                if (i > 0) try buf.append(allocator, '.');
+                try buf.appendSlice(allocator, seg.name);
+            }
+        },
+        .reference => |r| {
+            if (r.mut) {
+                try buf.appendSlice(allocator, "*");
+            } else {
+                try buf.appendSlice(allocator, "*const ");
+            }
+            try emitType(allocator, buf, r.pointee);
+        },
+        else => try buf.appendSlice(allocator, "/* unsupported type */"),
+    }
+}
+
+fn emitPattern(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    b: *const Bodies,
+    pat_id: exprs.NodeId,
+) !void {
+    const p = b.pats[pat_id];
+    switch (p.kind) {
+        .binding => |bd| try buf.appendSlice(allocator, bd.name),
+        .wildcard => try buf.append(allocator, '_'),
+        else => try buf.append(allocator, '_'),
+    }
+}
+
+fn emitExpr(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    expr_id: exprs.NodeId,
+    depth: u32,
+) anyerror!void {
+    const e = b.exprs[expr_id];
+    switch (e.kind) {
+        .literal => |lit| switch (lit) {
+            .int => |i| try buf.appendSlice(allocator, i.text),
+            .string => |s| {
+                try buf.append(allocator, '"');
+                try buf.appendSlice(allocator, s.bytes);
+                try buf.append(allocator, '"');
+            },
+            .boolean => |v| try buf.appendSlice(allocator, if (v) "true" else "false"),
+            else => try buf.appendSlice(allocator, "/* unsupported literal */"),
+        },
+        .path => |pe| {
+            if (g.symbol_table.get(pe.def)) |ent| {
+                try buf.appendSlice(allocator, ent.name);
+            } else {
+                try buf.appendSlice(allocator, "/* unknown path */");
+            }
+        },
+        .block => |blk| try emitBlock(allocator, buf, g, b, blk, depth),
+        .unit => {},
+        .return_ => |ret| {
+            // Semicolon is added by the calling context (emitStmt or
+            // emitBlock tail), so return_ only emits the bare `return [val]`.
+            try buf.appendSlice(allocator, "return");
+            if (ret.value) |vid| {
+                try buf.append(allocator, ' ');
+                try emitExpr(allocator, buf, g, b, vid, depth);
+            }
+        },
+        .assign => |asgn| {
+            try emitExpr(allocator, buf, g, b, asgn.target, depth);
+            try buf.append(allocator, ' ');
+            try buf.appendSlice(allocator, assignOpString(asgn.op, asgn.overflow));
+            try buf.append(allocator, ' ');
+            try emitExpr(allocator, buf, g, b, asgn.value, depth);
+        },
+        .for_ => |fe| {
+            try buf.appendSlice(allocator, "for (");
+            try emitExpr(allocator, buf, g, b, fe.iterable, depth);
+            try buf.appendSlice(allocator, ") |");
+            try emitPattern(allocator, buf, b, fe.pattern);
+            try buf.appendSlice(allocator, "| ");
+            try emitBlock(allocator, buf, g, b, fe.body, depth + 1);
+        },
+        .binary => |be| {
+            try emitExpr(allocator, buf, g, b, be.lhs, depth);
+            try buf.append(allocator, ' ');
+            try buf.appendSlice(allocator, binaryOpString(be.op, be.overflow));
+            try buf.append(allocator, ' ');
+            try emitExpr(allocator, buf, g, b, be.rhs, depth);
+        },
+        else => try buf.appendSlice(allocator, "/* unsupported expr */"),
+    }
+}
+
+fn emitStmt(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    stmt_id: exprs.NodeId,
+    depth: u32,
+) !void {
+    const s = b.stmts[stmt_id];
+    switch (s.kind) {
+        .let => |ls| {
+            try writeIndent(allocator, buf, depth);
+            const pat = b.pats[ls.pattern];
+            const mutable = switch (pat.kind) {
+                .binding => |bd| bd.mutable,
+                else => false,
+            };
+            try buf.appendSlice(allocator, if (mutable) "var " else "const ");
+            try emitPattern(allocator, buf, b, ls.pattern);
+            if (ls.ty) |ty_id| {
+                try buf.appendSlice(allocator, ": ");
+                try emitType(allocator, buf, b.types[ty_id]);
+            }
+            if (ls.init) |init_id| {
+                try buf.appendSlice(allocator, " = ");
+                try emitExpr(allocator, buf, g, b, init_id, depth);
+            }
+            try buf.appendSlice(allocator, ";\n");
+        },
+        .expr => |eid| {
+            try writeIndent(allocator, buf, depth);
+            try emitExpr(allocator, buf, g, b, eid, depth);
+            // Control-flow exprs (for, while, if, …) are used as statements
+            // without a trailing `;` in Zig; value expressions require one.
+            const needs_semi = switch (b.exprs[eid].kind) {
+                .for_, .while_, .loop_, .if_else, .if_let, .match, .block => false,
+                else => true,
+            };
+            if (needs_semi) try buf.append(allocator, ';');
+            try buf.append(allocator, '\n');
+        },
+        .item => {
+            try writeIndent(allocator, buf, depth);
+            try buf.appendSlice(allocator, "// unsupported: nested item in statement position");
+            try buf.append(allocator, '\n');
+        },
+        .let_else => {
+            try writeIndent(allocator, buf, depth);
+            try buf.appendSlice(allocator, "// unsupported: let-else");
+            try buf.append(allocator, '\n');
+        },
+    }
+}
+
+/// Emit block contents (statements + optional tail) without the outer braces.
+/// Used when the caller already opened `{` (e.g. the fn_ emit path).
+fn emitBlockBody(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    block: exprs.BlockExpr,
+    depth: u32,
+) !void {
+    for (block.statements) |sid| {
+        try emitStmt(allocator, buf, g, b, sid, depth);
+    }
+    if (block.tail) |tid| {
+        try writeIndent(allocator, buf, depth);
+        try emitExpr(allocator, buf, g, b, tid, depth);
+        // Tail expressions always need `;` (return already handled via
+        // emitStmt or emitBlock context — here we add unconditionally for
+        // non-control-flow tails, which is the common case for value tails).
+        const kind = b.exprs[tid].kind;
+        switch (kind) {
+            .return_ => try buf.append(allocator, ';'),
+            .for_, .while_, .loop_, .if_else, .if_let, .match, .block => {},
+            else => try buf.append(allocator, ';'),
+        }
+        try buf.append(allocator, '\n');
+    }
+}
+
+fn emitBlock(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    b: *const Bodies,
+    block: exprs.BlockExpr,
+    depth: u32,
+) !void {
+    if (block.statements.len == 0 and block.tail == null) {
+        try buf.appendSlice(allocator, "{}");
+        return;
+    }
+    try buf.append(allocator, '{');
+    try buf.append(allocator, '\n');
+    try emitBlockBody(allocator, buf, g, b, block, depth);
+    // Closing brace at parent indentation.
+    if (depth > 0) try writeIndent(allocator, buf, depth - 1);
+    try buf.append(allocator, '}');
+}
+
+fn emitFnSignature(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    params: []const items.Param,
+    ret: types.Type,
+) !void {
+    try buf.append(allocator, '(');
+    for (params, 0..) |p, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, p.name);
+        try buf.appendSlice(allocator, ": ");
+        try emitType(allocator, buf, p.ty);
+    }
+    try buf.appendSlice(allocator, ") ");
+    try emitType(allocator, buf, ret);
+}
+
+fn binaryOpString(op: exprs.BinaryOp, ov: exprs.Overflow) []const u8 {
+    return switch (op) {
+        .add => if (ov == .wrapping) "+%" else "+",
+        .sub => if (ov == .wrapping) "-%" else "-",
+        .mul => if (ov == .wrapping) "*%" else "*",
+        .div => if (ov == .wrapping) "/%" else "/",
+        .rem => if (ov == .wrapping) "%" else "%",
+        .bit_and => "&",
+        .bit_or => "|",
+        .bit_xor => "^",
+        .shl => "<<",
+        .shr => ">>",
+        .eq => "==",
+        .ne => "!=",
+        .lt => "<",
+        .le => "<=",
+        .gt => ">",
+        .ge => ">=",
+        .boolean_and => "and",
+        .boolean_or => "or",
+    };
+}
+
+fn assignOpString(op: exprs.AssignOp, ov: exprs.Overflow) []const u8 {
+    return switch (op) {
+        .plain => "=",
+        .add => if (ov == .wrapping) "+%=" else "+=",
+        .sub => if (ov == .wrapping) "-%=" else "-=",
+        .mul => if (ov == .wrapping) "*%=" else "*=",
+        .div => if (ov == .wrapping) "/%=" else "/=",
+        .rem => "%=",
+        .bit_and => "&=",
+        .bit_or => "|=",
+        .bit_xor => "^=",
+        .shl => "<<=",
+        .shr => ">>=",
+    };
+}
+
+// ── Vis / unsupported (unchanged from P2) ─────────────────────────────────
+
 fn visPrefix(v: spine.Visibility) []const u8 {
     return switch (v) {
         .public => "pub ",
@@ -186,16 +571,11 @@ fn unsupported(
 }
 
 // ---------------------------------------------------------------------------
-// Golden-file test
+// Test infrastructure (shared by P2 golden test and P3 golden test)
 //
-// Reads `src/fixtures/model/fnv.json` and `src/fixtures/model/fnv.zig` at
-// runtime via `std.testing.io` + `std.Io.Dir.cwd()`. `@embedFile` would
-// resolve relative to this file and could not reach `..`, which is the
-// failure mode the P1 fixture tests already worked around; mirroring that
-// pattern here keeps both tests on equal footing.
-//
-// Each open file needs its own `io_buf`: the `Reader` borrows the buffer
-// it was constructed with, so two readers cannot share storage safely.
+// Reads fixture files at runtime via `std.testing.io` + `std.Io.Dir.cwd()`.
+// `@embedFile` would resolve relative to this file and could not reach `..`,
+// which is the failure mode the P1 fixture tests already worked around.
 // ---------------------------------------------------------------------------
 
 fn readFixture(allocator: std.mem.Allocator, test_io: std.Io, path: []const u8) ![]const u8 {
@@ -243,6 +623,10 @@ fn normalize(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
     return out.toOwnedSlice(allocator);
 }
+
+// ---------------------------------------------------------------------------
+// P2 golden-file test — wire-driven (no bodies, P2 placeholder output)
+// ---------------------------------------------------------------------------
 
 test "emit fnv golden" {
     const allocator = std.testing.allocator;
@@ -307,9 +691,7 @@ test "emit: dispatches every EntityKind without crashing" {
     var g = graph.CrateGraph.init(allocator);
     defer g.deinit();
 
-    // Root module — name "" is safe because graph.deinit handles it (the
-    // JSON parser also produces "" for root modules and their deinit path
-    // handles the empty string).
+    // Root module — name "" is safe because graph.deinit handles it.
     const root_id = try g.addModule(.{
         .id = 0,
         .kind = .root,

@@ -6,7 +6,6 @@ const std = @import("std");
 
 pub const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
 pub const FNV_PRIME: u64 = 1099511628211;
-
 pub fn fnv1a_hash(data: []const u8) u64 {
     var h: u64 = FNV_OFFSET_BASIS;
     for (data) |byte| {
