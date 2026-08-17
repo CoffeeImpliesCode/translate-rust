@@ -83,6 +83,25 @@ pub fn build(b: *std.Build) void {
     translate_cmd.addArgs(&.{"--translate"});
     if (b.args) |args| translate_cmd.addArgs(args);
     translate_step.dependOn(&translate_cmd.step);
+    // ── r2z translated packages — exported as first-class Zig modules & libs ──
+    const r2z_fnv_mod = b.addModule("r2z-fnv", .{
+        .root_source_file = b.path("test/r2z-fnv.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const r2z_fletcher_mod = b.addModule("r2z-fletcher", .{
+        .root_source_file = b.path("test/r2z-fletcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    _ = r2z_fletcher_mod;
+
+    const r2z_fnv_lib = b.addLibrary(.{
+        .name = "r2z-fnv",
+        .root_module = r2z_fnv_mod,
+        .linkage = .static,
+    });
+    b.installArtifact(r2z_fnv_lib);
 
     // ── test-crates: run `zig test` on each translated crate golden ──────
     // The translated outputs (test/r2z-*.zig) carry the crate's own #[test]

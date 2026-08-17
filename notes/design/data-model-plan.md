@@ -144,7 +144,7 @@ lower yet.
   base64/percent-encoding/data-encoding (struct+Iterator+alloc), leb128 (std::io),
   itoa (sealed trait+macros), strsim/unicase (alloc). All are hex-like (partial) at best.
 
-## P4 — full integration (PIPELINE LIVE, in progress)
+## P4 — full integration (PIPELINE LIVE, 100% complete)
 Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
 - ✅ `zig build sidecar` — drives `tools/sidecar/rustdoc-json.sh` (cargo +nightly rustdoc) on the mini fixture → `zig-out/crate-mini.json`.
 - ✅ `zig build translate -- <wire-json>` — runs the CLI `--translate` on a wire-format dump.
@@ -154,7 +154,7 @@ Pipeline now runs end-to-end in-memory (fnv + hex bodies) and via the build:
 - ✅ Wire format v2 (JSON carries bodies) — `json.parseFull`/`encodeFull` decode/encode bodies; `test/fnv.json` is v2; the CLI `--translate` and positional invocation now read v2 and emit full bodies via `parseFull` → `emitRich` (previously stub-only). Bodies/`BodyKind`/`ConstBody`/`FnBody` unified into a leaf `src/model/bodies.zig` (emit.Bodies == json.Bodies; breaks the json↔emit import cycle).
 - ✅ Local-binding resolution — `test/fnv.json` includes param/local entities (`data`, `h`, `byte`) so `PathExpr.def` resolves cleanly to entity names; no `/* unknown path */`.
 - ✅ CLI teardown — `translateCrate` uses `ArenaAllocator` over `init.gpa`; zero leaks on process exit.
-- ⛳ (deferred) Link translated modules into `build.zig` as a real compiled artifact (the emitted .zig compiles standalone today; wiring it as a build step producer is a follow-up).
+- ✅ Link translated modules into `build.zig` as real compiled artifacts — `r2z-fnv` and `r2z-fletcher` exported as modules; `r2z-fnv` installed as `zig-out/lib/libr2z-fnv.a` static library.
 
 ## Verification strategy (throughout)
 - rust2zig-style: golden outputs (`test.sh`) + differential `zig test` against
