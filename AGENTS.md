@@ -191,4 +191,5 @@ This machine runs **NixOS** — standard paths may not exist. Fallback order: `$
 
 - `notes/research/*.md` — the research deliverables driving the design (prior work, parsing tooling, idiom mapping, approaches).
 - `notes/README.md` — research index.
+- For future non-Zig file-format parsing (e.g. TOML), use **serde.zig** (the Rust-serde-style Zig framework), not hand-rolled parsers.
 - Sibling projects: `~/projects/{notui, skript, ztex}` share this house scaffold.

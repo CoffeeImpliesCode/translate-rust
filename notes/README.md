@@ -43,6 +43,20 @@ Fork the rust2zig dialect baseline; v0 = reproduce.com + one example on Zig
 `research/approaches.md` §6 for the full roadmap, and its §7 / the other
 notes' §Sources for citations.
 
+## Design (data model)
+
+The next deliverable after research: the lossless semantic IR the translator
+emits Zig from. Unified reference + four axis notes + implementation plan.
+
+| Doc | Contents |
+|-----|----------|
+| [design/data-model.md](design/data-model.md) | **Unified IR design** — shared spine, node inventory, JSON boundary, v1 subset, open decisions |
+| [design/data-model/crate-graph.md](design/data-model/crate-graph.md) | Crate/module graph, visibility, paths, symbol table |
+| [design/data-model/items-types.md](design/data-model/items-types.md) | Items + types + generics/monomorphization |
+| [design/data-model/exprs-patterns.md](design/data-model/exprs-patterns.md) | Expressions, statements, patterns + Zig-lowering hooks |
+| [design/data-model/ownership-mem.md](design/data-model/ownership-mem.md) | Ownership, Drop, allocator, unsoundness markers |
+| [design/data-model-plan.md](design/data-model-plan.md) | Implementation plan (P1–P4) + v1 target crate `fnv` |
+
 ## Design-phase open questions (answered by the user, not the research)
 
 1. **dyn Trait**: synthesize a vtable struct, or exclude from v1 (rust2zig
