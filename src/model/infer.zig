@@ -23,6 +23,7 @@ const std = @import("std");
 const exprs = @import("exprs.zig");
 const bodies = @import("bodies.zig");
 const types = @import("types.zig");
+const spine = @import("spine.zig");
 const items = @import("items.zig");
 
 /// Unannotated literal class for defaulting unconstrained variables.
@@ -1246,8 +1247,7 @@ fn testPrimPath(alloc: std.mem.Allocator, name: []const u8) !types.Type {
 }
 
 // Compile-time span reused across fixtures.
-const TESTSPAN: exprs.Span = .TESTSPAN;
-
+const test_span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 test "generic PathExpr with type arguments records an instantiation" {
     const a = std.testing.allocator;
 
@@ -1263,7 +1263,7 @@ test "generic PathExpr with type arguments records an instantiation" {
     const exprs_store = try a.alloc(exprs.Expr, 1);
     exprs_store[0] = .{
         .id = 0,
-        .span = TESTSPAN,
+        .span = test_span,
         .ty = null,
         .kind = .{ .path = .{ .def = 1, .generic_args = fake_path } },
     };
@@ -1313,7 +1313,7 @@ test "generic fn call unifies argument type and records instantiation" {
     defer a.free(param.path.segments);
     const id_fn_params = try a.alloc(items.Param, 1);
     defer a.free(id_fn_params);
-    id_fn_params[0] = .{ .name = "x", .ty = param, .span = TESTSPAN };
+    id_fn_params[0] = .{ .name = "x", .ty = param, .span = test_span };
 
     // Expr table (caller body):
     // 0: block body
@@ -1326,26 +1326,26 @@ test "generic fn call unifies argument type and records instantiation" {
     stmt_ids[0] = 0;
     exprs_store[0] = .{
         .id = 0,
-        .span = TESTSPAN,
+        .span = test_span,
         .ty = null,
         .kind = .{ .block = .{ .statements = stmt_ids, .tail = null, .labelled = null } },
     };
     exprs_store[1] = .{
         .id = 1,
-        .span = TESTSPAN,
+        .span = test_span,
         .ty = null,
         .kind = .{ .literal = .{ .int = .{ .text = "5u32", .value = 5, .base = .dec, .ty_suffix = "u32" } } },
     };
     exprs_store[2] = .{
         .id = 2,
-        .span = TESTSPAN,
+        .span = test_span,
         .ty = null,
         .kind = .{ .call = .{ .call_kind = .{ .free = 1 }, .args = &.{1} } },
     };
 
     const stmts_store = try a.alloc(exprs.Statement, 1);
     defer a.free(stmts_store);
-    stmts_store[0] = .{ .id = 0, .span = TESTSPAN, .ty = null, .kind = .{ .expr = 2 } };
+    stmts_store[0] = .{ .id = 0, .span = test_span, .ty = null, .kind = .{ .expr = 2 } };
 
     const bodies_store = try a.alloc(bodies.BodyKind, 2);
     defer a.free(bodies_store);
@@ -1390,8 +1390,8 @@ test "generic struct literal records instantiation" {
     defer a.free(field_t.path.segments);
     const struct_fields = try a.alloc(items.Field, 2);
     defer a.free(struct_fields);
-    struct_fields[0] = .{ .name = "x", .ty = field_t, .visibility = .public, .span = TESTSPAN };
-    struct_fields[1] = .{ .name = "y", .ty = field_t, .visibility = .public, .span = TESTSPAN };
+    struct_fields[0] = .{ .name = "x", .ty = field_t, .visibility = .public, .span = test_span };
+    struct_fields[1] = .{ .name = "y", .ty = field_t, .visibility = .public, .span = test_span };
 
     const exprs_store = try a.alloc(exprs.Expr, 3);
     defer a.free(exprs_store);
@@ -1400,19 +1400,19 @@ test "generic struct literal records instantiation" {
     stmt_ids[0] = 0;
     exprs_store[0] = .{
         .id = 0,
-        .span = TESTSPAN,
+        .span = test_span,
         .ty = null,
         .kind = .{ .block = .{ .statements = stmt_ids, .tail = null, .labelled = null } },
     };
     exprs_store[1] = .{
         .id = 1,
-        .span = TESTSPAN,
+        .span = test_span,
         .ty = null,
         .kind = .{ .literal = .{ .int = .{ .text = "5u32", .value = 5, .base = .dec, .ty_suffix = "u32" } } },
     };
     exprs_store[2] = .{
         .id = 2,
-        .span = TESTSPAN,
+        .span = test_span,
         .ty = null,
         .kind = .{ .struct_lit = .{
             .def = 1,
@@ -1423,7 +1423,7 @@ test "generic struct literal records instantiation" {
 
     const stmts_store = try a.alloc(exprs.Statement, 1);
     defer a.free(stmts_store);
-    stmts_store[0] = .{ .id = 0, .span = TESTSPAN, .ty = null, .kind = .{ .expr = 2 } };
+    stmts_store[0] = .{ .id = 0, .span = test_span, .ty = null, .kind = .{ .expr = 2 } };
 
     const bodies_store = try a.alloc(bodies.BodyKind, 2);
     defer a.free(bodies_store);
