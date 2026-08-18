@@ -133,6 +133,13 @@ pub fn build(b: *std.Build) void {
         .{ "test/wyhash.json", "wyhash" },
         .{ "test/adler.json", "adler" },
         .{ "test/xxhash-rust.json", "xxhash-rust" },
+        .{ "test/seahash.json", "seahash" },
+        .{ "test/crc16.json", "crc16" },
+        .{ "test/atoi.json", "atoi" },
+        .{ "test/leb128.json", "leb128" },
+        .{ "test/itoa.json", "itoa" },
+        .{ "test/siphasher.json", "siphasher" },
+        .{ "test/percent-encoding.json", "percent-encoding" },
     };
     for (specs) |spec| {
         const regen = b.addSystemCommand(&.{
