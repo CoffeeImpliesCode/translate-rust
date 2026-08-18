@@ -178,8 +178,8 @@ test "M3/M4: Comptime Generic Struct Constructor and Inherent Methods" {
     // Verify comptime generic struct constructor
     try std.testing.expect(std.mem.indexOf(u8, out, "pub fn Fletcher(comptime T: type) type {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "// bound: T: FletcherAccumulator") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "pub a: T,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "pub b: T,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a: T,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "b: T,") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "pub const Self = @This();") != null);
 
     // Verify inherent methods with receivers

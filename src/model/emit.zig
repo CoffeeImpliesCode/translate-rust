@@ -243,7 +243,7 @@ fn emitEntity(
                             try buf.appendSlice(allocator, "test \"");
                             try buf.appendSlice(allocator, e.name);
                             try buf.appendSlice(allocator, "\" ");
-                            try emitFnBody(allocator, buf, g, bb, fb.body, fb.ret, 1);
+                            try emitFnBody(allocator, buf, g, bb, fb.body, fb.params, fb.ret, 1);
                             try buf.append(allocator, '\n');
                             return;
                         },
@@ -264,7 +264,7 @@ fn emitEntity(
                     .fn_ => |fb| {
                         try emitFnSignature(allocator, buf, fb.params, fb.ret, fb.is_allocating);
                         try buf.append(allocator, ' ');
-                        try emitFnBody(allocator, buf, g, bb, fb.body, fb.ret, 1);
+                        try emitFnBody(allocator, buf, g, bb, fb.body, fb.params, fb.ret, 1);
                         try buf.append(allocator, '\n');
                         return;
                     },
@@ -614,7 +614,7 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
         },
         .generic_inst => |gi| {
             _ = gi;
-            try buf.appendSlice(allocator, "Generic");
+            try buf.appendSlice(allocator, "anyopaque");
         },
         .fn_ptr => |fp| {
             try buf.appendSlice(allocator, "*const fn (");
@@ -770,8 +770,6 @@ fn emitStructInner(
         .named => {
             for (sb.fields) |f| {
                 try writeIndent(allocator, buf, depth);
-                const f_pub = visPrefix(f.visibility);
-                try buf.appendSlice(allocator, f_pub);
                 try emitIdent(allocator, buf, f.name);
                 try buf.appendSlice(allocator, ": ");
                 try emitType(allocator, buf, f.ty);
@@ -781,8 +779,6 @@ fn emitStructInner(
         .tuple => {
             for (sb.fields, 0..) |f, i| {
                 try writeIndent(allocator, buf, depth);
-                const f_pub = visPrefix(f.visibility);
-                try buf.appendSlice(allocator, f_pub);
                 const tuple_name = try std.fmt.allocPrint(allocator, "{d}", .{i});
                 defer allocator.free(tuple_name);
                 try emitIdent(allocator, buf, tuple_name);
@@ -1627,13 +1623,32 @@ fn typeIsUnit(ty: types.Type) bool {
 /// explicit `return <tail>;`: Zig parses a trailing value in a block as a
 /// statement needing `;`, so `{ if (c) a else b }` (no semicolon) is a syntax
 /// error. Existing `return <value>;` tails are emitted unchanged, and a void
-/// fn's statement-kind `if`/`match` tail is emitted as a bare statement.
+fn isUnsupportedOrEmptyBody(b: *const Bodies, body_id: exprs.NodeId) bool {
+    if (body_id >= b.exprs.len) return true;
+    const body = b.exprs[body_id];
+    if (body.kind != .block) return body.kind == .unsupported;
+    const block = body.kind.block;
+    if (block.statements.len == 0 and block.tail == null) return true;
+    if (block.statements.len == 1 and block.tail == null) {
+        const sid = block.statements[0];
+        if (sid < b.stmts.len) {
+            const stmt = b.stmts[sid];
+            if (stmt.kind == .expr and stmt.kind.expr < b.exprs.len) {
+                const e = b.exprs[stmt.kind.expr];
+                if (e.kind == .unsupported) return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn emitFnBody(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     g: *const graph.CrateGraph,
     b: *const Bodies,
     body_id: exprs.NodeId,
+    params: []const items.Param,
     ret: types.Type,
     depth: u32,
 ) !void {
@@ -1644,13 +1659,34 @@ fn emitFnBody(
     }
     const block = body.kind.block;
     if (block.statements.len == 0 and block.tail == null) {
-        try buf.appendSlice(allocator, "{}");
+        if (params.len == 0) {
+            try buf.appendSlice(allocator, "{}");
+            return;
+        }
+        try buf.appendSlice(allocator, "{\n");
+        for (params) |p| {
+            try writeIndent(allocator, buf, depth);
+            try buf.appendSlice(allocator, "_ = ");
+            try emitIdent(allocator, buf, p.name);
+            try buf.appendSlice(allocator, ";\n");
+        }
+        try writeIndent(allocator, buf, depth - 1);
+        try buf.append(allocator, '}');
         return;
     }
     const returns_no_value = typeIsUnit(ret);
+    const should_discard_params = isUnsupportedOrEmptyBody(b, body_id);
 
     try buf.append(allocator, '{');
     try buf.append(allocator, '\n');
+    if (should_discard_params) {
+        for (params) |p| {
+            try writeIndent(allocator, buf, depth);
+            try buf.appendSlice(allocator, "_ = ");
+            try emitIdent(allocator, buf, p.name);
+            try buf.appendSlice(allocator, ";\n");
+        }
+    }
     for (block.statements) |sid| {
         try emitStmt(allocator, buf, g, b, sid, depth, false);
     }
@@ -2364,14 +2400,13 @@ test "M1: struct fields (named, tuple, unit) and methods" {
     defer allocator.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "pub const Point = struct {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "pub x: i32,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "pub y: i32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x: i32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "y: i32,") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "pub fn distance(self: *const Self) f64 {") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "pub const Pair = struct {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "pub @\"0\": u64,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "pub @\"1\": bool,") != null);
-
+    try std.testing.expect(std.mem.indexOf(u8, out, "@\"0\": u64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@\"1\": bool,") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "pub const Marker = struct {") != null);
 
     const formatted = try formatZig(allocator, out);

@@ -95,6 +95,28 @@ pub fn build(b: *std.Build) void {
     source_cmd.step.dependOn(b.getInstallStep());
     source_step.dependOn(&source_cmd.step);
 
+    // ── e2e: in-process native translation of Rust source → Zig packages ──
+    // Runs test/e2e_test.zig as a normal executable (NOT a b.addTest: Zig's
+    // `--listen` test-runner protocol cannot spawn grandchildren, but the e2e
+    // test must run `zig build test` inside each emitted package). Exercises
+    // `driver.translate` on test/crates/{mini,fnv} and asserts the emitted
+    // packages compile + pass `zig build test` with no Rust toolchain.
+    const e2e_mod = b.addModule("e2e_test", .{
+        .root_source_file = b.path("test/e2e_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "translate_rust", .module = translate_rust },
+        },
+    });
+    const e2e_exe = b.addExecutable(.{
+        .name = "e2e-test",
+        .root_module = e2e_mod,
+    });
+    const run_e2e = b.addRunArtifact(e2e_exe);
+    const e2e_step = b.step("test-e2e", "E2E: translate Rust source crates -> working Zig packages");
+    e2e_step.dependOn(&run_e2e.step);
+
     // ── translate: run the CLI on a wire-format JSON in `zig-out/` ─────
     // `zig build translate -- test/mini.json` → parses + emits.
     const translate_step = b.step("translate", "Run translate-rust --translate on a JSON dump");
@@ -175,4 +197,8 @@ pub fn build(b: *std.Build) void {
 
     const model_tests = b.addTest(.{ .root_module = model });
     test_step.dependOn(&b.addRunArtifact(model_tests).step);
+
+    // E2E integration tests (in-process native translation → working Zig pkgs).
+    test_step.dependOn(&run_e2e.step);
+    test_crates_step.dependOn(&run_e2e.step);
 }
