@@ -1761,7 +1761,7 @@
             "def": 5
           },
           "args": [
-            54
+            100
           ]
         }
       },
@@ -2032,9 +2032,20 @@
         "ty": null,
         "kind": "literal",
         "value": {
-          "kind": "string",
+          "kind": "byte_array",
           "value": {
-            "bytes": "abcdefghij"
+            "items": [
+              6,
+              131,
+              13,
+              0,
+              197,
+              24,
+              229,
+              8,
+              239,
+              17
+            ]
           }
         }
       },
@@ -2142,9 +2153,14 @@
         "ty": null,
         "kind": "literal",
         "value": {
-          "kind": "string",
+          "kind": "byte_array",
           "value": {
-            "bytes": "wxyz"
+            "items": [
+              1,
+              2,
+              248,
+              4
+            ]
           }
         }
       },
@@ -2278,6 +2294,54 @@
             "value": "0",
             "base": "dec",
             "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 100,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "byte_array",
+          "value": {
+            "items": [
+              193,
+              119,
+              233,
+              192,
+              171,
+              30
+            ]
+          }
+        }
+      },
+      {
+        "id": 100,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "byte_array",
+          "value": {
+            "items": [
+              193,
+              119,
+              233,
+              192,
+              171,
+              30
+            ]
           }
         }
       }

@@ -10,6 +10,7 @@ pub const graph = @import("graph.zig");
 pub const json = @import("json.zig");
 pub const emit = @import("emit.zig");
 pub const package = @import("package.zig");
+pub const driver = @import("driver.zig");
 
 test {
     std.testing.refAllDecls(@This());

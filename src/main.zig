@@ -60,10 +60,24 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    try stdout.writeStreamingAll(io,
-        \\translate-rust: unrecognized argument; run with --help
-        \\
-    );
+    // Non-`.json` positional arg → treat it as a Rust crate directory and run
+    // the source driver (cargo +nightly rustdoc → r2z package). Requires -o.
+    var crate_out_dir: ?[]const u8 = null;
+    if (arg_it.next()) |next_arg| {
+        if (std.mem.eql(u8, next_arg, "-o") or std.mem.eql(u8, next_arg, "--output")) {
+            crate_out_dir = arg_it.next();
+        }
+    }
+    if (crate_out_dir == null) {
+        try stdout.writeStreamingAll(io,
+            \\translate-rust: crate-directory mode requires -o <out-dir>
+            \\usage: translate-rust <crate-dir> -o <out-dir>
+            \\
+        );
+        return;
+    }
+    try translate_rust.model.driver.translate(init.gpa, io, stdout, arg_slice, crate_out_dir.?);
+    return;
 }
 
 fn dumpModel(io: std.Io, init: std.process.Init, stdout: std.Io.File, arg_it: *std.process.Args.Iterator) !void {
@@ -218,7 +232,7 @@ fn printUsage(io: std.Io, stdout: std.Io.File) !void {
     try stdout.writeStreamingAll(io,
         \\translate-rust — Rust → Zig translation (research phase, no full pipeline yet)
         \\
-        \\usage: translate-rust <crate-path>          translate a Rust crate to Zig (not implemented)
+        \\usage: translate-rust <crate-dir> -o <dir>  translate a Rust crate (cargo +nightly rustdoc) to an r2z package
         \\       translate-rust <file.json> [-o dir]  translate a wire-format JSON dump (stdout or package dir)
         \\       translate-rust --emit-package <file.json> -o <dir>  emit standalone Zig package
         \\       translate-rust --dump model <file>   parse a sidecar wire-format JSON dump and print

@@ -76,6 +76,17 @@ pub fn build(b: *std.Build) void {
     });
     sidecar_step.dependOn(&sidecar.step);
 
+    // ── source: run the Rust-source driver on a crate dir ─────────────
+    // `zig build source` → cargo +nightly rustdoc (via sidecar) on
+    // test/crates/fnv, producing zig-out/r2z-fnv/ as a standalone package.
+    const source_step = b.step("source", "Run the Rust-source driver on the fnv crate -> zig-out/r2z-fnv");
+    const source_cmd = b.addSystemCommand(&.{
+        "sh",                                                                                        "-c",
+        "rm -rf zig-out/r2z-fnv && ./zig-out/bin/translate-rust test/crates/fnv -o zig-out/r2z-fnv",
+    });
+    source_cmd.step.dependOn(b.getInstallStep());
+    source_step.dependOn(&source_cmd.step);
+
     // ── translate: run the CLI on a wire-format JSON in `zig-out/` ─────
     // `zig build translate -- test/mini.json` → parses + emits.
     const translate_step = b.step("translate", "Run translate-rust --translate on a JSON dump");

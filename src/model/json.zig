@@ -373,6 +373,22 @@ fn decodeStringLit(allocator: std.mem.Allocator, v: Json) !exprs.StringLit {
     return .{ .bytes = try allocator.dupe(u8, try reqStr(o, "bytes")) };
 }
 
+fn decodeByteArrayLit(allocator: std.mem.Allocator, v: Json) !exprs.ByteArrayLit {
+    const o = try getObj(v);
+    const arr = switch (try req(o, "items")) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    const out = try allocator.alloc(u8, arr.items.len);
+    for (arr.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .integer => |x| @intCast(x),
+            else => return error.BadWireFormat,
+        };
+    }
+    return .{ .items = out };
+}
+
 fn decodeLiteral(allocator: std.mem.Allocator, v: Json) !exprs.Literal {
     const o = try getObj(v);
     const tag = try reqStr(o, "kind");
@@ -381,6 +397,7 @@ fn decodeLiteral(allocator: std.mem.Allocator, v: Json) !exprs.Literal {
     if (std.mem.eql(u8, tag, "float")) return .{ .float = try decodeFloatLit(allocator, val) };
     if (std.mem.eql(u8, tag, "character")) return .{ .character = try decodeCharLit(allocator, val) };
     if (std.mem.eql(u8, tag, "string")) return .{ .string = try decodeStringLit(allocator, val) };
+    if (std.mem.eql(u8, tag, "byte_array")) return .{ .byte_array = try decodeByteArrayLit(allocator, val) };
     if (std.mem.eql(u8, tag, "boolean")) {
         const b = switch (val) {
             .bool => |x| x,
@@ -1487,6 +1504,16 @@ fn encodeStringLit(allocator: std.mem.Allocator, lit: exprs.StringLit) !Json {
     return .{ .object = o };
 }
 
+fn encodeByteArrayLit(allocator: std.mem.Allocator, lit: exprs.ByteArrayLit) !Json {
+    var o = ObjectMap.empty;
+    var arr = Array.init(allocator);
+    for (lit.items) |byte| {
+        try arr.append(mkInt(byte));
+    }
+    try o.put(allocator, "items", .{ .array = arr });
+    return .{ .object = o };
+}
+
 /// Primitive encode: `{ "kind": "int", "value": {...} }` etc.
 fn encodeLiteralObj(allocator: std.mem.Allocator, lit: exprs.Literal) !Json {
     var o = ObjectMap.empty;
@@ -1506,6 +1533,10 @@ fn encodeLiteralObj(allocator: std.mem.Allocator, lit: exprs.Literal) !Json {
         .string => |v| {
             try o.put(allocator, "kind", .{ .string = "string" });
             try o.put(allocator, "value", try encodeStringLit(allocator, v));
+        },
+        .byte_array => |v| {
+            try o.put(allocator, "kind", .{ .string = "byte_array" });
+            try o.put(allocator, "value", try encodeByteArrayLit(allocator, v));
         },
         .boolean => |v| {
             try o.put(allocator, "kind", .{ .string = "boolean" });

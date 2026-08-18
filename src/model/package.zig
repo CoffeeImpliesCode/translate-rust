@@ -276,7 +276,7 @@ test "generatePackage: mini fixture generates multi-file package with imports an
     try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub const Point = struct {") != null);
     try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub const Shape = enum(u8) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub fn area()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub const helper = helper;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub const helper = util.helper;") != null);
 
     // Verify src/util.zig contains util submodule's items
     try std.testing.expect(std.mem.indexOf(u8, pkg.files[3].content, "pub fn helper()") != null);

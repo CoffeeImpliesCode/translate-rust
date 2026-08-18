@@ -95,6 +95,7 @@ pub const Literal = union(enum) {
     float: FloatLit,
     character: CharLit,
     string: StringLit,
+    byte_array: ByteArrayLit,
     boolean: bool,
 };
 
@@ -120,6 +121,14 @@ pub const CharLit = struct {
 
 pub const StringLit = struct {
     bytes: []const u8,
+};
+
+/// A fixed byte-array literal (Rust `b"..."` / `[u8; N]` constant pool).
+/// `items` holds the raw bytes; the empty array is allowed (for `b""`).
+/// Lossless: the emitter re-derives Zig array syntax (`&[_]u8{ ... }`,
+/// collapsing to `&[_]u8{V} ** N` when every byte is equal).
+pub const ByteArrayLit = struct {
+    items: []const u8,
 };
 
 /// A resolved reference, not a name. Collapses Rust's `x`, `Foo::Bar` (unit
