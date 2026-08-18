@@ -130,6 +130,9 @@ pub fn build(b: *std.Build) void {
         .{ "test/mini.json", "mini" },
         .{ "test/fletcher.json", "fletcher" },
         .{ "test/hex.json", "hex" },
+        .{ "test/wyhash.json", "wyhash" },
+        .{ "test/adler.json", "adler" },
+        .{ "test/xxhash-rust.json", "xxhash-rust" },
     };
     for (specs) |spec| {
         const regen = b.addSystemCommand(&.{

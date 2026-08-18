@@ -109,6 +109,12 @@ fn generateBuildZigZon(allocator: std.mem.Allocator, package_name: []const u8) !
         0x8fb5a334fecd91fb
     else if (std.mem.eql(u8, zon_name, "r2z_fletcher"))
         0x480daae3a1cf814c
+    else if (std.mem.eql(u8, zon_name, "r2z_wyhash"))
+        0xebe5c3e2fd648abb
+    else if (std.mem.eql(u8, zon_name, "r2z_adler"))
+        0xbd2e1da5b462aa64
+    else if (std.mem.eql(u8, zon_name, "r2z_xxhash_rust"))
+        0xe46280788d2fa579
     else
         0x81677af200000000 | (@as(u64, @as(u32, @truncate(std.hash.Wyhash.hash(0, package_name)))));
 
