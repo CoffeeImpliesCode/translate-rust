@@ -59,6 +59,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "translate_rust.ir", .module = ir },
         },
     });
+    // ── translate_rust.backend — target representations & lowering ───────
+    const backend = b.addModule("translate_rust.backend", .{
+        .root_source_file = b.path("src/backend/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "translate_rust.ir", .module = ir },
+        },
+    });
 
     // ── translate_rust — library root ─────────────────────────
     const translate_rust = b.addModule("translate_rust", .{
@@ -70,9 +79,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "translate_rust.model", .module = model },
             .{ .name = "translate_rust.ir", .module = ir },
             .{ .name = "translate_rust.frontend", .module = frontend },
+            .{ .name = "translate_rust.backend", .module = backend },
         },
     });
-
     // ── translate-rust executable ─────────────────────────
     const exe = b.addExecutable(.{
         .name = "translate-rust",
@@ -237,6 +246,20 @@ pub fn build(b: *std.Build) void {
 
     const frontend_tests = b.addTest(.{ .root_module = frontend });
     test_step.dependOn(&b.addRunArtifact(frontend_tests).step);
+    const backend_tests = b.addTest(.{ .root_module = backend });
+    test_step.dependOn(&b.addRunArtifact(backend_tests).step);
+
+    const backend_serialize_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/backend/zig/serialize_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust.ir", .module = ir },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(backend_serialize_tests).step);
 
     // E2E integration tests (in-process native translation → working Zig pkgs).
     test_step.dependOn(&run_e2e.step);

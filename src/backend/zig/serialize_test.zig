@@ -1,0 +1,317 @@
+//! translate_rust.backend.zig.serialize_test — JSON roundtrip tests
+//! for ast.Package serialization.
+
+const std = @import("std");
+const testing = std.testing;
+const ast = @import("ast.zig");
+const serialize = @import("serialize.zig");
+
+test "serialize: ast package JSON roundtrip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // ---- Build a rich representative Package. All `allocator.create` nodes
+    // live in the arena; slice/array literals live on this test stack frame
+    // (valid for the whole test = encode + decode scope).
+
+    // Types
+    const u8_ty = try allocator.create(ast.Type);
+    u8_ty.* = .{ .prim = .u8 };
+    const slice_ty = try allocator.create(ast.Type);
+    slice_ty.* = .{ .slice = .{ .elem = u8_ty, .is_const = true } };
+    const opt_ty = try allocator.create(ast.Type);
+    opt_ty.* = .{ .opt = slice_ty };
+
+    // Exprs
+    const lit_str = try allocator.create(ast.Expr);
+    lit_str.* = .{ .lit = .{ .str = "hello" } };
+
+    const ident_a = try allocator.create(ast.Expr);
+    ident_a.* = .{ .ident = "a" };
+    const ident_b = try allocator.create(ast.Expr);
+    ident_b.* = .{ .ident = "b" };
+
+    const bin_expr = try allocator.create(ast.Expr);
+    bin_expr.* = .{
+        .bin_op = .{
+            .op = .add,
+            .lhs = ident_a,
+            .rhs = ident_b,
+        },
+    };
+
+    const let_stmt = ast.Stmt{
+        .let_stmt = .{
+            .name = "sum",
+            .ty = .{ .prim = .u32 },
+            .init = bin_expr.*,
+            .is_mut = true,
+        },
+    };
+
+    const const_decl = ast.Decl{
+        .const_decl = .{
+            .name = "GREETING",
+            .ty = slice_ty.*,
+            .init = lit_str.*,
+        },
+    };
+
+    const method_fn = ast.Decl{
+        .fn_decl = .{
+            .name = "area",
+            .params = &.{
+                .{ .name = "self", .ty = .{ .ptr = .{ .elem = u8_ty } } },
+            },
+            .ret_type = .{ .prim = .u32 },
+            .body = .{
+                .stmts = &.{let_stmt},
+                .expr = bin_expr,
+            },
+        },
+    };
+
+    const struct_decl = ast.Decl{
+        .struct_decl = .{
+            .name = "Rectangle",
+            .fields = &.{
+                .{ .name = "width", .ty = .{ .prim = .u32 } },
+                .{ .name = "height", .ty = .{ .prim = .u32 } },
+            },
+            .decls = &.{method_fn},
+        },
+    };
+
+    const enum_decl = ast.Decl{
+        .enum_decl = .{
+            .name = "Color",
+            .tag_type = .{ .prim = .u8 },
+            .variants = &.{
+                .{ .name = "Red" },
+                .{ .name = "Green", .value = bin_expr },
+            },
+        },
+    };
+
+    const union_decl = ast.Decl{
+        .union_decl = .{
+            .name = "Shape",
+            .tag_type = .{ .prim = .u8 },
+            .fields = &.{
+                .{ .name = "circle", .ty = .{ .prim = .f64 } },
+                .{ .name = "rect", .ty = .{ .slice = .{ .elem = slice_ty, .is_const = true } } },
+            },
+        },
+    };
+
+    const var_decl = ast.Decl{
+        .var_decl = .{
+            .name = "counter",
+            .ty = .{ .prim = .u32 },
+            .init = .{ .lit = .{ .uint = 42 } },
+        },
+    };
+
+    const match_expr = try allocator.create(ast.Expr);
+    match_expr.* = .{
+        .match_expr = .{
+            .target = ident_a,
+            .arms = &.{
+                .{ .patterns = &.{.{ .binding = "x" }}, .body = lit_str.* },
+                .{ .patterns = &.{.wildcard}, .body = .{ .lit = .{ .str = "other" } } },
+            },
+        },
+    };
+
+    const generic_fn = ast.Decl{
+        .fn_decl = .{
+            .name = "identity",
+            .ret_type = .{ .generic = .{ .name = "T" } },
+            .body = .{
+                .expr = match_expr,
+            },
+            .generic_params = &.{
+                .{ .name = "T" },
+            },
+        },
+    };
+
+    const comment_decl = ast.Decl{
+        .comment = " a comment",
+    };
+
+    const test_decl = ast.TestDecl{
+        .name = "basic test",
+        .body = .{
+            .stmts = &.{let_stmt},
+        },
+    };
+
+    const file = ast.File{
+        .path = "src/root.zig",
+        .imports = &.{
+            .{ .local_name = "std", .module_or_path = "std" },
+        },
+        .decls = &.{
+            const_decl,
+            struct_decl,
+            enum_decl,
+            union_decl,
+            var_decl,
+            generic_fn,
+            comment_decl,
+        },
+        .tests = &.{test_decl},
+    };
+
+    const pkg = ast.Package{
+        .name = "demo_pkg",
+        .version = "0.1.0",
+        .fingerprint = 0xABCDEF0123456789,
+        .files = &.{file},
+        .zon_deps = &.{
+            .{ .name = "dep", .url = "https://example.com/dep.tar.gz", .hash = "1220abc" },
+        },
+    };
+    // ----
+
+    const json_bytes = try serialize.encode(allocator, &pkg);
+
+    // Basic sanity of JSON output.
+    try testing.expect(std.mem.indexOf(u8, json_bytes, "demo_pkg") != null);
+    try testing.expect(std.mem.indexOf(u8, json_bytes, "Rectangle") != null);
+
+    // Roundtrip.
+    const decoded = try serialize.decode(allocator, json_bytes);
+
+    // Validate decoded structure.
+    try testing.expectEqualStrings("demo_pkg", decoded.name);
+    try testing.expectEqualStrings("0.1.0", decoded.version);
+    try testing.expectEqual(@as(?u64, 0xABCDEF0123456789), decoded.fingerprint);
+    try testing.expectEqual(@as(usize, 1), decoded.files.len);
+    try testing.expectEqual(@as(usize, 1), decoded.zon_deps.len);
+
+    const f = decoded.files[0];
+    try testing.expectEqualStrings("src/root.zig", f.path);
+    try testing.expectEqual(@as(usize, 1), f.imports.len);
+    try testing.expectEqualStrings("std", f.imports[0].local_name);
+    try testing.expectEqual(@as(usize, 7), f.decls.len);
+    try testing.expectEqual(@as(usize, 1), f.tests.len);
+
+    // decl 0: const_decl
+    const d0 = f.decls[0];
+    try testing.expect(d0 == .const_decl);
+    try testing.expectEqualStrings("GREETING", d0.const_decl.name);
+    try testing.expect(d0.const_decl.ty.?.slice.elem.* == .prim);
+
+    // decl 1: struct_decl
+    const d1 = f.decls[1];
+    try testing.expect(d1 == .struct_decl);
+    try testing.expectEqualStrings("Rectangle", d1.struct_decl.name);
+    try testing.expectEqual(@as(usize, 2), d1.struct_decl.fields.len);
+    try testing.expectEqualStrings("width", d1.struct_decl.fields[0].name);
+    // hoisted method
+    try testing.expectEqual(@as(usize, 1), d1.struct_decl.decls.len);
+    try testing.expect(d1.struct_decl.decls[0] == .fn_decl);
+    try testing.expectEqualStrings("area", d1.struct_decl.decls[0].fn_decl.name);
+    // body with let_stmt + bin_op expr
+    const area_body = d1.struct_decl.decls[0].fn_decl.body.?;
+    try testing.expectEqual(@as(usize, 1), area_body.stmts.len);
+    try testing.expect(area_body.stmts[0] == .let_stmt);
+    try testing.expectEqualStrings("sum", area_body.stmts[0].let_stmt.name);
+    const tail = area_body.expr.?.*;
+    try testing.expect(tail == .bin_op);
+    try testing.expect(tail.bin_op.op == .add);
+
+    // decl 2: enum_decl
+    const d2 = f.decls[2];
+    try testing.expect(d2 == .enum_decl);
+    try testing.expectEqualStrings("Color", d2.enum_decl.name);
+    try testing.expectEqual(@as(usize, 2), d2.enum_decl.variants.len);
+    try testing.expectEqualStrings("Red", d2.enum_decl.variants[0].name);
+    try testing.expect(d2.enum_decl.variants[0].value == null);
+    try testing.expect(d2.enum_decl.variants[1].value != null);
+
+    // decl 3: union_decl
+    const d3 = f.decls[3];
+    try testing.expect(d3 == .union_decl);
+    try testing.expectEqualStrings("Shape", d3.union_decl.name);
+    try testing.expectEqual(@as(usize, 2), d3.union_decl.fields.len);
+
+    // decl 4: var_decl
+    const d4 = f.decls[4];
+    try testing.expect(d4 == .var_decl);
+    try testing.expectEqualStrings("counter", d4.var_decl.name);
+    try testing.expect(d4.var_decl.init == .lit);
+
+    // decl 5: generic fn
+    const d5 = f.decls[5];
+    try testing.expect(d5 == .fn_decl);
+    try testing.expectEqualStrings("identity", d5.fn_decl.name);
+    try testing.expectEqual(@as(usize, 1), d5.fn_decl.generic_params.len);
+    const gen_body_expr = d5.fn_decl.body.?.expr.?.*;
+    try testing.expect(gen_body_expr == .match_expr);
+    try testing.expectEqual(@as(usize, 2), gen_body_expr.match_expr.arms.len);
+    try testing.expect(gen_body_expr.match_expr.arms[0].patterns[0] == .binding);
+
+    // decl 6: comment
+    const d6 = f.decls[6];
+    try testing.expect(d6 == .comment);
+    try testing.expectEqualStrings(" a comment", d6.comment);
+
+    // zon deps
+    try testing.expectEqualStrings("dep", decoded.zon_deps[0].name);
+    try testing.expectEqualStrings("https://example.com/dep.tar.gz", decoded.zon_deps[0].url);
+    try testing.expectEqualStrings("1220abc", decoded.zon_deps[0].hash);
+}
+
+test "serialize: minimal empty package roundtrip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const pkg = ast.Package{
+        .name = "empty",
+    };
+
+    const json_bytes = try serialize.encodeVal(allocator, pkg);
+    const json_bytes2 = try serialize.serialize(allocator, pkg);
+    // encodeVal and serialize alias; both produced.
+    _ = json_bytes2;
+
+    const decoded = try serialize.deserialize(allocator, json_bytes);
+    try testing.expectEqualStrings("empty", decoded.name);
+    try testing.expectEqualStrings("0.0.0", decoded.version);
+    try testing.expectEqual(@as(?u64, null), decoded.fingerprint);
+    try testing.expectEqual(@as(usize, 0), decoded.files.len);
+    try testing.expectEqual(@as(usize, 0), decoded.zon_deps.len);
+}
+
+test "serialize: whitespace formatting" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const pkg = ast.Package{
+        .name = "fmt_check",
+        .files = &.{
+            .{
+                .path = "src/a.zig",
+                .imports = &.{
+                    .{ .local_name = "std", .module_or_path = "std" },
+                },
+            },
+        },
+    };
+
+    const json_bytes = try serialize.encode(allocator, &pkg);
+    // Indented output contains newlines.
+    try testing.expect(std.mem.indexOf(u8, json_bytes, "\n") != null);
+
+    // Roundtrip still correct.
+    const decoded = try serialize.decode(allocator, json_bytes);
+    try testing.expectEqualStrings("fmt_check", decoded.name);
+    try testing.expectEqual(@as(usize, 1), decoded.files.len);
+    try testing.expectEqualStrings("src/a.zig", decoded.files[0].path);
+}
