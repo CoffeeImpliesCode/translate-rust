@@ -1096,8 +1096,11 @@ pub fn translate(
 
     // 2b. Tree-sitter hybrid: rustdoc carries signatures only (no fn bodies).
     //     Parse the crate root source and replace each fn's empty body with a
-    //     tree-sitter-lowered one. Fns not found in the root source keep their
-    //     rustdoc empty body (never a silent partial lower).
+    //     tree-sitter-lowered one. Lowering is lossless: fn bodies found in the
+    //     source are always kept in full, and unresolvable sub-expressions
+    //     become per-node `.unsupported` exprs that emit as loud runtime
+    //     `@panic` unsoundness markers (never a silent wrong value). Only fns
+    //     absent from the parsed source keep their rustdoc empty body.
     if (mapped_ok) {
         const lib_path_opt = libPathFromManifest(arena, io, crate_dir);
         if (lib_path_opt) |lib_path| {

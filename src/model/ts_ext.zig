@@ -12,8 +12,15 @@
 //! `let` bindings) and registers each binding as a symbol-table entity parented
 //! to the enclosing fn. `emit` prints such an entity's name for a `.path` expr.
 //! Globals (consts / other fns / types) resolve by name against the crate
-//! graph's module-scope entities. Unresolved names cause the whole body to be
-//! skipped (never a silent partial lower) — the rustdoc empty body remains.
+//! graph's module-scope entities.
+//!
+//! Lossless-lowering contract: fn bodies are always lowered in full. An
+//! unresolvable sub-expression becomes a per-node `.unsupported` expr (with
+//! a non-empty `.reason`), which `emit` renders as a loud runtime
+//! `@panic("translate-rust: unsupported: <reason>")` — an explicit
+//! unsoundness marker, never a silent wrong value. There is no whole-body
+//! rejection; `extractFunction` returns false only when the fn's block is
+//! absent from the parsed source (the rustdoc empty body then remains).
 
 const std = @import("std");
 const spine = @import("spine.zig");
@@ -52,8 +59,6 @@ const Ext = struct {
     /// Enclosing fn entity id (for local parents).
     fn_id: spine.EntityId,
     locals: std.ArrayListUnmanaged(Local) = .empty,
-    /// Set when an unsupported node is appended (extraction is rejected).
-    has_unsupported: bool = false,
 
     fn deinit(self: *Ext) void {
         self.locals.deinit(self.ctx.alloc);
@@ -213,11 +218,14 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
     var name: ?[]const u8 = null;
     var type_node: ?ts.Node = null;
     var init_node: ?ts.Node = null;
+    var is_mut = false;
 
     var i: u32 = 0;
     while (node.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
-        if (std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "value_identifier")) {
+        if (std.mem.eql(u8, k, "mutable_specifier")) {
+            is_mut = true;
+        } else if (std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "value_identifier")) {
             name = text(e, c);
         } else if (std.mem.eql(u8, k, "type") or std.mem.eql(u8, k, "primitive_type")) {
             type_node = c;
@@ -240,7 +248,7 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
     const pat_id = try appendPat(e, .{ .binding = .{
         .name = nm,
         .mode = .{ .value = {} },
-        .mutable = true,
+        .mutable = is_mut,
     } });
     _ = try appendStmt(e, .{ .let = .{
         .pattern = pat_id,
@@ -722,7 +730,6 @@ fn mapAssignOp(op: []const u8) exprs.AssignOp {
 }
 
 fn unsupported(e: *Ext, reason: []const u8) anyerror!exprs.NodeId {
-    e.has_unsupported = true;
     return appendExpr(e, .{ .unsupported = .{ .reason = reason, .suggested_version = .v3 } });
 }
 
@@ -780,10 +787,9 @@ pub fn extractFunction(
         }
 
         const body_expr = try lowerExpr(&ex, blk_node);
-        // Reject if any node lowered to `.unsupported` (unresolved method /
-        // type we cannot name): emit would produce broken Zig. Keep the
-        // rustdoc empty body instead — never a silent partial lower.
-        if (ex.has_unsupported) return false;
+        // Lossless partial lower: keep the full lowered body even when
+        // sub-expressions are `.unsupported`; emit renders those as loud
+        // runtime `@panic` unsoundness markers (never a silent wrong value).
         const fb = ctx.bodies_list.items[fn_entity];
         var fn_body = fb.fn_;
         fn_body.body = body_expr;

@@ -242,9 +242,9 @@ fn emitEntity(
                         .fn_ => |fb| {
                             try buf.appendSlice(allocator, "test \"");
                             try buf.appendSlice(allocator, e.name);
-                            try buf.appendSlice(allocator, "\" {\n");
-                            try emitExpr(allocator, buf, g, bb, fb.body, 1, true);
-                            try buf.appendSlice(allocator, "}\n");
+                            try buf.appendSlice(allocator, "\" ");
+                            try emitFnBody(allocator, buf, g, bb, fb.body, fb.ret, 1);
+                            try buf.append(allocator, '\n');
                             return;
                         },
                         else => {},
@@ -288,7 +288,7 @@ fn emitEntity(
                         try buf.appendSlice(allocator, ": ");
                         try emitType(allocator, buf, cb.ty);
                         try buf.appendSlice(allocator, " = ");
-                        try emitExpr(allocator, buf, g, bb, cb.init, 0, true);
+                        try emitExpr(allocator, buf, g, bb, cb.init, 0, true, true);
                         try buf.appendSlice(allocator, ";\n");
                         return;
                     },
@@ -835,7 +835,7 @@ fn emitStructInner(
         try emitIdent(allocator, buf, m.name);
         try emitMethodSignature(allocator, buf, m.receiver, m.params, m.ret, m.is_allocating);
         try buf.append(allocator, ' ');
-        try emitExpr(allocator, buf, g, b, m.body, depth + 1, true);
+        try emitExpr(allocator, buf, g, b, m.body, depth + 1, true, false);
         try buf.append(allocator, '\n');
     }
 }
@@ -1032,9 +1032,10 @@ fn emitMatch(
     b: *const Bodies,
     m: exprs.MatchExpr,
     depth: u32,
+    is_comptime: bool,
 ) !void {
     try buf.appendSlice(allocator, "switch (");
-    try emitExpr(allocator, buf, g, b, m.scrutinee, depth, true);
+    try emitExpr(allocator, buf, g, b, m.scrutinee, depth, true, is_comptime);
     try buf.appendSlice(allocator, ") {\n");
 
     for (m.arms) |arm| {
@@ -1108,18 +1109,47 @@ fn emitMatch(
 
         if (arm.guard) |gid| {
             try buf.appendSlice(allocator, "if (");
-            try emitExpr(allocator, buf, g, b, gid, depth + 1, true);
+            try emitExpr(allocator, buf, g, b, gid, depth + 1, true, is_comptime);
             try buf.appendSlice(allocator, ") ");
-            try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true);
+            try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true, is_comptime);
             try buf.appendSlice(allocator, " else unreachable");
         } else {
-            try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true);
+            try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true, is_comptime);
         }
         try buf.appendSlice(allocator, ",\n");
     }
 
     try writeIndent(allocator, buf, depth);
     try buf.append(allocator, '}');
+}
+
+/// Append `bytes` as the BODY of a valid Zig string literal (no surrounding
+/// quotes): backslashes, double quotes, and control characters are escaped
+/// (`\\`, `\"`, `\n`, `\r`, `\t`, `\xNN`). Printable ASCII and UTF-8 pass
+/// through, so the result is always a syntactically valid literal.
+fn appendEscapedString(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    bytes: []const u8,
+) !void {
+    for (bytes) |ch| {
+        switch (ch) {
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => {
+                if (ch < 0x20 or ch == 0x7f) {
+                    const hex = try std.fmt.allocPrint(allocator, "\\x{x:0>2}", .{ch});
+                    defer allocator.free(hex);
+                    try buf.appendSlice(allocator, hex);
+                } else {
+                    try buf.append(allocator, ch);
+                }
+            },
+        }
+    }
 }
 
 fn emitExpr(
@@ -1130,6 +1160,7 @@ fn emitExpr(
     expr_id: exprs.NodeId,
     depth: u32,
     value_position: bool,
+    is_comptime: bool,
 ) anyerror!void {
     const e = b.exprs[expr_id];
     switch (e.kind) {
@@ -1164,21 +1195,21 @@ fn emitExpr(
                 try buf.appendSlice(allocator, "/* unknown path */");
             }
         },
-        .block => |blk| try emitBlock(allocator, buf, g, b, blk, depth),
+        .block => |blk| try emitBlock(allocator, buf, g, b, blk, depth, is_comptime),
         .unit => {},
         .return_ => |ret| {
             try buf.appendSlice(allocator, "return");
             if (ret.value) |vid| {
                 try buf.append(allocator, ' ');
-                try emitExpr(allocator, buf, g, b, vid, depth, true);
+                try emitExpr(allocator, buf, g, b, vid, depth, true, is_comptime);
             }
         },
         .assign => |asgn| {
-            try emitExpr(allocator, buf, g, b, asgn.target, depth, false);
+            try emitExpr(allocator, buf, g, b, asgn.target, depth, false, is_comptime);
             try buf.append(allocator, ' ');
             try buf.appendSlice(allocator, assignOpString(asgn.op, asgn.overflow));
             try buf.append(allocator, ' ');
-            try emitExpr(allocator, buf, g, b, asgn.value, depth, true);
+            try emitExpr(allocator, buf, g, b, asgn.value, depth, true, is_comptime);
         },
         .for_ => |fe| {
             const iter_expr = b.exprs[fe.iterable];
@@ -1205,84 +1236,84 @@ fn emitExpr(
                 try buf.appendSlice(allocator, "var chunk_i: usize = 0;\n");
                 try writeIndent(allocator, buf, depth);
                 try buf.appendSlice(allocator, "while (chunk_i < ");
-                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth, true);
+                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth, true, is_comptime);
                 try buf.appendSlice(allocator, ".len) : (chunk_i += ");
-                try emitExpr(allocator, buf, g, b, chunk_size.?, depth, true);
+                try emitExpr(allocator, buf, g, b, chunk_size.?, depth, true, is_comptime);
                 try buf.appendSlice(allocator, ") {\n");
                 try writeIndent(allocator, buf, depth + 1);
                 try buf.appendSlice(allocator, "const ");
                 try emitPattern(allocator, buf, b, fe.pattern);
                 try buf.appendSlice(allocator, " = ");
-                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth, true);
+                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth, true, is_comptime);
                 try buf.appendSlice(allocator, "[chunk_i..@min(chunk_i + ");
-                try emitExpr(allocator, buf, g, b, chunk_size.?, depth, true);
+                try emitExpr(allocator, buf, g, b, chunk_size.?, depth, true, is_comptime);
                 try buf.appendSlice(allocator, ", ");
-                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth, true);
+                try emitExpr(allocator, buf, g, b, chunk_receiver.?, depth, true, is_comptime);
                 try buf.appendSlice(allocator, ".len)];\n");
-                try emitBlockBody(allocator, buf, g, b, fe.body, depth + 1);
+                try emitBlockBody(allocator, buf, g, b, fe.body, depth + 1, is_comptime);
                 try writeIndent(allocator, buf, depth);
                 try buf.appendSlice(allocator, "}\n");
                 if (depth > 0) try writeIndent(allocator, buf, depth - 1);
                 try buf.append(allocator, '}');
             } else {
                 try buf.appendSlice(allocator, "for (");
-                try emitExpr(allocator, buf, g, b, fe.iterable, depth, true);
+                try emitExpr(allocator, buf, g, b, fe.iterable, depth, true, is_comptime);
                 try buf.appendSlice(allocator, ") |");
                 try emitPattern(allocator, buf, b, fe.pattern);
                 try buf.appendSlice(allocator, "| ");
-                try emitBlock(allocator, buf, g, b, fe.body, depth + 1);
+                try emitBlock(allocator, buf, g, b, fe.body, depth + 1, is_comptime);
             }
         },
         .while_ => |we| {
             try buf.appendSlice(allocator, "while (");
-            try emitExpr(allocator, buf, g, b, we.cond, depth, true);
+            try emitExpr(allocator, buf, g, b, we.cond, depth, true, is_comptime);
             try buf.appendSlice(allocator, ") ");
-            try emitBlock(allocator, buf, g, b, we.body, depth + 1);
+            try emitBlock(allocator, buf, g, b, we.body, depth + 1, is_comptime);
         },
         .if_else => |ie| {
             try buf.appendSlice(allocator, "if (");
-            try emitExpr(allocator, buf, g, b, ie.cond, depth, true);
+            try emitExpr(allocator, buf, g, b, ie.cond, depth, true, is_comptime);
             try buf.appendSlice(allocator, ") ");
-            try emitBranch(allocator, buf, g, b, ie.then_, depth, value_position);
+            try emitBranch(allocator, buf, g, b, ie.then_, depth, value_position, is_comptime);
             switch (ie.@"else") {
                 .none => {},
                 .block => |blk| {
                     try buf.appendSlice(allocator, " else ");
-                    try emitBranch(allocator, buf, g, b, blk, depth, value_position);
+                    try emitBranch(allocator, buf, g, b, blk, depth, value_position, is_comptime);
                 },
                 .chain => |cid| {
                     try buf.appendSlice(allocator, " else ");
-                    try emitExpr(allocator, buf, g, b, cid, depth, value_position);
+                    try emitExpr(allocator, buf, g, b, cid, depth, value_position, is_comptime);
                 },
             }
         },
         .if_let => |ile| {
             try buf.appendSlice(allocator, "if (");
-            try emitExpr(allocator, buf, g, b, ile.scrutinee, depth, true);
+            try emitExpr(allocator, buf, g, b, ile.scrutinee, depth, true, is_comptime);
             try buf.appendSlice(allocator, ") |");
             try emitPattern(allocator, buf, b, ile.pattern);
             try buf.appendSlice(allocator, "| ");
-            try emitBlock(allocator, buf, g, b, ile.then_, depth);
+            try emitBlock(allocator, buf, g, b, ile.then_, depth, is_comptime);
             switch (ile.@"else") {
                 .none => {},
                 .block => |blk| {
                     try buf.appendSlice(allocator, " else ");
-                    try emitBlock(allocator, buf, g, b, blk, depth);
+                    try emitBlock(allocator, buf, g, b, blk, depth, is_comptime);
                 },
                 .chain => |cid| {
                     try buf.appendSlice(allocator, " else ");
-                    try emitExpr(allocator, buf, g, b, cid, depth, value_position);
+                    try emitExpr(allocator, buf, g, b, cid, depth, value_position, is_comptime);
                 },
             }
         },
         .match => |me| {
-            try emitMatch(allocator, buf, g, b, me, depth);
+            try emitMatch(allocator, buf, g, b, me, depth, is_comptime);
         },
         .break_ => |be| {
             try buf.appendSlice(allocator, "break");
             if (be.value) |vid| {
                 try buf.append(allocator, ' ');
-                try emitExpr(allocator, buf, g, b, vid, depth, true);
+                try emitExpr(allocator, buf, g, b, vid, depth, true, is_comptime);
             }
         },
         .continue_ => {
@@ -1290,36 +1321,36 @@ fn emitExpr(
         },
         .loop_ => |le| {
             try buf.appendSlice(allocator, "while (true) ");
-            try emitBlock(allocator, buf, g, b, le.body, depth + 1);
+            try emitBlock(allocator, buf, g, b, le.body, depth + 1, is_comptime);
         },
         .binary => |be| {
-            try emitOperand(allocator, buf, g, b, be.lhs, depth);
+            try emitOperand(allocator, buf, g, b, be.lhs, depth, is_comptime);
             try buf.append(allocator, ' ');
             try buf.appendSlice(allocator, binaryOpString(be.op, be.overflow));
             try buf.append(allocator, ' ');
-            try emitOperand(allocator, buf, g, b, be.rhs, depth);
+            try emitOperand(allocator, buf, g, b, be.rhs, depth, is_comptime);
         },
         .unary => |ue| {
             switch (ue.op) {
                 .negate => {
                     try buf.append(allocator, '-');
-                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true);
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true, is_comptime);
                 },
                 .logical_not => {
                     try buf.append(allocator, '!');
-                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true);
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true, is_comptime);
                 },
                 .bit_not => {
                     try buf.appendSlice(allocator, "~");
-                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true);
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true, is_comptime);
                 },
                 .deref => {
-                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true);
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true, is_comptime);
                     try buf.appendSlice(allocator, ".*");
                 },
                 .ref => {
                     try buf.append(allocator, '&');
-                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true);
+                    try emitExpr(allocator, buf, g, b, ue.operand, depth, true, is_comptime);
                 },
             }
         },
@@ -1354,12 +1385,12 @@ fn emitExpr(
             try buf.append(allocator, '(');
             for (c.args, 0..) |aid, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
-                try emitExpr(allocator, buf, g, b, aid, depth, true);
+                try emitExpr(allocator, buf, g, b, aid, depth, true, is_comptime);
             }
             try buf.append(allocator, ')');
         },
         .method_call => |mc| {
-            try emitExpr(allocator, buf, g, b, mc.receiver, depth, true);
+            try emitExpr(allocator, buf, g, b, mc.receiver, depth, true, is_comptime);
             try buf.append(allocator, '.');
             if (g.symbol_table.get(mc.method)) |me| {
                 try emitIdent(allocator, buf, entityName(me));
@@ -1369,19 +1400,19 @@ fn emitExpr(
             try buf.append(allocator, '(');
             for (mc.args, 0..) |aid, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
-                try emitExpr(allocator, buf, g, b, aid, depth, true);
+                try emitExpr(allocator, buf, g, b, aid, depth, true, is_comptime);
             }
             try buf.append(allocator, ')');
         },
         .field => |fe| {
-            try emitExpr(allocator, buf, g, b, fe.base, depth, true);
+            try emitExpr(allocator, buf, g, b, fe.base, depth, true, is_comptime);
             try buf.append(allocator, '.');
             try emitIdent(allocator, buf, fe.field);
         },
         .index => |ie| {
-            try emitExpr(allocator, buf, g, b, ie.base, depth, true);
+            try emitExpr(allocator, buf, g, b, ie.base, depth, true, is_comptime);
             try buf.append(allocator, '[');
-            try emitExpr(allocator, buf, g, b, ie.index, depth, true);
+            try emitExpr(allocator, buf, g, b, ie.index, depth, true, is_comptime);
             try buf.append(allocator, ']');
         },
         .struct_lit => |sl| {
@@ -1392,7 +1423,7 @@ fn emitExpr(
                     try buf.appendSlice(allocator, " .");
                     try emitIdent(allocator, buf, fld.field);
                     try buf.appendSlice(allocator, " = ");
-                    try emitExpr(allocator, buf, g, b, fld.value, depth, true);
+                    try emitExpr(allocator, buf, g, b, fld.value, depth, true, is_comptime);
                 }
                 try buf.appendSlice(allocator, " }");
             } else {
@@ -1401,7 +1432,7 @@ fn emitExpr(
         },
         .try_ => |te| {
             try buf.appendSlice(allocator, "try ");
-            try emitExpr(allocator, buf, g, b, te.inner, depth, true);
+            try emitExpr(allocator, buf, g, b, te.inner, depth, true, is_comptime);
         },
         .enum_variant => |ev| {
             // A variant of an error-set enum (parent enum lives in the
@@ -1419,7 +1450,7 @@ fn emitExpr(
             try emitIdent(allocator, buf, ev.variant);
             if (ev.tuple_fields.len == 1) {
                 try buf.appendSlice(allocator, " = ");
-                try emitExpr(allocator, buf, g, b, ev.tuple_fields[0], depth, value_position);
+                try emitExpr(allocator, buf, g, b, ev.tuple_fields[0], depth, value_position, is_comptime);
             } else if (ev.tuple_fields.len > 1) {
                 try buf.appendSlice(allocator, " = .{ ");
                 for (ev.tuple_fields, 0..) |tf, i| {
@@ -1428,7 +1459,7 @@ fn emitExpr(
                     defer allocator.free(tf_name);
                     try buf.appendSlice(allocator, tf_name);
                     try buf.appendSlice(allocator, " = ");
-                    try emitExpr(allocator, buf, g, b, tf, depth, value_position);
+                    try emitExpr(allocator, buf, g, b, tf, depth, value_position, is_comptime);
                 }
                 try buf.appendSlice(allocator, " }");
             } else if (ev.named_fields.len > 0) {
@@ -1438,13 +1469,40 @@ fn emitExpr(
                     try buf.append(allocator, '.');
                     try emitIdent(allocator, buf, nf.field);
                     try buf.appendSlice(allocator, " = ");
-                    try emitExpr(allocator, buf, g, b, nf.value, depth, value_position);
+                    try emitExpr(allocator, buf, g, b, nf.value, depth, value_position, is_comptime);
                 }
                 try buf.appendSlice(allocator, " }");
             }
             try buf.appendSlice(allocator, " }");
         },
-        else => try buf.appendSlice(allocator, "/* unsupported expr */"),
+        .unsupported => |u| {
+            if (is_comptime) {
+                // Never @panic at comptime: const/static initializers are
+                // evaluated at compile time, where a panic is a compile error.
+                // Emit a loud comment plus `undefined`, which coerces to the
+                // declared type of the enclosing initializer.
+                try buf.appendSlice(allocator, "// translate-rust: unsupported ");
+                try appendEscapedString(allocator, buf, u.reason);
+                try buf.append(allocator, '\n');
+                try buf.appendSlice(allocator, "undefined");
+            } else {
+                // `if (true) @panic(...)` prevents unreachable code errors while
+                // coercing in value positions so downstream references typecheck.
+                try buf.appendSlice(allocator, "if (true) @panic(\"translate-rust: unsupported: ");
+                try appendEscapedString(allocator, buf, u.reason);
+                try buf.appendSlice(allocator, "\")");
+            }
+        },
+        else => {
+            // Genuinely unhandled kinds (closure, iterator_chain, future seams).
+            if (is_comptime) {
+                try buf.appendSlice(allocator, "// translate-rust: unsupported expression\nundefined");
+            } else if (value_position) {
+                try buf.appendSlice(allocator, "if (true) @panic(\"translate-rust: unsupported expression\")");
+            } else {
+                try buf.appendSlice(allocator, "if (true) @panic(\"translate-rust: unsupported expression\")");
+            }
+        },
     }
 }
 
@@ -1455,6 +1513,7 @@ fn emitStmt(
     b: *const Bodies,
     stmt_id: exprs.NodeId,
     depth: u32,
+    is_comptime: bool,
 ) !void {
     const s = b.stmts[stmt_id];
     switch (s.kind) {
@@ -1473,13 +1532,13 @@ fn emitStmt(
             }
             if (ls.init) |init_id| {
                 try buf.appendSlice(allocator, " = ");
-                try emitExpr(allocator, buf, g, b, init_id, depth, true);
+                try emitExpr(allocator, buf, g, b, init_id, depth, true, is_comptime);
             }
             try buf.appendSlice(allocator, ";\n");
         },
         .expr => |eid| {
             try writeIndent(allocator, buf, depth);
-            try emitExpr(allocator, buf, g, b, eid, depth, false);
+            try emitExpr(allocator, buf, g, b, eid, depth, false, is_comptime);
             // Control-flow exprs (for, while, if, …) are used as statements
             // without a trailing `;` in Zig; value expressions require one.
             const needs_semi = switch (b.exprs[eid].kind) {
@@ -1511,13 +1570,14 @@ fn emitBlockBody(
     b: *const Bodies,
     block: exprs.BlockExpr,
     depth: u32,
+    is_comptime: bool,
 ) !void {
     for (block.statements) |sid| {
-        try emitStmt(allocator, buf, g, b, sid, depth);
+        try emitStmt(allocator, buf, g, b, sid, depth, is_comptime);
     }
     if (block.tail) |tid| {
         try writeIndent(allocator, buf, depth);
-        try emitExpr(allocator, buf, g, b, tid, depth, true);
+        try emitExpr(allocator, buf, g, b, tid, depth, true, is_comptime);
         // Tail expressions always need `;` (return already handled via
         // emitStmt or emitBlock context — here we add unconditionally for
         // non-control-flow tails, which is the common case for value tails).
@@ -1538,6 +1598,7 @@ fn emitBlock(
     b: *const Bodies,
     block: exprs.BlockExpr,
     depth: u32,
+    is_comptime: bool,
 ) !void {
     if (block.statements.len == 0 and block.tail == null) {
         try buf.appendSlice(allocator, "{}");
@@ -1545,7 +1606,7 @@ fn emitBlock(
     }
     try buf.append(allocator, '{');
     try buf.append(allocator, '\n');
-    try emitBlockBody(allocator, buf, g, b, block, depth);
+    try emitBlockBody(allocator, buf, g, b, block, depth, is_comptime);
     // Closing brace at parent indentation.
     if (depth > 0) try writeIndent(allocator, buf, depth - 1);
     try buf.append(allocator, '}');
@@ -1579,7 +1640,7 @@ fn emitFnBody(
     const body = b.exprs[body_id];
     if (body.kind != .block) {
         // Not a block body (unusual); emit it directly as the fn expression.
-        return emitExpr(allocator, buf, g, b, body_id, depth, true);
+        return emitExpr(allocator, buf, g, b, body_id, depth, true, false);
     }
     const block = body.kind.block;
     if (block.statements.len == 0 and block.tail == null) {
@@ -1591,7 +1652,7 @@ fn emitFnBody(
     try buf.append(allocator, '{');
     try buf.append(allocator, '\n');
     for (block.statements) |sid| {
-        try emitStmt(allocator, buf, g, b, sid, depth);
+        try emitStmt(allocator, buf, g, b, sid, depth, false);
     }
     if (block.tail) |tid| {
         try writeIndent(allocator, buf, depth);
@@ -1599,12 +1660,12 @@ fn emitFnBody(
         switch (te.kind) {
             .return_ => {
                 // `return <value>;` — the return_ expr already writes "return".
-                try emitExpr(allocator, buf, g, b, tid, depth, true);
+                try emitExpr(allocator, buf, g, b, tid, depth, true, false);
                 try buf.append(allocator, ';');
             },
             .for_, .while_, .loop_ => {
                 // Statement-kind control flow; no trailing `;`.
-                try emitExpr(allocator, buf, g, b, tid, depth, false);
+                try emitExpr(allocator, buf, g, b, tid, depth, false, false);
             },
             else => {
                 // `if`/`match`/bare-value tail. For a void fn, an `if`/`match`
@@ -1613,15 +1674,15 @@ fn emitFnBody(
                 // value and must be wrapped in an explicit `return`.
                 if (returns_no_value) {
                     switch (te.kind) {
-                        .if_else, .if_let, .match => try emitExpr(allocator, buf, g, b, tid, depth, false),
+                        .if_else, .if_let, .match => try emitExpr(allocator, buf, g, b, tid, depth, false, false),
                         else => {
-                            try emitExpr(allocator, buf, g, b, tid, depth, true);
+                            try emitExpr(allocator, buf, g, b, tid, depth, true, false);
                             try buf.append(allocator, ';');
                         },
                     }
                 } else {
                     try buf.appendSlice(allocator, "return ");
-                    try emitExpr(allocator, buf, g, b, tid, depth, true);
+                    try emitExpr(allocator, buf, g, b, tid, depth, true, false);
                     try buf.append(allocator, ';');
                 }
             },
@@ -1688,25 +1749,26 @@ fn emitBranch(
     block: exprs.BlockExpr,
     depth: u32,
     value_position: bool,
+    is_comptime: bool,
 ) !void {
     if (block.statements.len == 0) {
         if (block.tail) |tid| {
             const te = b.exprs[tid];
             if (value_position and te.kind == .return_) {
                 if (te.kind.return_.value) |vid| {
-                    try emitExpr(allocator, buf, g, b, vid, depth, true);
+                    try emitExpr(allocator, buf, g, b, vid, depth, true, is_comptime);
                 } else {
                     try buf.appendSlice(allocator, "{}");
                 }
                 return;
             }
-            try emitExpr(allocator, buf, g, b, tid, depth, value_position);
+            try emitExpr(allocator, buf, g, b, tid, depth, value_position, is_comptime);
             return;
         }
         try buf.appendSlice(allocator, "{}");
         return;
     }
-    try emitBlock(allocator, buf, g, b, block, depth);
+    try emitBlock(allocator, buf, g, b, block, depth, is_comptime);
 }
 
 fn emitOperand(
@@ -1716,6 +1778,7 @@ fn emitOperand(
     b: *const Bodies,
     expr_id: exprs.NodeId,
     depth: u32,
+    is_comptime: bool,
 ) !void {
     // Parenthesize nested operator expressions so Zig's precedence preserves
     // the IR's AST grouping (e.g. `(a & b) + (c >> d)`).
@@ -1725,10 +1788,10 @@ fn emitOperand(
     };
     if (needs_paren) {
         try buf.append(allocator, '(');
-        try emitExpr(allocator, buf, g, b, expr_id, depth, true);
+        try emitExpr(allocator, buf, g, b, expr_id, depth, true, is_comptime);
         try buf.append(allocator, ')');
     } else {
-        try emitExpr(allocator, buf, g, b, expr_id, depth, true);
+        try emitExpr(allocator, buf, g, b, expr_id, depth, true, is_comptime);
     }
 }
 
@@ -2870,4 +2933,9 @@ test "M2: function calls, method calls, and builtin calls" {
     const formatted = try formatZig(allocator, out);
     defer allocator.free(formatted);
     try std.testing.expect(formatted.len > 0);
+}
+
+// Wire in the P2 `.unsupported`-expr emission tests.
+test {
+    _ = @import("emit_unsupported_test.zig");
 }
