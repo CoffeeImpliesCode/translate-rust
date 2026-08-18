@@ -9,6 +9,7 @@ pub const version = "0.0.0";
 // Expose the syntax front-end and the semantic IR under the project namespace.
 pub const rust = @import("translate_rust.rust");
 pub const model = @import("translate_rust.model");
+pub const ir = @import("translate_rust.ir");
 
 test {
     std.testing.refAllDecls(@This());

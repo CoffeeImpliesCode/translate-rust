@@ -41,6 +41,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rust", .module = rust },
         },
     });
+    // ── translate_rust.ir — pure semantic IR and serialization ───────────
+    const ir = b.addModule("translate_rust.ir", .{
+        .root_source_file = b.path("src/ir/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // ── translate_rust — library root ─────────────────────────
     const translate_rust = b.addModule("translate_rust", .{
@@ -50,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "translate_rust.rust", .module = rust },
             .{ .name = "translate_rust.model", .module = model },
+            .{ .name = "translate_rust.ir", .module = ir },
         },
     });
 
@@ -191,6 +198,23 @@ pub fn build(b: *std.Build) void {
 
     const lib_tests = b.addTest(.{ .root_module = translate_rust });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+
+    const ir_unit_tests = b.addTest(.{
+        .root_module = ir,
+    });
+    test_step.dependOn(&b.addRunArtifact(ir_unit_tests).step);
+
+    const ir_serialize_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ir/serialize_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust.ir", .module = ir },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(ir_serialize_tests).step);
 
     const rust_tests = b.addTest(.{ .root_module = rust });
     test_step.dependOn(&b.addRunArtifact(rust_tests).step);
