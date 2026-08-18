@@ -12,6 +12,7 @@ pub const model = @import("translate_rust.model");
 pub const ir = @import("translate_rust.ir");
 pub const frontend = @import("translate_rust.frontend");
 pub const backend = @import("translate_rust.backend");
+pub const driver = @import("translate_rust.driver");
 
 test {
     std.testing.refAllDecls(@This());

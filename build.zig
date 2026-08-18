@@ -69,6 +69,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── translate_rust.driver — end-to-end translation pipeline ─────────
+    const driver = b.addModule("translate_rust.driver", .{
+        .root_source_file = b.path("src/driver/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "translate_rust.ir", .module = ir },
+            .{ .name = "translate_rust.frontend", .module = frontend },
+            .{ .name = "translate_rust.backend", .module = backend },
+        },
+    });
+
     // ── translate_rust — library root ─────────────────────────
     const translate_rust = b.addModule("translate_rust", .{
         .root_source_file = b.path("src/root.zig"),
@@ -80,6 +92,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "translate_rust.ir", .module = ir },
             .{ .name = "translate_rust.frontend", .module = frontend },
             .{ .name = "translate_rust.backend", .module = backend },
+            .{ .name = "translate_rust.driver", .module = driver },
         },
     });
     // ── translate-rust executable ─────────────────────────

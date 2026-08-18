@@ -6,6 +6,10 @@ const std = @import("std");
 
 /// Structured DOM for Zig source packages.
 pub const ast = @import("ast.zig");
+/// Text emitter: ast.Package/File -> Zig source.
+pub const emit = @import("emit.zig");
+/// Package writer: ast.Package -> files on disk (build.zig, build.zig.zon, src/*).
+pub const package = @import("package.zig");
 /// Lowering engine: RustIR to ast.Package.
 pub const lower = @import("lower.zig");
 /// Lowering engine tests.
