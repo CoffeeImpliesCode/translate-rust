@@ -502,9 +502,9 @@ test "full fn f produces exact pins and edges" {
     var g = try infer.gen(a, &fx.b);
     defer g.deinit(a);
 
-    // Exact count: 3 pins (init of x, init of acc, 0x1u64), 3 edges (LHS<->res, RHS<->res, ret).
+    // Exact count: 3 pins (init of x, init of acc, 0x1u64), 5 edges (LHS<->res, RHS<->res, assign<->target, ret<->val, ret<->fn_body).
     try std.testing.expectEqual(@as(usize, 3), g.pins.items.len);
-    try std.testing.expectEqual(@as(usize, 3), g.edges.items.len);
+    try std.testing.expectEqual(@as(usize, 5), g.edges.items.len);
 
     // Pins:
     // 0: let x: u32 = 5 -> {node: 0, ty: 1}
@@ -522,12 +522,15 @@ test "full fn f produces exact pins and edges" {
     // Edges:
     // 0: eq(3, 4) — acc <-> add result
     // 1: eq(2, 4) — 0x1u64 <-> add result
-    // 2: ret(3, 7) — return acc <-> fn body block
+    // 2: eq(3, 5) — acc <-> assign node
+    // 3: eq(3, 6) — acc <-> return node
+    // 4: ret(3, 7) — return acc <-> fn body block
     try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 3, .b = 4 } }, g.edges.items[0]);
     try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 2, .b = 4 } }, g.edges.items[1]);
-    try std.testing.expectEqual(infer.Edge{ .ret = .{ .expr = 3, .fn_body = 7 } }, g.edges.items[2]);
+    try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 5, .b = 3 } }, g.edges.items[2]);
+    try std.testing.expectEqual(infer.Edge{ .ret = .{ .expr = 3, .fn_body = 7 } }, g.edges.items[3]);
+    try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 6, .b = 3 } }, g.edges.items[4]);
 }
-
 test "(e) body containing .unsupported completes without error and emits supported pins" {
     const a = std.testing.allocator;
     var fx = try buildFixtureG(a);
@@ -560,6 +563,383 @@ test "(e) body containing .unsupported completes without error and emits support
             },
         }
     }
+}
+
+test "solve on fixture f infers u32 and u64 on expressions" {
+    const a = std.testing.allocator;
+    var fx = try buildFixtureF(a);
+    defer {
+        deinitFixtureFStatements(a, &fx);
+        fx.deinit(a);
+    }
+
+    var inferred = try infer.solve(a, &fx.b);
+    defer inferred.deinit(a);
+
+    // Node 0 (lit 5 in `let x: u32 = 5`) -> u32 (1)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 1), inferred.getType(0));
+    // Node 1 (lit 0u64) -> u64 (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(1));
+    // Node 2 (lit 0x1u64) -> u64 (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(2));
+    // Node 3 (path acc) -> u64 (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(3));
+    // Node 4 (binary add `acc + 0x1u64`) -> u64 (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(4));
+    // Node 5 (assign `acc = acc + 0x1u64`) -> u64 (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(5));
+    // Node 6 (return acc) -> u64 (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(6));
+}
+
+test "fnv1a_hash and checksum style function infers u64 on every node with wrapping_mul" {
+    const a = std.testing.allocator;
+
+    // ── Types: 0=u64, 1=u32, 2=bool, 3=i32 ──
+    const types_store = try a.alloc(types.Type, 4);
+    types_store[0] = .{ .prim = .u64 };
+    types_store[1] = .{ .prim = .u32 };
+    types_store[2] = .{ .prim = .bool };
+    types_store[3] = .{ .prim = .i32 };
+
+    // ── Pats: 0=hash binding ──
+    const pats_store = try a.alloc(exprs.Pattern, 1);
+    pats_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "hash",
+            .mode = .{ .value = {} },
+            .mutable = true,
+        } },
+    };
+
+    // ── Exprs:
+    // 0: lit 0xcbf29ce484222325u64 (suffix u64)
+    // 1: path hash (def 10)
+    // 2: lit 0x100000001b3 (unannotated literal int)
+    // 3: binary wrapping_mul: hash *% 0x100000001b3 (lhs=1, rhs=2)
+    // 4: assign: hash = hash *% 0x100000001b3 (target=1, val=3)
+    // 5: return hash (value=1)
+    // 6: block body
+    const exprs_store = try a.alloc(exprs.Expr, 7);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "0xcbf29ce484222325u64",
+            .value = 14695981039346656037,
+            .base = .hex,
+            .ty_suffix = "u64",
+        } } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .path = .{ .def = 10, .generic_args = &.{} } },
+    };
+    exprs_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = null,
+        .kind = .{
+            .literal = .{
+                .int = .{
+                    .text = "0x100000001b3",
+                    .value = 1099511628211,
+                    .base = .hex,
+                    .ty_suffix = null, // unannotated!
+                },
+            },
+        },
+    };
+    exprs_store[3] = .{
+        .id = 3,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binary = .{
+            .op = .mul,
+            .overflow = .wrapping,
+            .lhs = 1,
+            .rhs = 2,
+        } },
+    };
+    exprs_store[4] = .{
+        .id = 4,
+        .span = span,
+        .ty = null,
+        .kind = .{ .assign = .{
+            .target = 1,
+            .op = .plain,
+            .value = 3,
+            .overflow = .wrapping,
+        } },
+    };
+    exprs_store[5] = .{
+        .id = 5,
+        .span = span,
+        .ty = null,
+        .kind = .{ .return_ = .{ .value = 1 } },
+    };
+    const stmt_ids = try a.alloc(exprs.NodeId, 3);
+    stmt_ids[0] = 0;
+    stmt_ids[1] = 1;
+    stmt_ids[2] = 2;
+    exprs_store[6] = .{
+        .id = 6,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = stmt_ids,
+            .tail = null,
+            .labelled = null,
+        } },
+    };
+
+    // ── Stmts:
+    // 0: let mut hash: u64 = 0xcbf29ce484222325u64
+    // 1: expr stmt (assign: hash = hash *% 0x100000001b3)
+    // 2: return hash
+    const stmts_store = try a.alloc(exprs.Statement, 3);
+    stmts_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .let = .{ .pattern = 0, .init = 0, .ty = 0 } },
+    };
+    stmts_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = 4 },
+    };
+    stmts_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = 5 },
+    };
+
+    const bodies_store = try a.alloc(bodies.BodyKind, 1);
+    const params = try a.dupe(items.Param, &.{});
+    bodies_store[0] = .{ .fn_ = .{
+        .params = params,
+        .ret = .{ .prim = .u64 },
+        .body = 6,
+    } };
+    defer {
+        a.free(stmt_ids);
+        a.free(params);
+        a.free(bodies_store);
+        a.free(stmts_store);
+        a.free(exprs_store);
+        a.free(pats_store);
+        a.free(types_store);
+    }
+
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = stmts_store,
+        .pats = pats_store,
+        .types = types_store,
+        .bodies = bodies_store,
+    };
+
+    var inferred = try infer.solve(a, &b);
+    defer inferred.deinit(a);
+
+    // Every expression node in fnv1a_hash must infer u64 (TypeId 0):
+    // 0: initial hash literal
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(0));
+    // 1: hash path
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(1));
+    // 2: unannotated multiplier literal 0x100000001b3 unifies to u64
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(2));
+    // 3: wrapping_mul binary expression
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(3));
+    // 4: assign expression
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(4));
+    // 5: return expression
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(5));
+
+    // Verify apply mutates exprs.ty
+    inferred.apply(exprs_store);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), exprs_store[0].ty);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), exprs_store[2].ty);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), exprs_store[3].ty);
+}
+
+test "unannotated integer defaults to i32 and unannotated float defaults to f64" {
+    const a = std.testing.allocator;
+
+    const types_store = try a.alloc(types.Type, 2);
+    types_store[0] = .{ .prim = .i32 };
+    types_store[1] = .{ .prim = .f64 };
+
+    const exprs_store = try a.alloc(exprs.Expr, 3);
+    // 0: unannotated integer literal 42
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "42",
+            .value = 42,
+            .base = .dec,
+            .ty_suffix = null,
+        } } },
+    };
+    // 1: unannotated float literal 3.14
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .float = .{
+            .text = "3.14",
+            .value = 3.14,
+        } } },
+    };
+    // 2: block body
+    const stmt_ids = try a.alloc(exprs.NodeId, 2);
+    stmt_ids[0] = 0;
+    stmt_ids[1] = 1;
+    exprs_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = stmt_ids,
+            .tail = null,
+            .labelled = null,
+        } },
+    };
+
+    const stmts_store = try a.alloc(exprs.Statement, 2);
+    stmts_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 0 } };
+    stmts_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 1 } };
+
+    const bodies_store = try a.alloc(bodies.BodyKind, 1);
+    const params = try a.dupe(items.Param, &.{});
+    bodies_store[0] = .{ .fn_ = .{
+        .params = params,
+        .ret = .{ .prim = .unit },
+        .body = 2,
+    } };
+
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = stmts_store,
+        .pats = &.{},
+        .types = types_store,
+        .bodies = bodies_store,
+    };
+
+    var inferred = try infer.solve(a, &b);
+    defer inferred.deinit(a);
+
+    // Unannotated integer 42 defaults to i32 (TypeId 0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(0));
+    // Unannotated float 3.14 defaults to f64 (TypeId 1)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 1), inferred.getType(1));
+
+    a.free(stmt_ids);
+    a.free(params);
+    a.free(bodies_store);
+    a.free(stmts_store);
+    a.free(exprs_store);
+    a.free(types_store);
+}
+
+test "control flow if_else and comparison type inference" {
+    const a = std.testing.allocator;
+
+    // Types: 0=u64, 1=bool, 2=i32
+    const types_store = try a.alloc(types.Type, 3);
+    types_store[0] = .{ .prim = .u64 };
+    types_store[1] = .{ .prim = .bool };
+    types_store[2] = .{ .prim = .i32 };
+
+    const exprs_store = try a.alloc(exprs.Expr, 6);
+    // 0: lit 10u64 (pinned u64)
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{ .text = "10u64", .value = 10, .base = .dec, .ty_suffix = "u64" } } },
+    };
+    // 1: lit 20 (unannotated)
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{ .text = "20", .value = 20, .base = .dec, .ty_suffix = null } } },
+    };
+    // 2: binary lt: 0 < 1
+    exprs_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binary = .{ .op = .lt, .overflow = .checked, .lhs = 0, .rhs = 1 } },
+    };
+    // 3: then block (tail=0)
+    exprs_store[3] = .{
+        .id = 3,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 0, .labelled = null } },
+    };
+    // 4: else block (tail=1)
+    exprs_store[4] = .{
+        .id = 4,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 1, .labelled = null } },
+    };
+    // 5: if_else (cond=2, then=3, else=4)
+    exprs_store[5] = .{
+        .id = 5,
+        .span = span,
+        .ty = null,
+        .kind = .{ .if_else = .{
+            .cond = 2,
+            .then_ = exprs_store[3].kind.block,
+            .@"else" = .{ .block = exprs_store[4].kind.block },
+        } },
+    };
+
+    const bodies_store = try a.alloc(bodies.BodyKind, 1);
+    const params = try a.dupe(items.Param, &.{});
+    bodies_store[0] = .{ .fn_ = .{
+        .params = params,
+        .ret = .{ .prim = .u64 },
+        .body = 5,
+    } };
+
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = types_store,
+        .bodies = bodies_store,
+    };
+
+    var inferred = try infer.solve(a, &b);
+    defer inferred.deinit(a);
+
+    // Comparison result is bool (TypeId 1)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 1), inferred.getType(2));
+    // Unannotated literal 20 in else branch unifies with 10u64 -> u64 (TypeId 0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(1));
+    // The if_else expr itself unifies with branches -> u64 (TypeId 0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(5));
+
+    a.free(params);
+    a.free(bodies_store);
+    a.free(exprs_store);
+    a.free(types_store);
 }
 
 test "non-fn bodies are skipped without error" {
