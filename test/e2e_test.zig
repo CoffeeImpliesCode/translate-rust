@@ -15,6 +15,22 @@ const std = @import("std");
 const translate_rust = @import("translate_rust");
 const driver = translate_rust.model.driver;
 
+fn writeMsg(io: std.Io, out: std.Io.File, comptime fmt: []const u8, args: anytype) !void {
+    const msg = try std.fmt.allocPrint(std.heap.page_allocator, fmt ++ "\n", args);
+    defer std.heap.page_allocator.free(msg);
+    try out.writeStreamingAll(io, msg);
+}
+
+/// Read a whole file into `allocator` (caller owns the returned slice).
+fn readFileAlloc(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    var dir = std.Io.Dir.cwd();
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    var io_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &io_buf);
+    return reader.interface.allocRemaining(gpa, .limited(1 << 24));
+}
+
 /// Translate `crate_dir` into `out_dir`, assert the emitted package layout and
 /// key symbols, then run `zig build test` inside the package.
 fn runCrate(
@@ -31,61 +47,43 @@ fn runCrate(
     try cwd.createDirPath(io, out_dir);
     errdefer cwd.deleteTree(io, out_dir) catch {};
 
-    try stdout.writeStreamingAll(io, "e2e: translating `{s}`...\n");
+    try writeMsg(io, stdout, "e2e: translating `{s}`", .{crate_dir});
 
-    // 1. In-process native translation (no Rust toolchain).
+    // 1. In-process native translation (no cargo/rustdoc/sidecar).
     try driver.translate(gpa, io, stdout, crate_dir, out_dir);
 
     // 2. Assert the emitted package layout exists on disk.
     const rel_paths = [_][]const u8{ "build.zig", "build.zig.zon", "src/root.zig" };
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(gpa);
     for (rel_paths) |rel| {
-        buf.clearRetainingCapacity();
-        try buf.appendSlice(gpa, out_dir);
-        try buf.append(gpa, '/');
-        try buf.appendSlice(gpa, rel);
-        const full = try buf.toOwnedSlice(gpa);
+        const full = try std.fs.path.join(gpa, &.{ out_dir, rel });
         defer gpa.free(full);
         var file = try cwd.openFile(io, full, .{});
         file.close(io);
     }
 
-    // 3. Assert content markers: `build.zig.zon` names the package, and
-    //    `src/root.zig` carries the expected translated symbols.
+    // 3. Assert `build.zig.zon` names the package.
     const zon_rel = try std.fs.path.join(gpa, &.{ out_dir, "build.zig.zon" });
     defer gpa.free(zon_rel);
-    {
-        var zon_file = try cwd.openFile(io, zon_rel, .{});
-        defer zon_file.close(io);
-        var io_buf: [4096]u8 = undefined;
-        var reader = zon_file.reader(io, &io_buf);
-        const zon_content = try reader.interface.allocRemaining(gpa, .limited(1 << 20));
-        defer gpa.free(zon_content);
-        if (std.mem.indexOf(u8, zon_content, package_stem) == null) {
-            try stdout.writeStreamingAll(io, "e2e: FAIL — build.zig.zon lacks package name `{s}`\n", .{package_stem});
-            return error.PackageNameMissing;
-        }
+    const zon_content = try readFileAlloc(gpa, io, zon_rel);
+    defer gpa.free(zon_content);
+    if (std.mem.indexOf(u8, zon_content, package_stem) == null) {
+        try writeMsg(io, stdout, "e2e: FAIL — build.zig.zon lacks package name `{s}`", .{package_stem});
+        return error.PackageNameMissing;
     }
 
+    // 4. Assert `src/root.zig` carries the expected translated symbols.
     const root_rel = try std.fs.path.join(gpa, &.{ out_dir, "src", "root.zig" });
     defer gpa.free(root_rel);
-    {
-        var root_file = try cwd.openFile(io, root_rel, .{});
-        defer root_file.close(io);
-        var io_buf: [4096]u8 = undefined;
-        var reader = root_file.reader(io, &io_buf);
-        const root_content = try reader.interface.allocRemaining(gpa, .limited(1 << 24));
-        defer gpa.free(root_content);
-        for (expected_symbols) |sym| {
-            if (std.mem.indexOf(u8, root_content, sym) == null) {
-                try stdout.writeStreamingAll(io, "e2e: FAIL — root.zig lacks symbol `{s}`\n", .{sym});
-                return error.SymbolMissing;
-            }
+    const root_content = try readFileAlloc(gpa, io, root_rel);
+    defer gpa.free(root_content);
+    for (expected_symbols) |sym| {
+        if (std.mem.indexOf(u8, root_content, sym) == null) {
+            try writeMsg(io, stdout, "e2e: FAIL — root.zig lacks symbol `{s}`", .{sym});
+            return error.SymbolMissing;
         }
     }
 
-    // 4. Prove the emitted package compiles and its tests pass.
+    // 5. Prove the emitted package compiles and its tests pass.
     const cmd = try std.fmt.allocPrint(gpa, "cd {s} && zig build test --summary all 2>&1", .{out_dir});
     defer gpa.free(cmd);
 
@@ -98,33 +96,45 @@ fn runCrate(
     switch (res.term) {
         .exited => |code| {
             if (code != 0) {
-                try stdout.writeStreamingAll(io, "e2e: FAIL — zig build test in `{s}` exited\n", .{out_dir});
+                try writeMsg(io, stdout, "e2e: FAIL — zig build test in `{s}` exited", .{out_dir});
                 try stdout.writeStreamingAll(io, res.stderr);
                 try stdout.writeStreamingAll(io, res.stdout);
                 return error.PackageTestFailed;
             }
         },
         else => {
-            try stdout.writeStreamingAll(io, "e2e: FAIL — zig build test in `{s}` terminated abnormally\n", .{out_dir});
+            try writeMsg(io, stdout, "e2e: FAIL — zig build test in `{s}` terminated abnormally", .{out_dir});
             return error.PackageTestTerminatedAbnormally;
         },
     }
 
     // Clean up on success.
     try cwd.deleteTree(io, out_dir);
-    try stdout.writeStreamingAll(io, "e2e: `{s}` → translated, compiles, and passes zig build test\n", .{crate_dir});
+    try writeMsg(io, stdout, "e2e: `{s}` translated, compiles, and passes zig build test", .{crate_dir});
 }
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const stdout = std.Io.File.stdout();
 
-    try runCrate(init.gpa, io, stdout,
-        "test/crates/mini", "zig-out/e2e-test-mini", "r2z_mini",
-        &.{ "Point", "Shape", "area" });
-    try runCrate(init.gpa, io, stdout,
-        "test/crates/fnv", "zig-out/e2e-test-fnv", "r2z_fnv",
-        &.{ "fnv1a_hash", "FNV_OFFSET_BASIS" });
+    try runCrate(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/mini",
+        "zig-out/e2e-test-mini",
+        "r2z_mini",
+        &.{ "Point", "Shape", "area" },
+    );
+    try runCrate(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/fnv",
+        "zig-out/e2e-test-fnv",
+        "r2z_fnv",
+        &.{ "FnvHasher", "FnvBuildHasher" },
+    );
 
-    try stdout.writeStreamingAll(io, "e2e: all crates translated and tested successfully\n");
+    try writeMsg(io, stdout, "e2e: all crates translated and tested successfully", .{});
 }
