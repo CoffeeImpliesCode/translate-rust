@@ -1013,6 +1013,25 @@ fn decodeParam(allocator: std.mem.Allocator, v: Json) !items.Param {
         .span = try decodeSpan(try req(o, "span")),
     };
 }
+fn decodeField(allocator: std.mem.Allocator, v: Json) !items.Field {
+    const o = try getObj(v);
+    const name = try reqStr(o, "name");
+    const ty = try decodeType(allocator, try req(o, "ty"));
+    const vis = if (o.get("vis") orelse o.get("visibility")) |vo|
+        try decodeVisibility(allocator, vo)
+    else
+        spine.Visibility.public;
+    const sp = if (o.get("span")) |sv|
+        try decodeSpan(sv)
+    else
+        spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .ty = ty,
+        .visibility = vis,
+        .span = sp,
+    };
+}
 
 fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
     const o = try getObj(v);
@@ -1040,6 +1059,27 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
         } };
     }
     if (std.mem.eql(u8, kind_str, "struct_")) {
+        if (o.get("value")) |sv| {
+            const so = try getObj(sv);
+            var layout: items.struct_kind = .named;
+            if (so.get("layout")) |_| {
+                const ls = try reqStr(so, "layout");
+                if (std.mem.eql(u8, ls, "tuple")) layout = .tuple;
+                if (std.mem.eql(u8, ls, "unit")) layout = .unit;
+            }
+            var fields_list: std.ArrayListUnmanaged(items.Field) = .empty;
+            if (so.get("fields")) |fv| {
+                if (fv == .array) {
+                    for (fv.array.items) |item| {
+                        try fields_list.append(allocator, try decodeField(allocator, item));
+                    }
+                }
+            }
+            return .{ .struct_ = .{
+                .layout = layout,
+                .fields = try fields_list.toOwnedSlice(allocator),
+            } };
+        }
         return .{ .struct_ = .{} };
     }
     if (std.mem.eql(u8, kind_str, "enum_")) {
@@ -2107,8 +2147,22 @@ fn encodeBodyKind(allocator: std.mem.Allocator, bk: BodyKind) !Json {
             try vo.put(allocator, "body", mkInt(fb.body));
             try o.put(allocator, "value", .{ .object = vo });
         },
-        .struct_ => {
+        .struct_ => |sb| {
             try o.put(allocator, "kind", .{ .string = "struct_" });
+            var vo = ObjectMap.empty;
+            if (sb.layout != .named) {
+                try vo.put(allocator, "layout", .{ .string = @tagName(sb.layout) });
+            }
+            var fields = Array.init(allocator);
+            for (sb.fields) |f| {
+                var fo = ObjectMap.empty;
+                try fo.put(allocator, "name", .{ .string = f.name });
+                try fo.put(allocator, "ty", try encodeType(allocator, f.ty));
+                try fo.put(allocator, "vis", try encodeVisibility(allocator, f.visibility));
+                try fields.append(.{ .object = fo });
+            }
+            try vo.put(allocator, "fields", .{ .array = fields });
+            try o.put(allocator, "value", .{ .object = vo });
         },
         .enum_ => {
             try o.put(allocator, "kind", .{ .string = "enum_" });
@@ -2360,7 +2414,7 @@ test "parseFull fnv v2 round-trip" {
     try std.testing.expectEqual(@as(usize, 7), model.bodies.stmts.len);
     try std.testing.expectEqual(@as(usize, 2), model.bodies.pats.len);
     try std.testing.expectEqual(@as(usize, 0), model.bodies.types.len);
-    try std.testing.expectEqual(@as(usize, 9), model.bodies.bodies.len);
+    try std.testing.expectEqual(@as(usize, 10), model.bodies.bodies.len);
     // bodies[1] (FNV_OFFSET_BASIS) is a const body whose init is expr 0.
     try std.testing.expectEqual(
         BodyKind.const_,
@@ -2385,5 +2439,5 @@ test "parseFull fnv v2 round-trip" {
     const model2 = try parseFull(arena.allocator(), encoded);
     try std.testing.expectEqual(@as(usize, 30), model2.bodies.exprs.len);
     try std.testing.expectEqual(@as(usize, 0), model2.bodies.types.len);
-    try std.testing.expectEqual(@as(usize, 9), model2.bodies.bodies.len);
+    try std.testing.expectEqual(@as(usize, 10), model2.bodies.bodies.len);
 }

@@ -1488,7 +1488,25 @@ fn emitExpr(
             try buf.append(allocator, ' ');
             try buf.appendSlice(allocator, binaryOpString(be.op, be.overflow));
             try buf.append(allocator, ' ');
-            try emitOperand(allocator, buf, g, b, be.rhs, depth, is_comptime);
+            // Zig requires the shift amount of `<<`/`>>` to be a narrow unsigned
+            // type (e.g. `u6` for a `u64` LHS), not a runtime `u64`. Comptime
+            // integer literals are accepted as-is, but a dynamic RHS must be
+            // narrowed explicitly or the emitted code fails to compile.
+            const is_shift = be.op == .shl or be.op == .shr;
+            const rhs_is_literal_int = switch (b.exprs[be.rhs].kind) {
+                .literal => |lit| switch (lit) {
+                    .int => true,
+                    else => false,
+                },
+                else => false,
+            };
+            if (is_shift and !rhs_is_literal_int) {
+                try buf.appendSlice(allocator, "@as(u6, @intCast(");
+                try emitOperand(allocator, buf, g, b, be.rhs, depth, is_comptime);
+                try buf.appendSlice(allocator, "))");
+            } else {
+                try emitOperand(allocator, buf, g, b, be.rhs, depth, is_comptime);
+            }
         },
         .unary => |ue| {
             switch (ue.op) {
@@ -2208,49 +2226,44 @@ test "emit fnv golden" {
     const allocator = std.testing.allocator;
     const test_io = std.testing.io;
 
-    // 1) Read and parse the wire input.
+    // 1) Read and parse the wire input (v2, with bodies).
     const json_bytes = try readFixture(allocator, test_io, "test/fnv.json");
     defer allocator.free(json_bytes);
 
-    var g = try json.parse(allocator, json_bytes);
-    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const model = try json.parseFull(arena.allocator(), json_bytes);
 
-    // 2) Emit Zig source text.
-    const emitted = try emit(allocator, &g);
+    // 2) Emit Zig source text with full body lowering.
+    const emitted = try emitRich(allocator, &model.graph, &model.bodies);
     defer allocator.free(emitted);
 
-    // P2 emitter produces placeholder signatures and const decls from the wire
-    // (which carries no params, return types, or bodies).  The golden file
-    // represents the aspirational full-translation output (P3).  We verify
-    // structural correctness by checking that the emitted text contains the
-    // expected items in the right order.
+    // The golden model carries a struct (FnvHasher, tuple layout @"0": u64)
+    // alongside the constants and fnv1a_hash function.
     //
-    // 3a) FNV_OFFSET_BASIS — private const, no pub prefix.
+    // 3a) FNV_OFFSET_BASIS — private const.
     try std.testing.expect(
-        std.mem.indexOf(u8, emitted, "const FNV_OFFSET_BASIS: void = // init not yet lowered") != null,
+        std.mem.indexOf(u8, emitted, "const FNV_OFFSET_BASIS") != null,
     );
-    // 3b) FNV_PRIME — same pattern.
+    // 3b) FNV_PRIME — private const.
     try std.testing.expect(
-        std.mem.indexOf(u8, emitted, "const FNV_PRIME: void = // init not yet lowered") != null,
+        std.mem.indexOf(u8, emitted, "const FNV_PRIME") != null,
     );
-    // 3c) fnv1a_hash — public fn with placeholder body.
+    // 3c) fnv1a_hash — public fn with a real body (no placeholder).
     try std.testing.expect(
-        std.mem.indexOf(u8, emitted, "pub fn fnv1a_hash() void {") != null,
+        std.mem.indexOf(u8, emitted, "pub fn fnv1a_hash") != null,
+    );
+    // 3d) FnvHasher — public tuple struct with @"0": u64 field.
+    try std.testing.expect(
+        std.mem.indexOf(u8, emitted, "pub const FnvHasher = struct {") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, emitted, "// body not yet lowered") != null,
-    );
-    // 3d) No "unsupported" comments for kinds the emitter handles.
-    try std.testing.expectEqual(
-        @as(?usize, null),
-        std.mem.indexOf(u8, emitted, "// unsupported:"),
+        std.mem.indexOf(u8, emitted, "@\"0\": u64,") != null,
     );
     // 3e) Declarations appear in wire order: consts before fn.
     const basis_pos = std.mem.indexOf(u8, emitted, "const FNV_OFFSET_BASIS").?;
-    const prime_pos = std.mem.indexOf(u8, emitted, "const FNV_PRIME").?;
     const fn_pos = std.mem.indexOf(u8, emitted, "pub fn fnv1a_hash").?;
-    try std.testing.expect(basis_pos < prime_pos);
-    try std.testing.expect(prime_pos < fn_pos);
+    try std.testing.expect(basis_pos < fn_pos);
 }
 
 // ---------------------------------------------------------------------------

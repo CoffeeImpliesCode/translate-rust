@@ -178,6 +178,42 @@
           "resolved": null,
           "renamed_to": null,
           "attributes": []
+        },
+        {
+          "id": 9,
+          "kind": "struct_",
+          "name": "FnvHasher",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 10,
+          "kind": "field",
+          "name": "0",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 9,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         }
       ],
       "modules": [
@@ -199,7 +235,8 @@
             1,
             2,
             3,
-            7
+            7,
+            9
           ],
           "attributes": []
         }
@@ -285,6 +322,24 @@
       },
       {
         "kind": "none"
+      },
+      {
+        "kind": "struct_",
+        "value": {
+          "layout": "tuple",
+          "fields": [
+            {
+              "name": "0",
+              "ty": {
+                "kind": "prim",
+                "value": "u64"
+              },
+              "vis": {
+                "kind": "public"
+              }
+            }
+          ]
+        }
       }
     ],
     "exprs": [

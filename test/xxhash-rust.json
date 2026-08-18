@@ -160,6 +160,24 @@
           "resolved": null,
           "renamed_to": null,
           "attributes": []
+        },
+        {
+          "id": 8,
+          "kind": "field",
+          "name": "hash",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 4,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         }
       ],
       "modules": [
@@ -259,7 +277,7 @@
             "kind": "prim",
             "value": "u32"
           },
-          "body": 19
+          "body": 28
         }
       },
       {
@@ -273,8 +291,11 @@
             "kind": "prim",
             "value": "unit"
           },
-          "body": 25
+          "body": 49
         }
+      },
+      {
+        "kind": "none"
       },
       {
         "kind": "none"
@@ -533,15 +554,10 @@
           "end_col": 1
         },
         "ty": null,
-        "kind": "literal",
+        "kind": "path",
         "value": {
-          "kind": "int",
-          "value": {
-            "text": "15",
-            "value": "15",
-            "base": "dec",
-            "ty_suffix": null
-          }
+          "def": 8,
+          "generic_args": []
         }
       },
       {
@@ -553,12 +569,15 @@
           "end_col": 1
         },
         "ty": null,
-        "kind": "binary",
+        "kind": "literal",
         "value": {
-          "op": "shr",
-          "overflow": "wrapping",
-          "lhs": 13,
-          "rhs": 14
+          "kind": "int",
+          "value": {
+            "text": "15",
+            "value": "15",
+            "base": "dec",
+            "ty_suffix": null
+          }
         }
       },
       {
@@ -572,14 +591,31 @@
         "ty": null,
         "kind": "binary",
         "value": {
-          "op": "bit_xor",
+          "op": "shr",
           "overflow": "wrapping",
-          "lhs": 13,
+          "lhs": 14,
           "rhs": 15
         }
       },
       {
         "id": 17,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "assign",
+        "value": {
+          "op": "bit_xor",
+          "target": 14,
+          "value": 16,
+          "overflow": "wrapping"
+        }
+      },
+      {
+        "id": 18,
         "span": {
           "start_line": 1,
           "start_col": 1,
@@ -599,23 +635,6 @@
         }
       },
       {
-        "id": 18,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "mul",
-          "overflow": "wrapping",
-          "lhs": 16,
-          "rhs": 17
-        }
-      },
-      {
         "id": 19,
         "span": {
           "start_line": 1,
@@ -624,11 +643,12 @@
           "end_col": 1
         },
         "ty": null,
-        "kind": "block",
+        "kind": "assign",
         "value": {
-          "statements": [],
-          "tail": 18,
-          "labelled": null
+          "op": "mul",
+          "target": 14,
+          "value": 18,
+          "overflow": "wrapping"
         }
       },
       {
@@ -644,8 +664,8 @@
         "value": {
           "kind": "int",
           "value": {
-            "text": "0",
-            "value": "0",
+            "text": "13",
+            "value": "13",
             "base": "dec",
             "ty_suffix": null
           }
@@ -653,6 +673,154 @@
       },
       {
         "id": 21,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "shr",
+          "overflow": "wrapping",
+          "lhs": 14,
+          "rhs": 20
+        }
+      },
+      {
+        "id": 22,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "assign",
+        "value": {
+          "op": "bit_xor",
+          "target": 14,
+          "value": 21,
+          "overflow": "wrapping"
+        }
+      },
+      {
+        "id": 23,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0xC2B2AE3D",
+            "value": "3266489917",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 24,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "assign",
+        "value": {
+          "op": "mul",
+          "target": 14,
+          "value": 23,
+          "overflow": "wrapping"
+        }
+      },
+      {
+        "id": 25,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "16",
+            "value": "16",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 26,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "shr",
+          "overflow": "wrapping",
+          "lhs": 14,
+          "rhs": 25
+        }
+      },
+      {
+        "id": 27,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "assign",
+        "value": {
+          "op": "bit_xor",
+          "target": 14,
+          "value": 26,
+          "overflow": "wrapping"
+        }
+      },
+      {
+        "id": 28,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "tail": 14,
+          "labelled": null
+        }
+      },
+      {
+        "id": 29,
         "span": {
           "start_line": 1,
           "start_col": 1,
@@ -672,7 +840,27 @@
         }
       },
       {
-        "id": 22,
+        "id": 30,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0",
+            "value": "0",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 31,
         "span": {
           "start_line": 1,
           "start_col": 1,
@@ -687,12 +875,12 @@
             "def": 4
           },
           "args": [
-            21
+            30
           ]
         }
       },
       {
-        "id": 23,
+        "id": 32,
         "span": {
           "start_line": 1,
           "start_col": 1,
@@ -707,13 +895,13 @@
             "def": 7
           },
           "args": [
-            20,
-            22
+            29,
+            31
           ]
         }
       },
       {
-        "id": 24,
+        "id": 33,
         "span": {
           "start_line": 1,
           "start_col": 1,
@@ -723,11 +911,296 @@
         "ty": null,
         "kind": "try_",
         "value": {
-          "inner": 23
+          "inner": 32
         }
       },
       {
-        "id": 25,
+        "id": 34,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x606D18A8",
+            "value": "1617762472",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 35,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "1",
+            "value": "1",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 36,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 4
+          },
+          "args": [
+            35
+          ]
+        }
+      },
+      {
+        "id": 37,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 7
+          },
+          "args": [
+            34,
+            36
+          ]
+        }
+      },
+      {
+        "id": 38,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 37
+        }
+      },
+      {
+        "id": 39,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x7979F230",
+            "value": "2038034992",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 40,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x12345678",
+            "value": "305419896",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 41,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 4
+          },
+          "args": [
+            40
+          ]
+        }
+      },
+      {
+        "id": 42,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 7
+          },
+          "args": [
+            39,
+            41
+          ]
+        }
+      },
+      {
+        "id": 43,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 42
+        }
+      },
+      {
+        "id": 44,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x0AB656AC",
+            "value": "179721900",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 45,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x9E3779B1",
+            "value": "2654435761",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 46,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 4
+          },
+          "args": [
+            45
+          ]
+        }
+      },
+      {
+        "id": 47,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 7
+          },
+          "args": [
+            44,
+            46
+          ]
+        }
+      },
+      {
+        "id": 48,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 47
+        }
+      },
+      {
+        "id": 49,
         "span": {
           "start_line": 1,
           "start_col": 1,
@@ -738,7 +1211,10 @@
         "kind": "block",
         "value": {
           "statements": [
-            0
+            6,
+            7,
+            8,
+            9
           ],
           "tail": null,
           "labelled": null
@@ -755,11 +1231,152 @@
           "end_col": 1
         },
         "ty": null,
+        "kind": "let",
+        "value": {
+          "pattern": 0,
+          "init": 13,
+          "ty": 0
+        }
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 17
+      },
+      {
+        "id": 2,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 19
+      },
+      {
+        "id": 3,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 22
+      },
+      {
+        "id": 4,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
         "kind": "expr",
         "value": 24
+      },
+      {
+        "id": 5,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 27
+      },
+      {
+        "id": 6,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 33
+      },
+      {
+        "id": 7,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 38
+      },
+      {
+        "id": 8,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 43
+      },
+      {
+        "id": 9,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 48
       }
     ],
-    "pats": [],
-    "types": []
+    "pats": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binding",
+        "value": {
+          "name": "hash",
+          "mode": "value",
+          "mutable": true
+        }
+      }
+    ],
+    "types": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "kind": "prim",
+        "value": "u32"
+      }
+    ]
   }
 }

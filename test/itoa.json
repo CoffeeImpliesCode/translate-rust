@@ -167,6 +167,9 @@
         "kind": "none"
       },
       {
+        "kind": "none"
+      },
+      {
         "kind": "fn_",
         "value": {
           "params": [],
@@ -174,11 +177,8 @@
             "kind": "prim",
             "value": "unit"
           },
-          "body": 11
+          "body": 26
         }
-      },
-      {
-        "kind": "none"
       }
     ],
     "exprs": [
@@ -300,8 +300,8 @@
         "value": {
           "kind": "int",
           "value": {
-            "text": "57",
-            "value": "57",
+            "text": "48",
+            "value": "48",
             "base": "dec",
             "ty_suffix": null
           }
@@ -320,8 +320,8 @@
         "value": {
           "kind": "int",
           "value": {
-            "text": "9",
-            "value": "9",
+            "text": "0",
+            "value": "0",
             "base": "dec",
             "ty_suffix": null
           }
@@ -391,10 +391,298 @@
           "end_col": 1
         },
         "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "53",
+            "value": "53",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 12,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "5",
+            "value": "5",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 13,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 1
+          },
+          "args": [
+            12
+          ]
+        }
+      },
+      {
+        "id": 14,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 3
+          },
+          "args": [
+            11,
+            13
+          ]
+        }
+      },
+      {
+        "id": 15,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 14
+        }
+      },
+      {
+        "id": 16,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "57",
+            "value": "57",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 17,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "9",
+            "value": "9",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 18,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 1
+          },
+          "args": [
+            17
+          ]
+        }
+      },
+      {
+        "id": 19,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 3
+          },
+          "args": [
+            16,
+            18
+          ]
+        }
+      },
+      {
+        "id": 20,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 19
+        }
+      },
+      {
+        "id": 21,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "53",
+            "value": "53",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 22,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "15",
+            "value": "15",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 23,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 1
+          },
+          "args": [
+            22
+          ]
+        }
+      },
+      {
+        "id": 24,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 3
+          },
+          "args": [
+            21,
+            23
+          ]
+        }
+      },
+      {
+        "id": 25,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 24
+        }
+      },
+      {
+        "id": 26,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
         "kind": "block",
         "value": {
           "statements": [
-            0
+            0,
+            1,
+            2,
+            3
           ],
           "tail": null,
           "labelled": null
@@ -413,6 +701,42 @@
         "ty": null,
         "kind": "expr",
         "value": 10
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 15
+      },
+      {
+        "id": 2,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 20
+      },
+      {
+        "id": 3,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 25
       }
     ],
     "pats": [],

@@ -286,7 +286,29 @@
       {
         "kind": "struct_",
         "value": {
-          "fields": []
+          "layout": "named",
+          "fields": [
+            {
+              "name": "a",
+              "ty": {
+                "kind": "prim",
+                "value": "u16"
+              },
+              "vis": {
+                "kind": "public"
+              }
+            },
+            {
+              "name": "b",
+              "ty": {
+                "kind": "prim",
+                "value": "u16"
+              },
+              "vis": {
+                "kind": "public"
+              }
+            }
+          ]
         }
       },
       {
