@@ -1,0 +1,203 @@
+{
+  "format_version": 1,
+  "name": "fnv",
+  "version": "0.0.0",
+  "fingerprint": null,
+  "files": [
+    {
+      "path": "src/root.zig",
+      "imports": [
+        {
+          "local_name": "std",
+          "module_or_path": "std",
+          "is_pub": false
+        }
+      ],
+      "decls": [
+        {
+          "kind": "struct_decl",
+          "value": {
+            "name": "FnvHasher",
+            "is_pub": true,
+            "is_tuple": false,
+            "fields": [
+              {
+                "name": "0",
+                "ty": {
+                  "kind": "prim",
+                  "value": "u64"
+                },
+                "default_val": null,
+                "is_pub": true
+              }
+            ],
+            "decls": [],
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "FnvBuildHasher",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "ident",
+              "name": "std.hash.BuildHasherDefault"
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "FnvHashMap",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "ident",
+              "name": "std.AutoHashMap"
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "FnvHashSet",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "ident",
+              "name": "std.AutoHashMap"
+            }
+          }
+        }
+      ],
+      "tests": []
+    },
+    {
+      "path": "src/test.zig",
+      "imports": [
+        {
+          "local_name": "std",
+          "module_or_path": "std",
+          "is_pub": false
+        }
+      ],
+      "decls": [
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "fnv1a",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "bytes",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": true
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": null,
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "repeat_10",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "bytes",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": true
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": null,
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "repeat_500",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "bytes",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": true
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": null,
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "basic_tests",
+            "is_pub": true,
+            "is_test": false,
+            "params": [],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": null,
+            "generic_params": []
+          }
+        }
+      ],
+      "tests": []
+    }
+  ],
+  "zon_deps": []
+}

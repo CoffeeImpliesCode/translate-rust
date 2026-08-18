@@ -1,0 +1,981 @@
+{
+  "format_version": 1,
+  "name": "hex",
+  "version": "0.0.0",
+  "fingerprint": null,
+  "files": [
+    {
+      "path": "src/root.zig",
+      "imports": [
+        {
+          "local_name": "std",
+          "module_or_path": "std",
+          "is_pub": false
+        }
+      ],
+      "decls": [
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "FromHexError",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "ident",
+              "name": "FromHexError"
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "deserialize",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "ident",
+              "name": ""
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "serialize",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "ident",
+              "name": ""
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "serialize_upper",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "ident",
+              "name": ""
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "HEX_CHARS_LOWER",
+            "is_pub": true,
+            "ty": {
+              "kind": "named",
+              "name": "unsupported type"
+            },
+            "init": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "HEX_CHARS_UPPER",
+            "is_pub": true,
+            "ty": {
+              "kind": "named",
+              "name": "unsupported type"
+            },
+            "init": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "kind": "struct_decl",
+          "value": {
+            "name": "BytesToHexChars",
+            "is_pub": true,
+            "is_tuple": false,
+            "fields": [
+              {
+                "name": "inner",
+                "ty": {
+                  "kind": "named",
+                  "name": "unsupported type"
+                },
+                "default_val": null,
+                "is_pub": false
+              },
+              {
+                "name": "table",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": true
+                },
+                "default_val": null,
+                "is_pub": false
+              },
+              {
+                "name": "next",
+                "ty": {
+                  "kind": "opt",
+                  "elem": {
+                    "kind": "prim",
+                    "value": "u32"
+                  }
+                },
+                "default_val": null,
+                "is_pub": false
+              }
+            ],
+            "decls": [],
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "encode_to_iter",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "table",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": true
+                },
+                "is_comptime": false
+              },
+              {
+                "name": "source",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": true
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "field_access",
+                  "target": {
+                    "kind": "call",
+                    "callee": {
+                      "kind": "ident",
+                      "name": "new"
+                    },
+                    "args": [
+                      {
+                        "kind": "ident",
+                        "name": "source"
+                      },
+                      {
+                        "kind": "ident",
+                        "name": "table"
+                      }
+                    ]
+                  },
+                  "field_name": "collect"
+                },
+                "args": []
+              }
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "val",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "c",
+                "ty": {
+                  "kind": "prim",
+                  "value": "u8"
+                },
+                "is_comptime": false
+              },
+              {
+                "name": "idx",
+                "ty": {
+                  "kind": "prim",
+                  "value": "usize"
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "match_expr",
+                    "target": {
+                      "kind": "ident",
+                      "name": "c"
+                    },
+                    "arms": [
+                      {
+                        "patterns": [
+                          {
+                            "kind": "wildcard"
+                          }
+                        ],
+                        "body": {
+                          "kind": "unsupported",
+                          "reason": "unresolved call"
+                        }
+                      },
+                      {
+                        "patterns": [
+                          {
+                            "kind": "wildcard"
+                          }
+                        ],
+                        "body": {
+                          "kind": "unsupported",
+                          "reason": "unresolved call"
+                        }
+                      },
+                      {
+                        "patterns": [
+                          {
+                            "kind": "wildcard"
+                          }
+                        ],
+                        "body": {
+                          "kind": "unsupported",
+                          "reason": "unresolved call"
+                        }
+                      },
+                      {
+                        "patterns": [
+                          {
+                            "kind": "wildcard"
+                          }
+                        ],
+                        "body": {
+                          "kind": "unsupported",
+                          "reason": "unresolved call"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ],
+              "expr": null
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "encode",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "data",
+                "ty": {
+                  "kind": "named",
+                  "name": "unsupported type"
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "field_access",
+                  "target": {
+                    "kind": "ident",
+                    "name": "data"
+                  },
+                  "field_name": "encode_hex"
+                },
+                "args": []
+              }
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "encode_upper",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "data",
+                "ty": {
+                  "kind": "named",
+                  "name": "unsupported type"
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "field_access",
+                  "target": {
+                    "kind": "ident",
+                    "name": "data"
+                  },
+                  "field_name": "encode_hex_upper"
+                },
+                "args": []
+              }
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "decode",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "data",
+                "ty": {
+                  "kind": "named",
+                  "name": "unsupported type"
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "ident",
+                  "name": "from_hex"
+                },
+                "args": [
+                  {
+                    "kind": "ident",
+                    "name": "data"
+                  }
+                ]
+              }
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "decode_to_slice",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "data",
+                "ty": {
+                  "kind": "named",
+                  "name": "unsupported type"
+                },
+                "is_comptime": false
+              },
+              {
+                "name": "out",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": false
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [
+                {
+                  "kind": "let_stmt",
+                  "name": "data",
+                  "ty": null,
+                  "init": {
+                    "kind": "call",
+                    "callee": {
+                      "kind": "field_access",
+                      "target": {
+                        "kind": "ident",
+                        "name": "data"
+                      },
+                      "field_name": "as_ref"
+                    },
+                    "args": []
+                  },
+                  "is_mut": false
+                },
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "struct_init",
+                    "type_name": null,
+                    "fields": []
+                  }
+                },
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "struct_init",
+                    "type_name": null,
+                    "fields": []
+                  }
+                },
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "for iterable"
+                  }
+                }
+              ],
+              "expr": {
+                "kind": "unsupported",
+                "reason": "unresolved call"
+              }
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "generate_iter",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "len",
+                "ty": {
+                  "kind": "prim",
+                  "value": "usize"
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "field_access",
+                  "target": {
+                    "kind": "call",
+                    "callee": {
+                      "kind": "field_access",
+                      "target": {
+                        "kind": "unsupported",
+                        "reason": "expression"
+                      },
+                      "field_name": "step_by"
+                    },
+                    "args": [
+                      {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "int",
+                          "value": "2"
+                        }
+                      }
+                    ]
+                  },
+                  "field_name": "zip"
+                },
+                "args": [
+                  {
+                    "kind": "call",
+                    "callee": {
+                      "kind": "field_access",
+                      "target": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "expression"
+                          },
+                          "field_name": "skip"
+                        },
+                        "args": [
+                          {
+                            "kind": "lit",
+                            "value": {
+                              "kind": "int",
+                              "value": "1"
+                            }
+                          }
+                        ]
+                      },
+                      "field_name": "step_by"
+                    },
+                    "args": [
+                      {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "int",
+                          "value": "2"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "byte2hex",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "byte",
+                "ty": {
+                  "kind": "prim",
+                  "value": "u8"
+                },
+                "is_comptime": false
+              },
+              {
+                "name": "table",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": true
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [
+                {
+                  "kind": "let_stmt",
+                  "name": "high",
+                  "ty": null,
+                  "init": {
+                    "kind": "lit",
+                    "value": {
+                      "kind": "undefined_lit"
+                    }
+                  },
+                  "is_mut": false
+                },
+                {
+                  "kind": "let_stmt",
+                  "name": "low",
+                  "ty": null,
+                  "init": {
+                    "kind": "lit",
+                    "value": {
+                      "kind": "undefined_lit"
+                    }
+                  },
+                  "is_mut": false
+                }
+              ],
+              "expr": {
+                "kind": "unsupported",
+                "reason": "expression"
+              }
+            },
+            "generic_params": []
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "encode_to_slice",
+            "is_pub": true,
+            "is_test": false,
+            "params": [
+              {
+                "name": "input",
+                "ty": {
+                  "kind": "named",
+                  "name": "unsupported type"
+                },
+                "is_comptime": false
+              },
+              {
+                "name": "output",
+                "ty": {
+                  "kind": "slice",
+                  "elem": {
+                    "kind": "array",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "void_type"
+                    },
+                    "len": 0
+                  },
+                  "is_const": false
+                },
+                "is_comptime": false
+              }
+            ],
+            "ret_type": {
+              "kind": "prim",
+              "value": "void_type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "struct_init",
+                    "type_name": null,
+                    "fields": []
+                  }
+                },
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "for iterable"
+                  }
+                }
+              ],
+              "expr": {
+                "kind": "unsupported",
+                "reason": "unresolved call"
+              }
+            },
+            "generic_params": []
+          }
+        }
+      ],
+      "tests": []
+    },
+    {
+      "path": "test/crates/hex/src/error.rs",
+      "imports": [
+        {
+          "local_name": "std",
+          "module_or_path": "std",
+          "is_pub": false
+        }
+      ],
+      "decls": [
+        {
+          "kind": "enum_decl",
+          "value": {
+            "name": "FromHexError",
+            "is_pub": true,
+            "tag_type": null,
+            "variants": [
+              {
+                "name": "InvalidHexCharacter",
+                "value": null
+              },
+              {
+                "name": "OddLength",
+                "value": null
+              },
+              {
+                "name": "InvalidStringLength",
+                "value": null
+              }
+            ],
+            "decls": []
+          }
+        }
+      ],
+      "tests": []
+    },
+    {
+      "path": "src/tests.zig",
+      "imports": [
+        {
+          "local_name": "std",
+          "module_or_path": "std",
+          "is_pub": false
+        }
+      ],
+      "decls": [],
+      "tests": [
+        {
+          "name": "test_display",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "path": "src/serde.zig",
+      "imports": [
+        {
+          "local_name": "std",
+          "module_or_path": "std",
+          "is_pub": false
+        }
+      ],
+      "decls": [],
+      "tests": []
+    },
+    {
+      "path": "src/test.zig",
+      "imports": [
+        {
+          "local_name": "std",
+          "module_or_path": "std",
+          "is_pub": false
+        }
+      ],
+      "decls": [],
+      "tests": [
+        {
+          "name": "test_gen_iter",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_encode_to_slice",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_decode_to_slice",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_encode",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_decode",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_from_hex_okay_str",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_from_hex_okay_bytes",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_invalid_length",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_invalid_char",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_empty",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_from_hex_whitespace",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_from_hex_array",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        },
+        {
+          "name": "test_to_hex",
+          "body": {
+            "label": null,
+            "stmts": [],
+            "expr": {
+              "kind": "ident",
+              "name": "source"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "zon_deps": []
+}

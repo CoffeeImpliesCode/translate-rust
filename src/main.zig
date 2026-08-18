@@ -29,11 +29,38 @@ pub fn main(init: std.process.Init) !void {
         try printUsage(io, stdout);
         return;
     }
-    if (std.mem.eql(u8, arg_slice, "--dump")) {
-        try dumpModel(io, init, stdout, &arg_it);
+    // `--strategy <name>` must be read before the subcommand token when it
+    // precedes a dump verb. Consume it now and validate the value up front.
+    var strategy_name: ?[]const u8 = null;
+    var first = arg_slice;
+    if (std.mem.eql(u8, first, "--strategy")) {
+        const sn = arg_it.next() orelse {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --strategy <default|embedded>\n");
+            return;
+        };
+        if (!validateStrategy(sn)) {
+            const emsg = try std.fmt.allocPrint(init.gpa,
+                \\translate-rust: unknown strategy '{s}'
+                \\usage: --strategy <default|embedded>
+                \\
+                \\
+            , .{sn});
+            defer init.gpa.free(emsg);
+            try stdout.writeStreamingAll(io, emsg);
+            return;
+        }
+        strategy_name = sn;
+        first = arg_it.next() orelse {
+            try printUsage(io, stdout);
+            return;
+        };
+    }
+
+    if (std.mem.eql(u8, first, "--dump")) {
+        try dumpDispatch(io, init, stdout, &arg_it, strategy_name);
         return;
     }
-    if (std.mem.eql(u8, arg_slice, "--dump-types")) {
+    if (std.mem.eql(u8, first, "--dump-types")) {
         const path = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump-types <crate-dir>\n");
             return;
@@ -41,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
         try dumpTypes(io, init, stdout, path);
         return;
     }
-    if (std.mem.eql(u8, arg_slice, "--dump-names")) {
+    if (std.mem.eql(u8, first, "--dump-names")) {
         const p = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump-names <crate-dir>\n");
             return;
@@ -49,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
         try dumpNames(io, init, stdout, p);
         return;
     }
-    if (std.mem.eql(u8, arg_slice, "--dump-infer")) {
+    if (std.mem.eql(u8, first, "--dump-infer")) {
         const p = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump-infer <crate-dir>\n");
             return;
@@ -57,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         try dumpInfer(io, init, stdout, p);
         return;
     }
-    if (std.mem.eql(u8, arg_slice, "--translate") or std.mem.eql(u8, arg_slice, "--emit-package")) {
+    if (std.mem.eql(u8, first, "--translate") or std.mem.eql(u8, first, "--emit-package")) {
         const path = arg_it.next() orelse {
             try printUsage(io, stdout);
             return;
@@ -73,14 +100,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Default positional behavior: if passed a .json file, translate it.
-    if (std.mem.endsWith(u8, arg_slice, ".json")) {
+    if (std.mem.endsWith(u8, first, ".json")) {
         var out_dir: ?[]const u8 = null;
         if (arg_it.next()) |next_arg| {
             if (std.mem.eql(u8, next_arg, "-o") or std.mem.eql(u8, next_arg, "--output")) {
                 out_dir = arg_it.next();
             }
         }
-        try translateCrate(io, init, stdout, arg_slice, out_dir);
+        try translateCrate(io, init, stdout, first, out_dir);
         return;
     }
 
@@ -100,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
         );
         return;
     }
-    try translate_rust.model.driver.translate(init.gpa, io, stdout, arg_slice, crate_out_dir.?);
+    try translate_rust.model.driver.translate(init.gpa, io, stdout, first, crate_out_dir.?);
     return;
 }
 
@@ -460,13 +487,14 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
     try stdout.writeStreamingAll(io, out.items);
 }
 
-fn dumpModel(io: std.Io, init: std.process.Init, stdout: std.Io.File, arg_it: *std.process.Args.Iterator) !void {
-    const mode = arg_it.next() orelse return error.UsageMissingDumpMode;
-    if (!std.mem.eql(u8, mode, "model")) {
-        return error.UnknownDumpMode;
-    }
-    const path = arg_it.next() orelse return error.UsageMissingJsonPath;
-
+/// `--dump model <file>`: parse a sidecar wire-format JSON dump and print the
+/// crate/module inventory.
+fn dumpJsonModel(
+    io: std.Io,
+    init: std.process.Init,
+    stdout: std.Io.File,
+    path: []const u8,
+) !void {
     var dir = std.Io.Dir.cwd();
     const file = try dir.openFile(io, path, .{});
     defer file.close(io);
@@ -491,6 +519,129 @@ fn dumpModel(io: std.Io, init: std.process.Init, stdout: std.Io.File, arg_it: *s
     }
 
     try stdout.writeStreamingAll(io, buf.items);
+}
+
+/// Dispatch for `--dump <mode>`. Modes that operate on Wire JSON remain in
+/// the classic `dumpModel`; Rust-source modes (`rustir`, `zigast`) call the
+/// frontend and serialize the resulting IR or ZigAST.
+fn dumpDispatch(
+    io: std.Io,
+    init: std.process.Init,
+    stdout: std.Io.File,
+    arg_it: *std.process.Args.Iterator,
+    strategy_name: ?[]const u8,
+) !void {
+    const mode = arg_it.next() orelse {
+        try stdout.writeStreamingAll(io,
+            \\usage: translate-rust --dump <model|rustir|zigast> <path>
+            \\
+        );
+        return;
+    };
+
+    if (std.mem.eql(u8, mode, "model")) {
+        const path = arg_it.next() orelse return error.UsageMissingJsonPath;
+        try dumpJsonModel(io, init, stdout, path);
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "rustir")) {
+        const crate_dir = arg_it.next() orelse {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump rustir <crate-dir>\n");
+            return;
+        };
+        try dumpRustIr(io, init, stdout, crate_dir);
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "zigast")) {
+        const crate_dir = arg_it.next() orelse {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump zigast <crate-dir>\n");
+            return;
+        };
+        try dumpZigAst(io, init, stdout, crate_dir, strategy_name);
+        return;
+    }
+
+    const msg = try std.fmt.allocPrint(init.gpa, "translate-rust: unknown dump mode '{s}'\n", .{mode});
+    defer init.gpa.free(msg);
+    try stdout.writeStreamingAll(io, msg);
+}
+
+/// `--dump rustir <crate-dir>`: run the full frontend analysis and print the
+/// serialized `ir.RustIR` JSON to stdout.
+fn dumpRustIr(
+    io: std.Io,
+    init: std.process.Init,
+    stdout: std.Io.File,
+    crate_dir: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const rust_ir = try translate_rust.frontend.analyzeCrate(allocator, io, crate_dir);
+    const ser_ir: translate_rust.ir.serialize.RustIR = .{
+        .crate_name = rust_ir.crate_name,
+        .edition = rust_ir.edition,
+        .graph = rust_ir.graph,
+        .types = rust_ir.types,
+        .bodies = rust_ir.bodies,
+    };
+    const json_bytes = try translate_rust.ir.serialize.encode(allocator, &ser_ir);
+    try stdout.writeStreamingAll(io, json_bytes);
+    try stdout.writeStreamingAll(io, "\n");
+}
+
+/// Resolve the selected lowering strategy into a vtable-backed pointer, or
+/// null to let the lowering engine pick the default.
+fn resolveStrategy(
+    name: ?[]const u8,
+    out: *translate_rust.backend.strategy.LoweringStrategy,
+) ?*const translate_rust.backend.strategy.LoweringStrategy {
+    if (name) |n| {
+        if (std.mem.eql(u8, n, "embedded")) {
+            out.* = .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lowerType = translate_rust.backend.zig.strategies.embedded.EmbeddedStrategy.lowerType,
+                    .lowerStdGeneric = translate_rust.backend.zig.strategies.embedded.EmbeddedStrategy.lowerStdGeneric,
+                },
+            };
+            return out;
+        }
+        // "default" (and any other validated name) falls through to the engine
+        // default by returning null.
+    }
+    return null;
+}
+
+/// `--dump zigast <crate-dir>`: run the frontend analysis, lower to ZigAST, and
+/// print the serialized `backend.zig.ast.Package` JSON to stdout.
+fn dumpZigAst(
+    io: std.Io,
+    init: std.process.Init,
+    stdout: std.Io.File,
+    crate_dir: []const u8,
+    strategy_name: ?[]const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const rust_ir = try translate_rust.frontend.analyzeCrate(allocator, io, crate_dir);
+
+    var strat: translate_rust.backend.strategy.LoweringStrategy = undefined;
+    const maybe_strat = resolveStrategy(strategy_name, &strat);
+
+    const pkg = try translate_rust.backend.zig.lower.lowerRustIR(allocator, &rust_ir, maybe_strat);
+    const json_bytes = try translate_rust.backend.zig.serialize.encode(allocator, &pkg);
+    try stdout.writeStreamingAll(io, json_bytes);
+    try stdout.writeStreamingAll(io, "\n");
+}
+
+fn validateStrategy(name: []const u8) bool {
+    return std.mem.eql(u8, name, "default") or std.mem.eql(u8, name, "embedded");
 }
 
 fn dumpModule(
@@ -617,6 +768,11 @@ fn printUsage(io: std.Io, stdout: std.Io.File) !void {
         \\       translate-rust --emit-package <file.json> -o <dir>  emit standalone Zig package
         \\       translate-rust --dump model <file>   parse a sidecar wire-format JSON dump and print
         \\                                            the crate/module inventory
+        \\       translate-rust --dump rustir <crate-dir>  run the frontend analysis and print the
+        \\                                            serialized Rust semantic IR (JSON)
+        \\       translate-rust --dump zigast <crate-dir>  lower to ZigAST and print the serialized
+        \\                                            package AST (JSON)
+        \\       translate-rust --strategy <default|embedded>  select the Zig lowering strategy
         \\       translate-rust --version             print version
         \\       translate-rust --help                show this help
         \\

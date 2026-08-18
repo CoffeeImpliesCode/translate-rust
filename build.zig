@@ -277,4 +277,17 @@ pub fn build(b: *std.Build) void {
     // E2E integration tests (in-process native translation → working Zig pkgs).
     test_step.dependOn(&run_e2e.step);
     test_crates_step.dependOn(&run_e2e.step);
+
+    // ── golden serialization tests (RustIR + ZigAST snapshots) ─────────────
+    const golden_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/golden_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(golden_tests).step);
 }
