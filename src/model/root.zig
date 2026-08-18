@@ -12,6 +12,11 @@ pub const emit = @import("emit.zig");
 pub const package = @import("package.zig");
 pub const driver = @import("driver.zig");
 pub const ts_ext = @import("ts_ext.zig");
+pub const cst = @import("cst.zig");
+pub const types = @import("types.zig");
+pub const bodies = @import("bodies.zig");
+pub const items = @import("items.zig");
+pub const exprs = @import("exprs.zig");
 
 test {
     std.testing.refAllDecls(@This());
