@@ -1,0 +1,12 @@
+[package]
+name = "wyhash"
+version = "0.4.0"
+edition = "2018"
+publish = false
+
+# Source vendored from https://crates.io/crates/wyhash (eldruin/wyhash-rs), MIT OR Apache-2.0.
+# v1-dialect core: src/lib.rs + src/functions.rs only. The upstream `traits` module
+# (WyHash Hasher / WyRng RngCore impls, which required the rand_core dependency) is
+# trimmed out of the vendored copy, along with the upstream `[dependencies.rand_core]`.
+# The remaining base is #![no_std], zero-dependency, zero-unsafe (`wyhash`, `read64`,
+# `wyrng` free functions).

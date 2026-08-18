@@ -1,0 +1,17 @@
+[package]
+name = "xxhash-rust"
+version = "0.8.15"
+edition = "2018"
+publish = false
+
+# Source vendored from https://crates.io/crates/xxhash-rust (DoumanAsh/xxhash-rust), BSL-1.0.
+# v1-dialect core: only the 32-bit algorithm (src/lib.rs + src/xxh32.rs +
+# src/xxh32_common.rs + src/utils.rs) with the `xxh32` feature enabled by default.
+# The feature-gated xxh64/xxh3/const_* modules and all dev-dependencies
+# (getrandom, xxhash-c-sys) are trimmed out of the vendored copy. The remaining
+# base is #![no_std] and zero-dependency.
+
+[features]
+default = ["xxh32"]
+std = []
+xxh32 = []

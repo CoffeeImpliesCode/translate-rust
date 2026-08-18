@@ -1,0 +1,15 @@
+[package]
+name = "adler"
+version = "1.0.2"
+edition = "2015"
+publish = false
+
+# Source vendored from https://crates.io/crates/adler (jonas-schievink/adler), 0BSD OR MIT OR Apache-2.0.
+# v1-dialect core: src/lib.rs + src/algo.rs only. The upstream optional `compiler_builtins` /
+# `core` (rustc-std-workspace-core) deps and the criterion dev-dependency are trimmed.
+# `default-features = false` selects the #![no_std] core (`default = ["std"]` upstream).
+# The `adler32<R: BufRead>` helper is #[cfg(feature = "std")] and stays out of the no_std build.
+
+[features]
+default = []
+std = []
