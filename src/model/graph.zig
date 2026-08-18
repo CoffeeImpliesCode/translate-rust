@@ -173,10 +173,12 @@ pub const CrateGraph = struct {
         return id;
     }
 
-    /// Look up a Module by id; `null` if id is out of range (dense table).
+    /// Look up a Module by EntityId.
     pub fn module(self: *const CrateGraph, id: spine.EntityId) ?Module {
-        if (id >= self.modules.items.len) return null;
-        return self.modules.items[id];
+        for (self.modules.items) |m| {
+            if (m.id == id) return m;
+        }
+        return null;
     }
 
     pub fn findCrate(self: *const CrateGraph, name: []const u8) ?Crate {

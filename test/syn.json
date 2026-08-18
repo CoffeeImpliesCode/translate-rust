@@ -1,0 +1,1116 @@
+{
+  "format_version": 2,
+  "sidecar": "translate-rust-syn-fixture",
+  "toolchain": "1.77.0",
+  "crates": [
+    {
+      "name": "syn",
+      "edition": 2021,
+      "kind": "lib",
+      "root": 0,
+      "is_translated": true,
+      "deps": [],
+      "entities": [
+        {
+          "id": 0,
+          "kind": "module",
+          "name": "",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": null,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 1,
+          "kind": "struct_",
+          "name": "Ident",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 2,
+          "kind": "field",
+          "name": "sym",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 1,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 3,
+          "kind": "struct_",
+          "name": "LitInt",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 4,
+          "kind": "field",
+          "name": "value",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 3,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 5,
+          "kind": "enum_",
+          "name": "BinOp",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 6,
+          "kind": "variant",
+          "name": "Add",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 5,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 7,
+          "kind": "variant",
+          "name": "Sub",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 5,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 8,
+          "kind": "variant",
+          "name": "Mul",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 5,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 9,
+          "kind": "fn_",
+          "name": "is_ident_char",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 10,
+          "kind": "field",
+          "name": "c",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 9,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 11,
+          "kind": "fn_",
+          "name": "test_syn_ident_char",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": [
+            {
+              "name": "test",
+              "meta": "",
+              "known": true
+            }
+          ]
+        },
+        {
+          "id": 12,
+          "kind": "fn_",
+          "name": "expectEqual",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        }
+      ],
+      "modules": [
+        {
+          "id": 0,
+          "kind": "root",
+          "name": "",
+          "parent": null,
+          "source_path": "src/lib.rs",
+          "is_crate": true,
+          "is_extern": false,
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "items": [
+            1,
+            3,
+            5,
+            9,
+            11
+          ],
+          "attributes": []
+        }
+      ],
+      "uses": []
+    }
+  ],
+  "bodies": {
+    "bodies": [
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "struct_",
+        "value": {
+          "fields": [
+            {
+              "name": "sym",
+              "ty": {
+                "kind": "slice",
+                "value": {
+                  "const_": true,
+                  "elem": {
+                    "kind": "prim",
+                    "value": "u8"
+                  }
+                }
+              },
+              "vis": {
+                "kind": "public"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "struct_",
+        "value": {
+          "fields": [
+            {
+              "name": "value",
+              "ty": {
+                "kind": "prim",
+                "value": "u64"
+              },
+              "vis": {
+                "kind": "public"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "enum_",
+        "value": {
+          "kind": "c_like",
+          "variants": [
+            {
+              "name": "Add",
+              "fields": {
+                "plain": {}
+              },
+              "discriminant": null
+            },
+            {
+              "name": "Sub",
+              "fields": {
+                "plain": {}
+              },
+              "discriminant": null
+            },
+            {
+              "name": "Mul",
+              "fields": {
+                "plain": {}
+              },
+              "discriminant": null
+            }
+          ],
+          "repr_int": null,
+          "non_exhaustive": false
+        }
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "fn_",
+        "value": {
+          "params": [
+            {
+              "name": "c",
+              "ty": {
+                "kind": "prim",
+                "value": "u8"
+              },
+              "span": {
+                "start_line": 1,
+                "start_col": 1,
+                "end_line": 1,
+                "end_col": 1
+              }
+            }
+          ],
+          "ret": {
+            "kind": "prim",
+            "value": "u8"
+          },
+          "body": 18
+        }
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "fn_",
+        "value": {
+          "params": [],
+          "ret": {
+            "kind": "prim",
+            "value": "unit"
+          },
+          "body": 34
+        }
+      },
+      {
+        "kind": "none"
+      }
+    ],
+    "exprs": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 10,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "97",
+            "value": "97",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 2,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "ge",
+          "overflow": "wrapping",
+          "lhs": 0,
+          "rhs": 1
+        }
+      },
+      {
+        "id": 3,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "122",
+            "value": "122",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 4,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "le",
+          "overflow": "wrapping",
+          "lhs": 0,
+          "rhs": 3
+        }
+      },
+      {
+        "id": 5,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "boolean_and",
+          "overflow": "wrapping",
+          "lhs": 2,
+          "rhs": 4
+        }
+      },
+      {
+        "id": 6,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "65",
+            "value": "65",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 7,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "ge",
+          "overflow": "wrapping",
+          "lhs": 0,
+          "rhs": 6
+        }
+      },
+      {
+        "id": 8,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "90",
+            "value": "90",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 9,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "le",
+          "overflow": "wrapping",
+          "lhs": 0,
+          "rhs": 8
+        }
+      },
+      {
+        "id": 10,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "boolean_and",
+          "overflow": "wrapping",
+          "lhs": 7,
+          "rhs": 9
+        }
+      },
+      {
+        "id": 11,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "95",
+            "value": "95",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 12,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "eq",
+          "overflow": "wrapping",
+          "lhs": 0,
+          "rhs": 11
+        }
+      },
+      {
+        "id": 13,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "boolean_or",
+          "overflow": "wrapping",
+          "lhs": 5,
+          "rhs": 10
+        }
+      },
+      {
+        "id": 14,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "boolean_or",
+          "overflow": "wrapping",
+          "lhs": 13,
+          "rhs": 12
+        }
+      },
+      {
+        "id": 15,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "1",
+            "value": "1",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 16,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0",
+            "value": "0",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 17,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "if_else",
+        "value": {
+          "cond": 14,
+          "then": {
+            "statements": [],
+            "tail": 15,
+            "labelled": null
+          },
+          "else": {
+            "kind": "block",
+            "value": {
+              "statements": [],
+              "tail": 16,
+              "labelled": null
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [],
+          "tail": 17,
+          "labelled": null
+        }
+      },
+      {
+        "id": 19,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "1",
+            "value": "1",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 20,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "97",
+            "value": "97",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 21,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 9
+          },
+          "args": [
+            20
+          ]
+        }
+      },
+      {
+        "id": 22,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 12
+          },
+          "args": [
+            19,
+            21
+          ]
+        }
+      },
+      {
+        "id": 23,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 22
+        }
+      },
+      {
+        "id": 24,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "1",
+            "value": "1",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 25,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "95",
+            "value": "95",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 26,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 9
+          },
+          "args": [
+            25
+          ]
+        }
+      },
+      {
+        "id": 27,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 12
+          },
+          "args": [
+            24,
+            26
+          ]
+        }
+      },
+      {
+        "id": 28,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 27
+        }
+      },
+      {
+        "id": 29,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0",
+            "value": "0",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 30,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "32",
+            "value": "32",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 31,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 9
+          },
+          "args": [
+            30
+          ]
+        }
+      },
+      {
+        "id": 32,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 12
+          },
+          "args": [
+            29,
+            31
+          ]
+        }
+      },
+      {
+        "id": 33,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 32
+        }
+      },
+      {
+        "id": 34,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [
+            0,
+            1,
+            2
+          ],
+          "tail": null,
+          "labelled": null
+        }
+      }
+    ],
+    "stmts": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 23
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 28
+      },
+      {
+        "id": 2,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 33
+      }
+    ],
+    "pats": [],
+    "types": []
+  }
+}

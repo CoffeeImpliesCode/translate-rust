@@ -81,21 +81,16 @@ pub fn emitModuleFile(
 
     const m = g.module(mod_id) orelse return buf.toOwnedSlice(allocator);
 
-    // 1. Emit submodule imports for child modules that are files or directories.
-    for (m.items) |item_id| {
-        const e = g.symbol_table.get(item_id) orelse continue;
-        if (e.kind == .module) {
-            if (g.module(e.id)) |child_m| {
-                if (child_m.kind == .file or child_m.kind == .directory) {
-                    const child_name = if (child_m.name.len > 0) child_m.name else e.name;
-                    if (child_name.len > 0) {
-                        try buf.appendSlice(allocator, "pub const ");
-                        try emitIdent(allocator, &buf, child_name);
-                        try buf.appendSlice(allocator, " = @import(\"");
-                        try buf.appendSlice(allocator, child_name);
-                        try buf.appendSlice(allocator, ".zig\");\n");
-                    }
-                }
+    // 1. Emit submodule imports for all child modules that are separate files.
+    for (g.modules.items) |child_m| {
+        if (child_m.parent == mod_id and (child_m.kind == .file or child_m.kind == .directory)) {
+            const child_name = child_m.name;
+            if (child_name.len > 0) {
+                try buf.appendSlice(allocator, "pub const ");
+                try emitIdent(allocator, &buf, child_name);
+                try buf.appendSlice(allocator, " = @import(\"");
+                try buf.appendSlice(allocator, child_name);
+                try buf.appendSlice(allocator, ".zig\");\n");
             }
         }
     }
@@ -634,7 +629,7 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
             try buf.append(allocator, '*');
             try emitType(allocator, buf, bx.*);
         },
-        else => try buf.appendSlice(allocator, "/* unsupported type */"),
+        else => try buf.appendSlice(allocator, "anyopaque"),
     }
 }
 

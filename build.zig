@@ -140,6 +140,7 @@ pub fn build(b: *std.Build) void {
         .{ "test/itoa.json", "itoa" },
         .{ "test/siphasher.json", "siphasher" },
         .{ "test/percent-encoding.json", "percent-encoding" },
+        .{ "test/syn.json", "syn" },
     };
     for (specs) |spec| {
         const regen = b.addSystemCommand(&.{

@@ -129,6 +129,8 @@ fn generateBuildZigZon(allocator: std.mem.Allocator, package_name: []const u8) !
         0x4a84ad1d60265c2d
     else if (std.mem.eql(u8, zon_name, "r2z_percent_encoding"))
         0xe744c10119a5920f
+    else if (std.mem.eql(u8, zon_name, "r2z_syn"))
+        0x8d6507a985abb37c
     else
         0x81677af200000000 | (@as(u64, @as(u32, @truncate(std.hash.Wyhash.hash(0, package_name)))));
 

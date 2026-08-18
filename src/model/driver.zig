@@ -197,6 +197,11 @@ fn mapRustdocType(
 
     if (std.mem.eql(u8, tag, "primitive")) {
         if (payload == .string) {
+            if (std.mem.eql(u8, payload.string, "str")) {
+                const s = arena.create(types.Slice) catch return unsupportedType();
+                s.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+                return .{ .slice = s };
+            }
             if (mapPrim(payload.string)) |p| return .{ .prim = p };
         }
         return unsupportedType();
@@ -233,6 +238,8 @@ fn mapRustdocType(
             rp.* = .{ .mut = mut, .pointee = pointee };
             return .{ .raw_ptr = rp };
         }
+        // Rust `&str` or `&[T]` is already a fat slice in Zig (`[]const T`), not a pointer to a slice.
+        if (pointee == .slice) return pointee;
         const r = arena.create(types.Ref) catch return unsupportedType();
         r.* = .{ .mut = mut, .pointee = pointee };
         return .{ .reference = r };
@@ -781,8 +788,9 @@ fn mapModule(state: *State, item: std.json.Value, parent_mod: ?spine.EntityId) a
 
     // Register the Module table entry BEFORE recursing into its items, so that
     // `isErrorModule` (checked while mapping child enums) resolves correctly.
+    const mod_idx = state.g.modules.items.len;
     _ = try state.g.addModule(.{
-        .id = 0,
+        .id = mod_ent,
         .kind = if (name.len == 0) .root else .file,
         .name = try state.arena.dupe(u8, name),
         .parent = parent_mod,
@@ -806,8 +814,8 @@ fn mapModule(state: *State, item: std.json.Value, parent_mod: ?spine.EntityId) a
             }
         }
     }
-    // Populate the just-added module entry's items (dense id == mod_ent).
-    state.g.modules.items[mod_ent].items = child_items;
+    // Populate the just-added module entry's items.
+    state.g.modules.items[mod_idx].items = child_items;
 
     return mod_ent;
 }

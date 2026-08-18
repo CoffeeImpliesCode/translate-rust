@@ -66,6 +66,7 @@ mkdir -p "$out_dir"
 # deterministic.
 cargo_target="$out_dir/cargo-target"
 export CARGO_TARGET_DIR="$cargo_target"
+export RUSTFLAGS="${RUSTFLAGS:--C linker=clang}"
 
 cargo +nightly rustdoc --lib --manifest-path "$manifest" \
     -- --output-format json -Z unstable-options --document-private-items
