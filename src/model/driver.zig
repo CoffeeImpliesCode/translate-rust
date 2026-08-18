@@ -29,6 +29,7 @@ const emit = @import("emit.zig");
 const ts_ext = @import("ts_ext.zig");
 const infer = @import("infer.zig");
 const resolve_methods = @import("resolve_methods.zig");
+const monomorphize = @import("monomorphize.zig");
 const Span = spine.Span;
 const EntityId = spine.EntityId;
 
@@ -1140,6 +1141,7 @@ pub fn translate(
         if (infer.solve(arena, &b_temp)) |inferred| {
             inferred.apply(state.exprs.items);
             _ = resolve_methods.resolveMethods(&g, &b_temp);
+            _ = monomorphize.collectInstantiations(arena, &g, &b_temp) catch null;
         } else |_| {}
         bodies_opt = .{
             .exprs = try state.exprs.toOwnedSlice(arena),

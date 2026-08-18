@@ -106,6 +106,13 @@ pub const GenericArgs = struct {
     params: []const Type,
 };
 
+/// §3.1 — Monomorphized instantiation record linking a generic entity to concrete args.
+pub const Instantiation = struct {
+    generic_id: spine.EntityId,
+    args: GenericArgs,
+    zig_suffix: []const u8,
+};
+
 /// §4.3 — `Result<T, E>` with `is_error_unionable` flagging whether `E` is a
 /// finite error set (→ `E!T`) or open (`Box<dyn Error>` → `anyerror` /
 /// `unsupported`).
