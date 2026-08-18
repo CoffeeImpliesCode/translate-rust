@@ -13,6 +13,7 @@ const types = @import("types.zig");
 const graph = @import("graph.zig");
 const bodies = @import("bodies.zig");
 const items = @import("items.zig");
+const names = @import("names.zig");
 const ts = @import("tree_sitter");
 
 extern fn tree_sitter_rust() callconv(.c) *const ts.Language;
@@ -506,15 +507,31 @@ fn functionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, is_trait_sig: b
     } };
 }
 
+/// Recover the full source path of a `use` declaration from its CST text:
+/// "std::collections::HashMap", "crate::foo::Bar as Baz", "super::x::*".
+/// The `use_tree` subtree excludes the `use` keyword, any `pub`, and the
+/// terminating `;`.
+fn usePathText(e: *const Ctx, item: ts.Node) []const u8 {
+    var i: u32 = 0;
+    while (item.namedChild(i)) |c| : (i += 1) {
+        if (std.mem.eql(u8, c.kind(), "use_tree")) return text(e, c);
+    }
+    // Fallback: strip a leading `use` and the trailing `;` from the raw text.
+    var raw = std.mem.trim(u8, text(e, item), " \t\r\n");
+    if (raw.len > 0 and raw[raw.len - 1] == ';') raw = raw[0 .. raw.len - 1];
+    if (std.mem.indexOf(u8, raw, "use")) |ui| raw = raw[ui + 3 ..];
+    return std.mem.trim(u8, raw, " \t\r\n");
+}
+
 /// Register a `use` declaration as a UseDecl (target not resolved yet — P1).
 fn useItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
-    const eid = try addEntity(e, .use_, "", parent);
+    const path_text = usePathText(e, item);
+    const eid = try addEntity(e, .use_, path_text, parent);
     var last_seg: []const u8 = "";
     var i: u32 = 0;
     while (item.namedChild(i)) |c| : (i += 1) {
         if (std.mem.eql(u8, c.kind(), "identifier")) last_seg = text(e, c);
     }
-    e.g.symbol_table.entities.items[eid].name = try e.alloc.dupe(u8, last_seg);
     try e.g.addUse(.{
         .id = eid,
         .kind = .{ .plain = 0 }, // target resolved in P1 (names pass)
@@ -615,4 +632,5 @@ pub fn extractFile(ctx: *Ctx) !void {
     defer tree.destroy();
     const root = tree.rootNode();
     try mapItems(ctx, root, 0);
+    try names.resolveGraph(ctx.alloc, ctx.g);
 }
