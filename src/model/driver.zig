@@ -206,12 +206,15 @@ pub fn translate(
     try bodies_list.append(arena, .none);
 
     // 5. Run `cst.extractFile(&cst_ctx)` to extract items, declarations, types, and body kinds.
+    const lib_dir = std.fs.path.dirname(lib_path) orelse crate_dir;
     var cst_ctx: cst.Ctx = .{
         .alloc = arena,
         .g = &g,
         .src = src,
         .types_list = &types_list,
         .bodies_list = &bodies_list,
+        .base_dir = lib_dir,
+        .io = io,
     };
     try cst.extractFile(&cst_ctx);
 
@@ -222,6 +225,20 @@ pub fn translate(
     var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
     var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
     var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+
+    // Cache each module's source text. The crate root (id 0) uses the lib
+    // source already read; file-split submodules read their own file.
+    var module_srcs: std.AutoHashMapUnmanaged(spine.EntityId, []const u8) = .empty;
+    defer module_srcs.deinit(arena);
+    try module_srcs.put(arena, 0, src);
+    for (g.modules.items) |m| {
+        if (m.id == 0) continue;
+        if (m.source_path) |sp| {
+            if (readFileAlloc(arena, io, sp)) |m_src| {
+                try module_srcs.put(arena, m.id, m_src);
+            } else |_| {}
+        }
+    }
 
     var ts_ctx: ts_ext.Ctx = .{
         .alloc = arena,
@@ -235,10 +252,27 @@ pub fn translate(
         .mod_id = 0,
     };
 
+    var fn_ids: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer fn_ids.deinit(arena);
     for (g.symbol_table.entities.items) |ent| {
-        if (ent.kind == .fn_) {
-            _ = ts_ext.extractFunction(&ts_ctx, ent.id) catch false;
+        if (ent.kind == .fn_) try fn_ids.append(arena, ent.id);
+    }
+
+    for (fn_ids.items) |fn_id| {
+        const ent = g.symbol_table.get(fn_id) orelse continue;
+        var cur = ent.parent orelse continue;
+        var m_src: ?[]const u8 = null;
+        while (g.module(cur)) |m| {
+            if (module_srcs.get(cur)) |s| {
+                m_src = s;
+                break;
+            }
+            cur = m.parent orelse break;
         }
+        const fn_src = m_src orelse continue;
+        ts_ctx.src = fn_src;
+        ts_ctx.mod_id = ent.parent.?;
+        _ = ts_ext.extractFunction(&ts_ctx, fn_id) catch false;
     }
 
     // 8. Run `infer.solve(arena, &bodies)` and apply inferred types to expression slots via `inferred.apply(exprs)`.

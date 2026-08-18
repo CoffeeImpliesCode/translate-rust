@@ -74,10 +74,8 @@ fn text(e: *const Ext, node: ts.Node) []const u8 {
 /// first module-kind-parented symbol with `name`.
 fn lookupModuleEntity(e: *const Ext, name: []const u8) ?spine.EntityId {
     for (e.ctx.g.symbol_table.entities.items) |ent| {
-        if (std.mem.eql(u8, ent.name, name) and ent.parent != null) {
-            if (e.ctx.g.symbol_table.get(ent.parent.?)) |p| {
-                if (p.kind == .module) return ent.id;
-            }
+        if (std.mem.eql(u8, ent.name, name)) {
+            return ent.id;
         }
     }
     return null;
@@ -90,7 +88,8 @@ fn resolveName(e: *const Ext, name: []const u8) ?spine.EntityId {
         i -= 1;
         if (std.mem.eql(u8, e.locals.items[i].name, name)) return e.locals.items[i].def;
     }
-    return lookupModuleEntity(e, name);
+    if (lookupModuleEntity(e, name)) |def| return def;
+    return null;
 }
 
 /// Register a local binding as a symbol-table entity (parent = fn). Not listed
@@ -229,7 +228,7 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
             name = text(e, c);
         } else if (std.mem.eql(u8, k, "type") or std.mem.eql(u8, k, "primitive_type")) {
             type_node = c;
-        } else if (std.mem.eql(u8, k, "value") or std.mem.eql(u8, k, "call_expression") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "integer_literal") or std.mem.eql(u8, k, "boolean_literal") or std.mem.eql(u8, k, "string_literal") or std.mem.eql(u8, k, "char_literal") or std.mem.eql(u8, k, "macro_invocation") or std.mem.eql(u8, k, "binary_expression") or std.mem.eql(u8, k, "array_expression") or std.mem.eql(u8, k, "struct_expression")) {
+        } else if (std.mem.eql(u8, k, "value") or std.mem.eql(u8, k, "call_expression") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "integer_literal") or std.mem.eql(u8, k, "float_literal") or std.mem.eql(u8, k, "boolean_literal") or std.mem.eql(u8, k, "string_literal") or std.mem.eql(u8, k, "char_literal") or std.mem.eql(u8, k, "macro_invocation") or std.mem.eql(u8, k, "binary_expression") or std.mem.eql(u8, k, "array_expression") or std.mem.eql(u8, k, "struct_expression") or std.mem.eql(u8, k, "match_expression")) {
             if (init_node == null) init_node = c;
         }
     }
@@ -409,6 +408,12 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     if (std.mem.eql(u8, kind, "integer_literal")) {
         return lowerIntLit(e, node);
     }
+    if (std.mem.eql(u8, kind, "float_literal")) {
+        return lowerFloatLit(e, node);
+    }
+    if (std.mem.eql(u8, kind, "char_literal")) {
+        return lowerCharLit(e, node);
+    }
     if (std.mem.eql(u8, kind, "string_literal")) {
         return lowerStrLit(e, node);
     }
@@ -474,9 +479,15 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         } });
     }
 
-    // Calls.
+    // Calls & construction.
     if (std.mem.eql(u8, kind, "call_expression")) {
         return lowerCall(e, node);
+    }
+    if (std.mem.eql(u8, kind, "struct_expression")) {
+        return lowerStructExpr(e, node);
+    }
+    if (std.mem.eql(u8, kind, "match_expression")) {
+        return lowerMatch(e, node);
     }
 
     // Field / index access.
@@ -582,6 +593,481 @@ fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     var s = raw;
     if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
     return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = try e.ctx.alloc.dupe(u8, s) } } });
+}
+fn lowerFloatLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const t = text(e, node);
+    const value = std.fmt.parseFloat(f64, t) catch 0.0;
+    return appendExpr(e, .{ .literal = .{ .float = .{
+        .text = try e.ctx.alloc.dupe(u8, t),
+        .value = value,
+    } } });
+}
+
+fn lowerCharLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const t = text(e, node);
+    var val: u32 = 0;
+    if (t.len >= 3 and t[0] == '\'' and t[t.len - 1] == '\'') {
+        val = t[1];
+    }
+    return appendExpr(e, .{ .literal = .{ .character = .{
+        .text = try e.ctx.alloc.dupe(u8, t),
+        .value = val,
+    } } });
+}
+
+fn lowerStructExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    var name_node: ?ts.Node = null;
+    var fields_node: ?ts.Node = null;
+
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "field_initializer_list")) {
+            fields_node = c;
+        } else if (name_node == null and !isComment(c)) {
+            name_node = c;
+        }
+    }
+
+    const n_node = name_node orelse return unsupported(e, "struct expression missing name");
+    const raw_name = text(e, n_node);
+    const last_colon = std.mem.lastIndexOfScalar(u8, raw_name, ':');
+    var leaf_name = if (last_colon) |idx| raw_name[idx + 1 ..] else raw_name;
+    if (std.mem.indexOfScalar(u8, leaf_name, '<')) |lt_idx| {
+        leaf_name = leaf_name[0..lt_idx];
+    }
+    leaf_name = std.mem.trim(u8, leaf_name, " \t\r\n:");
+    const def = resolveName(e, leaf_name) orelse (resolveName(e, raw_name) orelse return unsupported(e, "unresolved struct type"));
+
+    var fields: std.ArrayListUnmanaged(exprs.FieldInit) = .empty;
+    defer fields.deinit(e.ctx.alloc);
+
+    var base_id: ?exprs.NodeId = null;
+
+    if (fields_node) |fn_node| {
+        var j: u32 = 0;
+        while (fn_node.namedChild(j)) |c| : (j += 1) {
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "field_initializer")) {
+                var fname_node: ?ts.Node = null;
+                var fval_node: ?ts.Node = null;
+                var m: u32 = 0;
+                while (c.namedChild(m)) |child| : (m += 1) {
+                    const ck = child.kind();
+                    if (std.mem.eql(u8, ck, "field_identifier") or std.mem.eql(u8, ck, "identifier")) {
+                        if (fname_node == null) fname_node = child else if (fval_node == null) fval_node = child;
+                    } else if (!isComment(child)) {
+                        if (fval_node == null) fval_node = child;
+                    }
+                }
+                const fnm = if (fname_node) |fnn| text(e, fnn) else "";
+                if (fnm.len == 0) continue;
+                if (fval_node) |fvn| {
+                    const val_id = try lowerExpr(e, fvn);
+                    try fields.append(e.ctx.alloc, .{
+                        .field = try e.ctx.alloc.dupe(u8, fnm),
+                        .value = val_id,
+                        .shorthand = false,
+                    });
+                } else {
+                    // Shorthand `Point { x }` -> PathExpr(x)
+                    const var_def = resolveName(e, fnm) orelse try pushLocal(e, fnm);
+                    const val_id = try appendExpr(e, .{ .path = .{ .def = var_def, .generic_args = &.{} } });
+                    try fields.append(e.ctx.alloc, .{
+                        .field = try e.ctx.alloc.dupe(u8, fnm),
+                        .value = val_id,
+                        .shorthand = true,
+                    });
+                }
+            } else if (std.mem.eql(u8, k, "shorthand_field_initializer")) {
+                const fnm = text(e, c);
+                const var_def = resolveName(e, fnm) orelse try pushLocal(e, fnm);
+                const val_id = try appendExpr(e, .{ .path = .{ .def = var_def, .generic_args = &.{} } });
+                try fields.append(e.ctx.alloc, .{
+                    .field = try e.ctx.alloc.dupe(u8, fnm),
+                    .value = val_id,
+                    .shorthand = true,
+                });
+            } else if (std.mem.eql(u8, k, "base_field_initializer")) {
+                if (c.namedChild(0)) |bn| {
+                    base_id = try lowerExpr(e, bn);
+                }
+            }
+        }
+    }
+
+    return appendExpr(e, .{ .struct_lit = .{
+        .def = def,
+        .fields = try fields.toOwnedSlice(e.ctx.alloc),
+        .base = base_id,
+    } });
+}
+
+fn lowerFieldPattern(e: *Ext, node: ts.Node) anyerror!exprs.FieldPat {
+    // `width` shorthand → `shorthand_field_identifier` child, pattern implied
+    // by name. `x: ax` → `field_identifier` x + pattern `ax`.
+    var fname: []const u8 = "";
+    var fpat_node: ?ts.Node = null;
+    var is_shorthand = false;
+
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "field_identifier")) {
+            fname = text(e, c);
+        } else if (std.mem.eql(u8, k, "shorthand_field_identifier")) {
+            fname = text(e, c);
+            is_shorthand = true;
+        } else if (std.mem.eql(u8, k, "identifier")) {
+            // `x: ax` — the nested pattern binding is an identifier.
+            fpat_node = c;
+        } else if (!isComment(c) and !std.mem.eql(u8, k, ":")) {
+            fpat_node = c;
+        }
+    }
+
+    if (fname.len == 0) {
+        return .{ .field = "", .pat = try appendPat(e, .{ .wildcard = {} }), .shorthand = true };
+    }
+
+    if (fpat_node) |fpn| {
+        const pid = try lowerPattern(e, fpn);
+        return .{
+            .field = try e.ctx.alloc.dupe(u8, fname),
+            .pat = pid,
+            .shorthand = false,
+        };
+    }
+
+    // Shorthand `Point { width }` binds a local named `width`.
+    _ = try pushLocal(e, fname);
+    const pid = try appendPat(e, .{ .binding = .{
+        .name = try e.ctx.alloc.dupe(u8, fname),
+        .mode = .{ .value = {} },
+        .mutable = false,
+    } });
+    return .{
+        .field = try e.ctx.alloc.dupe(u8, fname),
+        .pat = pid,
+        .shorthand = true,
+    };
+}
+
+fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const kind = node.kind();
+
+    if (std.mem.eql(u8, kind, "wildcard_pattern") or std.mem.eql(u8, kind, "_")) {
+        return appendPat(e, .{ .wildcard = {} });
+    }
+
+    if (std.mem.eql(u8, kind, "mut_pattern")) {
+        var nm: []const u8 = "";
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            if (std.mem.eql(u8, c.kind(), "identifier")) nm = text(e, c);
+        }
+        _ = try pushLocal(e, nm);
+        return appendPat(e, .{ .binding = .{
+            .name = try e.ctx.alloc.dupe(u8, nm),
+            .mode = .{ .value = {} },
+            .mutable = true,
+        } });
+    }
+
+    if (std.mem.eql(u8, kind, "identifier")) {
+        const nm = text(e, node);
+        if (resolveName(e, nm)) |def| {
+            if (e.ctx.g.symbol_table.get(def)) |ent| {
+                if (ent.kind == .variant or ent.kind == .const_) {
+                    return appendPat(e, .{ .path = .{ .def = def, .variant = null } });
+                }
+            }
+        }
+        _ = try pushLocal(e, nm);
+        return appendPat(e, .{ .binding = .{
+            .name = try e.ctx.alloc.dupe(u8, nm),
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } });
+    }
+
+    if (std.mem.eql(u8, kind, "scoped_identifier") or std.mem.eql(u8, kind, "path")) {
+        const t = text(e, node);
+        const last = std.mem.lastIndexOfScalar(u8, t, ':');
+        const leaf = if (last) |idx| t[idx + 1 ..] else t;
+        const def = resolveName(e, leaf) orelse (resolveName(e, t) orelse try pushLocal(e, leaf));
+        return appendPat(e, .{ .path = .{
+            .def = def,
+            .variant = try e.ctx.alloc.dupe(u8, leaf),
+        } });
+    }
+
+    if (std.mem.eql(u8, kind, "tuple_pattern")) {
+        var elems: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+        defer elems.deinit(e.ctx.alloc);
+        var has_rest = false;
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            if (std.mem.eql(u8, c.kind(), "rest_pattern") or std.mem.eql(u8, c.kind(), "..")) {
+                has_rest = true;
+            } else if (!isComment(c)) {
+                try elems.append(e.ctx.alloc, try lowerPattern(e, c));
+            }
+        }
+        return appendPat(e, .{ .tuple = .{
+            .elements = try elems.toOwnedSlice(e.ctx.alloc),
+            .rest = has_rest,
+        } });
+    }
+
+    if (std.mem.eql(u8, kind, "match_pattern")) {
+        // `match_pattern` wraps the real pattern. A bare `_` has no named
+        // children → wildcard. Otherwise lower the first named child.
+        if (node.namedChildCount() == 0) return appendPat(e, .{ .wildcard = {} });
+        return lowerPattern(e, node.namedChild(0).?);
+    }
+
+    if (std.mem.eql(u8, kind, "tuple_struct_pattern")) {
+        var type_node: ?ts.Node = null;
+        var pat_nodes: std.ArrayListUnmanaged(ts.Node) = .empty;
+        defer pat_nodes.deinit(e.ctx.alloc);
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (type_node == null and (std.mem.eql(u8, k, "scoped_identifier") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "scoped_type_identifier") or std.mem.eql(u8, k, "path"))) {
+                type_node = c;
+            } else if (!isComment(c) and !std.mem.eql(u8, k, "..")) {
+                // Field patterns are direct children (e.g. `r` in `Circle(r)`).
+                try pat_nodes.append(e.ctx.alloc, c);
+            }
+        }
+        const raw_type = if (type_node) |tn| text(e, tn) else "";
+        const last_colon = std.mem.lastIndexOfScalar(u8, raw_type, ':');
+        const leaf = if (last_colon) |idx| raw_type[idx + 1 ..] else raw_type;
+        const def = resolveName(e, leaf) orelse (resolveName(e, raw_type) orelse try pushLocal(e, leaf));
+
+        var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
+        defer field_pats.deinit(e.ctx.alloc);
+        for (pat_nodes.items) |pnode| {
+            const pid = try lowerPattern(e, pnode);
+            const ptext = text(e, pnode);
+            try field_pats.append(e.ctx.alloc, .{
+                .field = try e.ctx.alloc.dupe(u8, ptext),
+                .pat = pid,
+                .shorthand = true,
+            });
+        }
+        return appendPat(e, .{ .struct_pat = .{
+            .def = def,
+            .fields = try field_pats.toOwnedSlice(e.ctx.alloc),
+            .rest = false,
+        } });
+    }
+
+    if (std.mem.eql(u8, kind, "struct_pattern")) {
+        var type_node: ?ts.Node = null;
+        var fields_list_node: ?ts.Node = null;
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (type_node == null and (std.mem.eql(u8, k, "scoped_identifier") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "scoped_type_identifier") or std.mem.eql(u8, k, "path"))) {
+                type_node = c;
+            } else if (std.mem.eql(u8, k, "field_pattern_list") or std.mem.eql(u8, k, "field_initializer_list")) {
+                fields_list_node = c;
+            }
+        }
+        const raw_type = if (type_node) |tn| text(e, tn) else "";
+        const last_colon = std.mem.lastIndexOfScalar(u8, raw_type, ':');
+        const leaf = if (last_colon) |idx| raw_type[idx + 1 ..] else raw_type;
+        const def = resolveName(e, leaf) orelse (resolveName(e, raw_type) orelse try pushLocal(e, leaf));
+
+        var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
+        defer field_pats.deinit(e.ctx.alloc);
+        var has_rest = false;
+
+        // When the struct_pattern's field nodes are direct children (no
+        // field_pattern_list wrapper), fold them in here.
+        if (fields_list_node == null) {
+            var j: u32 = 0;
+            while (node.namedChild(j)) |c| : (j += 1) {
+                if (type_node) |tn| {
+                    if (c.id == tn.id) continue;
+                }
+                const k = c.kind();
+                if (std.mem.eql(u8, k, "field_pattern")) {
+                    const fpat = try lowerFieldPattern(e, c);
+                    try field_pats.append(e.ctx.alloc, fpat);
+                } else if (std.mem.eql(u8, k, "remaining_field_pattern") or std.mem.eql(u8, k, "..")) {
+                    has_rest = true;
+                }
+            }
+        } else if (fields_list_node) |fln| {
+            var j: u32 = 0;
+            while (fln.namedChild(j)) |c| : (j += 1) {
+                const k = c.kind();
+                if (std.mem.eql(u8, k, "field_pattern")) {
+                    try field_pats.append(e.ctx.alloc, try lowerFieldPattern(e, c));
+                } else if (std.mem.eql(u8, k, "remaining_field_pattern") or std.mem.eql(u8, k, "..")) {
+                    has_rest = true;
+                }
+            }
+        }
+        return appendPat(e, .{ .struct_pat = .{
+            .def = def,
+            .fields = try field_pats.toOwnedSlice(e.ctx.alloc),
+            .rest = has_rest,
+        } });
+    }
+
+    if (std.mem.eql(u8, kind, "or_pattern")) {
+        var alts: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+        defer alts.deinit(e.ctx.alloc);
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            if (!isComment(c)) {
+                try alts.append(e.ctx.alloc, try lowerPattern(e, c));
+            }
+        }
+        return appendPat(e, .{ .@"or" = .{ .alternatives = try alts.toOwnedSlice(e.ctx.alloc) } });
+    }
+
+    if (std.mem.eql(u8, kind, "reference_pattern")) {
+        if (node.namedChild(0)) |inner| {
+            const pid = try lowerPattern(e, inner);
+            return appendPat(e, .{ .reference = .{
+                .mode = .{ .value = {} },
+                .inner = pid,
+            } });
+        }
+    }
+
+    if (std.mem.eql(u8, kind, "integer_literal")) {
+        const t = text(e, node);
+        var base: u8 = 10;
+        if (t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X')) base = 16;
+        if (t.len > 2 and t[0] == '0' and (t[1] == 'b' or t[1] == 'B')) base = 2;
+        if (t.len > 2 and t[0] == '0' and (t[1] == 'o' or t[1] == 'O')) base = 8;
+        const value = std.fmt.parseInt(i128, t, base) catch 0;
+        return appendPat(e, .{ .literal = .{ .int = .{
+            .text = try e.ctx.alloc.dupe(u8, t),
+            .value = value,
+            .base = if (base == 16) .hex else if (base == 2) .bin else if (base == 8) .oct else .dec,
+            .ty_suffix = null,
+        } } });
+    }
+
+    if (std.mem.eql(u8, kind, "string_literal")) {
+        const raw = text(e, node);
+        var s = raw;
+        if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
+        return appendPat(e, .{ .literal = .{ .string = .{ .bytes = try e.ctx.alloc.dupe(u8, s) } } });
+    }
+
+    if (std.mem.eql(u8, kind, "boolean_literal")) {
+        return appendPat(e, .{ .literal = .{ .boolean = std.mem.eql(u8, text(e, node), "true") } });
+    }
+
+    return appendPat(e, .{ .wildcard = {} });
+}
+
+fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    var val_node: ?ts.Node = null;
+    var block_node: ?ts.Node = null;
+
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "match_block")) {
+            block_node = c;
+        } else if (val_node == null and !isComment(c)) {
+            if (std.mem.eql(u8, k, "condition") or std.mem.eql(u8, k, "match_condition")) {
+                if (c.namedChildCount() > 0) val_node = c.namedChild(0) else val_node = c;
+            } else {
+                val_node = c;
+            }
+        }
+    }
+
+    const scr_node = val_node orelse return unsupported(e, "match expression missing scrutinee");
+    const scrutinee_id = try lowerExpr(e, scr_node);
+
+    var arms: std.ArrayListUnmanaged(exprs.MatchArm) = .empty;
+    defer arms.deinit(e.ctx.alloc);
+
+    if (block_node) |bn| {
+        var j: u32 = 0;
+        while (bn.namedChild(j)) |c| : (j += 1) {
+            if (!std.mem.eql(u8, c.kind(), "match_arm")) continue;
+
+            // `match_arm` = `match_pattern` + body-expr. The `match_pattern`
+            // node wraps the actual pattern; when a guard is present
+            // (`n if n > 5`) the guard expression is a sibling of the pattern
+            // inside `match_pattern`.
+            var match_pattern: ?ts.Node = null;
+            var body_node: ?ts.Node = null;
+
+            var m: u32 = 0;
+            while (c.namedChild(m)) |child| : (m += 1) {
+                if (std.mem.eql(u8, child.kind(), "match_pattern")) {
+                    match_pattern = child;
+                } else if (body_node == null) {
+                    body_node = child;
+                }
+            }
+
+            const mp = match_pattern orelse continue;
+            const bn_arm = body_node orelse continue;
+
+            // Pattern node: first named child of `match_pattern`, or the
+            // bare `_` wildcard token when the wrapper is empty.
+            var pn: ts.Node = undefined;
+            var has_pat = false;
+            var guard_node: ?ts.Node = null;
+            if (mp.namedChildCount() > 0) {
+                pn = mp.namedChild(0).?;
+                has_pat = true;
+                if (mp.namedChildCount() > 1) guard_node = mp.namedChild(1);
+            }
+
+            var pat_ids: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+            defer pat_ids.deinit(e.ctx.alloc);
+
+            if (has_pat) {
+                if (std.mem.eql(u8, pn.kind(), "or_pattern")) {
+                    // Collapse `a | b | c` into one entry per alternative.
+                    var k: u32 = 0;
+                    while (pn.namedChild(k)) |alt| : (k += 1) {
+                        if (!isComment(alt) and !std.mem.eql(u8, alt.kind(), "|")) {
+                            try pat_ids.append(e.ctx.alloc, try lowerPattern(e, alt));
+                        }
+                    }
+                } else {
+                    try pat_ids.append(e.ctx.alloc, try lowerPattern(e, pn));
+                }
+            } else {
+                try pat_ids.append(e.ctx.alloc, try appendPat(e, .{ .wildcard = {} }));
+            }
+
+            var guard_id: ?exprs.NodeId = null;
+            if (guard_node) |gn| {
+                guard_id = try lowerExpr(e, gn);
+            }
+
+            const arm_body_id = try lowerExpr(e, bn_arm);
+
+            try arms.append(e.ctx.alloc, .{
+                .patterns = try pat_ids.toOwnedSlice(e.ctx.alloc),
+                .guard = guard_id,
+                .body = arm_body_id,
+            });
+        }
+    }
+
+    return appendExpr(e, .{ .match = .{
+        .scrutinee = scrutinee_id,
+        .arms = try arms.toOwnedSlice(e.ctx.alloc),
+        .option_scrutinee = false,
+    } });
 }
 
 fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
@@ -1065,4 +1551,141 @@ test "lower built-in macro invocations in fn bodies" {
     try std.testing.expect(found_ne); // assert_ne! → .ne binary
     try std.testing.expect(found_byte_array); // vec![1,2,3] → byte_array literal
     try std.testing.expect(found_unsupported); // panic!/unreachable!/unresolved → .unsupported
+}
+
+test "lower struct_expression to .struct_lit and match_expression to .match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    // Root module entity (id 0).
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    // fn area (1), fn origin (2), struct Point (3), enum Shape (4).
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "area"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "origin"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .struct_, .name = try alloc.dupe(u8, "Point"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .enum_, .name = try alloc.dupe(u8, "Shape"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .variant, .name = try alloc.dupe(u8, "Circle"), .span = span, .visibility = .public, .parent = 4, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .variant, .name = try alloc.dupe(u8, "Rect"), .span = span, .visibility = .public, .parent = 4, .resolved = null, .renamed_to = null, .attributes = &.{} });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .f64 }, .body = 0 } });
+    try bodies_list.append(alloc, .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .f64 }, .body = 0 } });
+    try bodies_list.append(alloc, .{ .struct_ = .{ .generic_params = &.{}, .layout = .named, .fields = &.{} } });
+    try bodies_list.append(alloc, .{ .enum_ = .{
+        .kind = .data,
+        .variants = &.{
+            .{ .name = "Circle", .fields = .{ .tuple = &.{.{ .prim = .f64 }} }, .discriminant = null },
+            .{ .name = "Rect", .fields = .{ .named = &.{} }, .discriminant = null },
+        },
+        .repr_int = null,
+        .non_exhaustive = false,
+    } });
+
+    const src =
+        \\pub fn area(shape: Shape) -> f64 {
+        \\    match shape {
+        \\        Shape::Circle(r) => r * r * 3.14159,
+        \\        Shape::Rect { width, height } => width * height,
+        \\    }
+        \\}
+        \\pub fn origin() -> Point {
+        \\    Point { x: 0, y: 0 }
+        \\}
+    ;
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = src,
+        .mod_id = 0,
+    };
+
+    try std.testing.expect(try extractFunction(&ctx, 1)); // area
+    try std.testing.expect(try extractFunction(&ctx, 2)); // origin
+
+    var found_struct_lit = false;
+    var found_match = false;
+    var match_arm_count: usize = 0;
+    var struct_pat_count: usize = 0;
+    var found_float = false;
+    var found_binding_r = false;
+    for (exprs_list.items) |ex| {
+        switch (ex.kind) {
+            .struct_lit => |sl| {
+                found_struct_lit = true;
+                try std.testing.expectEqual(@as(exprs.DefId, 3), sl.def); // Point
+                try std.testing.expectEqual(@as(usize, 2), sl.fields.len);
+                try std.testing.expectEqualStrings("x", sl.fields[0].field);
+                try std.testing.expectEqualStrings("y", sl.fields[1].field);
+            },
+            .match => |me| {
+                found_match = true;
+                try std.testing.expect(!me.option_scrutinee);
+                match_arm_count = me.arms.len;
+            },
+            .literal => |l| {
+                if (l == .float) found_float = true;
+            },
+            else => {},
+        }
+    }
+    for (pats_list.items) |pt| {
+        switch (pt.kind) {
+            .struct_pat => |sp| {
+                struct_pat_count += 1;
+                const sp_ent = g.symbol_table.get(sp.def) orelse return error.UnexpectedMissing;
+                if (sp_ent.kind != .variant) return error.UnexpectedNonVariant;
+            },
+            .binding => |bd| {
+                if (std.mem.eql(u8, bd.name, "r")) found_binding_r = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_struct_lit); // Point { x: 0, y: 0 }
+    try std.testing.expect(found_match); // match shape { ... }
+    try std.testing.expectEqual(@as(usize, 2), match_arm_count);
+    try std.testing.expectEqual(@as(usize, 2), struct_pat_count); // Circle + Rect
+    try std.testing.expect(found_binding_r); // r bound by Circle(r)
+    try std.testing.expect(found_float); // 3.14159 in the Circle arm body
 }

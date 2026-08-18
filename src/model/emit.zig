@@ -220,7 +220,7 @@ fn emitEntity(
             if (bodies) |bb| {
                 if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
                     .enum_ => |eb| {
-                        try emitEnumDef(allocator, buf, e, eb);
+                        try emitEnumDef(allocator, buf, g, e, eb);
                         return;
                     },
                     else => {},
@@ -262,7 +262,7 @@ fn emitEntity(
             if (bodies) |bb| {
                 if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
                     .fn_ => |fb| {
-                        try emitFnSignature(allocator, buf, fb.params, fb.ret, fb.is_allocating);
+                        try emitFnSignature(allocator, buf, g, fb.params, fb.ret, fb.is_allocating);
                         try buf.append(allocator, ' ');
                         try emitFnBody(allocator, buf, g, bb, fb.body, fb.params, fb.ret, 1);
                         try buf.append(allocator, '\n');
@@ -286,7 +286,7 @@ fn emitEntity(
                 if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
                     .const_ => |cb| {
                         try buf.appendSlice(allocator, ": ");
-                        try emitType(allocator, buf, cb.ty);
+                        try emitType(allocator, buf, g, cb.ty);
                         try buf.appendSlice(allocator, " = ");
                         try emitExpr(allocator, buf, g, bb, cb.init, 0, true, true);
                         try buf.appendSlice(allocator, ";\n");
@@ -340,7 +340,11 @@ fn emitEntity(
             }
             try unsupported(allocator, buf, e, "trait");
         },
-        .impl_ => try unsupported(allocator, buf, e, "impl"),
+        .impl_ => {
+            // Inherent and trait impls for structs/enums are emitted directly
+            // as members of their target struct in emitStructInner; skip emitting
+            // top-level stub comments for them.
+        },
         .type_alias => {
             if (bodies) |bb| {
                 if (e.id < bb.bodies.len) switch (bb.bodies[e.id]) {
@@ -349,7 +353,7 @@ fn emitEntity(
                         try buf.appendSlice(allocator, "const ");
                         try emitIdent(allocator, buf, entityName(e));
                         try buf.appendSlice(allocator, " = ");
-                        try emitType(allocator, buf, ab.target);
+                        try emitType(allocator, buf, g, ab.target);
                         try buf.appendSlice(allocator, ";\n");
                         return;
                     },
@@ -518,13 +522,18 @@ fn primName(p: types.Prim) []const u8 {
     };
 }
 
-fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: types.Type) !void {
+fn emitType(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
+    ty: types.Type,
+) !void {
     switch (ty) {
         .prim => |p| try buf.appendSlice(allocator, primName(p)),
         .slice => |s| {
             try buf.appendSlice(allocator, "[]");
             if (s.const_) try buf.appendSlice(allocator, "const ");
-            try emitType(allocator, buf, s.elem);
+            try emitType(allocator, buf, g, s.elem);
         },
         .path => |p| {
             for (p.segments, 0..) |seg, i| {
@@ -538,7 +547,7 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
             } else {
                 try buf.appendSlice(allocator, "*const ");
             }
-            try emitType(allocator, buf, r.pointee);
+            try emitType(allocator, buf, g, r.pointee);
         },
         .raw_ptr => |rp| {
             if (rp.mut) {
@@ -546,7 +555,7 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
             } else {
                 try buf.appendSlice(allocator, "[*]const ");
             }
-            try emitType(allocator, buf, rp.pointee);
+            try emitType(allocator, buf, g, rp.pointee);
         },
         .array => |a| {
             try buf.append(allocator, '[');
@@ -563,7 +572,7 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
                 },
             }
             try buf.append(allocator, ']');
-            try emitType(allocator, buf, a.elem);
+            try emitType(allocator, buf, g, a.elem);
         },
         .tuple => |tup| {
             if (tup.len == 0) {
@@ -577,7 +586,7 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
                 defer allocator.free(fld_name);
                 try buf.appendSlice(allocator, fld_name);
                 try buf.appendSlice(allocator, ": ");
-                try emitType(allocator, buf, elem_ty);
+                try emitType(allocator, buf, g, elem_ty);
             }
             try buf.appendSlice(allocator, " }");
         },
@@ -596,38 +605,71 @@ fn emitType(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), ty: 
                     else => {},
                 }
                 if (!is_anyerror) {
-                    try emitType(allocator, buf, res.err);
+                    try emitType(allocator, buf, g, res.err);
                 }
                 try buf.append(allocator, '!');
-                try emitType(allocator, buf, res.ok);
+                try emitType(allocator, buf, g, res.ok);
             } else {
                 try buf.appendSlice(allocator, "Result(");
-                try emitType(allocator, buf, res.ok);
+                try emitType(allocator, buf, g, res.ok);
                 try buf.appendSlice(allocator, ", ");
-                try emitType(allocator, buf, res.err);
+                try emitType(allocator, buf, g, res.err);
                 try buf.append(allocator, ')');
             }
         },
         .option => |opt| {
             try buf.append(allocator, '?');
-            try emitType(allocator, buf, opt.*);
+            try emitType(allocator, buf, g, opt.*);
         },
         .generic_inst => |gi| {
-            _ = gi;
-            try buf.appendSlice(allocator, "anyopaque");
+            const base_name = if (g.symbol_table.get(gi.decl)) |ent| ent.name else "";
+            const params = gi.args.params;
+            if (std.mem.eql(u8, base_name, "BuildHasherDefault")) {
+                try buf.appendSlice(allocator, "std.hash.BuildHasherDefault(");
+                if (params.len >= 1) {
+                    try emitType(allocator, buf, g, params[0]);
+                } else {
+                    try buf.appendSlice(allocator, "anyopaque");
+                }
+                try buf.append(allocator, ')');
+            } else if (std.mem.eql(u8, base_name, "HashMap")) {
+                try buf.appendSlice(allocator, "std.AutoHashMap(");
+                if (params.len >= 1) {
+                    try emitType(allocator, buf, g, params[0]);
+                } else {
+                    try buf.appendSlice(allocator, "anyopaque");
+                }
+                try buf.appendSlice(allocator, ", ");
+                if (params.len >= 2) {
+                    try emitType(allocator, buf, g, params[1]);
+                } else {
+                    try buf.appendSlice(allocator, "void");
+                }
+                try buf.append(allocator, ')');
+            } else if (std.mem.eql(u8, base_name, "HashSet")) {
+                try buf.appendSlice(allocator, "std.AutoHashMap(");
+                if (params.len >= 1) {
+                    try emitType(allocator, buf, g, params[0]);
+                } else {
+                    try buf.appendSlice(allocator, "anyopaque");
+                }
+                try buf.appendSlice(allocator, ", void)");
+            } else {
+                try buf.appendSlice(allocator, "anyopaque");
+            }
         },
         .fn_ptr => |fp| {
             try buf.appendSlice(allocator, "*const fn (");
             for (fp.params, 0..) |pt, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
-                try emitType(allocator, buf, pt);
+                try emitType(allocator, buf, g, pt);
             }
             try buf.appendSlice(allocator, ") ");
-            try emitType(allocator, buf, fp.ret);
+            try emitType(allocator, buf, g, fp.ret);
         },
         .boxed => |bx| {
             try buf.append(allocator, '*');
-            try emitType(allocator, buf, bx.*);
+            try emitType(allocator, buf, g, bx.*);
         },
         else => try buf.appendSlice(allocator, "anyopaque"),
     }
@@ -744,7 +786,7 @@ fn emitStructDef(
         }
 
         try buf.appendSlice(allocator, "    return struct {\n");
-        try emitStructInner(allocator, buf, g, b, sb, 2);
+        try emitStructInner(allocator, buf, g, b, entityName(e), sb, 2);
         try buf.appendSlice(allocator, "    };\n");
         try buf.appendSlice(allocator, "}\n");
     } else {
@@ -752,7 +794,7 @@ fn emitStructDef(
         try buf.appendSlice(allocator, "const ");
         try emitIdent(allocator, buf, entityName(e));
         try buf.appendSlice(allocator, " = struct {\n");
-        try emitStructInner(allocator, buf, g, b, sb, 1);
+        try emitStructInner(allocator, buf, g, b, entityName(e), sb, 1);
         try buf.appendSlice(allocator, "};\n");
     }
 }
@@ -762,6 +804,7 @@ fn emitStructInner(
     buf: *std.ArrayListUnmanaged(u8),
     g: *const graph.CrateGraph,
     b: *const Bodies,
+    struct_name: []const u8,
     sb: bodies_mod.StructBody,
     depth: u32,
 ) !void {
@@ -772,7 +815,7 @@ fn emitStructInner(
                 try writeIndent(allocator, buf, depth);
                 try emitIdent(allocator, buf, f.name);
                 try buf.appendSlice(allocator, ": ");
-                try emitType(allocator, buf, f.ty);
+                try emitType(allocator, buf, g, f.ty);
                 try buf.appendSlice(allocator, ",\n");
             }
         },
@@ -783,7 +826,7 @@ fn emitStructInner(
                 defer allocator.free(tuple_name);
                 try emitIdent(allocator, buf, tuple_name);
                 try buf.appendSlice(allocator, ": ");
-                try emitType(allocator, buf, f.ty);
+                try emitType(allocator, buf, g, f.ty);
                 try buf.appendSlice(allocator, ",\n");
             }
         },
@@ -829,10 +872,67 @@ fn emitStructInner(
         try buf.appendSlice(allocator, m_pub);
         try buf.appendSlice(allocator, "fn ");
         try emitIdent(allocator, buf, m.name);
-        try emitMethodSignature(allocator, buf, m.receiver, m.params, m.ret, m.is_allocating);
+        try emitMethodSignature(allocator, buf, g, m.receiver, m.params, m.ret, m.is_allocating);
         try buf.append(allocator, ' ');
         try emitExpr(allocator, buf, g, b, m.body, depth + 1, true, false);
         try buf.append(allocator, '\n');
+    }
+
+    // 5. Hoist inherent methods from `impl <StructName>` blocks.
+    var prev_was_method = sb.methods.len > 0;
+    for (g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .impl_) continue;
+        if (!std.mem.eql(u8, ent.name, struct_name) and !std.mem.endsWith(u8, ent.name, struct_name)) continue;
+        for (g.symbol_table.entities.items) |child| {
+            if (child.parent != ent.id) continue;
+            if (child.kind != .fn_) continue;
+            const already = blk: {
+                for (sb.methods) |m| {
+                    if (std.mem.eql(u8, m.name, child.name)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (already) continue;
+            if (prev_was_method) try buf.append(allocator, '\n');
+            prev_was_method = true;
+
+            try writeIndent(allocator, buf, depth);
+            const c_pub = visPrefix(child.visibility);
+            try buf.appendSlice(allocator, c_pub);
+            try buf.appendSlice(allocator, "fn ");
+            try emitIdent(allocator, buf, entityName(child));
+            if (child.id < b.bodies.len) {
+                switch (b.bodies[child.id]) {
+                    .fn_ => |fb| {
+                        try emitFnSignature(allocator, buf, g, fb.params, fb.ret, fb.is_allocating);
+                        try buf.append(allocator, ' ');
+                        if (fb.body < b.exprs.len) {
+                            try emitFnBody(allocator, buf, g, b, fb.body, fb.params, fb.ret, depth + 1);
+                        } else {
+                            try buf.appendSlice(allocator, "{\n");
+                            for (fb.params) |p| {
+                                try writeIndent(allocator, buf, depth + 1);
+                                try buf.appendSlice(allocator, "_ = ");
+                                try emitIdent(allocator, buf, p.name);
+                                try buf.appendSlice(allocator, ";\n");
+                            }
+                            try writeIndent(allocator, buf, depth);
+                            try buf.append(allocator, '}');
+                        }
+                        try buf.append(allocator, '\n');
+                        continue;
+                    },
+                    else => {},
+                }
+            }
+            // Signature-only fallback.
+            try buf.appendSlice(allocator, "() void {\n");
+            try writeIndent(allocator, buf, depth + 1);
+            try buf.appendSlice(allocator, "// body not yet lowered\n");
+            try writeIndent(allocator, buf, depth);
+            try buf.append(allocator, '}');
+            try buf.append(allocator, '\n');
+        }
     }
 }
 
@@ -844,7 +944,6 @@ fn emitTraitDef(
     e: spine.Entity,
     tb: bodies_mod.TraitBody,
 ) !void {
-    _ = g;
     _ = b;
     const pub_ = visPrefix(e.visibility);
     const trait_name = entityName(e);
@@ -871,10 +970,10 @@ fn emitTraitDef(
             try buf.appendSlice(allocator, ", ");
             try emitIdent(allocator, buf, p.name);
             try buf.appendSlice(allocator, ": ");
-            try emitType(allocator, buf, p.ty);
+            try emitType(allocator, buf, g, p.ty);
         }
         try buf.appendSlice(allocator, ") ");
-        try emitType(allocator, buf, m.ret);
+        try emitType(allocator, buf, g, m.ret);
         try buf.appendSlice(allocator, ",\n");
     }
     try buf.appendSlice(allocator, "    };\n\n");
@@ -893,10 +992,10 @@ fn emitTraitDef(
             try buf.appendSlice(allocator, ", ");
             try emitIdent(allocator, buf, p.name);
             try buf.appendSlice(allocator, ": ");
-            try emitType(allocator, buf, p.ty);
+            try emitType(allocator, buf, g, p.ty);
         }
         try buf.appendSlice(allocator, ") ");
-        try emitType(allocator, buf, m.ret);
+        try emitType(allocator, buf, g, m.ret);
         try buf.appendSlice(allocator, " {\n");
         try buf.appendSlice(allocator, "            return self.vtable.");
         try emitIdent(allocator, buf, m.name);
@@ -931,6 +1030,7 @@ fn emitTraitDef(
 fn emitEnumDef(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
     e: spine.Entity,
     eb: bodies_mod.EnumBody,
 ) !void {
@@ -986,7 +1086,7 @@ fn emitEnumDef(
                 .tuple => |tup| {
                     if (tup.len == 1) {
                         try buf.appendSlice(allocator, ": ");
-                        try emitType(allocator, buf, tup[0]);
+                        try emitType(allocator, buf, g, tup[0]);
                         try buf.appendSlice(allocator, ",\n");
                     } else {
                         try buf.appendSlice(allocator, ": struct {\n");
@@ -996,7 +1096,7 @@ fn emitEnumDef(
                             defer allocator.free(tuple_field_name);
                             try emitIdent(allocator, buf, tuple_field_name);
                             try buf.appendSlice(allocator, ": ");
-                            try emitType(allocator, buf, ty);
+                            try emitType(allocator, buf, g, ty);
                             try buf.appendSlice(allocator, ",\n");
                         }
                         try writeIndent(allocator, buf, 1);
@@ -1009,7 +1109,7 @@ fn emitEnumDef(
                         try writeIndent(allocator, buf, 2);
                         try emitIdent(allocator, buf, f.name);
                         try buf.appendSlice(allocator, ": ");
-                        try emitType(allocator, buf, f.ty);
+                        try emitType(allocator, buf, g, f.ty);
                         try buf.appendSlice(allocator, ",\n");
                     }
                     try writeIndent(allocator, buf, 1);
@@ -1038,7 +1138,7 @@ fn emitMatch(
         try writeIndent(allocator, buf, depth + 1);
 
         var capture_name: ?[]const u8 = null;
-
+        var struct_fields_slice: ?[]const exprs.FieldPat = null;
         for (arm.patterns, 0..) |pid, i| {
             if (i > 0) try buf.appendSlice(allocator, ", ");
             const pat = b.pats[pid];
@@ -1062,18 +1162,38 @@ fn emitMatch(
                     }
                 },
                 .struct_pat => |sp| {
+                    // A tuple-struct variant `Shape::Circle(r)` lowers to Zig
+                    // `switch` prong `.Circle => |r|`. Resolve the variant
+                    // name from its entity (enum variant or the extractor's
+                    // synthetic leaf entity); data payloads bind a capture.
                     if (g.symbol_table.get(sp.def)) |ent| {
-                        if (ent.kind == .variant) {
+                        if (ent.kind == .variant or ent.kind == .field) {
                             try buf.append(allocator, '.');
                             try emitIdent(allocator, buf, entityName(ent));
-                        } else {
+                        } else if (ent.name.len > 0) {
                             try emitIdent(allocator, buf, entityName(ent));
+                        } else {
+                            try buf.append(allocator, '_');
                         }
                     } else {
                         try buf.append(allocator, '_');
                     }
-                    if (sp.fields.len > 0) {
-                        capture_name = sp.fields[0].field;
+                    // Bind payload as the Zig switch capture:
+                    // If multiple named fields (e.g. `Rect { width, height }`), bind single struct capture `_rect`
+                    // or if single field `Circle(r)`, bind `r`.
+                    if (sp.fields.len == 1) {
+                        if (sp.fields[0].pat) |fpat_id| {
+                            const fpat = b.pats[fpat_id];
+                            switch (fpat.kind) {
+                                .binding => |bd| capture_name = bd.name,
+                                else => capture_name = sp.fields[0].field,
+                            }
+                        } else {
+                            capture_name = sp.fields[0].field;
+                        }
+                    } else if (sp.fields.len > 1) {
+                        capture_name = "_payload";
+                        struct_fields_slice = sp.fields;
                     }
                 },
                 .tuple => |tp| {
@@ -1096,21 +1216,47 @@ fn emitMatch(
         }
 
         try buf.appendSlice(allocator, " => ");
-
+        const has_payload_unpack = (capture_name != null and std.mem.eql(u8, capture_name.?, "_payload") and struct_fields_slice != null);
         if (capture_name) |cap| {
             try buf.append(allocator, '|');
             try emitIdent(allocator, buf, cap);
             try buf.appendSlice(allocator, "| ");
         }
 
-        if (arm.guard) |gid| {
-            try buf.appendSlice(allocator, "if (");
-            try emitExpr(allocator, buf, g, b, gid, depth + 1, true, is_comptime);
-            try buf.appendSlice(allocator, ") ");
-            try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true, is_comptime);
-            try buf.appendSlice(allocator, " else unreachable");
+        if (has_payload_unpack) {
+            try buf.appendSlice(allocator, "{\n");
+            for (struct_fields_slice.?) |fld| {
+                try writeIndent(allocator, buf, depth + 2);
+                try buf.appendSlice(allocator, "const ");
+                try emitIdent(allocator, buf, fld.field);
+                try buf.appendSlice(allocator, " = _payload.");
+                try emitIdent(allocator, buf, fld.field);
+                try buf.appendSlice(allocator, ";\n");
+            }
+            try writeIndent(allocator, buf, depth + 2);
+            if (arm.guard) |gid| {
+                try buf.appendSlice(allocator, "if (");
+                try emitExpr(allocator, buf, g, b, gid, depth + 2, true, is_comptime);
+                try buf.appendSlice(allocator, ") ");
+                try emitExpr(allocator, buf, g, b, arm.body, depth + 2, true, is_comptime);
+                try buf.appendSlice(allocator, " else unreachable;\n");
+            } else {
+                try buf.appendSlice(allocator, "return ");
+                try emitExpr(allocator, buf, g, b, arm.body, depth + 2, true, is_comptime);
+                try buf.appendSlice(allocator, ";\n");
+            }
+            try writeIndent(allocator, buf, depth + 1);
+            try buf.append(allocator, '}');
         } else {
-            try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true, is_comptime);
+            if (arm.guard) |gid| {
+                try buf.appendSlice(allocator, "if (");
+                try emitExpr(allocator, buf, g, b, gid, depth + 1, true, is_comptime);
+                try buf.appendSlice(allocator, ") ");
+                try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true, is_comptime);
+                try buf.appendSlice(allocator, " else unreachable");
+            } else {
+                try emitExpr(allocator, buf, g, b, arm.body, depth + 1, true, is_comptime);
+            }
         }
         try buf.appendSlice(allocator, ",\n");
     }
@@ -1168,13 +1314,31 @@ fn emitExpr(
                 try buf.append(allocator, '"');
             },
             .byte_array => |ba| try emitByteArrayLit(allocator, buf, ba.items),
+            .float => |fl| {
+                if (fl.text.len > 0) {
+                    // Ensure the token reads as a float literal for Zig
+                    // (Rust allows `1` or `1.` which Zig requires as `1.0`).
+                    if (std.mem.indexOfAny(u8, fl.text, ".eE") != null) {
+                        try buf.appendSlice(allocator, fl.text);
+                    } else {
+                        try buf.appendSlice(allocator, fl.text);
+                        try buf.appendSlice(allocator, ".0");
+                    }
+                } else {
+                    var tmp: [64]u8 = undefined;
+                    const formatted = try std.fmt.bufPrint(&tmp, "{d}", .{fl.value});
+                    try buf.appendSlice(allocator, formatted);
+                    if (std.mem.indexOfAny(u8, formatted, ".eE") == null) {
+                        try buf.appendSlice(allocator, ".0");
+                    }
+                }
+            },
             .character => |c| {
                 const formatted = try std.fmt.allocPrint(allocator, "'{c}'", .{@as(u8, @truncate(c.value))});
                 defer allocator.free(formatted);
                 try buf.appendSlice(allocator, formatted);
             },
             .boolean => |v| try buf.appendSlice(allocator, if (v) "true" else "false"),
-            else => try buf.appendSlice(allocator, "/* unsupported literal */"),
         },
         .path => |pe| {
             if (g.symbol_table.get(pe.def)) |ent| {
@@ -1412,7 +1576,25 @@ fn emitExpr(
             try buf.append(allocator, ']');
         },
         .struct_lit => |sl| {
-            try buf.appendSlice(allocator, ".{");
+            // Emit a named struct literal (`Point{ .x = 0, .y = 0 }`) when the
+            // target resolves to a named struct; otherwise fall back to an
+            // anonymous `.{ .field = val }` literal.
+            const named = blk: {
+                if (g.symbol_table.get(sl.def)) |ent| {
+                    if (ent.name.len > 0 and ent.kind != .field) break :blk true;
+                }
+                break :blk false;
+            };
+            if (named) {
+                if (g.symbol_table.get(sl.def)) |ent| {
+                    try emitIdent(allocator, buf, entityName(ent));
+                } else {
+                    try buf.append(allocator, '.');
+                }
+                try buf.append(allocator, '{');
+            } else {
+                try buf.appendSlice(allocator, ".{");
+            }
             if (sl.fields.len > 0) {
                 for (sl.fields, 0..) |fld, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
@@ -1524,7 +1706,7 @@ fn emitStmt(
             try emitPattern(allocator, buf, b, ls.pattern);
             if (ls.ty) |ty_id| {
                 try buf.appendSlice(allocator, ": ");
-                try emitType(allocator, buf, b.types[ty_id]);
+                try emitType(allocator, buf, g, b.types[ty_id]);
             }
             if (ls.init) |init_id| {
                 try buf.appendSlice(allocator, " = ");
@@ -1654,8 +1836,18 @@ fn emitFnBody(
 ) !void {
     const body = b.exprs[body_id];
     if (body.kind != .block) {
-        // Not a block body (unusual); emit it directly as the fn expression.
-        return emitExpr(allocator, buf, g, b, body_id, depth, true, false);
+        try buf.append(allocator, '{');
+        try buf.append(allocator, '\n');
+        try writeIndent(allocator, buf, depth);
+        if (!typeIsUnit(ret)) {
+            try buf.appendSlice(allocator, "return ");
+        }
+        try emitExpr(allocator, buf, g, b, body_id, depth, true, false);
+        try buf.append(allocator, ';');
+        try buf.append(allocator, '\n');
+        try writeIndent(allocator, buf, depth - 1);
+        try buf.append(allocator, '}');
+        return;
     }
     const block = body.kind.block;
     if (block.statements.len == 0 and block.tail == null) {
@@ -1834,6 +2026,7 @@ fn emitOperand(
 fn emitFnSignature(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
     params: []const items.Param,
     ret: types.Type,
     is_allocating: bool,
@@ -1848,16 +2041,17 @@ fn emitFnSignature(
         if (count > 0) try buf.appendSlice(allocator, ", ");
         try emitIdent(allocator, buf, p.name);
         try buf.appendSlice(allocator, ": ");
-        try emitType(allocator, buf, p.ty);
+        try emitType(allocator, buf, g, p.ty);
         count += 1;
     }
     try buf.appendSlice(allocator, ") ");
-    try emitType(allocator, buf, ret);
+    try emitType(allocator, buf, g, ret);
 }
 
 fn emitMethodSignature(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
+    g: *const graph.CrateGraph,
     receiver: ?items.Receiver,
     params: []const items.Param,
     ret: types.Type,
@@ -1882,11 +2076,11 @@ fn emitMethodSignature(
         if (count > 0) try buf.appendSlice(allocator, ", ");
         try emitIdent(allocator, buf, p.name);
         try buf.appendSlice(allocator, ": ");
-        try emitType(allocator, buf, p.ty);
+        try emitType(allocator, buf, g, p.ty);
         count += 1;
     }
     try buf.appendSlice(allocator, ") ");
-    try emitType(allocator, buf, ret);
+    try emitType(allocator, buf, g, ret);
 }
 
 fn binaryOpString(op: exprs.BinaryOp, ov: exprs.Overflow) []const u8 {

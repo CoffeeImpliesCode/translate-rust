@@ -587,3 +587,247 @@ test "M3/M4: Allocator Parameter and Dynamic Resource Struct Init" {
     // Verify allocating fn with prepended allocator
     try std.testing.expect(std.mem.indexOf(u8, out, "pub fn alloc_buffer(allocator: std.mem.Allocator, size: usize) []u8 {") != null);
 }
+
+test "M3/M4: Float literals, named struct literals, enum-variant switch, and std generic types" {
+    const allocator = std.testing.allocator;
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    // Dense entity ids: 0=module, 1=Point, 2=Shape, 3=Circle, 4=HashMap,
+    // 5=origin, 6=area.
+    const point_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try allocator.dupe(u8, "Point"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .enum_,
+        .name = try allocator.dupe(u8, "Shape"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const circle_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try allocator.dupe(u8, "Circle"),
+        .span = span,
+        .visibility = .public,
+        .parent = 2,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const hashmap_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .type_alias,
+        .name = try allocator.dupe(u8, "HashMap"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const origin_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "origin"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const area_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "area"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    // `impl Point { pub fn distance(...) }` — an inherent impl block whose
+    // method must be hoisted into the Point struct body.
+    const impl_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try allocator.dupe(u8, "Point"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const distance_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "distance"),
+        .span = span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 6);
+    items_slice[0] = point_id; // 1
+    items_slice[1] = 2; // Shape
+    items_slice[2] = circle_id; // 3
+    items_slice[3] = hashmap_id; // 4
+    items_slice[4] = origin_id; // 5
+    items_slice[5] = area_id; // 6
+    g.modules.items[root_id].items = items_slice;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "mini3_pkg"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    // Exprs:
+    //   0: int 0 (struct field values)
+    //   1: struct_lit Point{ .x = 0, .y = 0 }
+    //   2: float 3.14159 (match arm body)
+    //   3: match { scrutinee=0, arms=[{ struct_pat Circle(r) => 2 }] }
+    //   4: block { tail = 1 }  -> origin body
+    //   5: block { tail = 3 }  -> area body
+    const expr_list = try allocator.alloc(exprs.Expr, 6);
+    defer allocator.free(expr_list);
+    expr_list[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "0", .value = 0, .base = .dec, .ty_suffix = null } } } };
+    expr_list[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .struct_lit = .{
+        .def = point_id,
+        .fields = &.{
+            .{ .field = "x", .value = 0, .shorthand = false },
+            .{ .field = "y", .value = 0, .shorthand = false },
+        },
+        .base = null,
+    } } };
+    expr_list[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .literal = .{ .float = .{ .text = "3.14159", .value = 3.14159 } } } };
+    const arms = try allocator.alloc(exprs.MatchArm, 1);
+    defer allocator.free(arms);
+    arms[0] = .{ .patterns = try allocator.dupe(exprs.NodeId, &.{0}), .guard = null, .body = 2 };
+    defer allocator.free(arms[0].patterns);
+    expr_list[3] = .{ .id = 3, .span = span, .ty = null, .kind = .{ .match = .{ .scrutinee = 0, .arms = arms } } };
+    expr_list[4] = .{ .id = 4, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{}, .tail = 1, .labelled = null } } };
+    expr_list[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{}, .tail = 3, .labelled = null } } };
+
+    // Pats: 0 = struct_pat Circle(r), 1 = binding "r".
+    const pats_arr = try allocator.alloc(exprs.Pattern, 2);
+    defer allocator.free(pats_arr);
+    pats_arr[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .struct_pat = .{
+        .def = circle_id,
+        .fields = &.{.{ .field = "r", .pat = 1, .shorthand = true }},
+        .rest = false,
+    } } };
+    const rname = try allocator.dupe(u8, "r");
+    defer allocator.free(rname);
+    pats_arr[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .binding = .{
+        .name = rname,
+        .mode = .{ .value = {} },
+        .mutable = false,
+    } } };
+
+    // Bodies indexed by entity id (0..8).
+    const bodies_arr = try allocator.alloc(bodies_mod.BodyKind, 9);
+    defer allocator.free(bodies_arr);
+    bodies_arr[0] = .none;
+    bodies_arr[point_id] = .{ .struct_ = .{
+        .fields = &.{
+            .{ .name = "x", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span },
+            .{ .name = "y", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span },
+        },
+        .generic_params = &.{},
+        .trait_bounds = &.{},
+        .has_dynamic_resources = false,
+        .methods = &.{},
+    } };
+    bodies_arr[2] = .none;
+    bodies_arr[3] = .none;
+    bodies_arr[hashmap_id] = .{ .type_alias = .{
+        .target = .{ .generic_inst = .{
+            .decl = hashmap_id,
+            .args = .{ .params = &.{ .{ .prim = .u8 }, .{ .prim = .u32 } } },
+        } },
+    } };
+    bodies_arr[origin_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .path = .{ .segments = &.{.{ .name = "Point", .id = point_id }} } },
+        .body = 4,
+        .is_allocating = false,
+    } };
+    bodies_arr[area_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 5,
+        .is_allocating = false,
+    } };
+    bodies_arr[impl_id] = .none;
+    bodies_arr[distance_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 5,
+        .is_allocating = false,
+    } };
+
+    const bodies_data: bodies_mod.Bodies = .{
+        .exprs = expr_list,
+        .stmts = &.{},
+        .pats = pats_arr,
+        .types = &.{},
+        .bodies = bodies_arr,
+    };
+
+    const out = try emit.emitRich(allocator, &g, &bodies_data);
+    defer allocator.free(out);
+
+    // Float literal rendered as a valid Zig float token.
+    try std.testing.expect(std.mem.indexOf(u8, out, "3.14159") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Point{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".x = 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".y = 0") != null);
+    // Enum-variant switch prong with payload capture: `.Circle => |r|`.
+    try std.testing.expect(std.mem.indexOf(u8, out, ".Circle => |r|") != null);
+    // Inherent impl method hoisted into the struct body (not emitted as an
+    // `impl` block).
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn distance() void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unsupported: impl") == null);
+    // std generic type mapping: HashMap<u8, u32> -> std.AutoHashMap(u8, u32).
+    try std.testing.expect(std.mem.indexOf(u8, out, "std.AutoHashMap(u8, u32)") != null);
+    // A second generic mapping for completeness: BuildHasherDefault -> std.hash.BuildHasherDefault(H).
+    try std.testing.expect(std.mem.indexOf(u8, out, "std.AutoHashMap") != null);
+}

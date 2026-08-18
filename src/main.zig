@@ -128,6 +128,7 @@ fn dumpTypes(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
         try stdout.writeStreamingAll(io, msg);
         return;
     };
+    const lib_dir = std.fs.path.dirname(path) orelse crate_dir;
 
     var dir = std.Io.Dir.cwd();
     const file = try dir.openFile(io, path, .{});
@@ -172,6 +173,8 @@ fn dumpTypes(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
         .src = src,
         .types_list = &types_list,
         .bodies_list = &bodies_list,
+        .base_dir = lib_dir,
+        .io = io,
     };
     try model.cst.extractFile(&ctx);
 
@@ -227,6 +230,7 @@ fn dumpNames(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
         try stdout.writeStreamingAll(io, msg);
         return;
     };
+    const lib_dir = std.fs.path.dirname(path) orelse crate_dir;
 
     var dir = std.Io.Dir.cwd();
     const file = try dir.openFile(io, path, .{});
@@ -271,6 +275,8 @@ fn dumpNames(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
         .src = src,
         .types_list = &types_list,
         .bodies_list = &bodies_list,
+        .base_dir = lib_dir,
+        .io = io,
     };
     try model.cst.extractFile(&ctx);
 
@@ -321,6 +327,7 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
         try stdout.writeStreamingAll(io, msg);
         return;
     };
+    const lib_dir = std.fs.path.dirname(path) orelse crate_dir;
 
     var dir = std.Io.Dir.cwd();
     const file = try dir.openFile(io, path, .{});
@@ -365,6 +372,8 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
         .src = src,
         .types_list = &types_list,
         .bodies_list = &bodies_list,
+        .base_dir = lib_dir,
+        .io = io,
     };
     try model.cst.extractFile(&ctx);
     try model.names.resolveGraph(allocator, &g);
@@ -372,6 +381,24 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
     var exprs_list: std.ArrayListUnmanaged(model.exprs.Expr) = .empty;
     var stmts_list: std.ArrayListUnmanaged(model.exprs.Statement) = .empty;
     var pats_list: std.ArrayListUnmanaged(model.exprs.Pattern) = .empty;
+
+    var module_srcs: std.AutoHashMapUnmanaged(model.spine.EntityId, []const u8) = .empty;
+    defer module_srcs.deinit(allocator);
+    try module_srcs.put(allocator, 0, src);
+    for (g.modules.items) |m| {
+        if (m.id == 0) continue;
+        if (m.source_path) |sp| {
+            var mdir = std.Io.Dir.cwd();
+            if (mdir.openFile(io, sp, .{})) |mf| {
+                defer mf.close(io);
+                var mio_buf: [4096]u8 = undefined;
+                var mreader = mf.reader(io, &mio_buf);
+                if (mreader.interface.allocRemaining(allocator, .limited(1 << 24))) |m_src| {
+                    try module_srcs.put(allocator, m.id, m_src);
+                } else |_| {}
+            } else |_| {}
+        }
+    }
 
     var ts_ctx: model.ts_ext.Ctx = .{
         .alloc = allocator,
@@ -386,9 +413,20 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
     };
 
     for (g.symbol_table.entities.items) |ent| {
-        if (ent.kind == .fn_ and ent.parent != null) {
-            _ = model.ts_ext.extractFunction(&ts_ctx, ent.id) catch false;
+        if (ent.kind != .fn_) continue;
+        var cur = ent.parent orelse continue;
+        var m_src: ?[]const u8 = null;
+        while (g.module(cur)) |m| {
+            if (module_srcs.get(cur)) |s| {
+                m_src = s;
+                break;
+            }
+            cur = m.parent orelse break;
         }
+        const fn_src = m_src orelse continue;
+        ts_ctx.src = fn_src;
+        ts_ctx.mod_id = ent.parent.?;
+        _ = model.ts_ext.extractFunction(&ts_ctx, ent.id) catch false;
     }
 
     const b: model.bodies.Bodies = .{
