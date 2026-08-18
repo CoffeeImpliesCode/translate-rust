@@ -48,6 +48,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── translate_rust.frontend — pure Rust understanding pipeline ───────
+    const frontend = b.addModule("translate_rust.frontend", .{
+        .root_source_file = b.path("src/frontend/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tree_sitter", .module = ts_mod },
+            .{ .name = "rust", .module = rust },
+            .{ .name = "translate_rust.ir", .module = ir },
+        },
+    });
+
     // ── translate_rust — library root ─────────────────────────
     const translate_rust = b.addModule("translate_rust", .{
         .root_source_file = b.path("src/root.zig"),
@@ -57,6 +69,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "translate_rust.rust", .module = rust },
             .{ .name = "translate_rust.model", .module = model },
             .{ .name = "translate_rust.ir", .module = ir },
+            .{ .name = "translate_rust.frontend", .module = frontend },
         },
     });
 
@@ -221,6 +234,9 @@ pub fn build(b: *std.Build) void {
 
     const model_tests = b.addTest(.{ .root_module = model });
     test_step.dependOn(&b.addRunArtifact(model_tests).step);
+
+    const frontend_tests = b.addTest(.{ .root_module = frontend });
+    test_step.dependOn(&b.addRunArtifact(frontend_tests).step);
 
     // E2E integration tests (in-process native translation → working Zig pkgs).
     test_step.dependOn(&run_e2e.step);

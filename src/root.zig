@@ -10,6 +10,7 @@ pub const version = "0.0.0";
 pub const rust = @import("translate_rust.rust");
 pub const model = @import("translate_rust.model");
 pub const ir = @import("translate_rust.ir");
+pub const frontend = @import("translate_rust.frontend");
 
 test {
     std.testing.refAllDecls(@This());
