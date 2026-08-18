@@ -19,6 +19,7 @@ pub const types = @import("types.zig");
 pub const bodies = @import("bodies.zig");
 pub const items = @import("items.zig");
 pub const exprs = @import("exprs.zig");
+pub const resolve_methods = @import("resolve_methods.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -33,4 +34,6 @@ test {
     _ = @import("names_test.zig");
     _ = @import("infer.zig");
     _ = @import("infer_test.zig");
+    _ = @import("resolve_methods.zig");
+    _ = @import("resolve_methods_test.zig");
 }

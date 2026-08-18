@@ -28,6 +28,7 @@ const exprs = @import("exprs.zig");
 const emit = @import("emit.zig");
 const ts_ext = @import("ts_ext.zig");
 const infer = @import("infer.zig");
+const resolve_methods = @import("resolve_methods.zig");
 const Span = spine.Span;
 const EntityId = spine.EntityId;
 
@@ -1129,7 +1130,7 @@ pub fn translate(
     //    then emit the standalone package to disk.
     var bodies_opt: ?emit.Bodies = null;
     if (mapped_ok) {
-        const b_temp: emit.Bodies = .{
+        var b_temp: emit.Bodies = .{
             .exprs = state.exprs.items,
             .stmts = state.stmts.items,
             .pats = state.pats.items,
@@ -1138,6 +1139,7 @@ pub fn translate(
         };
         if (infer.solve(arena, &b_temp)) |inferred| {
             inferred.apply(state.exprs.items);
+            _ = resolve_methods.resolveMethods(&g, &b_temp);
         } else |_| {}
         bodies_opt = .{
             .exprs = try state.exprs.toOwnedSlice(arena),

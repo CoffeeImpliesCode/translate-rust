@@ -541,6 +541,48 @@ fn useItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         .span = span_of,
     });
 }
+fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
+    var self_ty_name: []const u8 = "";
+    var trait_name: ?[]const u8 = null;
+    var decl_list: ?ts.Node = null;
+
+    var i: u32 = 0;
+    while (item.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "generic_type") or std.mem.eql(u8, k, "primitive_type")) {
+            if (self_ty_name.len == 0) {
+                self_ty_name = text(e, c);
+            } else {
+                trait_name = self_ty_name;
+                self_ty_name = text(e, c);
+            }
+        } else if (std.mem.eql(u8, k, "declaration_list")) {
+            decl_list = c;
+        }
+    }
+
+    const name = if (trait_name) |tr|
+        try std.fmt.allocPrint(e.alloc, "{s} for {s}", .{ tr, self_ty_name })
+    else
+        try e.alloc.dupe(u8, self_ty_name);
+
+    const impl_id = try addEntity(e, .impl_, name, mod_id);
+
+    if (decl_list) |dl| {
+        var j: u32 = 0;
+        while (dl.namedChild(j)) |child| : (j += 1) {
+            if (std.mem.eql(u8, child.kind(), "function_item")) {
+                try functionItem(e, child, impl_id, false);
+            } else if (std.mem.eql(u8, child.kind(), "const_item")) {
+                try constItem(e, child, impl_id);
+            } else if (std.mem.eql(u8, child.kind(), "type_item")) {
+                try typeAliasItem(e, child, impl_id);
+            }
+        }
+    }
+
+    return impl_id;
+}
 
 // ── module tree ─────────────────────────────────────────────────────────────
 
@@ -615,7 +657,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
             try functionItem(e, item, mod_id, false);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "impl_item")) {
-            const id = try addEntity(e, .impl_, "", mod_id);
+            const id = try implItem(e, item, mod_id);
             try item_ids.append(e.alloc, id);
         }
     }
