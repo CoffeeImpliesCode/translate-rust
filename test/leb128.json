@@ -67,8 +67,8 @@
         },
         {
           "id": 3,
-          "kind": "module",
-          "name": "tests",
+          "kind": "fn_",
+          "name": "expectEqual",
           "span": {
             "start_line": 1,
             "start_col": 1,
@@ -96,28 +96,16 @@
           "visibility": {
             "kind": "public"
           },
-          "parent": 3,
-          "resolved": null,
-          "renamed_to": null,
-          "attributes": []
-        },
-        {
-          "id": 5,
-          "kind": "fn_",
-          "name": "expectEqual",
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "visibility": {
-            "kind": "public"
-          },
           "parent": 0,
           "resolved": null,
           "renamed_to": null,
-          "attributes": []
+          "attributes": [
+            {
+              "name": "test",
+              "meta": "",
+              "known": true
+            }
+          ]
         }
       ],
       "modules": [
@@ -137,25 +125,6 @@
           },
           "items": [
             1,
-            3
-          ],
-          "attributes": []
-        },
-        {
-          "id": 1,
-          "kind": "inline",
-          "name": "tests",
-          "parent": 0,
-          "source_path": null,
-          "is_crate": false,
-          "is_extern": false,
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "items": [
             4
           ],
           "attributes": []
@@ -193,9 +162,6 @@
           },
           "body": 3
         }
-      },
-      {
-        "kind": "none"
       },
       {
         "kind": "none"
@@ -357,7 +323,7 @@
         "value": {
           "call_kind": {
             "kind": "free",
-            "def": 5
+            "def": 3
           },
           "args": [
             4,
@@ -374,15 +340,9 @@
           "end_col": 1
         },
         "ty": null,
-        "kind": "literal",
+        "kind": "try_",
         "value": {
-          "kind": "int",
-          "value": {
-            "text": "0",
-            "value": "0",
-            "base": "dec",
-            "ty_suffix": null
-          }
+          "inner": 7
         }
       },
       {
@@ -397,14 +357,27 @@
         "kind": "block",
         "value": {
           "statements": [
-            7
+            0
           ],
-          "tail": 8,
+          "tail": null,
           "labelled": null
         }
       }
     ],
-    "stmts": [],
+    "stmts": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 8
+      }
+    ],
     "pats": [],
     "types": []
   }

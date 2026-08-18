@@ -2356,11 +2356,11 @@ test "parseFull fnv v2 round-trip" {
 
     const model = try parseFull(arena.allocator(), bytes);
     // Bodies decode correctly and mirror the in-memory fnv model.
-    try std.testing.expectEqual(@as(usize, 13), model.bodies.exprs.len);
-    try std.testing.expectEqual(@as(usize, 4), model.bodies.stmts.len);
+    try std.testing.expectEqual(@as(usize, 30), model.bodies.exprs.len);
+    try std.testing.expectEqual(@as(usize, 7), model.bodies.stmts.len);
     try std.testing.expectEqual(@as(usize, 2), model.bodies.pats.len);
-    try std.testing.expectEqual(@as(usize, 2), model.bodies.types.len);
-    try std.testing.expectEqual(@as(usize, 7), model.bodies.bodies.len);
+    try std.testing.expectEqual(@as(usize, 0), model.bodies.types.len);
+    try std.testing.expectEqual(@as(usize, 9), model.bodies.bodies.len);
     // bodies[1] (FNV_OFFSET_BASIS) is a const body whose init is expr 0.
     try std.testing.expectEqual(
         BodyKind.const_,
@@ -2383,7 +2383,7 @@ test "parseFull fnv v2 round-trip" {
 
     // The produced output is parseable again and keeps the body tables.
     const model2 = try parseFull(arena.allocator(), encoded);
-    try std.testing.expectEqual(@as(usize, 13), model2.bodies.exprs.len);
-    try std.testing.expectEqual(@as(usize, 2), model2.bodies.types.len);
-    try std.testing.expectEqual(@as(usize, 7), model2.bodies.bodies.len);
+    try std.testing.expectEqual(@as(usize, 30), model2.bodies.exprs.len);
+    try std.testing.expectEqual(@as(usize, 0), model2.bodies.types.len);
+    try std.testing.expectEqual(@as(usize, 9), model2.bodies.bodies.len);
 }

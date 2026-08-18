@@ -5,7 +5,7 @@
   "crates": [
     {
       "name": "xxhash-rust",
-      "edition": 2018,
+      "edition": 2021,
       "kind": "lib",
       "root": 0,
       "is_translated": true,
@@ -32,60 +32,6 @@
         {
           "id": 1,
           "kind": "fn_",
-          "name": "xxh32",
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "visibility": {
-            "kind": "public"
-          },
-          "parent": 0,
-          "resolved": null,
-          "renamed_to": null,
-          "attributes": []
-        },
-        {
-          "id": 2,
-          "kind": "field",
-          "name": "input",
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "visibility": {
-            "kind": "private"
-          },
-          "parent": 1,
-          "resolved": null,
-          "renamed_to": null,
-          "attributes": []
-        },
-        {
-          "id": 3,
-          "kind": "field",
-          "name": "seed",
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "visibility": {
-            "kind": "private"
-          },
-          "parent": 1,
-          "resolved": null,
-          "renamed_to": null,
-          "attributes": []
-        },
-        {
-          "id": 4,
-          "kind": "fn_",
           "name": "round",
           "span": {
             "start_line": 1,
@@ -102,7 +48,7 @@
           "attributes": []
         },
         {
-          "id": 5,
+          "id": 2,
           "kind": "field",
           "name": "acc",
           "span": {
@@ -112,15 +58,15 @@
             "end_col": 1
           },
           "visibility": {
-            "kind": "private"
+            "kind": "public"
           },
-          "parent": 4,
+          "parent": 1,
           "resolved": null,
           "renamed_to": null,
           "attributes": []
         },
         {
-          "id": 6,
+          "id": 3,
           "kind": "field",
           "name": "input",
           "span": {
@@ -130,15 +76,15 @@
             "end_col": 1
           },
           "visibility": {
-            "kind": "private"
+            "kind": "public"
           },
-          "parent": 4,
+          "parent": 1,
           "resolved": null,
           "renamed_to": null,
           "attributes": []
         },
         {
-          "id": 7,
+          "id": 4,
           "kind": "fn_",
           "name": "avalanche",
           "span": {
@@ -148,7 +94,7 @@
             "end_col": 1
           },
           "visibility": {
-            "kind": "private"
+            "kind": "public"
           },
           "parent": 0,
           "resolved": null,
@@ -156,7 +102,7 @@
           "attributes": []
         },
         {
-          "id": 8,
+          "id": 5,
           "kind": "field",
           "name": "input",
           "span": {
@@ -166,35 +112,17 @@
             "end_col": 1
           },
           "visibility": {
-            "kind": "private"
+            "kind": "public"
           },
-          "parent": 7,
+          "parent": 4,
           "resolved": null,
           "renamed_to": null,
           "attributes": []
         },
         {
-          "id": 9,
-          "kind": "field",
-          "name": "h",
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "visibility": {
-            "kind": "private"
-          },
-          "parent": 7,
-          "resolved": null,
-          "renamed_to": null,
-          "attributes": []
-        },
-        {
-          "id": 10,
-          "kind": "module",
-          "name": "tests",
+          "id": 6,
+          "kind": "fn_",
+          "name": "test_xxhash_avalanche",
           "span": {
             "start_line": 1,
             "start_col": 1,
@@ -207,34 +135,16 @@
           "parent": 0,
           "resolved": null,
           "renamed_to": null,
-          "attributes": []
-        },
-        {
-          "id": 11,
-          "kind": "fn_",
-          "name": "xxh32_known_vectors",
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "visibility": {
-            "kind": "public"
-          },
-          "parent": 10,
-          "resolved": null,
-          "renamed_to": null,
           "attributes": [
             {
               "name": "test",
               "meta": "",
-              "known": false
+              "known": true
             }
           ]
         },
         {
-          "id": 12,
+          "id": 7,
           "kind": "fn_",
           "name": "expectEqual",
           "span": {
@@ -244,7 +154,7 @@
             "end_col": 1
           },
           "visibility": {
-            "kind": "private"
+            "kind": "public"
           },
           "parent": 0,
           "resolved": null,
@@ -270,27 +180,7 @@
           "items": [
             1,
             4,
-            7,
-            10
-          ],
-          "attributes": []
-        },
-        {
-          "id": 1,
-          "kind": "inline",
-          "name": "tests",
-          "parent": 0,
-          "source_path": null,
-          "is_crate": false,
-          "is_extern": false,
-          "span": {
-            "start_line": 1,
-            "start_col": 1,
-            "end_line": 1,
-            "end_col": 1
-          },
-          "items": [
-            11
+            6
           ],
           "attributes": []
         }
@@ -299,1798 +189,7 @@
     }
   ],
   "bodies": {
-    "exprs": [
-      {
-        "id": 0,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "path",
-        "value": {
-          "def": 5,
-          "generic_args": []
-        }
-      },
-      {
-        "id": 1,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "path",
-        "value": {
-          "def": 6,
-          "generic_args": []
-        }
-      },
-      {
-        "id": 2,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x85EBCA77",
-            "value": "2246822519",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 3,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "mul",
-          "overflow": "checked",
-          "lhs": 1,
-          "rhs": 2
-        }
-      },
-      {
-        "id": 4,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "add",
-          "overflow": "checked",
-          "lhs": 0,
-          "rhs": 3
-        }
-      },
-      {
-        "id": 5,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "13",
-            "value": "13",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 6,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shl",
-          "overflow": "checked",
-          "lhs": 4,
-          "rhs": 5
-        }
-      },
-      {
-        "id": 7,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "19",
-            "value": "19",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 8,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shr",
-          "overflow": "checked",
-          "lhs": 4,
-          "rhs": 7
-        }
-      },
-      {
-        "id": 9,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "bit_or",
-          "overflow": "checked",
-          "lhs": 6,
-          "rhs": 8
-        }
-      },
-      {
-        "id": 10,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x9E3779B1",
-            "value": "2654435761",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 11,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "mul",
-          "overflow": "checked",
-          "lhs": 9,
-          "rhs": 10
-        }
-      },
-      {
-        "id": 12,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "block",
-        "value": {
-          "statements": [],
-          "tail": 11,
-          "labelled": null
-        }
-      },
-      {
-        "id": 13,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "path",
-        "value": {
-          "def": 8,
-          "generic_args": []
-        }
-      },
-      {
-        "id": 14,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "path",
-        "value": {
-          "def": 8,
-          "generic_args": []
-        }
-      },
-      {
-        "id": 15,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "path",
-        "value": {
-          "def": 8,
-          "generic_args": []
-        }
-      },
-      {
-        "id": 16,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "15",
-            "value": "15",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 17,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shr",
-          "overflow": "checked",
-          "lhs": 15,
-          "rhs": 16
-        }
-      },
-      {
-        "id": 18,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "bit_xor",
-          "overflow": "checked",
-          "lhs": 15,
-          "rhs": 17
-        }
-      },
-      {
-        "id": 19,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 13,
-          "op": "plain",
-          "value": 18,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 20,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x85EBCA77",
-            "value": "2246822519",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 21,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "mul",
-          "overflow": "checked",
-          "lhs": 13,
-          "rhs": 20
-        }
-      },
-      {
-        "id": 22,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 13,
-          "op": "plain",
-          "value": 21,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 23,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "13",
-            "value": "13",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 24,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shr",
-          "overflow": "checked",
-          "lhs": 13,
-          "rhs": 23
-        }
-      },
-      {
-        "id": 25,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "bit_xor",
-          "overflow": "checked",
-          "lhs": 13,
-          "rhs": 24
-        }
-      },
-      {
-        "id": 26,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 13,
-          "op": "plain",
-          "value": 25,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 27,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0xC2B2AE3D",
-            "value": "3266489917",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 28,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "mul",
-          "overflow": "checked",
-          "lhs": 13,
-          "rhs": 27
-        }
-      },
-      {
-        "id": 29,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 13,
-          "op": "plain",
-          "value": 28,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 30,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "16",
-            "value": "16",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 31,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shr",
-          "overflow": "checked",
-          "lhs": 13,
-          "rhs": 30
-        }
-      },
-      {
-        "id": 32,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "bit_xor",
-          "overflow": "checked",
-          "lhs": 13,
-          "rhs": 31
-        }
-      },
-      {
-        "id": 33,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 13,
-          "op": "plain",
-          "value": 32,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 34,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "block",
-        "value": {
-          "statements": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5
-          ],
-          "tail": 13,
-          "labelled": null
-        }
-      },
-      {
-        "id": 35,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "path",
-        "value": {
-          "def": 9,
-          "generic_args": []
-        }
-      },
-      {
-        "id": 36,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "path",
-        "value": {
-          "def": 8,
-          "generic_args": []
-        }
-      },
-      {
-        "id": 37,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "15",
-            "value": "15",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 38,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shr",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 37
-        }
-      },
-      {
-        "id": 39,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "bit_xor",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 38
-        }
-      },
-      {
-        "id": 40,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 35,
-          "op": "plain",
-          "value": 39,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 41,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x85EBCA77",
-            "value": "2246822519",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 42,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "mul",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 41
-        }
-      },
-      {
-        "id": 43,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 35,
-          "op": "plain",
-          "value": 42,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 44,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "13",
-            "value": "13",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 45,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shr",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 44
-        }
-      },
-      {
-        "id": 46,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "bit_xor",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 45
-        }
-      },
-      {
-        "id": 47,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 35,
-          "op": "plain",
-          "value": 46,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 48,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0xC2B2AE3D",
-            "value": "3266489917",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 49,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "mul",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 48
-        }
-      },
-      {
-        "id": 50,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 35,
-          "op": "plain",
-          "value": 49,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 51,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "16",
-            "value": "16",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 52,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "shr",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 51
-        }
-      },
-      {
-        "id": 53,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binary",
-        "value": {
-          "op": "bit_xor",
-          "overflow": "checked",
-          "lhs": 35,
-          "rhs": 52
-        }
-      },
-      {
-        "id": 54,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "assign",
-        "value": {
-          "target": 35,
-          "op": "plain",
-          "value": 53,
-          "overflow": "checked"
-        }
-      },
-      {
-        "id": 55,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "block",
-        "value": {
-          "statements": [
-            6,
-            7,
-            8,
-            9,
-            10,
-            11
-          ],
-          "tail": 35,
-          "labelled": null
-        }
-      },
-      {
-        "id": 56,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "string",
-          "value": {
-            "bytes": ""
-          }
-        }
-      },
-      {
-        "id": 57,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x02cc5d05",
-            "value": "46947589",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 58,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0",
-            "value": "0",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 59,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 1
-          },
-          "args": [
-            56,
-            58
-          ]
-        }
-      },
-      {
-        "id": 60,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 12
-          },
-          "args": [
-            57,
-            59
-          ]
-        }
-      },
-      {
-        "id": 61,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "string",
-          "value": {
-            "bytes": "a"
-          }
-        }
-      },
-      {
-        "id": 62,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0xd49cb133",
-            "value": "3567038771",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 63,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0",
-            "value": "0",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 64,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 1
-          },
-          "args": [
-            61,
-            63
-          ]
-        }
-      },
-      {
-        "id": 65,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 12
-          },
-          "args": [
-            62,
-            64
-          ]
-        }
-      },
-      {
-        "id": 66,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "string",
-          "value": {
-            "bytes": "abc"
-          }
-        }
-      },
-      {
-        "id": 67,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x3f602dcf",
-            "value": "1063267791",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 68,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0",
-            "value": "0",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 69,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 1
-          },
-          "args": [
-            66,
-            68
-          ]
-        }
-      },
-      {
-        "id": 70,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 12
-          },
-          "args": [
-            67,
-            69
-          ]
-        }
-      },
-      {
-        "id": 71,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "string",
-          "value": {
-            "bytes": "hello"
-          }
-        }
-      },
-      {
-        "id": 72,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x53907204",
-            "value": "1401975300",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 73,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0",
-            "value": "0",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 74,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 1
-          },
-          "args": [
-            71,
-            73
-          ]
-        }
-      },
-      {
-        "id": 75,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 12
-          },
-          "args": [
-            72,
-            74
-          ]
-        }
-      },
-      {
-        "id": 76,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "string",
-          "value": {
-            "bytes": "hello world"
-          }
-        }
-      },
-      {
-        "id": 77,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0x7d581db8",
-            "value": "2102926776",
-            "base": "hex",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 78,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "literal",
-        "value": {
-          "kind": "int",
-          "value": {
-            "text": "0",
-            "value": "0",
-            "base": "dec",
-            "ty_suffix": null
-          }
-        }
-      },
-      {
-        "id": 79,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 1
-          },
-          "args": [
-            76,
-            78
-          ]
-        }
-      },
-      {
-        "id": 80,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "call",
-        "value": {
-          "call_kind": {
-            "kind": "free",
-            "def": 12
-          },
-          "args": [
-            77,
-            79
-          ]
-        }
-      },
-      {
-        "id": 81,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "block",
-        "value": {
-          "statements": [
-            12,
-            13,
-            14,
-            15,
-            16
-          ],
-          "tail": null,
-          "labelled": null
-        }
-      }
-    ],
-    "stmts": [
-      {
-        "id": 0,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "let",
-        "value": {
-          "pattern": 0,
-          "init": 14,
-          "ty": 1
-        }
-      },
-      {
-        "id": 1,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 19
-      },
-      {
-        "id": 2,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 22
-      },
-      {
-        "id": 3,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 26
-      },
-      {
-        "id": 4,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 29
-      },
-      {
-        "id": 5,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 33
-      },
-      {
-        "id": 6,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "let",
-        "value": {
-          "pattern": 1,
-          "init": 36,
-          "ty": 1
-        }
-      },
-      {
-        "id": 7,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 40
-      },
-      {
-        "id": 8,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 43
-      },
-      {
-        "id": 9,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 47
-      },
-      {
-        "id": 10,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 50
-      },
-      {
-        "id": 11,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 54
-      },
-      {
-        "id": 12,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 60
-      },
-      {
-        "id": 13,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 65
-      },
-      {
-        "id": 14,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 70
-      },
-      {
-        "id": 15,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 75
-      },
-      {
-        "id": 16,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "expr",
-        "value": 80
-      }
-    ],
-    "pats": [
-      {
-        "id": 0,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binding",
-        "value": {
-          "name": "h",
-          "mode": "value",
-          "mutable": true
-        }
-      },
-      {
-        "id": 1,
-        "span": {
-          "start_line": 1,
-          "start_col": 1,
-          "end_line": 1,
-          "end_col": 1
-        },
-        "ty": null,
-        "kind": "binding",
-        "value": {
-          "name": "h",
-          "mode": "value",
-          "mutable": true
-        }
-      }
-    ],
-    "types": [
-      {
-        "kind": "prim",
-        "value": "u8"
-      },
-      {
-        "kind": "prim",
-        "value": "u32"
-      },
-      {
-        "kind": "prim",
-        "value": "unit"
-      },
-      {
-        "kind": "slice",
-        "value": {
-          "const_": true,
-          "elem": {
-            "kind": "prim",
-            "value": "u8"
-          }
-        }
-      }
-    ],
     "bodies": [
-      {
-        "kind": "none"
-      },
-      {
-        "kind": "none"
-      },
-      {
-        "kind": "none"
-      },
       {
         "kind": "none"
       },
@@ -2160,14 +259,8 @@
             "kind": "prim",
             "value": "u32"
           },
-          "body": 55
+          "body": 19
         }
-      },
-      {
-        "kind": "none"
-      },
-      {
-        "kind": "none"
       },
       {
         "kind": "none"
@@ -2180,12 +273,493 @@
             "kind": "prim",
             "value": "unit"
           },
-          "body": 81
+          "body": 25
         }
       },
       {
         "kind": "none"
       }
-    ]
+    ],
+    "exprs": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 2,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 3,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 2,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x85EBCA77",
+            "value": "2246822519",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 3,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "mul",
+          "overflow": "wrapping",
+          "lhs": 1,
+          "rhs": 2
+        }
+      },
+      {
+        "id": 4,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "add",
+          "overflow": "wrapping",
+          "lhs": 0,
+          "rhs": 3
+        }
+      },
+      {
+        "id": 5,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "13",
+            "value": "13",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 6,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "shl",
+          "overflow": "wrapping",
+          "lhs": 4,
+          "rhs": 5
+        }
+      },
+      {
+        "id": 7,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "19",
+            "value": "19",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 8,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "shr",
+          "overflow": "wrapping",
+          "lhs": 4,
+          "rhs": 7
+        }
+      },
+      {
+        "id": 9,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "bit_or",
+          "overflow": "wrapping",
+          "lhs": 6,
+          "rhs": 8
+        }
+      },
+      {
+        "id": 10,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x9E3779B1",
+            "value": "2654435761",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 11,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "mul",
+          "overflow": "wrapping",
+          "lhs": 9,
+          "rhs": 10
+        }
+      },
+      {
+        "id": 12,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [],
+          "tail": 11,
+          "labelled": null
+        }
+      },
+      {
+        "id": 13,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 5,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 14,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "15",
+            "value": "15",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 15,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "shr",
+          "overflow": "wrapping",
+          "lhs": 13,
+          "rhs": 14
+        }
+      },
+      {
+        "id": 16,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "bit_xor",
+          "overflow": "wrapping",
+          "lhs": 13,
+          "rhs": 15
+        }
+      },
+      {
+        "id": 17,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x85EBCA77",
+            "value": "2246822519",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 18,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "mul",
+          "overflow": "wrapping",
+          "lhs": 16,
+          "rhs": 17
+        }
+      },
+      {
+        "id": 19,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [],
+          "tail": 18,
+          "labelled": null
+        }
+      },
+      {
+        "id": 20,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0",
+            "value": "0",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 21,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0",
+            "value": "0",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 22,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 4
+          },
+          "args": [
+            21
+          ]
+        }
+      },
+      {
+        "id": 23,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 7
+          },
+          "args": [
+            20,
+            22
+          ]
+        }
+      },
+      {
+        "id": 24,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 23
+        }
+      },
+      {
+        "id": 25,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [
+            0
+          ],
+          "tail": null,
+          "labelled": null
+        }
+      }
+    ],
+    "stmts": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 24
+      }
+    ],
+    "pats": [],
+    "types": []
   }
 }

@@ -12,115 +12,951 @@
       "deps": [],
       "entities": [
         {
-          "id": 0, "kind": "module", "name": "",
-          "span": {"start_line": 1, "start_col": 1, "end_line": 13, "end_col": 1},
-          "visibility": {"kind": "public"}, "parent": null,
-          "resolved": null, "renamed_to": null, "attributes": []
+          "id": 0,
+          "kind": "module",
+          "name": "",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": null,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         },
         {
-          "id": 1, "kind": "const_", "name": "FNV_OFFSET_BASIS",
-          "span": {"start_line": 5, "start_col": 1, "end_line": 5, "end_col": 44},
-          "visibility": {"kind": "private"}, "parent": 0,
-          "resolved": null, "renamed_to": null, "attributes": []
+          "id": 1,
+          "kind": "const_",
+          "name": "FNV_OFFSET_BASIS",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "private"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         },
         {
-          "id": 2, "kind": "const_", "name": "FNV_PRIME",
-          "span": {"start_line": 6, "start_col": 1, "end_line": 6, "end_col": 36},
-          "visibility": {"kind": "private"}, "parent": 0,
-          "resolved": null, "renamed_to": null, "attributes": []
+          "id": 2,
+          "kind": "const_",
+          "name": "FNV_PRIME",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "private"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         },
         {
-          "id": 3, "kind": "fn_", "name": "fnv1a_hash",
-          "span": {"start_line": 8, "start_col": 1, "end_line": 14, "end_col": 1},
-          "visibility": {"kind": "public"}, "parent": 0,
-          "resolved": null, "renamed_to": null, "attributes": []
+          "id": 3,
+          "kind": "fn_",
+          "name": "fnv1a_hash",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         },
         {
-          "id": 4, "kind": "field", "name": "data",
-          "span": {"start_line": 8, "start_col": 16, "end_line": 8, "end_col": 20},
-          "visibility": {"kind": "private"}, "parent": 3,
-          "resolved": null, "renamed_to": null, "attributes": []
+          "id": 4,
+          "kind": "field",
+          "name": "data",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 3,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         },
         {
-          "id": 5, "kind": "field", "name": "h",
-          "span": {"start_line": 9, "start_col": 9, "end_line": 9, "end_col": 10},
-          "visibility": {"kind": "private"}, "parent": 3,
-          "resolved": null, "renamed_to": null, "attributes": []
+          "id": 5,
+          "kind": "field",
+          "name": "h",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 3,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         },
         {
-          "id": 6, "kind": "field", "name": "byte",
-          "span": {"start_line": 10, "start_col": 10, "end_line": 10, "end_col": 14},
-          "visibility": {"kind": "private"}, "parent": 3,
-          "resolved": null, "renamed_to": null, "attributes": []
+          "id": 6,
+          "kind": "field",
+          "name": "byte",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 3,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
+        },
+        {
+          "id": 7,
+          "kind": "fn_",
+          "name": "test_fnv1a_hash",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": [
+            {
+              "name": "test",
+              "meta": "",
+              "known": true
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "kind": "fn_",
+          "name": "expectEqual",
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "visibility": {
+            "kind": "public"
+          },
+          "parent": 0,
+          "resolved": null,
+          "renamed_to": null,
+          "attributes": []
         }
       ],
       "modules": [
         {
-          "id": 0, "kind": "root", "name": "",
-          "parent": null, "source_path": "src/lib.rs",
-          "is_crate": true, "is_extern": false,
-          "span": {"start_line": 1, "start_col": 1, "end_line": 13, "end_col": 1},
-          "items": [1, 2, 3], "attributes": []
+          "id": 0,
+          "kind": "root",
+          "name": "",
+          "parent": null,
+          "source_path": "src/lib.rs",
+          "is_crate": true,
+          "is_extern": false,
+          "span": {
+            "start_line": 1,
+            "start_col": 1,
+            "end_line": 1,
+            "end_col": 1
+          },
+          "items": [
+            1,
+            2,
+            3,
+            7
+          ],
+          "attributes": []
         }
       ],
       "uses": []
     }
   ],
   "bodies": {
-    "exprs": [
-      {
-        "id": 0, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null,
-        "kind": "literal",
-        "value": {"kind": "int", "value": {"text": "14695981039346656037", "value": "14695981039346656037", "base": "dec", "ty_suffix": null}}
-      },
-      {
-        "id": 1, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null,
-        "kind": "literal",
-        "value": {"kind": "int", "value": {"text": "1099511628211", "value": "1099511628211", "base": "dec", "ty_suffix": null}}
-      },
-      {"id": 2, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 1, "generic_args": []}},
-      {"id": 3, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 2, "generic_args": []}},
-      {"id": 4, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 4, "generic_args": []}},
-      {"id": 5, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 5, "generic_args": []}},
-      {"id": 6, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "path", "value": {"def": 6, "generic_args": []}},
-      {"id": 7, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "assign", "value": {"target": 5, "op": "bit_xor", "value": 6, "overflow": "checked"}},
-      {"id": 8, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "assign", "value": {"target": 5, "op": "mul", "value": 3, "overflow": "wrapping"}},
-      {"id": 9, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "block", "value": {"statements": [1, 2], "tail": null, "labelled": null}},
-      {"id": 10, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "for_", "value": {"pattern": 1, "iterable": 4, "body": {"statements": [1, 2], "tail": null, "labelled": null}, "iter_kind": {"kind": "slice"}}},
-      {"id": 11, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "return_", "value": {"value": 5}},
-      {"id": 12, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "block", "value": {"statements": [0, 3], "tail": 11, "labelled": null}}
-    ],
-    "stmts": [
-      {"id": 0, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "let", "value": {"pattern": 0, "init": 2, "ty": 0}},
-      {"id": 1, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "expr", "value": 7},
-      {"id": 2, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "expr", "value": 8},
-      {"id": 3, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "expr", "value": 10}
-    ],
-    "pats": [
-      {"id": 0, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "binding", "value": {"name": "h", "mode": "value", "mutable": true}},
-      {"id": 1, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}, "ty": null, "kind": "binding", "value": {"name": "byte", "mode": "value", "mutable": false}}
-    ],
-    "types": [
-      {"kind": "prim", "value": "u64"},
-      {"kind": "slice", "value": {"const_": true, "elem": {"kind": "prim", "value": "u8"}}}
-    ],
     "bodies": [
-      {"kind": "none"},
-      {"kind": "const_", "value": {"ty": {"kind": "prim", "value": "u64"}, "init": 0}},
-      {"kind": "const_", "value": {"ty": {"kind": "prim", "value": "u64"}, "init": 1}},
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "const_",
+        "value": {
+          "ty": {
+            "kind": "prim",
+            "value": "u64"
+          },
+          "init": 0
+        }
+      },
+      {
+        "kind": "const_",
+        "value": {
+          "ty": {
+            "kind": "prim",
+            "value": "u64"
+          },
+          "init": 1
+        }
+      },
       {
         "kind": "fn_",
         "value": {
           "params": [
-            {"name": "data", "ty": {"kind": "slice", "value": {"const_": true, "elem": {"kind": "prim", "value": "u8"}}}, "span": {"start_line": 1, "start_col": 1, "end_line": 1, "end_col": 1}}
+            {
+              "name": "data",
+              "ty": {
+                "kind": "slice",
+                "value": {
+                  "const_": true,
+                  "elem": {
+                    "kind": "prim",
+                    "value": "u8"
+                  }
+                }
+              },
+              "span": {
+                "start_line": 1,
+                "start_col": 1,
+                "end_line": 1,
+                "end_col": 1
+              }
+            }
           ],
-          "ret": {"kind": "prim", "value": "u64"},
-          "body": 12
+          "ret": {
+            "kind": "prim",
+            "value": "u64"
+          },
+          "body": 13
         }
       },
-      {"kind": "none"},
-      {"kind": "none"},
-      {"kind": "none"}
-    ]
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "fn_",
+        "value": {
+          "params": [],
+          "ret": {
+            "kind": "prim",
+            "value": "unit"
+          },
+          "body": 29
+        }
+      },
+      {
+        "kind": "none"
+      }
+    ],
+    "exprs": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "14695981039346656037",
+            "value": "14695981039346656037",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "1099511628211",
+            "value": "1099511628211",
+            "base": "dec",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 2,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 1,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 3,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 4,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 4,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 5,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 5,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 6,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 6,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "path",
+        "value": {
+          "def": 2,
+          "generic_args": []
+        }
+      },
+      {
+        "id": 7,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "bit_xor",
+          "overflow": "wrapping",
+          "lhs": 4,
+          "rhs": 5
+        }
+      },
+      {
+        "id": 8,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "assign",
+        "value": {
+          "op": "plain",
+          "target": 4,
+          "value": 7,
+          "overflow": "wrapping"
+        }
+      },
+      {
+        "id": 9,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binary",
+        "value": {
+          "op": "mul",
+          "overflow": "wrapping",
+          "lhs": 4,
+          "rhs": 6
+        }
+      },
+      {
+        "id": 10,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "assign",
+        "value": {
+          "op": "plain",
+          "target": 4,
+          "value": 9,
+          "overflow": "wrapping"
+        }
+      },
+      {
+        "id": 11,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [
+            1,
+            2
+          ],
+          "tail": null,
+          "labelled": null
+        }
+      },
+      {
+        "id": 12,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "for_",
+        "value": {
+          "pattern": 1,
+          "iter_kind": {
+            "kind": "slice"
+          },
+          "body": {
+            "statements": [
+              1,
+              2
+            ],
+            "tail": null,
+            "labelled": null
+          },
+          "labelled": null,
+          "iterable": 3
+        }
+      },
+      {
+        "id": 13,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [
+            0,
+            3
+          ],
+          "tail": 4,
+          "labelled": null
+        }
+      },
+      {
+        "id": 14,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0xcbf29ce484222325",
+            "value": "14695981039346656037",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 15,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "string",
+          "value": {
+            "bytes": ""
+          }
+        }
+      },
+      {
+        "id": 16,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 3
+          },
+          "args": [
+            15
+          ]
+        }
+      },
+      {
+        "id": 17,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 8
+          },
+          "args": [
+            14,
+            16
+          ]
+        }
+      },
+      {
+        "id": 18,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 17
+        }
+      },
+      {
+        "id": 19,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0xaf63dc4c8601ec8c",
+            "value": "12638187200555641996",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 20,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "string",
+          "value": {
+            "bytes": "a"
+          }
+        }
+      },
+      {
+        "id": 21,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 3
+          },
+          "args": [
+            20
+          ]
+        }
+      },
+      {
+        "id": 22,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 8
+          },
+          "args": [
+            19,
+            21
+          ]
+        }
+      },
+      {
+        "id": 23,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 22
+        }
+      },
+      {
+        "id": 24,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "int",
+          "value": {
+            "text": "0x85944171f73967e8",
+            "value": "9625390261332436968",
+            "base": "hex",
+            "ty_suffix": null
+          }
+        }
+      },
+      {
+        "id": 25,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "literal",
+        "value": {
+          "kind": "string",
+          "value": {
+            "bytes": "foobar"
+          }
+        }
+      },
+      {
+        "id": 26,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 3
+          },
+          "args": [
+            25
+          ]
+        }
+      },
+      {
+        "id": 27,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "call",
+        "value": {
+          "call_kind": {
+            "kind": "free",
+            "def": 8
+          },
+          "args": [
+            24,
+            26
+          ]
+        }
+      },
+      {
+        "id": 28,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "try_",
+        "value": {
+          "inner": 27
+        }
+      },
+      {
+        "id": 29,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "block",
+        "value": {
+          "statements": [
+            4,
+            5,
+            6
+          ],
+          "tail": null,
+          "labelled": null
+        }
+      }
+    ],
+    "stmts": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "let",
+        "value": {
+          "pattern": 0,
+          "init": 2,
+          "ty": null
+        }
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 8
+      },
+      {
+        "id": 2,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 10
+      },
+      {
+        "id": 3,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 12
+      },
+      {
+        "id": 4,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 18
+      },
+      {
+        "id": 5,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 23
+      },
+      {
+        "id": 6,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "expr",
+        "value": 28
+      }
+    ],
+    "pats": [
+      {
+        "id": 0,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binding",
+        "value": {
+          "name": "h",
+          "mode": "value",
+          "mutable": true
+        }
+      },
+      {
+        "id": 1,
+        "span": {
+          "start_line": 1,
+          "start_col": 1,
+          "end_line": 1,
+          "end_col": 1
+        },
+        "ty": null,
+        "kind": "binding",
+        "value": {
+          "name": "byte",
+          "mode": "value",
+          "mutable": false
+        }
+      }
+    ],
+    "types": []
   }
 }
