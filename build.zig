@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "tree_sitter", .module = ts_mod },
+            .{ .name = "rust", .module = rust },
         },
     });
 

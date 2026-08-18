@@ -28,9 +28,9 @@ const types = @import("types.zig");
 const exprs = @import("exprs.zig");
 const graph = @import("graph.zig");
 const bodies = @import("bodies.zig");
+const expand = @import("expand.zig");
 const ts = @import("tree_sitter");
-
-extern fn tree_sitter_rust() callconv(.c) *const ts.Language;
+const rust = @import("rust");
 
 pub const span_of: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
@@ -229,7 +229,7 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
             name = text(e, c);
         } else if (std.mem.eql(u8, k, "type") or std.mem.eql(u8, k, "primitive_type")) {
             type_node = c;
-        } else if (std.mem.eql(u8, k, "value") or std.mem.eql(u8, k, "call_expression") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "integer_literal") or std.mem.eql(u8, k, "boolean_literal") or std.mem.eql(u8, k, "string_literal") or std.mem.eql(u8, k, "char_literal")) {
+        } else if (std.mem.eql(u8, k, "value") or std.mem.eql(u8, k, "call_expression") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "integer_literal") or std.mem.eql(u8, k, "boolean_literal") or std.mem.eql(u8, k, "string_literal") or std.mem.eql(u8, k, "char_literal") or std.mem.eql(u8, k, "macro_invocation") or std.mem.eql(u8, k, "binary_expression") or std.mem.eql(u8, k, "array_expression") or std.mem.eql(u8, k, "struct_expression")) {
             if (init_node == null) init_node = c;
         }
     }
@@ -359,6 +359,11 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
                 try e.ctx.stmts.append(e.ctx.alloc, .{ .id = sid, .span = span_of, .ty = null, .kind = .{ .expr = eid } });
                 try stmt_ids.append(e.ctx.alloc, sid);
             }
+        } else if (std.mem.eql(u8, k, "macro_invocation")) {
+            const eid = try lowerMacroInvocation(e, c);
+            const sid: exprs.NodeId = @intCast(e.ctx.stmts.items.len);
+            try e.ctx.stmts.append(e.ctx.alloc, .{ .id = sid, .span = span_of, .ty = null, .kind = .{ .expr = eid } });
+            try stmt_ids.append(e.ctx.alloc, sid);
         } else if (std.mem.eql(u8, k, "for_expression")) {
             const eid = try lowerFor(e, c);
             const sid: exprs.NodeId = @intCast(e.ctx.stmts.items.len);
@@ -396,6 +401,10 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
 fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const kind = node.kind();
 
+    // Macro invocation.
+    if (std.mem.eql(u8, kind, "macro_invocation")) {
+        return lowerMacroInvocation(e, node);
+    }
     // Literals.
     if (std.mem.eql(u8, kind, "integer_literal")) {
         return lowerIntLit(e, node);
@@ -733,6 +742,153 @@ fn unsupported(e: *Ext, reason: []const u8) anyerror!exprs.NodeId {
     return appendExpr(e, .{ .unsupported = .{ .reason = reason, .suggested_version = .v3 } });
 }
 
+fn parseAndLowerSubExpr(e: *Ext, arg_str: []const u8) anyerror!exprs.NodeId {
+    const trimmed = std.mem.trim(u8, arg_str, " \t\r\n");
+    if (trimmed.len == 0) return appendExpr(e, .{ .unit = {} });
+
+    // Build a wrapper function string to parse the expression safely
+    const prefix = "fn __macro_sub__() { ";
+    const suffix = "; }";
+    const wrapped = try std.fmt.allocPrint(e.ctx.alloc, "{s}{s}{s}", .{ prefix, trimmed, suffix });
+    defer e.ctx.alloc.free(wrapped);
+
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    if (parser.setLanguage(rust.language())) |_| {} else |_| {}
+    const tree = parser.parseString(wrapped, null) orelse return unsupported(e, "failed to parse macro argument");
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    const fn_node = root.namedChild(0) orelse return unsupported(e, "macro argument parse error");
+    var block_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (fn_node.namedChild(i)) |c| : (i += 1) {
+        if (std.mem.eql(u8, c.kind(), "block")) {
+            block_node = c;
+            break;
+        }
+    }
+    const blk = block_node orelse return unsupported(e, "macro argument block missing");
+    const first_child = blk.namedChild(0) orelse return unsupported(e, "macro argument empty");
+
+    var expr_node = first_child;
+    if (std.mem.eql(u8, first_child.kind(), "expression_statement")) {
+        expr_node = first_child.namedChild(0) orelse first_child;
+    }
+
+    const orig_src = e.ctx.src;
+    e.ctx.src = wrapped;
+    defer e.ctx.src = orig_src;
+
+    return lowerExpr(e, expr_node);
+}
+
+fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    var mname_node: ?ts.Node = null;
+    var token_tree_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "scoped_identifier")) {
+            if (mname_node == null) mname_node = c;
+        } else if (std.mem.eql(u8, k, "token_tree")) {
+            token_tree_node = c;
+        }
+    }
+
+    const mname = if (mname_node) |mn| text(e, mn) else return unsupported(e, "macro invocation missing name");
+    const raw_tokens = if (token_tree_node) |tt| text(e, tt) else "";
+    const kind = expand.identifyMacro(mname);
+
+    switch (kind) {
+        .panic, .todo, .unimplemented => {
+            const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
+            defer e.ctx.alloc.free(args);
+            const msg = try expand.expandPanicMessage(e.ctx.alloc, args);
+            defer e.ctx.alloc.free(msg);
+            const prefix = switch (kind) {
+                .panic => "panic",
+                .todo => "todo",
+                .unimplemented => "unimplemented",
+                else => unreachable,
+            };
+            const full_msg = if (msg.len > 0)
+                try std.fmt.allocPrint(e.ctx.alloc, "{s}: {s}", .{ prefix, msg })
+            else
+                try std.fmt.allocPrint(e.ctx.alloc, "{s}", .{prefix});
+            return unsupported(e, full_msg);
+        },
+        .unreachable_ => {
+            return unsupported(e, "unreachable");
+        },
+        .assert_eq, .assert_ne => {
+            const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
+            defer e.ctx.alloc.free(args);
+            if (args.len >= 2) {
+                const lhs = try parseAndLowerSubExpr(e, args[0]);
+                const rhs = try parseAndLowerSubExpr(e, args[1]);
+                const bop: exprs.BinaryOp = if (kind == .assert_eq) .eq else .ne;
+                return appendExpr(e, .{ .binary = .{
+                    .op = bop,
+                    .overflow = .wrapping,
+                    .lhs = lhs,
+                    .rhs = rhs,
+                } });
+            }
+            return unsupported(e, "assert_eq: expected at least 2 arguments");
+        },
+        .assert => {
+            const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
+            defer e.ctx.alloc.free(args);
+            if (args.len >= 1) {
+                return parseAndLowerSubExpr(e, args[0]);
+            }
+            return unsupported(e, "assert: missing condition");
+        },
+        .vec => {
+            const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
+            defer e.ctx.alloc.free(args);
+            if (args.len == 0) {
+                return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = try e.ctx.alloc.dupe(u8, &[_]u8{}) } } });
+            }
+            const bytes = try e.ctx.alloc.alloc(u8, args.len);
+            var all_u8 = true;
+            for (args, 0..) |arg, idx| {
+                const trimmed = std.mem.trim(u8, arg, " \t\r\n");
+                var base: u8 = 10;
+                var slice = trimmed;
+                if (slice.len > 2 and slice[0] == '0' and (slice[1] == 'x' or slice[1] == 'X')) {
+                    base = 16;
+                    slice = slice[2..];
+                } else if (slice.len > 2 and slice[0] == '0' and (slice[1] == 'b' or slice[1] == 'B')) {
+                    base = 2;
+                    slice = slice[2..];
+                } else if (slice.len > 2 and slice[0] == '0' and (slice[1] == 'o' or slice[1] == 'O')) {
+                    base = 8;
+                    slice = slice[2..];
+                }
+                if (std.fmt.parseInt(u8, slice, base)) |val| {
+                    bytes[idx] = val;
+                } else |_| {
+                    all_u8 = false;
+                    break;
+                }
+            }
+            if (all_u8) {
+                return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
+            }
+            e.ctx.alloc.free(bytes);
+            return unsupported(e, "vec macro non-byte elements");
+        },
+        .println, .eprintln, .format => {
+            return unsupported(e, try std.fmt.allocPrint(e.ctx.alloc, "macro {s}", .{@tagName(kind)}));
+        },
+        .custom => {
+            return unsupported(e, try std.fmt.allocPrint(e.ctx.alloc, "macro {s}", .{mname}));
+        },
+    }
+}
+
 // ── top-level entry ──────────────────────────────────────────────────────────
 
 /// Extract the body of the function whose entity is `fn_entity` by parsing
@@ -747,7 +903,7 @@ pub fn extractFunction(
 
     const parser = ts.Parser.create();
     defer parser.destroy();
-    if (parser.setLanguage(tree_sitter_rust())) |_| {} else |_| {}
+    if (parser.setLanguage(rust.language())) |_| {} else |_| {}
     const tree = parser.parseString(ctx.src, null) orelse return false;
     defer tree.destroy();
 
@@ -797,4 +953,116 @@ pub fn extractFunction(
         return true;
     }
     return false;
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+test "lower built-in macro invocations in fn bodies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    // Root module entity (id 0).
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    // Fn entity (id 1).
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "check"),
+        .span = span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+
+    const src =
+        \\fn check() {
+        \\    assert!(true);
+        \\    assert_eq!(1 + 1, 2);
+        \\    assert_ne!(a, b);
+        \\    panic!("boom");
+        \\    unreachable!();
+        \\    let v = vec![1, 2, 3];
+        \\}
+    ;
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = src,
+        .mod_id = 0,
+    };
+    const ok = try extractFunction(&ctx, 1);
+    try std.testing.expect(ok);
+    // The body must have been lowered to a real block expr (not left empty).
+    try std.testing.expect(bodies_list.items[1].fn_.body > 0);
+
+    var found_eq = false;
+    var found_ne = false;
+    var found_byte_array = false;
+    var found_unsupported = false;
+    for (exprs_list.items) |ex| {
+        switch (ex.kind) {
+            .binary => |b| {
+                if (b.op == .eq) found_eq = true;
+                if (b.op == .ne) found_ne = true;
+            },
+            .literal => |l| {
+                if (l == .byte_array) found_byte_array = true;
+            },
+            .unsupported => found_unsupported = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(found_eq); // assert_eq! → .eq binary
+    try std.testing.expect(found_ne); // assert_ne! → .ne binary
+    try std.testing.expect(found_byte_array); // vec![1,2,3] → byte_array literal
+    try std.testing.expect(found_unsupported); // panic!/unreachable!/unresolved → .unsupported
 }

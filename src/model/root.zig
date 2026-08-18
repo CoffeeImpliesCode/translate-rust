@@ -19,6 +19,7 @@ pub const types = @import("types.zig");
 pub const bodies = @import("bodies.zig");
 pub const items = @import("items.zig");
 pub const exprs = @import("exprs.zig");
+pub const expand = @import("expand.zig");
 pub const resolve_methods = @import("resolve_methods.zig");
 pub const monomorphize = @import("monomorphize.zig");
 
@@ -37,6 +38,9 @@ test {
     _ = @import("infer_test.zig");
     _ = @import("resolve_methods.zig");
     _ = @import("resolve_methods_test.zig");
+    _ = @import("exprs.zig");
+    _ = @import("expand.zig");
     _ = @import("monomorphize.zig");
     _ = @import("monomorphize_test.zig");
+    _ = @import("expand_test.zig");
 }

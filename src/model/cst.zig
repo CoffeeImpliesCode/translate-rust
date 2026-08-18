@@ -15,8 +15,7 @@ const bodies = @import("bodies.zig");
 const items = @import("items.zig");
 const names = @import("names.zig");
 const ts = @import("tree_sitter");
-
-extern fn tree_sitter_rust() callconv(.c) *const ts.Language;
+const rust = @import("rust");
 
 pub const span_of: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
@@ -669,7 +668,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
 pub fn extractFile(ctx: *Ctx) !void {
     var parser = ts.Parser.create();
     defer parser.destroy();
-    if (parser.setLanguage(tree_sitter_rust())) |_| {} else |_| {}
+    if (parser.setLanguage(rust.language())) |_| {} else |_| {}
     const tree = parser.parseString(ctx.src, null) orelse return;
     defer tree.destroy();
     const root = tree.rootNode();
