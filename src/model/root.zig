@@ -11,6 +11,7 @@ pub const json = @import("json.zig");
 pub const emit = @import("emit.zig");
 pub const package = @import("package.zig");
 pub const driver = @import("driver.zig");
+pub const ts_ext = @import("ts_ext.zig");
 
 test {
     std.testing.refAllDecls(@This());

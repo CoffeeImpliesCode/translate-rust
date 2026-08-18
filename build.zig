@@ -28,10 +28,17 @@ pub fn build(b: *std.Build) void {
     rust.link_libc = true;
 
     // ── translate_rust.model — the lossless semantic IR (P1) ─────────────
+    // tree-sitter Zig bindings are available to the model for the hybrid
+    // body extractor (ts_ext.zig). The tree-sitter C runtime is compiled into
+    // the `rust` module; the exe links both modules so the extern symbols
+    // resolve.
     const model = b.addModule("translate_rust.model", .{
         .root_source_file = b.path("src/model/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tree_sitter", .module = ts_mod },
+        },
     });
 
     // ── translate_rust — library root ─────────────────────────

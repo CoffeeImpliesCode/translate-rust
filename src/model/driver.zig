@@ -26,6 +26,7 @@ const items = @import("items.zig");
 const types = @import("types.zig");
 const exprs = @import("exprs.zig");
 const emit = @import("emit.zig");
+const ts_ext = @import("ts_ext.zig");
 
 const Span = spine.Span;
 const EntityId = spine.EntityId;
@@ -91,6 +92,52 @@ fn crateNameFromManifestImpl(
 
 fn crateNameFromManifestPage(io: std.Io, dir: []const u8) anyerror![]const u8 {
     return crateNameFromManifestImpl(std.heap.page_allocator, io, dir);
+}
+
+/// Resolve the crate's lib source path from Cargo.toml (`[lib] path`), falling
+/// back to the conventional `src/lib.rs` then root `lib.rs`. Returns null if
+/// no lib source is found on disk.
+fn libPathFromManifest(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) ?[]const u8 {
+    const cargo_path = std.fs.path.join(allocator, &.{ dir, "Cargo.toml" }) catch return null;
+    const bytes = readFileAlloc(allocator, io, cargo_path) catch {
+        // No manifest — try conventions.
+        return fallbackLibPath(allocator, io, dir);
+    };
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    var in_lib = false;
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '[') {
+            in_lib = std.mem.eql(u8, std.mem.trim(u8, line, "[] \t"), "lib");
+            continue;
+        }
+        if (!in_lib) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        if (!std.mem.eql(u8, key, "path")) continue;
+        const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        var val_it = std.mem.splitScalar(u8, val, '"');
+        _ = val_it.next();
+        if (val_it.next()) |p| {
+            const joined = std.fs.path.join(allocator, &.{ dir, p }) catch return null;
+            const f = std.Io.Dir.cwd().openFile(io, joined, .{}) catch return null;
+            f.close(io);
+            return joined;
+        }
+    }
+    return fallbackLibPath(allocator, io, dir);
+}
+
+fn fallbackLibPath(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) ?[]const u8 {
+    const candidates = [_][]const u8{ "src/lib.rs", "lib.rs" };
+    for (candidates) |c| {
+        const joined = std.fs.path.join(allocator, &.{ dir, c }) catch return null;
+        const f = std.Io.Dir.cwd().openFile(io, joined, .{}) catch continue;
+        f.close(io);
+        return joined;
+    }
+    return null;
 }
 
 /// Best-effort crate-name extraction, exposed with the required fn-pointer
@@ -458,6 +505,10 @@ const State = struct {
     def_map: std.AutoHashMap(i64, spine.EntityId),
     /// Parallel to the symbol table: exprs for fn bodies / const inits.
     exprs: std.ArrayListUnmanaged(exprs.Expr),
+    /// Statement / pattern / type tables grown by the tree-sitter extractor.
+    stmts: std.ArrayListUnmanaged(exprs.Statement) = .empty,
+    pats: std.ArrayListUnmanaged(exprs.Pattern) = .empty,
+    types: std.ArrayListUnmanaged(types.Type) = .empty,
     /// Parallel to the symbol table: one BodyKind per entity.
     bodies: std.ArrayListUnmanaged(emit.BodyKind),
 };
@@ -1043,15 +1094,43 @@ pub fn translate(
         .is_translated = true,
     });
 
-    // 3. Assemble Bodies (dense exprs + sparse BodyKind), then emit the
-    //    standalone package to disk.
+    // 2b. Tree-sitter hybrid: rustdoc carries signatures only (no fn bodies).
+    //     Parse the crate root source and replace each fn's empty body with a
+    //     tree-sitter-lowered one. Fns not found in the root source keep their
+    //     rustdoc empty body (never a silent partial lower).
+    if (mapped_ok) {
+        const lib_path_opt = libPathFromManifest(arena, io, crate_dir);
+        if (lib_path_opt) |lib_path| {
+            if (readFileAlloc(arena, io, lib_path)) |src| {
+                var ctx: ts_ext.Ctx = .{
+                    .alloc = arena,
+                    .g = &g,
+                    .exprs = &state.exprs,
+                    .stmts = &state.stmts,
+                    .pats = &state.pats,
+                    .types = &state.types,
+                    .bodies_list = &state.bodies,
+                    .src = src,
+                    .mod_id = 0,
+                };
+                for (g.symbol_table.entities.items) |ent| {
+                    if (ent.kind == .fn_ and ent.parent != null) {
+                        _ = ts_ext.extractFunction(&ctx, ent.id) catch false;
+                    }
+                }
+            } else |_| {}
+        }
+    }
+
+    // 3. Assemble Bodies (dense exprs/stmts/pats/types + sparse BodyKind),
+    //    then emit the standalone package to disk.
     var bodies_opt: ?emit.Bodies = null;
     if (mapped_ok) {
         bodies_opt = .{
             .exprs = try state.exprs.toOwnedSlice(arena),
-            .stmts = &.{},
-            .pats = &.{},
-            .types = &.{},
+            .stmts = try state.stmts.toOwnedSlice(arena),
+            .pats = try state.pats.toOwnedSlice(arena),
+            .types = try state.types.toOwnedSlice(arena),
             .bodies = try state.bodies.toOwnedSlice(arena),
         };
     }
