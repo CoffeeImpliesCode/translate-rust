@@ -103,20 +103,31 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(r2z_fnv_lib);
 
-    // ── test-crates: run `zig test` on each translated crate golden ──────
-    // The translated outputs (test/r2z-*.zig) carry the crate's own #[test]
-    // blocks translated to Zig `test` blocks — the differential oracle.
-    // `zig build test-crates` runs them all.
-    const test_crates_step = b.step("test-crates", "Run zig test on every translated crate (test/r2z-*.zig)");
-    // 1. r2z-core runtime library (standalone package).
+    // ── test-crates: verify the TRANSLATION OUTPUT (not just translator src) ──
+    // Regenerates every r2z package from its wire model, then ast-checks and
+    // builds each emitted .zig. This is what makes the gate genuinely parse
+    // (and compile) the actual translation output, not merely the translator's
+    // own source. All 4 corpus crates (incl. generated fletcher/hex) run here.
+    const test_crates_step = b.step("test-crates", "Regenerate + ast-check + build every generated r2z package");
     {
+        // r2z-core runtime library (standalone package, part of the pipeline).
         const tc = b.addSystemCommand(&.{ "sh", "-c", "cd r2z-core && zig build test --summary all" });
         test_crates_step.dependOn(&tc.step);
     }
-    // Only goldens that are real compilable translation targets go here.
-    // r2z-hex.zig is a reduced textual subset (the emitter's `for (bytes) |byte|`
-    // has an unused capture, so it is not valid Zig) — excluded until hex truly
-    // translates (errors/alloc/arrays).
+    const specs = [_][2][]const u8{
+        .{ "test/fnv.json", "fnv" },
+        .{ "test/mini.json", "mini" },
+        .{ "test/fletcher.json", "fletcher" },
+        .{ "test/hex.json", "hex" },
+    };
+    for (specs) |spec| {
+        const regen = b.addSystemCommand(&.{
+            "sh",                                                                                                                                                                                                                                                                                            "-c",
+            b.fmt("rm -rf zig-out/r2z-check/{s} && ./zig-out/bin/translate-rust {s} -o zig-out/r2z-check/{s} && for f in $(find zig-out/r2z-check/{s} -name '*.zig'); do zig ast-check $f || exit 1; done && cd zig-out/r2z-check/{s} && zig build test", .{ spec[1], spec[0], spec[1], spec[1], spec[1] }),
+        });
+        test_crates_step.dependOn(&regen.step);
+    }
+    // Hand-authored goldens (fnv 203 vectors, fletcher 6 vectors) also parse.
     const goldens = [_][]const u8{ "test/r2z-fnv.zig", "test/r2z-fletcher.zig" };
     for (goldens) |golden| {
         const tc = b.addSystemCommand(&.{ "zig", "test", golden });
