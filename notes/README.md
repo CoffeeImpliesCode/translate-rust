@@ -9,6 +9,7 @@ self-contained research deliverable.
 | [research/parsing-tooling.md](research/parsing-tooling.md) | Linkable Rust parsers / semantic sources; how translate-c works | ✅ (2026-08-17) |
 | [research/idiom-mapping.md](research/idiom-mapping.md) | Rust features → correct, proper Zig | ✅ (2026-08-17) |
 | [research/approaches.md](research/approaches.md) | Architectures: full vs. boundary vs. pull-in-deps; recommended path | ✅ (2026-08-17) |
+| [design/source-model-type-inference.md](design/source-model-type-inference.md) | Complete Rust model: tree-sitter parse + in-Zig type inference (drop all Rust deps) | 📋 plan (2026-08-18) |
 
 ## Synthesis (what the research decides)
 

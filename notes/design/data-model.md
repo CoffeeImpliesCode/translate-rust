@@ -192,3 +192,11 @@ Consensus defaults (safe unless overridden): (1) rustdoc JSON for v0/v1;
 header override + sidecar annotation when known; (4) thread `.param` from the
 start where the model already threads allocators; (5) IR-local renumbering +
 keep `format_version`; (6) defer both, seal the seams.
+
+**Decision 1 supersedes for v2+**: the rustdoc sidecar is a v0/v1 stopgap. The
+endgame is a self-contained Zig producer — tree-sitter parses source, a Zig
+type-inference engine fills every `Expr.ty` and resolves methods/traits/
+generics — so translate-rust depends on no Rust toolchain. See
+`source-model-type-inference.md` (plan). This IR (the `types.Type` table, the
+`exprs/` code tables, `Instantiation` records) is the producer-neutral contract
+both the sidecar and the inference engine target unchanged.
