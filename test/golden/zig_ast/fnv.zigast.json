@@ -35,6 +35,21 @@
               {
                 "kind": "fn_decl",
                 "value": {
+                  "name": "default",
+                  "is_pub": true,
+                  "is_test": false,
+                  "params": [],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": null,
+                  "generic_params": []
+                }
+              },
+              {
+                "kind": "fn_decl",
+                "value": {
                   "name": "with_key",
                   "is_pub": true,
                   "is_test": false,
@@ -44,6 +59,78 @@
                       "ty": {
                         "kind": "prim",
                         "value": "u64"
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": null,
+                  "generic_params": []
+                }
+              },
+              {
+                "kind": "fn_decl",
+                "value": {
+                  "name": "finish",
+                  "is_pub": true,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "self",
+                      "ty": {
+                        "kind": "ptr",
+                        "elem": {
+                          "kind": "named",
+                          "name": "FnvHasher"
+                        },
+                        "is_const": true,
+                        "is_allowzero": false,
+                        "size": "one"
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": null,
+                  "generic_params": []
+                }
+              },
+              {
+                "kind": "fn_decl",
+                "value": {
+                  "name": "write",
+                  "is_pub": true,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "self",
+                      "ty": {
+                        "kind": "ptr",
+                        "elem": {
+                          "kind": "named",
+                          "name": "FnvHasher"
+                        },
+                        "is_const": false,
+                        "is_allowzero": false,
+                        "size": "one"
+                      },
+                      "is_comptime": false
+                    },
+                    {
+                      "name": "bytes",
+                      "ty": {
+                        "kind": "slice",
+                        "elem": {
+                          "kind": "prim",
+                          "value": "u8"
+                        },
+                        "is_const": true
                       },
                       "is_comptime": false
                     }

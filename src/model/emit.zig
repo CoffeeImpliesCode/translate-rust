@@ -747,6 +747,30 @@ fn emitPattern(
                 try emitPattern(allocator, buf, b, alt_id);
             }
         },
+        .reference => |rp| {
+            try emitPattern(allocator, buf, b, rp.inner);
+        },
+        .tuple => |tp| {
+            for (tp.elements, 0..) |elem_id, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try emitPattern(allocator, buf, b, elem_id);
+            }
+        },
+        .struct_pat => |sp| {
+            // `Some(x)` / `Ok(x)` style while-let captures: emit the payload
+            // binding(s), which is what Zig's while-capture (and for-pattern)
+            // actually binds.
+            for (sp.fields, 0..) |f, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                if (f.pat) |fpid| {
+                    try emitPattern(allocator, buf, b, fpid);
+                } else {
+                    // Shorthand (`{ x }`) binds a same-named local: the field
+                    // name itself is the capture identifier.
+                    try emitIdent(allocator, buf, f.field);
+                }
+            }
+        },
         else => try buf.append(allocator, '_'),
     }
 }
@@ -1427,7 +1451,13 @@ fn emitExpr(
         .while_ => |we| {
             try buf.appendSlice(allocator, "while (");
             try emitExpr(allocator, buf, g, b, we.cond, depth, true, is_comptime);
-            try buf.appendSlice(allocator, ") ");
+            try buf.appendSlice(allocator, ")");
+            if (we.capture) |cap_id| {
+                try buf.appendSlice(allocator, " |");
+                try emitPattern(allocator, buf, b, cap_id);
+                try buf.appendSlice(allocator, "|");
+            }
+            try buf.appendSlice(allocator, " ");
             try emitBlock(allocator, buf, g, b, we.body, depth + 1, is_comptime);
         },
         .if_else => |ie| {

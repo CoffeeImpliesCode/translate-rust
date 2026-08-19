@@ -16,6 +16,7 @@ const exprs = ir.exprs;
 const bodies = ir.bodies;
 const items = ir.items;
 const names = @import("names.zig");
+const exp = @import("expand.zig");
 const ts = @import("tree_sitter");
 const rust = @import("rust");
 
@@ -30,6 +31,10 @@ pub const Ctx = struct {
     exprs_list: *std.ArrayListUnmanaged(exprs.Expr),
     base_dir: ?[]const u8 = null,
     io: ?std.Io = null,
+    /// In-crate `macro_rules!` definitions registered during CST extraction.
+    /// Shared by the root module and every submodule so an item-level macro
+    /// invocation can be expanded regardless of which file defined it.
+    macro_table: ?*exp.MacroTable = null,
 };
 
 fn readFileAlloc(
@@ -1033,18 +1038,30 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
     var trait_name: ?[]const u8 = null;
     var decl_list: ?ts.Node = null;
 
-    var i: u32 = 0;
-    while (item.namedChild(i)) |c| : (i += 1) {
-        const k = c.kind();
-        if (std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "generic_type") or std.mem.eql(u8, k, "primitive_type")) {
-            if (self_ty_name.len == 0) {
-                self_ty_name = text(e, c);
-            } else {
-                trait_name = self_ty_name;
-                self_ty_name = text(e, c);
+    if (item.childByFieldName("trait")) |tn| {
+        trait_name = text(e, tn);
+    }
+    if (item.childByFieldName("type")) |tn| {
+        self_ty_name = text(e, tn);
+    }
+    if (item.childByFieldName("body")) |bn| {
+        decl_list = bn;
+    }
+
+    if (self_ty_name.len == 0 or decl_list == null) {
+        var i: u32 = 0;
+        while (item.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "generic_type") or std.mem.eql(u8, k, "primitive_type") or std.mem.eql(u8, k, "scoped_type_identifier") or std.mem.eql(u8, k, "type_path")) {
+                if (self_ty_name.len == 0) {
+                    self_ty_name = text(e, c);
+                } else if (trait_name == null) {
+                    trait_name = self_ty_name;
+                    self_ty_name = text(e, c);
+                }
+            } else if (std.mem.eql(u8, k, "declaration_list")) {
+                if (decl_list == null) decl_list = c;
             }
-        } else if (std.mem.eql(u8, k, "declaration_list")) {
-            decl_list = c;
         }
     }
 
@@ -1054,6 +1071,9 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
     }
     if (std.mem.indexOf(u8, target_name, "<")) |idx| {
         target_name = target_name[0..idx];
+    }
+    if (std.mem.lastIndexOf(u8, target_name, "::")) |idx| {
+        target_name = target_name[idx + 2 ..];
     }
     target_name = std.mem.trim(u8, target_name, " ");
 
@@ -1071,11 +1091,10 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
     else
         try e.alloc.dupe(u8, self_ty_name);
 
-    // Only inherent impls (`impl Type { ... }`) hoist their methods into the
-    // target struct; trait impls (`impl Trait for Type { ... }`) stay
-    // top-level and keep their items parented to the impl block.
-    const inherent = trait_name == null;
-    const impl_parent = if (inherent) (target_id orelse mod_id) else mod_id;
+    // Both inherent impls (`impl Type { ... }`) and trait impls
+    // (`impl Trait for Type { ... }`) parent their methods to the resolved
+    // target struct, allowing the backend to hoist the methods there.
+    const impl_parent = target_id orelse mod_id;
     const impl_id = try addEntity(e, .impl_, name, impl_parent);
 
     if (decl_list) |dl| {
@@ -1089,72 +1108,81 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                 // below; the backend dedups the two paths by method name.
                 try functionItem(e, child, impl_id, false);
 
-                if (inherent) {
-                    if (target_id) |tid| {
-                        if (tid < e.bodies_list.items.len) {
-                            switch (e.bodies_list.items[tid]) {
-                                .struct_ => |*sb| {
-                                    var mname: []const u8 = "";
-                                    var mparams_node: ?ts.Node = null;
-                                    var mret: types.Type = .{ .prim = .unit };
-                                    var k: u32 = 0;
-                                    while (child.namedChild(k)) |c| : (k += 1) {
-                                        const kk = c.kind();
-                                        if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
-                                        if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
-                                        if (std.mem.eql(u8, kk, "return_type")) {
-                                            var t: u32 = 0;
-                                            while (c.namedChild(t)) |rc| : (t += 1) {
-                                                const mapped = mapType(e, rc);
-                                                if (mapped != .unsupported) {
-                                                    mret = mapped;
-                                                    break;
-                                                }
-                                            }
-                                            if (mret == .prim and mret.prim == .unit and c.namedChildCount() > 0) {
-                                                mret = mapType(e, c.namedChild(0).?);
-                                            }
-                                        }
-                                    }
-
-                                    const all_params = mapParams(e, mparams_node);
-                                    var receiver: ?items.Receiver = null;
-                                    var method_params: []const items.Param = all_params;
-
-                                    if (mparams_node) |pn| {
-                                        var pi: u32 = 0;
-                                        while (pn.namedChild(pi)) |p| : (pi += 1) {
-                                            if (std.mem.eql(u8, p.kind(), "self_parameter")) {
-                                                const p_text = text(e, p);
-                                                if (std.mem.indexOf(u8, p_text, "&mut") != null) {
-                                                    receiver = .mut_ref;
-                                                } else if (std.mem.indexOf(u8, p_text, "&") != null) {
-                                                    receiver = .ref_;
-                                                } else {
-                                                    receiver = .owned;
-                                                }
+                if (target_id) |tid| {
+                    if (tid < e.bodies_list.items.len) {
+                        switch (e.bodies_list.items[tid]) {
+                            .struct_ => |*sb| {
+                                var mname: []const u8 = "";
+                                var mparams_node: ?ts.Node = null;
+                                var mret: types.Type = .{ .prim = .unit };
+                                var k: u32 = 0;
+                                while (child.namedChild(k)) |c| : (k += 1) {
+                                    const kk = c.kind();
+                                    if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
+                                    if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
+                                    if (std.mem.eql(u8, kk, "return_type")) {
+                                        var t: u32 = 0;
+                                        while (c.namedChild(t)) |rc| : (t += 1) {
+                                            const mapped = mapType(e, rc);
+                                            if (mapped != .unsupported) {
+                                                mret = mapped;
                                                 break;
                                             }
                                         }
-                                    }
-                                    if (receiver == null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
-                                        if (all_params[0].ty == .reference) {
-                                            if (all_params[0].ty.reference.*.mut) {
-                                                receiver = .mut_ref;
-                                            } else {
-                                                receiver = .ref_;
-                                            }
-                                        } else {
-                                            receiver = .owned;
+                                        if (mret == .prim and mret.prim == .unit and c.namedChildCount() > 0) {
+                                            mret = mapType(e, c.namedChild(0).?);
                                         }
                                     }
-                                    if (receiver != null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
-                                        method_params = all_params[1..];
-                                    }
+                                }
 
+                                const all_params = mapParams(e, mparams_node);
+                                var receiver: ?items.Receiver = null;
+                                var method_params: []const items.Param = all_params;
+
+                                if (mparams_node) |pn| {
+                                    var pi: u32 = 0;
+                                    while (pn.namedChild(pi)) |p| : (pi += 1) {
+                                        if (std.mem.eql(u8, p.kind(), "self_parameter")) {
+                                            const p_text = text(e, p);
+                                            if (std.mem.indexOf(u8, p_text, "&mut") != null) {
+                                                receiver = .mut_ref;
+                                            } else if (std.mem.indexOf(u8, p_text, "&") != null) {
+                                                receiver = .ref_;
+                                            } else {
+                                                receiver = .owned;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (receiver == null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
+                                    if (all_params[0].ty == .reference) {
+                                        if (all_params[0].ty.reference.*.mut) {
+                                            receiver = .mut_ref;
+                                        } else {
+                                            receiver = .ref_;
+                                        }
+                                    } else {
+                                        receiver = .owned;
+                                    }
+                                }
+                                if (receiver != null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
+                                    method_params = all_params[1..];
+                                }
+
+                                var method_exists = false;
+                                for (sb.methods) |existing_m| {
+                                    if (std.mem.eql(u8, existing_m.name, mname)) {
+                                        method_exists = true;
+                                        break;
+                                    }
+                                }
+
+                                if (!method_exists) {
+                                    const vis: spine.Visibility = if (trait_name != null) .public else visOf(e, child);
                                     const sm: bodies.StructMethod = .{
                                         .name = try e.alloc.dupe(u8, mname),
-                                        .visibility = visOf(e, child),
+                                        .visibility = vis,
                                         .params = method_params,
                                         .ret = mret,
                                         .body = 0,
@@ -1166,9 +1194,9 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                                     @memcpy(new_methods[0..old_methods.len], old_methods);
                                     new_methods[old_methods.len] = sm;
                                     sb.methods = new_methods;
-                                },
-                                else => {},
-                            }
+                                }
+                            },
+                            else => {},
                         }
                     }
                 }
@@ -1197,13 +1225,140 @@ fn mapItems(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) !void {
     }
 }
 
+/// Extract the value of a `#[path = "..."]` attribute (path or not) from an
+/// attribute's raw text slice. Handles `#[path = "x"], `#[ path = "x" ]`,
+/// raw strings, and returns null when no path attribute is present.
+fn extractPathFromAttrText(attr_text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < attr_text.len) {
+        if (std.mem.startsWith(u8, attr_text[i..], "path")) {
+            const prev_ok = (i == 0 or !std.ascii.isAlphanumeric(attr_text[i - 1]) and attr_text[i - 1] != '_');
+            const next_idx = i + 4;
+            const next_ok = (next_idx >= attr_text.len or !std.ascii.isAlphanumeric(attr_text[next_idx]) and attr_text[next_idx] != '_');
+            if (prev_ok and next_ok) {
+                var eq_idx = next_idx;
+                while (eq_idx < attr_text.len and (attr_text[eq_idx] == ' ' or attr_text[eq_idx] == '\t')) : (eq_idx += 1) {}
+                if (eq_idx < attr_text.len and attr_text[eq_idx] == '=') {
+                    var quote_start = eq_idx + 1;
+                    while (quote_start < attr_text.len and
+                        (attr_text[quote_start] == ' ' or attr_text[quote_start] == '\t' or
+                            attr_text[quote_start] == 'r' or attr_text[quote_start] == '#'))
+                    {
+                        if (attr_text[quote_start] == '"') break;
+                        quote_start += 1;
+                    }
+                    if (quote_start < attr_text.len and attr_text[quote_start] == '"') {
+                        const str_start = quote_start + 1;
+                        if (std.mem.indexOfScalar(u8, attr_text[str_start..], '"')) |len| {
+                            return attr_text[str_start .. str_start + len];
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Find a `#[path = "..."]` attribute on a `mod_item`. The attribute may be a
+/// child of the item or a preceding sibling of it.
+fn extractPathAttr(e: *const Ctx, item: ts.Node) ?[]const u8 {
+    var j: u32 = 0;
+    while (item.namedChild(j)) |c| : (j += 1) {
+        if (std.mem.eql(u8, c.kind(), "attribute_item")) {
+            if (extractPathFromAttrText(text(e, c))) |p| return p;
+        }
+    }
+    var prev = item.prevNamedSibling();
+    while (prev) |pnode| {
+        if (std.mem.eql(u8, pnode.kind(), "attribute_item")) {
+            if (extractPathFromAttrText(text(e, pnode))) |p| return p;
+            prev = pnode.prevNamedSibling();
+        } else {
+            break;
+        }
+    }
+    return null;
+}
+
+/// Register a `macro_rules! name { … }` definition into the shared macro
+/// table so item-level invocations can be expanded later in this pass.
+fn registerMacroDefinition(e: *Ctx, item: ts.Node) !void {
+    const table = e.macro_table orelse return;
+    const raw_def = text(e, item);
+    const def = (try exp.parseMacroRulesDefinition(e.alloc, raw_def)) orelse return;
+    try table.register(def.name, def);
+}
+
+/// Expand an item-level `name!(…);` invocation when the named macro was
+/// defined in-crate. The expanded Rust source is re-parsed and its generated
+/// items are ingested into the current module (so `impl_integer!(i8, i16… )`
+/// produces real impl blocks instead of being dropped).
+fn expandMacroInvocationItems(
+    e: *Ctx,
+    item: ts.Node,
+    mod_id: spine.EntityId,
+    item_ids: *std.ArrayListUnmanaged(spine.EntityId),
+) anyerror!void {
+    const table = e.macro_table orelse return;
+    var mname: ?[]const u8 = null;
+    var token_tree_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (item.namedChild(i)) |c| : (i += 1) {
+        const ck = c.kind();
+        if (std.mem.eql(u8, ck, "identifier") or std.mem.eql(u8, ck, "scoped_identifier")) {
+            if (mname == null) mname = text(e, c);
+        } else if (std.mem.eql(u8, ck, "token_tree")) {
+            token_tree_node = c;
+        }
+    }
+    const name = mname orelse return;
+    const raw_args = if (token_tree_node) |tt| text(e, tt) else "";
+    const def = (table.get(name)) orelse return;
+
+    const expanded = try exp.expandMacroRules(e.alloc, def, raw_args) orelse return;
+    defer e.alloc.free(expanded);
+
+    // Re-parse the expanded source and ingest any generated top-level items.
+    var parser = ts.Parser.create();
+    defer parser.destroy();
+    if (parser.setLanguage(rust.language())) |_| {} else |_| {}
+    const tree = parser.parseString(expanded, null) orelse return;
+    defer tree.destroy();
+
+    var exp_ctx: Ctx = .{
+        .alloc = e.alloc,
+        .g = e.g,
+        .src = expanded,
+        .types_list = e.types_list,
+        .bodies_list = e.bodies_list,
+        .exprs_list = e.exprs_list,
+        .base_dir = e.base_dir,
+        .io = e.io,
+        .macro_table = e.macro_table,
+    };
+    const generated = try mapItemsInner(&exp_ctx, tree.rootNode(), mod_id);
+    try item_ids.appendSlice(e.alloc, generated);
+}
+
 /// Like mapItems but returns the item id list (for a nested module).
 fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.EntityId {
     var item_ids: std.ArrayListUnmanaged(spine.EntityId) = .empty;
     var i: u32 = 0;
     while (node.namedChild(i)) |item| : (i += 1) {
         if (isComment(item)) continue;
-        const k = item.kind();
+        // An item-level macro invocation is wrapped in an expression_statement
+        // node (e.g. `name!(...);`); descend into it so the following branch
+        // sees the `macro_invocation` child directly.
+        var item2 = item;
+        if (std.mem.eql(u8, item.kind(), "expression_statement")) {
+            const mi = item.namedChild(0) orelse continue;
+            if (std.mem.eql(u8, mi.kind(), "macro_invocation")) {
+                item2 = mi;
+            }
+        }
+        const k = item2.kind();
         if (std.mem.eql(u8, k, "mod_item")) {
             var mname: []const u8 = "";
             var decls: ?ts.Node = null;
@@ -1233,24 +1388,40 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                 var sub_path: ?[]const u8 = null;
                 var sub_base_dir: ?[]const u8 = null;
                 if (e.base_dir) |bdir| {
-                    const rs_name = try std.fmt.allocPrint(e.alloc, "{s}.rs", .{mname});
-                    defer e.alloc.free(rs_name);
-                    const cand1 = try std.fs.path.join(e.alloc, &.{ bdir, rs_name });
-                    defer e.alloc.free(cand1);
-                    const cand2 = try std.fs.path.join(e.alloc, &.{ bdir, mname, "mod.rs" });
-                    defer e.alloc.free(cand2);
-                    sub_base_dir = try std.fs.path.join(e.alloc, &.{ bdir, mname });
-                    if (e.io) |io| {
-                        var dir = std.Io.Dir.cwd();
-                        if (dir.openFile(io, cand1, .{})) |f| {
-                            f.close(io);
-                            sub_path = try e.alloc.dupe(u8, cand1);
-                        } else |_| {}
-                        if (sub_path == null) {
-                            if (dir.openFile(io, cand2, .{})) |f| {
+                    if (extractPathAttr(e, item)) |custom_rel_path| {
+                        // `#[path = "..."]` is resolved relative to the
+                        // directory containing the declaring file.
+                        const cand = try std.fs.path.join(e.alloc, &.{ bdir, custom_rel_path });
+                        defer e.alloc.free(cand);
+                        if (e.io) |io| {
+                            var dir = std.Io.Dir.cwd();
+                            if (dir.openFile(io, cand, .{})) |f| {
                                 f.close(io);
-                                sub_path = try e.alloc.dupe(u8, cand2);
+                                sub_path = try e.alloc.dupe(u8, cand);
                             } else |_| {}
+                        }
+                        const custom_parent = std.fs.path.dirname(cand) orelse bdir;
+                        sub_base_dir = try std.fs.path.join(e.alloc, &.{ custom_parent, mname });
+                    } else {
+                        const rs_name = try std.fmt.allocPrint(e.alloc, "{s}.rs", .{mname});
+                        defer e.alloc.free(rs_name);
+                        const cand1 = try std.fs.path.join(e.alloc, &.{ bdir, rs_name });
+                        defer e.alloc.free(cand1);
+                        const cand2 = try std.fs.path.join(e.alloc, &.{ bdir, mname, "mod.rs" });
+                        defer e.alloc.free(cand2);
+                        sub_base_dir = try std.fs.path.join(e.alloc, &.{ bdir, mname });
+                        if (e.io) |io| {
+                            var dir = std.Io.Dir.cwd();
+                            if (dir.openFile(io, cand1, .{})) |f| {
+                                f.close(io);
+                                sub_path = try e.alloc.dupe(u8, cand1);
+                            } else |_| {}
+                            if (sub_path == null) {
+                                if (dir.openFile(io, cand2, .{})) |f| {
+                                    f.close(io);
+                                    sub_path = try e.alloc.dupe(u8, cand2);
+                                } else |_| {}
+                            }
                         }
                     }
                 }
@@ -1282,6 +1453,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                                 .exprs_list = e.exprs_list,
                                 .base_dir = sub_base_dir,
                                 .io = e.io,
+                                .macro_table = e.macro_table,
                             };
                             const child_items = try mapItemsInner(&sub_ctx, sub_tree.rootNode(), child_id);
                             e.g.modules.items[child_mod_idx].items = child_items;
@@ -1291,31 +1463,35 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
             }
             try item_ids.append(e.alloc, child_id);
         } else if (std.mem.eql(u8, k, "use_declaration")) {
-            try useItem(e, item, mod_id, &item_ids);
+            try useItem(e, item2, mod_id, &item_ids);
         } else if (std.mem.eql(u8, k, "struct_item")) {
-            try structItem(e, item, mod_id);
+            try structItem(e, item2, mod_id);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "enum_item")) {
-            try enumItem(e, item, mod_id);
+            try enumItem(e, item2, mod_id);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "union_item")) {
-            try unionItem(e, item, mod_id);
+            try unionItem(e, item2, mod_id);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "trait_item")) {
-            try traitItem(e, item, mod_id);
+            try traitItem(e, item2, mod_id);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "type_item")) {
-            try typeAliasItem(e, item, mod_id);
+            try typeAliasItem(e, item2, mod_id);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "const_item")) {
-            try constItem(e, item, mod_id);
+            try constItem(e, item2, mod_id);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "function_item")) {
-            try functionItem(e, item, mod_id, false);
+            try functionItem(e, item2, mod_id, false);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "impl_item")) {
-            const id = try implItem(e, item, mod_id);
+            const id = try implItem(e, item2, mod_id);
             try item_ids.append(e.alloc, id);
+        } else if (std.mem.eql(u8, k, "macro_definition")) {
+            try registerMacroDefinition(e, item2);
+        } else if (std.mem.eql(u8, k, "macro_invocation")) {
+            try expandMacroInvocationItems(e, item2, mod_id, &item_ids);
         }
     }
     return item_ids.toOwnedSlice(e.alloc);
@@ -1324,6 +1500,18 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
 /// Entry: parse `src` and build the type model into `ctx`. The root module
 /// (id 0) must already exist. Returns the root module's item list.
 pub fn extractFile(ctx: *Ctx) !void {
+    var local_table: exp.MacroTable = undefined;
+    var has_local = false;
+    if (ctx.macro_table == null) {
+        local_table = exp.MacroTable.init(ctx.alloc);
+        ctx.macro_table = &local_table;
+        has_local = true;
+    }
+    defer if (has_local) {
+        ctx.macro_table = null;
+        local_table.deinit();
+    };
+
     var parser = ts.Parser.create();
     defer parser.destroy();
     if (parser.setLanguage(rust.language())) |_| {} else |_| {}

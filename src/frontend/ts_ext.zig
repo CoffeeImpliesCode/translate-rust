@@ -459,6 +459,115 @@ fn isPatternNode(node: ts.Node) bool {
         std.mem.eql(u8, k, "literal_pattern");
 }
 
+/// Classification of a `for` iterable produced by `unwrapIterable`.
+const UnwrappedIter = struct {
+    kind: exprs.IterKind,
+    /// Carrier iterator expression (slice for `.slice`, end bound for
+    /// `.range`, base slice for `.enumerate`, primary zip iterator for
+    /// `.multi`).
+    eid: exprs.NodeId,
+};
+
+/// The method name of a `recv.method(...)` call node, or null.
+fn methodNameOf(e: *Ext, node: ts.Node) ?[]const u8 {
+    if (!std.mem.eql(u8, node.kind(), "call_expression")) return null;
+    const callee = node.namedChild(0) orelse return null;
+    if (!std.mem.eql(u8, callee.kind(), "field_expression")) return null;
+    const method = callee.namedChild(1) orelse return null;
+    return text(e, method);
+}
+
+/// The receiver (`recv`) of a `recv.method(...)` call node, or null.
+fn receiverOf(node: ts.Node) ?ts.Node {
+    if (!std.mem.eql(u8, node.kind(), "call_expression")) return null;
+    const callee = node.namedChild(0) orelse return null;
+    if (!std.mem.eql(u8, callee.kind(), "field_expression")) return null;
+    return callee.namedChild(0);
+}
+
+/// The `arguments` child of a call node, or null.
+fn argumentsOf(node: ts.Node) ?ts.Node {
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        if (std.mem.eql(u8, c.kind(), "arguments")) return c;
+    }
+    return null;
+}
+
+/// Peel a range node (`a..b`, `a..=b`, `a..`) into its iterator classification.
+/// Only `0..b` / `0..=b` are lowered (start must be the literal `0`); `..=b`
+/// lowers to the inclusive bound `b+1` which the backend emits as `0..(b+1)`.
+fn lowerRangeIter(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
+    var start_n: ?ts.Node = null;
+    var end_n: ?ts.Node = null;
+    var inclusive = false;
+    var saw_op = false;
+    var i: u32 = 0;
+    while (node.child(i)) |c| : (i += 1) {
+        const t = text(e, c);
+        if (std.mem.eql(u8, t, "..=")) {
+            saw_op = true;
+            inclusive = true;
+        } else if (std.mem.eql(u8, t, "..")) {
+            saw_op = true;
+        } else if (c.isNamed()) {
+            if (saw_op) end_n = c else start_n = c;
+        }
+    }
+    if (start_n) |sn| {
+        const st = std.mem.trim(u8, text(e, sn), " \t\r\n");
+        if (!std.mem.eql(u8, st, "0")) return unsupportedIter(e, "range start");
+    }
+    if (end_n == null) return unsupportedIter(e, "range no end");
+    var end_eid = try lowerExpr(e, end_n.?);
+    if (inclusive) {
+        const one = try appendExpr(e, .{ .literal = .{ .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null } } });
+        end_eid = try appendExpr(e, .{ .binary = .{ .op = .add, .overflow = .wrapping, .lhs = end_eid, .rhs = one } });
+    }
+    return .{ .kind = .{ .range = {} }, .eid = end_eid };
+}
+
+/// The iterator equivalent of `unsupported`: a `.slice` iterable whose carrier
+/// is an `.unsupported` expr (renders as a loud `@panic`, never a wrong value).
+fn unsupportedIter(e: *Ext, reason: []const u8) anyerror!UnwrappedIter {
+    const eid = try unsupported(e, reason);
+    return .{ .kind = .{ .slice = {} }, .eid = eid };
+}
+
+/// Classify a `for` iterable expression, peeling `.iter()`, `.iter_mut()`,
+/// `.as_ref()` and detecting `.enumerate()` / `.zip()` / ranges.
+fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
+    const k = node.kind();
+    if (std.mem.eql(u8, k, "range_expression")) {
+        return lowerRangeIter(e, node);
+    }
+    if (std.mem.eql(u8, k, "call_expression")) {
+        if (methodNameOf(e, node)) |mname| {
+            if (std.mem.eql(u8, mname, "enumerate")) {
+                const recv = receiverOf(node) orelse return unsupportedIter(e, "enumerate receiver");
+                const base = try unwrapIterable(e, recv);
+                return .{ .kind = .{ .enumerate = {} }, .eid = base.eid };
+            }
+            if (std.mem.eql(u8, mname, "zip")) {
+                const recv = receiverOf(node) orelse return unsupportedIter(e, "zip receiver");
+                const base = try unwrapIterable(e, recv);
+                const arg = firstArg(e, argumentsOf(node)) orelse return unsupportedIter(e, "zip arg");
+                const other = try lowerExpr(e, arg);
+                const ids = try e.ctx.alloc.alloc(exprs.NodeId, 2);
+                ids[0] = base.eid;
+                ids[1] = other;
+                return .{ .kind = .{ .multi = ids }, .eid = base.eid };
+            }
+            if (std.mem.eql(u8, mname, "iter") or std.mem.eql(u8, mname, "iter_mut") or std.mem.eql(u8, mname, "as_ref") or std.mem.eql(u8, mname, "clone")) {
+                const recv = receiverOf(node) orelse return unsupportedIter(e, "iter receiver");
+                return unwrapIterable(e, recv);
+            }
+        }
+    }
+    const eid = try lowerExpr(e, node);
+    return .{ .kind = .{ .slice = {} }, .eid = eid };
+}
+
 /// Lower a `for_expression` to a wire `for_` expr, returning its expr id.
 fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     // `for <pattern> in <iter> { <block> }`
@@ -469,12 +578,12 @@ fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     var i: u32 = 0;
     while (node.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
-        if (std.mem.eql(u8, k, "pattern") or std.mem.eql(u8, k, "reference_pattern")) {
+        if (isPatternNode(c)) {
             if (pat_node == null) pat_node = c;
         } else if (std.mem.eql(u8, k, "block")) {
             body_node = c;
-        } else if (std.mem.eql(u8, k, "identifier")) {
-            if (iter_node == null and pat_node != null) iter_node = c;
+        } else if (iter_node == null) {
+            iter_node = c;
         }
     }
     // Fallback: `for byte in data` — the first identifier is the binding, the
@@ -493,31 +602,23 @@ fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (pat_node == null) pat_node = idents[0];
     }
 
-    var pat_id: exprs.NodeId = 0;
-    if (pat_node) |pn_raw| {
-        var pn = pn_raw;
-        if (pn.namedChildCount() > 0 and std.mem.eql(u8, pn.kind(), "reference_pattern")) {
-            pn = pn.namedChild(0).?;
-        }
-        if (std.mem.eql(u8, pn.kind(), "identifier")) {
-            const nm = text(e, pn);
-            pat_id = try appendPat(e, .{ .binding = .{ .name = nm, .mode = .{ .value = {} }, .mutable = false } });
-            _ = try pushLocal(e, nm);
-        } else {
-            pat_id = try appendPat(e, .{ .wildcard = {} });
-        }
-    } else {
-        pat_id = try appendPat(e, .{ .wildcard = {} });
-    }
+    // Lower the pattern first so every loop binding is in local scope before
+    // the body is lowered (`lowerPattern` registers each binding via
+    // `pushLocal`, including tuple and reference patterns).
+    const pat_id = if (pat_node) |pn|
+        try lowerPattern(e, pn)
+    else
+        try appendPat(e, .{ .wildcard = {} });
 
-    const iter_eid = try lowerExpr(e, iter_node orelse return unsupported(e, "for iterable"));
+    const it = try unwrapIterable(e, iter_node orelse return unsupported(e, "for iterable"));
+    const iter_eid = it.eid;
     const body_blk = try lowerBlock(e, body_node orelse return unsupported(e, "for body"));
 
     return appendExpr(e, .{ .for_ = .{
         .pattern = pat_id,
         .iterable = iter_eid,
         .body = body_blk,
-        .iter_kind = .{ .slice = {} },
+        .iter_kind = it.kind,
     } });
 }
 
@@ -728,9 +829,29 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         while (node.namedChild(i)) |c| : (i += 1) {
             if (std.mem.eql(u8, c.kind(), "block")) body_node = c else if (cond_node == null) cond_node = c;
         }
+        const cond = cond_node orelse return unsupported(e, "while cond");
+        // `while let <pat> = <expr>` — the condition may be a `let_condition`
+        // (or wrap one inside a generic `condition` / `let_chain`).
+        var capture: ?exprs.NodeId = null;
+        var val_node: ?ts.Node = null;
+        if (std.mem.eql(u8, cond.kind(), "let_condition")) {
+            const pl = try lowerWhileLet(e, cond);
+            capture = pl.pattern;
+            val_node = pl.value;
+        } else if (std.mem.eql(u8, cond.kind(), "condition") and cond.namedChildCount() > 0) {
+            const inner = cond.namedChild(0).?;
+            if (std.mem.eql(u8, inner.kind(), "let_condition")) {
+                const pl = try lowerWhileLet(e, inner);
+                capture = pl.pattern;
+                val_node = pl.value;
+            }
+        }
+        const cond_expr = val_node orelse cond;
+        const body = body_node orelse return unsupported(e, "while body");
         return appendExpr(e, .{ .while_ = .{
-            .cond = try lowerExpr(e, cond_node orelse return unsupported(e, "while cond")),
-            .body = try lowerBlock(e, body_node orelse return unsupported(e, "while body")),
+            .cond = try lowerExpr(e, cond_expr),
+            .capture = capture,
+            .body = try lowerBlock(e, body),
         } });
     }
     if (std.mem.eql(u8, kind, "block")) {
@@ -1414,6 +1535,49 @@ fn firstArg(e: *Ext, args_node: ?ts.Node) ?ts.Node {
         if (an.namedChildCount() > 0) return an.namedChild(0);
     }
     return null;
+}
+
+/// Result of lowering a `let_condition`: the pattern id and the scrutinee
+/// expression node (lowered later with the rest of the condition).
+const WhileLetPat = struct {
+    pattern: exprs.NodeId,
+    value: ?ts.Node,
+};
+
+/// Lower a `let_condition` (`while let <pat> = <expr>`).
+///
+/// The `let_condition` node has a pattern as its first named child followed by
+/// the scrutinee expression (the `value` field).
+fn lowerWhileLet(e: *Ext, node: ts.Node) anyerror!WhileLetPat {
+    const pat_node = node.namedChild(0) orelse {
+        _ = try unsupported(e, "while let pattern");
+        return error.UnsupportedWhileLetPattern;
+    };
+    var val_node: ?ts.Node = null;
+    var i: u32 = 1;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        if (isComment(c) or std.mem.eql(u8, c.kind(), "=")) continue;
+        if (val_node == null) val_node = c;
+    }
+    const pat_id = try lowerPattern(e, pat_node);
+    // Register the pattern's bindings as locals so the loop body can resolve
+    // them (e.g. `byte` in `while let Some(byte) = ...`).
+    try registerPatternLocals(e, pat_node);
+    return .{ .pattern = pat_id, .value = val_node };
+}
+
+/// Register every binding identifier in a tree-sitter pattern as a local
+/// (mirrors how `let` / `for` register their pattern bindings).
+fn registerPatternLocals(e: *Ext, node: ts.Node) anyerror!void {
+    if (std.mem.eql(u8, node.kind(), "identifier")) {
+        const nm = text(e, node);
+        if (!std.mem.eql(u8, nm, "_")) _ = try pushLocal(e, nm);
+        return;
+    }
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        try registerPatternLocals(e, c);
+    }
 }
 
 fn lowerArgs(e: *Ext, args_node: ?ts.Node) anyerror![]const exprs.NodeId {

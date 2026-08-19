@@ -131,6 +131,11 @@ const Lowerer = struct {
                     // `lowerEntityDecl`; skip re-hoisting its `.fn_` entity to
                     // avoid a duplicate declaration in the emitted struct.
                     if (self.isStructMethodRegistered(tid, ent.name)) continue;
+                    // Both inherent (`impl Target`) and trait (`impl Trait for
+                    // Target`) blocks collect methods onto the target here.
+                    // Guard by method name so an identical name supplied by a
+                    // second impl block is not appended twice.
+                    if (self.isHoistedMethodRegistered(tid, ent.name)) continue;
                     const fn_decl = try self.lowerFnEntity(entity_id, ent);
                     const decl = ast.Decl{ .fn_decl = fn_decl };
                     var list = self.hoisted_by_id.get(tid) orelse std.ArrayListUnmanaged(ast.Decl).empty;
@@ -154,6 +159,16 @@ const Lowerer = struct {
             },
             else => return false,
         }
+    }
+
+    /// True when a hoisted declaration already exists for `name` on `tid`.
+    fn isHoistedMethodRegistered(self: *Lowerer, tid: ir.spine.EntityId, name: []const u8) bool {
+        if (self.hoisted_by_id.get(tid)) |list| {
+            for (list.items) |d| {
+                if (d == .fn_decl and std.mem.eql(u8, d.fn_decl.name, name)) return true;
+            }
+        }
+        return false;
     }
 
     fn lowerModule(self: *Lowerer, mod: ir.graph.Module) !ast.File {
@@ -1078,6 +1093,149 @@ const Lowerer = struct {
     // Expression Lowering
     // -------------------------------------------------------------------------
 
+    /// True when the declared type of `expr_id` is (or reference-wraps) an array.
+    fn receiverIsArray(self: *const Lowerer, expr_id: ir.exprs.NodeId) bool {
+        if (expr_id >= self.ir.bodies.exprs.len) return false;
+        const e = self.ir.bodies.exprs[expr_id];
+        if (e.ty) |tid| {
+            if (tid < self.ir.bodies.types.len) {
+                var t = self.ir.bodies.types[tid];
+                while (true) {
+                    switch (t) {
+                        .array => return true,
+                        .reference => |r| t = r.pointee,
+                        else => return false,
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Grok the lowered receiver when it is a `&x` / `&mut x` unary-expression node,
+    /// producing `x` for use as a by-value operand.
+    fn lowerDeref(self: *Lowerer, recv_node: ir.exprs.NodeId, receiver: *const ast.Expr) anyerror!*const ast.Expr {
+        if (recv_node < self.ir.bodies.exprs.len) {
+            const re = self.ir.bodies.exprs[recv_node];
+            if (re.kind == .unary and re.kind.unary.op == .ref) {
+                return receiver;
+            }
+        }
+        return receiver;
+    }
+
+    /// Slice-coercion helper: cite `receiver[0..]` for array receivers, else the
+    /// receiver expression itself (slices/references are already slice-compatible).
+    fn lowerAsRef(self: *Lowerer, receiver_node: ir.exprs.NodeId, receiver: *const ast.Expr) anyerror!*const ast.Expr {
+        if (self.receiverIsArray(receiver_node)) {
+            const zero = try self.allocExpr(ast.Expr{ .lit = .{ .int = 0 } });
+            const open = try self.allocExpr(ast.Expr{ .range = .{ .start = zero, .end = null } });
+            var args = try self.alloc.alloc(ast.Expr, 2);
+            args[0] = receiver.*;
+            args[1] = open.*;
+            return try self.allocExpr(ast.Expr{ .builtin = .{ .name = "index", .args = args } });
+        }
+        return receiver;
+    }
+
+    /// Lower a prelude method call to native Zig. Returns the lowered
+    /// expression when `method_name` is a recognised std prelude trait method
+    /// (identity/slice coercion, clone, len, or an operator trait); returns
+    /// null to fall through to the default method-call emission.
+    fn lowerStdMethodCall(
+        self: *Lowerer,
+        method_name: []const u8,
+        receiver_node: ir.exprs.NodeId,
+        receiver: *const ast.Expr,
+        args: []const ast.Expr,
+    ) anyerror!?*const ast.Expr {
+        if (std.mem.eql(u8, method_name, "as_ref") or
+            std.mem.eql(u8, method_name, "as_bytes") or
+            std.mem.eql(u8, method_name, "borrow") or
+            std.mem.eql(u8, method_name, "as_slice"))
+        {
+            return try self.lowerAsRef(receiver_node, receiver);
+        }
+        if (std.mem.eql(u8, method_name, "clone") or
+            std.mem.eql(u8, method_name, "to_vec"))
+        {
+            // Zig assignments (and by-value params/returns) copy already.
+            return receiver;
+        }
+        if (std.mem.eql(u8, method_name, "len")) {
+            return try self.allocExpr(ast.Expr{
+                .field_access = .{
+                    .target = receiver,
+                    .field_name = try self.alloc.dupe(u8, "len"),
+                },
+            });
+        }
+        if (std.mem.eql(u8, method_name, "is_empty")) {
+            if (args.len != 0) return null;
+            const len = try self.allocExpr(ast.Expr{
+                .field_access = .{
+                    .target = receiver,
+                    .field_name = try self.alloc.dupe(u8, "len"),
+                },
+            });
+            const zero = try self.allocExpr(ast.Expr{ .lit = .{ .int = 0 } });
+            return try self.allocExpr(ast.Expr{
+                .bin_op = .{ .op = .equal, .lhs = len, .rhs = zero },
+            });
+        }
+        const bin_kind: ?ast.BinOpKind = if (std.mem.eql(u8, method_name, "bitxor"))
+            .bit_xor
+        else if (std.mem.eql(u8, method_name, "bitor"))
+            .bit_or
+        else if (std.mem.eql(u8, method_name, "bitand"))
+            .bit_and
+        else if (std.mem.eql(u8, method_name, "shl"))
+            .shl
+        else if (std.mem.eql(u8, method_name, "shr"))
+            .shr
+        else if (std.mem.eql(u8, method_name, "add"))
+            .add
+        else if (std.mem.eql(u8, method_name, "sub"))
+            .sub
+        else if (std.mem.eql(u8, method_name, "mul"))
+            .mul
+        else if (std.mem.eql(u8, method_name, "div"))
+            .div
+        else if (std.mem.eql(u8, method_name, "rem"))
+            .mod
+        else if (std.mem.eql(u8, method_name, "wrapping_add"))
+            .add_wrap
+        else if (std.mem.eql(u8, method_name, "wrapping_sub"))
+            .sub_wrap
+        else if (std.mem.eql(u8, method_name, "wrapping_mul"))
+            .mul_wrap
+        else if (std.mem.eql(u8, method_name, "saturating_add"))
+            .add_sat
+        else if (std.mem.eql(u8, method_name, "saturating_sub"))
+            .sub_sat
+        else
+            null;
+        if (bin_kind) |bk| {
+            if (args.len < 1) return null;
+            const lhs = receiver;
+            const rhs = try self.allocExpr(args[0]);
+            return try self.allocExpr(ast.Expr{
+                .bin_op = .{ .op = bk, .lhs = lhs, .rhs = rhs },
+            });
+        }
+        if (std.mem.eql(u8, method_name, "neg")) {
+            return try self.allocExpr(ast.Expr{
+                .unary_op = .{ .op = .negate, .operand = receiver },
+            });
+        }
+        if (std.mem.eql(u8, method_name, "not")) {
+            return try self.allocExpr(ast.Expr{
+                .unary_op = .{ .op = .bit_not, .operand = receiver },
+            });
+        }
+        return null;
+    }
+
     pub fn lowerExpr(self: *Lowerer, expr_id: ir.exprs.NodeId) anyerror!ast.Expr {
         if (expr_id >= self.ir.bodies.exprs.len) {
             return ast.Expr{ .ident = "undefined" };
@@ -1191,32 +1349,103 @@ const Lowerer = struct {
             },
             .while_ => |we| blk: {
                 const cond = try self.allocExpr(try self.lowerExpr(we.cond));
+                const captures = if (we.capture) |cap_id|
+                    try self.lowerWhileCapture(cap_id)
+                else
+                    null;
                 break :blk ast.Expr{
                     .while_expr = .{
                         .cond = cond,
+                        .captures = captures,
                         .body = try self.lowerBlock(we.body),
                     },
                 };
             },
             .for_ => |fe| blk: {
-                const input = try self.lowerExpr(fe.iterable);
-                var inputs = try self.alloc.alloc(ast.Expr, 1);
-                inputs[0] = input;
-
+                var inputs: std.ArrayListUnmanaged(ast.Expr) = .empty;
+                defer inputs.deinit(self.alloc);
                 var captures_list: std.ArrayListUnmanaged([]const u8) = .empty;
-                if (fe.pattern < self.ir.bodies.pats.len) {
-                    const pat = self.ir.bodies.pats[fe.pattern];
-                    switch (pat.kind) {
-                        .binding => |b| try captures_list.append(self.alloc, try self.alloc.dupe(u8, b.name)),
-                        else => {},
-                    }
+                defer captures_list.deinit(self.alloc);
+                var destructure: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+                defer destructure.deinit(self.alloc);
+
+                switch (fe.iter_kind) {
+                    .slice => {
+                        try inputs.append(self.alloc, try self.lowerExpr(fe.iterable));
+                        try self.appendPatternCaptures(fe.pattern, &captures_list);
+                    },
+                    .range => {
+                        // `0..end`; a Rust start that isn't 0 (or `..=` inclusive)
+                        // was handled in the frontend (`..=` lowers to `end+1`).
+                        const start = try self.allocExpr(ast.Expr{ .lit = .{ .int = 0 } });
+                        const end = try self.allocExpr(try self.lowerExpr(fe.iterable));
+                        try inputs.append(self.alloc, ast.Expr{ .range = .{ .start = start, .end = end } });
+                        try self.appendPatternCaptures(fe.pattern, &captures_list);
+                    },
+                    .enumerate => {
+                        // Rust `for (idx, elem) in xs.enumerate()` →
+                        // Zig `for (xs, 0..) |elem, idx|`.
+                        const slice = try self.lowerExpr(fe.iterable);
+                        const zstart = try self.allocExpr(ast.Expr{ .lit = .{ .int = 0 } });
+                        const open = try self.allocExpr(ast.Expr{ .range = .{ .start = zstart, .end = null } });
+                        try inputs.append(self.alloc, slice);
+                        try inputs.append(self.alloc, open.*);
+
+                        var idx_name: []const u8 = "_";
+                        var elem_name: []const u8 = "_";
+                        if (fe.pattern < self.ir.bodies.pats.len) {
+                            const pat = self.ir.bodies.pats[fe.pattern];
+                            switch (pat.kind) {
+                                .tuple => |tp| {
+                                    if (tp.elements.len >= 1) idx_name = try self.patternName(tp.elements[0]);
+                                    if (tp.elements.len >= 2) elem_name = try self.patternName(tp.elements[1]);
+                                },
+                                .binding => elem_name = try self.patternName(fe.pattern),
+                                else => {},
+                            }
+                        }
+                        try captures_list.append(self.alloc, elem_name);
+                        try captures_list.append(self.alloc, idx_name);
+                    },
+                    .multi => |ids| {
+                        for (ids, 0..) |mid, mi| {
+                            try inputs.append(self.alloc, try self.lowerExpr(mid));
+                            if (fe.pattern < self.ir.bodies.pats.len) {
+                                const pat = self.ir.bodies.pats[fe.pattern];
+                                if (pat.kind == .tuple) {
+                                    const tp = pat.kind.tuple;
+                                    if (mi < tp.elements.len) {
+                                        try self.appendMultiCapture(tp.elements[mi], &captures_list, &destructure);
+                                    } else {
+                                        try captures_list.append(self.alloc, try self.alloc.dupe(u8, "_"));
+                                    }
+                                } else {
+                                    try self.appendPatternCaptures(fe.pattern, &captures_list);
+                                }
+                            } else {
+                                try captures_list.append(self.alloc, try self.alloc.dupe(u8, "_"));
+                            }
+                        }
+                    },
+                    .adapter => |ad| {
+                        _ = ad;
+                        return error.UnsupportedIterableAdapter;
+                    },
+                }
+
+                var body = try self.lowerBlock(fe.body);
+                if (destructure.items.len > 0) {
+                    const merged = try self.alloc.alloc(ast.Stmt, destructure.items.len + body.stmts.len);
+                    @memcpy(merged[0..destructure.items.len], destructure.items);
+                    @memcpy(merged[destructure.items.len..], body.stmts);
+                    body.stmts = merged;
                 }
 
                 break :blk ast.Expr{
                     .for_expr = .{
-                        .inputs = inputs,
+                        .inputs = try inputs.toOwnedSlice(self.alloc),
                         .captures = try captures_list.toOwnedSlice(self.alloc),
-                        .body = try self.lowerBlock(fe.body),
+                        .body = body,
                     },
                 };
             },
@@ -1241,6 +1470,18 @@ const Lowerer = struct {
                         "unknown_ctor",
                 };
 
+                // Trait-associated calls like `Clone::clone(&x)` / `AsRef::as_ref(&x)`
+                // lower to the receiver/copy/slice expression directly.
+                if (c.call_kind == .associated) {
+                    if (c.args.len >= 1) {
+                        const recv_ast = try self.lowerExpr(c.args[0]);
+                        const recv_ptr = try self.allocExpr(recv_ast);
+                        if (try self.lowerStdMethodCall(callee_name, c.args[0], recv_ptr, &.{})) |lowered| {
+                            break :blk lowered.*;
+                        }
+                    }
+                }
+
                 const callee_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, callee_name) };
                 var args = try self.alloc.alloc(ast.Expr, c.args.len);
                 for (c.args, 0..) |arg_id, i| {
@@ -1261,17 +1502,21 @@ const Lowerer = struct {
                 else
                     "method";
 
+                var args = try self.alloc.alloc(ast.Expr, mc.args.len);
+                for (mc.args, 0..) |arg_id, i| {
+                    args[i] = try self.lowerExpr(arg_id);
+                }
+
+                if (try self.lowerStdMethodCall(method_name, mc.receiver, receiver, args)) |lowered| {
+                    break :blk lowered.*;
+                }
+
                 const field_access = try self.allocExpr(ast.Expr{
                     .field_access = .{
                         .target = receiver,
                         .field_name = try self.alloc.dupe(u8, method_name),
                     },
                 });
-
-                var args = try self.alloc.alloc(ast.Expr, mc.args.len);
-                for (mc.args, 0..) |arg_id, i| {
-                    args[i] = try self.lowerExpr(arg_id);
-                }
 
                 break :blk ast.Expr{
                     .call = .{
@@ -1499,6 +1744,109 @@ const Lowerer = struct {
     }
 
     // -------------------------------------------------------------------------
+    // For-loop capture helpers
+    // -------------------------------------------------------------------------
+
+    /// Append the flat capture name(s) for a simple loop pattern (bindings,
+    /// references and wildcards — not tuples).
+    fn appendPatternCaptures(
+        self: *Lowerer,
+        pat_id: ir.exprs.NodeId,
+        captures: *std.ArrayListUnmanaged([]const u8),
+    ) anyerror!void {
+        try captures.append(self.alloc, try self.patternName(pat_id));
+    }
+
+    /// The Zig capture identifier for a pattern: a binding's name, `_` for a
+    /// wildcard, the inner pattern's name for a reference.
+    fn patternName(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror![]const u8 {
+        if (pat_id >= self.ir.bodies.pats.len) return self.alloc.dupe(u8, "_");
+        const pat = self.ir.bodies.pats[pat_id];
+        return switch (pat.kind) {
+            .binding => |b| self.alloc.dupe(u8, b.name),
+            .reference => |r| self.patternName(r.inner),
+            .wildcard => self.alloc.dupe(u8, "_"),
+            else => self.alloc.dupe(u8, "_"),
+        };
+    }
+
+    /// Capture for one zip (`multi`) input. A plain binding/reference yields a
+    /// single Zig capture; a tuple element yields a temporary capture plus a
+    /// `const` destructure injected at the top of the loop body.
+    fn appendMultiCapture(
+        self: *Lowerer,
+        pat_id: ir.exprs.NodeId,
+        captures: *std.ArrayListUnmanaged([]const u8),
+        destructure: *std.ArrayListUnmanaged(ast.Stmt),
+    ) anyerror!void {
+        if (pat_id >= self.ir.bodies.pats.len) {
+            try captures.append(self.alloc, try self.alloc.dupe(u8, "_"));
+            return;
+        }
+        const pat = self.ir.bodies.pats[pat_id];
+        switch (pat.kind) {
+            .binding => |b| try captures.append(self.alloc, try self.alloc.dupe(u8, b.name)),
+            .reference => |r| try self.appendMultiCapture(r.inner, captures, destructure),
+            .wildcard => try captures.append(self.alloc, try self.alloc.dupe(u8, "_")),
+            .tuple => |tp| {
+                const tmp = try self.alloc.dupe(u8, "_tup");
+                try captures.append(self.alloc, tmp);
+                const base = try self.allocExpr(ast.Expr{ .ident = tmp });
+                try self.emitTupleDestructure(tp, base, destructure);
+            },
+            else => try captures.append(self.alloc, try self.alloc.dupe(u8, "_")),
+        }
+    }
+
+    /// Emit `const a = base[i]; const b = base[j]; ...` statements for a tuple
+    /// pattern, recursing into nested tuple sub-patterns.
+    fn emitTupleDestructure(
+        self: *Lowerer,
+        tp: ir.exprs.TuplePat,
+        base: *const ast.Expr,
+        destructure: *std.ArrayListUnmanaged(ast.Stmt),
+    ) anyerror!void {
+        for (tp.elements, 0..) |el, i| {
+            const el_pat = self.ir.bodies.pats[el];
+            const el_access = try self.indexExpr(base, i);
+            switch (el_pat.kind) {
+                .binding => |b| try destructure.append(self.alloc, ast.Stmt{
+                    .let_stmt = .{
+                        .name = try self.alloc.dupe(u8, b.name),
+                        .init = el_access.*,
+                        .is_mut = b.mutable,
+                    },
+                }),
+                .reference => |r| {
+                    const rp = self.ir.bodies.pats[r.inner];
+                    if (rp.kind == .binding) {
+                        const rb = rp.kind.binding;
+                        try destructure.append(self.alloc, ast.Stmt{
+                            .let_stmt = .{
+                                .name = try self.alloc.dupe(u8, rb.name),
+                                .init = el_access.*,
+                                .is_mut = rb.mutable,
+                            },
+                        });
+                    }
+                },
+                .wildcard => {},
+                .tuple => |sub| try self.emitTupleDestructure(sub, el_access, destructure),
+                else => {},
+            }
+        }
+    }
+
+    /// Allocate `base[idx]` (the emitter renders `@index` with 2 args as `[ ]`).
+    fn indexExpr(self: *Lowerer, base: *const ast.Expr, idx: usize) anyerror!*const ast.Expr {
+        const idx_lit = try self.allocExpr(ast.Expr{ .lit = .{ .int = @intCast(idx) } });
+        var args = try self.alloc.alloc(ast.Expr, 2);
+        args[0] = base.*;
+        args[1] = idx_lit.*;
+        return self.allocExpr(ast.Expr{ .builtin = .{ .name = "index", .args = args } });
+    }
+
+    // -------------------------------------------------------------------------
     // Pattern Lowering
     // -------------------------------------------------------------------------
 
@@ -1566,6 +1914,38 @@ const Lowerer = struct {
                 break :blk ast.Pattern.wildcard;
             },
             else => ast.Pattern.wildcard,
+        };
+    }
+
+    /// Extract the capture identifier(s) for a `while let` pattern. Handles
+    /// `Some(v)` / `Ok(v)` (struct pattern → its single field's binding) and a
+    /// plain `v` (direct binding). Returns null when there is no binding.
+    fn lowerWhileCapture(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror!?[]const []const u8 {
+        if (pat_id >= self.ir.bodies.pats.len) return null;
+        const cap = (try self.whileCaptureName(pat_id)) orelse return null;
+        var out = try self.alloc.alloc([]const u8, 1);
+        out[0] = cap;
+        return out;
+    }
+
+    fn whileCaptureName(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror!?[]const u8 {
+        if (pat_id >= self.ir.bodies.pats.len) return null;
+        const pat = self.ir.bodies.pats[pat_id];
+        return switch (pat.kind) {
+            .binding => |b| try self.alloc.dupe(u8, b.name),
+            .reference => |rp| try self.whileCaptureName(rp.inner),
+            .struct_pat => |sp| blk: {
+                if (sp.fields.len == 0) break :blk null;
+                const f = sp.fields[0];
+                if (f.pat) |fpid| {
+                    break :blk try self.whileCaptureName(fpid);
+                }
+                if (f.shorthand) {
+                    break :blk try self.alloc.dupe(u8, f.field);
+                }
+                break :blk null;
+            },
+            else => null,
         };
     }
 

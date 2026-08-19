@@ -284,7 +284,7 @@ pub fn translate(
         .bodies = bodies_list.items,
     };
 
-    if (infer.solve(arena, &b_temp)) |inferred| {
+    if (infer.solveWithGraph(arena, &b_temp, &g)) |inferred| {
         inferred.apply(exprs_list.items);
         // 9. Run `resolve_methods.resolveMethods(&g, &bodies)` to dispatch methods.
         _ = resolve_methods.resolveMethods(&g, &b_temp);

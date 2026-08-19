@@ -24,7 +24,7 @@
               "kind": "field_access",
               "target": {
                 "kind": "ident",
-                "name": "FromHexError"
+                "name": "test"
               },
               "field_name": "FromHexError"
             }
@@ -206,8 +206,88 @@
               {
                 "kind": "fn_decl",
                 "value": {
+                  "name": "next",
+                  "is_pub": true,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "self",
+                      "ty": {
+                        "kind": "ptr",
+                        "elem": {
+                          "kind": "named",
+                          "name": "BytesToHexChars"
+                        },
+                        "is_const": false,
+                        "is_allowzero": false,
+                        "size": "one"
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": {
+                    "label": null,
+                    "stmts": [],
+                    "expr": {
+                      "kind": "lit",
+                      "value": {
+                        "kind": "str",
+                        "value": "0123456789abcdef"
+                      }
+                    }
+                  },
+                  "generic_params": []
+                }
+              },
+              {
+                "kind": "fn_decl",
+                "value": {
+                  "name": "size_hint",
+                  "is_pub": true,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "self",
+                      "ty": {
+                        "kind": "ptr",
+                        "elem": {
+                          "kind": "named",
+                          "name": "BytesToHexChars"
+                        },
+                        "is_const": true,
+                        "is_allowzero": false,
+                        "size": "one"
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": {
+                    "label": null,
+                    "stmts": [],
+                    "expr": {
+                      "kind": "lit",
+                      "value": {
+                        "kind": "str",
+                        "value": "0123456789abcdef"
+                      }
+                    }
+                  },
+                  "generic_params": []
+                }
+              },
+              {
+                "kind": "fn_decl",
+                "value": {
                   "name": "len",
-                  "is_pub": false,
+                  "is_pub": true,
                   "is_test": false,
                   "params": [
                     {
@@ -566,16 +646,8 @@
                   "name": "data",
                   "ty": null,
                   "init": {
-                    "kind": "call",
-                    "callee": {
-                      "kind": "field_access",
-                      "target": {
-                        "kind": "ident",
-                        "name": "data"
-                      },
-                      "field_name": "as_ref"
-                    },
-                    "args": []
+                    "kind": "ident",
+                    "name": "data"
                   },
                   "is_mut": false
                 },
@@ -598,8 +670,42 @@
                 {
                   "kind": "expr_stmt",
                   "expr": {
-                    "kind": "unsupported",
-                    "reason": "for iterable"
+                    "kind": "for_expr",
+                    "inputs": [
+                      {
+                        "kind": "ident",
+                        "name": "out"
+                      },
+                      {
+                        "kind": "range",
+                        "start": {
+                          "kind": "lit",
+                          "value": {
+                            "kind": "int",
+                            "value": "0"
+                          }
+                        },
+                        "end": null
+                      }
+                    ],
+                    "captures": [
+                      "byte",
+                      "i"
+                    ],
+                    "body": {
+                      "label": null,
+                      "stmts": [
+                        {
+                          "kind": "expr_stmt",
+                          "expr": {
+                            "kind": "unsupported",
+                            "reason": "assign_expr"
+                          }
+                        }
+                      ],
+                      "expr": null
+                    },
+                    "else_body": null
                   }
                 }
               ],
@@ -866,8 +972,136 @@
                 {
                   "kind": "expr_stmt",
                   "expr": {
-                    "kind": "unsupported",
-                    "reason": "for iterable"
+                    "kind": "for_expr",
+                    "inputs": [
+                      {
+                        "kind": "ident",
+                        "name": "input"
+                      },
+                      {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "ident",
+                          "name": "generate_iter"
+                        },
+                        "args": [
+                          {
+                            "kind": "bin_op",
+                            "op": "mul_wrap",
+                            "lhs": {
+                              "kind": "field_access",
+                              "target": {
+                                "kind": "ident",
+                                "name": "input"
+                              },
+                              "field_name": "len"
+                            },
+                            "rhs": {
+                              "kind": "lit",
+                              "value": {
+                                "kind": "int",
+                                "value": "2"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    ],
+                    "captures": [
+                      "byte",
+                      "_tup"
+                    ],
+                    "body": {
+                      "label": null,
+                      "stmts": [
+                        {
+                          "kind": "let_stmt",
+                          "name": "i",
+                          "ty": null,
+                          "init": {
+                            "kind": "builtin",
+                            "name": "index",
+                            "args": [
+                              {
+                                "kind": "ident",
+                                "name": "_tup"
+                              },
+                              {
+                                "kind": "lit",
+                                "value": {
+                                  "kind": "int",
+                                  "value": "0"
+                                }
+                              }
+                            ]
+                          },
+                          "is_mut": false
+                        },
+                        {
+                          "kind": "let_stmt",
+                          "name": "j",
+                          "ty": null,
+                          "init": {
+                            "kind": "builtin",
+                            "name": "index",
+                            "args": [
+                              {
+                                "kind": "ident",
+                                "name": "_tup"
+                              },
+                              {
+                                "kind": "lit",
+                                "value": {
+                                  "kind": "int",
+                                  "value": "1"
+                                }
+                              }
+                            ]
+                          },
+                          "is_mut": false
+                        },
+                        {
+                          "kind": "let_stmt",
+                          "name": "_",
+                          "ty": null,
+                          "init": {
+                            "kind": "call",
+                            "callee": {
+                              "kind": "ident",
+                              "name": "byte2hex"
+                            },
+                            "args": [
+                              {
+                                "kind": "struct_init",
+                                "type_name": null,
+                                "fields": []
+                              },
+                              {
+                                "kind": "ident",
+                                "name": "HEX_CHARS_LOWER"
+                              }
+                            ]
+                          },
+                          "is_mut": false
+                        },
+                        {
+                          "kind": "expr_stmt",
+                          "expr": {
+                            "kind": "unsupported",
+                            "reason": "assign_expr"
+                          }
+                        },
+                        {
+                          "kind": "expr_stmt",
+                          "expr": {
+                            "kind": "unsupported",
+                            "reason": "assign_expr"
+                          }
+                        }
+                      ],
+                      "expr": null
+                    },
+                    "else_body": null
                   }
                 }
               ],

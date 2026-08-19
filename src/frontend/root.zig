@@ -26,5 +26,6 @@ pub const analyzeCrate = pipeline.analyzeCrate;
 pub const analyzeSource = pipeline.analyzeSource;
 
 test {
+    _ = @import("expand_test.zig");
     std.testing.refAllDecls(@This());
 }

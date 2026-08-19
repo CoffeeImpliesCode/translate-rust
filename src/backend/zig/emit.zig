@@ -825,6 +825,14 @@ pub fn emitExpr(
             try buf.appendSlice(allocator, "while (");
             try emitExpr(allocator, buf, we.cond.*, depth);
             try buf.appendSlice(allocator, ")");
+            if (we.captures) |caps| {
+                try buf.appendSlice(allocator, " |");
+                for (caps, 0..) |cap, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    try buf.appendSlice(allocator, cap);
+                }
+                try buf.appendSlice(allocator, "|");
+            }
             if (we.continue_expr) |ce| {
                 try buf.appendSlice(allocator, " : (");
                 try emitExpr(allocator, buf, ce.*, depth);
@@ -854,6 +862,11 @@ pub fn emitExpr(
                 try buf.appendSlice(allocator, " else ");
                 try emitExpr(allocator, buf, eb.*, depth);
             }
+        },
+        .range => |r| {
+            try emitExpr(allocator, buf, r.start.*, depth);
+            try buf.appendSlice(allocator, "..");
+            if (r.end) |en| try emitExpr(allocator, buf, en.*, depth);
         },
         .return_expr => |re| {
             if (re) |val| {

@@ -203,6 +203,8 @@ pub const WhileExpr = struct {
     /// Condition expression index (expr table).
     cond: NodeId,
     body: BlockExpr,
+    /// Optional pattern capture index (pattern table); null for standard while loops.
+    capture: ?NodeId = null,
 };
 
 pub const ForExpr = struct {

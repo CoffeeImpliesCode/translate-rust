@@ -708,6 +708,7 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
         return .{ .while_ = .{
             .cond = try reqU32(q, "cond"),
             .body = try decodeBlockExpr(allocator, try req(q, "body")),
+            .capture = try reqOptionalId(q, "capture"),
         } };
     }
     if (std.mem.eql(u8, tag, "for_")) {
@@ -1796,6 +1797,7 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try o.put(allocator, "kind", .{ .string = "while_" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "cond", mkInt(v.cond));
+            try vo.put(allocator, "capture", encodeOptId(v.capture));
             try vo.put(allocator, "body", try encodeBlockExpr(allocator, v.body));
             try o.put(allocator, "value", .{ .object = vo });
         },

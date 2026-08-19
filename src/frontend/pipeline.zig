@@ -202,7 +202,7 @@ fn analyzeSourceWithGraph(
         .bodies = bodies_list.items,
     };
 
-    if (infer.solve(allocator, &b_temp)) |inferred| {
+    if (infer.solveWithGraph(allocator, &b_temp, &g)) |inferred| {
         inferred.apply(exprs_list.items);
         _ = resolve_methods.resolveMethods(&g, &b_temp);
         _ = monomorphize.collectInstantiations(allocator, &g, &b_temp) catch null;
@@ -312,4 +312,70 @@ test "analyzeSource: const array + primitive initializers parsed into const body
     try std.testing.expect(saw_zeroes);
     try std.testing.expect(saw_flag);
     try std.testing.expect(saw_count);
+}
+
+test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // `test/crates/multimod` exercises:
+    //  - `mod foo;` -> `src/foo.rs`
+    //  - `mod bar;` inside `foo.rs` -> `src/foo/bar.rs` (two-level recursion)
+    //  - `#[path = "custom.rs"] pub mod custom_pub;` (attribute-resolved path)
+    const rust_ir = try analyzeCrate(allocator, std.testing.io, "test/crates/multimod");
+
+    // The dense `modules[]` table is indexed by module id (see `addModule`),
+    // which is independent of the entity ids in the symbol table. Look each
+    // module up by scanning `modules[]` and matching its name.
+    const find_mod = struct {
+        fn find(
+            ir_: *const ir.RustIR,
+            name_: []const u8,
+        ) ?graph.Module {
+            for (ir_.graph.modules.items) |m| {
+                if (std.mem.eql(u8, m.name, name_)) return m;
+            }
+            return null;
+        }
+    }.find;
+
+    // A root entity for `enter` must exist (root items intact).
+    const enter_ent = struct {
+        fn find(ir_: *const ir.RustIR) ?spine.EntityId {
+            for (ir_.graph.symbol_table.entities.items) |ent| {
+                if (std.mem.eql(u8, ent.name, "enter")) return ent.id;
+            }
+            return null;
+        }
+    }.find(&rust_ir);
+    if (enter_ent == null) return error.MissingRootFn;
+
+    // `mod foo;` was found as an out-of-line file module and populated.
+    const foo_mod = find_mod(&rust_ir, "foo") orelse return error.MissingFooModule;
+    try std.testing.expect(foo_mod.kind == .file);
+    try std.testing.expect(foo_mod.source_path != null);
+    try std.testing.expect(foo_mod.items.len > 0);
+
+    // Two-level recursion: `foo` contains its child `bar` module.
+    const bar_mod = find_mod(&rust_ir, "bar") orelse return error.MissingBarModule;
+    try std.testing.expect(bar_mod.kind == .file);
+    try std.testing.expect(bar_mod.source_path != null);
+    try std.testing.expect(bar_mod.items.len > 0);
+
+    // A `foo_fn` fn entity exists under module `foo`.
+    const foo_fn = struct {
+        fn find(ir_: *const ir.RustIR) ?spine.EntityId {
+            for (ir_.graph.symbol_table.entities.items) |ent| {
+                if (std.mem.eql(u8, ent.name, "foo_fn")) return ent.id;
+            }
+            return null;
+        }
+    }.find(&rust_ir);
+    if (foo_fn == null) return error.MissingFooFn;
+
+    // `#[path = "custom.rs"]` resolved the module from the attrs.
+    const custom_mod = find_mod(&rust_ir, "custom_pub") orelse return error.MissingCustomModule;
+    try std.testing.expect(custom_mod.source_path != null);
+    try std.testing.expect(custom_mod.items.len > 0);
 }

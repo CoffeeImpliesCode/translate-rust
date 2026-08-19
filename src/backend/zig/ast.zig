@@ -232,6 +232,7 @@ pub const Expr = union(enum) {
     if_expr: IfExpr,
     while_expr: WhileExpr,
     for_expr: ForExpr,
+    range: Range,
     return_expr: ?*const Expr,
     break_expr: ?*const Expr,
     continue_expr: void,
@@ -372,6 +373,8 @@ pub const IfExpr = struct {
 pub const WhileExpr = struct {
     cond: *const Expr,
     continue_expr: ?*const Expr = null,
+    /// Capture identifiers for `while (cond) |x| { body }`; null = no capture.
+    captures: ?[]const []const u8 = null,
     body: Block,
     else_body: ?*const Expr = null,
 };
@@ -381,6 +384,11 @@ pub const ForExpr = struct {
     captures: []const []const u8 = &.{},
     body: Block,
     else_body: ?*const Expr = null,
+};
+
+pub const Range = struct {
+    start: *const Expr,
+    end: ?*const Expr = null,
 };
 
 pub const AssignOp = enum {

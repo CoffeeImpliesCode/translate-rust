@@ -25,6 +25,7 @@ const bodies = @import("bodies.zig");
 const types = @import("types.zig");
 const spine = @import("spine.zig");
 const items = @import("items.zig");
+const graph = @import("graph.zig");
 
 /// Unannotated literal class for defaulting unconstrained variables.
 pub const Class = enum {
@@ -245,6 +246,7 @@ const Ctx = struct {
     alloc: std.mem.Allocator,
     b: *const bodies.Bodies,
     g: *Gen,
+    cg: ?*const graph.CrateGraph = null,
     bool_ty: ?exprs.TypeId = null,
     def_map: std.AutoHashMapUnmanaged(exprs.DefId, exprs.NodeId) = .empty,
 
@@ -306,6 +308,32 @@ pub fn findTypeIndex(b: *const bodies.Bodies, target: types.Type) ?exprs.TypeId 
     std.debug.assert(b.types.len >= 0);
     for (b.types, 0..) |t, i| {
         if (typeEqual(t, target)) return @intCast(i);
+    }
+    return null;
+}
+
+fn findSliceTypeId(b: *const bodies.Bodies, elem_prim: types.Prim) ?exprs.TypeId {
+    std.debug.assert(b.types.len >= 0);
+    for (b.types, 0..) |t, i| {
+        switch (t) {
+            .slice => |s| {
+                if (s.elem == .prim and s.elem.prim == elem_prim) return @intCast(i);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn findSliceTypeForElem(b: *const bodies.Bodies, elem: types.Type) ?exprs.TypeId {
+    std.debug.assert(b.types.len >= 0);
+    for (b.types, 0..) |t, i| {
+        switch (t) {
+            .slice => |s| {
+                if (typeEqual(s.elem, elem)) return @intCast(i);
+            },
+            else => {},
+        }
     }
     return null;
 }
@@ -967,8 +995,7 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             try handleCall(ctx, node, c, fn_body);
         },
         .method_call => |m| {
-            try walkExpr(ctx, m.receiver, fn_body);
-            for (m.args) |a| try walkExpr(ctx, a, fn_body);
+            try walkMethodCall(ctx, node, m, fn_body);
         },
         .struct_lit => |s| {
             try handleStructLit(ctx, node, s);
@@ -1016,9 +1043,140 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
     }
 }
 
+fn getMethodName(ctx: *Ctx, def: exprs.DefId) ?[]const u8 {
+    if (ctx.cg) |cg| {
+        if (cg.symbol_table.get(def)) |ent| {
+            if (ent.renamed_to) |rn| return rn;
+            if (ent.name.len > 0) return ent.name;
+        }
+    }
+    if (def < ctx.b.bodies.len) {
+        switch (ctx.b.bodies[def]) {
+            .struct_ => |sb| {
+                for (sb.methods) |sm| {
+                    if (sm.name.len > 0) return sm.name;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
+    try walkExpr(ctx, m.receiver, fn_body);
+    for (m.args) |a| try walkExpr(ctx, a, fn_body);
+
+    const m_name = getMethodName(ctx, m.method) orelse return;
+
+    if (std.mem.eql(u8, m_name, "len")) {
+        if (primTypeId(ctx.b, .usize)) |uid| {
+            try addPin(ctx, node, uid);
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "clone")) {
+        try addEq(ctx, m.receiver, node);
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "as_ref") or
+        std.mem.eql(u8, m_name, "as_bytes") or
+        std.mem.eql(u8, m_name, "borrow") or
+        std.mem.eql(u8, m_name, "as_slice"))
+    {
+        if (getKnownType(ctx, m.receiver)) |recv_ty| {
+            const elem_ty: ?types.Type = switch (recv_ty) {
+                .slice => |s| s.elem,
+                .array => |arr| arr.elem,
+                .reference => |r| switch (r.pointee) {
+                    .slice => |s| s.elem,
+                    .array => |arr| arr.elem,
+                    .prim => |p| if (p == .u8 and std.mem.eql(u8, m_name, "as_bytes")) types.Type{ .prim = .u8 } else null,
+                    else => null,
+                },
+                .prim => |p| if (p == .u8 and std.mem.eql(u8, m_name, "as_bytes")) types.Type{ .prim = .u8 } else null,
+                else => null,
+            };
+            if (elem_ty) |elem| {
+                if (findSliceTypeForElem(ctx.b, elem)) |stid| {
+                    try addPin(ctx, node, stid);
+                    return;
+                }
+            }
+        }
+        if (std.mem.eql(u8, m_name, "as_bytes")) {
+            if (findSliceTypeId(ctx.b, .u8)) |stid| {
+                try addPin(ctx, node, stid);
+                return;
+            }
+        }
+        try addEq(ctx, m.receiver, node);
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "to_vec")) {
+        if (getKnownType(ctx, m.receiver)) |recv_ty| {
+            const elem_ty: ?types.Type = switch (recv_ty) {
+                .slice => |s| s.elem,
+                .array => |arr| arr.elem,
+                .reference => |r| switch (r.pointee) {
+                    .slice => |s| s.elem,
+                    .array => |arr| arr.elem,
+                    else => null,
+                },
+                else => null,
+            };
+            if (elem_ty) |elem| {
+                if (findSliceTypeForElem(ctx.b, elem)) |stid| {
+                    try addPin(ctx, node, stid);
+                    return;
+                }
+            }
+        }
+        try addEq(ctx, m.receiver, node);
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "bitxor") or
+        std.mem.eql(u8, m_name, "bitor") or
+        std.mem.eql(u8, m_name, "bitand") or
+        std.mem.eql(u8, m_name, "add") or
+        std.mem.eql(u8, m_name, "sub") or
+        std.mem.eql(u8, m_name, "mul") or
+        std.mem.eql(u8, m_name, "wrapping_add") or
+        std.mem.eql(u8, m_name, "wrapping_sub") or
+        std.mem.eql(u8, m_name, "wrapping_mul") or
+        std.mem.eql(u8, m_name, "saturating_add") or
+        std.mem.eql(u8, m_name, "saturating_sub") or
+        std.mem.eql(u8, m_name, "saturating_mul"))
+    {
+        try addEq(ctx, m.receiver, node);
+        if (m.args.len > 0) {
+            try addEq(ctx, m.receiver, m.args[0]);
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "shl") or std.mem.eql(u8, m_name, "shr")) {
+        try addEq(ctx, m.receiver, node);
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "not") or std.mem.eql(u8, m_name, "neg")) {
+        try addEq(ctx, m.receiver, node);
+        return;
+    }
+}
+
 /// Walk the lossless code model of every `.fn_` body in `b` and generate
 /// authoritative type pins and unification edges.
 pub fn gen(alloc: std.mem.Allocator, b: *const bodies.Bodies) std.mem.Allocator.Error!Gen {
+    return genWithGraph(alloc, b, null);
+}
+
+pub fn genWithGraph(alloc: std.mem.Allocator, b: *const bodies.Bodies, cg: ?*const graph.CrateGraph) std.mem.Allocator.Error!Gen {
     std.debug.assert(b.bodies.len >= 0);
     var g: Gen = .{};
     errdefer g.deinit(alloc);
@@ -1027,6 +1185,7 @@ pub fn gen(alloc: std.mem.Allocator, b: *const bodies.Bodies) std.mem.Allocator.
         .alloc = alloc,
         .b = b,
         .g = &g,
+        .cg = cg,
     };
     defer ctx.deinit();
 
@@ -1233,8 +1392,12 @@ pub fn solveWithGen(
 
 /// Generate constraints and run full unification solver with defaults on `b`.
 pub fn solve(alloc: std.mem.Allocator, b: *const bodies.Bodies) std.mem.Allocator.Error!Inferred {
+    return solveWithGraph(alloc, b, null);
+}
+
+pub fn solveWithGraph(alloc: std.mem.Allocator, b: *const bodies.Bodies, cg: ?*const graph.CrateGraph) std.mem.Allocator.Error!Inferred {
     std.debug.assert(b.exprs.len >= 0);
-    var g = try gen(alloc, b);
+    var g = try genWithGraph(alloc, b, cg);
     defer g.deinit(alloc);
     return solveWithGen(alloc, b, &g);
 }

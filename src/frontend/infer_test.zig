@@ -969,3 +969,83 @@ test "non-fn bodies are skipped without error" {
     a.free(bodies_store);
     a.free(types_store);
 }
+
+test "prelude trait methods infer return types (len=usize, clone=self, bitxor=self)" {
+    const a = std.testing.allocator;
+
+    var graph = ir.graph.CrateGraph.init(a);
+    defer graph.deinit();
+
+    const len_ent = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "len", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    const clone_ent = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "clone", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    const bitxor_ent = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "bitxor", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    _ = len_ent;
+    _ = clone_ent;
+    _ = bitxor_ent;
+
+    // Types: 0 = []const u8 (slice), 1 = u8, 2 = usize, 3 = bool.
+    const slice_t = try a.create(types.Slice);
+    defer a.destroy(slice_t);
+    slice_t.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const types_store = try a.alloc(types.Type, 4);
+    defer a.free(types_store);
+    types_store[0] = .{ .slice = slice_t };
+    types_store[1] = .{ .prim = .u8 };
+    types_store[2] = .{ .prim = .usize };
+    types_store[3] = .{ .prim = .bool };
+
+    // Exprs:
+    //   0: receiver `data` (path → slice, ty=0)
+    //   1: data.len()       → usize (2)
+    //   2: data.clone()     → slice (0, eq to receiver)
+    //   3: data.bitxor(o)   → slice (0, eq to receiver)
+    //   4: rhs literal (path def, untyped)
+    //   5: block tail = bitxor result
+    const exprs_store = try a.alloc(exprs.Expr, 6);
+    defer a.free(exprs_store);
+    const recv_def: exprs.DefId = @intCast(graph.symbol_table.count());
+    exprs_store[0] = .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = recv_def, .generic_args = &.{} } } };
+    exprs_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{ .receiver = 0, .receiver_mode = .shared, .method = len_ent, .args = &.{} } } };
+    exprs_store[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{ .receiver = 0, .receiver_mode = .value, .method = clone_ent, .args = &.{} } } };
+    exprs_store[3] = .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{ .receiver = 0, .receiver_mode = .value, .method = bitxor_ent, .args = &.{4} } } };
+    exprs_store[4] = .{ .id = 4, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null } } } };
+    exprs_store[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{}, .tail = 3, .labelled = null } } };
+
+    const bodies_store = try a.alloc(bodies.BodyKind, 1);
+    defer a.free(bodies_store);
+    bodies_store[0] = .{ .fn_ = .{
+        .params = try a.dupe(items.Param, &.{}),
+        .ret = types_store[0],
+        .body = 5,
+    } };
+
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = types_store,
+        .bodies = bodies_store,
+    };
+
+    var inferred = try infer.solveWithGraph(a, &b, &graph);
+    defer inferred.deinit(a);
+
+    // data.len() -> usize (2)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 2), inferred.getType(1));
+    // data.clone() -> slice (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(2));
+    // data.bitxor(o) -> slice (0)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(3));
+}

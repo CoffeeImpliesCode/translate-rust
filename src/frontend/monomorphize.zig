@@ -419,6 +419,7 @@ fn collectExpr(
         .loop_ => |l| try collectBlock(table, alloc, b, v, l.body),
         .while_ => |wh| {
             try collectExpr(table, alloc, b, v, wh.cond);
+            if (wh.capture) |cap_id| try collectPat(table, alloc, b, v, cap_id);
             try collectBlock(table, alloc, b, v, wh.body);
         },
         .for_ => |f| {

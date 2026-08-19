@@ -694,6 +694,15 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
             } else {
                 try o.put(allocator, "continue_expr", .{ .null = {} });
             }
+            if (we.captures) |caps| {
+                var cap_arr = Array.init(allocator);
+                for (caps) |cap| {
+                    try cap_arr.append(.{ .string = cap });
+                }
+                try o.put(allocator, "captures", .{ .array = cap_arr });
+            } else {
+                try o.put(allocator, "captures", .{ .null = {} });
+            }
             try o.put(allocator, "body", try encodeBlock(allocator, we.body));
             if (we.else_body) |eb| {
                 try o.put(allocator, "else_body", try encodeExpr(allocator, eb.*));
@@ -720,6 +729,15 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
                 try o.put(allocator, "else_body", try encodeExpr(allocator, eb.*));
             } else {
                 try o.put(allocator, "else_body", .{ .null = {} });
+            }
+        },
+        .range => |r| {
+            try o.put(allocator, "kind", .{ .string = "range" });
+            try o.put(allocator, "start", try encodeExpr(allocator, r.start.*));
+            if (r.end) |en| {
+                try o.put(allocator, "end", try encodeExpr(allocator, en.*));
+            } else {
+                try o.put(allocator, "end", .{ .null = {} });
             }
         },
         .return_expr => |re| {
@@ -986,10 +1004,23 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 break :blk ep;
             },
         }) else null;
+        var caps_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (o.get("captures")) |cv| {
+            if (cv == .array) {
+                for (cv.array.items) |item| {
+                    const s = switch (item) {
+                        .string => |st| st,
+                        else => return error.BadWireFormat,
+                    };
+                    try caps_list.append(allocator, try allocator.dupe(u8, s));
+                }
+            }
+        }
         return .{
             .while_expr = .{
                 .cond = cond_ptr,
                 .continue_expr = cont_ptr,
+                .captures = if (caps_list.items.len > 0) try caps_list.toOwnedSlice(allocator) else null,
                 .body = body,
                 .else_body = else_ptr,
             },
@@ -1037,6 +1068,18 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 .else_body = else_ptr,
             },
         };
+    } else if (std.mem.eql(u8, kind, "range")) {
+        const start_ptr = try allocator.create(ast.Expr);
+        start_ptr.* = try decodeExpr(allocator, try req(o, "start"));
+        const end_ptr: ?*const ast.Expr = if (o.get("end")) |en| (switch (en) {
+            .null => null,
+            else => blk: {
+                const p = try allocator.create(ast.Expr);
+                p.* = try decodeExpr(allocator, en);
+                break :blk p;
+            },
+        }) else null;
+        return .{ .range = .{ .start = start_ptr, .end = end_ptr } };
     } else if (std.mem.eql(u8, kind, "return_expr")) {
         const val_ptr: ?*const ast.Expr = if (o.get("value")) |v_node| (switch (v_node) {
             .null => null,

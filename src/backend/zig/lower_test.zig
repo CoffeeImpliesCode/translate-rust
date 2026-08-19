@@ -974,3 +974,120 @@ test "lower: const array + primitive initializers emit real Zig values" {
     try std.testing.expect(saw_multi);
     try std.testing.expect(saw_repeat);
 }
+
+test "lower: prelude trait methods lower to native Zig expressions" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    // Register the method entities so the symbol table resolves their names.
+    const as_ref_id = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "as_ref", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    const clone_id = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "clone", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    const len_id = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "len", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    const bitxor_id = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "bitxor", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    const to_vec_id = try graph.symbol_table.add(.{
+        .id = 0, .kind = .fn_, .name = "to_vec", .span = span,
+        .visibility = .public, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    _ = clone_id;
+    _ = len_id;
+    _ = bitxor_id;
+    _ = to_vec_id;
+
+    // Types: 0 = []const u8 (slice), 1 = u8, 2 = usize.
+    const slice_t = try alloc.create(ir.types.Slice);
+    slice_t.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const types_store = try alloc.alloc(ir.types.Type, 3);
+    types_store[0] = .{ .slice = slice_t };
+    types_store[1] = .{ .prim = .u8 };
+    types_store[2] = .{ .prim = .usize };
+
+    // Receiver `data` (path → ident) is a slice (ty = 0) → slice-compatible.
+    const recv_def = try graph.symbol_table.add(.{
+        .id = 0, .kind = .const_, .name = "data", .span = span,
+        .visibility = .private, .parent = null, .resolved = null,
+        .renamed_to = null, .attributes = &.{},
+    });
+    const e_recv = try model.e(.{ .path = .{ .def = recv_def, .generic_args = &.{} } });
+    // Set the receiver's declared type so array/slice detection is grounded.
+    model.exprs.items[e_recv].ty = 0;
+
+    // data.as_ref()
+    const mc_asref = try model.e(.{ .method_call = .{
+        .receiver = e_recv, .receiver_mode = .shared, .method = as_ref_id, .args = &.{},
+    } });
+    const e_blk = try model.e(.{ .block = .{ .statements = &.{}, .tail = mc_asref, .labelled = null } });
+    const body_id: ir.spine.EntityId = @intCast(model.bodies.items.len);
+    try model.bodies.append(model.a(), .{
+        .fn_ = .{
+            .params = &.{ .{ .name = "data", .ty = types_store[0], .span = span } },
+            .ret = types_store[0],
+            .body = e_blk,
+        },
+    });
+
+    const final_bodies = ir.bodies.Bodies{
+        .exprs = try model.exprs.toOwnedSlice(model.a()),
+        .stmts = try model.stmts.toOwnedSlice(model.a()),
+        .pats = try model.pats.toOwnedSlice(model.a()),
+        .types = types_store,
+        .bodies = try model.bodies.toOwnedSlice(model.a()),
+    };
+
+    const root_id = try graph.addModule(.{
+        .id = 0, .kind = .root, .name = "", .parent = null,
+        .source_path = null, .is_crate = true, .is_extern = false,
+        .span = span, .items = &.{body_id}, .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "sample", .edition = 2021, .kind = .lib, .root = root_id,
+        .deps = &.{}, .is_translated = true,
+    });
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "sample",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = final_bodies,
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+
+    // data.as_ref() must lower to a plain ident, not an unresolvable method call.
+    var found_ident = false;
+    var found_call = false;
+    const file0 = pkg.files[0];
+    for (file0.decls) |d| {
+        if (d != .fn_decl) continue;
+        if (d.fn_decl.body) |b| {
+            if (b.expr) |tail| {
+                if (tail.* == .ident) found_ident = true;
+                if (tail.* == .call) found_call = true;
+            }
+        }
+    }
+    // The prelude `.as_ref()` lowers to the receiver ident (slice-compatible).
+    try std.testing.expect(found_ident);
+    try std.testing.expect(!found_call);
+}
