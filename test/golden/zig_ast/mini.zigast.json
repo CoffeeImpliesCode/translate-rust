@@ -146,10 +146,10 @@
                     ],
                     "body": {
                       "kind": "bin_op",
-                      "op": "mul_wrap",
+                      "op": "mul",
                       "lhs": {
                         "kind": "bin_op",
-                        "op": "mul_wrap",
+                        "op": "mul",
                         "lhs": {
                           "kind": "ident",
                           "name": "r"
@@ -193,7 +193,7 @@
                     ],
                     "body": {
                       "kind": "bin_op",
-                      "op": "mul_wrap",
+                      "op": "mul",
                       "lhs": {
                         "kind": "ident",
                         "name": "width"

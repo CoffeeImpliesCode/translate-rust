@@ -221,18 +221,51 @@
                             "label": null,
                             "stmts": [
                               {
-                                "kind": "expr_stmt",
-                                "expr": {
-                                  "kind": "unsupported",
-                                  "reason": "assign_expr"
-                                }
+                                "kind": "assign",
+                                "target": {
+                                  "kind": "ident",
+                                  "name": "hash"
+                                },
+                                "val": {
+                                  "kind": "bin_op",
+                                  "op": "bit_xor",
+                                  "lhs": {
+                                    "kind": "ident",
+                                    "name": "hash"
+                                  },
+                                  "rhs": {
+                                    "kind": "unary_op",
+                                    "op": "deref",
+                                    "operand": {
+                                      "kind": "ident",
+                                      "name": "byte"
+                                    }
+                                  }
+                                },
+                                "op": "assign"
                               },
                               {
-                                "kind": "expr_stmt",
-                                "expr": {
-                                  "kind": "unsupported",
-                                  "reason": "assign_expr"
-                                }
+                                "kind": "assign",
+                                "target": {
+                                  "kind": "ident",
+                                  "name": "hash"
+                                },
+                                "val": {
+                                  "kind": "bin_op",
+                                  "op": "mul_wrap",
+                                  "lhs": {
+                                    "kind": "ident",
+                                    "name": "hash"
+                                  },
+                                  "rhs": {
+                                    "kind": "lit",
+                                    "value": {
+                                      "kind": "int",
+                                      "value": "0"
+                                    }
+                                  }
+                                },
+                                "op": "assign"
                               }
                             ],
                             "expr": null
@@ -241,11 +274,29 @@
                         }
                       },
                       {
-                        "kind": "expr_stmt",
-                        "expr": {
-                          "kind": "unsupported",
-                          "reason": "assign_expr"
-                        }
+                        "kind": "assign",
+                        "target": {
+                          "kind": "unary_op",
+                          "op": "deref",
+                          "operand": {
+                            "kind": "ident",
+                            "name": "self"
+                          }
+                        },
+                        "val": {
+                          "kind": "call",
+                          "callee": {
+                            "kind": "ident",
+                            "name": "FnvHasher"
+                          },
+                          "args": [
+                            {
+                              "kind": "ident",
+                              "name": "hash"
+                            }
+                          ]
+                        },
+                        "op": "assign"
                       }
                     ],
                     "expr": null
@@ -529,7 +580,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\""
+                                "value": ""
                               }
                             }
                           ]
@@ -568,7 +619,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"a\""
+                                "value": "a"
                               }
                             }
                           ]
@@ -607,7 +658,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"b\""
+                                "value": "b"
                               }
                             }
                           ]
@@ -646,7 +697,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"c\""
+                                "value": "c"
                               }
                             }
                           ]
@@ -685,7 +736,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"d\""
+                                "value": "d"
                               }
                             }
                           ]
@@ -724,7 +775,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"e\""
+                                "value": "e"
                               }
                             }
                           ]
@@ -763,7 +814,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"f\""
+                                "value": "f"
                               }
                             }
                           ]
@@ -802,7 +853,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"fo\""
+                                "value": "fo"
                               }
                             }
                           ]
@@ -841,7 +892,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"foo\""
+                                "value": "foo"
                               }
                             }
                           ]
@@ -880,7 +931,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"foob\""
+                                "value": "foob"
                               }
                             }
                           ]
@@ -919,7 +970,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"fooba\""
+                                "value": "fooba"
                               }
                             }
                           ]
@@ -958,7 +1009,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"foobar\""
+                                "value": "foobar"
                               }
                             }
                           ]
@@ -997,7 +1048,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\0\""
+                                "value": "\u0000"
                               }
                             }
                           ]
@@ -1036,7 +1087,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"a\\0\""
+                                "value": "a\u0000"
                               }
                             }
                           ]
@@ -1075,7 +1126,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"b\\0\""
+                                "value": "b\u0000"
                               }
                             }
                           ]
@@ -1114,7 +1165,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"c\\0\""
+                                "value": "c\u0000"
                               }
                             }
                           ]
@@ -1153,7 +1204,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"d\\0\""
+                                "value": "d\u0000"
                               }
                             }
                           ]
@@ -1192,7 +1243,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"e\\0\""
+                                "value": "e\u0000"
                               }
                             }
                           ]
@@ -1231,7 +1282,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"f\\0\""
+                                "value": "f\u0000"
                               }
                             }
                           ]
@@ -1270,7 +1321,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"fo\\0\""
+                                "value": "fo\u0000"
                               }
                             }
                           ]
@@ -1309,7 +1360,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"foo\\0\""
+                                "value": "foo\u0000"
                               }
                             }
                           ]
@@ -1348,7 +1399,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"foob\\0\""
+                                "value": "foob\u0000"
                               }
                             }
                           ]
@@ -1387,7 +1438,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"fooba\\0\""
+                                "value": "fooba\u0000"
                               }
                             }
                           ]
@@ -1426,7 +1477,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"foobar\\0\""
+                                "value": "foobar\u0000"
                               }
                             }
                           ]
@@ -1465,7 +1516,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"ch\""
+                                "value": "ch"
                               }
                             }
                           ]
@@ -1504,7 +1555,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"cho\""
+                                "value": "cho"
                               }
                             }
                           ]
@@ -1543,7 +1594,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chon\""
+                                "value": "chon"
                               }
                             }
                           ]
@@ -1582,7 +1633,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chong\""
+                                "value": "chong"
                               }
                             }
                           ]
@@ -1621,7 +1672,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo\""
+                                "value": "chongo"
                               }
                             }
                           ]
@@ -1660,7 +1711,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo \""
+                                "value": "chongo "
                               }
                             }
                           ]
@@ -1699,7 +1750,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo w\""
+                                "value": "chongo w"
                               }
                             }
                           ]
@@ -1738,7 +1789,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo wa\""
+                                "value": "chongo wa"
                               }
                             }
                           ]
@@ -1777,7 +1828,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was\""
+                                "value": "chongo was"
                               }
                             }
                           ]
@@ -1816,7 +1867,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was \""
+                                "value": "chongo was "
                               }
                             }
                           ]
@@ -1855,7 +1906,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was h\""
+                                "value": "chongo was h"
                               }
                             }
                           ]
@@ -1894,7 +1945,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was he\""
+                                "value": "chongo was he"
                               }
                             }
                           ]
@@ -1933,7 +1984,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was her\""
+                                "value": "chongo was her"
                               }
                             }
                           ]
@@ -1972,7 +2023,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was here\""
+                                "value": "chongo was here"
                               }
                             }
                           ]
@@ -2011,7 +2062,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was here!\""
+                                "value": "chongo was here!"
                               }
                             }
                           ]
@@ -2050,7 +2101,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was here!\\n\""
+                                "value": "chongo was here!\n"
                               }
                             }
                           ]
@@ -2089,7 +2140,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"ch\\0\""
+                                "value": "ch\u0000"
                               }
                             }
                           ]
@@ -2128,7 +2179,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"cho\\0\""
+                                "value": "cho\u0000"
                               }
                             }
                           ]
@@ -2167,7 +2218,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chon\\0\""
+                                "value": "chon\u0000"
                               }
                             }
                           ]
@@ -2206,7 +2257,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chong\\0\""
+                                "value": "chong\u0000"
                               }
                             }
                           ]
@@ -2245,7 +2296,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo\\0\""
+                                "value": "chongo\u0000"
                               }
                             }
                           ]
@@ -2284,7 +2335,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo \\0\""
+                                "value": "chongo \u0000"
                               }
                             }
                           ]
@@ -2323,7 +2374,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo w\\0\""
+                                "value": "chongo w\u0000"
                               }
                             }
                           ]
@@ -2362,7 +2413,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo wa\\0\""
+                                "value": "chongo wa\u0000"
                               }
                             }
                           ]
@@ -2401,7 +2452,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was\\0\""
+                                "value": "chongo was\u0000"
                               }
                             }
                           ]
@@ -2440,7 +2491,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was \\0\""
+                                "value": "chongo was \u0000"
                               }
                             }
                           ]
@@ -2479,7 +2530,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was h\\0\""
+                                "value": "chongo was h\u0000"
                               }
                             }
                           ]
@@ -2518,7 +2569,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was he\\0\""
+                                "value": "chongo was he\u0000"
                               }
                             }
                           ]
@@ -2557,7 +2608,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was her\\0\""
+                                "value": "chongo was her\u0000"
                               }
                             }
                           ]
@@ -2596,7 +2647,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was here\\0\""
+                                "value": "chongo was here\u0000"
                               }
                             }
                           ]
@@ -2635,7 +2686,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was here!\\0\""
+                                "value": "chongo was here!\u0000"
                               }
                             }
                           ]
@@ -2674,7 +2725,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo was here!\\n\\0\""
+                                "value": "chongo was here!\n\u0000"
                               }
                             }
                           ]
@@ -2713,7 +2764,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"cu\""
+                                "value": "cu"
                               }
                             }
                           ]
@@ -2752,7 +2803,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"cur\""
+                                "value": "cur"
                               }
                             }
                           ]
@@ -2791,7 +2842,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curd\""
+                                "value": "curd"
                               }
                             }
                           ]
@@ -2830,7 +2881,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds\""
+                                "value": "curds"
                               }
                             }
                           ]
@@ -2869,7 +2920,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds \""
+                                "value": "curds "
                               }
                             }
                           ]
@@ -2908,7 +2959,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds a\""
+                                "value": "curds a"
                               }
                             }
                           ]
@@ -2947,7 +2998,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds an\""
+                                "value": "curds an"
                               }
                             }
                           ]
@@ -2986,7 +3037,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and\""
+                                "value": "curds and"
                               }
                             }
                           ]
@@ -3025,7 +3076,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and \""
+                                "value": "curds and "
                               }
                             }
                           ]
@@ -3064,7 +3115,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and w\""
+                                "value": "curds and w"
                               }
                             }
                           ]
@@ -3103,7 +3154,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and wh\""
+                                "value": "curds and wh"
                               }
                             }
                           ]
@@ -3142,7 +3193,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and whe\""
+                                "value": "curds and whe"
                               }
                             }
                           ]
@@ -3181,7 +3232,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and whey\""
+                                "value": "curds and whey"
                               }
                             }
                           ]
@@ -3220,7 +3271,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and whey\\n\""
+                                "value": "curds and whey\n"
                               }
                             }
                           ]
@@ -3259,7 +3310,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"cu\\0\""
+                                "value": "cu\u0000"
                               }
                             }
                           ]
@@ -3298,7 +3349,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"cur\\0\""
+                                "value": "cur\u0000"
                               }
                             }
                           ]
@@ -3337,7 +3388,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curd\\0\""
+                                "value": "curd\u0000"
                               }
                             }
                           ]
@@ -3376,7 +3427,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds\\0\""
+                                "value": "curds\u0000"
                               }
                             }
                           ]
@@ -3415,7 +3466,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds \\0\""
+                                "value": "curds \u0000"
                               }
                             }
                           ]
@@ -3454,7 +3505,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds a\\0\""
+                                "value": "curds a\u0000"
                               }
                             }
                           ]
@@ -3493,7 +3544,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds an\\0\""
+                                "value": "curds an\u0000"
                               }
                             }
                           ]
@@ -3532,7 +3583,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and\\0\""
+                                "value": "curds and\u0000"
                               }
                             }
                           ]
@@ -3571,7 +3622,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and \\0\""
+                                "value": "curds and \u0000"
                               }
                             }
                           ]
@@ -3610,7 +3661,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and w\\0\""
+                                "value": "curds and w\u0000"
                               }
                             }
                           ]
@@ -3649,7 +3700,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and wh\\0\""
+                                "value": "curds and wh\u0000"
                               }
                             }
                           ]
@@ -3688,7 +3739,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and whe\\0\""
+                                "value": "curds and whe\u0000"
                               }
                             }
                           ]
@@ -3727,7 +3778,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and whey\\0\""
+                                "value": "curds and whey\u0000"
                               }
                             }
                           ]
@@ -3766,7 +3817,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"curds and whey\\n\\0\""
+                                "value": "curds and whey\n\u0000"
                               }
                             }
                           ]
@@ -3805,7 +3856,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"hi\""
+                                "value": "hi"
                               }
                             }
                           ]
@@ -3844,7 +3895,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"hi\\0\""
+                                "value": "hi\u0000"
                               }
                             }
                           ]
@@ -3883,7 +3934,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"hello\""
+                                "value": "hello"
                               }
                             }
                           ]
@@ -3922,7 +3973,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"hello\\0\""
+                                "value": "hello\u0000"
                               }
                             }
                           ]
@@ -3961,7 +4012,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\xff\\x00\\x00\\x01\""
+                                "value": [
+                                  255,
+                                  0,
+                                  0,
+                                  1
+                                ]
                               }
                             }
                           ]
@@ -4000,7 +4056,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x01\\x00\\x00\\xff\""
+                                "value": [
+                                  1,
+                                  0,
+                                  0,
+                                  255
+                                ]
                               }
                             }
                           ]
@@ -4039,7 +4100,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\xff\\x00\\x00\\x02\""
+                                "value": [
+                                  255,
+                                  0,
+                                  0,
+                                  2
+                                ]
                               }
                             }
                           ]
@@ -4078,7 +4144,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x02\\x00\\x00\\xff\""
+                                "value": [
+                                  2,
+                                  0,
+                                  0,
+                                  255
+                                ]
                               }
                             }
                           ]
@@ -4117,7 +4188,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\xff\\x00\\x00\\x03\""
+                                "value": [
+                                  255,
+                                  0,
+                                  0,
+                                  3
+                                ]
                               }
                             }
                           ]
@@ -4156,7 +4232,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x03\\x00\\x00\\xff\""
+                                "value": [
+                                  3,
+                                  0,
+                                  0,
+                                  255
+                                ]
                               }
                             }
                           ]
@@ -4195,7 +4276,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\xff\\x00\\x00\\x04\""
+                                "value": [
+                                  255,
+                                  0,
+                                  0,
+                                  4
+                                ]
                               }
                             }
                           ]
@@ -4234,7 +4320,12 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x04\\x00\\x00\\xff\""
+                                "value": [
+                                  4,
+                                  0,
+                                  0,
+                                  255
+                                ]
                               }
                             }
                           ]
@@ -4273,7 +4364,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x40\\x51\\x4e\\x44\""
+                                "value": "@QND"
                               }
                             }
                           ]
@@ -4312,7 +4403,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x44\\x4e\\x51\\x40\""
+                                "value": "DNQ@"
                               }
                             }
                           ]
@@ -4351,7 +4442,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x40\\x51\\x4e\\x4a\""
+                                "value": "@QNJ"
                               }
                             }
                           ]
@@ -4390,7 +4481,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x4a\\x4e\\x51\\x40\""
+                                "value": "JNQ@"
                               }
                             }
                           ]
@@ -4429,7 +4520,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x40\\x51\\x4e\\x54\""
+                                "value": "@QNT"
                               }
                             }
                           ]
@@ -4468,7 +4559,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"\\x54\\x4e\\x51\\x40\""
+                                "value": "TNQ@"
                               }
                             }
                           ]
@@ -4507,7 +4598,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"127.0.0.1\""
+                                "value": "127.0.0.1"
                               }
                             }
                           ]
@@ -4546,7 +4637,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"127.0.0.1\\0\""
+                                "value": "127.0.0.1\u0000"
                               }
                             }
                           ]
@@ -4585,7 +4676,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"127.0.0.2\""
+                                "value": "127.0.0.2"
                               }
                             }
                           ]
@@ -4624,7 +4715,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"127.0.0.2\\0\""
+                                "value": "127.0.0.2\u0000"
                               }
                             }
                           ]
@@ -4663,7 +4754,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"127.0.0.3\""
+                                "value": "127.0.0.3"
                               }
                             }
                           ]
@@ -4702,7 +4793,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"127.0.0.3\\0\""
+                                "value": "127.0.0.3\u0000"
                               }
                             }
                           ]
@@ -4741,7 +4832,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"64.81.78.68\""
+                                "value": "64.81.78.68"
                               }
                             }
                           ]
@@ -4780,7 +4871,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"64.81.78.68\\0\""
+                                "value": "64.81.78.68\u0000"
                               }
                             }
                           ]
@@ -4819,7 +4910,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"64.81.78.74\""
+                                "value": "64.81.78.74"
                               }
                             }
                           ]
@@ -4858,7 +4949,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"64.81.78.74\\0\""
+                                "value": "64.81.78.74\u0000"
                               }
                             }
                           ]
@@ -4897,7 +4988,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"64.81.78.84\""
+                                "value": "64.81.78.84"
                               }
                             }
                           ]
@@ -4936,7 +5027,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"64.81.78.84\\0\""
+                                "value": "64.81.78.84\u0000"
                               }
                             }
                           ]
@@ -4975,7 +5066,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"feedface\""
+                                "value": "feedface"
                               }
                             }
                           ]
@@ -5014,7 +5105,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"feedface\\0\""
+                                "value": "feedface\u0000"
                               }
                             }
                           ]
@@ -5053,7 +5144,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"feedfacedaffdeed\""
+                                "value": "feedfacedaffdeed"
                               }
                             }
                           ]
@@ -5092,7 +5183,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"feedfacedaffdeed\\0\""
+                                "value": "feedfacedaffdeed\u0000"
                               }
                             }
                           ]
@@ -5131,7 +5222,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"feedfacedeadbeef\""
+                                "value": "feedfacedeadbeef"
                               }
                             }
                           ]
@@ -5170,7 +5261,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"feedfacedeadbeef\\0\""
+                                "value": "feedfacedeadbeef\u0000"
                               }
                             }
                           ]
@@ -5209,7 +5300,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"line 1\\nline 2\\nline 3\""
+                                "value": "line 1\nline 2\nline 3"
                               }
                             }
                           ]
@@ -5248,7 +5339,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo <Landon Curt Noll> /\\\\../\\\\\""
+                                "value": "chongo <Landon Curt Noll> /\\../\\"
                               }
                             }
                           ]
@@ -5287,7 +5378,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo <Landon Curt Noll> /\\\\../\\\\\\0\""
+                                "value": "chongo <Landon Curt Noll> /\\../\\\u0000"
                               }
                             }
                           ]
@@ -5326,7 +5417,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo (Landon Curt Noll) /\\\\../\\\\\""
+                                "value": "chongo (Landon Curt Noll) /\\../\\"
                               }
                             }
                           ]
@@ -5365,7 +5456,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"chongo (Landon Curt Noll) /\\\\../\\\\\\0\""
+                                "value": "chongo (Landon Curt Noll) /\\../\\\u0000"
                               }
                             }
                           ]
@@ -5404,7 +5495,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://antwrp.gsfc.nasa.gov/apod/astropix.html\""
+                                "value": "http://antwrp.gsfc.nasa.gov/apod/astropix.html"
                               }
                             }
                           ]
@@ -5443,7 +5534,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://en.wikipedia.org/wiki/Fowler_Noll_Vo_hash\""
+                                "value": "http://en.wikipedia.org/wiki/Fowler_Noll_Vo_hash"
                               }
                             }
                           ]
@@ -5482,7 +5573,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://epod.usra.edu/\""
+                                "value": "http://epod.usra.edu/"
                               }
                             }
                           ]
@@ -5521,7 +5612,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://exoplanet.eu/\""
+                                "value": "http://exoplanet.eu/"
                               }
                             }
                           ]
@@ -5560,7 +5651,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://hvo.wr.usgs.gov/cam3/\""
+                                "value": "http://hvo.wr.usgs.gov/cam3/"
                               }
                             }
                           ]
@@ -5599,7 +5690,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://hvo.wr.usgs.gov/cams/HMcam/\""
+                                "value": "http://hvo.wr.usgs.gov/cams/HMcam/"
                               }
                             }
                           ]
@@ -5638,7 +5729,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://hvo.wr.usgs.gov/kilauea/update/deformation.html\""
+                                "value": "http://hvo.wr.usgs.gov/kilauea/update/deformation.html"
                               }
                             }
                           ]
@@ -5677,7 +5768,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://hvo.wr.usgs.gov/kilauea/update/images.html\""
+                                "value": "http://hvo.wr.usgs.gov/kilauea/update/images.html"
                               }
                             }
                           ]
@@ -5716,7 +5807,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://hvo.wr.usgs.gov/kilauea/update/maps.html\""
+                                "value": "http://hvo.wr.usgs.gov/kilauea/update/maps.html"
                               }
                             }
                           ]
@@ -5755,7 +5846,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://hvo.wr.usgs.gov/volcanowatch/current_issue.html\""
+                                "value": "http://hvo.wr.usgs.gov/volcanowatch/current_issue.html"
                               }
                             }
                           ]
@@ -5794,7 +5885,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://neo.jpl.nasa.gov/risk/\""
+                                "value": "http://neo.jpl.nasa.gov/risk/"
                               }
                             }
                           ]
@@ -5833,7 +5924,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://norvig.com/21-days.html\""
+                                "value": "http://norvig.com/21-days.html"
                               }
                             }
                           ]
@@ -5872,7 +5963,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://primes.utm.edu/curios/home.php\""
+                                "value": "http://primes.utm.edu/curios/home.php"
                               }
                             }
                           ]
@@ -5911,7 +6002,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://slashdot.org/\""
+                                "value": "http://slashdot.org/"
                               }
                             }
                           ]
@@ -5950,7 +6041,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://tux.wr.usgs.gov/Maps/155.25-19.5.html\""
+                                "value": "http://tux.wr.usgs.gov/Maps/155.25-19.5.html"
                               }
                             }
                           ]
@@ -5989,7 +6080,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://volcano.wr.usgs.gov/kilaueastatus.php\""
+                                "value": "http://volcano.wr.usgs.gov/kilaueastatus.php"
                               }
                             }
                           ]
@@ -6028,7 +6119,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.avo.alaska.edu/activity/Redoubt.php\""
+                                "value": "http://www.avo.alaska.edu/activity/Redoubt.php"
                               }
                             }
                           ]
@@ -6067,7 +6158,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.dilbert.com/fast/\""
+                                "value": "http://www.dilbert.com/fast/"
                               }
                             }
                           ]
@@ -6106,7 +6197,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.fourmilab.ch/gravitation/orbits/\""
+                                "value": "http://www.fourmilab.ch/gravitation/orbits/"
                               }
                             }
                           ]
@@ -6145,7 +6236,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.fpoa.net/\""
+                                "value": "http://www.fpoa.net/"
                               }
                             }
                           ]
@@ -6184,7 +6275,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.ioccc.org/index.html\""
+                                "value": "http://www.ioccc.org/index.html"
                               }
                             }
                           ]
@@ -6223,7 +6314,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/cgi-bin/number.cgi\""
+                                "value": "http://www.isthe.com/cgi-bin/number.cgi"
                               }
                             }
                           ]
@@ -6262,7 +6353,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/bio.html\""
+                                "value": "http://www.isthe.com/chongo/bio.html"
                               }
                             }
                           ]
@@ -6301,7 +6392,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/index.html\""
+                                "value": "http://www.isthe.com/chongo/index.html"
                               }
                             }
                           ]
@@ -6340,7 +6431,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/src/calc/lucas-calc\""
+                                "value": "http://www.isthe.com/chongo/src/calc/lucas-calc"
                               }
                             }
                           ]
@@ -6379,7 +6470,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/astro/venus2004.html\""
+                                "value": "http://www.isthe.com/chongo/tech/astro/venus2004.html"
                               }
                             }
                           ]
@@ -6418,7 +6509,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/astro/vita.html\""
+                                "value": "http://www.isthe.com/chongo/tech/astro/vita.html"
                               }
                             }
                           ]
@@ -6457,7 +6548,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/comp/c/expert.html\""
+                                "value": "http://www.isthe.com/chongo/tech/comp/c/expert.html"
                               }
                             }
                           ]
@@ -6496,7 +6587,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/comp/calc/index.html\""
+                                "value": "http://www.isthe.com/chongo/tech/comp/calc/index.html"
                               }
                             }
                           ]
@@ -6535,7 +6626,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/comp/fnv/index.html\""
+                                "value": "http://www.isthe.com/chongo/tech/comp/fnv/index.html"
                               }
                             }
                           ]
@@ -6574,7 +6665,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/math/number/howhigh.html\""
+                                "value": "http://www.isthe.com/chongo/tech/math/number/howhigh.html"
                               }
                             }
                           ]
@@ -6613,7 +6704,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/math/number/number.html\""
+                                "value": "http://www.isthe.com/chongo/tech/math/number/number.html"
                               }
                             }
                           ]
@@ -6652,7 +6743,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/math/prime/mersenne.html\""
+                                "value": "http://www.isthe.com/chongo/tech/math/prime/mersenne.html"
                               }
                             }
                           ]
@@ -6691,7 +6782,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.isthe.com/chongo/tech/math/prime/mersenne.html#largest\""
+                                "value": "http://www.isthe.com/chongo/tech/math/prime/mersenne.html#largest"
                               }
                             }
                           ]
@@ -6730,7 +6821,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.lavarnd.org/cgi-bin/corpspeak.cgi\""
+                                "value": "http://www.lavarnd.org/cgi-bin/corpspeak.cgi"
                               }
                             }
                           ]
@@ -6769,7 +6860,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.lavarnd.org/cgi-bin/haiku.cgi\""
+                                "value": "http://www.lavarnd.org/cgi-bin/haiku.cgi"
                               }
                             }
                           ]
@@ -6808,7 +6899,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.lavarnd.org/cgi-bin/rand-none.cgi\""
+                                "value": "http://www.lavarnd.org/cgi-bin/rand-none.cgi"
                               }
                             }
                           ]
@@ -6847,7 +6938,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.lavarnd.org/cgi-bin/randdist.cgi\""
+                                "value": "http://www.lavarnd.org/cgi-bin/randdist.cgi"
                               }
                             }
                           ]
@@ -6886,7 +6977,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.lavarnd.org/index.html\""
+                                "value": "http://www.lavarnd.org/index.html"
                               }
                             }
                           ]
@@ -6925,7 +7016,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.lavarnd.org/what/nist-test.html\""
+                                "value": "http://www.lavarnd.org/what/nist-test.html"
                               }
                             }
                           ]
@@ -6964,7 +7055,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.macosxhints.com/\""
+                                "value": "http://www.macosxhints.com/"
                               }
                             }
                           ]
@@ -7003,7 +7094,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.mellis.com/\""
+                                "value": "http://www.mellis.com/"
                               }
                             }
                           ]
@@ -7042,7 +7133,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.nature.nps.gov/air/webcams/parks/havoso2alert/havoalert.cfm\""
+                                "value": "http://www.nature.nps.gov/air/webcams/parks/havoso2alert/havoalert.cfm"
                               }
                             }
                           ]
@@ -7081,7 +7172,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.nature.nps.gov/air/webcams/parks/havoso2alert/timelines_24.cfm\""
+                                "value": "http://www.nature.nps.gov/air/webcams/parks/havoso2alert/timelines_24.cfm"
                               }
                             }
                           ]
@@ -7120,7 +7211,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.paulnoll.com/\""
+                                "value": "http://www.paulnoll.com/"
                               }
                             }
                           ]
@@ -7159,7 +7250,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.pepysdiary.com/\""
+                                "value": "http://www.pepysdiary.com/"
                               }
                             }
                           ]
@@ -7198,7 +7289,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.sciencenews.org/index/home/activity/view\""
+                                "value": "http://www.sciencenews.org/index/home/activity/view"
                               }
                             }
                           ]
@@ -7237,7 +7328,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.skyandtelescope.com/\""
+                                "value": "http://www.skyandtelescope.com/"
                               }
                             }
                           ]
@@ -7276,7 +7367,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.sput.nl/~rob/sirius.html\""
+                                "value": "http://www.sput.nl/~rob/sirius.html"
                               }
                             }
                           ]
@@ -7315,7 +7406,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.systemexperts.com/\""
+                                "value": "http://www.systemexperts.com/"
                               }
                             }
                           ]
@@ -7354,7 +7445,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.tq-international.com/phpBB3/index.php\""
+                                "value": "http://www.tq-international.com/phpBB3/index.php"
                               }
                             }
                           ]
@@ -7393,7 +7484,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.travelquesttours.com/index.htm\""
+                                "value": "http://www.travelquesttours.com/index.htm"
                               }
                             }
                           ]
@@ -7432,7 +7523,7 @@
                               "kind": "lit",
                               "value": {
                                 "kind": "str",
-                                "value": "b\"http://www.wunderground.com/global/stations/89606.html\""
+                                "value": "http://www.wunderground.com/global/stations/89606.html"
                               }
                             }
                           ]
@@ -7478,7 +7569,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"21701\""
+                                    "value": "21701"
                                   }
                                 }
                               ]
@@ -7526,7 +7617,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"M21701\""
+                                    "value": "M21701"
                                   }
                                 }
                               ]
@@ -7574,7 +7665,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"2^21701-1\""
+                                    "value": "2^21701-1"
                                   }
                                 }
                               ]
@@ -7622,7 +7713,10 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x54\\xc5\""
+                                    "value": [
+                                      84,
+                                      197
+                                    ]
                                   }
                                 }
                               ]
@@ -7670,7 +7764,10 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\xc5\\x54\""
+                                    "value": [
+                                      197,
+                                      84
+                                    ]
                                   }
                                 }
                               ]
@@ -7718,7 +7815,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"23209\""
+                                    "value": "23209"
                                   }
                                 }
                               ]
@@ -7766,7 +7863,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"M23209\""
+                                    "value": "M23209"
                                   }
                                 }
                               ]
@@ -7814,7 +7911,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"2^23209-1\""
+                                    "value": "2^23209-1"
                                   }
                                 }
                               ]
@@ -7862,7 +7959,10 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x5a\\xa9\""
+                                    "value": [
+                                      90,
+                                      169
+                                    ]
                                   }
                                 }
                               ]
@@ -7910,7 +8010,10 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\xa9\\x5a\""
+                                    "value": [
+                                      169,
+                                      90
+                                    ]
                                   }
                                 }
                               ]
@@ -7958,7 +8061,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"391581216093\""
+                                    "value": "391581216093"
                                   }
                                 }
                               ]
@@ -8006,7 +8109,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"391581*2^216093-1\""
+                                    "value": "391581*2^216093-1"
                                   }
                                 }
                               ]
@@ -8054,7 +8157,14 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x05\\xf9\\x9d\\x03\\x4c\\x81\""
+                                    "value": [
+                                      5,
+                                      249,
+                                      157,
+                                      3,
+                                      76,
+                                      129
+                                    ]
                                   }
                                 }
                               ]
@@ -8102,7 +8212,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"FEDCBA9876543210\""
+                                    "value": "FEDCBA9876543210"
                                   }
                                 }
                               ]
@@ -8150,7 +8260,16 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\xfe\\xdc\\xba\\x98\\x76\\x54\\x32\\x10\""
+                                    "value": [
+                                      254,
+                                      220,
+                                      186,
+                                      152,
+                                      118,
+                                      84,
+                                      50,
+                                      16
+                                    ]
                                   }
                                 }
                               ]
@@ -8198,7 +8317,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"EFCDAB8967452301\""
+                                    "value": "EFCDAB8967452301"
                                   }
                                 }
                               ]
@@ -8246,7 +8365,16 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\xef\\xcd\\xab\\x89\\x67\\x45\\x23\\x01\""
+                                    "value": [
+                                      239,
+                                      205,
+                                      171,
+                                      137,
+                                      103,
+                                      69,
+                                      35,
+                                      1
+                                    ]
                                   }
                                 }
                               ]
@@ -8294,7 +8422,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"0123456789ABCDEF\""
+                                    "value": "0123456789ABCDEF"
                                   }
                                 }
                               ]
@@ -8342,7 +8470,16 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x01\\x23\\x45\\x67\\x89\\xab\\xcd\\xef\""
+                                    "value": [
+                                      1,
+                                      35,
+                                      69,
+                                      103,
+                                      137,
+                                      171,
+                                      205,
+                                      239
+                                    ]
                                   }
                                 }
                               ]
@@ -8390,7 +8527,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"1032547698BADCFE\""
+                                    "value": "1032547698BADCFE"
                                   }
                                 }
                               ]
@@ -8438,7 +8575,16 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x10\\x32\\x54\\x76\\x98\\xba\\xdc\\xfe\""
+                                    "value": [
+                                      16,
+                                      50,
+                                      84,
+                                      118,
+                                      152,
+                                      186,
+                                      220,
+                                      254
+                                    ]
                                   }
                                 }
                               ]
@@ -8486,7 +8632,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x00\""
+                                    "value": "\u0000"
                                   }
                                 }
                               ]
@@ -8534,7 +8680,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x07\""
+                                    "value": "\u0007"
                                   }
                                 }
                               ]
@@ -8582,7 +8728,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"~\""
+                                    "value": "~"
                                   }
                                 }
                               ]
@@ -8630,7 +8776,7 @@
                                   "kind": "lit",
                                   "value": {
                                     "kind": "str",
-                                    "value": "b\"\\x7f\""
+                                    "value": ""
                                   }
                                 }
                               ]

@@ -129,6 +129,17 @@ fn buildSampleModel(
         .renamed_to = null,
         .attributes = &.{},
     });
+    const local_x_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = "x",
+        .span = span,
+        .visibility = .private,
+        .parent = test_dbg_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
 
     // ── Expression graph ──────────────────────────────────────────────────
     // scale body: block { tail = 7 }
@@ -159,14 +170,44 @@ fn buildSampleModel(
         },
     });
 
-    // var x = 1  (let statement inside the test-fn block)
+    // var x = 1; x = 2; x += 2; x -= 2; x *= 2; x &= 2; x |= 2; x ^= 2;
     const e_one = try model.e(litInt(1));
-    const p_bind_x = try model.pat(.{ .binding = .{ .name = "x", .mode = .{ .value = {} }, .mutable = false } });
+    const e_two = try model.e(litInt(2));
+    const e_x = try model.e(.{ .path = .{ .def = local_x_id, .generic_args = &.{} } });
+    const p_bind_x = try model.pat(.{
+        .binding = .{
+            .name = "x",
+            .mode = .{ .value = {} },
+            .mutable = true,
+        },
+    });
     const s_let_x = try model.stmt(.{
         .let = .{ .pattern = p_bind_x, .init = e_one, .ty = null },
     });
+    const assign_ops = [_]ir.exprs.AssignOp{
+        .plain,
+        .add,
+        .sub,
+        .mul,
+        .bit_and,
+        .bit_or,
+        .bit_xor,
+    };
+    var assign_stmts: [assign_ops.len]ir.exprs.NodeId = undefined;
+    for (assign_ops, 0..) |op, index| {
+        const assignment = try model.e(.{ .assign = .{
+            .target = e_x,
+            .op = op,
+            .value = e_two,
+            .overflow = .wrapping,
+        } });
+        assign_stmts[index] = try model.stmt(.{ .expr = assignment });
+    }
+    const test_statements = try alloc.alloc(ir.exprs.NodeId, 1 + assign_stmts.len);
+    test_statements[0] = s_let_x;
+    @memcpy(test_statements[1..], &assign_stmts);
     const e_test_block = try model.e(.{
-        .block = .{ .statements = &.{s_let_x}, .tail = null, .labelled = null },
+        .block = .{ .statements = test_statements, .tail = null, .labelled = null },
     });
 
     // ── Bodies ────────────────────────────────────────────────────────────
@@ -358,9 +399,26 @@ test "lowerRustIR: struct methods, hoisting, and expressions" {
     // ── Test declaration ──────────────────────────────────────────────────
     try std.testing.expectEqual(@as(usize, 1), file.tests.len);
     try std.testing.expectEqualStrings("test_dbg", file.tests[0].name);
-    try std.testing.expectEqual(@as(usize, 1), file.tests[0].body.stmts.len);
-    try std.testing.expect(file.tests[0].body.stmts[0] == .let_stmt);
-    try std.testing.expectEqualStrings("x", file.tests[0].body.stmts[0].let_stmt.name);
+    const test_stmts = file.tests[0].body.stmts;
+    try std.testing.expectEqual(@as(usize, 8), test_stmts.len);
+    try std.testing.expect(test_stmts[0] == .let_stmt);
+    try std.testing.expectEqualStrings("x", test_stmts[0].let_stmt.name);
+    const expected_ops = [_]ast.AssignOp{
+        .assign,
+        .add_assign,
+        .sub_assign,
+        .mul_assign,
+        .bit_and_assign,
+        .bit_or_assign,
+        .bit_xor_assign,
+    };
+    for (expected_ops, test_stmts[1..]) |expected_op, stmt| {
+        try std.testing.expect(stmt == .assign);
+        try std.testing.expectEqual(expected_op, stmt.assign.op);
+        try std.testing.expect(stmt.assign.target == .ident);
+        try std.testing.expectEqualStrings("x", stmt.assign.target.ident);
+        try std.testing.expectEqual(@as(i128, 2), stmt.assign.val.lit.int);
+    }
 }
 
 /// Build a model whose fn returns a non-primitive path type via a
@@ -1311,4 +1369,134 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
     }
     try std.testing.expect(saw_constructor);
     try std.testing.expect(saw_update);
+}
+test "lower: qualifies unqualified inherent static calls with Self" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const struct_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = "U32X4",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const impl_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = "U32X4",
+        .span = span,
+        .visibility = .private,
+        .parent = struct_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const new_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "new",
+        .span = span,
+        .visibility = .private,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    var model = Model.init(alloc);
+    const new_value = try model.e(litInt(0));
+    const new_body = try model.e(.{
+        .block = .{ .statements = &.{}, .tail = new_value, .labelled = null },
+    });
+    const new_call = try model.e(.{
+        .call = .{
+            .call_kind = .{ .free = new_id },
+            .args = &.{},
+        },
+    });
+    const use_new_body = try model.e(.{
+        .block = .{ .statements = &.{}, .tail = new_call, .labelled = null },
+    });
+    const methods = try alloc.dupe(ir.bodies.StructMethod, &[_]ir.bodies.StructMethod{
+        .{
+            .name = "new",
+            .ret = .{ .prim = .u32 },
+            .body = new_body,
+            .receiver = null,
+        },
+        .{
+            .name = "use_new",
+            .ret = .{ .prim = .u32 },
+            .body = use_new_body,
+            .receiver = null,
+        },
+    });
+    try model.bodies.append(model.a(), .{ .none = {} });
+    try model.bodies.append(model.a(), .{ .struct_ = .{ .methods = methods } });
+
+    const root_module = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{struct_id},
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "adler",
+        .edition = 2015,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "adler",
+        .edition = "2015",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(model.a()),
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = try model.bodies.toOwnedSlice(model.a()),
+        },
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const struct_decl = pkg.files[0].decls[0].struct_decl;
+
+    for (struct_decl.decls) |decl| {
+        if (!std.mem.eql(u8, decl.fn_decl.name, "use_new")) continue;
+        const tail = decl.fn_decl.body.?.expr.?;
+        try std.testing.expect(tail.* == .call);
+        try std.testing.expect(tail.*.call.callee.* == .field_access);
+        try std.testing.expectEqualStrings("Self", tail.*.call.callee.field_access.target.ident);
+        try std.testing.expectEqualStrings("new", tail.*.call.callee.field_access.field_name);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }

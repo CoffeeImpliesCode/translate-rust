@@ -579,6 +579,9 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
     if (init_node == null) init_node = node.childByFieldName("value");
     if (pat_node) |pn| {
         if (hasTupleStructPattern(pn)) {
+            // Keep tuple-struct bindings in scope even when the destructuring
+            // statement itself remains a value-expression fallback.
+            _ = try lowerPattern(e, pn);
             const init_expr = if (init_node) |inn|
                 try lowerExpr(e, inn)
             else
@@ -846,10 +849,17 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
             try stmt_ids.append(e.ctx.alloc, sid);
         } else if (std.mem.eql(u8, k, "return_expression")) {
             tail = try lowerExpr(e, c);
-        } else if (std.mem.eql(u8, k, "assignment_expression") or std.mem.eql(u8, k, "compound_assignment_expr")) {
-            const eid = try lowerExpr(e, c);
+        } else if (std.mem.eql(u8, k, "assignment_expression") or
+            std.mem.eql(u8, k, "compound_assignment_expr"))
+        {
+            const eid = try lowerAssignmentExpression(e, c);
             const sid: exprs.NodeId = @intCast(e.ctx.stmts.items.len);
-            try e.ctx.stmts.append(e.ctx.alloc, .{ .id = sid, .span = span_of, .ty = null, .kind = .{ .expr = eid } });
+            try e.ctx.stmts.append(e.ctx.alloc, .{
+                .id = sid,
+                .span = span_of,
+                .ty = null,
+                .kind = .{ .expr = eid },
+            });
             try stmt_ids.append(e.ctx.alloc, sid);
         } else if (is_last) {
             // Bare trailing expression (call, if, identifier, ...) → block tail.
@@ -867,6 +877,27 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
 }
 
 // ── expression lowering ─────────────────────────────────────────────────────
+
+fn lowerAssignmentExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const lhs = node.namedChild(0);
+    const rhs = if (node.namedChildCount() > 1)
+        node.namedChild(node.namedChildCount() - 1)
+    else
+        null;
+    if (lhs == null or rhs == null) return unsupported(e, "assignment operands");
+
+    const op: exprs.AssignOp = if (std.mem.eql(u8, node.kind(), "assignment_expression"))
+        .plain
+    else
+        mapAssignOp(opOf(e, node)) orelse return unsupported(e, "assignment operator");
+
+    return appendExpr(e, .{ .assign = .{
+        .target = try lowerExpr(e, lhs.?),
+        .op = op,
+        .value = try lowerExpr(e, rhs.?),
+        .overflow = .wrapping,
+    } });
+}
 fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const kind = node.kind();
 
@@ -890,10 +921,13 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     if (std.mem.eql(u8, kind, "float_literal")) {
         return lowerFloatLit(e, node);
     }
-    if (std.mem.eql(u8, kind, "char_literal")) {
+    if (std.mem.eql(u8, kind, "char_literal") or std.mem.eql(u8, kind, "byte_literal")) {
         return lowerCharLit(e, node);
     }
-    if (std.mem.eql(u8, kind, "string_literal")) {
+    if (std.mem.eql(u8, kind, "string_literal") or
+        std.mem.eql(u8, kind, "byte_string_literal") or
+        std.mem.eql(u8, kind, "raw_string_literal"))
+    {
         return lowerStrLit(e, node);
     }
     if (std.mem.eql(u8, kind, "boolean_literal")) {
@@ -932,30 +966,10 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             .rhs = try lowerExpr(e, rhs.?),
         } });
     }
-    if (std.mem.eql(u8, kind, "compound_assignment_expr")) {
-        const lhs = node.namedChild(0);
-        const rhs = node.namedChild(if (node.namedChildCount() > 2) 2 else 1);
-        if (lhs == null or rhs == null) return appendExpr(e, .{ .unit = {} });
-        const op_txt = opOf(e, node);
-        const target = try lowerExpr(e, lhs.?);
-        const value = try lowerExpr(e, rhs.?);
-        return appendExpr(e, .{ .assign = .{
-            .target = target,
-            .op = mapAssignOp(op_txt),
-            .value = value,
-            .overflow = .wrapping,
-        } });
-    }
-    if (std.mem.eql(u8, kind, "assignment_expression")) {
-        const lhs = node.namedChild(0);
-        const rhs = node.namedChild(1);
-        if (lhs == null or rhs == null) return appendExpr(e, .{ .unit = {} });
-        return appendExpr(e, .{ .assign = .{
-            .target = try lowerExpr(e, lhs.?),
-            .op = .plain,
-            .value = try lowerExpr(e, rhs.?),
-            .overflow = .wrapping,
-        } });
+    if (std.mem.eql(u8, kind, "assignment_expression") or
+        std.mem.eql(u8, kind, "compound_assignment_expr"))
+    {
+        return lowerAssignmentExpression(e, node);
     }
 
     // Calls & construction.
@@ -1099,8 +1113,102 @@ fn lowerIntLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     } } });
 }
 
+fn hexDigit(value: u8) ?u8 {
+    if (value >= '0' and value <= '9') return value - '0';
+    if (value >= 'a' and value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' and value <= 'F') return value - 'A' + 10;
+    return null;
+}
+
+fn decodeEscapedBytes(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < body.len) {
+        const current = body[i];
+        if (current != '\\') {
+            try bytes.append(allocator, current);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= body.len) return error.InvalidLiteral;
+        const escaped = body[i];
+        switch (escaped) {
+            'n' => try bytes.append(allocator, '\n'),
+            'r' => try bytes.append(allocator, '\r'),
+            't' => try bytes.append(allocator, '\t'),
+            '0' => try bytes.append(allocator, 0),
+            '\\' => try bytes.append(allocator, '\\'),
+            '"' => try bytes.append(allocator, '"'),
+            '\'' => try bytes.append(allocator, '\''),
+            'x' => {
+                if (i + 2 >= body.len) return error.InvalidLiteral;
+                const high = hexDigit(body[i + 1]) orelse return error.InvalidLiteral;
+                const low = hexDigit(body[i + 2]) orelse return error.InvalidLiteral;
+                try bytes.append(allocator, high * 16 + low);
+                i += 2;
+            },
+            '\n' => {},
+            '\r' => {
+                if (i + 1 < body.len and body[i + 1] == '\n') i += 1;
+            },
+            else => return error.InvalidLiteral,
+        }
+        i += 1;
+    }
+    return bytes.toOwnedSlice(allocator);
+}
+
+fn decodeRawBytes(allocator: std.mem.Allocator, raw: []const u8, prefix_len: usize) !?[]const u8 {
+    var marker = prefix_len;
+    var hash_count: usize = 0;
+    while (marker < raw.len and raw[marker] == '#') : (marker += 1) {
+        hash_count += 1;
+    }
+    if (marker >= raw.len or raw[marker] != '"') return null;
+    const body_start = marker + 1;
+    if (raw.len < body_start + hash_count + 1) return null;
+    const close_start = raw.len - hash_count - 1;
+    if (close_start < body_start or raw[close_start] != '"') return null;
+    var i: usize = 0;
+    while (i < hash_count) : (i += 1) {
+        if (raw[close_start + 1 + i] != '#') return null;
+    }
+    return try allocator.dupe(u8, raw[body_start..close_start]);
+}
+
+/// Decode Rust byte strings (`b"..."`, `br#"..."#`) and byte characters.
+/// A null result means that `raw` is not a byte literal.
+fn decodeRustByteLiteral(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    if (std.mem.startsWith(u8, raw, "br")) return decodeRawBytes(allocator, raw, 2);
+    if (!std.mem.startsWith(u8, raw, "b")) return null;
+    const prefix_len: usize = 1;
+    if (prefix_len >= raw.len) return null;
+
+    const quote = raw[prefix_len];
+    if (quote == '\'') {
+        if (raw.len < prefix_len + 3 or raw[raw.len - 1] != '\'') return null;
+        const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+        if (bytes.len == 1) return bytes;
+        allocator.free(bytes);
+        return null;
+    }
+    if (quote != '"' or raw.len < prefix_len + 2 or raw[raw.len - 1] != '"') return null;
+    return try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+}
+
 fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const raw = text(e, node);
+    const kind = node.kind();
+    const is_byte = std.mem.eql(u8, kind, "byte_string_literal") or
+        std.mem.startsWith(u8, raw, "b");
+    const decoded = decodeRustByteLiteral(e.ctx.alloc, raw) catch return unsupported(e, "invalid byte literal");
+    if (decoded) |bytes| {
+        return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
+    }
+    if (is_byte) return unsupported(e, "invalid byte literal");
     var s = raw;
     if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
     return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = try e.ctx.alloc.dupe(u8, s) } } });
@@ -1116,6 +1224,13 @@ fn lowerFloatLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
 fn lowerCharLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const t = text(e, node);
+    const is_byte = std.mem.eql(u8, node.kind(), "byte_literal") or
+        std.mem.startsWith(u8, t, "b");
+    const decoded = decodeRustByteLiteral(e.ctx.alloc, t) catch return unsupported(e, "invalid byte literal");
+    if (decoded) |bytes| {
+        return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
+    }
+    if (is_byte) return unsupported(e, "invalid byte literal");
     var val: u32 = 0;
     if (t.len >= 3 and t[0] == '\'' and t[t.len - 1] == '\'') {
         val = t[1];
@@ -1496,8 +1611,21 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         } } });
     }
 
-    if (std.mem.eql(u8, kind, "string_literal")) {
+    if (std.mem.eql(u8, kind, "string_literal") or
+        std.mem.eql(u8, kind, "byte_string_literal") or
+        std.mem.eql(u8, kind, "byte_literal") or
+        std.mem.eql(u8, kind, "raw_string_literal"))
+    {
         const raw = text(e, node);
+        const is_byte = std.mem.eql(u8, kind, "byte_string_literal") or
+            std.mem.eql(u8, kind, "byte_literal") or
+            std.mem.startsWith(u8, raw, "b");
+        const decoded = decodeRustByteLiteral(e.ctx.alloc, raw) catch
+            return appendPat(e, .{ .wildcard = {} });
+        if (decoded) |bytes| {
+            return appendPat(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
+        }
+        if (is_byte) return appendPat(e, .{ .wildcard = {} });
         var s = raw;
         if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
         return appendPat(e, .{ .literal = .{ .string = .{ .bytes = try e.ctx.alloc.dupe(u8, s) } } });
@@ -1858,8 +1986,8 @@ fn mapBinaryOp(op: []const u8) ?exprs.BinaryOp {
     return null;
 }
 
-fn mapAssignOp(op: []const u8) exprs.AssignOp {
-    if (op.len == 0) return .plain;
+fn mapAssignOp(op: []const u8) ?exprs.AssignOp {
+    if (op.len == 0) return null;
     const base = if (op[op.len - 1] == '=') op[0 .. op.len - 1] else op;
     if (std.mem.eql(u8, base, "+")) return .add;
     if (std.mem.eql(u8, base, "-")) return .sub;
@@ -1871,7 +1999,7 @@ fn mapAssignOp(op: []const u8) exprs.AssignOp {
     if (std.mem.eql(u8, base, "^")) return .bit_xor;
     if (std.mem.eql(u8, base, "<<")) return .shl;
     if (std.mem.eql(u8, base, ">>")) return .shr;
-    return .plain;
+    return null;
 }
 
 fn unsupported(e: *Ext, reason: []const u8) anyerror!exprs.NodeId {
@@ -2334,7 +2462,16 @@ test "lower built-in macro invocations in fn bodies" {
     } });
 
     const src =
-        \\fn check() {
+        \\fn check(mut self) {
+        \\    let mut x = 0;
+        \\    x = 1;
+        \\    x += 2;
+        \\    x *= 3;
+        \\    x ^= 4;
+        \\    x &= 5;
+        \\    x |= 6;
+        \\    x -= 7;
+        \\    self.0 = 8;
         \\    assert!(true);
         \\    assert_eq!(1 + 1, 2);
         \\    assert_ne!(a, b);
@@ -2367,8 +2504,29 @@ test "lower built-in macro invocations in fn bodies" {
     var found_unsupported = false;
     var found_assert_marker = false;
     var found_debug_assert_ge = false;
+    const expected_assign_ops = [_]exprs.AssignOp{
+        .plain,
+        .add,
+        .mul,
+        .bit_xor,
+        .bit_and,
+        .bit_or,
+        .sub,
+        .plain,
+    };
+    var assign_count: usize = 0;
     for (exprs_list.items) |ex| {
         switch (ex.kind) {
+            .assign => |assignment| {
+                try std.testing.expect(assign_count < expected_assign_ops.len);
+                try std.testing.expectEqual(expected_assign_ops[assign_count], assignment.op);
+                if (assign_count == expected_assign_ops.len - 1) {
+                    const target = exprs_list.items[assignment.target];
+                    try std.testing.expect(target.kind == .field);
+                    try std.testing.expectEqualStrings("0", target.kind.field.field);
+                }
+                assign_count += 1;
+            },
             .binary => |b| {
                 if (b.op == .eq) found_eq = true;
                 if (b.op == .ne) found_ne = true;
@@ -2387,6 +2545,16 @@ test "lower built-in macro invocations in fn bodies" {
             else => {},
         }
     }
+    try std.testing.expectEqual(expected_assign_ops.len, assign_count);
+    // The block statement table must reference every lowered assignment.
+    var statement_assign_count: usize = 0;
+    for (stmts_list.items) |statement| {
+        if (statement.kind != .expr) continue;
+        const expr_id = statement.kind.expr;
+        if (expr_id >= exprs_list.items.len) continue;
+        if (exprs_list.items[expr_id].kind == .assign) statement_assign_count += 1;
+    }
+    try std.testing.expectEqual(expected_assign_ops.len, statement_assign_count);
     try std.testing.expect(found_eq); // assert_eq! → .eq binary
     try std.testing.expect(found_ne); // assert_ne! → .ne binary
     try std.testing.expect(found_byte_array); // vec![1,2,3] → byte_array literal

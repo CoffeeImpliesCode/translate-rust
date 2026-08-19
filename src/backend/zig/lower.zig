@@ -32,6 +32,11 @@ const Lowerer = struct {
     strat: strategy.LoweringStrategy,
     def_strat_inst: default_strat.DefaultStrategy = .{},
     current_module_id: ?ir.spine.EntityId = null,
+    /// The inherent struct/enum/union whose method body is being lowered.
+    current_struct_id: ?ir.spine.EntityId = null,
+    /// An explicit floating-point function result supplies the expected type
+    /// for nested arithmetic whose operands lack inferred type metadata.
+    float_context: bool = false,
 
     /// Map from target struct/enum EntityId to hoisted method declarations
     hoisted_by_id: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.ArrayListUnmanaged(ast.Decl)) = .empty,
@@ -245,6 +250,75 @@ const Lowerer = struct {
         return null;
     }
 
+    /// Return the generated source path for a module. The Rust module ancestry
+    /// forms the directory hierarchy so equal leaf names under different
+    /// parents cannot collide.
+    fn moduleFilePath(self: *Lowerer, module: ir.graph.Module) ![]const u8 {
+        if (module.kind == .root or module.is_crate) {
+            return self.alloc.dupe(u8, "src/root.zig");
+        }
+
+        var components: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer components.deinit(self.alloc);
+
+        var current = module;
+        var remaining = self.ir.graph.modules.items.len + 1;
+        while (current.kind != .root and !current.is_crate) {
+            if (remaining == 0) return error.ModuleHierarchyCycle;
+            remaining -= 1;
+
+            if (current.name.len > 0) {
+                try components.append(self.alloc, current.name);
+            }
+            const parent_id = current.parent orelse break;
+            current = self.moduleForEntity(parent_id) orelse {
+                return error.ModuleParentMissing;
+            };
+        }
+
+        if (components.items.len == 0) {
+            return self.alloc.dupe(u8, "src/root.zig");
+        }
+
+        var path: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer path.deinit(self.alloc);
+        try path.appendSlice(self.alloc, "src/");
+
+        var index = components.items.len;
+        while (index > 0) {
+            index -= 1;
+            try path.appendSlice(self.alloc, components.items[index]);
+            if (index > 0) try path.append(self.alloc, '/');
+        }
+        try path.appendSlice(self.alloc, ".zig");
+        return path.toOwnedSlice(self.alloc);
+    }
+
+    /// Return the target module path relative to the importing module file.
+    fn moduleImportPath(
+        self: *Lowerer,
+        importing_module: ir.graph.Module,
+        target_module: ir.graph.Module,
+    ) ![]const u8 {
+        const importing_path = try self.moduleFilePath(importing_module);
+        defer self.alloc.free(importing_path);
+        const target_path = try self.moduleFilePath(target_module);
+        defer self.alloc.free(target_path);
+
+        const importing_dir = std.fs.path.dirname(importing_path) orelse ".";
+        const relative_path = try std.fs.path.relativePosix(
+            self.alloc,
+            ".",
+            importing_dir,
+            target_path,
+        );
+        if (relative_path.len > 0 and relative_path[0] == '.') {
+            return relative_path;
+        }
+        defer self.alloc.free(relative_path);
+        return std.fmt.allocPrint(self.alloc, "./{s}", .{relative_path});
+    }
+
     /// Add the import required by a sibling path or call.
     fn appendUseSiblingImport(
         self: *Lowerer,
@@ -265,7 +339,8 @@ const Lowerer = struct {
 
         const parent_module = self.moduleForEntity(parent_id) orelse return;
         if (parent_module.name.len == 0 or parent_module.is_extern) return;
-        const module_path = try std.fmt.allocPrint(self.alloc, "./{s}.zig", .{parent_module.name});
+        const current_module = self.moduleForEntity(current_mod_id) orelse return;
+        const module_path = try self.moduleImportPath(current_module, parent_module);
         defer self.alloc.free(module_path);
         const parent_entity = self.ir.graph.symbol_table.get(parent_id) orelse return;
         try self.appendImport(
@@ -284,6 +359,61 @@ const Lowerer = struct {
             current = entity.parent;
         }
         return null;
+    }
+
+    /// Return the nominal type that owns an inherent method entity.
+    fn inherentStructForEntity(
+        self: *const Lowerer,
+        entity_id: ir.spine.EntityId,
+    ) ?ir.spine.EntityId {
+        const entity = self.ir.graph.symbol_table.get(entity_id) orelse return null;
+        if (entity.kind != .fn_) return null;
+
+        var parent_id = entity.parent;
+        while (parent_id) |id| {
+            const parent = self.ir.graph.symbol_table.get(id) orelse return null;
+            switch (parent.kind) {
+                .struct_, .enum_, .union_ => return id,
+                .impl_ => {
+                    // An impl whose name contains " for " is a trait impl.
+                    // Trait methods are not inherent members of the target.
+                    if (std.mem.indexOf(u8, parent.name, " for ") != null) return null;
+                    const target_id = parent.parent orelse return null;
+                    const target = self.ir.graph.symbol_table.get(target_id) orelse return null;
+                    switch (target.kind) {
+                        .struct_, .enum_, .union_ => return target_id,
+                        else => parent_id = target.parent,
+                    }
+                },
+                else => parent_id = parent.parent,
+            }
+        }
+        return null;
+    }
+
+    /// Qualify an inherent method with its type namespace. Methods called from
+    /// their own struct use `Self`; calls from another scope use the type name.
+    fn qualifyInherentMethod(
+        self: *Lowerer,
+        entity_id: ir.spine.EntityId,
+        resolved: ast.Expr,
+    ) !ast.Expr {
+        const owner_id = self.inherentStructForEntity(entity_id) orelse return resolved;
+        const owner = self.ir.graph.symbol_table.get(owner_id) orelse return resolved;
+        const owner_name = owner.renamed_to orelse owner.name;
+        const target_name = if (self.current_struct_id) |current_id|
+            if (current_id == owner_id) "Self" else owner_name
+        else
+            owner_name;
+        const entity = self.ir.graph.symbol_table.get(entity_id) orelse return resolved;
+        const name = entity.renamed_to orelse entity.name;
+        const target = try self.allocExpr(.{
+            .ident = try self.alloc.dupe(u8, target_name),
+        });
+        return ast.Expr{ .field_access = .{
+            .target = target,
+            .field_name = try self.alloc.dupe(u8, name),
+        } };
     }
 
     /// Emit a resolved entity as a bare name in its module, or as
@@ -330,7 +460,8 @@ const Lowerer = struct {
         const parent_module = self.moduleForEntity(parent_id) orelse return;
         if (parent_module.name.len == 0 or parent_module.is_extern) return;
         const parent_entity = self.ir.graph.symbol_table.get(parent_id) orelse return;
-        const module_path = try std.fmt.allocPrint(self.alloc, "./{s}.zig", .{parent_module.name});
+        const current_module = self.moduleForEntity(current_mod_id) orelse return;
+        const module_path = try self.moduleImportPath(current_module, parent_module);
         defer self.alloc.free(module_path);
         try self.appendImport(
             imports,
@@ -341,12 +472,7 @@ const Lowerer = struct {
     }
 
     fn lowerModule(self: *Lowerer, mod: ir.graph.Module) !ast.File {
-        const file_path = if (mod.kind == .root or mod.is_crate)
-            try self.alloc.dupe(u8, "src/root.zig")
-        else if (mod.name.len > 0)
-            try std.fmt.allocPrint(self.alloc, "src/{s}.zig", .{mod.name})
-        else
-            try self.alloc.dupe(u8, "src/root.zig");
+        const file_path = try self.moduleFilePath(mod);
 
         const current_mod_id = self.moduleEntityId(mod) orelse mod.id;
 
@@ -365,11 +491,7 @@ const Lowerer = struct {
 
             if (ent.kind == .module) {
                 const child_mod = self.moduleForEntity(item_id) orelse continue;
-                const module_path = try std.fmt.allocPrint(
-                    self.alloc,
-                    "./{s}.zig",
-                    .{child_mod.name},
-                );
+                const module_path = try self.moduleImportPath(mod, child_mod);
                 defer self.alloc.free(module_path);
                 try self.appendImport(
                     &imports_list,
@@ -502,6 +624,9 @@ const Lowerer = struct {
 
         switch (ent.kind) {
             .struct_ => {
+                const previous_struct_id = self.current_struct_id;
+                self.current_struct_id = entity_id;
+                defer self.current_struct_id = previous_struct_id;
                 var fields_list: std.ArrayListUnmanaged(ast.StructField) = .empty;
                 var inner_decls: std.ArrayListUnmanaged(ast.Decl) = .empty;
                 var generic_params_list: std.ArrayListUnmanaged(ast.GenericParam) = .empty;
@@ -838,6 +963,9 @@ const Lowerer = struct {
         const previous_module_id = self.current_module_id;
         self.current_module_id = self.owningModuleEntity(entity_id) orelse previous_module_id;
         defer self.current_module_id = previous_module_id;
+        const previous_struct_id = self.current_struct_id;
+        self.current_struct_id = self.inherentStructForEntity(entity_id) orelse previous_struct_id;
+        defer self.current_struct_id = previous_struct_id;
         const is_pub = switch (ent.visibility) {
             .public => true,
             else => false,
@@ -880,6 +1008,9 @@ const Lowerer = struct {
                 else
                     fb.ret;
                 ret_type = try self.lowerType(effective_ret);
+                const previous_float_context = self.float_context;
+                self.float_context = isFloatType(effective_ret);
+                defer self.float_context = previous_float_context;
 
                 if (fb.body < self.ir.bodies.exprs.len) {
                     const expr_node = self.ir.bodies.exprs[fb.body];
@@ -1046,9 +1177,14 @@ const Lowerer = struct {
         if (id >= self.ir.bodies.exprs.len) return null;
         const e = self.ir.bodies.exprs[id];
         if (e.ty) |ty_id| {
-            if (ty_id < self.ir.types.len) {
-                const ct = self.ir.types[ty_id];
-                if (ct != .unsupported) return ct;
+            const ct: ?ir.types.Type = if (ty_id < self.ir.types.len)
+                self.ir.types[ty_id]
+            else if (ty_id < self.ir.bodies.types.len)
+                self.ir.bodies.types[ty_id]
+            else
+                null;
+            if (ct) |resolved| {
+                if (resolved != .unsupported) return resolved;
             }
         }
         return switch (e.kind) {
@@ -1081,16 +1217,19 @@ const Lowerer = struct {
             .eq, .ne, .lt, .le, .gt, .ge, .boolean_and, .boolean_or => .{ .prim = .bool },
             else => blk: {
                 const lt = self.exprType(b.lhs);
-                if (lt) |t| {
-                    if (t == .prim and (t.prim == .f32 or t.prim == .f64)) break :blk t;
-                }
+                if (isFloatType(lt)) break :blk lt;
                 const rt = self.exprType(b.rhs);
-                if (rt) |t| {
-                    if (t == .prim and (t.prim == .f32 or t.prim == .f64)) break :blk t;
-                }
+                if (isFloatType(rt)) break :blk rt;
                 break :blk if (lt) |t| t else rt;
             },
         };
+    }
+
+    /// True for a resolved f32/f64 type. Float arithmetic must never use
+    /// integer wrapping operators, even when the source overflow mode is
+    /// `.wrapping`.
+    fn isFloatType(t: ?ir.types.Type) bool {
+        return if (t) |ty| ty == .prim and (ty.prim == .f32 or ty.prim == .f64) else false;
     }
 
     fn lowerStructMethod(
@@ -1165,6 +1304,9 @@ const Lowerer = struct {
             self_type
         else
             try self.lowerType(m.ret);
+        const previous_float_context = self.float_context;
+        self.float_context = isFloatType(m.ret);
+        defer self.float_context = previous_float_context;
 
         var fn_block: ?ast.Block = null;
         if (m.body < self.ir.bodies.exprs.len) {
@@ -1261,6 +1403,9 @@ const Lowerer = struct {
         const previous_module_id = self.current_module_id;
         self.current_module_id = self.owningModuleEntity(entity_id) orelse previous_module_id;
         defer self.current_module_id = previous_module_id;
+        const previous_struct_id = self.current_struct_id;
+        self.current_struct_id = self.inherentStructForEntity(entity_id) orelse previous_struct_id;
+        defer self.current_struct_id = previous_struct_id;
         const body_kind = if (entity_id < self.ir.bodies.bodies.len)
             self.ir.bodies.bodies[entity_id]
         else
@@ -1924,7 +2069,8 @@ const Lowerer = struct {
                     }
                 }
 
-                const callee_expr = try self.lowerResolvedEntity(callee_def);
+                const resolved_callee = try self.lowerResolvedEntity(callee_def);
+                const callee_expr = try self.qualifyInherentMethod(callee_def, resolved_callee);
                 var args = try self.alloc.alloc(ast.Expr, c.args.len);
                 for (c.args, 0..) |arg_id, i| {
                     args[i] = try self.lowerExpr(arg_id);
@@ -2039,20 +2185,24 @@ const Lowerer = struct {
                 };
             },
             .binary => |be| blk: {
+                const uses_float = self.float_context or isFloatType(self.binopResultType(be));
+                const previous_float_context = self.float_context;
+                self.float_context = uses_float;
+                defer self.float_context = previous_float_context;
                 const lhs = try self.allocExpr(try self.lowerExpr(be.lhs));
                 const rhs = try self.allocExpr(try self.lowerExpr(be.rhs));
                 const op_kind: ast.BinOpKind = switch (be.op) {
-                    .add => switch (be.overflow) {
+                    .add => if (uses_float) .add else switch (be.overflow) {
                         .checked => .add,
                         .wrapping => .add_wrap,
                         .saturating => .add_sat,
                     },
-                    .sub => switch (be.overflow) {
+                    .sub => if (uses_float) .sub else switch (be.overflow) {
                         .checked => .sub,
                         .wrapping => .sub_wrap,
                         .saturating => .sub_sat,
                     },
-                    .mul => switch (be.overflow) {
+                    .mul => if (uses_float) .mul else switch (be.overflow) {
                         .checked => .mul,
                         .wrapping => .mul_wrap,
                         .saturating => .add,
@@ -2188,6 +2338,33 @@ const Lowerer = struct {
                 };
             },
             .expr => |e_id| blk: {
+                if (e_id < self.ir.bodies.exprs.len) {
+                    switch (self.ir.bodies.exprs[e_id].kind) {
+                        .assign => |assignment| {
+                            const target = try self.lowerExpr(assignment.target);
+                            const val = try self.lowerExpr(assignment.value);
+                            const op: ast.AssignOp = switch (assignment.op) {
+                                .plain => .assign,
+                                .add => .add_assign,
+                                .sub => .sub_assign,
+                                .mul => .mul_assign,
+                                .div => .div_assign,
+                                .rem => .mod_assign,
+                                .bit_and => .bit_and_assign,
+                                .bit_or => .bit_or_assign,
+                                .bit_xor => .bit_xor_assign,
+                                .shl => .shl_assign,
+                                .shr => .shr_assign,
+                            };
+                            break :blk ast.Stmt{ .assign = .{
+                                .target = target,
+                                .val = val,
+                                .op = op,
+                            } };
+                        },
+                        else => {},
+                    }
+                }
                 const expr_ptr = try self.allocExpr(try self.lowerExpr(e_id));
                 break :blk ast.Stmt{ .expr_stmt = expr_ptr };
             },

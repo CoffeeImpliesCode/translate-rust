@@ -572,19 +572,58 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     return unsupported(e, "expression");
 }
 
+const int_suffixes = [_][]const u8{
+    "i128",  "i64",   "i32", "i16", "i8",
+    "u128",  "u64",   "u32", "u16", "u8",
+    "isize", "usize",
+};
+
+const ParsedInt = struct {
+    body: []const u8,
+    base: u8,
+    value: i128,
+    suffix: []const u8,
+};
+
+fn parseIntText(raw: []const u8) ?ParsedInt {
+    var body = raw;
+    for (int_suffixes) |suffix| {
+        if (raw.len > suffix.len and std.mem.endsWith(u8, raw, suffix)) {
+            const prefix = raw[0 .. raw.len - suffix.len];
+            if (prefix.len > 0 and (std.ascii.isDigit(prefix[prefix.len - 1]) or prefix[prefix.len - 1] == '_')) {
+                body = prefix;
+                break;
+            }
+        }
+    }
+    if (body.len == 0) return null;
+    const base: u8 = if (body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X'))
+        16
+    else if (body.len > 2 and body[0] == '0' and (body[1] == 'b' or body[1] == 'B'))
+        2
+    else if (body.len > 2 and (body[0] == '0' and (body[1] == 'o' or body[1] == 'O')))
+        8
+    else
+        10;
+    const digits = if (base != 10) body[2..] else body;
+    const value = std.fmt.parseInt(i128, digits, base) catch return null;
+    return .{
+        .body = body,
+        .base = base,
+        .value = value,
+        .suffix = raw[body.len..],
+    };
+}
+
 fn lowerIntLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const t = text(e, node);
-    const body = t;
-    var base: u8 = 10;
-    if (body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X')) base = 16;
-    if (body.len > 2 and body[0] == '0' and (body[1] == 'b' or body[1] == 'B')) base = 2;
-    if (body.len > 2 and body[0] == '0' and (body[1] == 'o' or body[1] == 'O')) base = 8;
-    const value = std.fmt.parseInt(i128, body, base) catch 0;
+    const parsed = parseIntText(t) orelse return unsupported(e, "integer literal");
+    const suffix = if (parsed.suffix.len == 0) null else try e.ctx.alloc.dupe(u8, parsed.suffix);
     return appendExpr(e, .{ .literal = .{ .int = .{
         .text = try e.ctx.alloc.dupe(u8, t),
-        .value = value,
-        .base = if (base == 16) .hex else if (base == 2) .bin else if (base == 8) .oct else .dec,
-        .ty_suffix = null,
+        .value = parsed.value,
+        .base = if (parsed.base == 16) .hex else if (parsed.base == 2) .bin else if (parsed.base == 8) .oct else .dec,
+        .ty_suffix = suffix,
     } } });
 }
 
@@ -943,16 +982,13 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     if (std.mem.eql(u8, kind, "integer_literal")) {
         const t = text(e, node);
-        var base: u8 = 10;
-        if (t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X')) base = 16;
-        if (t.len > 2 and t[0] == '0' and (t[1] == 'b' or t[1] == 'B')) base = 2;
-        if (t.len > 2 and t[0] == '0' and (t[1] == 'o' or t[1] == 'O')) base = 8;
-        const value = std.fmt.parseInt(i128, t, base) catch 0;
+        const parsed = parseIntText(t) orelse return appendPat(e, .{ .wildcard = {} });
+        const suffix = if (parsed.suffix.len == 0) null else try e.ctx.alloc.dupe(u8, parsed.suffix);
         return appendPat(e, .{ .literal = .{ .int = .{
             .text = try e.ctx.alloc.dupe(u8, t),
-            .value = value,
-            .base = if (base == 16) .hex else if (base == 2) .bin else if (base == 8) .oct else .dec,
-            .ty_suffix = null,
+            .value = parsed.value,
+            .base = if (parsed.base == 16) .hex else if (parsed.base == 2) .bin else if (parsed.base == 8) .oct else .dec,
+            .ty_suffix = suffix,
         } } });
     }
 
@@ -1512,6 +1548,7 @@ test "lower built-in macro invocations in fn bodies" {
         \\    panic!("boom");
         \\    unreachable!();
         \\    let v = vec![1, 2, 3];
+        \\    let n = 0x1u64;
         \\}
     ;
     var ctx: Ctx = .{
@@ -1533,6 +1570,7 @@ test "lower built-in macro invocations in fn bodies" {
     var found_eq = false;
     var found_ne = false;
     var found_byte_array = false;
+    var found_suffixed_u64 = false;
     var found_unsupported = false;
     for (exprs_list.items) |ex| {
         switch (ex.kind) {
@@ -1540,8 +1578,10 @@ test "lower built-in macro invocations in fn bodies" {
                 if (b.op == .eq) found_eq = true;
                 if (b.op == .ne) found_ne = true;
             },
-            .literal => |l| {
-                if (l == .byte_array) found_byte_array = true;
+            .literal => |l| switch (l) {
+                .byte_array => found_byte_array = true,
+                .int => |int| found_suffixed_u64 = std.mem.eql(u8, int.ty_suffix orelse "", "u64"),
+                else => {},
             },
             .unsupported => found_unsupported = true,
             else => {},
@@ -1550,6 +1590,7 @@ test "lower built-in macro invocations in fn bodies" {
     try std.testing.expect(found_eq); // assert_eq! → .eq binary
     try std.testing.expect(found_ne); // assert_ne! → .ne binary
     try std.testing.expect(found_byte_array); // vec![1,2,3] → byte_array literal
+    try std.testing.expect(found_suffixed_u64); // 0x1u64 preserves its authoritative suffix
     try std.testing.expect(found_unsupported); // panic!/unreachable!/unresolved → .unsupported
 }
 

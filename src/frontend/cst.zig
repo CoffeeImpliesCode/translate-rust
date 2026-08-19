@@ -688,19 +688,107 @@ fn arrayElemTy(ty: types.Type) ?types.Type {
     };
 }
 
-/// Lower a string / byte-string const literal (handles `"..."` and `b"..."`,
-/// which tree-sitter-rust reports as `string_literal`). Bytes are the decoded
-/// content without the delimiters / `b` prefix.
+fn hexDigit(value: u8) ?u8 {
+    if (value >= '0' and value <= '9') return value - '0';
+    if (value >= 'a' and value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' and value <= 'F') return value - 'A' + 10;
+    return null;
+}
+
+fn decodeEscapedBytes(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < body.len) {
+        const current = body[i];
+        if (current != '\\') {
+            try bytes.append(allocator, current);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= body.len) return error.InvalidLiteral;
+        const escaped = body[i];
+        switch (escaped) {
+            'n' => try bytes.append(allocator, '\n'),
+            'r' => try bytes.append(allocator, '\r'),
+            't' => try bytes.append(allocator, '\t'),
+            '0' => try bytes.append(allocator, 0),
+            '\\' => try bytes.append(allocator, '\\'),
+            '"' => try bytes.append(allocator, '"'),
+            '\'' => try bytes.append(allocator, '\''),
+            'x' => {
+                if (i + 2 >= body.len) return error.InvalidLiteral;
+                const high = hexDigit(body[i + 1]) orelse return error.InvalidLiteral;
+                const low = hexDigit(body[i + 2]) orelse return error.InvalidLiteral;
+                try bytes.append(allocator, high * 16 + low);
+                i += 2;
+            },
+            '\n' => {},
+            '\r' => {
+                if (i + 1 < body.len and body[i + 1] == '\n') i += 1;
+            },
+            else => return error.InvalidLiteral,
+        }
+        i += 1;
+    }
+    return bytes.toOwnedSlice(allocator);
+}
+
+fn decodeRawBytes(allocator: std.mem.Allocator, raw: []const u8, prefix_len: usize) !?[]const u8 {
+    var marker = prefix_len;
+    var hash_count: usize = 0;
+    while (marker < raw.len and raw[marker] == '#') : (marker += 1) {
+        hash_count += 1;
+    }
+    if (marker >= raw.len or raw[marker] != '"') return null;
+    const body_start = marker + 1;
+    if (raw.len < body_start + hash_count + 1) return null;
+    const close_start = raw.len - hash_count - 1;
+    if (close_start < body_start or raw[close_start] != '"') return null;
+    var i: usize = 0;
+    while (i < hash_count) : (i += 1) {
+        if (raw[close_start + 1 + i] != '#') return null;
+    }
+    return try allocator.dupe(u8, raw[body_start..close_start]);
+}
+
+/// Decode Rust byte strings (`b"..."`, `br#"..."#`) and byte characters.
+/// A null result means that `raw` is not a byte literal.
+fn decodeRustByteLiteral(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    if (std.mem.startsWith(u8, raw, "br")) return decodeRawBytes(allocator, raw, 2);
+    if (!std.mem.startsWith(u8, raw, "b")) return null;
+    const prefix_len: usize = 1;
+    if (prefix_len >= raw.len) return null;
+
+    const quote = raw[prefix_len];
+    if (quote == '\'') {
+        if (raw.len < prefix_len + 3 or raw[raw.len - 1] != '\'') return null;
+        const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+        if (bytes.len == 1) return bytes;
+        allocator.free(bytes);
+        return null;
+    }
+    if (quote != '"' or raw.len < prefix_len + 2 or raw[raw.len - 1] != '"') return null;
+    return try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+}
+
+/// Lower a string / byte-string const literal. Bytes are decoded before they
+/// enter the IR, so the emitter never sees Rust prefixes or escape sequences.
 fn lowerConstString(e: *Ctx, node: ts.Node) ?exprs.NodeId {
     const raw = text(e, node);
-    const is_bytes = raw.len >= 2 and raw[0] == 'b' and (raw[1] == '"' or raw[1] == 'r');
-    var s = raw;
-    if (is_bytes) s = s[1..];
-    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
-    const bytes = e.alloc.dupe(u8, s) catch return null;
-    if (is_bytes) {
+    const kind = node.kind();
+    const is_byte = std.mem.eql(u8, kind, "byte_string_literal") or
+        std.mem.eql(u8, kind, "byte_literal") or
+        std.mem.startsWith(u8, raw, "b");
+    if (decodeRustByteLiteral(e.alloc, raw) catch null) |bytes| {
         return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } }) catch null;
     }
+    if (is_byte) return null;
+    var s = raw;
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
+    const bytes = e.alloc.dupe(u8, s) catch return null;
     return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = bytes } } }) catch null;
 }
 
@@ -886,8 +974,13 @@ fn lowerConstInit(e: *Ctx, node: ts.Node) ?exprs.NodeId {
             .value = std.fmt.parseFloat(f64, t) catch 0.0,
         } } }) catch null;
     }
-    if (std.mem.eql(u8, kind, "char_literal")) {
+    if (std.mem.eql(u8, kind, "char_literal") or std.mem.eql(u8, kind, "byte_literal")) {
         const t = text(e, node);
+        const is_byte = std.mem.eql(u8, kind, "byte_literal") or std.mem.startsWith(u8, t, "b");
+        if (decodeRustByteLiteral(e.alloc, t) catch null) |bytes| {
+            return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } }) catch null;
+        }
+        if (is_byte) return null;
         var val: u32 = 0;
         if (t.len >= 3 and t[0] == '\'' and t[t.len - 1] == '\'') val = t[1];
         return appendExpr(e, .{ .literal = .{ .character = .{
@@ -898,7 +991,10 @@ fn lowerConstInit(e: *Ctx, node: ts.Node) ?exprs.NodeId {
     if (std.mem.eql(u8, kind, "boolean_literal")) {
         return appendExpr(e, .{ .literal = .{ .boolean = std.mem.eql(u8, text(e, node), "true") } }) catch null;
     }
-    if (std.mem.eql(u8, kind, "string_literal") or std.mem.eql(u8, kind, "byte_string_literal")) {
+    if (std.mem.eql(u8, kind, "string_literal") or
+        std.mem.eql(u8, kind, "byte_string_literal") or
+        std.mem.eql(u8, kind, "raw_string_literal"))
+    {
         return lowerConstString(e, node);
     }
     return null;
@@ -1364,6 +1460,24 @@ fn extractPathAttr(e: *const Ctx, item: ts.Node) ?[]const u8 {
     return null;
 }
 
+/// Derive the directory used to resolve a file module's children from the
+/// module file that was actually selected. `mod.rs` keeps its containing
+/// directory; every other file gets a sibling directory named after the
+/// module. This preserves nested layouts for both conventional and
+/// `#[path = "..."]` modules.
+fn childModuleBaseDir(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    module_name: []const u8,
+) ![]const u8 {
+    const source_dir = std.fs.path.dirname(source_path) orelse ".";
+    const source_name = std.fs.path.basename(source_path);
+    if (std.mem.eql(u8, source_name, "mod.rs")) {
+        return allocator.dupe(u8, source_dir);
+    }
+    return std.fs.path.join(allocator, &.{ source_dir, module_name });
+}
+
 /// Register a `macro_rules! name { … }` definition into the shared macro
 /// table so item-level invocations can be expanded later in this pass.
 fn registerMacroDefinition(e: *Ctx, item: ts.Node) !void {
@@ -1482,8 +1596,6 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                                 sub_path = try e.alloc.dupe(u8, cand);
                             } else |_| {}
                         }
-                        const custom_parent = std.fs.path.dirname(cand) orelse bdir;
-                        sub_base_dir = try std.fs.path.join(e.alloc, &.{ custom_parent, mname });
                     } else {
                         const rs_name = try std.fmt.allocPrint(e.alloc, "{s}.rs", .{mname});
                         defer e.alloc.free(rs_name);
@@ -1491,7 +1603,6 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                         defer e.alloc.free(cand1);
                         const cand2 = try std.fs.path.join(e.alloc, &.{ bdir, mname, "mod.rs" });
                         defer e.alloc.free(cand2);
-                        sub_base_dir = try std.fs.path.join(e.alloc, &.{ bdir, mname });
                         if (e.io) |io| {
                             var dir = std.Io.Dir.cwd();
                             if (dir.openFile(io, cand1, .{})) |f| {
@@ -1505,6 +1616,9 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                                 } else |_| {}
                             }
                         }
+                    }
+                    if (sub_path) |resolved_path| {
+                        sub_base_dir = try childModuleBaseDir(e.alloc, resolved_path, mname);
                     }
                 }
                 _ = try e.g.addModule(.{
@@ -1872,4 +1986,148 @@ test "cst and ts_ext lower trait impl method bodies" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+test "cst and ts_ext decode Rust byte string and byte character literals" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = graph.CrateGraph.init(allocator);
+    defer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    const source =
+        \\pub const COOKED: &[u8] = b"line\n\x00\xff";
+        \\pub const EMPTY: &[u8] = b"";
+        \\pub const RAW: &[u8] = br#"raw \n text"#;
+        \\pub const BYTE: u8 = b'\x41';
+        \\pub fn bytes() -> &'static [u8] {
+        \\    b'\x42';
+        \\    br#"raw \n text"#;
+        \\    b"body\n";
+        \\}
+    ;
+    var cst_ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src = source,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&cst_ctx);
+
+    const expected = [_]struct { name: []const u8, bytes: []const u8 }{
+        .{ .name = "COOKED", .bytes = "line\n\x00\xff" },
+        .{ .name = "EMPTY", .bytes = "" },
+        .{ .name = "RAW", .bytes = "raw \\n text" },
+        .{ .name = "BYTE", .bytes = "\x41" },
+    };
+    for (expected) |want| {
+        var found: ?spine.EntityId = null;
+        for (crate_graph.symbol_table.entities.items) |entity| {
+            if (entity.kind == .const_ and std.mem.eql(u8, entity.name, want.name)) {
+                found = entity.id;
+                break;
+            }
+        }
+        const entity_id = found orelse return error.TestUnexpectedResult;
+        const init_id = switch (bodies_list.items[entity_id]) {
+            .const_ => |constant| constant.init,
+            else => return error.TestUnexpectedResult,
+        };
+        switch (exprs_list.items[init_id].kind) {
+            .literal => |literal| switch (literal) {
+                .byte_array => |byte_array| try std.testing.expectEqualSlices(u8, want.bytes, byte_array.items),
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    var lower_ctx: ts_ext.Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = source,
+        .mod_id = 0,
+    };
+    var function_id: ?spine.EntityId = null;
+    for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "bytes")) {
+            function_id = entity.id;
+            break;
+        }
+    }
+    const body_expr_start = exprs_list.items.len;
+    const body_id = function_id orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try ts_ext.extractFunction(&lower_ctx, body_id));
+
+    var found_body_byte = false;
+    var found_body_raw = false;
+    var found_body_string = false;
+    for (exprs_list.items[body_expr_start..]) |expression| {
+        switch (expression.kind) {
+            .literal => |literal| switch (literal) {
+                .byte_array => |byte_array| {
+                    if (std.mem.eql(u8, byte_array.items, "\x42")) found_body_byte = true;
+                    if (std.mem.eql(u8, byte_array.items, "raw \\n text")) found_body_raw = true;
+                    if (std.mem.eql(u8, byte_array.items, "body\n")) found_body_string = true;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_body_byte);
+    try std.testing.expect(found_body_raw);
+    try std.testing.expect(found_body_string);
+}
+
+test "cst preserves file module child directories" {
+    const allocator = std.testing.allocator;
+
+    const conventional = try childModuleBaseDir(allocator, "src/foo.rs", "foo");
+    defer allocator.free(conventional);
+    try std.testing.expectEqualStrings("src/foo", conventional);
+
+    const directory_module = try childModuleBaseDir(allocator, "src/foo/mod.rs", "foo");
+    defer allocator.free(directory_module);
+    try std.testing.expectEqualStrings("src/foo", directory_module);
+
+    const custom_module = try childModuleBaseDir(allocator, "src/custom.rs", "custom_pub");
+    defer allocator.free(custom_module);
+    try std.testing.expectEqualStrings("src/custom_pub", custom_module);
 }
