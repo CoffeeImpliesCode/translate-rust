@@ -19,6 +19,7 @@ const names = @import("names.zig");
 const exp = @import("expand.zig");
 const ts = @import("tree_sitter");
 const rust = @import("rust");
+const ts_ext = @import("ts_ext.zig");
 
 pub const span_of: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
@@ -225,6 +226,27 @@ fn mapType(e: *Ctx, node: ts.Node) types.Type {
     if (node.namedChildCount() > 0) return mapType(e, node.namedChild(0).?);
     return unsupportedTy();
 }
+/// Return the type node attached to a function's `return_type` field.
+///
+/// Tree-sitter exposes `return_type` as a field name on `function_item` and
+/// `function_signature_item`; it does not normally create a node whose kind is
+/// `"return_type"`. Keep the named-child fallback for older grammar versions.
+fn returnTypeNode(node: ts.Node) ?ts.Node {
+    if (node.childByFieldName("return_type")) |ret| return ret;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "return_type")) {
+            if (child.namedChildCount() > 0) return child.namedChild(0);
+            return child;
+        }
+    }
+    return null;
+}
+
+fn mapReturnType(e: *Ctx, node: ts.Node) types.Type {
+    const ret = returnTypeNode(node) orelse return .{ .prim = .unit };
+    return mapType(e, ret);
+}
 
 /// A named (path) type — possibly generic `Foo<T>`, with std prelude
 /// recognition (Option/Result/Box/Vec) into the dedicated IR nodes.
@@ -256,6 +278,9 @@ fn mapNamedType(e: *Ctx, node: ts.Node) types.Type {
                 }
             }
         }
+    }
+    if (name == null and segs.items.len > 0) {
+        name = segs.items[segs.items.len - 1].name;
     }
     const nm = name orelse return unsupportedTy();
     var args: []const types.Type = &.{};
@@ -304,7 +329,9 @@ fn mapNamedType(e: *Ctx, node: ts.Node) types.Type {
             },
         };
     }
-    segs.append(e.alloc, .{ .name = nm, .id = null }) catch return unsupportedTy();
+    if (segs.items.len == 0 or !std.mem.eql(u8, segs.items[segs.items.len - 1].name, nm)) {
+        segs.append(e.alloc, .{ .name = nm, .id = null }) catch return unsupportedTy();
+    }
     return .{ .path = .{ .segments = segs.toOwnedSlice(e.alloc) catch return unsupportedTy() } };
 }
 
@@ -331,27 +358,29 @@ fn unsupportedTy() types.Type {
 
 // ── generics ────────────────────────────────────────────────────────────────
 
-fn collectGenerics(e: *Ctx, item: ts.Node) types.Generics {
-    var params: std.ArrayListUnmanaged(types.GenericParam) = .empty;
+fn collectFunctionGenericParams(e: *Ctx, item: ts.Node) ![]const []const u8 {
+    var params: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: u32 = 0;
-    while (item.namedChild(i)) |c| : (i += 1) {
-        if (std.mem.eql(u8, c.kind(), "type_parameters")) {
-            var j: u32 = 0;
-            while (c.namedChild(j)) |tp| : (j += 1) {
-                if (std.mem.eql(u8, tp.kind(), "type_parameter")) {
-                    var pname: []const u8 = "";
-                    var q: u32 = 0;
-                    while (tp.namedChild(q)) |cc| : (q += 1) {
-                        if (std.mem.eql(u8, cc.kind(), "type_identifier")) pname = text(e, cc);
-                    }
-                    params.append(e.alloc, .{ .type_ = .{ .name = pname, .bounds = &.{} } }) catch break;
-                } else if (std.mem.eql(u8, tp.kind(), "lifetime_parameter")) {
-                    params.append(e.alloc, .{ .lifetime = .{ .name = "lt" } }) catch break;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (!std.mem.eql(u8, child.kind(), "type_parameters")) continue;
+
+        var j: u32 = 0;
+        while (child.namedChild(j)) |parameter| : (j += 1) {
+            if (!std.mem.eql(u8, parameter.kind(), "type_parameter")) continue;
+
+            var name: []const u8 = "";
+            var k: u32 = 0;
+            while (parameter.namedChild(k)) |parameter_child| : (k += 1) {
+                if (std.mem.eql(u8, parameter_child.kind(), "type_identifier")) {
+                    name = text(e, parameter_child);
+                    break;
                 }
             }
+            if (name.len == 0) continue;
+            try params.append(e.alloc, try e.alloc.dupe(u8, name));
         }
     }
-    return .{ .params = params.toOwnedSlice(e.alloc) catch &.{}, .where_clauses = &.{} };
+    return params.toOwnedSlice(e.alloc);
 }
 
 // ── item lowering ────────────────────────────────────────────────────────────
@@ -575,20 +604,8 @@ fn traitItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
                 const kk = c.kind();
                 if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
                 if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
-                if (std.mem.eql(u8, kk, "return_type")) {
-                    var t: u32 = 0;
-                    while (c.namedChild(t)) |rc| : (t += 1) {
-                        const mapped = mapType(e, rc);
-                        if (mapped != .unsupported) {
-                            mret = mapped;
-                            break;
-                        }
-                    }
-                    if (mret == .prim and mret.prim == .unit and c.namedChildCount() > 0) {
-                        mret = mapType(e, c.namedChild(0).?);
-                    }
-                }
             }
+            mret = mapReturnType(e, m);
             const mparams = mapParams(e, mparams_node);
             // Split a leading `self` param into the receiver kind.
             var receiver: items.Receiver = .ref_;
@@ -728,41 +745,137 @@ fn lowerConstArray(e: *Ctx, node: ts.Node) ?exprs.NodeId {
     } }) catch null;
 }
 
+/// Parsed integer text, with the Rust-only suffix separated from the digits.
+const ParsedConstInt = struct {
+    value: i128,
+    base: u8,
+    body: []const u8,
+    suffix: []const u8,
+};
+
+fn parseConstIntText(raw: []const u8) ?ParsedConstInt {
+    const body = stripIntSuffix(raw);
+    if (body.len == 0) return null;
+    const base: u8 = if (body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X'))
+        16
+    else if (body.len > 2 and body[0] == '0' and (body[1] == 'b' or body[1] == 'B'))
+        2
+    else if (body.len > 2 and body[0] == '0' and (body[1] == 'o' or body[1] == 'O'))
+        8
+    else
+        10;
+    const digits = if (base != 10) body[2..] else body;
+    const value = std.fmt.parseInt(i128, digits, base) catch return null;
+    return .{
+        .value = value,
+        .base = base,
+        .body = body,
+        .suffix = raw[body.len..],
+    };
+}
+
+fn constOperator(e: *const Ctx, left: ts.Node, right: ts.Node) []const u8 {
+    const start = left.endByte();
+    const end = right.startByte();
+    if (end <= start) return "";
+    return std.mem.trim(u8, e.src[start..end], " \t\r\n");
+}
+
+/// Evaluate the integer-only subset needed by Rust const initializers.
+fn constIntegerValue(e: *const Ctx, node: ts.Node) ?i128 {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "integer_literal")) {
+        return (parseConstIntText(text(e, node)) orelse return null).value;
+    }
+    if (std.mem.eql(u8, kind, "expression") or
+        std.mem.eql(u8, kind, "parenthesized_expression") or
+        std.mem.eql(u8, kind, "reference_expression") or
+        std.mem.eql(u8, kind, "unsafe_expression") or
+        std.mem.eql(u8, kind, "type_cast_expression"))
+    {
+        if (node.namedChildCount() == 0) return null;
+        return constIntegerValue(e, node.namedChild(0).?);
+    }
+    if (std.mem.eql(u8, kind, "unary_expression")) {
+        if (node.namedChildCount() == 0) return null;
+        const operand = node.namedChild(node.namedChildCount() - 1).?;
+        const value = constIntegerValue(e, operand) orelse return null;
+        const raw = text(e, node);
+        const op_len = operand.startByte() - node.startByte();
+        const op = std.mem.trim(u8, raw[0..op_len], " \t\r\n");
+        if (std.mem.eql(u8, op, "-")) return -%value;
+        if (std.mem.eql(u8, op, "+")) return value;
+        if (std.mem.eql(u8, op, "!")) return ~value;
+        return null;
+    }
+    if (std.mem.eql(u8, kind, "binary_expression")) {
+        if (node.namedChildCount() < 2) return null;
+        const left = node.namedChild(0).?;
+        const right = node.namedChild(node.namedChildCount() - 1).?;
+        const lhs = constIntegerValue(e, left) orelse return null;
+        const rhs = constIntegerValue(e, right) orelse return null;
+        const op = constOperator(e, left, right);
+        if (std.mem.eql(u8, op, "+")) return lhs +% rhs;
+        if (std.mem.eql(u8, op, "-")) return lhs -% rhs;
+        if (std.mem.eql(u8, op, "*")) return lhs *% rhs;
+        if (std.mem.eql(u8, op, "/")) {
+            if (rhs == 0) return null;
+            return @divTrunc(lhs, rhs);
+        }
+        if (std.mem.eql(u8, op, "%")) {
+            if (rhs == 0) return null;
+            return @mod(lhs, rhs);
+        }
+        if (std.mem.eql(u8, op, "&")) return lhs & rhs;
+        if (std.mem.eql(u8, op, "|")) return lhs | rhs;
+        if (std.mem.eql(u8, op, "^")) return lhs ^ rhs;
+        if (std.mem.eql(u8, op, "<<") or std.mem.eql(u8, op, ">>")) {
+            if (rhs < 0 or rhs >= 128) return null;
+            const shift: u7 = @intCast(rhs);
+            if (std.mem.eql(u8, op, "<<")) return lhs << shift;
+            return lhs >> shift;
+        }
+    }
+    return null;
+}
+
 /// Lower a const initializer expression into the expr table. Returns null when
 /// the form is not representable (the const keeps its `undefined` fallback).
 fn lowerConstInit(e: *Ctx, node: ts.Node) ?exprs.NodeId {
     const kind = node.kind();
-    // Semantic-neutral wrappers for a const value.
+    // Semantic-neutral wrappers for a const value, including Rust casts. The
+    // cast type is deliberately ignored: the declared const type carries it.
     if (std.mem.eql(u8, kind, "expression") or
         std.mem.eql(u8, kind, "parenthesized_expression") or
-        std.mem.eql(u8, kind, "reference_expression"))
+        std.mem.eql(u8, kind, "reference_expression") or
+        std.mem.eql(u8, kind, "unsafe_expression") or
+        std.mem.eql(u8, kind, "type_cast_expression"))
     {
-        if (node.namedChildCount() > 0) return lowerConstInit(e, node.namedChild(0).?);
-        return null;
-    }
-    if (std.mem.eql(u8, kind, "unsafe_expression")) {
         if (node.namedChildCount() > 0) return lowerConstInit(e, node.namedChild(0).?);
         return null;
     }
     if (std.mem.eql(u8, kind, "array_expression")) return lowerConstArray(e, node);
     if (std.mem.eql(u8, kind, "integer_literal")) {
         const t = text(e, node);
-        const body = stripIntSuffix(t);
-        const base: u8 = if (body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X'))
-            16
-        else if (body.len > 2 and body[0] == '0' and (body[1] == 'b' or body[1] == 'B'))
-            2
-        else if (body.len > 2 and body[0] == '0' and (body[1] == 'o' or body[1] == 'O'))
-            8
+        const parsed = parseConstIntText(t) orelse return null;
+        const suffix = if (parsed.suffix.len == 0)
+            null
         else
-            10;
-        // Values are the bare digit string (no `0x`/`0b`/`0o` prefix).
-        const digits = if (base != 10) body[2..] else body;
-        const value = std.fmt.parseInt(i128, digits, base) catch 0;
+            e.alloc.dupe(u8, parsed.suffix) catch return null;
         return appendExpr(e, .{ .literal = .{ .int = .{
-            .text = e.alloc.dupe(u8, t) catch return null,
+            .text = e.alloc.dupe(u8, parsed.body) catch return null,
+            .value = parsed.value,
+            .base = if (parsed.base == 16) .hex else if (parsed.base == 2) .bin else if (parsed.base == 8) .oct else .dec,
+            .ty_suffix = suffix,
+        } } }) catch null;
+    }
+    if (std.mem.eql(u8, kind, "binary_expression") or std.mem.eql(u8, kind, "unary_expression")) {
+        const value = constIntegerValue(e, node) orelse return null;
+        const number = std.fmt.allocPrint(e.alloc, "{d}", .{value}) catch return null;
+        return appendExpr(e, .{ .literal = .{ .int = .{
+            .text = number,
             .value = value,
-            .base = if (base == 16) .hex else if (base == 2) .bin else if (base == 8) .oct else .dec,
+            .base = .dec,
             .ty_suffix = null,
         } } }) catch null;
     }
@@ -787,17 +900,6 @@ fn lowerConstInit(e: *Ctx, node: ts.Node) ?exprs.NodeId {
     }
     if (std.mem.eql(u8, kind, "string_literal") or std.mem.eql(u8, kind, "byte_string_literal")) {
         return lowerConstString(e, node);
-    }
-    if (std.mem.eql(u8, kind, "unary_expression")) {
-        const op = node.namedChild(0);
-        const operand = node.namedChild(1);
-        if (op == null or operand == null) return null;
-        const ot = text(e, op.?);
-        const oid = lowerConstInit(e, operand.?) orelse return null;
-        if (std.mem.eql(u8, ot, "-")) {
-            return appendExpr(e, .{ .unary = .{ .op = .negate, .operand = oid } }) catch null;
-        }
-        return oid;
     }
     return null;
 }
@@ -850,25 +952,15 @@ fn functionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, is_trait_sig: b
         const k = c.kind();
         if (std.mem.eql(u8, k, "identifier")) name = text(e, c);
         if (std.mem.eql(u8, k, "parameters")) params_node = c;
-        if (std.mem.eql(u8, k, "return_type")) {
-            var t: u32 = 0;
-            while (c.namedChild(t)) |rc| : (t += 1) {
-                const mapped = mapType(e, rc);
-                if (mapped != .unsupported) {
-                    ret = mapped;
-                    break;
-                }
-            }
-            if (ret == .prim and ret.prim == .unit and c.namedChildCount() > 0) {
-                ret = mapType(e, c.namedChild(0).?);
-            }
-        }
     }
+    ret = mapReturnType(e, item);
     const params = mapParams(e, params_node);
+    const generic_params = try collectFunctionGenericParams(e, item);
     const eid = try addEntity(e, .fn_, name, parent);
     e.bodies_list.items[eid] = .{ .fn_ = .{
         .params = params,
         .ret = ret,
+        .generic_params = generic_params,
         .body = 0,
     } };
 }
@@ -1120,20 +1212,9 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                                     const kk = c.kind();
                                     if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
                                     if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
-                                    if (std.mem.eql(u8, kk, "return_type")) {
-                                        var t: u32 = 0;
-                                        while (c.namedChild(t)) |rc| : (t += 1) {
-                                            const mapped = mapType(e, rc);
-                                            if (mapped != .unsupported) {
-                                                mret = mapped;
-                                                break;
-                                            }
-                                        }
-                                        if (mret == .prim and mret.prim == .unit and c.namedChildCount() > 0) {
-                                            mret = mapType(e, c.namedChild(0).?);
-                                        }
-                                    }
                                 }
+                                mret = mapReturnType(e, child);
+                                const generic_params = try collectFunctionGenericParams(e, child);
 
                                 const all_params = mapParams(e, mparams_node);
                                 var receiver: ?items.Receiver = null;
@@ -1185,6 +1266,7 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                                         .visibility = vis,
                                         .params = method_params,
                                         .ret = mret,
+                                        .generic_params = generic_params,
                                         .body = 0,
                                         .receiver = receiver,
                                         .is_allocating = false,
@@ -1520,4 +1602,274 @@ pub fn extractFile(ctx: *Ctx) !void {
     const root = tree.rootNode();
     try mapItems(ctx, root, 0);
     try names.resolveGraph(ctx.alloc, ctx.g);
+}
+test "cst lowers typed and cast integer constants as numeric literals" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = graph.CrateGraph.init(allocator);
+    defer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub const CONTINUATION_BIT: u8 = 1 << 7;
+        \\pub const SIGN_BIT: u8 = 1 << 6;
+        \\pub const CAST_BYTE: u8 = (0x80u8 as u16) as u8;
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const expected = [_]struct { name: []const u8, value: i128 }{
+        .{ .name = "CONTINUATION_BIT", .value = 128 },
+        .{ .name = "SIGN_BIT", .value = 64 },
+        .{ .name = "CAST_BYTE", .value = 128 },
+    };
+    for (expected) |want| {
+        var entity_id: ?spine.EntityId = null;
+        for (crate_graph.symbol_table.entities.items) |entity| {
+            if (std.mem.eql(u8, entity.name, want.name)) {
+                entity_id = entity.id;
+                break;
+            }
+        }
+        const id = entity_id orelse return error.TestUnexpectedResult;
+        const body = bodies_list.items[id];
+        const init_id = switch (body) {
+            .const_ => |constant| constant.init,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(init_id < exprs_list.items.len);
+        switch (exprs_list.items[init_id].kind) {
+            .literal => |literal| switch (literal) {
+                .int => |integer| try std.testing.expectEqual(want.value, integer.value),
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+test "cst preserves generic function type parameter names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = graph.CrateGraph.init(allocator);
+    defer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub fn atoi<I: FromRadix10>(text: &[u8]) -> I { text; }
+        \\pub fn identity<T>(value: T) -> T { value; }
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const expected = [_]struct { name: []const u8, generic: []const u8 }{
+        .{ .name = "atoi", .generic = "I" },
+        .{ .name = "identity", .generic = "T" },
+    };
+    for (expected) |want| {
+        var found: ?spine.Entity = null;
+        for (crate_graph.symbol_table.entities.items) |entity| {
+            if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, want.name)) {
+                found = entity;
+                break;
+            }
+        }
+        const entity = found orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), entity.attributes.len);
+        try std.testing.expect(entity.id < bodies_list.items.len);
+        const generic_params = switch (bodies_list.items[entity.id]) {
+            .fn_ => |fb| fb.generic_params,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(@as(usize, 1), generic_params.len);
+        try std.testing.expectEqualStrings(want.generic, generic_params[0]);
+    }
+}
+
+test "cst and ts_ext lower trait impl method bodies" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = graph.CrateGraph.init(allocator);
+    defer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub struct S { value: u64 }
+        \\trait T {
+        \\    fn f(&self, x: u64) -> u64;
+        \\}
+        \\impl T for S {
+        \\    fn f(&self, x: u64) -> u64 { self.value + x }
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    var struct_id: ?spine.EntityId = null;
+    var fn_id: ?spine.EntityId = null;
+    for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .struct_ and std.mem.eql(u8, entity.name, "S")) {
+            struct_id = entity.id;
+        }
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "f")) {
+            fn_id = entity.id;
+        }
+    }
+    const sid = struct_id orelse return error.TestUnexpectedResult;
+    const fid = fn_id orelse return error.TestUnexpectedResult;
+
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    var lower_ctx: ts_ext.Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = ctx.src,
+        .mod_id = 0,
+    };
+    try std.testing.expect(try ts_ext.extractFunction(&lower_ctx, fid));
+
+    const body_id = switch (bodies_list.items[fid]) {
+        .fn_ => |fb| fb.body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(body_id > 0);
+
+    var found_param_path = false;
+    var found_self_field = false;
+    for (exprs_list.items) |expression| {
+        switch (expression.kind) {
+            .path => found_param_path = true,
+            .field => |field| {
+                if (std.mem.eql(u8, field.field, "value") and field.base < exprs_list.items.len) {
+                    switch (exprs_list.items[field.base].kind) {
+                        .path => found_self_field = true,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_param_path);
+    try std.testing.expect(found_self_field);
+
+    switch (bodies_list.items[sid]) {
+        .struct_ => |sb| {
+            var found_method = false;
+            for (sb.methods) |method| {
+                if (std.mem.eql(u8, method.name, "f")) {
+                    found_method = true;
+                    try std.testing.expectEqual(body_id, method.body);
+                }
+            }
+            try std.testing.expect(found_method);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

@@ -18,6 +18,8 @@ pub const ConstBody = struct {
 pub const FnBody = struct {
     params: []const items.Param,
     ret: types.Type,
+    /// Ordered Rust type parameter names, owned by the frontend arena.
+    generic_params: []const []const u8 = &.{},
     /// Expr-table index of the fn body block.
     body: exprs.NodeId,
     is_allocating: bool = false,
@@ -29,6 +31,8 @@ pub const StructMethod = struct {
     visibility: spine.Visibility = .public,
     params: []const items.Param = &.{},
     ret: types.Type,
+    /// Ordered Rust type parameter names, owned by the frontend arena.
+    generic_params: []const []const u8 = &.{},
     body: exprs.NodeId,
     receiver: ?items.Receiver = null,
     is_allocating: bool = false,

@@ -11,6 +11,11 @@
           "local_name": "std",
           "module_or_path": "std",
           "is_pub": false
+        },
+        {
+          "local_name": "util",
+          "module_or_path": "./util.zig",
+          "is_pub": true
         }
       ],
       "decls": [
@@ -111,101 +116,96 @@
             ],
             "ret_type": {
               "kind": "prim",
-              "value": "void_type"
+              "value": "f64"
             },
             "body": {
               "label": null,
-              "stmts": [
-                {
-                  "kind": "expr_stmt",
-                  "expr": {
-                    "kind": "match_expr",
-                    "target": {
-                      "kind": "ident",
-                      "name": "shape"
-                    },
-                    "arms": [
+              "stmts": [],
+              "expr": {
+                "kind": "match_expr",
+                "target": {
+                  "kind": "ident",
+                  "name": "shape"
+                },
+                "arms": [
+                  {
+                    "patterns": [
                       {
-                        "patterns": [
+                        "kind": "struct_pat",
+                        "name": "Circle",
+                        "fields": [
                           {
-                            "kind": "struct_pat",
-                            "name": "Circle",
-                            "fields": [
-                              {
-                                "name": "r",
-                                "pat": {
-                                  "kind": "binding",
-                                  "name": "r"
-                                }
-                              }
-                            ]
-                          }
-                        ],
-                        "body": {
-                          "kind": "bin_op",
-                          "op": "mul_wrap",
-                          "lhs": {
-                            "kind": "bin_op",
-                            "op": "mul_wrap",
-                            "lhs": {
-                              "kind": "ident",
-                              "name": "r"
-                            },
-                            "rhs": {
-                              "kind": "ident",
+                            "name": "0",
+                            "pat": {
+                              "kind": "binding",
                               "name": "r"
                             }
-                          },
-                          "rhs": {
-                            "kind": "lit",
-                            "value": {
-                              "kind": "float",
-                              "value": 3.14159
-                            }
                           }
+                        ]
+                      }
+                    ],
+                    "body": {
+                      "kind": "bin_op",
+                      "op": "mul_wrap",
+                      "lhs": {
+                        "kind": "bin_op",
+                        "op": "mul_wrap",
+                        "lhs": {
+                          "kind": "ident",
+                          "name": "r"
+                        },
+                        "rhs": {
+                          "kind": "ident",
+                          "name": "r"
                         }
                       },
-                      {
-                        "patterns": [
-                          {
-                            "kind": "struct_pat",
-                            "name": "Rect",
-                            "fields": [
-                              {
-                                "name": "width",
-                                "pat": {
-                                  "kind": "binding",
-                                  "name": "width"
-                                }
-                              },
-                              {
-                                "name": "height",
-                                "pat": {
-                                  "kind": "binding",
-                                  "name": "height"
-                                }
-                              }
-                            ]
-                          }
-                        ],
-                        "body": {
-                          "kind": "bin_op",
-                          "op": "mul_wrap",
-                          "lhs": {
-                            "kind": "ident",
-                            "name": "width"
-                          },
-                          "rhs": {
-                            "kind": "ident",
-                            "name": "height"
-                          }
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "float",
+                          "value": 3.14159
                         }
                       }
-                    ]
+                    }
+                  },
+                  {
+                    "patterns": [
+                      {
+                        "kind": "struct_pat",
+                        "name": "Rect",
+                        "fields": [
+                          {
+                            "name": "width",
+                            "pat": {
+                              "kind": "binding",
+                              "name": "width"
+                            }
+                          },
+                          {
+                            "name": "height",
+                            "pat": {
+                              "kind": "binding",
+                              "name": "height"
+                            }
+                          }
+                        ]
+                      }
+                    ],
+                    "body": {
+                      "kind": "bin_op",
+                      "op": "mul_wrap",
+                      "lhs": {
+                        "kind": "ident",
+                        "name": "width"
+                      },
+                      "rhs": {
+                        "kind": "ident",
+                        "name": "height"
+                      }
+                    }
                   }
-                }
-              ],
-              "expr": null
+                ]
+              }
             },
             "generic_params": []
           }
@@ -277,7 +277,7 @@
       "tests": []
     },
     {
-      "path": "test/crates/mini/src/util.rs",
+      "path": "src/util.zig",
       "imports": [
         {
           "local_name": "std",
@@ -303,8 +303,8 @@
               }
             ],
             "ret_type": {
-              "kind": "named",
-              "name": "v"
+              "kind": "prim",
+              "value": "u8"
             },
             "body": {
               "label": null,

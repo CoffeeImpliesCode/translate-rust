@@ -317,6 +317,10 @@ fn emitFnDecl(
     try emitType(allocator, buf, fd.ret_type);
 
     if (fd.body) |body| {
+        if (body.stmts.len == 0 and body.expr == null) {
+            try buf.appendSlice(allocator, " {}\n");
+            return;
+        }
         try buf.appendSlice(allocator, " {\n");
         for (body.stmts) |stmt| {
             try emitStmt(allocator, buf, stmt, depth + 1);
@@ -338,7 +342,7 @@ fn emitFnDecl(
         try emitIndent(allocator, buf, depth);
         try buf.appendSlice(allocator, "}\n");
     } else {
-        try buf.appendSlice(allocator, ";\n");
+        try buf.appendSlice(allocator, " {}\n");
     }
 }
 
@@ -391,6 +395,10 @@ fn emitStructBody(
     sd: ast.StructDecl,
     depth: usize,
 ) std.mem.Allocator.Error!void {
+    if (sd.decls.len > 0 or sd.generic_params.len > 0) {
+        try emitIndent(allocator, buf, depth + 1);
+        try buf.appendSlice(allocator, "const Self = @This();\n\n");
+    }
     for (sd.fields) |f| {
         try emitIndent(allocator, buf, depth + 1);
         try emitIdent(allocator, buf, f.name);
@@ -552,6 +560,7 @@ pub fn emitStmt(
             try emitIndent(allocator, buf, depth);
             try emitExpr(allocator, buf, es.*, depth);
             if (!isStatementLike(es.*) and
+                es.* != .match_expr and
                 es.* != .return_expr and
                 es.* != .break_expr and
                 es.* != .continue_expr)
@@ -601,65 +610,7 @@ pub fn emitExpr(
         .block => |b| {
             try emitBlock(allocator, buf, b, depth);
         },
-        .match_expr => |m| {
-            try buf.appendSlice(allocator, "switch (");
-            try emitExpr(allocator, buf, m.target.*, depth);
-            try buf.appendSlice(allocator, ") {\n");
-
-            for (m.arms) |arm| {
-                try emitIndent(allocator, buf, depth + 1);
-
-                var any_binding = false;
-                var has_wildcard = false;
-                var non_binding_count: usize = 0;
-
-                for (arm.patterns) |pat| {
-                    if (pat == .wildcard) has_wildcard = true;
-                    if (pat == .binding) {
-                        any_binding = true;
-                    } else {
-                        non_binding_count += 1;
-                    }
-                }
-
-                if (has_wildcard or arm.patterns.len == 0 or non_binding_count == 0) {
-                    try buf.appendSlice(allocator, "else");
-                } else {
-                    var first = true;
-                    for (arm.patterns) |pat| {
-                        if (pat == .binding) continue;
-                        if (!first) try buf.appendSlice(allocator, ", ");
-                        first = false;
-                        try emitPattern(allocator, buf, pat);
-                    }
-                }
-
-                try buf.appendSlice(allocator, " =>");
-                if (any_binding) {
-                    try buf.appendSlice(allocator, " |");
-                    var first_binding = true;
-                    for (arm.patterns) |pat| {
-                        switch (pat) {
-                            .binding => |b| {
-                                if (!first_binding) try buf.appendSlice(allocator, ", ");
-                                first_binding = false;
-                                try emitIdent(allocator, buf, b);
-                            },
-                            else => {},
-                        }
-                    }
-                    try buf.appendSlice(allocator, "|");
-                }
-                try buf.appendSlice(allocator, " ");
-                // If the arm body is a block expression with multiple statements or complex control flow,
-                // ensure it formats as a clean labeled/unlabeled block
-                try emitExpr(allocator, buf, arm.body, depth + 1);
-                try buf.appendSlice(allocator, ",\n");
-            }
-
-            try emitIndent(allocator, buf, depth);
-            try buf.appendSlice(allocator, "}");
-        },
+        .match_expr => |match| try emitMatchExpr(allocator, buf, match, depth),
         .bin_op => |bo| {
             try buf.appendSlice(allocator, "(");
             try emitExpr(allocator, buf, bo.lhs.*, depth);
@@ -890,6 +841,176 @@ pub fn emitExpr(
     }
 }
 
+const match_payload_name = "match payload";
+const match_arm_label = "match arm";
+
+fn emitMatchExpr(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    match: ast.Match,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    try buf.appendSlice(allocator, "switch (");
+    try emitExpr(allocator, buf, match.target.*, depth);
+    try buf.appendSlice(allocator, ") {\n");
+
+    for (match.arms) |arm| {
+        try emitIndent(allocator, buf, depth + 1);
+
+        var has_wildcard = arm.patterns.len == 0;
+        var selector_count: usize = 0;
+        for (arm.patterns) |pattern| {
+            switch (pattern) {
+                .wildcard => has_wildcard = true,
+                .binding => {},
+                else => selector_count += 1,
+            }
+        }
+
+        if (has_wildcard or selector_count == 0) {
+            try buf.appendSlice(allocator, "else");
+        } else {
+            var selector_index: usize = 0;
+            for (arm.patterns) |pattern| {
+                if (pattern == .binding) continue;
+                if (selector_index > 0) try buf.appendSlice(allocator, ", ");
+                selector_index += 1;
+                try emitMatchSelector(allocator, buf, pattern);
+            }
+        }
+
+        const direct_binding = matchDirectBinding(arm);
+        const struct_pattern = matchStructPattern(arm);
+        const needs_destructure = if (struct_pattern) |pattern|
+            matchNeedsDestructure(pattern)
+        else
+            false;
+
+        try buf.appendSlice(allocator, " =>");
+        if (direct_binding) |binding| {
+            try buf.appendSlice(allocator, " |");
+            try emitIdent(allocator, buf, binding);
+            try buf.appendSlice(allocator, "|");
+        } else if (needs_destructure) {
+            try buf.appendSlice(allocator, " |");
+            try emitIdent(allocator, buf, match_payload_name);
+            try buf.appendSlice(allocator, "|");
+        }
+        try buf.appendSlice(allocator, " ");
+
+        if (needs_destructure) {
+            try emitMatchDestructureBody(
+                allocator,
+                buf,
+                struct_pattern.?,
+                arm.body,
+                depth,
+            );
+        } else {
+            try emitExpr(allocator, buf, arm.body, depth + 1);
+        }
+        try buf.appendSlice(allocator, ",\n");
+    }
+
+    try emitIndent(allocator, buf, depth);
+    try buf.appendSlice(allocator, "}");
+}
+
+fn emitMatchSelector(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    pattern: ast.Pattern,
+) std.mem.Allocator.Error!void {
+    switch (pattern) {
+        .struct_pat => |struct_pattern| {
+            const name = struct_pattern.name orelse {
+                try buf.appendSlice(allocator, "else");
+                return;
+            };
+            try buf.appendSlice(allocator, ".");
+            try emitIdent(allocator, buf, name);
+        },
+        else => try emitPattern(allocator, buf, pattern),
+    }
+}
+
+fn matchStructPattern(arm: ast.MatchArm) ?ast.StructPattern {
+    for (arm.patterns) |pattern| {
+        if (pattern == .struct_pat) return pattern.struct_pat;
+    }
+    return null;
+}
+
+fn matchDirectBinding(arm: ast.MatchArm) ?[]const u8 {
+    for (arm.patterns) |pattern| {
+        if (pattern == .binding) return pattern.binding;
+    }
+
+    const struct_pattern = matchStructPattern(arm) orelse return null;
+    if (struct_pattern.fields.len != 1) return null;
+    const field = struct_pattern.fields[0];
+    if (!std.mem.eql(u8, field.name, "0")) return null;
+    return switch (field.pat) {
+        .binding => |binding| binding,
+        else => null,
+    };
+}
+
+fn matchNeedsDestructure(pattern: ast.StructPattern) bool {
+    if (pattern.fields.len == 1 and
+        std.mem.eql(u8, pattern.fields[0].name, "0") and
+        pattern.fields[0].pat == .binding)
+    {
+        return false;
+    }
+    for (pattern.fields) |field| {
+        if (field.pat == .binding) return true;
+    }
+    return false;
+}
+
+fn emitMatchDestructureBody(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    pattern: ast.StructPattern,
+    body: ast.Expr,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    try emitIdent(allocator, buf, match_arm_label);
+    try buf.appendSlice(allocator, ": {\n");
+    for (pattern.fields) |field| {
+        const binding = switch (field.pat) {
+            .binding => |name| name,
+            else => continue,
+        };
+        try emitIndent(allocator, buf, depth + 2);
+        try buf.appendSlice(allocator, "const ");
+        try emitIdent(allocator, buf, binding);
+        try buf.appendSlice(allocator, " = ");
+        try emitIdent(allocator, buf, match_payload_name);
+        try buf.appendSlice(allocator, ".");
+        try emitIdent(allocator, buf, field.name);
+        try buf.appendSlice(allocator, ";\n");
+    }
+
+    try emitIndent(allocator, buf, depth + 2);
+    switch (body) {
+        .return_expr, .break_expr, .continue_expr => {
+            try emitExpr(allocator, buf, body, depth + 2);
+            try buf.appendSlice(allocator, ";\n");
+        },
+        else => {
+            try buf.appendSlice(allocator, "break :");
+            try emitIdent(allocator, buf, match_arm_label);
+            try buf.appendSlice(allocator, " ");
+            try emitExpr(allocator, buf, body, depth + 2);
+            try buf.appendSlice(allocator, ";\n");
+        },
+    }
+    try emitIndent(allocator, buf, depth + 1);
+    try buf.appendSlice(allocator, "}");
+}
+
 fn emitBlock(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
@@ -915,6 +1036,7 @@ fn emitBlock(
         } else {
             try emitExpr(allocator, buf, tail.*, depth + 1);
             if (!isStatementLike(tail.*) and
+                tail.* != .match_expr and
                 tail.* != .return_expr and
                 tail.* != .break_expr and
                 tail.* != .continue_expr)
@@ -1022,21 +1144,12 @@ pub fn emitPattern(
             try buf.appendSlice(allocator, "}");
         },
         .struct_pat => |sp| {
-            if (sp.name) |n| {
+            if (sp.name) |name| {
                 try buf.appendSlice(allocator, ".");
-                try emitIdent(allocator, buf, n);
+                try emitIdent(allocator, buf, name);
             } else {
-                try buf.appendSlice(allocator, ".");
+                try buf.appendSlice(allocator, "_");
             }
-            try buf.appendSlice(allocator, "{ ");
-            for (sp.fields, 0..) |f, i| {
-                if (i > 0) try buf.appendSlice(allocator, ", ");
-                try buf.appendSlice(allocator, ".");
-                try emitIdent(allocator, buf, f.name);
-                try buf.appendSlice(allocator, " = ");
-                try emitPattern(allocator, buf, f.pat);
-            }
-            try buf.appendSlice(allocator, " }");
         },
     }
 }
@@ -1109,7 +1222,11 @@ pub fn emitType(
             try emitType(allocator, buf, eu.payload.*);
         },
         .named => |n| {
-            try buf.appendSlice(allocator, n);
+            if (std.mem.eql(u8, n, "unsupported type")) {
+                try buf.appendSlice(allocator, "anyopaque");
+            } else {
+                try buf.appendSlice(allocator, n);
+            }
         },
         .generic => |g| {
             try buf.appendSlice(allocator, g.name);

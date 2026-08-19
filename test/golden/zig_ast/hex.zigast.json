@@ -11,6 +11,21 @@
           "local_name": "std",
           "module_or_path": "std",
           "is_pub": false
+        },
+        {
+          "local_name": "error",
+          "module_or_path": "./error.zig",
+          "is_pub": true
+        },
+        {
+          "local_name": "serde",
+          "module_or_path": "./serde.zig",
+          "is_pub": true
+        },
+        {
+          "local_name": "test",
+          "module_or_path": "./test.zig",
+          "is_pub": true
         }
       ],
       "decls": [
@@ -24,45 +39,9 @@
               "kind": "field_access",
               "target": {
                 "kind": "ident",
-                "name": "test"
+                "name": "error"
               },
               "field_name": "FromHexError"
-            }
-          }
-        },
-        {
-          "kind": "const_decl",
-          "value": {
-            "name": "deserialize",
-            "is_pub": true,
-            "ty": null,
-            "init": {
-              "kind": "ident",
-              "name": ""
-            }
-          }
-        },
-        {
-          "kind": "const_decl",
-          "value": {
-            "name": "serialize",
-            "is_pub": true,
-            "ty": null,
-            "init": {
-              "kind": "ident",
-              "name": ""
-            }
-          }
-        },
-        {
-          "kind": "const_decl",
-          "value": {
-            "name": "serialize_upper",
-            "is_pub": true,
-            "ty": null,
-            "init": {
-              "kind": "ident",
-              "name": ""
             }
           }
         },
@@ -113,217 +92,11 @@
         {
           "kind": "struct_decl",
           "value": {
-            "name": "BytesToHexChars",
+            "name": "Iter",
             "is_pub": true,
             "is_tuple": false,
-            "fields": [
-              {
-                "name": "inner",
-                "ty": {
-                  "kind": "named",
-                  "name": "unsupported type"
-                },
-                "default_val": null,
-                "is_pub": false
-              },
-              {
-                "name": "table",
-                "ty": {
-                  "kind": "array",
-                  "elem": {
-                    "kind": "prim",
-                    "value": "u8"
-                  },
-                  "len": 16
-                },
-                "default_val": null,
-                "is_pub": false
-              },
-              {
-                "name": "next",
-                "ty": {
-                  "kind": "opt",
-                  "elem": {
-                    "kind": "prim",
-                    "value": "u21"
-                  }
-                },
-                "default_val": null,
-                "is_pub": false
-              }
-            ],
-            "decls": [
-              {
-                "kind": "fn_decl",
-                "value": {
-                  "name": "new",
-                  "is_pub": false,
-                  "is_test": false,
-                  "params": [
-                    {
-                      "name": "inner",
-                      "ty": {
-                        "kind": "slice",
-                        "elem": {
-                          "kind": "prim",
-                          "value": "u8"
-                        },
-                        "is_const": true
-                      },
-                      "is_comptime": false
-                    },
-                    {
-                      "name": "table",
-                      "ty": {
-                        "kind": "array",
-                        "elem": {
-                          "kind": "prim",
-                          "value": "u8"
-                        },
-                        "len": 16
-                      },
-                      "is_comptime": false
-                    }
-                  ],
-                  "ret_type": {
-                    "kind": "prim",
-                    "value": "void_type"
-                  },
-                  "body": {
-                    "label": null,
-                    "stmts": [],
-                    "expr": {
-                      "kind": "lit",
-                      "value": {
-                        "kind": "str",
-                        "value": "0123456789abcdef"
-                      }
-                    }
-                  },
-                  "generic_params": []
-                }
-              },
-              {
-                "kind": "fn_decl",
-                "value": {
-                  "name": "next",
-                  "is_pub": true,
-                  "is_test": false,
-                  "params": [
-                    {
-                      "name": "self",
-                      "ty": {
-                        "kind": "ptr",
-                        "elem": {
-                          "kind": "named",
-                          "name": "BytesToHexChars"
-                        },
-                        "is_const": false,
-                        "is_allowzero": false,
-                        "size": "one"
-                      },
-                      "is_comptime": false
-                    }
-                  ],
-                  "ret_type": {
-                    "kind": "prim",
-                    "value": "void_type"
-                  },
-                  "body": {
-                    "label": null,
-                    "stmts": [],
-                    "expr": {
-                      "kind": "lit",
-                      "value": {
-                        "kind": "str",
-                        "value": "0123456789abcdef"
-                      }
-                    }
-                  },
-                  "generic_params": []
-                }
-              },
-              {
-                "kind": "fn_decl",
-                "value": {
-                  "name": "size_hint",
-                  "is_pub": true,
-                  "is_test": false,
-                  "params": [
-                    {
-                      "name": "self",
-                      "ty": {
-                        "kind": "ptr",
-                        "elem": {
-                          "kind": "named",
-                          "name": "BytesToHexChars"
-                        },
-                        "is_const": true,
-                        "is_allowzero": false,
-                        "size": "one"
-                      },
-                      "is_comptime": false
-                    }
-                  ],
-                  "ret_type": {
-                    "kind": "prim",
-                    "value": "void_type"
-                  },
-                  "body": {
-                    "label": null,
-                    "stmts": [],
-                    "expr": {
-                      "kind": "lit",
-                      "value": {
-                        "kind": "str",
-                        "value": "0123456789abcdef"
-                      }
-                    }
-                  },
-                  "generic_params": []
-                }
-              },
-              {
-                "kind": "fn_decl",
-                "value": {
-                  "name": "len",
-                  "is_pub": true,
-                  "is_test": false,
-                  "params": [
-                    {
-                      "name": "self",
-                      "ty": {
-                        "kind": "ptr",
-                        "elem": {
-                          "kind": "named",
-                          "name": "BytesToHexChars"
-                        },
-                        "is_const": true,
-                        "is_allowzero": false,
-                        "size": "one"
-                      },
-                      "is_comptime": false
-                    }
-                  ],
-                  "ret_type": {
-                    "kind": "prim",
-                    "value": "void_type"
-                  },
-                  "body": {
-                    "label": null,
-                    "stmts": [],
-                    "expr": {
-                      "kind": "lit",
-                      "value": {
-                        "kind": "str",
-                        "value": "0123456789abcdef"
-                      }
-                    }
-                  },
-                  "generic_params": []
-                }
-              }
-            ],
+            "fields": [],
+            "decls": [],
             "generic_params": []
           }
         },
@@ -334,6 +107,14 @@
             "is_pub": true,
             "is_test": false,
             "params": [
+              {
+                "name": "T",
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                },
+                "is_comptime": true
+              },
               {
                 "name": "table",
                 "ty": {
@@ -360,8 +141,8 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "named",
+              "name": "T"
             },
             "body": {
               "label": null,
@@ -420,70 +201,69 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "err_union",
+              "err_set": null,
+              "payload": {
+                "kind": "prim",
+                "value": "u8"
+              }
             },
             "body": {
               "label": null,
-              "stmts": [
-                {
-                  "kind": "expr_stmt",
-                  "expr": {
-                    "kind": "match_expr",
-                    "target": {
-                      "kind": "ident",
-                      "name": "c"
-                    },
-                    "arms": [
+              "stmts": [],
+              "expr": {
+                "kind": "match_expr",
+                "target": {
+                  "kind": "ident",
+                  "name": "c"
+                },
+                "arms": [
+                  {
+                    "patterns": [
                       {
-                        "patterns": [
-                          {
-                            "kind": "wildcard"
-                          }
-                        ],
-                        "body": {
-                          "kind": "unsupported",
-                          "reason": "unresolved call"
-                        }
-                      },
-                      {
-                        "patterns": [
-                          {
-                            "kind": "wildcard"
-                          }
-                        ],
-                        "body": {
-                          "kind": "unsupported",
-                          "reason": "unresolved call"
-                        }
-                      },
-                      {
-                        "patterns": [
-                          {
-                            "kind": "wildcard"
-                          }
-                        ],
-                        "body": {
-                          "kind": "unsupported",
-                          "reason": "unresolved call"
-                        }
-                      },
-                      {
-                        "patterns": [
-                          {
-                            "kind": "wildcard"
-                          }
-                        ],
-                        "body": {
-                          "kind": "unsupported",
-                          "reason": "unresolved call"
-                        }
+                        "kind": "wildcard"
                       }
-                    ]
+                    ],
+                    "body": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    }
+                  },
+                  {
+                    "patterns": [
+                      {
+                        "kind": "wildcard"
+                      }
+                    ],
+                    "body": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    }
+                  },
+                  {
+                    "patterns": [
+                      {
+                        "kind": "wildcard"
+                      }
+                    ],
+                    "body": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    }
+                  },
+                  {
+                    "patterns": [
+                      {
+                        "kind": "wildcard"
+                      }
+                    ],
+                    "body": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    }
                   }
-                }
-              ],
-              "expr": null
+                ]
+              }
             },
             "generic_params": []
           }
@@ -496,6 +276,14 @@
             "is_test": false,
             "params": [
               {
+                "name": "T",
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                },
+                "is_comptime": true
+              },
+              {
                 "name": "data",
                 "ty": {
                   "kind": "named",
@@ -505,8 +293,8 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "named",
+              "name": "std.ArrayListUnmanaged"
             },
             "body": {
               "label": null,
@@ -535,6 +323,14 @@
             "is_test": false,
             "params": [
               {
+                "name": "T",
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                },
+                "is_comptime": true
+              },
+              {
                 "name": "data",
                 "ty": {
                   "kind": "named",
@@ -544,8 +340,8 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "named",
+              "name": "std.ArrayListUnmanaged"
             },
             "body": {
               "label": null,
@@ -574,6 +370,14 @@
             "is_test": false,
             "params": [
               {
+                "name": "T",
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                },
+                "is_comptime": true
+              },
+              {
                 "name": "data",
                 "ty": {
                   "kind": "named",
@@ -583,25 +387,25 @@
               }
             ],
             "ret_type": {
-              "kind": "named",
-              "name": "from_hex"
+              "kind": "err_union",
+              "err_set": null,
+              "payload": {
+                "kind": "named",
+                "name": "std.ArrayListUnmanaged"
+              }
             },
             "body": {
               "label": null,
-              "stmts": [],
-              "expr": {
-                "kind": "call",
-                "callee": {
-                  "kind": "ident",
-                  "name": "from_hex"
-                },
-                "args": [
-                  {
-                    "kind": "ident",
-                    "name": "data"
+              "stmts": [
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "unresolved call"
                   }
-                ]
-              }
+                }
+              ],
+              "expr": null
             },
             "generic_params": []
           }
@@ -613,6 +417,14 @@
             "is_pub": true,
             "is_test": false,
             "params": [
+              {
+                "name": "T",
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                },
+                "is_comptime": true
+              },
               {
                 "name": "data",
                 "ty": {
@@ -635,8 +447,12 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "err_union",
+              "err_set": null,
+              "payload": {
+                "kind": "prim",
+                "value": "void_type"
+              }
             },
             "body": {
               "label": null,
@@ -707,12 +523,16 @@
                     },
                     "else_body": null
                   }
+                },
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "unresolved call"
+                  }
                 }
               ],
-              "expr": {
-                "kind": "unsupported",
-                "reason": "unresolved call"
-              }
+              "expr": null
             },
             "generic_params": []
           }
@@ -734,8 +554,14 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "generic",
+              "name": "Iterator",
+              "params": [
+                {
+                  "kind": "named",
+                  "name": "Item"
+                }
+              ]
             },
             "body": {
               "label": null,
@@ -838,8 +664,17 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "tuple",
+              "elements": [
+                {
+                  "kind": "prim",
+                  "value": "u8"
+                },
+                {
+                  "kind": "prim",
+                  "value": "u8"
+                }
+              ]
             },
             "body": {
               "label": null,
@@ -916,12 +751,16 @@
                     ]
                   },
                   "is_mut": false
+                },
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "expression"
+                  }
                 }
               ],
-              "expr": {
-                "kind": "unsupported",
-                "reason": "expression"
-              }
+              "expr": null
             },
             "generic_params": []
           }
@@ -933,6 +772,14 @@
             "is_pub": true,
             "is_test": false,
             "params": [
+              {
+                "name": "T",
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                },
+                "is_comptime": true
+              },
               {
                 "name": "input",
                 "ty": {
@@ -955,8 +802,12 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "err_union",
+              "err_set": null,
+              "payload": {
+                "kind": "prim",
+                "value": "void_type"
+              }
             },
             "body": {
               "label": null,
@@ -1072,9 +923,12 @@
                             },
                             "args": [
                               {
-                                "kind": "struct_init",
-                                "type_name": null,
-                                "fields": []
+                                "kind": "unary_op",
+                                "op": "deref",
+                                "operand": {
+                                  "kind": "ident",
+                                  "name": "byte"
+                                }
                               },
                               {
                                 "kind": "ident",
@@ -1103,12 +957,16 @@
                     },
                     "else_body": null
                   }
+                },
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "unresolved call"
+                  }
                 }
               ],
-              "expr": {
-                "kind": "unsupported",
-                "reason": "unresolved call"
-              }
+              "expr": null
             },
             "generic_params": []
           }
@@ -1117,12 +975,17 @@
       "tests": []
     },
     {
-      "path": "test/crates/hex/src/error.rs",
+      "path": "src/error.zig",
       "imports": [
         {
           "local_name": "std",
           "module_or_path": "std",
           "is_pub": false
+        },
+        {
+          "local_name": "tests",
+          "module_or_path": "./tests.zig",
+          "is_pub": true
         }
       ],
       "decls": [
@@ -1216,12 +1079,8 @@
                     }
                   ],
                   "ret_type": {
-                    "kind": "slice",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "u8"
-                    },
-                    "is_const": true
+                    "kind": "named",
+                    "name": "Result"
                   },
                   "body": {
                     "label": null,
@@ -1297,182 +1156,899 @@
           "name": "test_gen_iter",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "let_stmt",
+                "name": "result",
+                "ty": null,
+                "init": {
+                  "kind": "unsupported",
+                  "reason": "vec macro non-byte elements"
+                },
+                "is_mut": false
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "ident",
+                        "name": "result"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_encode_to_slice",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "let_stmt",
+                "name": "output_1",
+                "ty": null,
+                "init": {
+                  "kind": "unsupported",
+                  "reason": "expression"
+                },
+                "is_mut": false
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "field_access",
+                    "target": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    },
+                    "field_name": "unwrap"
+                  },
+                  "args": []
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "ident",
+                        "name": "output_1"
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"6b697769\""
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "let_stmt",
+                "name": "output_2",
+                "ty": null,
+                "init": {
+                  "kind": "unsupported",
+                  "reason": "expression"
+                },
+                "is_mut": false
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "field_access",
+                    "target": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    },
+                    "field_name": "unwrap"
+                  },
+                  "args": []
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "ident",
+                        "name": "output_2"
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"6b69776973\""
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "let_stmt",
+                "name": "output_3",
+                "ty": null,
+                "init": {
+                  "kind": "unsupported",
+                  "reason": "expression"
+                },
+                "is_mut": false
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_decode_to_slice",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "let_stmt",
+                "name": "output_1",
+                "ty": null,
+                "init": {
+                  "kind": "unsupported",
+                  "reason": "expression"
+                },
+                "is_mut": false
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "field_access",
+                    "target": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    },
+                    "field_name": "unwrap"
+                  },
+                  "args": []
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "ident",
+                        "name": "output_1"
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"kiwi\""
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "let_stmt",
+                "name": "output_2",
+                "ty": null,
+                "init": {
+                  "kind": "unsupported",
+                  "reason": "expression"
+                },
+                "is_mut": false
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "field_access",
+                    "target": {
+                      "kind": "unsupported",
+                      "reason": "unresolved call"
+                    },
+                    "field_name": "unwrap"
+                  },
+                  "args": []
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "ident",
+                        "name": "output_2"
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"kiwis\""
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "let_stmt",
+                "name": "output_3",
+                "ty": null,
+                "init": {
+                  "kind": "unsupported",
+                  "reason": "expression"
+                },
+                "is_mut": false
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_encode",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "666f6f626172"
+                        }
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_decode",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_from_hex_okay_str",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"foobar\""
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"foobar\""
+                        }
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_from_hex_okay_bytes",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"foobar\""
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"foobar\""
+                        }
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_invalid_length",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap_err"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved scoped path"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap_err"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved scoped path"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_invalid_char",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap_err"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved struct type"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_empty",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "str",
+                          "value": "b\"\""
+                        }
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_from_hex_whitespace",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "unsupported",
+                            "reason": "unresolved call"
+                          },
+                          "field_name": "unwrap_err"
+                        },
+                        "args": []
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved struct type"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_from_hex_array",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         },
         {
           "name": "test_to_hex",
           "body": {
             "label": null,
-            "stmts": [],
-            "expr": {
-              "kind": "lit",
-              "value": {
-                "kind": "str",
-                "value": "0123456789abcdef"
+            "stmts": [
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "lit",
+                            "value": {
+                              "kind": "str",
+                              "value": "666f6f626172"
+                            }
+                          },
+                          "field_name": "to_string"
+                        },
+                        "args": []
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "kind": "expr_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "ident",
+                    "name": "std.debug.assert"
+                  },
+                  "args": [
+                    {
+                      "kind": "bin_op",
+                      "op": "equal",
+                      "lhs": {
+                        "kind": "unsupported",
+                        "reason": "unresolved call"
+                      },
+                      "rhs": {
+                        "kind": "call",
+                        "callee": {
+                          "kind": "field_access",
+                          "target": {
+                            "kind": "lit",
+                            "value": {
+                              "kind": "str",
+                              "value": "666F6F626172"
+                            }
+                          },
+                          "field_name": "to_string"
+                        },
+                        "args": []
+                      }
+                    }
+                  ]
+                }
               }
-            }
+            ],
+            "expr": null
           }
         }
       ]

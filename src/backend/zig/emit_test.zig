@@ -59,6 +59,31 @@ test "emitFile: emits imports, struct with fields and methods" {
     try std.testing.expect(std.mem.indexOf(u8, out, "pub fn getId(self: *const Greeter) u64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "return self.id;\n") != null);
 }
+test "emitFile: emits compact bodies for empty non-extern functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const null_body = ast.Decl{ .fn_decl = .{
+        .name = "nullBody",
+        .ret_type = .{ .void_type = {} },
+    } };
+    const empty_body = ast.Decl{ .fn_decl = .{
+        .name = "emptyBody",
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = &.{}, .expr = null },
+    } };
+    const file = ast.File{
+        .path = "src/empty.zig",
+        .decls = &.{ null_body, empty_body },
+    };
+
+    const out = try emitFile(a, file);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn nullBody() void {}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn emptyBody() void {}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn nullBody() void;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn emptyBody() void {\n}\n") == null);
+}
 
 test "emitFile: emits enum with tag type and variants" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -233,7 +258,7 @@ test "emitFile: emits generic struct as comptime type fn and plain struct as con
     const generic = ast.Decl{ .struct_decl = .{
         .name = "Fletcher",
         .is_pub = true,
-        .generic_params = &.{ .{ .name = "T", .is_comptime = true, .ty = null } },
+        .generic_params = &.{.{ .name = "T", .is_comptime = true, .ty = null }},
         .fields = &.{
             .{ .name = "a", .ty = .{ .named = "T" } },
             .{ .name = "b", .ty = .{ .named = "T" } },
@@ -277,4 +302,12 @@ test "emitFile: emits comments" {
     const out = try emitFile(a, file);
     try std.testing.expect(std.mem.indexOf(u8, out, "// This is a top-level comment.\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "// Second line.\n") != null);
+}
+
+test "emitType: unsupported type name is a valid Zig type" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+
+    try emit.emitType(std.testing.allocator, &buf, .{ .named = "unsupported type" });
+    try std.testing.expectEqualStrings("anyopaque", buf.items);
 }

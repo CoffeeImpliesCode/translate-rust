@@ -113,18 +113,154 @@ fn findSelfType(e: *const Ext, ent: spine.Entity) ?spine.EntityId {
     return null;
 }
 
-/// Add a module-scope named fn entity id lookup — returns the entity id of the
-/// first module-kind-parented symbol with `name`.
-fn lookupModuleEntity(e: *const Ext, name: []const u8) ?spine.EntityId {
-    for (e.ctx.g.symbol_table.entities.items) |ent| {
-        if (std.mem.eql(u8, ent.name, name)) {
-            return ent.id;
+/// Return the module entity that owns `start`, climbing through impl/type
+/// entities when the current function is an associated item.
+fn owningModule(e: *const Ext, start: spine.EntityId) ?spine.EntityId {
+    var current: ?spine.EntityId = start;
+    while (current) |id| {
+        const ent = e.ctx.g.symbol_table.get(id) orelse return null;
+        if (ent.kind == .module) return id;
+        current = ent.parent;
+    }
+    return null;
+}
+
+/// Find the Module row for its symbol-table entity. Module ids are dense in the
+/// module table, while symbol-table ids also include every item, so the two
+/// indices must not be assumed to match.
+fn moduleByEntity(e: *const Ext, module_id: spine.EntityId) ?graph.Module {
+    const ent = e.ctx.g.symbol_table.get(module_id) orelse return null;
+    for (e.ctx.g.modules.items) |mod| {
+        if (mod.parent == ent.parent and std.mem.eql(u8, mod.name, ent.name)) return mod;
+    }
+    return null;
+}
+
+fn rootModuleEntity(e: *const Ext) ?spine.EntityId {
+    for (e.ctx.g.modules.items) |mod| {
+        if (!mod.is_crate) continue;
+        for (e.ctx.g.symbol_table.entities.items) |ent| {
+            if (ent.kind != .module) continue;
+            if (ent.parent == mod.parent and std.mem.eql(u8, ent.name, mod.name)) return ent.id;
         }
     }
     return null;
 }
 
-/// Resolve an identifier: local scope first, then module-scope globals.
+/// Resolve a name introduced by a module item, including a `use` alias.
+fn resolveModuleItem(e: *const Ext, module_id: spine.EntityId, name: []const u8) ?spine.EntityId {
+    const mod = moduleByEntity(e, module_id) orelse return null;
+    for (mod.items) |item_id| {
+        const ent = e.ctx.g.symbol_table.get(item_id) orelse continue;
+        if (ent.kind == .use_) {
+            const use_decl = e.ctx.g.useById(item_id) orelse continue;
+            if (!std.mem.eql(u8, use_decl.local_name, name)) continue;
+            if (e.ctx.g.symbol_table.get(use_decl.target) != null) return use_decl.target;
+        } else if (std.mem.eql(u8, ent.name, name)) {
+            return item_id;
+        }
+    }
+
+    // Check for enum variants whose enum is parented to this module
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind == .variant and std.mem.eql(u8, ent.name, name)) {
+            if (ent.parent) |enum_id| {
+                if (e.ctx.g.symbol_table.get(enum_id)) |enum_ent| {
+                    if (enum_ent.parent == module_id) return ent.id;
+                }
+            }
+        }
+    }
+
+    // The item list is the authoritative scope, but keep a dense-table
+    // fallback for forward declarations created before module lists are
+    // patched by the CST walker.
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.parent == module_id and std.mem.eql(u8, ent.name, name)) return ent.id;
+    }
+    return null;
+}
+
+/// Resolve a member on `type_id`, including constants and methods in any
+/// inherent or trait impl whose parent is that type.
+fn resolveTypeMember(e: *const Ext, type_id: spine.EntityId, name: []const u8) ?spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (!std.mem.eql(u8, ent.name, name)) continue;
+        const parent = ent.parent orelse continue;
+        if (parent == type_id) return ent.id;
+        if (e.ctx.g.symbol_table.get(parent)) |p| {
+            if (p.kind == .impl_ and p.parent == type_id) return ent.id;
+        }
+    }
+    return null;
+}
+
+/// Resolve a relative path through module entities.
+fn resolveModulePath(
+    e: *const Ext,
+    start: spine.EntityId,
+    segments: []const []const u8,
+) ?spine.EntityId {
+    if (segments.len == 0) return null;
+    var current = start;
+    for (segments, 0..) |segment, index| {
+        const found = resolveModuleItem(e, current, segment) orelse return null;
+        if (index + 1 == segments.len) return found;
+        const ent = e.ctx.g.symbol_table.get(found) orelse return null;
+        if (ent.kind != .module) return null;
+        current = found;
+    }
+    return null;
+}
+
+/// Resolve a CST scoped path to its terminal entity.
+fn resolveScopedPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
+    const raw = text(e, node);
+    var segments: [8][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.splitSequence(u8, raw, "::");
+    while (it.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (count == segments.len) return null;
+        segments[count] = segment;
+        count += 1;
+    }
+    if (count == 0) return null;
+    if (std.mem.eql(u8, segments[0], "Self")) {
+        if (count == 1) return e.self_ty;
+        if (count == 2) {
+            if (e.self_ty) |type_id| {
+                if (resolveTypeMember(e, type_id, segments[1])) |member| return member;
+            }
+        }
+        return resolveName(e, segments[count - 1]);
+    }
+
+    const owner = owningModule(e, e.ctx.mod_id) orelse return null;
+    var start = owner;
+    var offset: usize = 0;
+    if (std.mem.eql(u8, segments[0], "crate")) {
+        start = rootModuleEntity(e) orelse return null;
+        offset = 1;
+    } else if (std.mem.eql(u8, segments[0], "self")) {
+        offset = 1;
+    } else if (std.mem.eql(u8, segments[0], "super")) {
+        const owner_ent = e.ctx.g.symbol_table.get(owner) orelse return null;
+        const parent = owner_ent.parent orelse return null;
+        start = parent;
+        offset = 1;
+    }
+    if (offset >= count) return null;
+    if (resolveModulePath(e, start, segments[offset..count])) |def| return def;
+    return resolveName(e, segments[count - 1]);
+}
+
+/// Resolve an identifier: local scope first, then the current module scope.
+fn lookupModuleEntity(e: *const Ext, name: []const u8) ?spine.EntityId {
+    const owner = owningModule(e, e.ctx.mod_id) orelse return null;
+    return resolveModuleItem(e, owner, name);
+}
+
 fn resolveName(e: *const Ext, name: []const u8) ?spine.EntityId {
     var i = e.locals.items.len;
     while (i > 0) {
@@ -402,6 +538,15 @@ fn mapPrim(nm: []const u8) ?types.Prim {
 
 // ── statement lowering ───────────────────────────────────────────────────────
 
+fn hasTupleStructPattern(node: ts.Node) bool {
+    if (std.mem.eql(u8, node.kind(), "tuple_struct_pattern")) return true;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (hasTupleStructPattern(child)) return true;
+    }
+    return false;
+}
+
 /// Lower a `let_declaration`: registers the binding(s) locally via
 /// `lowerPattern` and appends a `let` statement.
 fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
@@ -414,10 +559,32 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
         const k = c.kind();
         if (pat_node == null and isPatternNode(c)) {
             pat_node = c;
-        } else if (std.mem.eql(u8, k, "type") or std.mem.eql(u8, k, "primitive_type") or std.mem.eql(u8, k, "generic_type") or std.mem.eql(u8, k, "reference_type") or std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "array_type") or std.mem.eql(u8, k, "slice_type") or std.mem.eql(u8, k, "tuple_type")) {
+        } else if (std.mem.eql(u8, k, "type") or
+            std.mem.eql(u8, k, "primitive_type") or
+            std.mem.eql(u8, k, "generic_type") or
+            std.mem.eql(u8, k, "reference_type") or
+            std.mem.eql(u8, k, "type_identifier") or
+            std.mem.eql(u8, k, "array_type") or
+            std.mem.eql(u8, k, "slice_type") or
+            std.mem.eql(u8, k, "tuple_type"))
+        {
             type_node = c;
-        } else if (init_node == null and !std.mem.eql(u8, k, "mutable_specifier") and !std.mem.eql(u8, k, "let")) {
+        } else if (init_node == null and
+            !std.mem.eql(u8, k, "mutable_specifier") and
+            !std.mem.eql(u8, k, "let"))
+        {
             init_node = c;
+        }
+    }
+    if (init_node == null) init_node = node.childByFieldName("value");
+    if (pat_node) |pn| {
+        if (hasTupleStructPattern(pn)) {
+            const init_expr = if (init_node) |inn|
+                try lowerExpr(e, inn)
+            else
+                try appendExpr(e, .{ .unit = {} });
+            _ = try appendStmt(e, .{ .expr = init_expr });
+            return;
         }
     }
 
@@ -700,9 +867,17 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
 }
 
 // ── expression lowering ─────────────────────────────────────────────────────
-
 fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const kind = node.kind();
+
+    // `self` is a distinct tree-sitter node in field expressions, but it
+    // resolves through the same local binding as an identifier.
+    if (std.mem.eql(u8, kind, "self")) {
+        if (resolveName(e, "self")) |def| {
+            return appendExpr(e, .{ .path = .{ .def = def, .generic_args = &.{} } });
+        }
+        return unsupported(e, "unresolved self");
+    }
 
     // Macro invocation.
     if (std.mem.eql(u8, kind, "macro_invocation")) {
@@ -733,10 +908,10 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
         return unsupported(e, "unresolved identifier");
     }
-    if (std.mem.eql(u8, kind, "scoped_identifier")) {
-        const t = text(e, node);
-        const last = std.mem.lastIndexOfScalar(u8, t, ':') orelse return unsupported(e, "scoped path");
-        if (resolveName(e, t[last + 1 ..])) |def| {
+    if (std.mem.eql(u8, kind, "scoped_identifier") or
+        std.mem.eql(u8, kind, "scoped_type_identifier"))
+    {
+        if (resolveScopedPath(e, node)) |def| {
             return appendExpr(e, .{ .path = .{ .def = def, .generic_args = &.{} } });
         }
         return unsupported(e, "unresolved scoped path");
@@ -875,14 +1050,26 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return appendExpr(e, .{ .return_ = .{ .value = val } });
     }
     if (std.mem.eql(u8, kind, "unary_expression")) {
-        const op = node.namedChild(0);
-        const operand = node.namedChild(1);
-        if (op == null or operand == null) return appendExpr(e, .{ .unit = {} });
-        const ot = text(e, op.?);
-        const oid = try lowerExpr(e, operand.?);
-        if (std.mem.eql(u8, ot, "!")) return appendExpr(e, .{ .unary = .{ .op = .logical_not, .operand = oid } });
-        if (std.mem.eql(u8, ot, "-")) return appendExpr(e, .{ .unary = .{ .op = .negate, .operand = oid } });
-        return oid;
+        const operand = if (node.namedChildCount() > 0)
+            node.namedChild(node.namedChildCount() - 1)
+        else
+            null;
+        if (operand == null) return appendExpr(e, .{ .unit = {} });
+        const operator = opOf(e, node);
+        const operand_id = try lowerExpr(e, operand.?);
+        if (std.mem.eql(u8, operator, "!")) {
+            return appendExpr(e, .{ .unary = .{ .op = .logical_not, .operand = operand_id } });
+        }
+        if (std.mem.eql(u8, operator, "-")) {
+            return appendExpr(e, .{ .unary = .{ .op = .negate, .operand = operand_id } });
+        }
+        if (std.mem.eql(u8, operator, "*")) {
+            return appendExpr(e, .{ .unary = .{ .op = .deref, .operand = operand_id } });
+        }
+        if (std.mem.eql(u8, operator, "&")) {
+            return appendExpr(e, .{ .unary = .{ .op = .{ .ref = .shared }, .operand = operand_id } });
+        }
+        return operand_id;
     }
     if (std.mem.eql(u8, kind, "parenthesized_expression")) {
         if (node.namedChildCount() > 0) return lowerExpr(e, node.namedChild(0).?);
@@ -1468,6 +1655,20 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         // Struct::method(...) / Enum::Variant(...) / Self::method(...) /
         // Type::constructor(...). Split the scoped path at "::".
         const t = text(e, callee);
+        // A module-qualified function (`bar::bar_fn`, `crate::bar::bar_fn`,
+        // or `super::bar::bar_fn`) is a free call, not an associated call.
+        // Resolve the complete path before interpreting the first segment as
+        // a type name.
+        if (resolveScopedPath(e, callee)) |path_def| {
+            if (e.ctx.g.symbol_table.get(path_def)) |path_ent| {
+                if (path_ent.kind == .fn_) {
+                    return appendExpr(e, .{ .call = .{
+                        .call_kind = .{ .free = path_def },
+                        .args = args,
+                    } });
+                }
+            }
+        }
         const sep = std.mem.indexOf(u8, t, "::") orelse return unsupported(e, "unresolved call");
         const base_name = t[0..sep];
         const leaf = t[sep + 2 ..];
@@ -1677,6 +1878,18 @@ fn unsupported(e: *Ext, reason: []const u8) anyerror!exprs.NodeId {
     return appendExpr(e, .{ .unsupported = .{ .reason = reason, .suggested_version = .v3 } });
 }
 
+/// Preserve an assertion condition for the backend without treating the macro
+/// itself as an unsupported expression. The condition remains a normal IR
+/// expression (so type inference and diagnostics can inspect it); the marker
+/// carries its node id to the Zig backend, which emits `std.debug.assert`.
+fn lowerAssertionMarker(e: *Ext, condition: ?exprs.NodeId) anyerror!exprs.NodeId {
+    const marker = if (condition) |id|
+        try std.fmt.allocPrint(e.ctx.alloc, "assertion:{d}", .{id})
+    else
+        try e.ctx.alloc.dupe(u8, "assertion:none");
+    return unsupported(e, marker);
+}
+
 fn parseAndLowerSubExpr(e: *Ext, arg_str: []const u8) anyerror!exprs.NodeId {
     const trimmed = std.mem.trim(u8, arg_str, " \t\r\n");
     if (trimmed.len == 0) return appendExpr(e, .{ .unit = {} });
@@ -1733,7 +1946,25 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     const mname = if (mname_node) |mn| text(e, mn) else return unsupported(e, "macro invocation missing name");
     const raw_tokens = if (token_tree_node) |tt| text(e, tt) else "";
-    const kind = expand.identifyMacro(mname);
+    var kind = expand.identifyMacro(mname);
+    // `debug_assert!` is a distinct Rust macro family, but it has the same
+    // boolean condition shape as `assert!`/`assert_eq!`. Normalize its
+    // basename here so the backend never sees it as an unsupported macro.
+    var macro_base = mname;
+    if (std.mem.lastIndexOf(u8, macro_base, "::")) |sep| {
+        macro_base = macro_base[sep + 2 ..];
+    }
+    macro_base = std.mem.trim(u8, macro_base, " \t\r\n");
+    if (std.mem.endsWith(u8, macro_base, "!")) {
+        macro_base = macro_base[0 .. macro_base.len - 1];
+    }
+    if (std.mem.eql(u8, macro_base, "debug_assert")) {
+        kind = .assert;
+    } else if (std.mem.eql(u8, macro_base, "debug_assert_eq")) {
+        kind = .assert_eq;
+    } else if (std.mem.eql(u8, macro_base, "debug_assert_ne")) {
+        kind = .assert_ne;
+    }
 
     switch (kind) {
         .panic, .todo, .unimplemented => {
@@ -1763,22 +1994,26 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 const lhs = try parseAndLowerSubExpr(e, args[0]);
                 const rhs = try parseAndLowerSubExpr(e, args[1]);
                 const bop: exprs.BinaryOp = if (kind == .assert_eq) .eq else .ne;
-                return appendExpr(e, .{ .binary = .{
+                const condition = try appendExpr(e, .{ .binary = .{
                     .op = bop,
                     .overflow = .wrapping,
                     .lhs = lhs,
                     .rhs = rhs,
                 } });
+                return lowerAssertionMarker(e, condition);
             }
-            return unsupported(e, "assert_eq: expected at least 2 arguments");
+            // Keep malformed assertions compilable as a no-op assertion.
+            return lowerAssertionMarker(e, null);
         },
         .assert => {
             const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
             defer e.ctx.alloc.free(args);
             if (args.len >= 1) {
-                return parseAndLowerSubExpr(e, args[0]);
+                const condition = try parseAndLowerSubExpr(e, args[0]);
+                return lowerAssertionMarker(e, condition);
             }
-            return unsupported(e, "assert: missing condition");
+            // Keep malformed assertions compilable as a no-op assertion.
+            return lowerAssertionMarker(e, null);
         },
         .vec => {
             const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
@@ -1843,6 +2078,138 @@ fn registerParamLocals(e: *Ext, node: ts.Node) anyerror!void {
     }
 }
 
+fn ctxText(ctx: *const Ctx, node: ts.Node) []const u8 {
+    return ctx.src[node.startByte()..node.endByte()];
+}
+
+fn isImplTypeNode(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "type_identifier") or
+        std.mem.eql(u8, kind, "generic_type") or
+        std.mem.eql(u8, kind, "primitive_type") or
+        std.mem.eql(u8, kind, "scoped_type_identifier") or
+        std.mem.eql(u8, kind, "type_path");
+}
+
+fn implTypeBase(raw: []const u8) []const u8 {
+    var value = std.mem.trim(u8, raw, " \t\r\n&*");
+    if (std.mem.startsWith(u8, value, "mut ")) value = value[4..];
+    if (std.mem.indexOf(u8, value, "<")) |idx| value = value[0..idx];
+    if (std.mem.lastIndexOf(u8, value, "::")) |idx| value = value[idx + 2 ..];
+    return std.mem.trim(u8, value, " \t\r\n");
+}
+
+fn sameImplName(left: []const u8, right: []const u8) bool {
+    if (std.mem.eql(u8, std.mem.trim(u8, left, " \t\r\n"), std.mem.trim(u8, right, " \t\r\n"))) {
+        return true;
+    }
+    return std.mem.eql(u8, implTypeBase(left), implTypeBase(right));
+}
+
+fn implNodeMatches(ctx: *const Ctx, node: ts.Node, wanted_name: []const u8) bool {
+    var trait_node: ?ts.Node = node.childByFieldName("trait");
+    var type_node: ?ts.Node = node.childByFieldName("type");
+
+    if (trait_node == null or type_node == null) {
+        var first_type: ?ts.Node = null;
+        var second_type: ?ts.Node = null;
+        var i: u32 = 0;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            if (!isImplTypeNode(child.kind())) continue;
+            if (first_type == null) {
+                first_type = child;
+            } else if (second_type == null) {
+                second_type = child;
+            }
+        }
+        if (type_node == null) {
+            if (trait_node == null and second_type != null) {
+                trait_node = first_type;
+                type_node = second_type;
+            } else {
+                type_node = second_type orelse first_type;
+            }
+        }
+    }
+
+    const type_text = if (type_node) |type_node_value| ctxText(ctx, type_node_value) else return false;
+    const separator = std.mem.indexOf(u8, wanted_name, " for ");
+    if (separator) |split| {
+        const trait_text = if (trait_node) |trait| ctxText(ctx, trait) else return false;
+        const wanted_trait = wanted_name[0..split];
+        const wanted_type = wanted_name[split + 5 ..];
+        return sameImplName(trait_text, wanted_trait) and
+            sameImplName(type_text, wanted_type);
+    }
+
+    if (trait_node != null) return false;
+    return sameImplName(type_text, wanted_name);
+}
+
+fn functionNodeName(ctx: *const Ctx, node: ts.Node) ?[]const u8 {
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "identifier")) return ctxText(ctx, child);
+    }
+    return null;
+}
+
+fn findFunctionNode(
+    ctx: *const Ctx,
+    node: ts.Node,
+    wanted_name: []const u8,
+    wanted_impl: ?[]const u8,
+    enclosing_impl: ?ts.Node,
+) ?ts.Node {
+    var current_impl = enclosing_impl;
+    if (std.mem.eql(u8, node.kind(), "impl_item")) current_impl = node;
+
+    if (std.mem.eql(u8, node.kind(), "function_item")) {
+        if (functionNodeName(ctx, node)) |name| {
+            if (std.mem.eql(u8, name, wanted_name)) {
+                if (wanted_impl) |impl_name| {
+                    if (current_impl) |impl_node| {
+                        if (implNodeMatches(ctx, impl_node, impl_name)) return node;
+                    }
+                } else if (current_impl == null) {
+                    return node;
+                }
+            }
+        }
+    }
+
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (findFunctionNode(ctx, child, wanted_name, wanted_impl, current_impl)) |found| {
+            return found;
+        }
+    }
+    return null;
+}
+
+fn updateStructMethodBody(ctx: *Ctx, ent: spine.Entity, body_id: exprs.NodeId) void {
+    var current = ent.parent;
+    while (current) |parent_id| {
+        const parent = ctx.g.symbol_table.get(parent_id) orelse return;
+        if (parent.kind == .struct_ or parent.kind == .enum_ or parent.kind == .union_) {
+            if (parent_id >= ctx.bodies_list.items.len) return;
+            switch (ctx.bodies_list.items[parent_id]) {
+                .struct_ => |*struct_body| {
+                    const methods = @constCast(struct_body.methods);
+                    for (methods) |*method| {
+                        if (std.mem.eql(u8, method.name, ent.name)) {
+                            method.body = body_id;
+                            return;
+                        }
+                    }
+                },
+                else => {},
+            }
+            return;
+        }
+        current = parent.parent;
+    }
+}
+
 /// Extract the body of the function whose entity is `fn_entity` by parsing
 /// `src`. Returns true on success (body replaced) or false when the fn cannot
 /// be matched/lowered.
@@ -1860,48 +2227,47 @@ pub fn extractFunction(
     defer tree.destroy();
 
     const root = tree.rootNode();
-    var i: u32 = 0;
-    while (root.namedChild(i)) |item| : (i += 1) {
-        if (!std.mem.eql(u8, item.kind(), "function_item")) continue;
-        // Find the identifier node.
-        var j: u32 = 0;
-        var fname: ?[]const u8 = null;
-        var block: ?ts.Node = null;
-        var params_node: ?ts.Node = null;
-        while (item.namedChild(j)) |c| : (j += 1) {
-            const k = c.kind();
-            if (std.mem.eql(u8, k, "identifier")) fname = ctx.src[c.startByte()..c.endByte()];
-            if (std.mem.eql(u8, k, "block")) block = c;
-            if (std.mem.eql(u8, k, "parameters")) params_node = c;
+    var wanted_impl: ?[]const u8 = null;
+    if (ent.parent) |parent_id| {
+        if (ctx.g.symbol_table.get(parent_id)) |parent| {
+            if (parent.kind == .impl_) wanted_impl = parent.name;
         }
-        const nm = fname orelse continue;
-        if (!std.mem.eql(u8, nm, ent.name)) continue;
-        const blk_node = block orelse continue;
-
-        var ex: Ext = .{ .ctx = ctx, .fn_id = fn_entity };
-        ex.self_ty = findSelfType(&ex, ent);
-        defer ex.deinit();
-
-        // Register params as locals so the body resolves them. Handles
-        // `self`, `mut x: T`, destructured patterns, and plain identifiers.
-        if (params_node) |pn| {
-            var p: u32 = 0;
-            while (pn.namedChild(p)) |pnode| : (p += 1) {
-                try registerParamLocals(&ex, pnode);
-            }
-        }
-
-        const body_expr = try lowerExpr(&ex, blk_node);
-        // Lossless partial lower: keep the full lowered body even when
-        // sub-expressions are `.unsupported`; emit renders those as loud
-        // runtime `@panic` unsoundness markers (never a silent wrong value).
-        const fb = ctx.bodies_list.items[fn_entity];
-        var fn_body = fb.fn_;
-        fn_body.body = body_expr;
-        ctx.bodies_list.items[fn_entity] = .{ .fn_ = fn_body };
-        return true;
     }
-    return false;
+    const item = findFunctionNode(ctx, root, ent.name, wanted_impl, null) orelse return false;
+
+    var block: ?ts.Node = null;
+    var params_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        const kind = child.kind();
+        if (std.mem.eql(u8, kind, "block")) block = child;
+        if (std.mem.eql(u8, kind, "parameters")) params_node = child;
+    }
+    const blk_node = block orelse return false;
+
+    var ex: Ext = .{ .ctx = ctx, .fn_id = fn_entity };
+    ex.self_ty = findSelfType(&ex, ent);
+    defer ex.deinit();
+
+    // Register params as locals so the body resolves them. Handles
+    // `self`, `mut x: T`, destructured patterns, and plain identifiers.
+    if (params_node) |pn| {
+        var p: u32 = 0;
+        while (pn.namedChild(p)) |pnode| : (p += 1) {
+            try registerParamLocals(&ex, pnode);
+        }
+    }
+
+    const body_expr = try lowerExpr(&ex, blk_node);
+    // Lossless partial lower: keep the full lowered body even when
+    // sub-expressions are `.unsupported`; emit renders those as loud
+    // runtime `@panic` unsoundness markers (never a silent wrong value).
+    const fb = ctx.bodies_list.items[fn_entity];
+    var fn_body = fb.fn_;
+    fn_body.body = body_expr;
+    ctx.bodies_list.items[fn_entity] = .{ .fn_ = fn_body };
+    updateStructMethodBody(ctx, ent, body_expr);
+    return true;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -1972,6 +2338,8 @@ test "lower built-in macro invocations in fn bodies" {
         \\    assert!(true);
         \\    assert_eq!(1 + 1, 2);
         \\    assert_ne!(a, b);
+        \\    debug_assert!(x > 0);
+        \\    debug_assert_eq!(rem, n % d);
         \\    panic!("boom");
         \\    unreachable!();
         \\    let v = vec![1, 2, 3];
@@ -1997,22 +2365,33 @@ test "lower built-in macro invocations in fn bodies" {
     var found_ne = false;
     var found_byte_array = false;
     var found_unsupported = false;
+    var found_assert_marker = false;
+    var found_debug_assert_ge = false;
     for (exprs_list.items) |ex| {
         switch (ex.kind) {
             .binary => |b| {
                 if (b.op == .eq) found_eq = true;
                 if (b.op == .ne) found_ne = true;
+                if (b.op == .gt) found_debug_assert_ge = true;
             },
             .literal => |l| {
                 if (l == .byte_array) found_byte_array = true;
             },
-            .unsupported => found_unsupported = true,
+            .unsupported => |u| {
+                if (std.mem.startsWith(u8, u.reason, "assertion:")) {
+                    found_assert_marker = true;
+                } else {
+                    found_unsupported = true;
+                }
+            },
             else => {},
         }
     }
     try std.testing.expect(found_eq); // assert_eq! → .eq binary
     try std.testing.expect(found_ne); // assert_ne! → .ne binary
     try std.testing.expect(found_byte_array); // vec![1,2,3] → byte_array literal
+    try std.testing.expect(found_assert_marker); // assert!/debug_assert! → assertion: marker
+    try std.testing.expect(found_debug_assert_ge); // debug_assert!(x > 0) → .gt binary
     try std.testing.expect(found_unsupported); // panic!/unreachable!/unresolved → .unsupported
 }
 
@@ -2283,4 +2662,166 @@ test "lowerCall resolves associated, enum-variant, constructor, and free calls" 
     try std.testing.expect(found_method_call); // f.value()
     try std.testing.expect(found_enum_variant); // Shape::Circle(1.5)
     try std.testing.expect(found_unresolved); // bogus() -> .unsupported("unresolved call")
+}
+
+test "resolve scoped constants and forward calls within the owning module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const add_module = struct {
+        fn run(
+            graph_: *graph.CrateGraph,
+            alloc_: std.mem.Allocator,
+            name: []const u8,
+            parent: ?spine.EntityId,
+            is_crate: bool,
+        ) !spine.EntityId {
+            const id = try graph_.symbol_table.add(.{
+                .id = 0,
+                .kind = .module,
+                .name = try alloc_.dupe(u8, name),
+                .span = span,
+                .visibility = .public,
+                .parent = parent,
+                .resolved = null,
+                .renamed_to = null,
+                .attributes = &.{},
+            });
+            _ = try graph_.addModule(.{
+                .id = id,
+                .kind = if (is_crate) .root else .file,
+                .name = try alloc_.dupe(u8, name),
+                .parent = parent,
+                .source_path = null,
+                .is_crate = is_crate,
+                .is_extern = false,
+                .span = span,
+                .items = &.{},
+                .attributes = &.{},
+            });
+            return id;
+        }
+    }.run;
+
+    const root_id = try add_module(&g, alloc, "", null, true);
+    const local_mod_id = try add_module(&g, alloc, "local", root_id, false);
+    const other_mod_id = try add_module(&g, alloc, "other", root_id, false);
+
+    const add_entity = struct {
+        fn run(
+            graph_: *graph.CrateGraph,
+            alloc_: std.mem.Allocator,
+            kind: spine.EntityKind,
+            name: []const u8,
+            parent: ?spine.EntityId,
+        ) !spine.EntityId {
+            return graph_.symbol_table.add(.{
+                .id = 0,
+                .kind = kind,
+                .name = try alloc_.dupe(u8, name),
+                .span = span,
+                .visibility = .public,
+                .parent = parent,
+                .resolved = null,
+                .renamed_to = null,
+                .attributes = &.{},
+            });
+        }
+    }.run;
+
+    // The unrelated declarations are inserted first to prove that resolution
+    // does not use a global first-name match.
+    const wrong_call_id = try add_entity(&g, alloc, .fn_, "wymix", other_mod_id);
+    const right_call_id = try add_entity(&g, alloc, .fn_, "wymix", local_mod_id);
+    const hasher_id = try add_entity(&g, alloc, .struct_, "Hasher", local_mod_id);
+    const impl_id = try add_entity(&g, alloc, .impl_, "Hasher", hasher_id);
+    const wrong_const_id = try add_entity(&g, alloc, .const_, "CONTINUATION_BIT", other_mod_id);
+    const right_const_id = try add_entity(&g, alloc, .const_, "CONTINUATION_BIT", impl_id);
+    const caller_id = try add_entity(&g, alloc, .fn_, "caller", impl_id);
+    const local_items = try alloc.alloc(spine.EntityId, 3);
+    local_items[0] = right_call_id;
+    local_items[1] = hasher_id;
+    local_items[2] = impl_id;
+    g.modules.items[local_mod_id].items = local_items;
+    const other_items = try alloc.alloc(spine.EntityId, 2);
+    other_items[0] = wrong_call_id;
+    other_items[1] = wrong_const_id;
+    g.modules.items[other_mod_id].items = other_items;
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    for (g.symbol_table.entities.items) |ent| {
+        switch (ent.kind) {
+            .fn_ => try bodies_list.append(alloc, .{ .fn_ = .{
+                .params = &.{},
+                .ret = .{ .prim = .u64 },
+                .body = 0,
+            } }),
+            .struct_ => try bodies_list.append(alloc, .{ .struct_ = .{
+                .generic_params = &.{},
+                .layout = .named,
+                .fields = &.{},
+            } }),
+            .const_ => try bodies_list.append(alloc, .{ .const_ = .{
+                .ty = .{ .prim = .u64 },
+                .init = 0,
+            } }),
+            else => try bodies_list.append(alloc, .none),
+        }
+    }
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src =
+        \\impl Hasher {
+        \\fn caller() -> u64 {
+        \\    Self::CONTINUATION_BIT;
+        \\    wymix()
+        \\}
+        \\}
+        ,
+        .mod_id = local_mod_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, caller_id));
+
+    var found_constant = false;
+    var found_forward_call = false;
+    for (exprs_list.items) |expression| {
+        switch (expression.kind) {
+            .path => |path| {
+                if (path.def == right_const_id) found_constant = true;
+            },
+            .call => |call| switch (call.call_kind) {
+                .free => |def| {
+                    if (def == right_call_id) found_forward_call = true;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_constant);
+    try std.testing.expect(found_forward_call);
 }

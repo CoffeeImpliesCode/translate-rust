@@ -143,16 +143,18 @@ fn buildSampleModel(
     const e_scrut = try model.e(litInt(5));
     const e_arm_body = try model.e(litInt(99));
     const p_wild = try model.pat(.wildcard);
+    const match_patterns = try alloc.alloc(ir.exprs.NodeId, 1);
+    match_patterns[0] = p_wild;
+    const match_arms = try alloc.alloc(ir.exprs.MatchArm, 1);
+    match_arms[0] = .{
+        .patterns = match_patterns,
+        .guard = null,
+        .body = e_arm_body,
+    };
     const e_match = try model.e(.{
         .match = .{
             .scrutinee = e_scrut,
-            .arms = &.{
-                .{
-                    .patterns = &.{p_wild},
-                    .guard = null,
-                    .body = e_arm_body,
-                },
-            },
+            .arms = match_arms,
             .option_scrutinee = false,
         },
     });
@@ -168,22 +170,24 @@ fn buildSampleModel(
     });
 
     // ── Bodies ────────────────────────────────────────────────────────────
+    const point_fields = try alloc.dupe(ir.items.Field, &[_]ir.items.Field{
+        .{ .name = "x", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span },
+        .{ .name = "y", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span },
+    });
+    const point_methods = try alloc.dupe(ir.bodies.StructMethod, &[_]ir.bodies.StructMethod{
+        .{
+            .name = "dist",
+            .visibility = .public,
+            .params = &.{},
+            .ret = .{ .prim = .u64 },
+            .body = e_dist_block,
+            .receiver = .ref_,
+        },
+    });
     try model.bodies.append(model.a(), .{
         .struct_ = .{
-            .fields = &.{
-                .{ .name = "x", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span },
-                .{ .name = "y", .ty = .{ .prim = .i32 }, .visibility = .public, .span = span },
-            },
-            .methods = &.{
-                .{
-                    .name = "dist",
-                    .visibility = .public,
-                    .params = &.{},
-                    .ret = .{ .prim = .u64 },
-                    .body = e_dist_block,
-                    .receiver = .ref_,
-                },
-            },
+            .fields = point_fields,
+            .methods = point_methods,
         },
     });
     try model.bodies.append(model.a(), .{
@@ -415,13 +419,14 @@ fn buildTypeModel(
     // make_point body: block { tail = Point { x = 1, y = 2 } }
     const e_x = try model.e(litInt(1));
     const e_y = try model.e(litInt(2));
+    const point_init_fields = try alloc.dupe(ir.exprs.FieldInit, &[_]ir.exprs.FieldInit{
+        .{ .field = "x", .value = e_x, .shorthand = false },
+        .{ .field = "y", .value = e_y, .shorthand = false },
+    });
     const e_pt_lit = try model.e(.{
         .struct_lit = .{
             .def = point_id,
-            .fields = &.{
-                .{ .field = "x", .value = e_x, .shorthand = false },
-                .{ .field = "y", .value = e_y, .shorthand = false },
-            },
+            .fields = point_init_fields,
             .base = null,
         },
     });
@@ -430,6 +435,9 @@ fn buildTypeModel(
     // first_char body: block { tail = literal 'A' }
     const e_char = try model.e(.{ .literal = .{ .character = .{ .text = "'A'", .value = 'A' } } });
     const e_char_block = try model.e(.{ .block = .{ .statements = &.{}, .tail = e_char, .labelled = null } });
+    const point_segments = try alloc.alloc(ir.types.PathSegment, 1);
+    point_segments[0] = .{ .name = "Point", .id = point_id };
+    const point_type: ir.types.Type = .{ .path = .{ .segments = point_segments } };
 
     // Bodies (indexed by entity id):
     //  id0: Point struct (no fields)
@@ -440,7 +448,7 @@ fn buildTypeModel(
     //  id1: make_point → path Point, body = pt block
     try model.bodies.append(model.a(), .{ .fn_ = .{
         .params = &.{},
-        .ret = .{ .path = .{ .segments = &.{ .{ .name = "Point", .id = point_id } } } },
+        .ret = point_type,
         .body = e_pt_block,
     } });
     //  id2: first_char → prim char, body = char block
@@ -655,9 +663,30 @@ fn buildUseModel(
         .span = span,
     });
 
+    // id5: a glob must be skipped even if malformed input carries a name.
+    const use_glob_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .use_,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = util_id,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try graph.addUse(.{
+        .id = use_glob_id,
+        .kind = .glob,
+        .target = util_id,
+        .local_name = "Foo",
+        .is_pub_export = true,
+        .span = span,
+    });
+
     // Pad the sparse bodies table to cover the use_ entity ids.
     var i: usize = 0;
-    while (i <= use_wild_id) : (i += 1) {
+    while (i <= use_glob_id) : (i += 1) {
         try model.bodies.append(model.a(), .{ .none = {} });
     }
 
@@ -669,8 +698,13 @@ fn buildUseModel(
         .bodies = try model.bodies.toOwnedSlice(model.a()),
     };
 
-    // Root module's items list must reference the three use entities.
-    graph.modules.items[0].items = &.{ use_helper_id, use_dup_id, use_wild_id };
+    // Root module's items list must reference all use entities.
+    graph.modules.items[0].items = &.{
+        use_helper_id,
+        use_dup_id,
+        use_wild_id,
+        use_glob_id,
+    };
 
     try graph.addCrate(.{
         .name = "usecrate",
@@ -986,29 +1020,59 @@ test "lower: prelude trait methods lower to native Zig expressions" {
 
     // Register the method entities so the symbol table resolves their names.
     const as_ref_id = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "as_ref", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = "as_ref",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     const clone_id = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "clone", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = "clone",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     const len_id = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "len", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = "len",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     const bitxor_id = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "bitxor", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = "bitxor",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     const to_vec_id = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "to_vec", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = "to_vec",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     _ = clone_id;
     _ = len_id;
@@ -1025,9 +1089,15 @@ test "lower: prelude trait methods lower to native Zig expressions" {
 
     // Receiver `data` (path → ident) is a slice (ty = 0) → slice-compatible.
     const recv_def = try graph.symbol_table.add(.{
-        .id = 0, .kind = .const_, .name = "data", .span = span,
-        .visibility = .private, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .const_,
+        .name = "data",
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     const e_recv = try model.e(.{ .path = .{ .def = recv_def, .generic_args = &.{} } });
     // Set the receiver's declared type so array/slice detection is grounded.
@@ -1035,13 +1105,16 @@ test "lower: prelude trait methods lower to native Zig expressions" {
 
     // data.as_ref()
     const mc_asref = try model.e(.{ .method_call = .{
-        .receiver = e_recv, .receiver_mode = .shared, .method = as_ref_id, .args = &.{},
+        .receiver = e_recv,
+        .receiver_mode = .shared,
+        .method = as_ref_id,
+        .args = &.{},
     } });
     const e_blk = try model.e(.{ .block = .{ .statements = &.{}, .tail = mc_asref, .labelled = null } });
     const body_id: ir.spine.EntityId = @intCast(model.bodies.items.len);
     try model.bodies.append(model.a(), .{
         .fn_ = .{
-            .params = &.{ .{ .name = "data", .ty = types_store[0], .span = span } },
+            .params = &.{.{ .name = "data", .ty = types_store[0], .span = span }},
             .ret = types_store[0],
             .body = e_blk,
         },
@@ -1056,13 +1129,24 @@ test "lower: prelude trait methods lower to native Zig expressions" {
     };
 
     const root_id = try graph.addModule(.{
-        .id = 0, .kind = .root, .name = "", .parent = null,
-        .source_path = null, .is_crate = true, .is_extern = false,
-        .span = span, .items = &.{body_id}, .attributes = &.{},
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{body_id},
+        .attributes = &.{},
     });
     try graph.addCrate(.{
-        .name = "sample", .edition = 2021, .kind = .lib, .root = root_id,
-        .deps = &.{}, .is_translated = true,
+        .name = "sample",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
     });
 
     const rust_ir = ir.RustIR{
@@ -1090,4 +1174,141 @@ test "lower: prelude trait methods lower to native Zig expressions" {
     // The prelude `.as_ref()` lowers to the receiver ident (slice-compatible).
     try std.testing.expect(found_ident);
     try std.testing.expect(!found_call);
+}
+
+test "lower: generic methods resolve Self and associated type qualifiers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_entity = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const struct_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = "Fletcher",
+        .span = span,
+        .visibility = .public,
+        .parent = root_entity,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const generic_segments = try alloc.alloc(ir.types.PathSegment, 1);
+    generic_segments[0] = .{ .name = "T", .id = null };
+    const generic_ty: ir.types.Type = .{ .path = .{
+        .segments = generic_segments,
+    } };
+    const input_segments = try alloc.alloc(ir.types.PathSegment, 3);
+    input_segments[0] = .{ .name = "T", .id = null };
+    input_segments[1] = .{ .name = "FletcherAccumulator", .id = null };
+    input_segments[2] = .{ .name = "InputType", .id = null };
+    const input_ty: ir.types.Type = .{ .path = .{
+        .segments = input_segments,
+    } };
+    const self_segments = try alloc.alloc(ir.types.PathSegment, 1);
+    self_segments[0] = .{ .name = "Self", .id = null };
+    const self_ty: ir.types.Type = .{ .path = .{
+        .segments = self_segments,
+    } };
+    const input_slice = try alloc.create(ir.types.Slice);
+    input_slice.* = .{ .const_ = true, .elem = input_ty };
+
+    const method_bodies = [_]ir.bodies.StructMethod{
+        .{
+            .name = "with_initial_values",
+            .params = &.{
+                .{ .name = "a", .ty = input_ty, .span = span },
+                .{ .name = "b", .ty = input_ty, .span = span },
+            },
+            .ret = self_ty,
+            .body = 0,
+        },
+        .{
+            .name = "update",
+            .params = &.{
+                .{ .name = "data", .ty = .{ .slice = input_slice }, .span = span },
+            },
+            .ret = .{ .prim = .unit },
+            .body = 0,
+            .receiver = .mut_ref,
+        },
+    };
+    const struct_body: ir.bodies.BodyKind = .{ .struct_ = .{
+        .generic_params = &.{"T"},
+        .fields = &.{
+            .{ .name = "a", .ty = generic_ty, .visibility = .private, .span = span },
+        },
+        .methods = &method_bodies,
+    } };
+
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{struct_id},
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "fletcher",
+        .edition = 2021,
+        .kind = .lib,
+        .root = 0,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "fletcher",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = &.{},
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = &.{ .none, struct_body },
+        },
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const struct_decl = pkg.files[0].decls[0].struct_decl;
+
+    var saw_constructor = false;
+    var saw_update = false;
+    for (struct_decl.decls) |decl| {
+        const method = decl.fn_decl;
+        if (std.mem.eql(u8, method.name, "with_initial_values")) {
+            saw_constructor = true;
+            try std.testing.expectEqualStrings("T", method.params[0].ty.named);
+            try std.testing.expectEqualStrings("T", method.params[1].ty.named);
+            try std.testing.expect(method.ret_type == .generic);
+            try std.testing.expectEqualStrings("Fletcher", method.ret_type.generic.name);
+        } else if (std.mem.eql(u8, method.name, "update")) {
+            saw_update = true;
+            try std.testing.expect(method.params[0].ty == .ptr);
+            try std.testing.expect(!method.params[0].ty.ptr.is_const);
+            try std.testing.expect(method.params[0].ty.ptr.elem.* == .generic);
+            try std.testing.expectEqualStrings("Fletcher", method.params[0].ty.ptr.elem.generic.name);
+            try std.testing.expectEqualStrings("T", method.params[1].ty.slice.elem.*.named);
+        }
+    }
+    try std.testing.expect(saw_constructor);
+    try std.testing.expect(saw_update);
 }

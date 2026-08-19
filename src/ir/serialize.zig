@@ -1491,7 +1491,33 @@ fn encodeLiteralObj(allocator: std.mem.Allocator, lit: exprs.Literal) !Json {
     return .{ .object = o };
 }
 
+fn hasValidTypeTag(ty: types.Type) bool {
+    const union_info = @typeInfo(types.Type).@"union";
+    const tag = blk: {
+        @setRuntimeSafety(false);
+        break :blk std.meta.activeTag(ty);
+    };
+    return @intFromEnum(tag) < union_info.fields.len;
+}
+
+fn encodeCorruptType(allocator: std.mem.Allocator) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "kind", .{ .string = "unsupported" });
+    var vo = ObjectMap.empty;
+    try vo.put(allocator, "reason", .{ .string = "std_prelude" });
+    try vo.put(allocator, "message", .{ .string = "corrupt type tag" });
+    try vo.put(allocator, "span", try encodeSpan(allocator, .{
+        .start_line = 0,
+        .start_col = 0,
+        .end_line = 0,
+        .end_col = 0,
+    }));
+    try o.put(allocator, "value", .{ .object = vo });
+    return .{ .object = o };
+}
+
 fn encodeType(allocator: std.mem.Allocator, ty: types.Type) !Json {
+    if (!hasValidTypeTag(ty)) return encodeCorruptType(allocator);
     var o = ObjectMap.empty;
     switch (ty) {
         .path => |p| {

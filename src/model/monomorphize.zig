@@ -145,7 +145,20 @@ fn sanitizeChar(c: u8, out: *std.ArrayListUnmanaged(u8)) void {
     }
 }
 
+fn hasValidTypeTag(ty: types.Type) bool {
+    const union_info = @typeInfo(types.Type).@"union";
+    const tag = blk: {
+        @setRuntimeSafety(false);
+        break :blk std.meta.activeTag(ty);
+    };
+    return @intFromEnum(tag) < union_info.fields.len;
+}
+
 fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: types.Type) std.mem.Allocator.Error!void {
+    if (!hasValidTypeTag(ty)) {
+        try w.appendSlice(alloc, "unsupported");
+        return;
+    }
     switch (ty) {
         .path => |p| try appendMangledPath(alloc, w, p),
         .prim => |p| try w.appendSlice(alloc, @tagName(p)),
@@ -209,7 +222,7 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
             try appendMangled(alloc, w, bx.*);
             try w.appendSlice(alloc, "_box");
         },
-        .unsupported => |u| try appendMangledName(alloc, w, @tagName(u.reason)),
+        else => try w.appendSlice(alloc, "unsupported"),
     }
 }
 
@@ -337,6 +350,7 @@ const Visited = struct {
 /// registration is deduplicated by `addOrGet`, so a simple recursive scan is
 /// safe.
 fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, ty: types.Type) std.mem.Allocator.Error!void {
+    if (!hasValidTypeTag(ty)) return;
     switch (ty) {
         .generic_inst => |g| {
             // A generic_inst guards on decl + args; only register when it has

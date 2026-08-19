@@ -21,11 +21,17 @@ pub fn lowerRustIR(
     return try lowerer.lowerPackage();
 }
 
+const MethodTypeContext = struct {
+    struct_name: []const u8,
+    generic_params: []const ast.GenericParam,
+};
+
 const Lowerer = struct {
     alloc: std.mem.Allocator,
     ir: *const ir.RustIR,
     strat: strategy.LoweringStrategy,
     def_strat_inst: default_strat.DefaultStrategy = .{},
+    current_module_id: ?ir.spine.EntityId = null,
 
     /// Map from target struct/enum EntityId to hoisted method declarations
     hoisted_by_id: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.ArrayListUnmanaged(ast.Decl)) = .empty,
@@ -171,15 +177,178 @@ const Lowerer = struct {
         return false;
     }
 
+    fn appendImport(
+        self: *Lowerer,
+        imports: *std.ArrayListUnmanaged(ast.Import),
+        local_name: []const u8,
+        module_or_path: []const u8,
+        is_pub: bool,
+    ) !void {
+        for (imports.items) |existing| {
+            if (std.mem.eql(u8, existing.local_name, local_name) and
+                std.mem.eql(u8, existing.module_or_path, module_or_path))
+            {
+                return;
+            }
+        }
+        try imports.append(self.alloc, .{
+            .local_name = try self.alloc.dupe(u8, local_name),
+            .module_or_path = try self.alloc.dupe(u8, module_or_path),
+            .is_pub = is_pub,
+        });
+    }
+
+    /// Find the module row for a module entity. Module rows are dense, while
+    /// symbol entities also contain non-module items, so their ids can differ.
+    fn moduleForEntity(self: *const Lowerer, entity_id: ir.spine.EntityId) ?ir.graph.Module {
+        const entity = self.ir.graph.symbol_table.get(entity_id) orelse {
+            return self.ir.graph.module(entity_id);
+        };
+
+        // Some hand-built IR fixtures contain module rows without matching
+        // module entities. Preserve the dense row lookup for those graphs,
+        // but prefer a name/parent match when the entity table is complete.
+        if (self.ir.graph.module(entity_id)) |dense_module| {
+            var has_matching_module_entity = false;
+            for (self.ir.graph.symbol_table.entities.items) |candidate| {
+                if (candidate.kind != .module) continue;
+                if (candidate.parent == dense_module.parent and
+                    std.mem.eql(u8, candidate.name, dense_module.name))
+                {
+                    has_matching_module_entity = true;
+                    break;
+                }
+            }
+            if (!has_matching_module_entity) return dense_module;
+            if (dense_module.parent == entity.parent and
+                std.mem.eql(u8, dense_module.name, entity.name))
+            {
+                return dense_module;
+            }
+        }
+
+        for (self.ir.graph.modules.items) |module| {
+            if (module.parent == entity.parent and std.mem.eql(u8, module.name, entity.name)) {
+                return module;
+            }
+        }
+        return null;
+    }
+
+    fn moduleEntityId(self: *const Lowerer, module: ir.graph.Module) ?ir.spine.EntityId {
+        for (self.ir.graph.symbol_table.entities.items) |entity| {
+            if (entity.kind != .module) continue;
+            if (entity.parent == module.parent and std.mem.eql(u8, entity.name, module.name)) {
+                return entity.id;
+            }
+        }
+        return null;
+    }
+
+    /// Add the import required by a sibling path or call.
+    fn appendUseSiblingImport(
+        self: *Lowerer,
+        imports: *std.ArrayListUnmanaged(ast.Import),
+        current_mod_id: ir.spine.EntityId,
+        use_id: ir.spine.EntityId,
+    ) !void {
+        const use_decl = self.ir.graph.useById(use_id) orelse return;
+        if (!self.useHasLowerableTarget(use_decl)) return;
+        if (use_decl.kind == .glob) return;
+
+        const target = self.ir.graph.symbol_table.get(use_decl.target) orelse return;
+        const parent_id = if (target.kind == .module)
+            target.id
+        else
+            target.parent orelse return;
+        if (parent_id == current_mod_id or parent_id == 0) return;
+
+        const parent_module = self.moduleForEntity(parent_id) orelse return;
+        if (parent_module.name.len == 0 or parent_module.is_extern) return;
+        const module_path = try std.fmt.allocPrint(self.alloc, "./{s}.zig", .{parent_module.name});
+        defer self.alloc.free(module_path);
+        const parent_entity = self.ir.graph.symbol_table.get(parent_id) orelse return;
+        try self.appendImport(
+            imports,
+            parent_module.name,
+            module_path,
+            use_decl.is_pub_export and parent_entity.visibility == .public,
+        );
+    }
+
+    fn owningModuleEntity(self: *const Lowerer, entity_id: ir.spine.EntityId) ?ir.spine.EntityId {
+        var current: ?ir.spine.EntityId = entity_id;
+        while (current) |id| {
+            const entity = self.ir.graph.symbol_table.get(id) orelse return null;
+            if (entity.kind == .module) return id;
+            current = entity.parent;
+        }
+        return null;
+    }
+
+    /// Emit a resolved entity as a bare name in its module, or as
+    /// `module.name` when the target belongs to another translated module.
+    fn lowerResolvedEntity(self: *Lowerer, def: ir.spine.EntityId) !ast.Expr {
+        const entity = self.ir.graph.symbol_table.get(def) orelse {
+            return ast.Expr{ .ident = "unknown" };
+        };
+        const name = entity.renamed_to orelse entity.name;
+        const owner = self.owningModuleEntity(def) orelse {
+            return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
+        };
+        if (self.current_module_id == null or self.current_module_id.? == owner) {
+            return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
+        }
+        const module = self.moduleForEntity(owner) orelse {
+            return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
+        };
+        if (module.name.len == 0) {
+            return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
+        }
+        const target = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, module.name) });
+        return ast.Expr{ .field_access = .{
+            .target = target,
+            .field_name = try self.alloc.dupe(u8, name),
+        } };
+    }
+
+    /// Register the module that owns a qualified public re-export.
+    fn appendUseModuleImport(
+        self: *Lowerer,
+        imports: *std.ArrayListUnmanaged(ast.Import),
+        current_mod_id: ir.spine.EntityId,
+        use_id: ir.spine.EntityId,
+    ) !void {
+        const use_decl = self.ir.graph.useById(use_id) orelse return;
+        if (!use_decl.is_pub_export) return;
+        if (use_decl.local_name.len == 0 or std.mem.eql(u8, use_decl.local_name, "_")) return;
+        if (use_decl.kind == .glob) return;
+
+        const target = self.ir.graph.symbol_table.get(use_decl.target) orelse return;
+        const parent_id = target.parent orelse return;
+        if (parent_id == current_mod_id or parent_id == 0) return;
+        const parent_module = self.moduleForEntity(parent_id) orelse return;
+        if (parent_module.name.len == 0 or parent_module.is_extern) return;
+        const parent_entity = self.ir.graph.symbol_table.get(parent_id) orelse return;
+        const module_path = try std.fmt.allocPrint(self.alloc, "./{s}.zig", .{parent_module.name});
+        defer self.alloc.free(module_path);
+        try self.appendImport(
+            imports,
+            parent_module.name,
+            module_path,
+            parent_entity.visibility == .public,
+        );
+    }
+
     fn lowerModule(self: *Lowerer, mod: ir.graph.Module) !ast.File {
-        const file_path = if (mod.source_path) |sp|
-            try self.alloc.dupe(u8, sp)
-        else if (mod.kind == .root or mod.is_crate)
+        const file_path = if (mod.kind == .root or mod.is_crate)
             try self.alloc.dupe(u8, "src/root.zig")
         else if (mod.name.len > 0)
             try std.fmt.allocPrint(self.alloc, "src/{s}.zig", .{mod.name})
         else
             try self.alloc.dupe(u8, "src/root.zig");
+
+        const current_mod_id = self.moduleEntityId(mod) orelse mod.id;
 
         var imports_list: std.ArrayListUnmanaged(ast.Import) = .empty;
         try imports_list.append(self.alloc, .{
@@ -194,6 +363,29 @@ const Lowerer = struct {
         for (mod.items) |item_id| {
             const ent = self.ir.graph.symbol_table.get(item_id) orelse continue;
 
+            if (ent.kind == .module) {
+                const child_mod = self.moduleForEntity(item_id) orelse continue;
+                const module_path = try std.fmt.allocPrint(
+                    self.alloc,
+                    "./{s}.zig",
+                    .{child_mod.name},
+                );
+                defer self.alloc.free(module_path);
+                try self.appendImport(
+                    &imports_list,
+                    child_mod.name,
+                    module_path,
+                    ent.visibility == .public,
+                );
+                continue;
+            }
+
+            if (ent.kind == .use_) {
+                const use_decl = self.ir.graph.useById(item_id) orelse continue;
+                if (!self.useHasLowerableTarget(use_decl)) continue;
+                try self.appendUseModuleImport(&imports_list, current_mod_id, item_id);
+                try self.appendUseSiblingImport(&imports_list, current_mod_id, item_id);
+            }
             if (ent.kind == .fn_ and (std.mem.startsWith(u8, ent.name, "test_") or std.mem.eql(u8, ent.name, "test"))) {
                 if (try self.lowerTestEntity(item_id, ent)) |td| {
                     try tests_list.append(self.alloc, td);
@@ -201,16 +393,23 @@ const Lowerer = struct {
                 }
             }
 
-            if (try self.lowerEntityDecl(item_id, ent, mod.id)) |decl| {
+            if (try self.lowerEntityDecl(item_id, ent, current_mod_id)) |decl| {
                 try decls_list.append(self.alloc, decl);
             }
         }
 
+        const imports = try imports_list.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(imports);
+        const decls = try decls_list.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(decls);
+        const tests = try tests_list.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(tests);
+
         return ast.File{
             .path = file_path,
-            .imports = try imports_list.toOwnedSlice(self.alloc),
-            .decls = try decls_list.toOwnedSlice(self.alloc),
-            .tests = try tests_list.toOwnedSlice(self.alloc),
+            .imports = imports,
+            .decls = decls,
+            .tests = tests,
         };
     }
 
@@ -232,6 +431,12 @@ const Lowerer = struct {
 
             // Skip nested methods (they are hoisted into structs)
             if (ent.parent != null and ent.kind == .fn_) continue;
+            if (ent.kind == .use_) {
+                const use_decl = self.ir.graph.useById(entity_id) orelse continue;
+                if (!self.useHasLowerableTarget(use_decl)) continue;
+                try self.appendUseModuleImport(&imports_list, 0, entity_id);
+                try self.appendUseSiblingImport(&imports_list, 0, entity_id);
+            }
 
             if (ent.kind == .fn_ and (std.mem.startsWith(u8, ent.name, "test_") or std.mem.eql(u8, ent.name, "test"))) {
                 if (try self.lowerTestEntity(entity_id, ent)) |td| {
@@ -245,15 +450,46 @@ const Lowerer = struct {
             }
         }
 
+        const imports = try imports_list.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(imports);
+        const decls = try decls_list.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(decls);
+        const tests = try tests_list.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(tests);
+
         return ast.File{
             .path = "src/root.zig",
-            .imports = try imports_list.toOwnedSlice(self.alloc),
-            .decls = try decls_list.toOwnedSlice(self.alloc),
-            .tests = try tests_list.toOwnedSlice(self.alloc),
+            .imports = imports,
+            .decls = decls,
+            .tests = tests,
         };
     }
 
+    fn useHasLowerableTarget(self: *const Lowerer, use_decl: ir.graph.UseDecl) bool {
+        if (use_decl.local_name.len == 0 or std.mem.eql(u8, use_decl.local_name, "_")) {
+            return false;
+        }
+
+        const use_entity = self.ir.graph.symbol_table.get(use_decl.id) orelse return false;
+        if (use_entity.kind != .use_ or use_entity.resolved == null) return false;
+
+        const target = self.ir.graph.symbol_table.get(use_decl.target) orelse return false;
+        if (target.name.len == 0 or std.mem.eql(u8, target.name, "_")) return false;
+        if (target.kind == .extern_crate) return false;
+
+        if (target.parent) |parent_id| {
+            if (self.moduleForEntity(parent_id)) |parent_module| {
+                if (parent_module.is_extern) return false;
+            }
+        }
+
+        return true;
+    }
+
     fn lowerEntityDecl(self: *Lowerer, entity_id: ir.spine.EntityId, ent: ir.spine.Entity, current_mod_id: ?ir.spine.EntityId) !?ast.Decl {
+        const previous_module_id = self.current_module_id;
+        self.current_module_id = current_mod_id;
+        defer self.current_module_id = previous_module_id;
         const is_pub = switch (ent.visibility) {
             .public => true,
             else => false,
@@ -300,7 +536,11 @@ const Lowerer = struct {
 
                         // Inherent methods from StructBody
                         for (sb.methods) |m| {
-                            const m_decl = try self.lowerStructMethod(m, ent.name, sb.generic_params.len > 0);
+                            const m_decl = try self.lowerStructMethod(
+                                m,
+                                ent.name,
+                                generic_params_list.items,
+                            );
                             try inner_decls.append(self.alloc, ast.Decl{ .fn_decl = m_decl });
                         }
                     },
@@ -314,13 +554,20 @@ const Lowerer = struct {
                     }
                 }
 
+                const fields = try fields_list.toOwnedSlice(self.alloc);
+                errdefer self.alloc.free(fields);
+                const decls = try inner_decls.toOwnedSlice(self.alloc);
+                errdefer self.alloc.free(decls);
+                const generic_params = try generic_params_list.toOwnedSlice(self.alloc);
+                errdefer self.alloc.free(generic_params);
+
                 return ast.Decl{
                     .struct_decl = .{
                         .name = try self.alloc.dupe(u8, ent.name),
                         .is_pub = is_pub,
-                        .fields = try fields_list.toOwnedSlice(self.alloc),
-                        .decls = try inner_decls.toOwnedSlice(self.alloc),
-                        .generic_params = try generic_params_list.toOwnedSlice(self.alloc),
+                        .fields = fields,
+                        .decls = decls,
+                        .generic_params = generic_params,
                     },
                 };
             },
@@ -385,23 +632,33 @@ const Lowerer = struct {
                 }
 
                 if (is_data_carrying) {
+                    const fields = try union_fields.toOwnedSlice(self.alloc);
+                    errdefer self.alloc.free(fields);
+                    const decls = try inner_decls.toOwnedSlice(self.alloc);
+                    errdefer self.alloc.free(decls);
+
                     return ast.Decl{
                         .union_decl = .{
                             .name = try self.alloc.dupe(u8, ent.name),
                             .is_pub = is_pub,
                             .tag_type = ast.Type{ .named = "enum" },
-                            .fields = try union_fields.toOwnedSlice(self.alloc),
-                            .decls = try inner_decls.toOwnedSlice(self.alloc),
+                            .fields = fields,
+                            .decls = decls,
                         },
                     };
                 }
+
+                const variants = try variants_list.toOwnedSlice(self.alloc);
+                errdefer self.alloc.free(variants);
+                const decls = try inner_decls.toOwnedSlice(self.alloc);
+                errdefer self.alloc.free(decls);
 
                 return ast.Decl{
                     .enum_decl = .{
                         .name = try self.alloc.dupe(u8, ent.name),
                         .is_pub = is_pub,
-                        .variants = try variants_list.toOwnedSlice(self.alloc),
-                        .decls = try inner_decls.toOwnedSlice(self.alloc),
+                        .variants = variants,
+                        .decls = decls,
                     },
                 };
             },
@@ -498,56 +755,62 @@ const Lowerer = struct {
                 };
             },
             .use_ => {
-                if (self.ir.graph.useById(entity_id)) |u| {
-                    if (u.is_pub_export) {
-                        if (std.mem.eql(u8, u.local_name, "_") or u.local_name.len == 0) {
-                            return null;
+                const use_decl = self.ir.graph.useById(entity_id) orelse return null;
+                if (!use_decl.is_pub_export) return null;
+                if (!self.useHasLowerableTarget(use_decl)) return null;
+                switch (use_decl.kind) {
+                    .glob => return null,
+                    else => {},
+                }
+
+                const target_entity = self.ir.graph.symbol_table.get(use_decl.target) orelse return null;
+                var init_expr: ?ast.Expr = null;
+
+                if (target_entity.parent) |parent_id| {
+                    const cur_mod_id = current_mod_id orelse 0;
+                    if (parent_id != cur_mod_id and parent_id != 0) {
+                        const mod_name = if (self.moduleForEntity(parent_id)) |pm|
+                            pm.name
+                        else if (self.ir.graph.symbol_table.get(parent_id)) |pe|
+                            pe.name
+                        else
+                            "";
+                        if (mod_name.len > 0) {
+                            const target_name = try self.alloc.dupe(u8, mod_name);
+                            errdefer self.alloc.free(target_name);
+                            const target = try self.allocExpr(ast.Expr{ .ident = target_name });
+                            errdefer self.alloc.destroy(target);
+                            const field_name = try self.alloc.dupe(u8, target_entity.name);
+                            errdefer self.alloc.free(field_name);
+                            init_expr = ast.Expr{
+                                .field_access = .{
+                                    .target = target,
+                                    .field_name = field_name,
+                                },
+                            };
                         }
-                        const te = self.ir.graph.symbol_table.get(u.target) orelse return null;
-
-                        var init_expr: ?ast.Expr = null;
-
-                        if (te.parent) |parent_id| {
-                            const cur_mod_id = current_mod_id orelse 0;
-                            if (parent_id != cur_mod_id and parent_id != 0) {
-                                const mod_name = if (self.ir.graph.module(parent_id)) |pm|
-                                    pm.name
-                                else if (self.ir.graph.symbol_table.get(parent_id)) |pe|
-                                    pe.name
-                                else
-                                    "";
-                                if (mod_name.len > 0) {
-                                    const target_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, mod_name) };
-                                    init_expr = ast.Expr{
-                                        .field_access = .{
-                                            .target = try self.allocExpr(target_expr),
-                                            .field_name = try self.alloc.dupe(u8, te.name),
-                                        },
-                                    };
-                                }
-                            }
-                        }
-
-                        if (init_expr == null) {
-                            const cur_mod_id = current_mod_id orelse 0;
-                            const target_parent = te.parent orelse 0;
-                            if (target_parent == cur_mod_id and std.mem.eql(u8, u.local_name, te.name)) {
-                                return null;
-                            }
-                            init_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, te.name) };
-                        }
-
-                        return ast.Decl{
-                            .const_decl = .{
-                                .name = try self.alloc.dupe(u8, u.local_name),
-                                .is_pub = true,
-                                .ty = null,
-                                .init = init_expr.?,
-                            },
-                        };
                     }
                 }
-                return null;
+
+                if (init_expr == null) {
+                    const cur_mod_id = current_mod_id orelse 0;
+                    const target_parent = target_entity.parent orelse 0;
+                    if (target_parent == cur_mod_id and
+                        std.mem.eql(u8, use_decl.local_name, target_entity.name))
+                    {
+                        return null;
+                    }
+                    init_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, target_entity.name) };
+                }
+
+                return ast.Decl{
+                    .const_decl = .{
+                        .name = try self.alloc.dupe(u8, use_decl.local_name),
+                        .is_pub = true,
+                        .ty = null,
+                        .init = init_expr.?,
+                    },
+                };
             },
             .impl_ => {
                 // Impl items are hoisted into their target structs/enums; skip at module root
@@ -557,7 +820,24 @@ const Lowerer = struct {
         }
     }
 
+    fn appendFunctionGenericParams(
+        self: *Lowerer,
+        generic_params: []const []const u8,
+        params: *std.ArrayListUnmanaged(ast.FnParam),
+    ) !void {
+        for (generic_params) |generic_name| {
+            try params.append(self.alloc, .{
+                .name = try self.alloc.dupe(u8, generic_name),
+                .ty = .{ .named = "type" },
+                .is_comptime = true,
+            });
+        }
+    }
+
     fn lowerFnEntity(self: *Lowerer, entity_id: ir.spine.EntityId, ent: ir.spine.Entity) !ast.FnDecl {
+        const previous_module_id = self.current_module_id;
+        self.current_module_id = self.owningModuleEntity(entity_id) orelse previous_module_id;
+        defer self.current_module_id = previous_module_id;
         const is_pub = switch (ent.visibility) {
             .public => true,
             else => false,
@@ -574,6 +854,7 @@ const Lowerer = struct {
 
         switch (body_kind) {
             .fn_ => |fb| {
+                try self.appendFunctionGenericParams(fb.generic_params, &params_list);
                 if (fb.is_allocating) {
                     try params_list.append(self.alloc, .{
                         .name = "allocator",
@@ -604,7 +885,12 @@ const Lowerer = struct {
                     const expr_node = self.ir.bodies.exprs[fb.body];
                     switch (expr_node.kind) {
                         .block => |be| {
-                            fn_block = try self.lowerBlock(be);
+                            var body = try self.lowerBlock(be);
+                            switch (ret_type) {
+                                .void_type => {},
+                                else => promoteTrailingMatch(&body),
+                            }
+                            fn_block = body;
                         },
                         else => {
                             const lowered_e = try self.lowerExpr(fb.body);
@@ -628,6 +914,22 @@ const Lowerer = struct {
         };
     }
 
+    /// Tree-sitter represents a final Rust match as an expression statement.
+    /// Restore value position when the function has a non-void return type.
+    fn promoteTrailingMatch(block: *ast.Block) void {
+        if (block.expr != null) return;
+        if (block.stmts.len == 0) return;
+
+        const tail = switch (block.stmts[block.stmts.len - 1]) {
+            .expr_stmt => |expr| expr,
+            else => return,
+        };
+        if (tail.* != .match_expr) return;
+
+        block.stmts = block.stmts[0 .. block.stmts.len - 1];
+        block.expr = tail;
+    }
+
     /// Infer a concrete return type from a function body's tail expression when
     /// the return type was left implicit (Rust `-> ()` desugars to unit). Used
     /// only to surface an accurate `ret_type` on the emitted fn; never attempts
@@ -638,9 +940,18 @@ const Lowerer = struct {
         if (body >= self.ir.bodies.exprs.len) return null;
         const tail = switch (self.ir.bodies.exprs[body].kind) {
             .block => |be| blk: {
-                const t = be.tail orelse return null;
-                if (t >= self.ir.bodies.exprs.len) return null;
-                break :blk t;
+                if (be.tail) |tail_id| {
+                    if (tail_id >= self.ir.bodies.exprs.len) return null;
+                    break :blk tail_id;
+                }
+                if (be.statements.len == 0) return null;
+
+                const stmt_id = be.statements[be.statements.len - 1];
+                if (stmt_id >= self.ir.bodies.stmts.len) return null;
+                break :blk switch (self.ir.bodies.stmts[stmt_id].kind) {
+                    .expr => |expr_id| expr_id,
+                    else => return null,
+                };
             },
             else => body,
         };
@@ -707,6 +1018,7 @@ const Lowerer = struct {
                 else => null,
             },
             .if_else => |ie| self.exprType(ie.then_.tail orelse return null),
+            .match => |match| self.matchResultType(match),
             else => null,
         };
     }
@@ -748,8 +1060,17 @@ const Lowerer = struct {
             },
             .struct_lit => |sl| self.namedFromDef(sl.def),
             .path => |pe| self.namedFromDef(pe.def),
+            .binary => |binary| self.binopResultType(binary),
+            .match => |match| self.matchResultType(match),
             else => null,
         };
+    }
+
+    fn matchResultType(self: *Lowerer, match: ir.exprs.MatchExpr) ?ir.types.Type {
+        for (match.arms) |arm| {
+            if (self.exprType(arm.body)) |result_type| return result_type;
+        }
+        return null;
     }
 
     /// Result type of a binary expression: comparisons/boolean ops are bool;
@@ -772,15 +1093,33 @@ const Lowerer = struct {
         };
     }
 
-    fn lowerStructMethod(self: *Lowerer, m: ir.bodies.StructMethod, struct_name: []const u8, is_generic: bool) !ast.FnDecl {
+    fn lowerStructMethod(
+        self: *Lowerer,
+        m: ir.bodies.StructMethod,
+        struct_name: []const u8,
+        generic_params: []const ast.GenericParam,
+    ) !ast.FnDecl {
         var params_list: std.ArrayListUnmanaged(ast.FnParam) = .empty;
+        try self.appendFunctionGenericParams(m.generic_params, &params_list);
+        var generic_args: []ast.Type = &.{};
+        if (generic_params.len > 0) {
+            generic_args = try self.alloc.alloc(ast.Type, generic_params.len);
+            for (generic_params, 0..) |gp, i| {
+                generic_args[i] = .{ .named = try self.alloc.dupe(u8, gp.name) };
+            }
+        }
+        const is_generic = generic_params.len > 0;
+        const self_type = if (is_generic)
+            ast.Type{ .generic = .{
+                .name = try self.alloc.dupe(u8, struct_name),
+                .params = generic_args,
+            } }
+        else
+            ast.Type{ .named = try self.alloc.dupe(u8, struct_name) };
 
         if (m.receiver) |rec| {
-            // Inside a generic struct the type is built by a comptime type
-            // function, so the receiver must reference `Self` (valid within
-            // the struct body) rather than the outer type name.
-            const self_name = if (is_generic) "Self" else struct_name;
-            const self_type = ast.Type{ .named = try self.alloc.dupe(u8, self_name) };
+            // A generic struct is emitted as a comptime type function. Keep the
+            // receiver tied to that type so its AST matches the method return.
             const self_type_ptr = try self.allocType(self_type);
 
             const rec_ty: ast.Type = switch (rec) {
@@ -822,7 +1161,10 @@ const Lowerer = struct {
             });
         }
 
-        const ret_type = try self.lowerType(m.ret);
+        const ret_type = if (is_generic and isSelfPath(m.ret))
+            self_type
+        else
+            try self.lowerType(m.ret);
 
         var fn_block: ?ast.Block = null;
         if (m.body < self.ir.bodies.exprs.len) {
@@ -916,6 +1258,9 @@ const Lowerer = struct {
     }
 
     fn lowerTestEntity(self: *Lowerer, entity_id: ir.spine.EntityId, ent: ir.spine.Entity) !?ast.TestDecl {
+        const previous_module_id = self.current_module_id;
+        self.current_module_id = self.owningModuleEntity(entity_id) orelse previous_module_id;
+        defer self.current_module_id = previous_module_id;
         const body_kind = if (entity_id < self.ir.bodies.bodies.len)
             self.ir.bodies.bodies[entity_id]
         else
@@ -953,6 +1298,44 @@ const Lowerer = struct {
     // -------------------------------------------------------------------------
     // Type Lowering
     // -------------------------------------------------------------------------
+
+    /// A path can come from a partially recovered sidecar or from a temporary
+    /// model slice. Reject null-ish/corrupt metadata before indexing it.
+    fn validPathSegments(segments: []const ir.types.PathSegment) bool {
+        if (segments.len == 0 or segments.len > 4096) return false;
+        const address = @intFromPtr(segments.ptr);
+        return address >= 4096 and address % @alignOf(ir.types.PathSegment) == 0;
+    }
+
+    /// Validate a path name before passing it to an allocator. In particular,
+    /// a stale slice can carry a huge length even when its pointer is non-null.
+    fn validPathName(name: []const u8) bool {
+        if (name.len == 0 or name.len > 4096) return false;
+        if (@intFromPtr(name.ptr) < 4096) return false;
+        for (name) |c| {
+            if (c == 0) return false;
+        }
+        return true;
+    }
+
+    fn genericPathParam(segments: []const ir.types.PathSegment) ?[]const u8 {
+        if (segments.len < 2) return null;
+        const first = segments[0];
+        if (first.id != null or !validPathName(first.name)) return null;
+        if (first.name.len != 1) return null;
+        if (first.name[0] < 'A' or first.name[0] > 'Z') return null;
+        return first.name;
+    }
+    fn isSelfPath(ty: ir.types.Type) bool {
+        return switch (ty) {
+            .path => |p| blk: {
+                if (!validPathSegments(p.segments)) break :blk false;
+                const last = p.segments[p.segments.len - 1].name;
+                break :blk validPathName(last) and std.mem.eql(u8, last, "Self");
+            },
+            else => false,
+        };
+    }
 
     pub fn lowerType(self: *Lowerer, ir_ty: ir.types.Type) anyerror!ast.Type {
         // Structural lowering is arena-backed and always safe to retain. The
@@ -1025,16 +1408,25 @@ const Lowerer = struct {
                 break :blk ast.Type{ .tuple = arr };
             },
             .path => |p| blk: {
-                if (p.segments.len > 0) {
-                    const last_seg = p.segments[p.segments.len - 1].name;
-                    if (last_seg.len > 0) {
-                        if (try self.strat.lowerStdGeneric(last_seg, &.{})) |std_ty| {
-                            break :blk std_ty;
-                        }
-                        break :blk ast.Type{ .named = try self.alloc.dupe(u8, last_seg) };
-                    }
+                if (!validPathSegments(p.segments)) {
+                    break :blk ast.Type{ .named = "unknown" };
                 }
-                break :blk ast.Type{ .named = "unknown" };
+                if (genericPathParam(p.segments)) |generic_name| {
+                    break :blk ast.Type{ .named = try self.alloc.dupe(u8, generic_name) };
+                }
+                const last_segment = p.segments[p.segments.len - 1];
+                if (!validPathName(last_segment.name)) {
+                    if (last_segment.id) |id| {
+                        if (self.ir.graph.symbol_table.get(id)) |ent| {
+                            break :blk ast.Type{ .named = try self.alloc.dupe(u8, ent.name) };
+                        }
+                    }
+                    break :blk ast.Type{ .named = "unknown" };
+                }
+                if (try self.strat.lowerStdGeneric(last_segment.name, &.{})) |std_ty| {
+                    break :blk std_ty;
+                }
+                break :blk ast.Type{ .named = try self.alloc.dupe(u8, last_segment.name) };
             },
             .generic_inst => |gi| blk: {
                 const decl_name = if (self.ir.graph.symbol_table.get(gi.decl)) |e| e.name else "";
@@ -1057,12 +1449,7 @@ const Lowerer = struct {
             },
             .boxed => |b| try self.lowerType(b.*),
             .fn_ptr => ast.Type{ .named = "fn_ptr" },
-            .unsupported => |u| blk: {
-                if (u.message.len > 0) {
-                    break :blk ast.Type{ .named = try self.alloc.dupe(u8, u.message) };
-                }
-                break :blk ast.Type{ .named = "anyopaque" };
-            },
+            .unsupported => ast.Type.any_opaque,
         };
     }
 
@@ -1236,6 +1623,46 @@ const Lowerer = struct {
         return null;
     }
 
+    /// Lower an assertion marker emitted by the frontend macro pass. The
+    /// marker stores the condition node id as `assertion:<id>` so the
+    /// condition remains a normal IR expression while the assertion call is
+    /// represented in the target AST.
+    fn lowerAssertionMarker(self: *Lowerer, reason: []const u8) anyerror!ast.Expr {
+        var condition_id: ?ir.exprs.NodeId = null;
+        if (std.mem.startsWith(u8, reason, "assertion:")) {
+            const suffix = reason["assertion:".len..];
+            if (!std.mem.eql(u8, suffix, "none")) {
+                if (std.fmt.parseInt(u32, suffix, 10)) |id| {
+                    condition_id = @intCast(id);
+                } else |_| {}
+            }
+        }
+
+        const condition = if (condition_id) |id|
+            if (id < self.ir.bodies.exprs.len)
+                try self.lowerExpr(id)
+            else
+                ast.Expr{ .lit = .{ .bool_lit = true } }
+        else
+            ast.Expr{ .lit = .{ .bool_lit = true } };
+
+        var args = try self.alloc.alloc(ast.Expr, 1);
+        args[0] = condition;
+        return ast.Expr{
+            .call = .{
+                .callee = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, "std.debug.assert") }),
+                .args = args,
+            },
+        };
+    }
+
+    fn isAssertionReason(reason: []const u8) bool {
+        if (std.mem.startsWith(u8, reason, "assertion:")) return true;
+        return std.mem.eql(u8, reason, "macro debug_assert") or
+            std.mem.eql(u8, reason, "macro debug_assert_eq") or
+            std.mem.eql(u8, reason, "macro debug_assert_ne");
+    }
+
     pub fn lowerExpr(self: *Lowerer, expr_id: ir.exprs.NodeId) anyerror!ast.Expr {
         if (expr_id >= self.ir.bodies.exprs.len) {
             return ast.Expr{ .ident = "undefined" };
@@ -1277,11 +1704,7 @@ const Lowerer = struct {
                 };
             },
             .path => |pe| blk: {
-                if (self.ir.graph.symbol_table.get(pe.def)) |ent| {
-                    const name = ent.renamed_to orelse ent.name;
-                    break :blk ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
-                }
-                break :blk ast.Expr{ .ident = "unknown" };
+                break :blk try self.lowerResolvedEntity(pe.def);
             },
             .block => |be| ast.Expr{ .block = try self.lowerBlock(be) },
             .unit => ast.Expr{ .struct_init = .{ .type_name = null, .fields = &.{} } },
@@ -1321,9 +1744,28 @@ const Lowerer = struct {
                 const target = try self.allocExpr(try self.lowerExpr(me.scrutinee));
                 var arms = try self.alloc.alloc(ast.MatchArm, me.arms.len);
                 for (me.arms, 0..) |arm, i| {
-                    var pats = try self.alloc.alloc(ast.Pattern, arm.patterns.len);
-                    for (arm.patterns, 0..) |p_id, j| {
-                        pats[j] = try self.lowerPattern(p_id);
+                    const pattern_ids = arm.patterns;
+                    const patterns_valid = pattern_ids.len > 0 and
+                        pattern_ids.len <= self.ir.bodies.pats.len and
+                        @intFromPtr(pattern_ids.ptr) >= 4096 and
+                        @intFromPtr(pattern_ids.ptr) % @alignOf(ir.exprs.NodeId) == 0;
+                    const pattern_count = if (pattern_ids.len > 0 and
+                        pattern_ids.len <= self.ir.bodies.pats.len and
+                        pattern_ids.len <= 4096)
+                        pattern_ids.len
+                    else
+                        0;
+                    var pats: []const ast.Pattern = &.{};
+                    if (pattern_count > 0) {
+                        var lowered_patterns = try self.alloc.alloc(ast.Pattern, pattern_count);
+                        if (patterns_valid) {
+                            for (pattern_ids, 0..) |p_id, j| {
+                                lowered_patterns[j] = try self.lowerPattern(p_id);
+                            }
+                        } else {
+                            for (lowered_patterns) |*pattern| pattern.* = .wildcard;
+                        }
+                        pats = lowered_patterns;
                     }
                     const body_expr = try self.lowerExpr(arm.body);
                     arms[i] = .{
@@ -1441,10 +1883,15 @@ const Lowerer = struct {
                     body.stmts = merged;
                 }
 
+                const for_inputs = try inputs.toOwnedSlice(self.alloc);
+                errdefer self.alloc.free(for_inputs);
+                const captures = try captures_list.toOwnedSlice(self.alloc);
+                errdefer self.alloc.free(captures);
+
                 break :blk ast.Expr{
                     .for_expr = .{
-                        .inputs = try inputs.toOwnedSlice(self.alloc),
-                        .captures = try captures_list.toOwnedSlice(self.alloc),
+                        .inputs = for_inputs,
+                        .captures = captures,
                         .body = body,
                     },
                 };
@@ -1455,20 +1902,15 @@ const Lowerer = struct {
             },
             .continue_ => ast.Expr{ .continue_expr = {} },
             .call => |c| blk: {
-                const callee_name: []const u8 = switch (c.call_kind) {
-                    .free => |def_id| if (self.ir.graph.symbol_table.get(def_id)) |e|
-                        e.renamed_to orelse e.name
-                    else
-                        "unknown_fn",
-                    .associated => |def_id| if (self.ir.graph.symbol_table.get(def_id)) |e|
-                        e.renamed_to orelse e.name
-                    else
-                        "unknown_assoc",
-                    .constructor => |def_id| if (self.ir.graph.symbol_table.get(def_id)) |e|
-                        e.renamed_to orelse e.name
-                    else
-                        "unknown_ctor",
+                const callee_def: ir.spine.EntityId = switch (c.call_kind) {
+                    .free => |def_id| def_id,
+                    .associated => |def_id| def_id,
+                    .constructor => |def_id| def_id,
                 };
+                const callee_name: []const u8 = if (self.ir.graph.symbol_table.get(callee_def)) |e|
+                    e.renamed_to orelse e.name
+                else
+                    "unknown_fn";
 
                 // Trait-associated calls like `Clone::clone(&x)` / `AsRef::as_ref(&x)`
                 // lower to the receiver/copy/slice expression directly.
@@ -1482,7 +1924,7 @@ const Lowerer = struct {
                     }
                 }
 
-                const callee_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, callee_name) };
+                const callee_expr = try self.lowerResolvedEntity(callee_def);
                 var args = try self.alloc.alloc(ast.Expr, c.args.len);
                 for (c.args, 0..) |arg_id, i| {
                     args[i] = try self.lowerExpr(arg_id);
@@ -1528,9 +1970,13 @@ const Lowerer = struct {
             .struct_lit => |sl| blk: {
                 var fields = try self.alloc.alloc(ast.StructInitField, sl.fields.len);
                 for (sl.fields, 0..) |fi, i| {
+                    const name = try self.alloc.dupe(u8, fi.field);
+                    errdefer self.alloc.free(name);
+                    const expr = try self.lowerExpr(fi.value);
+
                     fields[i] = .{
-                        .name = try self.alloc.dupe(u8, fi.field),
-                        .expr = try self.lowerExpr(fi.value),
+                        .name = name,
+                        .expr = expr,
                     };
                 }
 
@@ -1551,9 +1997,13 @@ const Lowerer = struct {
                 if (ev.tuple_fields.len > 0) {
                     var fields = try self.alloc.alloc(ast.StructInitField, ev.tuple_fields.len);
                     for (ev.tuple_fields, 0..) |tf, i| {
+                        const name = try std.fmt.allocPrint(self.alloc, "{d}", .{i});
+                        errdefer self.alloc.free(name);
+                        const expr = try self.lowerExpr(tf);
+
                         fields[i] = .{
-                            .name = try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
-                            .expr = try self.lowerExpr(tf),
+                            .name = name,
+                            .expr = expr,
                         };
                     }
                     break :blk ast.Expr{
@@ -1662,7 +2112,12 @@ const Lowerer = struct {
                 break :blk ast.Expr{ .return_expr = val };
             },
             .closure, .iterator_chain => ast.Expr{ .unsupported = "deferred" },
-            .unsupported => |u| ast.Expr{ .unsupported = try self.alloc.dupe(u8, u.reason) },
+            .unsupported => |u| blk: {
+                if (isAssertionReason(u.reason)) {
+                    break :blk try self.lowerAssertionMarker(u.reason);
+                }
+                break :blk ast.Expr{ .unsupported = try self.alloc.dupe(u8, u.reason) };
+            },
         };
     }
 
@@ -1850,6 +2305,42 @@ const Lowerer = struct {
     // Pattern Lowering
     // -------------------------------------------------------------------------
 
+    fn enumVariantFields(
+        self: *Lowerer,
+        variant_id: ir.spine.EntityId,
+    ) ?ir.items.VariantFields {
+        const variant_entity = self.ir.graph.symbol_table.get(variant_id) orelse return null;
+
+        if (variant_entity.kind == .variant) {
+            if (variant_entity.parent) |enum_id| {
+                if (enum_id < self.ir.bodies.bodies.len) {
+                    switch (self.ir.bodies.bodies[enum_id]) {
+                        .enum_ => |enum_body| {
+                            for (enum_body.variants) |variant| {
+                                if (std.mem.eql(u8, variant.name, variant_entity.name)) {
+                                    return variant.fields;
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        // Source extraction can resolve `Shape::Circle` to a local placeholder
+        // before enum variant entities are linked. Use the unique variant name.
+        for (self.ir.bodies.bodies) |body_kind| {
+            const enum_body = switch (body_kind) {
+                .enum_ => |body| body,
+                else => continue,
+            };
+            for (enum_body.variants) |variant| {
+                if (std.mem.eql(u8, variant.name, variant_entity.name)) return variant.fields;
+            }
+        }
+        return null;
+    }
     pub fn lowerPattern(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror!ast.Pattern {
         if (pat_id >= self.ir.bodies.pats.len) {
             return ast.Pattern.wildcard;
@@ -1895,8 +2386,15 @@ const Lowerer = struct {
                         try self.lowerPattern(p_id)
                     else
                         ast.Pattern{ .binding = try self.alloc.dupe(u8, f.field) };
+                    const field_name = if (self.enumVariantFields(sp.def)) |variant_fields|
+                        switch (variant_fields) {
+                            .tuple => try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
+                            else => try self.alloc.dupe(u8, f.field),
+                        }
+                    else
+                        try self.alloc.dupe(u8, f.field);
                     fields[i] = .{
-                        .name = try self.alloc.dupe(u8, f.field),
+                        .name = field_name,
                         .pat = f_pat,
                     };
                 }
@@ -1954,15 +2452,30 @@ const Lowerer = struct {
     // -------------------------------------------------------------------------
 
     pub fn lowerBlock(self: *Lowerer, be: ir.exprs.BlockExpr) anyerror!ast.Block {
-        var stmts = try self.alloc.alloc(ast.Stmt, be.statements.len);
-        for (be.statements, 0..) |stmt_id, i| {
-            stmts[i] = try self.lowerStmt(stmt_id);
-        }
-
-        const tail_expr = if (be.tail) |t_id|
+        // An unsupported tail expression would emit as `return @panic(...)`,
+        // which Zig rejects as unreachable code (the panic never returns).
+        // Keep it as a plain statement so the block still terminates in a loud
+        // unsoundness marker without diverting control flow or failing to
+        // compile.
+        const tail_ast = if (be.tail) |t_id|
             try self.allocExpr(try self.lowerExpr(t_id))
         else
             null;
+
+        var stmts = try self.alloc.alloc(
+            ast.Stmt,
+            be.statements.len + @intFromBool(tail_ast != null and tail_ast.?.* == .unsupported),
+        );
+        for (be.statements, 0..) |stmt_id, i| {
+            stmts[i] = try self.lowerStmt(stmt_id);
+        }
+        var tail_expr: ?*const ast.Expr = tail_ast;
+        if (tail_ast) |t| {
+            if (t.* == .unsupported) {
+                stmts[be.statements.len] = ast.Stmt{ .expr_stmt = t };
+                tail_expr = null;
+            }
+        }
 
         const label = if (be.labelled) |l| try self.alloc.dupe(u8, l) else null;
 
