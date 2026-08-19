@@ -2847,8 +2847,8 @@ test "resolve scoped constants and forward calls within the owning module" {
 
     const add_module = struct {
         fn run(
-            graph_: *graph.CrateGraph,
             alloc_: std.mem.Allocator,
+            graph_: *graph.CrateGraph,
             name: []const u8,
             parent: ?spine.EntityId,
             is_crate: bool,
@@ -2880,14 +2880,14 @@ test "resolve scoped constants and forward calls within the owning module" {
         }
     }.run;
 
-    const root_id = try add_module(&g, alloc, "", null, true);
-    const local_mod_id = try add_module(&g, alloc, "local", root_id, false);
-    const other_mod_id = try add_module(&g, alloc, "other", root_id, false);
+    const root_id = try add_module(alloc, &g, "", null, true);
+    const local_mod_id = try add_module(alloc, &g, "local", root_id, false);
+    const other_mod_id = try add_module(alloc, &g, "other", root_id, false);
 
     const add_entity = struct {
         fn run(
-            graph_: *graph.CrateGraph,
             alloc_: std.mem.Allocator,
+            graph_: *graph.CrateGraph,
             kind: spine.EntityKind,
             name: []const u8,
             parent: ?spine.EntityId,
@@ -2908,13 +2908,13 @@ test "resolve scoped constants and forward calls within the owning module" {
 
     // The unrelated declarations are inserted first to prove that resolution
     // does not use a global first-name match.
-    const wrong_call_id = try add_entity(&g, alloc, .fn_, "wymix", other_mod_id);
-    const right_call_id = try add_entity(&g, alloc, .fn_, "wymix", local_mod_id);
-    const hasher_id = try add_entity(&g, alloc, .struct_, "Hasher", local_mod_id);
-    const impl_id = try add_entity(&g, alloc, .impl_, "Hasher", hasher_id);
-    const wrong_const_id = try add_entity(&g, alloc, .const_, "CONTINUATION_BIT", other_mod_id);
-    const right_const_id = try add_entity(&g, alloc, .const_, "CONTINUATION_BIT", impl_id);
-    const caller_id = try add_entity(&g, alloc, .fn_, "caller", impl_id);
+    const wrong_call_id = try add_entity(alloc, &g, .fn_, "wymix", other_mod_id);
+    const right_call_id = try add_entity(alloc, &g, .fn_, "wymix", local_mod_id);
+    const hasher_id = try add_entity(alloc, &g, .struct_, "Hasher", local_mod_id);
+    const impl_id = try add_entity(alloc, &g, .impl_, "Hasher", hasher_id);
+    const wrong_const_id = try add_entity(alloc, &g, .const_, "CONTINUATION_BIT", other_mod_id);
+    const right_const_id = try add_entity(alloc, &g, .const_, "CONTINUATION_BIT", impl_id);
+    const caller_id = try add_entity(alloc, &g, .fn_, "caller", impl_id);
     const local_items = try alloc.alloc(spine.EntityId, 3);
     local_items[0] = right_call_id;
     local_items[1] = hasher_id;

@@ -27,5 +27,9 @@ pub const analyzeSource = pipeline.analyzeSource;
 
 test {
     _ = @import("expand_test.zig");
+    _ = @import("infer_test.zig");
+    _ = @import("names_test.zig");
+    _ = @import("resolve_methods_test.zig");
+    _ = @import("monomorphize_test.zig");
     std.testing.refAllDecls(@This());
 }

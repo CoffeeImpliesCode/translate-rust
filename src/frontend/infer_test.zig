@@ -977,23 +977,38 @@ test "prelude trait methods infer return types (len=usize, clone=self, bitxor=se
     defer graph.deinit();
 
     const len_ent = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "len", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = try a.dupe(u8, "len"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     const clone_ent = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "clone", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = try a.dupe(u8, "clone"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
     const bitxor_ent = try graph.symbol_table.add(.{
-        .id = 0, .kind = .fn_, .name = "bitxor", .span = span,
-        .visibility = .public, .parent = null, .resolved = null,
-        .renamed_to = null, .attributes = &.{},
+        .id = 0,
+        .kind = .fn_,
+        .name = try a.dupe(u8, "bitxor"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
     });
-    _ = len_ent;
-    _ = clone_ent;
-    _ = bitxor_ent;
 
     // Types: 0 = []const u8 (slice), 1 = u8, 2 = usize, 3 = bool.
     const slice_t = try a.create(types.Slice);
@@ -1021,7 +1036,16 @@ test "prelude trait methods infer return types (len=usize, clone=self, bitxor=se
     exprs_store[2] = .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{ .receiver = 0, .receiver_mode = .value, .method = clone_ent, .args = &.{} } } };
     exprs_store[3] = .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{ .receiver = 0, .receiver_mode = .value, .method = bitxor_ent, .args = &.{4} } } };
     exprs_store[4] = .{ .id = 4, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null } } } };
-    exprs_store[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .block = .{ .statements = &.{}, .tail = 3, .labelled = null } } };
+    const stmt_ids = try a.alloc(exprs.NodeId, 2);
+    defer a.free(stmt_ids);
+    stmt_ids[0] = 0;
+    stmt_ids[1] = 1;
+    exprs_store[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .block = .{ .statements = stmt_ids, .tail = 3, .labelled = null } } };
+
+    const stmts_store = try a.alloc(exprs.Statement, 2);
+    defer a.free(stmts_store);
+    stmts_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 1 } };
+    stmts_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 2 } };
 
     const bodies_store = try a.alloc(bodies.BodyKind, 1);
     defer a.free(bodies_store);
@@ -1033,7 +1057,7 @@ test "prelude trait methods infer return types (len=usize, clone=self, bitxor=se
 
     const b: bodies.Bodies = .{
         .exprs = exprs_store,
-        .stmts = &.{},
+        .stmts = stmts_store,
         .pats = &.{},
         .types = types_store,
         .bodies = bodies_store,
