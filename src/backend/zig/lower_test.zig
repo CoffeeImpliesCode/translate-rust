@@ -529,3 +529,448 @@ test "lower: non-primitive fn return types and block tail preservation" {
     try std.testing.expect(first_char.body.?.expr != null);
     try std.testing.expect(first_char.body.?.expr.?.* == .lit);
 }
+
+/// Build a graph exercising `pub use` re-export lowering:
+/// - cross-module qualified re-export (`pub use util::helper;` → `util.helper`)
+/// - same-module self-referential `pub use dup;` → skipped (no `pub const dup = dup;`)
+/// - `_` wildcard re-export → skipped
+fn buildUseModel(
+    alloc: std.mem.Allocator,
+    graph: *ir.graph.CrateGraph,
+    bodies: *ir.bodies.Bodies,
+) !void {
+    var model = Model.init(alloc);
+
+    // Module ids come from graph.addModule dense counter (root=0, util=1).
+    const root_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    const util_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = try alloc.dupe(u8, "util"),
+        .parent = 0,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    // id0: helper — lives in the `util` module (parent = util_id).
+    const helper_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "helper",
+        .span = span,
+        .visibility = .public,
+        .parent = util_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    // id1: dup — lives in the root module (parent = root_id = 0).
+    const dup_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "dup",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // id2: `pub use util::helper;` — cross-module qualified re-export.
+    const use_helper_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .use_,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = helper_id,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try graph.addUse(.{
+        .id = use_helper_id,
+        .kind = .{ .plain = helper_id },
+        .target = helper_id,
+        .local_name = "helper",
+        .is_pub_export = true,
+        .span = span,
+    });
+
+    // id3: `pub use dup;` — same-module self-referential → must be skipped.
+    const use_dup_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .use_,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = dup_id,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try graph.addUse(.{
+        .id = use_dup_id,
+        .kind = .{ .plain = dup_id },
+        .target = dup_id,
+        .local_name = "dup",
+        .is_pub_export = true,
+        .span = span,
+    });
+
+    // id4: `pub use other::x as _;` — wildcard local name → must be skipped.
+    const use_wild_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .use_,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = helper_id,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try graph.addUse(.{
+        .id = use_wild_id,
+        .kind = .{ .plain = helper_id },
+        .target = helper_id,
+        .local_name = "_",
+        .is_pub_export = true,
+        .span = span,
+    });
+
+    // Pad the sparse bodies table to cover the use_ entity ids.
+    var i: usize = 0;
+    while (i <= use_wild_id) : (i += 1) {
+        try model.bodies.append(model.a(), .{ .none = {} });
+    }
+
+    bodies.* = .{
+        .exprs = try model.exprs.toOwnedSlice(model.a()),
+        .stmts = try model.stmts.toOwnedSlice(model.a()),
+        .pats = try model.pats.toOwnedSlice(model.a()),
+        .types = &.{},
+        .bodies = try model.bodies.toOwnedSlice(model.a()),
+    };
+
+    // Root module's items list must reference the three use entities.
+    graph.modules.items[0].items = &.{ use_helper_id, use_dup_id, use_wild_id };
+
+    try graph.addCrate(.{
+        .name = "usecrate",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+}
+
+test "lower: pub use re-exports — qualified, self-ref, and wildcard" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var ir_bodies: ir.bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    try buildUseModel(alloc, &graph, &ir_bodies);
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "usecrate",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = ir_bodies,
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+
+    // Root module maps to src/root.zig.
+    var root_file: ?ast.File = null;
+    for (pkg.files) |f| {
+        if (std.mem.eql(u8, f.path, "src/root.zig")) {
+            root_file = f;
+            break;
+        }
+    }
+    const rf = root_file orelse return error.RootFileMissing;
+
+    // Only the cross-module `pub use util::helper;` should lower to a decl;
+    // the self-ref `pub use dup;` and `_` wildcard are skipped.
+    try std.testing.expectEqual(@as(usize, 1), rf.decls.len);
+
+    const d = rf.decls[0];
+    try std.testing.expect(d == .const_decl);
+    try std.testing.expectEqualStrings("helper", d.const_decl.name);
+    try std.testing.expect(d.const_decl.is_pub);
+    // init must be a qualified field access: util.helper
+    try std.testing.expect(d.const_decl.init == .field_access);
+    const fa = d.const_decl.init.field_access;
+    try std.testing.expect(fa.target.* == .ident);
+    try std.testing.expectEqualStrings("util", fa.target.*.ident);
+    try std.testing.expectEqualStrings("helper", fa.field_name);
+}
+
+fn buildGenericModel(
+    alloc: std.mem.Allocator,
+    graph: *ir.graph.CrateGraph,
+    bodies: *ir.bodies.Bodies,
+) !void {
+    var model = Model.init(alloc);
+
+    // id0: struct Fletcher<T>
+    const struct_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = "Fletcher",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const t_path = ir.types.Path{ .segments = &.{.{ .name = "T", .id = null }} };
+
+    // Explicit `generic_params` list on the StructBody (the primary path).
+    try model.bodies.append(model.a(), .{
+        .struct_ = .{
+            .generic_params = &.{"T"},
+            .trait_bounds = &.{},
+            .layout = .named,
+            .fields = &.{
+                .{ .name = "a", .ty = .{ .path = t_path }, .visibility = .public, .span = span },
+                .{ .name = "b", .ty = .{ .path = t_path }, .visibility = .public, .span = span },
+            },
+            .methods = &.{},
+            .has_dynamic_resources = false,
+        },
+    });
+
+    bodies.* = .{
+        .exprs = try model.exprs.toOwnedSlice(model.a()),
+        .stmts = try model.stmts.toOwnedSlice(model.a()),
+        .pats = try model.pats.toOwnedSlice(model.a()),
+        .types = &.{},
+        .bodies = try model.bodies.toOwnedSlice(model.a()),
+    };
+
+    const root_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{struct_id},
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "fletcher",
+        .edition = 2018,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+}
+
+test "lower: generic struct generic_params populate ast.StructDecl" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var ir_bodies: ir.bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    try buildGenericModel(alloc, &graph, &ir_bodies);
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "fletcher",
+        .edition = "2018",
+        .graph = graph,
+        .types = &.{},
+        .bodies = ir_bodies,
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+
+    var root_file: ?ast.File = null;
+    for (pkg.files) |f| {
+        if (std.mem.eql(u8, f.path, "src/root.zig")) {
+            root_file = f;
+            break;
+        }
+    }
+    const rf = root_file orelse return error.RootFileMissing;
+    try std.testing.expectEqual(@as(usize, 1), rf.decls.len);
+
+    const d = rf.decls[0];
+    try std.testing.expect(d == .struct_decl);
+    const sd = d.struct_decl;
+    try std.testing.expectEqualStrings("Fletcher", sd.name);
+    try std.testing.expectEqual(@as(usize, 2), sd.fields.len);
+
+    // The single generic param T is carried onto the ast.StructDecl.
+    try std.testing.expectEqual(@as(usize, 1), sd.generic_params.len);
+    try std.testing.expectEqualStrings("T", sd.generic_params[0].name);
+    try std.testing.expect(sd.generic_params[0].is_comptime);
+    try std.testing.expect(sd.generic_params[0].ty == null);
+}
+
+test "lower: const array + primitive initializers emit real Zig values" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    // Entity 0: `const A: [u16; 2] = [0x88, 0xCC];`  (explicit element list)
+    const a_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .const_,
+        .name = "A",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    // Entity 1: `const B: [u8; 256] = [0u8; 256];`   (repeating form)
+    const b_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .const_,
+        .name = "B",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // Type table: [0] = u16, [1] = u8 (element types referenced by Expr.ty).
+    const types_store: [2]ir.types.Type = .{ .{ .prim = .u16 }, .{ .prim = .u8 } };
+
+    // A = [0x88, 0xCC]
+    const e_a0 = try model.e(litInt(0x88));
+    const e_a1 = try model.e(litInt(0xCC));
+    const e_a = try model.e(.{ .array = .{ .elements = &.{ e_a0, e_a1 }, .repeat = null } });
+    model.exprs.items[e_a].ty = 0;
+    // B = [0u8; 256]
+    const e_b0 = try model.e(litInt(0));
+    const e_b = try model.e(.{ .array = .{ .elements = &.{e_b0}, .repeat = 256 } });
+    model.exprs.items[e_b].ty = 1;
+
+    const arr_u16 = try alloc.create(ir.types.Array);
+    arr_u16.* = .{ .elem = .{ .prim = .u16 }, .len = .{ .literal = 2 } };
+    const arr_u8 = try alloc.create(ir.types.Array);
+    arr_u8.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = 256 } };
+    try model.bodies.append(alloc, .{ .const_ = .{ .ty = .{ .array = arr_u16 }, .init = e_a } });
+    try model.bodies.append(alloc, .{ .const_ = .{ .ty = .{ .array = arr_u8 }, .init = e_b } });
+
+    const ir_bodies: ir.bodies.Bodies = .{
+        .exprs = try model.exprs.toOwnedSlice(alloc),
+        .stmts = try model.stmts.toOwnedSlice(alloc),
+        .pats = try model.pats.toOwnedSlice(alloc),
+        .types = &types_store,
+        .bodies = try model.bodies.toOwnedSlice(alloc),
+    };
+
+    const root_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{ a_id, b_id },
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "consts",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "consts",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types_store,
+        .bodies = ir_bodies,
+    };
+
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+
+    const emit = @import("emit.zig");
+    var found_a = false;
+    var found_b = false;
+    for (pkg.files) |*file| {
+        const src = try emit.emitFile(alloc, file);
+        if (std.mem.indexOf(u8, src, "const A: [2]u16 = [_]u16{ 136, 204 }") != null) found_a = true;
+        if (std.mem.indexOf(u8, src, "const B: [256]u8 = [_]u8{ 0 } ** 256") != null) found_b = true;
+    }
+    try std.testing.expect(found_a);
+    try std.testing.expect(found_b);
+
+    // Also assert the ast-level shapes directly: multi_array for the list,
+    // repeat for the repeating form.
+    var saw_multi = false;
+    var saw_repeat = false;
+    const file0 = pkg.files[0];
+    for (file0.decls) |d| {
+        if (d != .const_decl) continue;
+        switch (d.const_decl.init) {
+            .multi_array => |ma| {
+                try std.testing.expectEqual(@as(usize, 2), ma.elements.len);
+                saw_multi = true;
+            },
+            .repeat => |rp| {
+                try std.testing.expectEqual(@as(usize, 256), rp.len);
+                saw_repeat = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_multi);
+    try std.testing.expect(saw_repeat);
+}

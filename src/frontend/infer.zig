@@ -1014,6 +1014,7 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             }
         },
         .closure, .iterator_chain, .unsupported => {},
+        .array => |a| for (a.elements) |el| try walkExpr(ctx, el, fn_body),
     }
 }
 

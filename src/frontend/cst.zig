@@ -12,6 +12,7 @@ const ir = @import("translate_rust.ir");
 const spine = ir.spine;
 const types = ir.types;
 const graph = ir.graph;
+const exprs = ir.exprs;
 const bodies = ir.bodies;
 const items = ir.items;
 const names = @import("names.zig");
@@ -26,6 +27,7 @@ pub const Ctx = struct {
     src: []const u8,
     types_list: *std.ArrayListUnmanaged(types.Type),
     bodies_list: *std.ArrayListUnmanaged(bodies.BodyKind),
+    exprs_list: *std.ArrayListUnmanaged(exprs.Expr),
     base_dir: ?[]const u8 = null,
     io: ?std.Io = null,
 };
@@ -70,8 +72,8 @@ fn addEntity(e: *Ctx, kind: spine.EntityKind, name: []const u8, parent: ?spine.E
     return id;
 }
 
-fn appendType(e: *Ctx, t: types.Type) !types.TypeId {
-    const id: types.TypeId = @intCast(e.types_list.items.len);
+fn appendType(e: *Ctx, t: types.Type) !exprs.TypeId {
+    const id: exprs.TypeId = @intCast(e.types_list.items.len);
     try e.types_list.append(e.alloc, t);
     return id;
 }
@@ -398,10 +400,28 @@ fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     var name: []const u8 = "";
     var fields_node: ?ts.Node = null;
     var tuple = false;
+    var generic_params: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: u32 = 0;
     while (item.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
         if (std.mem.eql(u8, k, "type_identifier")) name = text(e, c);
+        if (std.mem.eql(u8, k, "type_parameters")) {
+            var j: u32 = 0;
+            while (c.namedChild(j)) |tp| : (j += 1) {
+                const tp_k = tp.kind();
+                if (std.mem.eql(u8, tp_k, "type_identifier")) {
+                    try generic_params.append(e.alloc, try e.alloc.dupe(u8, text(e, tp)));
+                } else if (std.mem.eql(u8, tp_k, "type_parameter") or std.mem.eql(u8, tp_k, "const_parameter")) {
+                    var m: u32 = 0;
+                    while (tp.namedChild(m)) |tpc| : (m += 1) {
+                        if (std.mem.eql(u8, tpc.kind(), "type_identifier")) {
+                            try generic_params.append(e.alloc, try e.alloc.dupe(u8, text(e, tpc)));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         if (std.mem.eql(u8, k, "field_declaration_list")) fields_node = c;
         if (std.mem.eql(u8, k, "ordered_field_declaration_list")) {
             fields_node = c;
@@ -412,9 +432,10 @@ fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     const fields = if (fields_node) |fn_| mapFields(e, fn_) else &.{};
     const layout: items.struct_kind = if (fields.len == 0) .unit else if (tuple) .tuple else .named;
     e.bodies_list.items[eid] = .{ .struct_ = .{
-        .generic_params = &.{},
+        .generic_params = try generic_params.toOwnedSlice(e.alloc),
         .layout = layout,
         .fields = fields,
+        .methods = &.{},
     } };
 }
 
@@ -550,7 +571,17 @@ fn traitItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
                 if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
                 if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
                 if (std.mem.eql(u8, kk, "return_type")) {
-                    if (c.namedChildCount() > 0) mret = mapType(e, c.namedChild(0).?);
+                    var t: u32 = 0;
+                    while (c.namedChild(t)) |rc| : (t += 1) {
+                        const mapped = mapType(e, rc);
+                        if (mapped != .unsupported) {
+                            mret = mapped;
+                            break;
+                        }
+                    }
+                    if (mret == .prim and mret.prim == .unit and c.namedChildCount() > 0) {
+                        mret = mapType(e, c.namedChild(0).?);
+                    }
                 }
             }
             const mparams = mapParams(e, mparams_node);
@@ -597,19 +628,211 @@ fn typeAliasItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     e.bodies_list.items[eid] = .{ .type_alias = .{ .target = target } };
 }
 
+/// Append an expression node, returning its dense NodeId.
+fn appendExpr(e: *Ctx, kind: exprs.ExprKind) !exprs.NodeId {
+    const id: exprs.NodeId = @intCast(e.exprs_list.items.len);
+    try e.exprs_list.append(e.alloc, .{
+        .id = id,
+        .span = span_of,
+        .ty = null,
+        .kind = kind,
+    });
+    return id;
+}
+
+/// Rust integer-literal type suffixes, longest first (so `u128` beats `u8`).
+const int_suffixes = [_][]const u8{ "i128", "i64", "i32", "i16", "i8", "u128", "u64", "u32", "u16", "u8", "isize", "usize" };
+
+/// Strip a digit suffix (`0x88u8` → `0x88`) so the numeric body parses.
+fn stripIntSuffix(body: []const u8) []const u8 {
+    for (int_suffixes) |s| {
+        if (body.len > s.len and std.mem.endsWith(u8, body, s)) {
+            const pre = body[0 .. body.len - s.len];
+            const last = pre[pre.len - 1];
+            if (std.ascii.isDigit(last) or last == '_') return pre;
+        }
+    }
+    return body;
+}
+
+/// Element type carried by a (possibly reference/pointer-wrapped) array type.
+fn arrayElemTy(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .array => |a| a.elem,
+        .reference => |r| arrayElemTy(r.pointee),
+        .raw_ptr => |p| arrayElemTy(p.pointee),
+        .slice => |s| s.elem,
+        else => null,
+    };
+}
+
+/// Lower a string / byte-string const literal (handles `"..."` and `b"..."`,
+/// which tree-sitter-rust reports as `string_literal`). Bytes are the decoded
+/// content without the delimiters / `b` prefix.
+fn lowerConstString(e: *Ctx, node: ts.Node) ?exprs.NodeId {
+    const raw = text(e, node);
+    const is_bytes = raw.len >= 2 and raw[0] == 'b' and (raw[1] == '"' or raw[1] == 'r');
+    var s = raw;
+    if (is_bytes) s = s[1..];
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
+    const bytes = e.alloc.dupe(u8, s) catch return null;
+    if (is_bytes) {
+        return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } }) catch null;
+    }
+    return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = bytes } } }) catch null;
+}
+
+fn lowerConstArray(e: *Ctx, node: ts.Node) ?exprs.NodeId {
+    // Repeating form `[e; N]` exposes a `length` field; the element node may
+    // or may not carry an `element` field (grammar-dependent), so fall back to
+    // the remaining named child when it is missing.
+    if (node.childByFieldName("length")) |len_node| {
+        var elem: ?ts.Node = node.childByFieldName("element");
+        if (elem == null) {
+            var i: u32 = 0;
+            while (node.namedChild(i)) |c| : (i += 1) {
+                if (c.eql(len_node)) continue;
+                elem = c;
+                break;
+            }
+        }
+        const en = elem orelse return null;
+        const elem_id = lowerConstInit(e, en) orelse return null;
+        const len = std.fmt.parseInt(usize, text(e, len_node), 10) catch 0;
+        var elems: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+        defer elems.deinit(e.alloc);
+        elems.append(e.alloc, elem_id) catch return null;
+        return appendExpr(e, .{ .array = .{
+            .elements = elems.toOwnedSlice(e.alloc) catch return null,
+            .repeat = len,
+        } }) catch null;
+    }
+    // Explicit list `[a, b, c]`.
+    var elements: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer elements.deinit(e.alloc);
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        if (isComment(c)) continue;
+        const eid = lowerConstInit(e, c) orelse continue;
+        elements.append(e.alloc, eid) catch return null;
+    }
+    if (elements.items.len == 0) return null;
+    return appendExpr(e, .{ .array = .{
+        .elements = elements.toOwnedSlice(e.alloc) catch return null,
+        .repeat = null,
+    } }) catch null;
+}
+
+/// Lower a const initializer expression into the expr table. Returns null when
+/// the form is not representable (the const keeps its `undefined` fallback).
+fn lowerConstInit(e: *Ctx, node: ts.Node) ?exprs.NodeId {
+    const kind = node.kind();
+    // Semantic-neutral wrappers for a const value.
+    if (std.mem.eql(u8, kind, "expression") or
+        std.mem.eql(u8, kind, "parenthesized_expression") or
+        std.mem.eql(u8, kind, "reference_expression"))
+    {
+        if (node.namedChildCount() > 0) return lowerConstInit(e, node.namedChild(0).?);
+        return null;
+    }
+    if (std.mem.eql(u8, kind, "unsafe_expression")) {
+        if (node.namedChildCount() > 0) return lowerConstInit(e, node.namedChild(0).?);
+        return null;
+    }
+    if (std.mem.eql(u8, kind, "array_expression")) return lowerConstArray(e, node);
+    if (std.mem.eql(u8, kind, "integer_literal")) {
+        const t = text(e, node);
+        const body = stripIntSuffix(t);
+        const base: u8 = if (body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X'))
+            16
+        else if (body.len > 2 and body[0] == '0' and (body[1] == 'b' or body[1] == 'B'))
+            2
+        else if (body.len > 2 and body[0] == '0' and (body[1] == 'o' or body[1] == 'O'))
+            8
+        else
+            10;
+        // Values are the bare digit string (no `0x`/`0b`/`0o` prefix).
+        const digits = if (base != 10) body[2..] else body;
+        const value = std.fmt.parseInt(i128, digits, base) catch 0;
+        return appendExpr(e, .{ .literal = .{ .int = .{
+            .text = e.alloc.dupe(u8, t) catch return null,
+            .value = value,
+            .base = if (base == 16) .hex else if (base == 2) .bin else if (base == 8) .oct else .dec,
+            .ty_suffix = null,
+        } } }) catch null;
+    }
+    if (std.mem.eql(u8, kind, "float_literal")) {
+        const t = text(e, node);
+        return appendExpr(e, .{ .literal = .{ .float = .{
+            .text = e.alloc.dupe(u8, t) catch return null,
+            .value = std.fmt.parseFloat(f64, t) catch 0.0,
+        } } }) catch null;
+    }
+    if (std.mem.eql(u8, kind, "char_literal")) {
+        const t = text(e, node);
+        var val: u32 = 0;
+        if (t.len >= 3 and t[0] == '\'' and t[t.len - 1] == '\'') val = t[1];
+        return appendExpr(e, .{ .literal = .{ .character = .{
+            .text = e.alloc.dupe(u8, t) catch return null,
+            .value = val,
+        } } }) catch null;
+    }
+    if (std.mem.eql(u8, kind, "boolean_literal")) {
+        return appendExpr(e, .{ .literal = .{ .boolean = std.mem.eql(u8, text(e, node), "true") } }) catch null;
+    }
+    if (std.mem.eql(u8, kind, "string_literal") or std.mem.eql(u8, kind, "byte_string_literal")) {
+        return lowerConstString(e, node);
+    }
+    if (std.mem.eql(u8, kind, "unary_expression")) {
+        const op = node.namedChild(0);
+        const operand = node.namedChild(1);
+        if (op == null or operand == null) return null;
+        const ot = text(e, op.?);
+        const oid = lowerConstInit(e, operand.?) orelse return null;
+        if (std.mem.eql(u8, ot, "-")) {
+            return appendExpr(e, .{ .unary = .{ .op = .negate, .operand = oid } }) catch null;
+        }
+        return oid;
+    }
+    return null;
+}
+
 fn constItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     var name: []const u8 = "";
     var ty: types.Type = unsupportedTy();
+    var init_node: ?ts.Node = null;
     var i: u32 = 0;
     while (item.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
-        if (std.mem.eql(u8, k, "identifier")) name = text(e, c);
-        if (std.mem.eql(u8, k, "primitive_type") or std.mem.eql(u8, k, "generic_type") or std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "array_type")) {
-            ty = mapType(e, c);
+        if (std.mem.eql(u8, k, "identifier")) {
+            name = text(e, c);
+            continue;
         }
+        if (std.mem.eql(u8, k, "visibility_modifier") or std.mem.eql(u8, k, "attribute_item")) continue;
+        if (std.mem.eql(u8, k, "primitive_type") or std.mem.eql(u8, k, "generic_type") or std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "array_type") or std.mem.eql(u8, k, "reference_type") or std.mem.eql(u8, k, "pointer_type")) {
+            ty = mapType(e, c);
+            continue;
+        }
+        // Any other named child is the initializer expression.
+        if (init_node == null) init_node = c;
     }
     const eid = try addEntity(e, .const_, name, parent);
     e.bodies_list.items[eid] = .{ .const_ = .{ .ty = ty, .init = 0 } };
+
+    if (init_node) |in| {
+        if (lowerConstInit(e, in)) |init_id| {
+            const cb = &e.bodies_list.items[eid].const_;
+            cb.init = init_id;
+            // Carry the element type onto an array constant so the backend can
+            // render `[_]T{ ... }` / `[_]T{ e } ** N`.
+            if (arrayElemTy(cb.ty)) |elem| {
+                if (e.exprs_list.items[init_id].kind == .array) {
+                    const tid = try appendType(e, elem);
+                    e.exprs_list.items[init_id].ty = tid;
+                }
+            }
+        }
+    }
 }
 
 fn functionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, is_trait_sig: bool) !void {
@@ -623,7 +846,17 @@ fn functionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, is_trait_sig: b
         if (std.mem.eql(u8, k, "identifier")) name = text(e, c);
         if (std.mem.eql(u8, k, "parameters")) params_node = c;
         if (std.mem.eql(u8, k, "return_type")) {
-            if (c.namedChildCount() > 0) ret = mapType(e, c.namedChild(0).?);
+            var t: u32 = 0;
+            while (c.namedChild(t)) |rc| : (t += 1) {
+                const mapped = mapType(e, rc);
+                if (mapped != .unsupported) {
+                    ret = mapped;
+                    break;
+                }
+            }
+            if (ret == .prim and ret.prim == .unit and c.namedChildCount() > 0) {
+                ret = mapType(e, c.namedChild(0).?);
+            }
         }
     }
     const params = mapParams(e, params_node);
@@ -815,18 +1048,130 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
         }
     }
 
+    var target_name = std.mem.trim(u8, self_ty_name, " &*");
+    if (std.mem.startsWith(u8, target_name, "mut ")) {
+        target_name = target_name[4..];
+    }
+    if (std.mem.indexOf(u8, target_name, "<")) |idx| {
+        target_name = target_name[0..idx];
+    }
+    target_name = std.mem.trim(u8, target_name, " ");
+
+    var target_id: ?spine.EntityId = null;
+    for (e.g.symbol_table.entities.items) |ent| {
+        if ((ent.kind == .struct_ or ent.kind == .enum_ or ent.kind == .union_) and std.mem.eql(u8, ent.name, target_name)) {
+            if (ent.parent == mod_id or target_id == null) {
+                target_id = ent.id;
+            }
+        }
+    }
+
     const name = if (trait_name) |tr|
         try std.fmt.allocPrint(e.alloc, "{s} for {s}", .{ tr, self_ty_name })
     else
         try e.alloc.dupe(u8, self_ty_name);
 
-    const impl_id = try addEntity(e, .impl_, name, mod_id);
+    // Only inherent impls (`impl Type { ... }`) hoist their methods into the
+    // target struct; trait impls (`impl Trait for Type { ... }`) stay
+    // top-level and keep their items parented to the impl block.
+    const inherent = trait_name == null;
+    const impl_parent = if (inherent) (target_id orelse mod_id) else mod_id;
+    const impl_id = try addEntity(e, .impl_, name, impl_parent);
 
     if (decl_list) |dl| {
         var j: u32 = 0;
         while (dl.namedChild(j)) |child| : (j += 1) {
             if (std.mem.eql(u8, child.kind(), "function_item")) {
+                // Parent the method entity on the impl block (matching the
+                // model reference) so the backend's collectHoistedMethods can
+                // resolve impl -> target struct and hoist the method there.
+                // The method is also registered on the target's StructBody
+                // below; the backend dedups the two paths by method name.
                 try functionItem(e, child, impl_id, false);
+
+                if (inherent) {
+                    if (target_id) |tid| {
+                        if (tid < e.bodies_list.items.len) {
+                            switch (e.bodies_list.items[tid]) {
+                                .struct_ => |*sb| {
+                                    var mname: []const u8 = "";
+                                    var mparams_node: ?ts.Node = null;
+                                    var mret: types.Type = .{ .prim = .unit };
+                                    var k: u32 = 0;
+                                    while (child.namedChild(k)) |c| : (k += 1) {
+                                        const kk = c.kind();
+                                        if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
+                                        if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
+                                        if (std.mem.eql(u8, kk, "return_type")) {
+                                            var t: u32 = 0;
+                                            while (c.namedChild(t)) |rc| : (t += 1) {
+                                                const mapped = mapType(e, rc);
+                                                if (mapped != .unsupported) {
+                                                    mret = mapped;
+                                                    break;
+                                                }
+                                            }
+                                            if (mret == .prim and mret.prim == .unit and c.namedChildCount() > 0) {
+                                                mret = mapType(e, c.namedChild(0).?);
+                                            }
+                                        }
+                                    }
+
+                                    const all_params = mapParams(e, mparams_node);
+                                    var receiver: ?items.Receiver = null;
+                                    var method_params: []const items.Param = all_params;
+
+                                    if (mparams_node) |pn| {
+                                        var pi: u32 = 0;
+                                        while (pn.namedChild(pi)) |p| : (pi += 1) {
+                                            if (std.mem.eql(u8, p.kind(), "self_parameter")) {
+                                                const p_text = text(e, p);
+                                                if (std.mem.indexOf(u8, p_text, "&mut") != null) {
+                                                    receiver = .mut_ref;
+                                                } else if (std.mem.indexOf(u8, p_text, "&") != null) {
+                                                    receiver = .ref_;
+                                                } else {
+                                                    receiver = .owned;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (receiver == null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
+                                        if (all_params[0].ty == .reference) {
+                                            if (all_params[0].ty.reference.*.mut) {
+                                                receiver = .mut_ref;
+                                            } else {
+                                                receiver = .ref_;
+                                            }
+                                        } else {
+                                            receiver = .owned;
+                                        }
+                                    }
+                                    if (receiver != null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
+                                        method_params = all_params[1..];
+                                    }
+
+                                    const sm: bodies.StructMethod = .{
+                                        .name = try e.alloc.dupe(u8, mname),
+                                        .visibility = visOf(e, child),
+                                        .params = method_params,
+                                        .ret = mret,
+                                        .body = 0,
+                                        .receiver = receiver,
+                                        .is_allocating = false,
+                                    };
+                                    const old_methods = sb.methods;
+                                    const new_methods = try e.alloc.alloc(bodies.StructMethod, old_methods.len + 1);
+                                    @memcpy(new_methods[0..old_methods.len], old_methods);
+                                    new_methods[old_methods.len] = sm;
+                                    sb.methods = new_methods;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
             } else if (std.mem.eql(u8, child.kind(), "const_item")) {
                 try constItem(e, child, impl_id);
             } else if (std.mem.eql(u8, child.kind(), "type_item")) {
@@ -934,6 +1279,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                                 .src = sub_src,
                                 .types_list = e.types_list,
                                 .bodies_list = e.bodies_list,
+                                .exprs_list = e.exprs_list,
                                 .base_dir = sub_base_dir,
                                 .io = e.io,
                             };

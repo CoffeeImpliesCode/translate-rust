@@ -757,6 +757,38 @@ pub fn emitExpr(
             }
             try buf.appendSlice(allocator, "}");
         },
+        .multi_array => |ma| {
+            if (ma.type_name) |tn| {
+                try buf.appendSlice(allocator, "[_]");
+                try emitType(allocator, buf, tn);
+            } else {
+                try buf.appendSlice(allocator, ".");
+            }
+            try buf.appendSlice(allocator, "{");
+            if (ma.elements.len > 0) {
+                try buf.appendSlice(allocator, " ");
+                for (ma.elements, 0..) |elem, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    try emitExpr(allocator, buf, elem, depth);
+                }
+                try buf.appendSlice(allocator, " ");
+            }
+            try buf.appendSlice(allocator, "}");
+        },
+        .repeat => |rp| {
+            if (rp.type_name) |tn| {
+                try buf.appendSlice(allocator, "[_]");
+                try emitType(allocator, buf, tn);
+            } else {
+                try buf.appendSlice(allocator, ".");
+            }
+            try buf.appendSlice(allocator, "{ ");
+            try emitExpr(allocator, buf, rp.elem.*, depth);
+            try buf.appendSlice(allocator, " } ** ");
+            var len_buf: [32]u8 = undefined;
+            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{rp.len}) catch unreachable;
+            try buf.appendSlice(allocator, len_str);
+        },
         .builtin => |bi| {
             if (std.mem.eql(u8, bi.name, "index") and bi.args.len == 2) {
                 try emitExpr(allocator, buf, bi.args[0], depth);

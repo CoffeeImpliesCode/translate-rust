@@ -224,6 +224,48 @@ test "emitFile: emits const, var, fn with match/switch and tests" {
     try std.testing.expect(std.mem.indexOf(u8, out, "test \"area test\" {") != null);
 }
 
+test "emitFile: emits generic struct as comptime type fn and plain struct as const" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // pub fn Fletcher(comptime T: type) type { return struct { a: T, b: T }; }
+    const generic = ast.Decl{ .struct_decl = .{
+        .name = "Fletcher",
+        .is_pub = true,
+        .generic_params = &.{ .{ .name = "T", .is_comptime = true, .ty = null } },
+        .fields = &.{
+            .{ .name = "a", .ty = .{ .named = "T" } },
+            .{ .name = "b", .ty = .{ .named = "T" } },
+        },
+    } };
+
+    // pub const Point = struct { x: i32, y: i32 };
+    const point = ast.Decl{ .struct_decl = .{
+        .name = "Point",
+        .is_pub = true,
+        .fields = &.{
+            .{ .name = "x", .ty = .{ .prim = .i32 } },
+            .{ .name = "y", .ty = .{ .prim = .i32 } },
+        },
+    } };
+
+    const file = ast.File{
+        .path = "src/root.zig",
+        .decls = &.{ generic, point },
+    };
+
+    const out = try emitFile(a, file);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn Fletcher(comptime T: type) type {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a: T,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "b: T,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "};") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const Point = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x: i32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "y: i32,") != null);
+}
+
 test "emitFile: emits comments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -190,7 +190,9 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
             try appendMangled(alloc, w, f.ret);
         },
         .generic_inst => |g| {
-            try appendMangledPath(alloc, w, segmentPath(g.decl));
+            var id_buf: [24]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "g{d}", .{g.decl}) catch "g0";
+            try appendMangledName(alloc, w, id_str);
             for (g.args.params) |a| {
                 try w.append(alloc, '_');
                 try appendMangled(alloc, w, a);
@@ -431,6 +433,7 @@ fn collectExpr(
         },
         .break_ => |br| if (br.value) |bval| try collectExpr(table, alloc, b, v, bval),
         .continue_, .literal, .unit, .unsupported => {},
+        .array => |a| for (a.elements) |el| try collectExpr(table, alloc, b, v, el),
         .call => |c| for (c.args) |a| try collectExpr(table, alloc, b, v, a),
         .method_call => |mc| {
             try collectExpr(table, alloc, b, v, mc.receiver);

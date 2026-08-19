@@ -640,6 +640,29 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
             }
             try o.put(allocator, "elements", .{ .array = elem_arr });
         },
+        .multi_array => |ma| {
+            try o.put(allocator, "kind", .{ .string = "multi_array" });
+            if (ma.type_name) |tn| {
+                try o.put(allocator, "type_name", try encodeType(allocator, tn));
+            } else {
+                try o.put(allocator, "type_name", .{ .null = {} });
+            }
+            var elem_arr = Array.init(allocator);
+            for (ma.elements) |e| {
+                try elem_arr.append(try encodeExpr(allocator, e));
+            }
+            try o.put(allocator, "elements", .{ .array = elem_arr });
+        },
+        .repeat => |rp| {
+            try o.put(allocator, "kind", .{ .string = "repeat" });
+            if (rp.type_name) |tn| {
+                try o.put(allocator, "type_name", try encodeType(allocator, tn));
+            } else {
+                try o.put(allocator, "type_name", .{ .null = {} });
+            }
+            try o.put(allocator, "elem", try encodeExpr(allocator, rp.elem.*));
+            try o.put(allocator, "len", .{ .integer = @intCast(rp.len) });
+        },
         .builtin => |bc| {
             try o.put(allocator, "kind", .{ .string = "builtin" });
             try o.put(allocator, "name", .{ .string = bc.name });
@@ -863,6 +886,44 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
             .array_init = .{
                 .type_name = type_name,
                 .elements = try elem_list.toOwnedSlice(allocator),
+            },
+        };
+    } else if (std.mem.eql(u8, kind, "multi_array")) {
+        const type_name = if (o.get("type_name")) |tn| (switch (tn) {
+            .null => null,
+            else => try decodeType(allocator, tn),
+        }) else null;
+        const elem_v = try req(o, "elements");
+        const elem_arr = switch (elem_v) {
+            .array => |a| a,
+            else => return error.BadWireFormat,
+        };
+        var elem_list: std.ArrayListUnmanaged(ast.Expr) = .empty;
+        for (elem_arr.items) |item| {
+            try elem_list.append(allocator, try decodeExpr(allocator, item));
+        }
+        return .{
+            .multi_array = .{
+                .type_name = type_name,
+                .elements = try elem_list.toOwnedSlice(allocator),
+            },
+        };
+    } else if (std.mem.eql(u8, kind, "repeat")) {
+        const type_name = if (o.get("type_name")) |tn| (switch (tn) {
+            .null => null,
+            else => try decodeType(allocator, tn),
+        }) else null;
+        const elem_ptr = try allocator.create(ast.Expr);
+        elem_ptr.* = try decodeExpr(allocator, try req(o, "elem"));
+        const len: usize = switch (try req(o, "len")) {
+            .integer => |i| @intCast(@max(i, 0)),
+            else => return error.BadWireFormat,
+        };
+        return .{
+            .repeat = .{
+                .type_name = type_name,
+                .elem = elem_ptr,
+                .len = len,
             },
         };
     } else if (std.mem.eql(u8, kind, "builtin")) {

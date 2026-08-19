@@ -225,6 +225,8 @@ pub const Expr = union(enum) {
     unary_op: UnaryOp,
     struct_init: StructInit,
     array_init: ArrayInit,
+    repeat: Repeat,
+    multi_array: MultiArray,
     builtin: BuiltinCall,
     unsupported: []const u8,
     if_expr: IfExpr,
@@ -337,6 +339,21 @@ pub const StructInitField = struct {
 };
 
 pub const ArrayInit = struct {
+    type_name: ?Type = null,
+    elements: []const Expr = &.{},
+};
+
+/// A comptime-repeated array literal: `[_]T{ elem } ** len` (`[e; N]`).
+pub const Repeat = struct {
+    /// Element type (`T` in `[_]T{ el } ** len`).
+    type_name: ?Type = null,
+    elem: *const Expr,
+    len: usize,
+};
+
+/// An explicit element-list array literal: `[_]T{ e0, e1, ... }`.
+pub const MultiArray = struct {
+    /// Element type (`T` in `[_]T{ ... }`).
     type_name: ?Type = null,
     elements: []const Expr = &.{},
 };

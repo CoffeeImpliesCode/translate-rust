@@ -117,6 +117,9 @@ fn analyzeSourceWithGraph(
     var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
     // Slot 0 for root module
     try bodies_list.append(allocator, .none);
+    // Const initializers are lowered into the expr table by cst, so the table
+    // must exist (and share the allocator) before CST extraction runs.
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
 
     // 2. CST extraction across root and submodules
     const root_dir = std.fs.path.dirname(manifest.root_path) orelse crate_dir;
@@ -126,6 +129,7 @@ fn analyzeSourceWithGraph(
         .src = src,
         .types_list = &types_list,
         .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
         .base_dir = root_dir,
         .io = maybe_io,
     };
@@ -135,7 +139,6 @@ fn analyzeSourceWithGraph(
     try names.resolveGraph(allocator, &g);
 
     // 4. Function body lowering
-    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
     var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
     var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
 
@@ -241,4 +244,72 @@ test "analyzeSource on simple Rust function" {
     try std.testing.expectEqualStrings("mini", rust_ir.crate_name);
     try std.testing.expectEqualStrings("2021", rust_ir.edition);
     try std.testing.expect(rust_ir.graph.symbol_table.entities.items.len > 0);
+}
+
+test "analyzeSource: const array + primitive initializers parsed into const body" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub const BIT_REVERSE_TABLE: [u16; 4] = [0x00, 0x80, 0x40, 0xC0];
+        \\pub const ZEROES: [u8; 256] = [0u8; 256];
+        \\pub const FLAG: bool = true;
+        \\pub const COUNT: u32 = 42;
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "consts", "2021", src);
+    const body_tables = rust_ir.bodies;
+
+    var saw_table = false;
+    var saw_zeroes = false;
+    var saw_flag = false;
+    var saw_count = false;
+    for (rust_ir.graph.symbol_table.entities.items) |ent| {
+        if (ent.kind != .const_) continue;
+        const cb = switch (body_tables.bodies[ent.id]) {
+            .const_ => |c| c,
+            else => continue,
+        };
+        if (std.mem.eql(u8, ent.name, "BIT_REVERSE_TABLE")) {
+            try std.testing.expect(cb.ty == .array);
+            try std.testing.expectEqual(@as(u32, 4), cb.ty.array.len.literal);
+            try std.testing.expect(cb.ty.array.elem.prim == .u16);
+            const ex = body_tables.exprs[cb.init];
+            try std.testing.expect(ex.kind == .array);
+            try std.testing.expectEqual(@as(?usize, null), ex.kind.array.repeat);
+            try std.testing.expectEqual(@as(usize, 4), ex.kind.array.elements.len);
+            // First element 0x00 → 0; third element 0x40 → 64.
+            const first = body_tables.exprs[ex.kind.array.elements[0]];
+            try std.testing.expectEqual(@as(i128, 0), first.kind.literal.int.value);
+            const third = body_tables.exprs[ex.kind.array.elements[2]];
+            try std.testing.expectEqual(@as(i128, 64), third.kind.literal.int.value);
+            saw_table = true;
+        } else if (std.mem.eql(u8, ent.name, "ZEROES")) {
+            try std.testing.expect(cb.ty == .array);
+            try std.testing.expectEqual(@as(u32, 256), cb.ty.array.len.literal);
+            const ex = body_tables.exprs[cb.init];
+            try std.testing.expect(ex.kind == .array);
+            try std.testing.expect(ex.kind == .array);
+            try std.testing.expectEqual(@as(?usize, 256), ex.kind.array.repeat);
+            try std.testing.expectEqual(@as(usize, 1), ex.kind.array.elements.len);
+            saw_zeroes = true;
+        } else if (std.mem.eql(u8, ent.name, "FLAG")) {
+            const ex = body_tables.exprs[cb.init];
+            try std.testing.expect(ex.kind == .literal);
+            try std.testing.expect(ex.kind.literal == .boolean);
+            try std.testing.expectEqual(true, ex.kind.literal.boolean);
+            saw_flag = true;
+        } else if (std.mem.eql(u8, ent.name, "COUNT")) {
+            const ex = body_tables.exprs[cb.init];
+            try std.testing.expect(ex.kind == .literal);
+            try std.testing.expect(ex.kind.literal == .int);
+            try std.testing.expectEqual(@as(i128, 42), ex.kind.literal.int.value);
+            saw_count = true;
+        }
+    }
+    try std.testing.expect(saw_table);
+    try std.testing.expect(saw_zeroes);
+    try std.testing.expect(saw_flag);
+    try std.testing.expect(saw_count);
 }

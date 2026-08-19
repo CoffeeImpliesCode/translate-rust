@@ -59,6 +59,9 @@ const Ext = struct {
     ctx: *Ctx,
     /// Enclosing fn entity id (for local parents).
     fn_id: spine.EntityId,
+    /// The struct/enum/union entity this fn's impl block implements, when the
+    /// enclosing fn is an associated method (`Self::method(...)` resolution).
+    self_ty: ?spine.EntityId = null,
     locals: std.ArrayListUnmanaged(Local) = .empty,
 
     fn deinit(self: *Ext) void {
@@ -69,6 +72,45 @@ const Ext = struct {
 
 fn text(e: *const Ext, node: ts.Node) []const u8 {
     return e.ctx.src[node.startByte()..node.endByte()];
+}
+
+/// Resolve an associated / inherent method on a type: given a type entity id
+/// (struct/enum/union), find the `.fn_` entity named `method` parented to it,
+/// either directly or via an inherent `impl` block whose parent is the type.
+fn resolveTypeMethod(e: *const Ext, type_id: spine.EntityId, method: []const u8) ?spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .fn_) continue;
+        if (!std.mem.eql(u8, ent.name, method)) continue;
+        const parent = ent.parent orelse continue;
+        if (parent == type_id) return ent.id;
+        if (e.ctx.g.symbol_table.get(parent)) |p| {
+            if (p.kind == .impl_ and p.parent == type_id) return ent.id;
+        }
+    }
+    return null;
+}
+
+/// Resolve an enum variant entity id parented to `enum_id`.
+fn resolveVariant(e: *const Ext, enum_id: spine.EntityId, variant: []const u8) ?spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .variant) continue;
+        if (!std.mem.eql(u8, ent.name, variant)) continue;
+        if (ent.parent == enum_id) return ent.id;
+    }
+    return null;
+}
+
+/// Climb an fn entity's parent chain to its innermost owning type entity
+/// (struct/enum/union via its inherent `impl` block), for `Self::method(...)`.
+fn findSelfType(e: *const Ext, ent: spine.Entity) ?spine.EntityId {
+    var cur = ent.parent;
+    while (cur) |pid| {
+        const p = e.ctx.g.symbol_table.get(pid) orelse return null;
+        if (p.kind == .module) return null;
+        if (p.kind == .struct_ or p.kind == .enum_ or p.kind == .union_) return pid;
+        cur = p.parent;
+    }
+    return null;
 }
 
 /// Add a module-scope named fn entity id lookup — returns the entity id of the
@@ -1290,7 +1332,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         } });
     }
 
-    // free / associated call
+    // free / associated / enum-variant / constructor call
     var arg_list: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
     defer arg_list.deinit(e.ctx.alloc);
     if (args_node) |an| {
@@ -1299,17 +1341,70 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             try arg_list.append(e.ctx.alloc, try lowerExpr(e, a));
         }
     }
-    var cdef: ?spine.EntityId = null;
-    if (std.mem.eql(u8, callee.kind(), "identifier")) {
-        cdef = resolveName(e, text(e, callee));
-    } else if (std.mem.eql(u8, callee.kind(), "scoped_identifier")) {
+    const args = try arg_list.toOwnedSlice(e.ctx.alloc);
+
+    if (std.mem.eql(u8, callee.kind(), "scoped_identifier")) {
+        // Struct::method(...) / Enum::Variant(...) / Self::method(...) /
+        // Type::constructor(...). Split the scoped path at "::".
         const t = text(e, callee);
-        const last = std.mem.lastIndexOfScalar(u8, t, ':') orelse return unsupported(e, "scoped call");
-        cdef = resolveName(e, t[last + 1 ..]);
+        const sep = std.mem.indexOf(u8, t, "::") orelse return unsupported(e, "unresolved call");
+        const base_name = t[0..sep];
+        const leaf = t[sep + 2 ..];
+        if (base_name.len == 0 or leaf.len == 0) return unsupported(e, "unresolved call");
+
+        // Base type resolution: `Self` → the enclosing impl's type; else the
+        // named module-scope type.
+        var base_def: ?spine.EntityId = null;
+        if (std.mem.eql(u8, base_name, "Self")) {
+            base_def = e.self_ty;
+        } else {
+            base_def = resolveName(e, base_name);
+        }
+
+        if (base_def) |bid| {
+            if (e.ctx.g.symbol_table.get(bid)) |base_ent| {
+                if (base_ent.kind == .enum_ and resolveVariant(e, bid, leaf) != null) {
+                    // Enum variant constructor: Shape::Circle(r)
+                    return appendExpr(e, .{ .enum_variant = .{
+                        .def = bid,
+                        .variant = try e.ctx.alloc.dupe(u8, leaf),
+                        .tuple_fields = args,
+                        .named_fields = &.{},
+                    } });
+                }
+                if (base_ent.kind == .struct_ or base_ent.kind == .union_ or base_ent.kind == .enum_) {
+                    if (resolveTypeMethod(e, bid, leaf)) |md| {
+                        // Associated fn: Fletcher::new(...) → Fletcher.new(...)
+                        return appendExpr(e, .{ .call = .{
+                            .call_kind = .{ .associated = md },
+                            .args = args,
+                        } });
+                    }
+                }
+            }
+        }
+        // Fall back to a module-scope free fn matching the leaf name.
+        if (resolveName(e, leaf)) |ld| {
+            return appendExpr(e, .{ .call = .{ .call_kind = .{ .free = ld }, .args = args } });
+        }
+        return unsupported(e, "unresolved call");
     }
-    if (cdef) |def| {
-        return appendExpr(e, .{ .call = .{ .call_kind = .{ .free = def }, .args = try arg_list.toOwnedSlice(e.ctx.alloc) } });
+
+    if (std.mem.eql(u8, callee.kind(), "identifier")) {
+        const name = text(e, callee);
+        if (resolveName(e, name)) |def| {
+            // An identifier resolving to a type used directly as a
+            // constructor: `Fletcher(...)` → constructor call on the type.
+            if (e.ctx.g.symbol_table.get(def)) |ent| {
+                if (ent.kind == .struct_ or ent.kind == .enum_ or ent.kind == .union_) {
+                    return appendExpr(e, .{ .call = .{ .call_kind = .{ .constructor = def }, .args = args } });
+                }
+            }
+            return appendExpr(e, .{ .call = .{ .call_kind = .{ .free = def }, .args = args } });
+        }
+        return unsupported(e, "unresolved call");
     }
+
     return unsupported(e, "unresolved call");
 }
 
@@ -1620,6 +1715,7 @@ pub fn extractFunction(
         const blk_node = block orelse continue;
 
         var ex: Ext = .{ .ctx = ctx, .fn_id = fn_entity };
+        ex.self_ty = findSelfType(&ex, ent);
         defer ex.deinit();
 
         // Register params as locals so the body resolves them. Handles
@@ -1891,4 +1987,136 @@ test "lower struct_expression to .struct_lit and match_expression to .match" {
     try std.testing.expectEqual(@as(usize, 2), struct_pat_count); // Circle + Rect
     try std.testing.expect(found_binding_r); // r bound by Circle(r)
     try std.testing.expect(found_float); // 3.14159 in the Circle arm body
+}
+
+test "lowerCall resolves associated, enum-variant, constructor, and free calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    // Root module (0).
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .module, .name = try alloc.dupe(u8, ""), .span = span, .visibility = .public, .parent = null, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.addModule(.{ .id = 0, .kind = .root, .name = "", .parent = null, .source_path = null, .is_crate = true, .is_extern = false, .span = span, .items = &.{}, .attributes = &.{} });
+
+    // struct Fletcher (1), impl (2), methods new(3) value(4) update(5) mk(6),
+    // enum Shape (7) variants Circle(8) Rect(9), free fns calc(10) reduce(11).
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .struct_, .name = try alloc.dupe(u8, "Fletcher"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .impl_, .name = try alloc.dupe(u8, "Fletcher"), .span = span, .visibility = .public, .parent = 1, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "new"), .span = span, .visibility = .public, .parent = 2, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "value"), .span = span, .visibility = .public, .parent = 2, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "update"), .span = span, .visibility = .public, .parent = 2, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "mk"), .span = span, .visibility = .public, .parent = 2, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .enum_, .name = try alloc.dupe(u8, "Shape"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .variant, .name = try alloc.dupe(u8, "Circle"), .span = span, .visibility = .public, .parent = 7, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .variant, .name = try alloc.dupe(u8, "Rect"), .span = span, .visibility = .public, .parent = 7, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "calc"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+    _ = try g.symbol_table.add(.{ .id = 0, .kind = .fn_, .name = try alloc.dupe(u8, "reduce"), .span = span, .visibility = .public, .parent = 0, .resolved = null, .renamed_to = null, .attributes = &.{} });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+
+    // Bodies parallel to symbol-table entities (same insertion order).
+    for (g.symbol_table.entities.items) |en| {
+        switch (en.kind) {
+            .fn_ => try bodies_list.append(alloc, .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0 } }),
+            .struct_ => try bodies_list.append(alloc, .{ .struct_ = .{ .generic_params = &.{}, .layout = .named, .fields = &.{} } }),
+            .enum_ => try bodies_list.append(alloc, .{ .enum_ = .{
+                .kind = .data,
+                .variants = &.{
+                    .{ .name = "Circle", .fields = .{ .tuple = &.{.{ .prim = .f64 }} }, .discriminant = null },
+                    .{ .name = "Rect", .fields = .{ .tuple = &.{ .{ .prim = .f64 }, .{ .prim = .f64 } } }, .discriminant = null },
+                },
+                .repr_int = null,
+                .non_exhaustive = false,
+            } }),
+            else => try bodies_list.append(alloc, .none),
+        }
+    }
+
+    const src =
+        \\pub struct Fletcher { a: u16, b: u16 }
+        \\impl Fletcher {
+        \\    pub fn mk() -> Fletcher {
+        \\        Self::new(1, 2)
+        \\    }
+        \\}
+        \\pub fn calc(x: u16) -> f64 {
+        \\    let f = Fletcher::new(x, x);
+        \\    let v = f.value();
+        \\    let r = reduce(x + 1);
+        \\    bogus();
+        \\    Shape::Circle(1.5)
+        \\}
+    ;
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = src,
+        .mod_id = 0,
+    };
+
+    // `mk`'s entity is a method inside the inherent `impl Fletcher` block, so
+    // its owning type is Fletcher — the base for `Self::` resolution.
+    const mk_ent = g.symbol_table.get(6).?;
+    var mk_ext: Ext = .{ .ctx = &ctx, .fn_id = 6 };
+    defer mk_ext.deinit();
+    try std.testing.expectEqual(@as(spine.EntityId, 1), findSelfType(&mk_ext, mk_ent));
+
+    // Lower the top-level free fn `calc`.
+    try std.testing.expect(try extractFunction(&ctx, 10)); // calc
+
+    var found_assoc_new = false;
+    var found_free_reduce = false;
+    var found_method_call = false;
+    var found_enum_variant = false;
+    var found_unresolved = false;
+
+    for (exprs_list.items) |ex| {
+        switch (ex.kind) {
+            .call => |c| switch (c.call_kind) {
+                .associated => |def| {
+                    // Fletcher::new(...) -> def == method `new` (3).
+                    // Self::new(...)  -> def == method `new` (3).
+                    try std.testing.expectEqual(@as(exprs.DefId, 3), def);
+                    found_assoc_new = true;
+                },
+                .free => |def| {
+                    if (def == 11) found_free_reduce = true;
+                },
+                .constructor => {},
+            },
+            .method_call => found_method_call = true, // f.value()
+            .enum_variant => |ev| {
+                try std.testing.expectEqual(@as(exprs.DefId, 7), ev.def); // Shape
+                try std.testing.expectEqualStrings("Circle", ev.variant);
+                try std.testing.expectEqual(@as(usize, 1), ev.tuple_fields.len);
+                found_enum_variant = true;
+            },
+            .unsupported => |u| {
+                if (std.mem.eql(u8, u.reason, "unresolved call")) found_unresolved = true;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(found_assoc_new); // Fletcher::new(...) -> .associated on `new`
+    try std.testing.expect(found_free_reduce); // reduce(x + 1)
+    try std.testing.expect(found_method_call); // f.value()
+    try std.testing.expect(found_enum_variant); // Shape::Circle(1.5)
+    try std.testing.expect(found_unresolved); // bogus() -> .unsupported("unresolved call")
 }

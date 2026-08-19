@@ -126,6 +126,11 @@ const Lowerer = struct {
                 };
 
                 if (target_id) |tid| {
+                    // A method already registered on the target's StructBody
+                    // is rendered directly from `StructBody.methods` by
+                    // `lowerEntityDecl`; skip re-hoisting its `.fn_` entity to
+                    // avoid a duplicate declaration in the emitted struct.
+                    if (self.isStructMethodRegistered(tid, ent.name)) continue;
                     const fn_decl = try self.lowerFnEntity(entity_id, ent);
                     const decl = ast.Decl{ .fn_decl = fn_decl };
                     var list = self.hoisted_by_id.get(tid) orelse std.ArrayListUnmanaged(ast.Decl).empty;
@@ -133,6 +138,21 @@ const Lowerer = struct {
                     try self.hoisted_by_id.put(self.alloc, tid, list);
                 }
             }
+        }
+    }
+
+    /// True when the target entity carries a `.struct_` body whose
+    /// `StructBody.methods` already registers a method named `name`.
+    fn isStructMethodRegistered(self: *Lowerer, tid: ir.spine.EntityId, name: []const u8) bool {
+        if (tid >= self.ir.bodies.bodies.len) return false;
+        switch (self.ir.bodies.bodies[tid]) {
+            .struct_ => |sb| {
+                for (sb.methods) |m| {
+                    if (std.mem.eql(u8, m.name, name)) return true;
+                }
+                return false;
+            },
+            else => return false,
         }
     }
 
@@ -166,7 +186,7 @@ const Lowerer = struct {
                 }
             }
 
-            if (try self.lowerEntityDecl(item_id, ent)) |decl| {
+            if (try self.lowerEntityDecl(item_id, ent, mod.id)) |decl| {
                 try decls_list.append(self.alloc, decl);
             }
         }
@@ -205,7 +225,7 @@ const Lowerer = struct {
                 }
             }
 
-            if (try self.lowerEntityDecl(entity_id, ent)) |decl| {
+            if (try self.lowerEntityDecl(entity_id, ent, 0)) |decl| {
                 try decls_list.append(self.alloc, decl);
             }
         }
@@ -218,7 +238,7 @@ const Lowerer = struct {
         };
     }
 
-    fn lowerEntityDecl(self: *Lowerer, entity_id: ir.spine.EntityId, ent: ir.spine.Entity) !?ast.Decl {
+    fn lowerEntityDecl(self: *Lowerer, entity_id: ir.spine.EntityId, ent: ir.spine.Entity, current_mod_id: ?ir.spine.EntityId) !?ast.Decl {
         const is_pub = switch (ent.visibility) {
             .public => true,
             else => false,
@@ -233,9 +253,24 @@ const Lowerer = struct {
             .struct_ => {
                 var fields_list: std.ArrayListUnmanaged(ast.StructField) = .empty;
                 var inner_decls: std.ArrayListUnmanaged(ast.Decl) = .empty;
+                var generic_params_list: std.ArrayListUnmanaged(ast.GenericParam) = .empty;
 
                 switch (body_kind) {
                     .struct_ => |sb| {
+                        if (sb.generic_params.len > 0) {
+                            for (sb.generic_params) |gp| {
+                                try generic_params_list.append(self.alloc, .{
+                                    .name = try self.alloc.dupe(u8, gp),
+                                    .is_comptime = true,
+                                    .ty = null,
+                                });
+                            }
+                        } else {
+                            for (sb.fields) |f| {
+                                try self.collectGenericTypeParams(f.ty, &generic_params_list);
+                            }
+                        }
+
                         for (sb.fields) |f| {
                             const f_ty = try self.lowerType(f.ty);
                             try fields_list.append(self.alloc, .{
@@ -250,7 +285,7 @@ const Lowerer = struct {
 
                         // Inherent methods from StructBody
                         for (sb.methods) |m| {
-                            const m_decl = try self.lowerStructMethod(m, ent.name);
+                            const m_decl = try self.lowerStructMethod(m, ent.name, sb.generic_params.len > 0);
                             try inner_decls.append(self.alloc, ast.Decl{ .fn_decl = m_decl });
                         }
                     },
@@ -270,6 +305,7 @@ const Lowerer = struct {
                         .is_pub = is_pub,
                         .fields = try fields_list.toOwnedSlice(self.alloc),
                         .decls = try inner_decls.toOwnedSlice(self.alloc),
+                        .generic_params = try generic_params_list.toOwnedSlice(self.alloc),
                     },
                 };
             },
@@ -449,16 +485,49 @@ const Lowerer = struct {
             .use_ => {
                 if (self.ir.graph.useById(entity_id)) |u| {
                     if (u.is_pub_export) {
-                        const target_name = if (self.ir.graph.symbol_table.get(u.target)) |te|
-                            te.name
-                        else
-                            "";
+                        if (std.mem.eql(u8, u.local_name, "_") or u.local_name.len == 0) {
+                            return null;
+                        }
+                        const te = self.ir.graph.symbol_table.get(u.target) orelse return null;
+
+                        var init_expr: ?ast.Expr = null;
+
+                        if (te.parent) |parent_id| {
+                            const cur_mod_id = current_mod_id orelse 0;
+                            if (parent_id != cur_mod_id and parent_id != 0) {
+                                const mod_name = if (self.ir.graph.module(parent_id)) |pm|
+                                    pm.name
+                                else if (self.ir.graph.symbol_table.get(parent_id)) |pe|
+                                    pe.name
+                                else
+                                    "";
+                                if (mod_name.len > 0) {
+                                    const target_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, mod_name) };
+                                    init_expr = ast.Expr{
+                                        .field_access = .{
+                                            .target = try self.allocExpr(target_expr),
+                                            .field_name = try self.alloc.dupe(u8, te.name),
+                                        },
+                                    };
+                                }
+                            }
+                        }
+
+                        if (init_expr == null) {
+                            const cur_mod_id = current_mod_id orelse 0;
+                            const target_parent = te.parent orelse 0;
+                            if (target_parent == cur_mod_id and std.mem.eql(u8, u.local_name, te.name)) {
+                                return null;
+                            }
+                            init_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, te.name) };
+                        }
+
                         return ast.Decl{
                             .const_decl = .{
                                 .name = try self.alloc.dupe(u8, u.local_name),
                                 .is_pub = true,
                                 .ty = null,
-                                .init = ast.Expr{ .ident = try self.alloc.dupe(u8, target_name) },
+                                .init = init_expr.?,
                             },
                         };
                     }
@@ -505,7 +574,16 @@ const Lowerer = struct {
                     });
                 }
 
-                ret_type = try self.lowerType(fb.ret);
+                // Explicit Rust `-> T` (including `-> ()`) wins. Only when the
+                // return type was left implicit (unit) do we try to infer a
+                // concrete type from the tail expression so the emitted fn
+                // carries a real `ret_type` (e.g. `origin() -> Point`,
+                // `area(s) -> f64`).
+                const effective_ret = if (fb.ret == .prim and fb.ret.prim == .unit)
+                    if (self.inferTailReturnType(fb.body)) |t| t else fb.ret
+                else
+                    fb.ret;
+                ret_type = try self.lowerType(effective_ret);
 
                 if (fb.body < self.ir.bodies.exprs.len) {
                     const expr_node = self.ir.bodies.exprs[fb.body];
@@ -535,11 +613,159 @@ const Lowerer = struct {
         };
     }
 
-    fn lowerStructMethod(self: *Lowerer, m: ir.bodies.StructMethod, struct_name: []const u8) !ast.FnDecl {
+    /// Infer a concrete return type from a function body's tail expression when
+    /// the return type was left implicit (Rust `-> ()` desugars to unit). Used
+    /// only to surface an accurate `ret_type` on the emitted fn; never attempts
+    /// full type inference. Returns `null` when the tail is unit/empty or an
+    /// explicit `return ...;` statement owns the value (the statement set has
+    /// no tail).
+    fn inferTailReturnType(self: *Lowerer, body: ir.exprs.NodeId) ?ir.types.Type {
+        if (body >= self.ir.bodies.exprs.len) return null;
+        const tail = switch (self.ir.bodies.exprs[body].kind) {
+            .block => |be| blk: {
+                const t = be.tail orelse return null;
+                if (t >= self.ir.bodies.exprs.len) return null;
+                break :blk t;
+            },
+            else => body,
+        };
+        if (tail >= self.ir.bodies.exprs.len) return null;
+
+        const e = self.ir.bodies.exprs[tail];
+        // A wired concerete type annotation on the tail expr is authoritative.
+        if (e.ty) |ty_id| {
+            if (ty_id < self.ir.types.len) {
+                const ct = self.ir.types[ty_id];
+                if (ct != .unsupported) return ct;
+            }
+        }
+
+        return switch (e.kind) {
+            .literal => |lit| switch (lit) {
+                .int => |il| blk: {
+                    const nm = il.ty_suffix orelse break :blk .{ .prim = .i32 };
+                    const prim: ir.types.Prim = if (std.mem.eql(u8, nm, "i8"))
+                        .i8
+                    else if (std.mem.eql(u8, nm, "i16"))
+                        .i16
+                    else if (std.mem.eql(u8, nm, "i32"))
+                        .i32
+                    else if (std.mem.eql(u8, nm, "i64"))
+                        .i64
+                    else if (std.mem.eql(u8, nm, "i128"))
+                        .i128
+                    else if (std.mem.eql(u8, nm, "isize"))
+                        .isize
+                    else if (std.mem.eql(u8, nm, "u8"))
+                        .u8
+                    else if (std.mem.eql(u8, nm, "u16"))
+                        .u16
+                    else if (std.mem.eql(u8, nm, "u32"))
+                        .u32
+                    else if (std.mem.eql(u8, nm, "u64"))
+                        .u64
+                    else if (std.mem.eql(u8, nm, "u128"))
+                        .u128
+                    else if (std.mem.eql(u8, nm, "usize"))
+                        .usize
+                    else
+                        .i32;
+                    break :blk .{ .prim = prim };
+                },
+                .float => .{ .prim = .f64 },
+                .boolean => .{ .prim = .bool },
+                .character => .{ .prim = .u8 },
+                .string => .{ .slice = (self.sliceU8Alloc() orelse return null) },
+                .byte_array => .{ .slice = (self.sliceU8Alloc() orelse return null) },
+            },
+            .struct_lit => |sl| self.namedFromDef(sl.def),
+            .enum_variant => |ev| self.namedFromDef(ev.def),
+            .call => |c| switch (c.call_kind) {
+                .free => |def_id| self.namedFromDef(def_id),
+                .associated => |def_id| self.namedFromDef(def_id),
+                .constructor => |def_id| self.namedFromDef(def_id),
+            },
+            .path => |pe| self.namedFromDef(pe.def),
+            .binary => |b| self.binopResultType(b),
+            .unary => |u| switch (u.op) {
+                .negate, .deref => self.exprType(u.operand),
+                else => null,
+            },
+            .if_else => |ie| self.exprType(ie.then_.tail orelse return null),
+            else => null,
+        };
+    }
+
+    /// Re-wrap a concrete ir type as a fresh slice-of-u8 (for string/byte-array
+    /// tail literals). The returned slice is arena-backed.
+    fn sliceU8Alloc(self: *Lowerer) ?*const ir.types.Slice {
+        const s = self.alloc.create(ir.types.Slice) catch return null;
+        s.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+        return s;
+    }
+
+    /// Resolve a def id to its emitted name as a `.named` type; null when
+    /// unresolvable in the symbol table.
+    fn namedFromDef(self: *Lowerer, def: ir.spine.EntityId) ?ir.types.Type {
+        const ent = self.ir.graph.symbol_table.get(def) orelse return null;
+        const nm = ent.renamed_to orelse ent.name;
+        if (nm.len == 0) return null;
+        return .{ .path = .{ .segments = &.{.{ .name = nm, .id = def }} } };
+    }
+
+    /// Best-effort concrete type of a sub-expression (used by binary/unary/if
+    /// inference), recursing one level only.
+    fn exprType(self: *Lowerer, id: ir.exprs.NodeId) ?ir.types.Type {
+        if (id >= self.ir.bodies.exprs.len) return null;
+        const e = self.ir.bodies.exprs[id];
+        if (e.ty) |ty_id| {
+            if (ty_id < self.ir.types.len) {
+                const ct = self.ir.types[ty_id];
+                if (ct != .unsupported) return ct;
+            }
+        }
+        return switch (e.kind) {
+            .literal => |lit| switch (lit) {
+                .int => .{ .prim = .i32 },
+                .float => .{ .prim = .f64 },
+                .boolean => .{ .prim = .bool },
+                else => null,
+            },
+            .struct_lit => |sl| self.namedFromDef(sl.def),
+            .path => |pe| self.namedFromDef(pe.def),
+            else => null,
+        };
+    }
+
+    /// Result type of a binary expression: comparisons/boolean ops are bool;
+    /// otherwise prefer an operand's concrete type (float vs int), falling back
+    /// to any operand concrete type.
+    fn binopResultType(self: *Lowerer, b: ir.exprs.BinaryExpr) ?ir.types.Type {
+        return switch (b.op) {
+            .eq, .ne, .lt, .le, .gt, .ge, .boolean_and, .boolean_or => .{ .prim = .bool },
+            else => blk: {
+                const lt = self.exprType(b.lhs);
+                if (lt) |t| {
+                    if (t == .prim and (t.prim == .f32 or t.prim == .f64)) break :blk t;
+                }
+                const rt = self.exprType(b.rhs);
+                if (rt) |t| {
+                    if (t == .prim and (t.prim == .f32 or t.prim == .f64)) break :blk t;
+                }
+                break :blk if (lt) |t| t else rt;
+            },
+        };
+    }
+
+    fn lowerStructMethod(self: *Lowerer, m: ir.bodies.StructMethod, struct_name: []const u8, is_generic: bool) !ast.FnDecl {
         var params_list: std.ArrayListUnmanaged(ast.FnParam) = .empty;
 
         if (m.receiver) |rec| {
-            const self_type = ast.Type{ .named = try self.alloc.dupe(u8, struct_name) };
+            // Inside a generic struct the type is built by a comptime type
+            // function, so the receiver must reference `Self` (valid within
+            // the struct body) rather than the outer type name.
+            const self_name = if (is_generic) "Self" else struct_name;
+            const self_type = ast.Type{ .named = try self.alloc.dupe(u8, self_name) };
             const self_type_ptr = try self.allocType(self_type);
 
             const rec_ty: ast.Type = switch (rec) {
@@ -610,6 +836,68 @@ const Lowerer = struct {
             .ret_type = ret_type,
             .body = fn_block,
         };
+    }
+
+    /// Collect generic type parameters referenced by a struct's field types so
+    /// a generic struct (e.g. `Fletcher<T>` with `a: T`) is recognized even
+    /// when the StructBody did not populate its own `generic_params` list.
+    /// Recurses through container types; appends each new parameter once.
+    fn collectGenericTypeParams(self: *Lowerer, ty: ir.types.Type, out: *std.ArrayListUnmanaged(ast.GenericParam)) !void {
+        switch (ty) {
+            .path => |p| {
+                // A generic type parameter reference (e.g. `a: T`) lowers to a
+                // single-segment path with a resolved `id` of null — the symbol
+                // table has no entity for a type parameter. Resolved nominal
+                // types always carry a non-null id, so null id is a safe
+                // discriminator for an undeclared generic parameter.
+                if (p.segments.len == 1) {
+                    const seg = p.segments[0];
+                    if (seg.id == null and isGenericParamName(seg.name) and
+                        !hasGenericParam(seg.name, out.items))
+                    {
+                        try out.append(self.alloc, .{
+                            .name = try self.alloc.dupe(u8, seg.name),
+                            .is_comptime = true,
+                            .ty = null,
+                        });
+                    }
+                }
+            },
+            .reference => |r| try self.collectGenericTypeParams(r.pointee, out),
+            .raw_ptr => |r| try self.collectGenericTypeParams(r.pointee, out),
+            .slice => |s| try self.collectGenericTypeParams(s.elem, out),
+            .array => |a| try self.collectGenericTypeParams(a.elem, out),
+            .tuple => |tup| for (tup) |t| try self.collectGenericTypeParams(t, out),
+            .generic_inst => |gi| for (gi.args.params) |arg| try self.collectGenericTypeParams(arg, out),
+            .option => |inner| try self.collectGenericTypeParams(inner.*, out),
+            .result => |r| {
+                try self.collectGenericTypeParams(r.ok, out);
+                try self.collectGenericTypeParams(r.err, out);
+            },
+            .boxed => |inner| try self.collectGenericTypeParams(inner.*, out),
+            else => {},
+        }
+    }
+
+    fn hasGenericParam(name: []const u8, list: []const ast.GenericParam) bool {
+        for (list) |gp| {
+            if (std.mem.eql(u8, gp.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Heuristic: a bare single segment whose name looks like a type parameter
+    /// (single uppercase letter `T`/`U`/`V`, or an uppercase-leading identifier
+    /// that is not a known resolved nominal type). Used only to recover generic
+    /// structs when `StructBody.generic_params` is empty.
+    fn isGenericParamName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        // Single uppercase letter type params (T, U, V, ...)
+        if (name.len == 1 and name[0] >= 'A' and name[0] <= 'Z') return true;
+        // Already declared as a generic param somewhere? Treat any
+        // non-resolved uppercase-leading identifier as a type parameter.
+        if (name[0] >= 'A' and name[0] <= 'Z') return true;
+        return false;
     }
 
     fn lowerTestEntity(self: *Lowerer, entity_id: ir.spine.EntityId, ent: ir.spine.Entity) !?ast.TestDecl {
@@ -805,6 +1093,30 @@ const Lowerer = struct {
                 .string => |sl| ast.Expr{ .lit = .{ .str = try self.alloc.dupe(u8, sl.bytes) } },
                 .byte_array => |ba| ast.Expr{ .lit = .{ .str = try self.alloc.dupe(u8, ba.items) } },
                 .boolean => |b| ast.Expr{ .lit = .{ .bool_lit = b } },
+            },
+            .array => |a| blk: {
+                const elem_ast: ?ast.Type = if (ir_expr.ty) |tid|
+                    if (tid < self.ir.bodies.types.len) try self.lowerType(self.ir.bodies.types[tid]) else null
+                else
+                    null;
+                if (a.repeat) |len| {
+                    const elem = try self.allocExpr(try self.lowerExpr(a.elements[0]));
+                    break :blk ast.Expr{
+                        .repeat = .{
+                            .type_name = elem_ast,
+                            .elem = elem,
+                            .len = len,
+                        },
+                    };
+                }
+                var elems = try self.alloc.alloc(ast.Expr, a.elements.len);
+                for (a.elements, 0..) |el, i| elems[i] = try self.lowerExpr(el);
+                break :blk ast.Expr{
+                    .multi_array = .{
+                        .type_name = elem_ast,
+                        .elements = elems,
+                    },
+                };
             },
             .path => |pe| blk: {
                 if (self.ir.graph.symbol_table.get(pe.def)) |ent| {

@@ -21,8 +21,12 @@
             "is_pub": true,
             "ty": null,
             "init": {
-              "kind": "ident",
-              "name": "FromHexError"
+              "kind": "field_access",
+              "target": {
+                "kind": "ident",
+                "name": "FromHexError"
+              },
+              "field_name": "FromHexError"
             }
           }
         },
@@ -68,12 +72,19 @@
             "name": "HEX_CHARS_LOWER",
             "is_pub": true,
             "ty": {
-              "kind": "named",
-              "name": "unsupported type"
+              "kind": "array",
+              "elem": {
+                "kind": "prim",
+                "value": "u8"
+              },
+              "len": 16
             },
             "init": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -83,12 +94,19 @@
             "name": "HEX_CHARS_UPPER",
             "is_pub": true,
             "ty": {
-              "kind": "named",
-              "name": "unsupported type"
+              "kind": "array",
+              "elem": {
+                "kind": "prim",
+                "value": "u8"
+              },
+              "len": 16
             },
             "init": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789ABCDEF"
+              }
             }
           }
         },
@@ -134,7 +152,98 @@
                 "is_pub": false
               }
             ],
-            "decls": [],
+            "decls": [
+              {
+                "kind": "fn_decl",
+                "value": {
+                  "name": "new",
+                  "is_pub": false,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "inner",
+                      "ty": {
+                        "kind": "slice",
+                        "elem": {
+                          "kind": "prim",
+                          "value": "u8"
+                        },
+                        "is_const": true
+                      },
+                      "is_comptime": false
+                    },
+                    {
+                      "name": "table",
+                      "ty": {
+                        "kind": "array",
+                        "elem": {
+                          "kind": "prim",
+                          "value": "u8"
+                        },
+                        "len": 16
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": {
+                    "label": null,
+                    "stmts": [],
+                    "expr": {
+                      "kind": "lit",
+                      "value": {
+                        "kind": "str",
+                        "value": "0123456789abcdef"
+                      }
+                    }
+                  },
+                  "generic_params": []
+                }
+              },
+              {
+                "kind": "fn_decl",
+                "value": {
+                  "name": "len",
+                  "is_pub": false,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "self",
+                      "ty": {
+                        "kind": "ptr",
+                        "elem": {
+                          "kind": "named",
+                          "name": "BytesToHexChars"
+                        },
+                        "is_const": true,
+                        "is_allowzero": false,
+                        "size": "one"
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": {
+                    "label": null,
+                    "stmts": [],
+                    "expr": {
+                      "kind": "lit",
+                      "value": {
+                        "kind": "str",
+                        "value": "0123456789abcdef"
+                      }
+                    }
+                  },
+                  "generic_params": []
+                }
+              }
+            ],
             "generic_params": []
           }
         },
@@ -394,8 +503,8 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "named",
+              "name": "from_hex"
             },
             "body": {
               "label": null,
@@ -835,7 +944,66 @@
                 "is_pub": true
               }
             ],
-            "decls": []
+            "decls": [
+              {
+                "kind": "fn_decl",
+                "value": {
+                  "name": "fmt",
+                  "is_pub": true,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "self",
+                      "ty": {
+                        "kind": "ptr",
+                        "elem": {
+                          "kind": "prim",
+                          "value": "void_type"
+                        },
+                        "is_const": true,
+                        "is_allowzero": false,
+                        "size": "one"
+                      },
+                      "is_comptime": false
+                    },
+                    {
+                      "name": "f",
+                      "ty": {
+                        "kind": "ptr",
+                        "elem": {
+                          "kind": "named",
+                          "name": "Formatter"
+                        },
+                        "is_const": false,
+                        "is_allowzero": false,
+                        "size": "one"
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "slice",
+                    "elem": {
+                      "kind": "prim",
+                      "value": "u8"
+                    },
+                    "is_const": true
+                  },
+                  "body": {
+                    "label": null,
+                    "stmts": [],
+                    "expr": {
+                      "kind": "lit",
+                      "value": {
+                        "kind": "str",
+                        "value": "0123456789abcdef"
+                      }
+                    }
+                  },
+                  "generic_params": []
+                }
+              }
+            ]
           }
         }
       ],
@@ -858,8 +1026,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         }
@@ -894,8 +1065,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -905,8 +1079,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -916,8 +1093,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -927,8 +1107,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -938,8 +1121,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -949,8 +1135,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -960,8 +1149,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -971,8 +1163,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -982,8 +1177,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -993,8 +1191,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -1004,8 +1205,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -1015,8 +1219,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         },
@@ -1026,8 +1233,11 @@
             "label": null,
             "stmts": [],
             "expr": {
-              "kind": "ident",
-              "name": "source"
+              "kind": "lit",
+              "value": {
+                "kind": "str",
+                "value": "0123456789abcdef"
+              }
             }
           }
         }

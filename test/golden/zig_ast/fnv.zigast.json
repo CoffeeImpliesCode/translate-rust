@@ -31,7 +31,32 @@
                 "is_pub": true
               }
             ],
-            "decls": [],
+            "decls": [
+              {
+                "kind": "fn_decl",
+                "value": {
+                  "name": "with_key",
+                  "is_pub": true,
+                  "is_test": false,
+                  "params": [
+                    {
+                      "name": "key",
+                      "ty": {
+                        "kind": "prim",
+                        "value": "u64"
+                      },
+                      "is_comptime": false
+                    }
+                  ],
+                  "ret_type": {
+                    "kind": "prim",
+                    "value": "void_type"
+                  },
+                  "body": null,
+                  "generic_params": []
+                }
+              }
+            ],
             "generic_params": []
           }
         },

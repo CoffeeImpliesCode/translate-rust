@@ -49,6 +49,7 @@ pub const Expr = struct {
 pub const ExprKind = union(enum) {
     // — literals & atoms (§1.1) —
     literal: Literal,
+    array: ArrayExpr,
     path: PathExpr,
     block: BlockExpr,
     unit: void,
@@ -129,6 +130,17 @@ pub const StringLit = struct {
 /// collapsing to `&[_]u8{V} ** N` when every byte is equal).
 pub const ByteArrayLit = struct {
     items: []const u8,
+};
+
+/// A fixed-length array literal: `[a, b, c]` or the repeating form `[e; N]`.
+/// `elements` holds the element expr NodeIds (all of them for the explicit
+/// list form; exactly one element for the repeating form). When `repeat` is
+/// non-null the total length is `repeat` (Rust `[e; N]`); otherwise the total
+/// length is `elements.len`. Lossless: element exprs are full `Expr` nodes and
+/// the backend derives Zig `[_]T{ ... }` / `[_]T{ e } ** N` from them.
+pub const ArrayExpr = struct {
+    elements: []const NodeId,
+    repeat: ?usize,
 };
 
 /// A resolved reference, not a name. Collapses Rust's `x`, `Foo::Bar` (unit

@@ -218,8 +218,8 @@
             "is_test": false,
             "params": [],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "named",
+              "name": "Point"
             },
             "body": {
               "label": null,
@@ -264,8 +264,12 @@
             "is_pub": true,
             "ty": null,
             "init": {
-              "kind": "ident",
-              "name": "helper"
+              "kind": "field_access",
+              "target": {
+                "kind": "ident",
+                "name": "util"
+              },
+              "field_name": "helper"
             }
           }
         }
@@ -299,8 +303,8 @@
               }
             ],
             "ret_type": {
-              "kind": "prim",
-              "value": "void_type"
+              "kind": "named",
+              "name": "v"
             },
             "body": {
               "label": null,
