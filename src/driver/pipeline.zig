@@ -34,17 +34,21 @@ pub fn translate(
     crate_dir: []const u8,
     out_dir: []const u8,
 ) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
     // 1. Ingest & analyze
-    const rust_ir = try frontend.pipeline.analyzeCrate(allocator, io, crate_dir);
+    const rust_ir = try frontend.pipeline.analyzeCrate(arena_alloc, io, crate_dir);
 
     // 2. Lower to ZigAST
-    const pkg = try backend.zig.lower.lowerRustIR(allocator, &rust_ir, null);
+    const pkg = try backend.zig.lower.lowerRustIR(arena_alloc, &rust_ir, null);
 
     // 3. Write package to disk
     try backend.zig.package.writeToDisk(io, &pkg, out_dir);
 
     // 4. Self-heal fingerprint
-    try fixFingerprint(allocator, io, out_dir);
+    try fixFingerprint(arena_alloc, io, out_dir);
 }
 
 /// Translate a wire-format v2 JSON dump into a standalone Zig package at `out_dir`.

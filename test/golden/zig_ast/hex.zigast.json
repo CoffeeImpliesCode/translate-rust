@@ -111,16 +111,12 @@
               {
                 "name": "table",
                 "ty": {
-                  "kind": "slice",
+                  "kind": "array",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
-                  "is_const": true
+                  "len": 16
                 },
                 "default_val": null,
                 "is_pub": false
@@ -131,7 +127,7 @@
                   "kind": "opt",
                   "elem": {
                     "kind": "prim",
-                    "value": "u32"
+                    "value": "u21"
                   }
                 },
                 "default_val": null,
@@ -152,16 +148,12 @@
               {
                 "name": "table",
                 "ty": {
-                  "kind": "slice",
+                  "kind": "array",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
-                  "is_const": true
+                  "len": 16
                 },
                 "is_comptime": false
               },
@@ -170,12 +162,8 @@
                 "ty": {
                   "kind": "slice",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
                   "is_const": true
                 },
@@ -322,7 +310,7 @@
                 "name": "data",
                 "ty": {
                   "kind": "named",
-                  "name": "unsupported type"
+                  "name": "T"
                 },
                 "is_comptime": false
               }
@@ -361,7 +349,7 @@
                 "name": "data",
                 "ty": {
                   "kind": "named",
-                  "name": "unsupported type"
+                  "name": "T"
                 },
                 "is_comptime": false
               }
@@ -400,7 +388,7 @@
                 "name": "data",
                 "ty": {
                   "kind": "named",
-                  "name": "unsupported type"
+                  "name": "T"
                 },
                 "is_comptime": false
               }
@@ -440,7 +428,7 @@
                 "name": "data",
                 "ty": {
                   "kind": "named",
-                  "name": "unsupported type"
+                  "name": "T"
                 },
                 "is_comptime": false
               },
@@ -449,14 +437,10 @@
                 "ty": {
                   "kind": "slice",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
-                  "is_const": false
+                  "is_const": true
                 },
                 "is_comptime": false
               }
@@ -628,16 +612,12 @@
               {
                 "name": "table",
                 "ty": {
-                  "kind": "slice",
+                  "kind": "array",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
-                  "is_const": true
+                  "len": 16
                 },
                 "is_comptime": false
               }
@@ -654,10 +634,40 @@
                   "name": "high",
                   "ty": null,
                   "init": {
-                    "kind": "lit",
-                    "value": {
-                      "kind": "undefined_lit"
-                    }
+                    "kind": "builtin",
+                    "name": "index",
+                    "args": [
+                      {
+                        "kind": "ident",
+                        "name": "table"
+                      },
+                      {
+                        "kind": "bin_op",
+                        "op": "shr",
+                        "lhs": {
+                          "kind": "bin_op",
+                          "op": "bit_and",
+                          "lhs": {
+                            "kind": "ident",
+                            "name": "byte"
+                          },
+                          "rhs": {
+                            "kind": "lit",
+                            "value": {
+                              "kind": "int",
+                              "value": "0"
+                            }
+                          }
+                        },
+                        "rhs": {
+                          "kind": "lit",
+                          "value": {
+                            "kind": "int",
+                            "value": "4"
+                          }
+                        }
+                      }
+                    ]
                   },
                   "is_mut": false
                 },
@@ -666,10 +676,29 @@
                   "name": "low",
                   "ty": null,
                   "init": {
-                    "kind": "lit",
-                    "value": {
-                      "kind": "undefined_lit"
-                    }
+                    "kind": "builtin",
+                    "name": "index",
+                    "args": [
+                      {
+                        "kind": "ident",
+                        "name": "table"
+                      },
+                      {
+                        "kind": "bin_op",
+                        "op": "bit_and",
+                        "lhs": {
+                          "kind": "ident",
+                          "name": "byte"
+                        },
+                        "rhs": {
+                          "kind": "lit",
+                          "value": {
+                            "kind": "int",
+                            "value": "0"
+                          }
+                        }
+                      }
+                    ]
                   },
                   "is_mut": false
                 }
@@ -693,7 +722,7 @@
                 "name": "input",
                 "ty": {
                   "kind": "named",
-                  "name": "unsupported type"
+                  "name": "T"
                 },
                 "is_comptime": false
               },
@@ -702,14 +731,10 @@
                 "ty": {
                   "kind": "slice",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
-                  "is_const": false
+                  "is_const": true
                 },
                 "is_comptime": false
               }
@@ -759,23 +784,55 @@
       ],
       "decls": [
         {
-          "kind": "enum_decl",
+          "kind": "union_decl",
           "value": {
             "name": "FromHexError",
             "is_pub": true,
-            "tag_type": null,
-            "variants": [
+            "tag_type": {
+              "kind": "named",
+              "name": "enum"
+            },
+            "fields": [
               {
                 "name": "InvalidHexCharacter",
-                "value": null
+                "ty": {
+                  "kind": "anon_struct",
+                  "fields": [
+                    {
+                      "name": "c",
+                      "ty": {
+                        "kind": "prim",
+                        "value": "u21"
+                      },
+                      "default_val": null,
+                      "is_pub": true
+                    },
+                    {
+                      "name": "index",
+                      "ty": {
+                        "kind": "prim",
+                        "value": "usize"
+                      },
+                      "default_val": null,
+                      "is_pub": true
+                    }
+                  ]
+                },
+                "is_pub": true
               },
               {
                 "name": "OddLength",
-                "value": null
+                "ty": {
+                  "kind": "void_type"
+                },
+                "is_pub": true
               },
               {
                 "name": "InvalidStringLength",
-                "value": null
+                "ty": {
+                  "kind": "void_type"
+                },
+                "is_pub": true
               }
             ],
             "decls": []

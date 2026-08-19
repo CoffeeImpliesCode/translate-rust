@@ -45,19 +45,49 @@
           }
         },
         {
-          "kind": "enum_decl",
+          "kind": "union_decl",
           "value": {
             "name": "Shape",
             "is_pub": true,
-            "tag_type": null,
-            "variants": [
+            "tag_type": {
+              "kind": "named",
+              "name": "enum"
+            },
+            "fields": [
               {
                 "name": "Circle",
-                "value": null
+                "ty": {
+                  "kind": "prim",
+                  "value": "f64"
+                },
+                "is_pub": true
               },
               {
                 "name": "Rect",
-                "value": null
+                "ty": {
+                  "kind": "anon_struct",
+                  "fields": [
+                    {
+                      "name": "width",
+                      "ty": {
+                        "kind": "prim",
+                        "value": "f64"
+                      },
+                      "default_val": null,
+                      "is_pub": true
+                    },
+                    {
+                      "name": "height",
+                      "ty": {
+                        "kind": "prim",
+                        "value": "f64"
+                      },
+                      "default_val": null,
+                      "is_pub": true
+                    }
+                  ]
+                },
+                "is_pub": true
               }
             ],
             "decls": []
@@ -74,7 +104,7 @@
                 "name": "shape",
                 "ty": {
                   "kind": "named",
-                  "name": "unsupported type"
+                  "name": "Shape"
                 },
                 "is_comptime": false
               }

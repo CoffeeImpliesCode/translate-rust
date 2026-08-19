@@ -204,6 +204,14 @@ pub fn encodeType(allocator: std.mem.Allocator, ty: ast.Type) anyerror!Json {
             }
             try o.put(allocator, "elements", .{ .array = elements_arr });
         },
+        .anon_struct => |as| {
+            try o.put(allocator, "kind", .{ .string = "anon_struct" });
+            var fields_arr = Array.init(allocator);
+            for (as.fields) |f| {
+                try fields_arr.append(try encodeStructField(allocator, f));
+            }
+            try o.put(allocator, "fields", .{ .array = fields_arr });
+        },
         .any_opaque => {
             try o.put(allocator, "kind", .{ .string = "any_opaque" });
         },
@@ -304,6 +312,21 @@ pub fn decodeType(allocator: std.mem.Allocator, v: Json) anyerror!ast.Type {
             try elem_list.append(allocator, try decodeType(allocator, ev));
         }
         return .{ .tuple = try elem_list.toOwnedSlice(allocator) };
+    } else if (std.mem.eql(u8, kind, "anon_struct")) {
+        const fields_v = try req(o, "fields");
+        const fields_arr = switch (fields_v) {
+            .array => |a| a,
+            else => return error.BadWireFormat,
+        };
+        var fields_list: std.ArrayListUnmanaged(ast.StructField) = .empty;
+        for (fields_arr.items) |fv| {
+            try fields_list.append(allocator, try decodeStructField(allocator, fv));
+        }
+        return .{
+            .anon_struct = .{
+                .fields = try fields_list.toOwnedSlice(allocator),
+            },
+        };
     } else if (std.mem.eql(u8, kind, "any_opaque")) {
         return .any_opaque;
     } else if (std.mem.eql(u8, kind, "void_type")) {

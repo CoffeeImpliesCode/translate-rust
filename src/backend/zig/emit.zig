@@ -150,6 +150,19 @@ pub fn emitIdent(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8),
         return;
     }
 
+    // If the identifier contains dots (e.g. "std.AutoHashMap" or "std.hash.BuildHasherDefault"),
+    // emit it as dotted identifiers without quoting the dots.
+    if (std.mem.indexOfScalar(u8, name, '.') != null) {
+        var it = std.mem.splitScalar(u8, name, '.');
+        var first = true;
+        while (it.next()) |part| {
+            if (!first) try buf.appendSlice(allocator, ".");
+            first = false;
+            try emitIdent(allocator, buf, part);
+        }
+        return;
+    }
+
     var needs_escape = false;
     if (name[0] >= '0' and name[0] <= '9') {
         needs_escape = true;
@@ -965,6 +978,7 @@ pub fn emitPattern(
         },
         .struct_pat => |sp| {
             if (sp.name) |n| {
+                try buf.appendSlice(allocator, ".");
                 try emitIdent(allocator, buf, n);
             } else {
                 try buf.appendSlice(allocator, ".");
@@ -1072,6 +1086,16 @@ pub fn emitType(
             for (tup, 0..) |elem, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
                 try emitType(allocator, buf, elem);
+            }
+            try buf.appendSlice(allocator, " }");
+        },
+        .anon_struct => |as| {
+            try buf.appendSlice(allocator, "struct { ");
+            for (as.fields, 0..) |f, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try emitIdent(allocator, buf, f.name);
+                try buf.appendSlice(allocator, ": ");
+                try emitType(allocator, buf, f.ty);
             }
             try buf.appendSlice(allocator, " }");
         },

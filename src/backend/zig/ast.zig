@@ -137,10 +137,14 @@ pub const Type = union(enum) {
     generic: GenericInst,
     array: Array,
     tuple: []const Type,
+    anon_struct: AnonStruct,
     any_opaque,
     void_type,
 };
 
+pub const AnonStruct = struct {
+    fields: []const StructField = &.{},
+};
 pub const Prim = enum {
     u8,
     u16,

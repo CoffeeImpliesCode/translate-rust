@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
         );
         return;
     }
-    try translate_rust.model.driver.translate(init.gpa, io, stdout, first, crate_out_dir.?);
+    try translate_rust.driver.translate(init.gpa, io, first, crate_out_dir.?);
     return;
 }
 

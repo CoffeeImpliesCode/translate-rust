@@ -112,12 +112,17 @@ fn mapPrim(nm: []const u8) ?types.Prim {
     if (std.mem.eql(u8, nm, "bool")) return .bool;
     if (std.mem.eql(u8, nm, "char")) return .char;
     if (std.mem.eql(u8, nm, "()")) return .unit;
+    if (std.mem.eql(u8, nm, "!")) return .never;
     return null;
 }
 
 /// Lower a tree-sitter type node into a wire `types.Type`.
 fn mapType(e: *Ctx, node: ts.Node) types.Type {
     const kind = node.kind();
+    if (std.mem.eql(u8, kind, "type")) {
+        if (node.namedChildCount() > 0) return mapType(e, node.namedChild(0).?);
+        return unsupportedTy();
+    }
     if (std.mem.eql(u8, kind, "primitive_type")) {
         const nm = text(e, node);
         if (std.mem.eql(u8, nm, "str")) {
@@ -126,48 +131,82 @@ fn mapType(e: *Ctx, node: ts.Node) types.Type {
             return .{ .slice = s };
         }
         if (mapPrim(nm)) |p| return .{ .prim = p };
-        return .{ .prim = .unit };
+        return unsupportedTy();
     }
     if (std.mem.eql(u8, kind, "reference_type")) {
-        // &[T] / &T / &mut T
+        // &[T] / &mut [T] / &str / &T / &mut T
         var mut = false;
         var inner: ?ts.Node = null;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
             const k = c.kind();
-            if (std.mem.eql(u8, k, "mutable_specifier")) mut = true;
-            if (std.mem.eql(u8, k, "array_type") or std.mem.eql(u8, k, "type")) {
+            if (std.mem.eql(u8, k, "mutable_specifier")) {
+                mut = true;
+            } else if (!std.mem.eql(u8, k, "lifetime")) {
                 if (inner == null) inner = c;
             }
         }
-        var elem: types.Type = .{ .prim = .unit };
         if (inner) |inn| {
-            if (inn.namedChildCount() > 0 and std.mem.eql(u8, inn.kind(), "type")) {
-                elem = mapType(e, inn.namedChild(0).?);
-            } else {
-                elem = mapType(e, inn);
+            const in_kind = inn.kind();
+            if (std.mem.eql(u8, in_kind, "slice_type") or std.mem.eql(u8, in_kind, "array_type")) {
+                return mapType(e, inn);
             }
+            if (std.mem.eql(u8, in_kind, "primitive_type") and std.mem.eql(u8, text(e, inn), "str")) {
+                const s = e.alloc.create(types.Slice) catch return unsupportedTy();
+                s.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+                return .{ .slice = s };
+            }
+            const pointee = mapType(e, inn);
+            if (pointee == .slice) return pointee;
+            const r = e.alloc.create(types.Ref) catch return unsupportedTy();
+            r.* = .{ .mut = mut, .pointee = pointee };
+            return .{ .reference = r };
         }
+        return unsupportedTy();
+    }
+    if (std.mem.eql(u8, kind, "slice_type")) {
+        var elem: types.Type = .{ .prim = .unit };
+        if (node.namedChildCount() > 0) elem = mapType(e, node.namedChild(0).?);
         const s = e.alloc.create(types.Slice) catch return unsupportedTy();
-        s.* = .{ .const_ = !mut, .elem = elem };
+        s.* = .{ .const_ = true, .elem = elem };
         return .{ .slice = s };
     }
     if (std.mem.eql(u8, kind, "array_type")) {
         var elem: types.Type = .{ .prim = .unit };
+        var len_lit: u32 = 0;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
-            if (std.mem.eql(u8, c.kind(), "type")) {
-                if (c.namedChildCount() > 0) elem = mapType(e, c.namedChild(0).?) else elem = mapType(e, c);
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "integer_literal")) {
+                len_lit = std.fmt.parseInt(u32, text(e, c), 10) catch 0;
+            } else {
+                elem = mapType(e, c);
             }
         }
         const a = e.alloc.create(types.Array) catch return unsupportedTy();
-        a.* = .{ .elem = elem, .len = .{ .literal = 0 } };
+        a.* = .{ .elem = elem, .len = .{ .literal = len_lit } };
         return .{ .array = a };
     }
-    if (std.mem.eql(u8, kind, "generic_type") or std.mem.eql(u8, kind, "type_identifier") or std.mem.eql(u8, kind, "scoped_type_identifier")) {
+    if (std.mem.eql(u8, kind, "pointer_type")) {
+        var mut = false;
+        var elem: types.Type = .{ .prim = .unit };
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "mutable_specifier")) {
+                mut = true;
+            } else if (!std.mem.eql(u8, k, "const_specifier")) {
+                elem = mapType(e, c);
+            }
+        }
+        const raw = e.alloc.create(types.RawPtr) catch return unsupportedTy();
+        raw.* = .{ .mut = mut, .pointee = elem };
+        return .{ .raw_ptr = raw };
+    }
+    if (std.mem.eql(u8, kind, "generic_type") or std.mem.eql(u8, kind, "type_identifier") or std.mem.eql(u8, kind, "identifier") or std.mem.eql(u8, kind, "scoped_type_identifier")) {
         return mapNamedType(e, node);
     }
-    if (std.mem.eql(u8, kind, "tuple_type")) {
+    if (std.mem.eql(u8, kind, "tuple_type") or std.mem.eql(u8, kind, "unit_type")) {
         var tup: std.ArrayListUnmanaged(types.Type) = .empty;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
@@ -176,30 +215,37 @@ fn mapType(e: *Ctx, node: ts.Node) types.Type {
         if (tup.items.len == 0) return .{ .prim = .unit };
         return .{ .tuple = tup.toOwnedSlice(e.alloc) catch return unsupportedTy() };
     }
+    if (node.namedChildCount() > 0) return mapType(e, node.namedChild(0).?);
     return unsupportedTy();
 }
 
 /// A named (path) type — possibly generic `Foo<T>`, with std prelude
 /// recognition (Option/Result/Box/Vec) into the dedicated IR nodes.
 fn mapNamedType(e: *Ctx, node: ts.Node) types.Type {
-    // Determine the base name (leaf identifier) + generic args.
     var name: ?[]const u8 = null;
     var arg_nodes: [8]ts.Node = undefined;
     var arg_count: usize = 0;
+    var segs: std.ArrayListUnmanaged(types.PathSegment) = .empty;
 
-    // Find the leaf identifier(s).
-    var i: u32 = 0;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        const k = c.kind();
-        if (std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "identifier")) {
-            name = text(e, c);
-        } else if (std.mem.eql(u8, k, "type_arguments") or std.mem.eql(u8, k, "generic_type")) {
-            // generic args under type_arguments
-            var j: u32 = 0;
-            while (c.namedChild(j)) |a| : (j += 1) {
-                if (arg_count < arg_nodes.len) {
-                    arg_nodes[arg_count] = a;
-                    arg_count += 1;
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "type_identifier") or std.mem.eql(u8, kind, "identifier")) {
+        name = text(e, node);
+    } else {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "identifier")) {
+                name = text(e, c);
+            } else if (std.mem.eql(u8, k, "scoped_type_identifier")) {
+                const sub = mapScopedSegments(e, c);
+                for (sub) |seg| segs.append(e.alloc, seg) catch return unsupportedTy();
+            } else if (std.mem.eql(u8, k, "type_arguments") or std.mem.eql(u8, k, "generic_type")) {
+                var j: u32 = 0;
+                while (c.namedChild(j)) |a| : (j += 1) {
+                    if (arg_count < arg_nodes.len) {
+                        arg_nodes[arg_count] = a;
+                        arg_count += 1;
+                    }
                 }
             }
         }
@@ -251,10 +297,25 @@ fn mapNamedType(e: *Ctx, node: ts.Node) types.Type {
             },
         };
     }
-    // Plain path.
-    var segs: std.ArrayListUnmanaged(types.PathSegment) = .empty;
     segs.append(e.alloc, .{ .name = nm, .id = null }) catch return unsupportedTy();
     return .{ .path = .{ .segments = segs.toOwnedSlice(e.alloc) catch return unsupportedTy() } };
+}
+
+/// All path segments of a `scoped_type_identifier` (prefix segments only; the
+/// caller appends the leaf name last).
+fn mapScopedSegments(e: *Ctx, node: ts.Node) []const types.PathSegment {
+    var segs: std.ArrayListUnmanaged(types.PathSegment) = .empty;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "scoped_identifier") or std.mem.eql(u8, k, "scoped_type_identifier")) {
+            const sub = mapScopedSegments(e, c);
+            segs.appendSlice(e.alloc, sub) catch return &.{};
+        } else if (std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "type_identifier")) {
+            segs.append(e.alloc, .{ .name = text(e, c), .id = null }) catch return &.{};
+        }
+    }
+    return segs.toOwnedSlice(e.alloc) catch &.{};
 }
 
 fn unsupportedTy() types.Type {
@@ -418,6 +479,54 @@ fn unionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     } };
 }
 
+/// Map a `parameters` node into `items.Param` entries. Handles `self_parameter`
+/// and `parameter` nodes, extracting the bound name from an `identifier` or a
+/// `pattern` (including `mut` / destructured patterns).
+fn mapParams(e: *Ctx, params_node: ?ts.Node) []const items.Param {
+    var params: std.ArrayListUnmanaged(items.Param) = .empty;
+    if (params_node) |pn| {
+        var j: u32 = 0;
+        while (pn.namedChild(j)) |p| : (j += 1) {
+            const pk = p.kind();
+            if (!std.mem.eql(u8, pk, "parameter") and !std.mem.eql(u8, pk, "self_parameter")) continue;
+            var pname: []const u8 = "";
+            var pty: types.Type = unsupportedTy();
+            if (std.mem.eql(u8, pk, "self_parameter")) {
+                pname = "self";
+                const r = e.alloc.create(types.Ref) catch return params.toOwnedSlice(e.alloc) catch &.{};
+                r.* = .{ .mut = false, .pointee = .{ .prim = .unit } };
+                pty = .{ .reference = r };
+            }
+            var k: u32 = 0;
+            while (p.namedChild(k)) |c| : (k += 1) {
+                const kk = c.kind();
+                if (std.mem.eql(u8, kk, "identifier")) {
+                    if (pname.len == 0) pname = text(e, c);
+                } else if (std.mem.eql(u8, kk, "pattern") or std.mem.eql(u8, kk, "mut_pattern") or std.mem.eql(u8, kk, "reference_pattern")) {
+                    if (pname.len == 0) {
+                        var m: u32 = 0;
+                        while (c.namedChild(m)) |cc| : (m += 1) {
+                            if (std.mem.eql(u8, cc.kind(), "identifier")) {
+                                pname = text(e, cc);
+                                break;
+                            }
+                        }
+                    }
+                } else if (std.mem.eql(u8, kk, "type") or std.mem.eql(u8, kk, "primitive_type") or std.mem.eql(u8, kk, "reference_type") or std.mem.eql(u8, kk, "generic_type") or std.mem.eql(u8, kk, "type_identifier") or std.mem.eql(u8, kk, "scoped_type_identifier") or std.mem.eql(u8, kk, "array_type") or std.mem.eql(u8, kk, "slice_type") or std.mem.eql(u8, kk, "tuple_type") or std.mem.eql(u8, kk, "unit_type")) {
+                    pty = mapType(e, c);
+                }
+            }
+            if (pname.len == 0) continue;
+            params.append(e.alloc, .{
+                .name = e.alloc.dupe(u8, pname) catch return params.toOwnedSlice(e.alloc) catch &.{},
+                .ty = pty,
+                .span = span_of,
+            }) catch break;
+        }
+    }
+    return params.toOwnedSlice(e.alloc) catch &.{};
+}
+
 fn traitItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     var name: []const u8 = "";
     var decls: ?ts.Node = null;
@@ -434,19 +543,35 @@ fn traitItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
             if (!std.mem.eql(u8, m.kind(), "function_signature_item")) continue;
             var mname: []const u8 = "";
             var mret: types.Type = .{ .prim = .unit };
+            var mparams_node: ?ts.Node = null;
             var k: u32 = 0;
             while (m.namedChild(k)) |c| : (k += 1) {
                 const kk = c.kind();
                 if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
+                if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
                 if (std.mem.eql(u8, kk, "return_type")) {
                     if (c.namedChildCount() > 0) mret = mapType(e, c.namedChild(0).?);
                 }
             }
+            const mparams = mapParams(e, mparams_node);
+            // Split a leading `self` param into the receiver kind.
+            var receiver: items.Receiver = .ref_;
+            var params = mparams;
+            if (mparams.len > 0 and std.mem.eql(u8, mparams[0].name, "self")) {
+                receiver = .ref_;
+                if (mparams[0].ty == .reference) {
+                    if (mparams[0].ty.reference.*.mut) receiver = .mut_ref;
+                    // `self` by value has no `&`; default owned.
+                } else {
+                    receiver = .owned;
+                }
+                params = mparams[1..];
+            }
             methods.append(e.alloc, .{
                 .name = try e.alloc.dupe(u8, mname),
-                .params = &.{},
+                .params = params,
                 .ret = mret,
-                .receiver = .ref_,
+                .receiver = receiver,
             }) catch break;
         }
     }
@@ -501,32 +626,10 @@ fn functionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, is_trait_sig: b
             if (c.namedChildCount() > 0) ret = mapType(e, c.namedChild(0).?);
         }
     }
-    var params: std.ArrayListUnmanaged(items.Param) = .empty;
-    if (params_node) |pn| {
-        var j: u32 = 0;
-        while (pn.namedChild(j)) |p| : (j += 1) {
-            if (!std.mem.eql(u8, p.kind(), "parameter")) continue;
-            var pname: []const u8 = "";
-            var pty: types.Type = unsupportedTy();
-            var k: u32 = 0;
-            while (p.namedChild(k)) |c| : (k += 1) {
-                const kk = c.kind();
-                if (std.mem.eql(u8, kk, "identifier")) pname = text(e, c);
-                if (std.mem.eql(u8, kk, "type") or std.mem.eql(u8, kk, "primitive_type") or std.mem.eql(u8, kk, "reference_type") or std.mem.eql(u8, kk, "generic_type") or std.mem.eql(u8, kk, "type_identifier") or std.mem.eql(u8, kk, "array_type") or std.mem.eql(u8, kk, "tuple_type")) {
-                    if (std.mem.eql(u8, kk, "type") and c.namedChildCount() > 0) {
-                        pty = mapType(e, c.namedChild(0).?);
-                    } else {
-                        pty = mapType(e, c);
-                    }
-                }
-            }
-            if (pname.len == 0) continue;
-            params.append(e.alloc, .{ .name = try e.alloc.dupe(u8, pname), .ty = pty, .span = span_of }) catch break;
-        }
-    }
+    const params = mapParams(e, params_node);
     const eid = try addEntity(e, .fn_, name, parent);
     e.bodies_list.items[eid] = .{ .fn_ = .{
-        .params = params.toOwnedSlice(e.alloc) catch &.{},
+        .params = params,
         .ret = ret,
         .body = 0,
     } };

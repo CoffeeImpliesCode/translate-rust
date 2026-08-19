@@ -96,12 +96,8 @@
                 "ty": {
                   "kind": "slice",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
                   "is_const": true
                 },
@@ -128,12 +124,8 @@
                 "ty": {
                   "kind": "slice",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
                   "is_const": true
                 },
@@ -160,12 +152,8 @@
                 "ty": {
                   "kind": "slice",
                   "elem": {
-                    "kind": "array",
-                    "elem": {
-                      "kind": "prim",
-                      "value": "void_type"
-                    },
-                    "len": 0
+                    "kind": "prim",
+                    "value": "u8"
                   },
                   "is_const": true
                 },

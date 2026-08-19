@@ -139,54 +139,202 @@ fn appendType(e: *Ext, t: types.Type) !exprs.TypeId {
 
 // ── type lowering ───────────────────────────────────────────────────────────
 
-/// Lower a tree-sitter type node to a wire `types.Type`. Unsupported types →
-/// `.unsupported`. `&T`, `&mut T`, `&[T]` → Zig `[]const`/`[]mut` slices.
+/// Lower a tree-sitter type node to a wire `types.Type`. Handles primitives,
+/// slices, arrays, references, named types (path / generic), and tuples.
+/// Unsupported types → `.unsupported` (loud @panic marker, never a wrong type).
 fn mapCstType(e: *const Ext, node: ts.Node) types.Type {
     const kind = node.kind();
+    if (std.mem.eql(u8, kind, "type")) {
+        if (node.namedChildCount() > 0) return mapCstType(e, node.namedChild(0).?);
+        return unsupportedCstType();
+    }
     if (std.mem.eql(u8, kind, "primitive_type")) {
         const nm = text(e, node);
         if (std.mem.eql(u8, nm, "str")) {
-            const s = e.ctx.alloc.create(types.Slice) catch return .{ .unsupported = .{ .reason = .cfg_gated, .message = "unsupported type", .span = span_of } };
-            s.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
-            return .{ .slice = s };
+            return cstSlice(e, .{ .prim = .u8 }, true);
         }
         const from = mapPrim(nm);
         if (from) |p| return .{ .prim = p };
-        return .{ .prim = .unit };
+        return unsupportedCstType();
     }
     if (std.mem.eql(u8, kind, "reference_type")) {
-        // &[T] → slice; &T → slice-const; everything else → slice too.
+        // &[T] / &mut [T] / &str / &T / &mut T
+        var mut = false;
         var inner: ?ts.Node = null;
         var i: u32 = 0;
-        while (node.namedChild(i)) |c| : (i += 1) tryFindType(c, &inner);
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "mutable_specifier")) {
+                mut = true;
+            } else if (!std.mem.eql(u8, k, "lifetime")) {
+                if (inner == null) inner = c;
+            }
+        }
+        if (inner) |inn| {
+            const in_kind = inn.kind();
+            if (std.mem.eql(u8, in_kind, "slice_type") or std.mem.eql(u8, in_kind, "array_type")) {
+                return mapCstType(e, inn);
+            }
+            if (std.mem.eql(u8, in_kind, "primitive_type") and std.mem.eql(u8, text(e, inn), "str")) {
+                return cstSlice(e, .{ .prim = .u8 }, true);
+            }
+            const r = e.ctx.alloc.create(types.Ref) catch return unsupportedCstType();
+            r.* = .{ .mut = mut, .pointee = mapCstType(e, inn) };
+            return .{ .reference = r };
+        }
+        return unsupportedCstType();
+    }
+    if (std.mem.eql(u8, kind, "slice_type")) {
         var elem: types.Type = .{ .prim = .unit };
-        if (inner) |inn| elem = mapCstType(e, inn);
-        const s = e.ctx.alloc.create(types.Slice) catch return .{ .unsupported = .{ .reason = .cfg_gated, .message = "unsupported type", .span = span_of } };
-        s.* = .{ .const_ = true, .elem = elem };
-        return .{ .slice = s };
+        if (node.namedChildCount() > 0) elem = mapCstType(e, node.namedChild(0).?);
+        return cstSlice(e, elem, true);
     }
     if (std.mem.eql(u8, kind, "array_type")) {
         var elem: types.Type = .{ .prim = .unit };
+        var len_lit: u32 = 0;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
-            if (std.mem.eql(u8, c.kind(), "type")) {
-                if (c.namedChildCount() > 0) elem = mapCstType(e, c.namedChild(0).?) else elem = mapCstType(e, c);
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "integer_literal")) {
+                len_lit = std.fmt.parseInt(u32, text(e, c), 10) catch 0;
+            } else {
+                elem = mapCstType(e, c);
             }
         }
-        const a = e.ctx.alloc.create(types.Array) catch return .{ .unsupported = .{ .reason = .cfg_gated, .message = "unsupported type", .span = span_of } };
-        a.* = .{ .elem = elem, .len = .{ .literal = 0 } };
+        const a = e.ctx.alloc.create(types.Array) catch return unsupportedCstType();
+        a.* = .{ .elem = elem, .len = .{ .literal = len_lit } };
         return .{ .array = a };
     }
+    if (std.mem.eql(u8, kind, "generic_type") or std.mem.eql(u8, kind, "type_identifier") or std.mem.eql(u8, kind, "identifier") or std.mem.eql(u8, kind, "scoped_type_identifier")) {
+        return mapCstNamedType(e, node);
+    }
+    if (std.mem.eql(u8, kind, "tuple_type") or std.mem.eql(u8, kind, "unit_type")) {
+        var tup: std.ArrayListUnmanaged(types.Type) = .empty;
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            tup.append(e.ctx.alloc, mapCstType(e, c)) catch return unsupportedCstType();
+        }
+        if (tup.items.len == 0) return .{ .prim = .unit };
+        return .{ .tuple = tup.toOwnedSlice(e.ctx.alloc) catch return unsupportedCstType() };
+    }
+    if (node.namedChildCount() > 0) return mapCstType(e, node.namedChild(0).?);
+    return unsupportedCstType();
+}
+
+fn cstSlice(e: *const Ext, elem: types.Type, const_: bool) types.Type {
+    const s = e.ctx.alloc.create(types.Slice) catch return unsupportedCstType();
+    s.* = .{ .const_ = const_, .elem = elem };
+    return .{ .slice = s };
+}
+
+fn unsupportedCstType() types.Type {
     return .{ .unsupported = .{ .reason = .cfg_gated, .message = "unsupported type", .span = span_of } };
 }
 
-fn tryFindType(node: ts.Node, out: *?ts.Node) void {
-    if (std.mem.eql(u8, node.kind(), "type") or
-        std.mem.eql(u8, node.kind(), "array_type") or
-        std.mem.eql(u8, node.kind(), "primitive_type"))
-    {
-        if (out.* == null) out.* = node;
+/// Map a named (path) type — possibly generic — to the wire model.
+fn mapCstNamedType(e: *const Ext, node: ts.Node) types.Type {
+    var name: ?[]const u8 = null;
+    var arg_nodes: [8]ts.Node = undefined;
+    var arg_count: usize = 0;
+    var segs: std.ArrayListUnmanaged(types.PathSegment) = .empty;
+
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "type_identifier") or std.mem.eql(u8, kind, "identifier")) {
+        name = text(e, node);
+    } else {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "identifier")) {
+                name = text(e, c);
+            } else if (std.mem.eql(u8, k, "scoped_type_identifier")) {
+                const sub = mapCstScopedSegments(e, c);
+                for (sub) |seg| segs.append(e.ctx.alloc, seg) catch return unsupportedCstType();
+            } else if (std.mem.eql(u8, k, "type_arguments") or std.mem.eql(u8, k, "generic_type")) {
+                var j: u32 = 0;
+                while (c.namedChild(j)) |a| : (j += 1) {
+                    if (arg_count < arg_nodes.len) {
+                        arg_nodes[arg_count] = a;
+                        arg_count += 1;
+                    }
+                }
+            }
+        }
     }
+    const nm = name orelse return unsupportedCstType();
+    var args: []const types.Type = &.{};
+    if (arg_count > 0) {
+        const args_arr = e.ctx.alloc.alloc(types.Type, arg_count) catch return unsupportedCstType();
+        for (arg_nodes[0..arg_count], 0..) |an, ai| args_arr[ai] = mapCstType(e, an);
+        args = args_arr;
+    }
+
+    if (std.mem.eql(u8, nm, "Option") and args.len == 1) {
+        const inner = e.ctx.alloc.create(types.Type) catch return unsupportedCstType();
+        inner.* = args[0];
+        return .{ .option = inner };
+    }
+    if (std.mem.eql(u8, nm, "Result") and args.len == 2) {
+        const r = e.ctx.alloc.create(types.Result) catch return unsupportedCstType();
+        r.* = .{ .ok = args[0], .err = args[1], .is_error_unionable = true };
+        return .{ .result = r };
+    }
+    if (std.mem.eql(u8, nm, "Box") and args.len == 1) {
+        const inner = e.ctx.alloc.create(types.Type) catch return unsupportedCstType();
+        inner.* = args[0];
+        return .{ .boxed = inner };
+    }
+    if (args.len > 0) {
+        var base_def: spine.EntityId = 0;
+        for (e.ctx.g.symbol_table.entities.items) |ent| {
+            if (std.mem.eql(u8, ent.name, nm)) {
+                base_def = ent.id;
+                break;
+            }
+        }
+        if (base_def == 0) {
+            const new_id = dismiss(e, nm) catch 0;
+            if (new_id == 0) return unsupportedCstType();
+            base_def = new_id;
+        }
+        return .{ .generic_inst = .{ .decl = base_def, .args = .{ .params = args } } };
+    }
+    segs.append(e.ctx.alloc, .{ .name = nm, .id = null }) catch return unsupportedCstType();
+    return .{ .path = .{ .segments = segs.toOwnedSlice(e.ctx.alloc) catch return unsupportedCstType() } };
+}
+
+fn mapCstScopedSegments(e: *const Ext, node: ts.Node) []const types.PathSegment {
+    var segs: std.ArrayListUnmanaged(types.PathSegment) = .empty;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "scoped_identifier") or std.mem.eql(u8, k, "scoped_type_identifier")) {
+            const sub = mapCstScopedSegments(e, c);
+            segs.appendSlice(e.ctx.alloc, sub) catch return &.{};
+        } else if (std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "type_identifier")) {
+            segs.append(e.ctx.alloc, .{ .name = text(e, c), .id = null }) catch return &.{};
+        }
+    }
+    return segs.toOwnedSlice(e.ctx.alloc) catch &.{};
+}
+
+/// Register a placeholder `.struct_` entity for an unresolved generic name and
+/// return its id (0 on failure).
+fn dismiss(e: *const Ext, nm: []const u8) !spine.EntityId {
+    const id: spine.EntityId = @intCast(e.ctx.g.symbol_table.entities.items.len);
+    _ = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try e.ctx.alloc.dupe(u8, nm),
+        .span = span_of,
+        .visibility = .public,
+        .parent = e.ctx.mod_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    return id;
 }
 
 fn mapPrim(nm: []const u8) ?types.Prim {
@@ -212,29 +360,24 @@ fn mapPrim(nm: []const u8) ?types.Prim {
 
 // ── statement lowering ───────────────────────────────────────────────────────
 
-/// Lower a `let_declaration`: registers the binding locally and appends a
-/// `let` statement.
+/// Lower a `let_declaration`: registers the binding(s) locally via
+/// `lowerPattern` and appends a `let` statement.
 fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
-    var name: ?[]const u8 = null;
+    var pat_node: ?ts.Node = null;
     var type_node: ?ts.Node = null;
     var init_node: ?ts.Node = null;
-    var is_mut = false;
 
     var i: u32 = 0;
     while (node.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
-        if (std.mem.eql(u8, k, "mutable_specifier")) {
-            is_mut = true;
-        } else if (std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "value_identifier")) {
-            name = text(e, c);
-        } else if (std.mem.eql(u8, k, "type") or std.mem.eql(u8, k, "primitive_type")) {
+        if (pat_node == null and isPatternNode(c)) {
+            pat_node = c;
+        } else if (std.mem.eql(u8, k, "type") or std.mem.eql(u8, k, "primitive_type") or std.mem.eql(u8, k, "generic_type") or std.mem.eql(u8, k, "reference_type") or std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "array_type") or std.mem.eql(u8, k, "slice_type") or std.mem.eql(u8, k, "tuple_type")) {
             type_node = c;
-        } else if (std.mem.eql(u8, k, "value") or std.mem.eql(u8, k, "call_expression") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "integer_literal") or std.mem.eql(u8, k, "float_literal") or std.mem.eql(u8, k, "boolean_literal") or std.mem.eql(u8, k, "string_literal") or std.mem.eql(u8, k, "char_literal") or std.mem.eql(u8, k, "macro_invocation") or std.mem.eql(u8, k, "binary_expression") or std.mem.eql(u8, k, "array_expression") or std.mem.eql(u8, k, "struct_expression") or std.mem.eql(u8, k, "match_expression")) {
-            if (init_node == null) init_node = c;
+        } else if (init_node == null and !std.mem.eql(u8, k, "mutable_specifier") and !std.mem.eql(u8, k, "let")) {
+            init_node = c;
         }
     }
-    _ = try pushLocal(e, name orelse return);
-    const nm = name.?;
 
     var ann: ?exprs.TypeId = null;
     if (type_node) |tn| {
@@ -245,16 +388,33 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
     var init_id: ?exprs.NodeId = null;
     if (init_node) |inn| init_id = try lowerExpr(e, inn);
 
-    const pat_id = try appendPat(e, .{ .binding = .{
-        .name = nm,
-        .mode = .{ .value = {} },
-        .mutable = is_mut,
-    } });
+    var pat_id: exprs.NodeId = 0;
+    if (pat_node) |pn| {
+        pat_id = try lowerPattern(e, pn);
+    } else {
+        pat_id = try appendPat(e, .{ .wildcard = {} });
+    }
     _ = try appendStmt(e, .{ .let = .{
         .pattern = pat_id,
         .init = init_id,
         .ty = ann,
     } });
+}
+
+fn isPatternNode(node: ts.Node) bool {
+    const k = node.kind();
+    return std.mem.eql(u8, k, "pattern") or
+        std.mem.eql(u8, k, "identifier") or
+        std.mem.eql(u8, k, "mut_pattern") or
+        std.mem.eql(u8, k, "tuple_pattern") or
+        std.mem.eql(u8, k, "struct_pattern") or
+        std.mem.eql(u8, k, "tuple_struct_pattern") or
+        std.mem.eql(u8, k, "reference_pattern") or
+        std.mem.eql(u8, k, "wildcard_pattern") or
+        std.mem.eql(u8, k, "or_pattern") or
+        std.mem.eql(u8, k, "scoped_identifier") or
+        std.mem.eql(u8, k, "slice_pattern") or
+        std.mem.eql(u8, k, "literal_pattern");
 }
 
 /// Lower a `for_expression` to a wire `for_` expr, returning its expr id.
@@ -756,6 +916,35 @@ fn lowerFieldPattern(e: *Ext, node: ts.Node) anyerror!exprs.FieldPat {
 
 fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const kind = node.kind();
+
+    // A generic `pattern` wrapper: unwrap when it simply wraps another
+    // pattern, or handle an inline `mutable_specifier`+identifier binding.
+    if (std.mem.eql(u8, kind, "pattern")) {
+        var mut = false;
+        var inner: ?ts.Node = null;
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const k = c.kind();
+            if (std.mem.eql(u8, k, "mutable_specifier")) {
+                mut = true;
+            } else if (k.len > 0 and !std.mem.eql(u8, k, "let") and inner == null) {
+                inner = c;
+            }
+        }
+        if (inner) |inn| {
+            if (std.mem.eql(u8, inn.kind(), "identifier")) {
+                const nm = text(e, inn);
+                _ = try pushLocal(e, nm);
+                return appendPat(e, .{ .binding = .{
+                    .name = try e.ctx.alloc.dupe(u8, nm),
+                    .mode = .{ .value = {} },
+                    .mutable = mut,
+                } });
+            }
+            return lowerPattern(e, inn);
+        }
+        return appendPat(e, .{ .wildcard = {} });
+    }
 
     if (std.mem.eql(u8, kind, "wildcard_pattern") or std.mem.eql(u8, kind, "_")) {
         return appendPat(e, .{ .wildcard = {} });
@@ -1378,6 +1567,23 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
 // ── top-level entry ──────────────────────────────────────────────────────────
 
+/// Register every local binding introduced by a function parameter node
+/// (`parameter`, `self_parameter`, or a plain `mut`/destructuring pattern) so
+/// the body resolves references to them.
+fn registerParamLocals(e: *Ext, node: ts.Node) anyerror!void {
+    const k = node.kind();
+    if (std.mem.eql(u8, k, "identifier")) {
+        _ = try pushLocal(e, text(e, node));
+    } else if (std.mem.eql(u8, k, "self_parameter")) {
+        _ = try pushLocal(e, "self");
+    } else {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            try registerParamLocals(e, c);
+        }
+    }
+}
+
 /// Extract the body of the function whose entity is `fn_entity` by parsing
 /// `src`. Returns true on success (body replaced) or false when the fn cannot
 /// be matched/lowered.
@@ -1416,16 +1622,12 @@ pub fn extractFunction(
         var ex: Ext = .{ .ctx = ctx, .fn_id = fn_entity };
         defer ex.deinit();
 
-        // Register params as locals so the body resolves them.
-        var p: u32 = 0;
+        // Register params as locals so the body resolves them. Handles
+        // `self`, `mut x: T`, destructured patterns, and plain identifiers.
         if (params_node) |pn| {
+            var p: u32 = 0;
             while (pn.namedChild(p)) |pnode| : (p += 1) {
-                var pn_ident: ?ts.Node = null;
-                var q: u32 = 0;
-                while (pnode.namedChild(q)) |pnchild| : (q += 1) {
-                    if (std.mem.eql(u8, pnchild.kind(), "identifier")) pn_ident = pnchild;
-                }
-                if (pn_ident) |pi| _ = try pushLocal(&ex, ctx.src[pi.startByte()..pi.endByte()]);
+                try registerParamLocals(&ex, pnode);
             }
         }
 

@@ -358,3 +358,174 @@ test "lowerRustIR: struct methods, hoisting, and expressions" {
     try std.testing.expect(file.tests[0].body.stmts[0] == .let_stmt);
     try std.testing.expectEqualStrings("x", file.tests[0].body.stmts[0].let_stmt.name);
 }
+
+/// Build a model whose fn returns a non-primitive path type via a
+/// struct-literal body tail, plus a char-returning fn, to exercise:
+///   - `lowerFnEntity`/`lowerStructMethod` return-type mapping (path → named,
+///     NOT void / anyopaque);
+///   - `lowerType` primitive mapping (char → u21) and `.unsupported` with a
+///     message → named type;
+///   - `lowerBlock` tail preservation (struct-init value tail kept in
+///     `ast.Block.expr`).
+fn buildTypeModel(
+    alloc: std.mem.Allocator,
+    graph: *ir.graph.CrateGraph,
+    bodies: *ir.bodies.Bodies,
+) !void {
+    var model = Model.init(alloc);
+
+    // Entities:
+    //  id0: struct Point (id)
+    //  id1: fn make_point — body struct_init tail, ret = path Point
+    //  id2: fn first_char — ret = prim char
+    const point_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = "Point",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const make_point_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "make_point",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const first_char_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "first_char",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // make_point body: block { tail = Point { x = 1, y = 2 } }
+    const e_x = try model.e(litInt(1));
+    const e_y = try model.e(litInt(2));
+    const e_pt_lit = try model.e(.{
+        .struct_lit = .{
+            .def = point_id,
+            .fields = &.{
+                .{ .field = "x", .value = e_x, .shorthand = false },
+                .{ .field = "y", .value = e_y, .shorthand = false },
+            },
+            .base = null,
+        },
+    });
+    const e_pt_block = try model.e(.{ .block = .{ .statements = &.{}, .tail = e_pt_lit, .labelled = null } });
+
+    // first_char body: block { tail = literal 'A' }
+    const e_char = try model.e(.{ .literal = .{ .character = .{ .text = "'A'", .value = 'A' } } });
+    const e_char_block = try model.e(.{ .block = .{ .statements = &.{}, .tail = e_char, .labelled = null } });
+
+    // Bodies (indexed by entity id):
+    //  id0: Point struct (no fields)
+    try model.bodies.append(model.a(), .{ .struct_ = .{
+        .fields = &.{},
+        .methods = &.{},
+    } });
+    //  id1: make_point → path Point, body = pt block
+    try model.bodies.append(model.a(), .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .path = .{ .segments = &.{ .{ .name = "Point", .id = point_id } } } },
+        .body = e_pt_block,
+    } });
+    //  id2: first_char → prim char, body = char block
+    try model.bodies.append(model.a(), .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .char },
+        .body = e_char_block,
+    } });
+
+    bodies.* = .{
+        .exprs = try model.exprs.toOwnedSlice(model.a()),
+        .stmts = try model.stmts.toOwnedSlice(model.a()),
+        .pats = try model.pats.toOwnedSlice(model.a()),
+        .types = &.{},
+        .bodies = try model.bodies.toOwnedSlice(model.a()),
+    };
+
+    const root_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{ point_id, make_point_id, first_char_id },
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "types",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+}
+
+test "lower: non-primitive fn return types and block tail preservation" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var ir_bodies: ir.bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    try buildTypeModel(alloc, &graph, &ir_bodies);
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "types",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = ir_bodies,
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+
+    try std.testing.expectEqual(@as(usize, 1), pkg.files.len);
+    const file = pkg.files[0];
+
+    // Root decls: Point struct + make_point + first_char.
+    try std.testing.expectEqual(@as(usize, 3), file.decls.len);
+
+    // make_point returns path "Point" → named "Point", NOT void/anyopaque.
+    const make_point = file.decls[1].fn_decl;
+    try std.testing.expectEqualStrings("make_point", make_point.name);
+    try std.testing.expect(make_point.ret_type == .named);
+    try std.testing.expectEqualStrings("Point", make_point.ret_type.named);
+    // Body tail (struct-init) is preserved as the block expr.
+    try std.testing.expect(make_point.body != null);
+    try std.testing.expect(make_point.body.?.expr != null);
+    try std.testing.expect(make_point.body.?.expr.?.* == .struct_init);
+
+    // first_char returns prim char → ast.Prim.u21.
+    const first_char = file.decls[2].fn_decl;
+    try std.testing.expectEqualStrings("first_char", first_char.name);
+    try std.testing.expect(first_char.ret_type == .prim);
+    try std.testing.expectEqual(ast.Prim.u21, first_char.ret_type.prim);
+    try std.testing.expect(first_char.body.?.expr != null);
+    try std.testing.expect(first_char.body.?.expr.?.* == .lit);
+}

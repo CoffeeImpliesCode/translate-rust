@@ -275,15 +275,53 @@ const Lowerer = struct {
             },
             .enum_ => {
                 var variants_list: std.ArrayListUnmanaged(ast.EnumVariant) = .empty;
+                var union_fields: std.ArrayListUnmanaged(ast.UnionField) = .empty;
                 var inner_decls: std.ArrayListUnmanaged(ast.Decl) = .empty;
+                var is_data_carrying = false;
 
                 switch (body_kind) {
                     .enum_ => |eb| {
+                        if (eb.kind == .data) is_data_carrying = true;
                         for (eb.variants) |v| {
-                            try variants_list.append(self.alloc, .{
-                                .name = try self.alloc.dupe(u8, v.name),
-                                .value = null,
-                            });
+                            if (is_data_carrying) {
+                                var v_ty: ast.Type = ast.Type{ .void_type = {} };
+                                switch (v.fields) {
+                                    .none => {
+                                        v_ty = ast.Type{ .void_type = {} };
+                                    },
+                                    .tuple => |tup| {
+                                        if (tup.len == 1) {
+                                            v_ty = try self.lowerType(tup[0]);
+                                        } else if (tup.len > 1) {
+                                            v_ty = try self.lowerType(ir.types.Type{ .tuple = tup });
+                                        }
+                                    },
+                                    .named => |flds| {
+                                        var sf_list: std.ArrayListUnmanaged(ast.StructField) = .empty;
+                                        for (flds) |f| {
+                                            const f_ty = try self.lowerType(f.ty);
+                                            try sf_list.append(self.alloc, .{
+                                                .name = try self.alloc.dupe(u8, f.name),
+                                                .ty = f_ty,
+                                            });
+                                        }
+                                        v_ty = ast.Type{
+                                            .anon_struct = .{
+                                                .fields = try sf_list.toOwnedSlice(self.alloc),
+                                            },
+                                        };
+                                    },
+                                }
+                                try union_fields.append(self.alloc, .{
+                                    .name = try self.alloc.dupe(u8, v.name),
+                                    .ty = v_ty,
+                                });
+                            } else {
+                                try variants_list.append(self.alloc, .{
+                                    .name = try self.alloc.dupe(u8, v.name),
+                                    .value = null,
+                                });
+                            }
                         }
                     },
                     else => {},
@@ -293,6 +331,18 @@ const Lowerer = struct {
                     for (hoisted.items) |d| {
                         try inner_decls.append(self.alloc, d);
                     }
+                }
+
+                if (is_data_carrying) {
+                    return ast.Decl{
+                        .union_decl = .{
+                            .name = try self.alloc.dupe(u8, ent.name),
+                            .is_pub = is_pub,
+                            .tag_type = ast.Type{ .named = "enum" },
+                            .fields = try union_fields.toOwnedSlice(self.alloc),
+                            .decls = try inner_decls.toOwnedSlice(self.alloc),
+                        },
+                    };
                 }
 
                 return ast.Decl{
@@ -360,18 +410,39 @@ const Lowerer = struct {
                     else => {},
                 }
 
-                const target_name = switch (target_ty) {
-                    .named => |n| n,
-                    .prim => |p| @tagName(p),
-                    else => "type",
-                };
+                var init_expr: ast.Expr = ast.Expr{ .ident = "type" };
+                switch (target_ty) {
+                    .named => |n| {
+                        init_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, n) };
+                    },
+                    .generic => |g| {
+                        var arg_exprs = try self.alloc.alloc(ast.Expr, g.params.len);
+                        for (g.params, 0..) |p, i| {
+                            arg_exprs[i] = switch (p) {
+                                .named => |pn| ast.Expr{ .ident = try self.alloc.dupe(u8, pn) },
+                                .prim => |pp| ast.Expr{ .ident = try self.alloc.dupe(u8, @tagName(pp)) },
+                                else => ast.Expr{ .ident = "anyopaque" },
+                            };
+                        }
+                        init_expr = ast.Expr{
+                            .call = .{
+                                .callee = try self.allocExpr(ast.Expr{ .ident = try self.alloc.dupe(u8, g.name) }),
+                                .args = arg_exprs,
+                            },
+                        };
+                    },
+                    .prim => |p| {
+                        init_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, @tagName(p)) };
+                    },
+                    else => {},
+                }
 
                 return ast.Decl{
                     .const_decl = .{
                         .name = try self.alloc.dupe(u8, ent.name),
                         .is_pub = is_pub,
                         .ty = null,
-                        .init = ast.Expr{ .ident = try self.alloc.dupe(u8, target_name) },
+                        .init = init_expr,
                     },
                 };
             },
@@ -606,14 +677,26 @@ const Lowerer = struct {
                     .size = .many,
                 },
             },
-            .array => |a| ast.Type{
-                .array = .{
-                    .elem = try self.allocType(try self.lowerType(a.elem)),
-                    .len = switch (a.len) {
-                        .literal => |n| n,
-                        .generic => 0,
+            .array => |a| blk: {
+                const elem_ty = try self.allocType(try self.lowerType(a.elem));
+                const len = switch (a.len) {
+                    .literal => |n| n,
+                    .generic => 0,
+                };
+                if (len == 0) {
+                    break :blk ast.Type{
+                        .slice = .{
+                            .elem = elem_ty,
+                            .is_const = true,
+                        },
+                    };
+                }
+                break :blk ast.Type{
+                    .array = .{
+                        .elem = elem_ty,
+                        .len = len,
                     },
-                },
+                };
             },
             .option => |opt| ast.Type{
                 .opt = try self.allocType(try self.lowerType(opt.*)),
@@ -641,10 +724,12 @@ const Lowerer = struct {
             .path => |p| blk: {
                 if (p.segments.len > 0) {
                     const last_seg = p.segments[p.segments.len - 1].name;
-                    if (try self.strat.lowerStdGeneric(last_seg, &.{})) |std_ty| {
-                        break :blk std_ty;
+                    if (last_seg.len > 0) {
+                        if (try self.strat.lowerStdGeneric(last_seg, &.{})) |std_ty| {
+                            break :blk std_ty;
+                        }
+                        break :blk ast.Type{ .named = try self.alloc.dupe(u8, last_seg) };
                     }
-                    break :blk ast.Type{ .named = try self.alloc.dupe(u8, last_seg) };
                 }
                 break :blk ast.Type{ .named = "unknown" };
             },
@@ -659,16 +744,22 @@ const Lowerer = struct {
                 for (gi.args.params, 0..) |p, i| {
                     params[i] = try self.lowerType(p);
                 }
+                const name = if (decl_name.len > 0) decl_name else "generic";
                 break :blk ast.Type{
                     .generic = .{
-                        .name = try self.alloc.dupe(u8, decl_name),
+                        .name = try self.alloc.dupe(u8, name),
                         .params = params,
                     },
                 };
             },
             .boxed => |b| try self.lowerType(b.*),
             .fn_ptr => ast.Type{ .named = "fn_ptr" },
-            .unsupported => |u| ast.Type{ .named = try self.alloc.dupe(u8, u.message) },
+            .unsupported => |u| blk: {
+                if (u.message.len > 0) {
+                    break :blk ast.Type{ .named = try self.alloc.dupe(u8, u.message) };
+                }
+                break :blk ast.Type{ .named = "anyopaque" };
+            },
         };
     }
 
@@ -689,7 +780,7 @@ const Lowerer = struct {
             .f32 => .f32,
             .f64 => .f64,
             .bool => .bool,
-            .char => .u32,
+            .char => .u21,
             .unit => .void_type,
             .never => .noreturn_type,
         };
