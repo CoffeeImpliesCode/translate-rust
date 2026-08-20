@@ -197,9 +197,8 @@ fn analyzeSourceWithGraph(
         for (g.modules.items) |m| {
             if (m.id == 0) continue;
             if (m.source_path) |sp| {
-                if (ingest.readFileAlloc(allocator, io, sp)) |m_src| {
-                    try module_srcs.put(allocator, m.id, m_src);
-                } else |_| {}
+                const m_src = try ingest.readFileAlloc(allocator, io, sp);
+                try module_srcs.put(allocator, m.id, m_src);
             }
         }
     }
@@ -236,7 +235,8 @@ fn analyzeSourceWithGraph(
         const fn_src = m_src orelse src;
         ts_ctx.src = fn_src;
         ts_ctx.mod_id = ent.parent.?;
-        _ = ts_ext.extractFunction(&ts_ctx, fn_id) catch false;
+        const extracted = try ts_ext.extractFunction(&ts_ctx, fn_id);
+        if (!extracted) continue;
     }
 
     // 5. Type inference, method resolution, and generic monomorphization
@@ -250,24 +250,22 @@ fn analyzeSourceWithGraph(
 
     var instantiation_table: monomorphize.InstantiationTable = .{};
     defer instantiation_table.deinit(allocator);
-    if (infer.solveWithGraph(allocator, &b_temp, &g)) |inferred| {
-        var solved = inferred;
-        defer solved.deinit(allocator);
-        solved.apply(exprs_list.items);
-        try materializeInferredConstructorTypes(
-            allocator,
-            &types_list,
-            exprs_list.items,
-            solved.instantiations,
-        );
-        b_temp.types = types_list.items;
-        _ = resolve_methods.resolveMethods(&g, &b_temp);
-        instantiation_table = monomorphize.collectInstantiations(allocator, &g, &b_temp) catch .{};
-        // Inference records are keyed by source expression. Copy their
-        // concrete argument slices into the long-lived table before `solved`
-        // releases its map and arena-owned temporary buffers.
-        try instantiation_table.mergeInferred(allocator, solved.instantiations);
-    } else |_| {}
+    var solved = try infer.solveWithGraph(allocator, &b_temp, &g);
+    defer solved.deinit(allocator);
+    solved.apply(exprs_list.items);
+    try materializeInferredConstructorTypes(
+        allocator,
+        &types_list,
+        exprs_list.items,
+        solved.instantiations,
+    );
+    b_temp.types = types_list.items;
+    _ = resolve_methods.resolveMethods(&g, &b_temp);
+    instantiation_table = try monomorphize.collectInstantiations(allocator, &g, &b_temp);
+    // Inference records are keyed by source expression. Copy their
+    // concrete argument slices into the long-lived table before `solved`
+    // releases its map and arena-owned temporary buffers.
+    try instantiation_table.mergeInferred(allocator, solved.instantiations);
 
     const final_bodies: bodies.Bodies = .{
         .exprs = try exprs_list.toOwnedSlice(allocator),

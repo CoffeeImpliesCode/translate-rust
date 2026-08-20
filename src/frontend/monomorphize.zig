@@ -833,3 +833,30 @@ test "collectInstantiations — discovers generics from fn body exprs & types" {
     try testing.expectEqual(@as(spine.EntityId, 5), inst.generic_id);
     try testing.expectEqualStrings("_i32", inst.zig_suffix);
 }
+
+test "collectInstantiations — propagates allocator failure" {
+    const generic_ret = genericOf(5, &.{primType(.i32)});
+    const body: bodies.BodyKind = .{ .fn_ = .{
+        .params = &.{},
+        .ret = generic_ret,
+        .body = 0,
+    } };
+    const bb: bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{body},
+    };
+
+    var g = graph.CrateGraph.init(testing.allocator);
+    defer g.deinit();
+
+    var failing_allocator = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    try testing.expectError(
+        error.OutOfMemory,
+        collectInstantiations(failing_allocator.allocator(), &g, &bb),
+    );
+}

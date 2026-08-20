@@ -785,6 +785,7 @@ fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?
 /// caller's temporary storage is freed.
 fn addInstantiation(ctx: *Ctx, node: exprs.NodeId, inst: types.Instantiation) std.mem.Allocator.Error!void {
     const owned = try ctx.alloc.dupe(types.Type, inst.args.params);
+    errdefer ctx.alloc.free(owned);
     const gop = try ctx.g.instantiations.getOrPut(ctx.alloc, node);
     if (gop.found_existing) {
         // Supersede the prior record's args without leaking it.
@@ -818,11 +819,14 @@ fn cloneInstantiationMap(
     var it = source.iterator();
     while (it.next()) |entry| {
         const owned = try alloc.dupe(types.Type, entry.value_ptr.args.params);
-        try out.put(alloc, entry.key_ptr.*, .{
+        out.put(alloc, entry.key_ptr.*, .{
             .generic_id = entry.value_ptr.generic_id,
             .args = .{ .params = owned },
             .zig_suffix = entry.value_ptr.zig_suffix,
-        });
+        }) catch |err| {
+            alloc.free(owned);
+            return err;
+        };
     }
     return out;
 }
@@ -1005,12 +1009,15 @@ fn explicitArgsMatchSignature(
     ctx: *Ctx,
     def: exprs.DefId,
     args: []const types.Type,
-) bool {
+) std.mem.Allocator.Error!bool {
     if (def >= ctx.b.bodies.len) return true;
     switch (ctx.b.bodies[def]) {
         .none => return true,
         .fn_, .struct_, .const_, .type_alias => {
-            const names = getGenericParamNames(ctx, def) catch return false;
+            const names = getGenericParamNames(ctx, def) catch |err| switch (err) {
+                error.Unsupported => return false,
+                else => |allocator_error| return allocator_error,
+            };
             defer ctx.alloc.free(names);
             return names.len == args.len;
         },
@@ -1078,7 +1085,10 @@ fn instantiateGenericDef(
     fields: []const exprs.FieldInit,
 ) std.mem.Allocator.Error!void {
     if (def >= ctx.b.bodies.len) return;
-    const caller_names = getGenericParamNames(ctx, def) catch return;
+    const caller_names = getGenericParamNames(ctx, def) catch |err| switch (err) {
+        error.Unsupported => return,
+        else => |allocator_error| return allocator_error,
+    };
     defer ctx.alloc.free(caller_names);
 
     var ret_ty: ?types.Type = null;
@@ -1101,7 +1111,7 @@ fn instantiateGenericDef(
     }
     const param_names = caller_names;
 
-    const inferred_args = ctx.alloc.alloc(?types.Type, param_names.len) catch return;
+    const inferred_args = try ctx.alloc.alloc(?types.Type, param_names.len);
     defer ctx.alloc.free(inferred_args);
     for (inferred_args) |*slot| slot.* = null;
 
@@ -1179,7 +1189,7 @@ fn instantiateGenericDef(
         if (slot == null) return;
     }
 
-    const concrete_args = ctx.alloc.alloc(types.Type, param_names.len) catch return;
+    const concrete_args = try ctx.alloc.alloc(types.Type, param_names.len);
     defer ctx.alloc.free(concrete_args);
     for (inferred_args, 0..) |slot, i| concrete_args[i] = slot.?;
 
@@ -1431,7 +1441,7 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .path => |p| {
             try walkPath(ctx, node, p);
             if (p.generic_args.len > 0 and
-                explicitArgsMatchSignature(ctx, p.def, p.generic_args))
+                try explicitArgsMatchSignature(ctx, p.def, p.generic_args))
             {
                 try addInstantiation(ctx, node, .{
                     .generic_id = p.def,
@@ -1768,9 +1778,11 @@ pub fn solveWithGen(
     const num_exprs = b.exprs.len;
     if (num_exprs == 0) {
         // Zero exprs: still hand over any recorded instantiations (rare no-body case).
+        const result_types = try alloc.alloc(?exprs.TypeId, 0);
+        errdefer alloc.free(result_types);
         return .{
-            .types = try alloc.alloc(?exprs.TypeId, 0),
-            .instantiations = cloneInstantiationMap(alloc, g.instantiations) catch .empty,
+            .types = result_types,
+            .instantiations = try cloneInstantiationMap(alloc, g.instantiations),
         };
     }
 
@@ -1866,6 +1878,7 @@ pub fn solveWithGen(
 
     // Assemble Inferred result array.
     const result_types = try alloc.alloc(?exprs.TypeId, num_exprs);
+    errdefer alloc.free(result_types);
     for (0..num_exprs) |i| {
         const root = findRoot(parent, @intCast(i));
         result_types[i] = concrete[root];
@@ -1873,7 +1886,7 @@ pub fn solveWithGen(
 
     return .{
         .types = result_types,
-        .instantiations = cloneInstantiationMap(alloc, g.instantiations) catch .empty,
+        .instantiations = try cloneInstantiationMap(alloc, g.instantiations),
     };
 }
 
@@ -2026,6 +2039,78 @@ test "generic fn call unifies argument type and records instantiation" {
 
     // Call node pinned to the substituted return type u32 (TypeId 0).
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(2));
+}
+
+fn checkSolveWithGraphAllocationFailures(
+    alloc: std.mem.Allocator,
+    b: *const bodies.Bodies,
+) !void {
+    var inferred = try solveWithGraph(alloc, b, null);
+    defer inferred.deinit(alloc);
+    try std.testing.expect(inferred.getInstantiation(2) != null);
+}
+
+test "solveWithGraph propagates allocation failures" {
+    const a = std.testing.allocator;
+
+    const types_store = try a.alloc(types.Type, 1);
+    defer a.free(types_store);
+    types_store[0] = .{ .prim = .u32 };
+
+    const param = try testPrimPath(a, "T");
+    defer a.free(param.path.segments);
+    const id_fn_params = try a.alloc(items.Param, 1);
+    defer a.free(id_fn_params);
+    id_fn_params[0] = .{ .name = "x", .ty = param, .span = test_span };
+
+    const exprs_store = try a.alloc(exprs.Expr, 3);
+    defer a.free(exprs_store);
+    const stmt_ids = try a.alloc(exprs.NodeId, 1);
+    defer a.free(stmt_ids);
+    stmt_ids[0] = 0;
+    exprs_store[0] = .{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = stmt_ids, .tail = null, .labelled = null } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{ .text = "5u32", .value = 5, .base = .dec, .ty_suffix = "u32" } } },
+    };
+    exprs_store[2] = .{
+        .id = 2,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .call = .{ .call_kind = .{ .free = 1 }, .args = &.{1} } },
+    };
+
+    const stmts_store = try a.alloc(exprs.Statement, 1);
+    defer a.free(stmts_store);
+    stmts_store[0] = .{ .id = 0, .span = test_span, .ty = null, .kind = .{ .expr = 2 } };
+
+    const bodies_store = try a.alloc(bodies.BodyKind, 2);
+    defer a.free(bodies_store);
+    const caller_params = try a.dupe(items.Param, &.{});
+    defer a.free(caller_params);
+    bodies_store[0] = .{ .fn_ = .{ .params = caller_params, .ret = .{ .prim = .u32 }, .body = 0 } };
+    bodies_store[1] = .{ .fn_ = .{ .params = id_fn_params, .ret = param, .body = 0 } };
+
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = stmts_store,
+        .pats = &.{},
+        .types = types_store,
+        .bodies = bodies_store,
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        a,
+        checkSolveWithGraphAllocationFailures,
+        .{&b},
+    );
 }
 
 test "generic struct literal records instantiation" {
