@@ -1,6 +1,6 @@
-//! translate_rust.backend.zig.lower — Lowering engine from RustIR to ZigAST.
+//! translate_rust.backend.zig.lower — Lowering engine from RustIr to ZigAST.
 //!
-//! Transforms target-agnostic semantic IR (RustIR) into a structured Zig package AST
+//! Transforms target-agnostic semantic IR (RustIr) into a structured Zig package AST
 //! (ast.Package). Handles module-to-file mapping, item translation, method hoisting
 //! (injecting inherent and trait impl methods into struct/enum bodies), type mapping
 //! via pluggable LoweringStrategy, and full expression/statement/pattern lowering.
@@ -11,14 +11,15 @@ const ast = @import("ast.zig");
 const strategy = @import("../strategy.zig");
 const default_strat = @import("strategies/default.zig");
 
-/// Lower a complete Rust semantic model (RustIR) into a target-language Zig package.
-pub fn lowerRustIR(
+/// Lower a complete Rust semantic model (RustIr) into a target-language Zig package.
+pub fn lowerRustIr(
     allocator: std.mem.Allocator,
-    rust_ir: *const ir.RustIR,
+    rust_ir: *const ir.RustIr,
     custom_strat: ?*const strategy.LoweringStrategy,
 ) !ast.Package {
     var lowerer = Lowerer.init(allocator, rust_ir, custom_strat);
-    return try lowerer.lowerPackage();
+    const package = try lowerer.lowerPackage();
+    return package;
 }
 
 const MethodTypeContext = struct {
@@ -28,7 +29,7 @@ const MethodTypeContext = struct {
 
 const Lowerer = struct {
     alloc: std.mem.Allocator,
-    ir: *const ir.RustIR,
+    ir: *const ir.RustIr,
     strat: strategy.LoweringStrategy,
     def_strat_inst: default_strat.DefaultStrategy = .{},
     current_module_id: ?ir.spine.EntityId = null,
@@ -43,10 +44,10 @@ const Lowerer = struct {
 
     fn init(
         allocator: std.mem.Allocator,
-        rust_ir: *const ir.RustIR,
+        rust_ir: *const ir.RustIr,
         custom_strat: ?*const strategy.LoweringStrategy,
     ) Lowerer {
-        var lowerer = Lowerer{
+        var lowerer: Lowerer = .{
             .alloc = allocator,
             .ir = rust_ir,
             .strat = undefined,
@@ -98,7 +99,7 @@ const Lowerer = struct {
 
         const pkg_name = try self.alloc.dupe(u8, self.ir.crate_name);
 
-        return ast.Package{
+        return .{
             .name = pkg_name,
             .version = "0.0.0",
             .fingerprint = null,
@@ -142,8 +143,8 @@ const Lowerer = struct {
                     // second impl block is not appended twice.
                     if (self.isHoistedMethodRegistered(tid, ent.name)) continue;
                     const fn_decl = try self.lowerFnEntity(entity_id, ent);
-                    const decl = ast.Decl{ .fn_decl = fn_decl };
-                    var list = self.hoisted_by_id.get(tid) orelse std.ArrayListUnmanaged(ast.Decl).empty;
+                    const decl: ast.Decl = .{ .fn_decl = fn_decl };
+                    var list: std.ArrayListUnmanaged(ast.Decl) = self.hoisted_by_id.get(tid) orelse .empty;
                     try list.append(self.alloc, decl);
                     try self.hoisted_by_id.put(self.alloc, tid, list);
                 }
@@ -190,9 +191,13 @@ const Lowerer = struct {
                 return;
             }
         }
+        const owned_local_name = try self.alloc.dupe(u8, local_name);
+        errdefer self.alloc.free(owned_local_name);
+        const owned_module_or_path = try self.alloc.dupe(u8, module_or_path);
+        errdefer self.alloc.free(owned_module_or_path);
         try imports.append(self.alloc, .{
-            .local_name = try self.alloc.dupe(u8, local_name),
-            .module_or_path = try self.alloc.dupe(u8, module_or_path),
+            .local_name = owned_local_name,
+            .module_or_path = owned_module_or_path,
             .is_pub = is_pub,
         });
     }
@@ -405,7 +410,7 @@ const Lowerer = struct {
         const target = try self.allocExpr(.{
             .ident = try self.alloc.dupe(u8, target_name),
         });
-        return ast.Expr{ .field_access = .{
+        return .{ .field_access = .{
             .target = target,
             .field_name = try self.alloc.dupe(u8, name),
         } };
@@ -413,11 +418,13 @@ const Lowerer = struct {
     fn lowerPathExpr(self: *Lowerer, path: ir.exprs.PathExpr) !ast.Expr {
         const resolved = try self.lowerResolvedEntity(path.def);
         if (path.generic_args.len == 0) return resolved;
-
-        return ast.Expr{
+        const callee = try self.allocExpr(resolved);
+        errdefer self.alloc.destroy(callee);
+        const generic_args = try self.lowerGenericArgs(path.def, path.generic_args);
+        return .{
             .call = .{
-                .callee = try self.allocExpr(resolved),
-                .generic_args = try self.lowerGenericArgs(path.def, path.generic_args),
+                .callee = callee,
+                .generic_args = generic_args,
                 .args = &.{},
             },
         };
@@ -434,16 +441,16 @@ const Lowerer = struct {
             return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
         };
         if (self.current_module_id == null or self.current_module_id.? == owner) {
-            return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
+            return .{ .ident = try self.alloc.dupe(u8, name) };
         }
         const module = self.moduleForEntity(owner) orelse {
             return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
         };
         if (module.name.len == 0) {
-            return ast.Expr{ .ident = try self.alloc.dupe(u8, name) };
+            return .{ .ident = try self.alloc.dupe(u8, name) };
         }
         const target = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, module.name) });
-        return ast.Expr{ .field_access = .{
+        return .{ .field_access = .{
             .target = target,
             .field_name = try self.alloc.dupe(u8, name),
         } };
@@ -534,7 +541,7 @@ const Lowerer = struct {
         const tests = try tests_list.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(tests);
 
-        return ast.File{
+        return .{
             .path = file_path,
             .imports = imports,
             .decls = decls,
@@ -586,7 +593,7 @@ const Lowerer = struct {
         const tests = try tests_list.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(tests);
 
-        return ast.File{
+        return .{
             .path = "src/root.zig",
             .imports = imports,
             .decls = decls,
@@ -1047,7 +1054,7 @@ const Lowerer = struct {
             else => {},
         }
 
-        return ast.FnDecl{
+        return .{
             .name = try self.alloc.dupe(u8, ent.name),
             .is_pub = is_pub,
             .params = try params_list.toOwnedSlice(self.alloc),
@@ -1336,7 +1343,7 @@ const Lowerer = struct {
             }
         }
 
-        return ast.FnDecl{
+        return .{
             .name = try self.alloc.dupe(u8, m.name),
             .is_pub = switch (m.visibility) {
                 .public => true,
@@ -1445,7 +1452,7 @@ const Lowerer = struct {
             else => return null,
         }
 
-        return ast.TestDecl{
+        return .{
             .name = try self.alloc.dupe(u8, ent.name),
             .body = test_block,
         };
@@ -1474,6 +1481,14 @@ const Lowerer = struct {
         return true;
     }
 
+    fn lastPathSegment(segments: []const ir.types.PathSegment) ?ir.types.PathSegment {
+        var last: ?ir.types.PathSegment = null;
+        for (segments) |segment| {
+            last = segment;
+        }
+        return last;
+    }
+
     fn genericPathParam(segments: []const ir.types.PathSegment) ?[]const u8 {
         if (segments.len < 2) return null;
         const first = segments[0];
@@ -1486,17 +1501,18 @@ const Lowerer = struct {
         return switch (ty) {
             .path => |p| blk: {
                 if (!validPathSegments(p.segments)) break :blk false;
-                const last = p.segments[p.segments.len - 1].name;
-                break :blk validPathName(last) and std.mem.eql(u8, last, "Self");
+                const last = lastPathSegment(p.segments) orelse break :blk false;
+                break :blk validPathName(last.name) and std.mem.eql(u8, last.name, "Self");
             },
             else => false,
         };
     }
 
     fn pathTypeEquals(a: ir.types.Path, b: ir.types.Path) bool {
-        if (a.segments.len == 0 or b.segments.len == 0) return a.segments.len == b.segments.len;
-        const a_last = a.segments[a.segments.len - 1];
-        const b_last = b.segments[b.segments.len - 1];
+        const a_last = lastPathSegment(a.segments) orelse {
+            return b.segments.len == 0;
+        };
+        const b_last = lastPathSegment(b.segments) orelse return false;
         return std.mem.eql(u8, a_last.name, b_last.name);
     }
 
@@ -1912,7 +1928,7 @@ const Lowerer = struct {
             };
         }
 
-        return ast.Expr{
+        return .{
             .struct_init = .{
                 .type_name = type_name,
                 .fields = fields,
@@ -1993,7 +2009,8 @@ const Lowerer = struct {
                 if (genericPathParam(p.segments)) |generic_name| {
                     break :blk ast.Type{ .named = try self.alloc.dupe(u8, generic_name) };
                 }
-                const last_segment = p.segments[p.segments.len - 1];
+                const last_segment = lastPathSegment(p.segments) orelse
+                    break :blk ast.Type{ .named = "unknown" };
                 if (!validPathName(last_segment.name)) {
                     if (last_segment.id) |id| {
                         if (self.ir.graph.symbol_table.get(id)) |ent| {
@@ -2099,7 +2116,8 @@ const Lowerer = struct {
             var args = try self.alloc.alloc(ast.Expr, 2);
             args[0] = receiver.*;
             args[1] = open.*;
-            return try self.allocExpr(ast.Expr{ .builtin = .{ .name = "index", .args = args } });
+            const result = try self.allocExpr(ast.Expr{ .builtin = .{ .name = "index", .args = args } });
+            return result;
         }
         return receiver;
     }
@@ -2209,7 +2227,8 @@ const Lowerer = struct {
 
     fn lowerUnsupportedStdMethod(self: *Lowerer, method_name: []const u8) !*const ast.Expr {
         const reason = try std.fmt.allocPrint(self.alloc, "unsupported std method: {s}", .{method_name});
-        return try self.allocExpr(.{ .unsupported = reason });
+        const result = try self.allocExpr(.{ .unsupported = reason });
+        return result;
     }
 
     /// Lower a prelude method call to native Zig or an explicit unsupported
@@ -2228,7 +2247,8 @@ const Lowerer = struct {
             std.mem.eql(u8, method_name, "borrow") or
             std.mem.eql(u8, method_name, "as_slice"))
         {
-            return try self.lowerAsRef(receiver_node, receiver);
+            const result = try self.lowerAsRef(receiver_node, receiver);
+            return result;
         }
         if (std.mem.eql(u8, method_name, "clone") or
             std.mem.eql(u8, method_name, "to_vec"))
@@ -2237,12 +2257,13 @@ const Lowerer = struct {
             return receiver;
         }
         if (std.mem.eql(u8, method_name, "len")) {
-            return try self.allocExpr(ast.Expr{
+            const result = try self.allocExpr(ast.Expr{
                 .field_access = .{
                     .target = receiver,
                     .field_name = try self.alloc.dupe(u8, "len"),
                 },
             });
+            return result;
         }
         if (std.mem.eql(u8, method_name, "is_empty")) {
             if (args.len != 0) return null;
@@ -2253,9 +2274,10 @@ const Lowerer = struct {
                 },
             });
             const zero = try self.allocExpr(ast.Expr{ .lit = .{ .int = 0 } });
-            return try self.allocExpr(ast.Expr{
+            const result = try self.allocExpr(ast.Expr{
                 .bin_op = .{ .op = .equal, .lhs = len, .rhs = zero },
             });
+            return result;
         }
         if (recognized_std_method) |std_method| {
             switch (std_method) {
@@ -2317,22 +2339,26 @@ const Lowerer = struct {
             if (args.len < 1) return null;
             const lhs = receiver;
             const rhs = try self.allocExpr(args[0]);
-            return try self.allocExpr(ast.Expr{
+            const result = try self.allocExpr(ast.Expr{
                 .bin_op = .{ .op = bk, .lhs = lhs, .rhs = rhs },
             });
+            return result;
         }
         if (std.mem.eql(u8, method_name, "neg")) {
-            return try self.allocExpr(ast.Expr{
+            const result = try self.allocExpr(ast.Expr{
                 .unary_op = .{ .op = .negate, .operand = receiver },
             });
+            return result;
         }
         if (std.mem.eql(u8, method_name, "not")) {
-            return try self.allocExpr(ast.Expr{
+            const result = try self.allocExpr(ast.Expr{
                 .unary_op = .{ .op = .bit_not, .operand = receiver },
             });
+            return result;
         }
         if (recognized_std_method != null) {
-            return try self.lowerUnsupportedStdMethod(method_name);
+            const result = try self.lowerUnsupportedStdMethod(method_name);
+            return result;
         }
         return null;
     }
@@ -2362,7 +2388,7 @@ const Lowerer = struct {
 
         var args = try self.alloc.alloc(ast.Expr, 1);
         args[0] = condition;
-        return ast.Expr{
+        return .{
             .call = .{
                 .callee = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, "std.debug.assert") }),
                 .args = args,
@@ -2379,7 +2405,7 @@ const Lowerer = struct {
 
     pub fn lowerExpr(self: *Lowerer, expr_id: ir.exprs.NodeId) anyerror!ast.Expr {
         if (expr_id >= self.ir.bodies.exprs.len) {
-            return ast.Expr{ .ident = "undefined" };
+            return .{ .ident = "undefined" };
         }
 
         const ir_expr = self.ir.bodies.exprs[expr_id];
@@ -2867,7 +2893,7 @@ const Lowerer = struct {
     pub fn lowerStmt(self: *Lowerer, stmt_id: ir.exprs.NodeId) anyerror!ast.Stmt {
         if (stmt_id >= self.ir.bodies.stmts.len) {
             const null_expr = try self.allocExpr(ast.Expr{ .lit = .undefined_lit });
-            return ast.Stmt{ .expr_stmt = null_expr };
+            return .{ .expr_stmt = null_expr };
         }
 
         const ir_stmt = self.ir.bodies.stmts[stmt_id];
@@ -3245,7 +3271,7 @@ const Lowerer = struct {
 
         const label = if (be.labelled) |l| try self.alloc.dupe(u8, l) else null;
 
-        return ast.Block{
+        return .{
             .label = label,
             .stmts = stmts,
             .expr = tail_expr,

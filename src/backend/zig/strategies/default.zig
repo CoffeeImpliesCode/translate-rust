@@ -5,11 +5,12 @@
 //! mapping (`HashMap` → `std.AutoHashMap`, `Vec` → `std.ArrayListUnmanaged`, ...).
 //! Generics lower via comptime duck typing (bounds erased at emit).
 //!
-//! The strategy is stateless: boxed types owned by a returned `ast.Type`
-//! (`.opt`, `.err_union`, `.ptr`/`.slice` element, `.array`) come from a
-//! thread-local cell pool. A pointer returned by one lowering call stays valid
-//! until the next lowering call on the same thread — sufficient for the
-//! single-call lowering pattern the engine uses.
+//! Boxed types owned by a returned `ast.Type` (`.opt`, `.err_union`,
+//! `.ptr`/`.slice` element, `.array`) come from a thread-local cell pool. Tuple
+//! element slices use fixed backing storage owned by the `DefaultStrategy`
+//! instance passed through the opaque context. A pointer returned by one
+//! lowering call stays valid until the next lowering call on the same owner —
+//! sufficient for the single-call lowering pattern the engine uses.
 
 const ir = @import("translate_rust.ir");
 const ast = @import("../ast.zig");
@@ -20,34 +21,39 @@ const BoxCells = struct {
 };
 threadlocal var box_cells: BoxCells = .{};
 
-/// The default lowering strategy. Stateless: every method is a pure function
-/// of its inputs, so the opaque context pointer is unused.
+/// The default lowering strategy. The caller owns each strategy instance and
+/// passes its address through the opaque context for tuple lowering.
 pub const DefaultStrategy = struct {
+    tuple_cells: [32][16]ast.Type = undefined,
+    next_tuple_cell: usize = 0,
     pub fn lowerType(ctx: *anyopaque, ty: ir.types.Type) anyerror!ast.Type {
         return switch (ty) {
             .prim => |p| ast.Type{ .prim = primToAst(p) },
             .path => |p| lowerPath(p),
-            .reference => |r| makePtr(!r.mut, .one, try lowerTypeImpl(r.pointee)),
-            .raw_ptr => |r| makePtr(!r.mut, .many, try lowerTypeImpl(r.pointee)),
-            .slice => |s| makeSlice(s.const_, try lowerTypeImpl(s.elem)),
+            .reference => |r| makePtr(!r.mut, .one, try lowerTypeImpl(ctx, r.pointee)),
+            .raw_ptr => |r| makePtr(!r.mut, .many, try lowerTypeImpl(ctx, r.pointee)),
+            .slice => |s| makeSlice(s.const_, try lowerTypeImpl(ctx, s.elem)),
             .array => |a| ast.Type{
                 .array = ast.Array{
-                    .elem = box(try lowerTypeImpl(a.elem)),
+                    .elem = box(try lowerTypeImpl(ctx, a.elem)),
                     .len = switch (a.len) {
                         .literal => |n| n,
                         .generic => 0,
                     },
                 },
             },
-            .tuple => |elems| ast.Type{ .tuple = try lowerTuple(elems) },
+            .tuple => |elems| blk: {
+                const self: *DefaultStrategy = @ptrCast(@alignCast(ctx));
+                break :blk ast.Type{ .tuple = try lowerTuple(self, ctx, elems) };
+            },
             .fn_ptr => ast.Type{ .named = "fnptr" },
             .generic_inst => |gi| blk: {
                 const maybe = try lowerStdGeneric(ctx, "", gi.args.params);
                 break :blk maybe orelse ast.Type.any_opaque;
             },
-            .option => |inner| ast.Type{ .opt = box(try lowerTypeImpl(inner.*)) },
-            .result => |r| resultToAst(r.*),
-            .boxed => |inner| ast.Type{ .opt = box(try lowerTypeImpl(inner.*)) },
+            .option => |inner| ast.Type{ .opt = box(try lowerTypeImpl(ctx, inner.*)) },
+            .result => |r| resultToAst(ctx, r.*),
+            .boxed => |inner| ast.Type{ .opt = box(try lowerTypeImpl(ctx, inner.*)) },
             .unsupported => ast.Type.any_opaque,
         };
     }
@@ -60,22 +66,22 @@ pub const DefaultStrategy = struct {
         _ = ctx;
         _ = params;
         if (std.mem.eql(u8, name, "Vec") or std.mem.eql(u8, name, "String")) {
-            return ast.Type{ .named = "std.ArrayListUnmanaged" };
+            return .{ .named = "std.ArrayListUnmanaged" };
         }
         if (std.mem.eql(u8, name, "BuildHasherDefault")) {
-            return ast.Type{ .named = "std.hash.BuildHasherDefault" };
+            return .{ .named = "std.hash.BuildHasherDefault" };
         }
         if (std.mem.eql(u8, name, "HashMap") or
             std.mem.eql(u8, name, "HashSet") or
             std.mem.eql(u8, name, "BTreeMap"))
         {
-            return ast.Type{ .named = "std.AutoHashMap" };
+            return .{ .named = "std.AutoHashMap" };
         }
         return null;
     }
 
-    fn lowerTypeImpl(ty: ir.types.Type) anyerror!ast.Type {
-        return DefaultStrategy.lowerType(undefined, ty);
+    fn lowerTypeImpl(ctx: *anyopaque, ty: ir.types.Type) anyerror!ast.Type {
+        return DefaultStrategy.lowerType(ctx, ty);
     }
 
     fn box(ty: ast.Type) *const ast.Type {
@@ -86,7 +92,7 @@ pub const DefaultStrategy = struct {
     }
 
     fn makePtr(is_const: bool, size: ast.PtrSize, elem: ast.Type) ast.Type {
-        return ast.Type{ .ptr = .{
+        return .{ .ptr = .{
             .elem = box(elem),
             .is_const = is_const,
             .size = size,
@@ -94,29 +100,35 @@ pub const DefaultStrategy = struct {
     }
 
     fn makeSlice(is_const: bool, elem: ast.Type) ast.Type {
-        return ast.Type{ .slice = .{
+        return .{ .slice = .{
             .elem = box(elem),
             .is_const = is_const,
         } };
     }
 
-    fn lowerTuple(elems: []const ir.types.Type) anyerror![]const ast.Type {
-        var buf: [16]ast.Type = undefined;
-        const n = @min(elems.len, buf.len);
+    fn lowerTuple(
+        self: *DefaultStrategy,
+        ctx: *anyopaque,
+        elems: []const ir.types.Type,
+    ) anyerror![]const ast.Type {
+        const cell_index = self.next_tuple_cell % self.tuple_cells.len;
+        self.next_tuple_cell += 1;
+        const cell = &self.tuple_cells[cell_index];
+        const n = @min(elems.len, cell.len);
         for (elems[0..n], 0..) |e, i| {
-            buf[i] = try lowerTypeImpl(e);
+            cell[i] = try lowerTypeImpl(ctx, e);
         }
-        return buf[0..n];
+        return cell[0..n];
     }
 
-    fn resultToAst(r: ir.types.Result) anyerror!ast.Type {
+    fn resultToAst(ctx: *anyopaque, r: ir.types.Result) anyerror!ast.Type {
         const err_unionable = switch (r.err) {
             .prim => |p| p == .unit,
             else => false,
         };
         if (err_unionable) {
-            return ast.Type{ .err_union = .{
-                .payload = box(try lowerTypeImpl(r.ok)),
+            return .{ .err_union = .{
+                .payload = box(try lowerTypeImpl(ctx, r.ok)),
             } };
         }
         return ast.Type.any_opaque;
@@ -124,7 +136,7 @@ pub const DefaultStrategy = struct {
 
     fn lowerPath(p: ir.types.Path) anyerror!ast.Type {
         if (p.segments.len == 0) return error.EmptyPath;
-        return ast.Type{ .named = p.segments[p.segments.len - 1].name };
+        return .{ .named = p.segments[p.segments.len - 1].name };
     }
 
     fn primToAst(p: ir.types.Prim) ast.Prim {
@@ -185,6 +197,51 @@ test "default: lower primitives, slices, options, results" {
         } },
     });
     try std.testing.expectEqualStrings("Result", named_ty.named);
+}
+
+test "default: lower short and long tuples into caller storage" {
+    var strategy: DefaultStrategy = .{};
+
+    const short = try DefaultStrategy.lowerType(&strategy, ir.types.Type{
+        .tuple = &.{
+            .{ .prim = .u8 },
+            .{ .prim = .i16 },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 2), short.tuple.len);
+    try std.testing.expectEqual(ast.Prim.u8, short.tuple[0].prim);
+    try std.testing.expectEqual(ast.Prim.i16, short.tuple[1].prim);
+
+    const long_elements = [_]ir.types.Type{
+        .{ .prim = .u8 },
+        .{ .prim = .u16 },
+        .{ .prim = .u32 },
+        .{ .prim = .u64 },
+        .{ .prim = .i8 },
+        .{ .prim = .i16 },
+        .{ .prim = .i32 },
+        .{ .prim = .i64 },
+        .{ .prim = .f32 },
+        .{ .prim = .f64 },
+        .{ .prim = .bool },
+        .{ .prim = .char },
+        .{ .prim = .isize },
+        .{ .prim = .usize },
+        .{ .prim = .unit },
+        .{ .prim = .never },
+    };
+    const long = try DefaultStrategy.lowerType(
+        &strategy,
+        ir.types.Type{ .tuple = &long_elements },
+    );
+    const expected = [_]ast.Prim{
+        .u8,  .u16, .u32,  .u64, .i8,    .i16,   .i32,       .i64,
+        .f32, .f64, .bool, .u21, .isize, .usize, .void_type, .noreturn_type,
+    };
+    try std.testing.expectEqual(@as(usize, expected.len), long.tuple.len);
+    for (expected, 0..) |expected_prim, index| {
+        try std.testing.expectEqual(expected_prim, long.tuple[index].prim);
+    }
 }
 
 test "default: standard generic mapping" {

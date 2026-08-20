@@ -3,7 +3,7 @@
 //! For each standard fixture crate (`mini`, `fnv`, `hex`), runs the full
 //! pipeline and snapshots the intermediate and final representations:
 //!
-//!   1. `frontend.analyzeCrate`   → `ir.RustIR`
+//!   1. `frontend.analyzeCrate`   → `ir.RustIr`
 //!   2. `ir.serialize.encode`     → `test/golden/rust_ir/<name>.rustir.json`
 //!   3. `backend.Lowering`        → `ast.Package`
 //!   4. `backend.serialize.encode`→ `test/golden/zig_ast/<name>.zigast.json`
@@ -66,14 +66,14 @@ fn runGoldenFixture(
     const rust_ir_path = try std.fmt.allocPrint(allocator, "test/golden/rust_ir/{s}.rustir.json", .{fixture_name});
     const zig_ast_path = try std.fmt.allocPrint(allocator, "test/golden/zig_ast/{s}.zigast.json", .{fixture_name});
 
-    // 1. Frontend analysis → RustIR.
+    // 1. Frontend analysis → RustIr.
     const rust_ir = try frontend.analyzeCrate(allocator, test_io, crate_dir);
 
-    // 2. Encode RustIR to JSON and snapshot. The frontend returns the IR
-    // module's canonical `root.RustIR`; `ir.serialize` keeps a
+    // 2. Encode RustIr to JSON and snapshot. The frontend returns the IR
+    // module's canonical `root.RustIr`; `ir.serialize` keeps a
     // self-contained copy of the struct for wire round-tripping, with
     // identical field types — convert surgically.
-    const wire_ir: ir.serialize.RustIR = .{
+    const wire_ir: ir.serialize.RustIr = .{
         .crate_name = rust_ir.crate_name,
         .edition = rust_ir.edition,
         .graph = rust_ir.graph,
@@ -84,8 +84,8 @@ fn runGoldenFixture(
     defer allocator.free(rust_ir_json);
     try checkGolden(allocator, test_io, rust_ir_path, rust_ir_json);
 
-    // 3. Lower RustIR → ast.Package via the default strategy.
-    const pkg = try backend.zig.lower.lowerRustIR(allocator, &rust_ir, null);
+    // 3. Lower RustIr → ast.Package via the default strategy.
+    const pkg = try backend.zig.lower.lowerRustIr(allocator, &rust_ir, null);
 
     // 4. Encode the package AST to JSON and snapshot.
     const zig_ast_json = try backend.zig.serialize.encode(allocator, &pkg);
@@ -174,7 +174,7 @@ test "source pipeline preserves generic instantiations through Zig emission" {
     try std.testing.expect(saw_u32);
     try std.testing.expect(saw_u8_slice);
 
-    const pkg = try backend.zig.lower.lowerRustIR(allocator, &rust_ir, null);
+    const pkg = try backend.zig.lower.lowerRustIr(allocator, &rust_ir, null);
     var emitted_root: ?[]const u8 = null;
     for (pkg.files) |*file| {
         if (!std.mem.eql(u8, file.path, "src/root.zig")) continue;

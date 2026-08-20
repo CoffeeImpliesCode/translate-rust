@@ -307,15 +307,28 @@ fn inherentImplTypeName(g: *const graph.CrateGraph, target: spine.EntityId) ?[]c
     return type_name;
 }
 
+const local_initializer_depth_max: usize = 128;
+
 const LocalInitializerFinder = struct {
     b: *const bodies.Bodies,
     target_name: []const u8,
     target_ordinal: usize,
     binding_ordinal: usize,
     result: ?exprs.NodeId = null,
+    depth_exceeded: bool = false,
 
-    fn visitPattern(self: *LocalInitializerFinder, pattern_id: exprs.NodeId, init: ?exprs.NodeId) void {
-        if (self.result != null or pattern_id >= self.b.pats.len) return;
+    fn visitPattern(
+        self: *LocalInitializerFinder,
+        pattern_id: exprs.NodeId,
+        init: ?exprs.NodeId,
+        depth: usize,
+    ) void {
+        if (self.result != null or self.depth_exceeded or pattern_id >= self.b.pats.len) return;
+        if (depth >= local_initializer_depth_max) {
+            self.depth_exceeded = true;
+            return;
+        }
+
         switch (self.b.pats[pattern_id].kind) {
             .binding => |binding| {
                 if (std.mem.eql(u8, binding.name, self.target_name)) {
@@ -326,14 +339,16 @@ const LocalInitializerFinder = struct {
                     self.binding_ordinal += 1;
                 }
             },
-            .tuple => |tuple| for (tuple.elements) |element| self.visitPattern(element, init),
+            .tuple => |tuple| for (tuple.elements) |element| {
+                self.visitPattern(element, init, depth + 1);
+            },
             .slice => |slice| {
-                for (slice.elements) |element| self.visitPattern(element, init);
-                if (slice.rest) |rest| self.visitPattern(rest, init);
+                for (slice.elements) |element| self.visitPattern(element, init, depth + 1);
+                if (slice.rest) |rest| self.visitPattern(rest, init, depth + 1);
             },
             .struct_pat => |struct_pat| for (struct_pat.fields) |field| {
                 if (field.pat) |field_pattern| {
-                    self.visitPattern(field_pattern, init);
+                    self.visitPattern(field_pattern, init, depth + 1);
                 } else if (field.shorthand) {
                     if (std.mem.eql(u8, field.field, self.target_name)) {
                         if (self.binding_ordinal == self.target_ordinal) {
@@ -344,112 +359,133 @@ const LocalInitializerFinder = struct {
                     }
                 }
             },
-            .reference => |reference| self.visitPattern(reference.inner, init),
+            .reference => |reference| self.visitPattern(reference.inner, init, depth + 1),
             .@"or" => |or_pattern| for (or_pattern.alternatives) |alternative| {
-                self.visitPattern(alternative, init);
+                self.visitPattern(alternative, init, depth + 1);
             },
             .unsupported => {},
             .wildcard, .literal, .path, .range => {},
         }
     }
 
-    fn visitBlock(self: *LocalInitializerFinder, block: exprs.BlockExpr) void {
-        if (self.result != null) return;
-        for (block.statements) |statement| self.visitStmt(statement);
-        if (block.tail) |tail| self.visitExpr(tail);
+    fn visitBlock(self: *LocalInitializerFinder, block: exprs.BlockExpr, depth: usize) void {
+        if (self.result != null or self.depth_exceeded) return;
+        if (depth >= local_initializer_depth_max) {
+            self.depth_exceeded = true;
+            return;
+        }
+        for (block.statements) |statement| self.visitStmt(statement, depth + 1);
+        if (block.tail) |tail| self.visitExpr(tail, depth + 1);
     }
 
-    fn visitStmt(self: *LocalInitializerFinder, statement_id: exprs.NodeId) void {
-        if (self.result != null or statement_id >= self.b.stmts.len) return;
+    fn visitStmt(
+        self: *LocalInitializerFinder,
+        statement_id: exprs.NodeId,
+        depth: usize,
+    ) void {
+        if (self.result != null or self.depth_exceeded or statement_id >= self.b.stmts.len) return;
+        if (depth >= local_initializer_depth_max) {
+            self.depth_exceeded = true;
+            return;
+        }
         switch (self.b.stmts[statement_id].kind) {
             .let => |let_stmt| {
-                if (let_stmt.init) |init| self.visitExpr(init);
-                self.visitPattern(let_stmt.pattern, let_stmt.init);
+                if (let_stmt.init) |init| self.visitExpr(init, depth + 1);
+                self.visitPattern(let_stmt.pattern, let_stmt.init, depth + 1);
             },
             .let_else => |let_else| {
-                self.visitExpr(let_else.init);
-                self.visitPattern(let_else.pattern, let_else.init);
-                self.visitBlock(let_else.else_block);
+                self.visitExpr(let_else.init, depth + 1);
+                self.visitPattern(let_else.pattern, let_else.init, depth + 1);
+                self.visitBlock(let_else.else_block, depth + 1);
             },
-            .expr => |expression| self.visitExpr(expression),
+            .expr => |expression| self.visitExpr(expression, depth + 1),
             .item => {},
         }
     }
 
-    fn visitElse(self: *LocalInitializerFinder, branch: exprs.ElseBranch) void {
+    fn visitElse(self: *LocalInitializerFinder, branch: exprs.ElseBranch, depth: usize) void {
+        if (self.result != null or self.depth_exceeded) return;
+        if (depth >= local_initializer_depth_max) {
+            self.depth_exceeded = true;
+            return;
+        }
         switch (branch) {
             .none => {},
-            .block => |block| self.visitBlock(block),
-            .chain => |node| self.visitExpr(node),
+            .block => |block| self.visitBlock(block, depth + 1),
+            .chain => |node| self.visitExpr(node, depth + 1),
         }
     }
 
-    fn visitExpr(self: *LocalInitializerFinder, node: exprs.NodeId) void {
-        if (self.result != null or node >= self.b.exprs.len) return;
+    fn visitExpr(self: *LocalInitializerFinder, node: exprs.NodeId, depth: usize) void {
+        if (self.result != null or self.depth_exceeded or node >= self.b.exprs.len) return;
+        if (depth >= local_initializer_depth_max) {
+            self.depth_exceeded = true;
+            return;
+        }
         switch (self.b.exprs[node].kind) {
-            .block => |block| self.visitBlock(block),
+            .block => |block| self.visitBlock(block, depth + 1),
             .if_else => |if_expr| {
-                self.visitExpr(if_expr.cond);
-                self.visitBlock(if_expr.then_);
-                self.visitElse(if_expr.@"else");
+                self.visitExpr(if_expr.cond, depth + 1);
+                self.visitBlock(if_expr.then_, depth + 1);
+                self.visitElse(if_expr.@"else", depth + 1);
             },
             .if_let => |if_let| {
-                self.visitExpr(if_let.scrutinee);
-                self.visitPattern(if_let.pattern, null);
-                self.visitBlock(if_let.then_);
-                self.visitElse(if_let.@"else");
+                self.visitExpr(if_let.scrutinee, depth + 1);
+                self.visitPattern(if_let.pattern, null, depth + 1);
+                self.visitBlock(if_let.then_, depth + 1);
+                self.visitElse(if_let.@"else", depth + 1);
             },
             .match => |match_expr| {
-                self.visitExpr(match_expr.scrutinee);
+                self.visitExpr(match_expr.scrutinee, depth + 1);
                 for (match_expr.arms) |arm| {
-                    for (arm.patterns) |pattern| self.visitPattern(pattern, null);
-                    if (arm.guard) |guard| self.visitExpr(guard);
-                    self.visitExpr(arm.body);
+                    for (arm.patterns) |pattern| self.visitPattern(pattern, null, depth + 1);
+                    if (arm.guard) |guard| self.visitExpr(guard, depth + 1);
+                    self.visitExpr(arm.body, depth + 1);
                 }
             },
-            .loop_ => |loop_expr| self.visitBlock(loop_expr.body),
+            .loop_ => |loop_expr| self.visitBlock(loop_expr.body, depth + 1),
             .while_ => |while_expr| {
-                self.visitExpr(while_expr.cond);
-                if (while_expr.capture) |capture| self.visitPattern(capture, null);
-                self.visitBlock(while_expr.body);
+                self.visitExpr(while_expr.cond, depth + 1);
+                if (while_expr.capture) |capture| self.visitPattern(capture, null, depth + 1);
+                self.visitBlock(while_expr.body, depth + 1);
             },
             .for_ => |for_expr| {
-                self.visitPattern(for_expr.pattern, null);
-                self.visitExpr(for_expr.iterable);
-                self.visitBlock(for_expr.body);
+                self.visitPattern(for_expr.pattern, null, depth + 1);
+                self.visitExpr(for_expr.iterable, depth + 1);
+                self.visitBlock(for_expr.body, depth + 1);
             },
-            .break_ => |break_expr| if (break_expr.value) |value| self.visitExpr(value),
-            .call => |call| for (call.args) |arg| self.visitExpr(arg),
+            .break_ => |break_expr| if (break_expr.value) |value| self.visitExpr(value, depth + 1),
+            .call => |call| for (call.args) |arg| self.visitExpr(arg, depth + 1),
             .method_call => |method| {
-                self.visitExpr(method.receiver);
-                for (method.args) |arg| self.visitExpr(arg);
+                self.visitExpr(method.receiver, depth + 1);
+                for (method.args) |arg| self.visitExpr(arg, depth + 1);
             },
             .struct_lit => |literal| {
-                for (literal.fields) |field| self.visitExpr(field.value);
-                if (literal.base) |base| self.visitExpr(base);
+                for (literal.fields) |field| self.visitExpr(field.value, depth + 1);
+                if (literal.base) |base| self.visitExpr(base, depth + 1);
             },
             .enum_variant => |variant| {
-                for (variant.tuple_fields) |field| self.visitExpr(field);
-                for (variant.named_fields) |field| self.visitExpr(field.value);
+                for (variant.tuple_fields) |field| self.visitExpr(field, depth + 1);
+                for (variant.named_fields) |field| self.visitExpr(field.value, depth + 1);
             },
-            .field => |field| self.visitExpr(field.base),
+            .field => |field| self.visitExpr(field.base, depth + 1),
             .index => |index| {
-                self.visitExpr(index.base);
-                self.visitExpr(index.index);
+                self.visitExpr(index.base, depth + 1);
+                self.visitExpr(index.index, depth + 1);
             },
             .binary => |binary| {
-                self.visitExpr(binary.lhs);
-                self.visitExpr(binary.rhs);
+                self.visitExpr(binary.lhs, depth + 1);
+                self.visitExpr(binary.rhs, depth + 1);
             },
-            .unary => |unary| self.visitExpr(unary.operand),
+            .unary => |unary| self.visitExpr(unary.operand, depth + 1),
             .assign => |assign| {
-                self.visitExpr(assign.target);
-                self.visitExpr(assign.value);
+                self.visitExpr(assign.target, depth + 1);
+                self.visitExpr(assign.value, depth + 1);
             },
-            .try_ => |try_expr| self.visitExpr(try_expr.inner),
-            .return_ => |return_expr| if (return_expr.value) |value| self.visitExpr(value),
-            .array => |array| for (array.elements) |element| self.visitExpr(element),
-            .vec_lit => |vec| for (vec.elements) |element| self.visitExpr(element),
+            .try_ => |try_expr| self.visitExpr(try_expr.inner, depth + 1),
+            .return_ => |return_expr| if (return_expr.value) |value| self.visitExpr(value, depth + 1),
+            .array => |array| for (array.elements) |element| self.visitExpr(element, depth + 1),
+            .vec_lit => |vec| for (vec.elements) |element| self.visitExpr(element, depth + 1),
             .literal, .unit, .path, .continue_, .closure, .iterator_chain, .unsupported => {},
         }
     }
@@ -488,8 +524,9 @@ fn findLocalInitializer(
         .target_ordinal = target_ordinal,
         .binding_ordinal = parameter_ordinal,
     };
-    finder.visitExpr(fn_body.body);
-    return finder.result orelse null;
+    finder.visitExpr(fn_body.body, 0);
+    if (finder.depth_exceeded) return null;
+    return finder.result;
 }
 
 fn initializerReturnType(
@@ -986,4 +1023,152 @@ test "resolveMethods pass updates method_call entity id and gathers stats" {
     try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);
     try std.testing.expectEqual(@as(usize, 1), stats.unsupported_methods);
     try std.testing.expectEqual(update_fn_id, b.exprs[1].kind.method_call.method);
+}
+
+fn nestedTuplePatternsForTest(
+    alloc: std.mem.Allocator,
+    nesting: usize,
+) ![]exprs.Pattern {
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+    const patterns = try alloc.alloc(exprs.Pattern, nesting + 1);
+    for (0..nesting) |index| {
+        const elements = try alloc.alloc(exprs.NodeId, 1);
+        elements[0] = @intCast(index + 1);
+        patterns[index] = .{
+            .id = @intCast(index),
+            .span = span,
+            .ty = null,
+            .kind = .{ .tuple = .{ .elements = elements, .rest = false } },
+        };
+    }
+    patterns[nesting] = .{
+        .id = @intCast(nesting),
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "target",
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } },
+    };
+    return patterns;
+}
+
+fn nestedIfExpressionsForTest(
+    alloc: std.mem.Allocator,
+    nesting: usize,
+) ![]exprs.Expr {
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+    const empty_block: exprs.BlockExpr = .{
+        .statements = &.{},
+        .tail = null,
+        .labelled = null,
+    };
+    const expressions = try alloc.alloc(exprs.Expr, nesting + 1);
+    for (0..nesting) |index| {
+        expressions[index] = .{
+            .id = @intCast(index),
+            .span = span,
+            .ty = null,
+            .kind = .{ .if_else = .{
+                .cond = @intCast(index + 1),
+                .then_ = empty_block,
+                .@"else" = .{ .none = {} },
+            } },
+        };
+    }
+    expressions[nesting] = .{
+        .id = @intCast(nesting),
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .boolean = false } },
+    };
+    return expressions;
+}
+
+test "LocalInitializerFinder bounds nested patterns and expressions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const accepted_nesting = local_initializer_depth_max - 1;
+    const accepted_patterns = try nestedTuplePatternsForTest(alloc, accepted_nesting);
+    const accepted_pattern_b: bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = accepted_patterns,
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var accepted_pattern_finder: LocalInitializerFinder = .{
+        .b = &accepted_pattern_b,
+        .target_name = "target",
+        .target_ordinal = 0,
+        .binding_ordinal = 0,
+    };
+    accepted_pattern_finder.visitPattern(0, 7, 0);
+    try std.testing.expect(!accepted_pattern_finder.depth_exceeded);
+    try std.testing.expectEqual(@as(?exprs.NodeId, 7), accepted_pattern_finder.result);
+
+    const rejected_patterns = try nestedTuplePatternsForTest(alloc, local_initializer_depth_max);
+    const rejected_pattern_b: bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = rejected_patterns,
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var rejected_pattern_finder: LocalInitializerFinder = .{
+        .b = &rejected_pattern_b,
+        .target_name = "target",
+        .target_ordinal = 0,
+        .binding_ordinal = 0,
+    };
+    rejected_pattern_finder.visitPattern(0, 7, 0);
+    try std.testing.expect(rejected_pattern_finder.depth_exceeded);
+    try std.testing.expectEqual(@as(?exprs.NodeId, null), rejected_pattern_finder.result);
+
+    const accepted_exprs = try nestedIfExpressionsForTest(alloc, accepted_nesting);
+    const accepted_expr_b: bodies.Bodies = .{
+        .exprs = accepted_exprs,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var accepted_expr_finder: LocalInitializerFinder = .{
+        .b = &accepted_expr_b,
+        .target_name = "target",
+        .target_ordinal = 0,
+        .binding_ordinal = 0,
+    };
+    accepted_expr_finder.visitExpr(0, 0);
+    try std.testing.expect(!accepted_expr_finder.depth_exceeded);
+
+    const rejected_exprs = try nestedIfExpressionsForTest(alloc, local_initializer_depth_max);
+    const rejected_expr_b: bodies.Bodies = .{
+        .exprs = rejected_exprs,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var rejected_expr_finder: LocalInitializerFinder = .{
+        .b = &rejected_expr_b,
+        .target_name = "target",
+        .target_ordinal = 0,
+        .binding_ordinal = 0,
+    };
+    rejected_expr_finder.visitExpr(0, 0);
+    try std.testing.expect(rejected_expr_finder.depth_exceeded);
 }

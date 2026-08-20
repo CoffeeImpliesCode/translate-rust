@@ -17,7 +17,7 @@ pub const std_model = @import("std_model.zig");
 
 /// The entire semantic model of a translated crate: its crate graph, the
 /// crate-level type table, body store, and retained generic instantiations.
-pub const RustIR = struct {
+pub const RustIr = struct {
     crate_name: []const u8,
     edition: []const u8 = "2021",
     graph: graph.CrateGraph,
@@ -27,7 +27,7 @@ pub const RustIR = struct {
     /// frontend allocator; nested type payloads borrow from `types`/`bodies`.
     instantiations: []const types.Instantiation = &.{},
 
-    pub fn deinitInstantiations(self: *RustIR, allocator: std.mem.Allocator) void {
+    pub fn deinitInstantiations(self: *RustIr, allocator: std.mem.Allocator) void {
         for (self.instantiations) |instantiation| {
             if (instantiation.args.params.len > 0) allocator.free(instantiation.args.params);
             if (instantiation.zig_suffix.len > 0) allocator.free(instantiation.zig_suffix);

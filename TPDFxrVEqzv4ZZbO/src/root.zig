@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const LIMIT: u32 = 42;
+pub const limit: u32 = 42;
 
 pub fn add(a: u32, b: u32) u32 {
     return (a + b);

@@ -1600,11 +1600,32 @@ fn emitExpr(
                 },
                 .associated, .constructor => |def| {
                     if (g.symbol_table.get(def)) |ent| {
-                        if (ent.parent) |parent_id| {
-                            if (g.symbol_table.get(parent_id)) |parent_ent| {
-                                try emitIdent(allocator, buf, entityName(parent_ent));
-                                try buf.append(allocator, '.');
+                        var owner: ?spine.Entity = null;
+                        var parent_id = ent.parent;
+                        while (parent_id) |pid| {
+                            const parent_ent = g.symbol_table.get(pid) orelse break;
+                            switch (parent_ent.kind) {
+                                .struct_, .enum_, .union_ => {
+                                    owner = parent_ent;
+                                    break;
+                                },
+                                .impl_ => {
+                                    for (g.symbol_table.entities.items) |candidate| {
+                                        if (candidate.kind != .struct_ and candidate.kind != .enum_ and candidate.kind != .union_) continue;
+                                        if (std.mem.eql(u8, parent_ent.name, candidate.name) or std.mem.startsWith(u8, parent_ent.name, candidate.name)) {
+                                            owner = candidate;
+                                            break;
+                                        }
+                                    }
+                                    if (owner != null) break;
+                                    parent_id = parent_ent.parent;
+                                },
+                                else => parent_id = parent_ent.parent,
                             }
+                        }
+                        if (owner) |type_ent| {
+                            try emitIdent(allocator, buf, entityName(type_ent));
+                            try buf.append(allocator, '.');
                         }
                         try emitIdent(allocator, buf, entityName(ent));
                     } else {
@@ -3216,6 +3237,131 @@ test "M2: function calls, method calls, and builtin calls" {
     const formatted = try formatZig(allocator, out);
     defer allocator.free(formatted);
     try std.testing.expect(formatted.len > 0);
+}
+
+test "emit: associated call from generic impl uses nominal owner" {
+    const allocator = std.testing.allocator;
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const root_id = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    const fletcher_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try allocator.dupe(u8, "Fletcher"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const impl_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try allocator.dupe(u8, "Fletcher<T>"),
+        .span = span,
+        .visibility = .private,
+        .parent = fletcher_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const new_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "new"),
+        .span = span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const caller_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "make_fletcher"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_items = try allocator.alloc(spine.EntityId, 1);
+    root_items[0] = caller_id;
+    g.modules.items[root_id].items = root_items;
+
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "generic_impl_call"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const exprs_store = try allocator.alloc(exprs.Expr, 2);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .call = .{ .call_kind = .{ .associated = new_id }, .args = &.{} } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{0}, .tail = null, .labelled = null } },
+    };
+
+    const stmts_store = try allocator.alloc(exprs.Statement, 1);
+    stmts_store[0] = .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 0 } };
+
+    const bodies_store = try allocator.alloc(bodies_mod.BodyKind, 4);
+    bodies_store[fletcher_id] = .none;
+    bodies_store[impl_id] = .none;
+    bodies_store[new_id] = .none;
+    bodies_store[caller_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 1,
+    } };
+
+    const bodies: Bodies = .{
+        .exprs = exprs_store,
+        .stmts = stmts_store,
+        .pats = &.{},
+        .types = &.{},
+        .bodies = bodies_store,
+    };
+    defer {
+        allocator.free(exprs_store);
+        allocator.free(stmts_store);
+        allocator.free(bodies_store);
+    }
+
+    const out = try emitRich(allocator, &g, &bodies);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "Fletcher.new();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@\"Fletcher<T>\".new();") == null);
 }
 
 // Wire in the P2 `.unsupported`-expr emission tests.

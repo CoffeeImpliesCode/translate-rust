@@ -10,7 +10,7 @@ pub const ast = @import("ast.zig");
 pub const emit = @import("emit.zig");
 /// Package writer: ast.Package -> files on disk (build.zig, build.zig.zon, src/*).
 pub const package = @import("package.zig");
-/// Lowering engine: RustIR to ast.Package.
+/// Lowering engine: RustIr to ast.Package.
 pub const lower = @import("lower.zig");
 /// Lowering engine tests.
 pub const lower_test = @import("lower_test.zig");

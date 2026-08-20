@@ -112,6 +112,403 @@ fn optStr(o: ObjectMap, key: []const u8) !?[]const u8 {
     };
 }
 
+fn freeDecodedVisibility(allocator: std.mem.Allocator, visibility: spine.Visibility) void {
+    switch (visibility) {
+        .in_path => |path| allocator.free(path),
+        else => {},
+    }
+}
+
+fn freeDecodedAttributes(allocator: std.mem.Allocator, attributes: []const spine.Attribute) void {
+    for (attributes) |attribute| {
+        allocator.free(attribute.name);
+        allocator.free(attribute.meta);
+    }
+    allocator.free(attributes);
+}
+
+fn freeDecodedAttributeList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(spine.Attribute),
+) void {
+    for (list.items) |attribute| {
+        allocator.free(attribute.name);
+        allocator.free(attribute.meta);
+    }
+    list.deinit(allocator);
+}
+
+fn freeDecodedPathSegments(
+    allocator: std.mem.Allocator,
+    segments: []const types.PathSegment,
+) void {
+    for (segments) |segment| allocator.free(segment.name);
+    allocator.free(segments);
+}
+
+fn freeDecodedType(allocator: std.mem.Allocator, ty: types.Type) void {
+    switch (ty) {
+        .path => |path| freeDecodedPathSegments(allocator, path.segments),
+        .reference => |reference| {
+            freeDecodedType(allocator, reference.pointee);
+            allocator.destroy(@constCast(reference));
+        },
+        .raw_ptr => |raw_ptr| {
+            freeDecodedType(allocator, raw_ptr.pointee);
+            allocator.destroy(@constCast(raw_ptr));
+        },
+        .slice => |slice| {
+            freeDecodedType(allocator, slice.elem);
+            allocator.destroy(@constCast(slice));
+        },
+        .array => |array| {
+            freeDecodedType(allocator, array.elem);
+            allocator.destroy(@constCast(array));
+        },
+        .tuple => |tuple| freeDecodedTypeSlice(allocator, tuple),
+        .fn_ptr => |fn_ptr| {
+            freeDecodedTypeSlice(allocator, fn_ptr.params);
+            freeDecodedType(allocator, fn_ptr.ret);
+            allocator.destroy(@constCast(fn_ptr));
+        },
+        .generic_inst => |generic_inst| {
+            freeDecodedTypeSlice(allocator, generic_inst.args.params);
+        },
+        .option => |option| {
+            freeDecodedType(allocator, option.*);
+            allocator.destroy(@constCast(option));
+        },
+        .result => |result| {
+            freeDecodedType(allocator, result.ok);
+            freeDecodedType(allocator, result.err);
+            allocator.destroy(@constCast(result));
+        },
+        .boxed => |boxed| {
+            freeDecodedType(allocator, boxed.*);
+            allocator.destroy(@constCast(boxed));
+        },
+        else => {},
+    }
+}
+
+fn freeDecodedTypeSlice(allocator: std.mem.Allocator, types_slice: []const types.Type) void {
+    for (types_slice) |ty| freeDecodedType(allocator, ty);
+    allocator.free(types_slice);
+}
+
+fn freeDecodedTypeList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(types.Type),
+) void {
+    for (list.items) |ty| freeDecodedType(allocator, ty);
+    list.deinit(allocator);
+}
+
+fn freeDecodedCrateDepList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(graph.CrateDep),
+) void {
+    for (list.items) |dependency| {
+        allocator.free(dependency.extern_name);
+        allocator.free(dependency.local_alias);
+    }
+    list.deinit(allocator);
+}
+
+fn freeDecodedIdList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.NodeId),
+) void {
+    list.deinit(allocator);
+}
+
+fn freeDecodedLiteral(allocator: std.mem.Allocator, literal: exprs.Literal) void {
+    switch (literal) {
+        .int => |int_literal| {
+            allocator.free(int_literal.text);
+            if (int_literal.ty_suffix) |suffix| allocator.free(suffix);
+        },
+        .float => |float_literal| allocator.free(float_literal.text),
+        .character => |char_literal| allocator.free(char_literal.text),
+        .string => |string_literal| allocator.free(string_literal.bytes),
+        .byte_array => |byte_array| allocator.free(byte_array.items),
+        .boolean => {},
+    }
+}
+fn freeDecodedBlockExpr(allocator: std.mem.Allocator, block: exprs.BlockExpr) void {
+    allocator.free(block.statements);
+    if (block.labelled) |labelled| allocator.free(labelled);
+}
+fn freeDecodedElseBranch(allocator: std.mem.Allocator, branch: exprs.ElseBranch) void {
+    switch (branch) {
+        .block => |block| freeDecodedBlockExpr(allocator, block),
+        else => {},
+    }
+}
+fn freeDecodedIterKind(allocator: std.mem.Allocator, iter_kind: exprs.IterKind) void {
+    switch (iter_kind) {
+        .multi => |ids| allocator.free(ids),
+        else => {},
+    }
+}
+
+fn freeDecodedUnsupported(allocator: std.mem.Allocator, unsupported: exprs.Unsupported) void {
+    allocator.free(unsupported.reason);
+}
+
+fn freeDecodedClosure(allocator: std.mem.Allocator, closure: exprs.ClosureExpr) void {
+    for (closure.captures) |capture| allocator.free(capture.name);
+    allocator.free(closure.captures);
+    allocator.free(closure.params);
+    freeDecodedBlockExpr(allocator, closure.body);
+}
+
+fn freeDecodedIteratorChain(
+    allocator: std.mem.Allocator,
+    chain: exprs.IteratorChainExpr,
+) void {
+    for (chain.adapters) |adapter| {
+        switch (adapter) {
+            .map => |map| freeDecodedClosure(allocator, map.closure),
+            .filter => |filter| freeDecodedClosure(allocator, filter.closure),
+            .other => |unsupported| freeDecodedUnsupported(allocator, unsupported),
+            else => {},
+        }
+    }
+    allocator.free(chain.adapters);
+}
+
+fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void {
+    switch (kind) {
+        .literal => |literal| freeDecodedLiteral(allocator, literal),
+        .vec_lit => |vec_lit| allocator.free(vec_lit.elements),
+        .path => |path| freeDecodedTypeSlice(allocator, path.generic_args),
+        .block => |block| freeDecodedBlockExpr(allocator, block),
+        .if_else => |if_else| {
+            freeDecodedBlockExpr(allocator, if_else.then_);
+            freeDecodedElseBranch(allocator, if_else.@"else");
+        },
+        .if_let => |if_let| {
+            freeDecodedBlockExpr(allocator, if_let.then_);
+            freeDecodedElseBranch(allocator, if_let.@"else");
+        },
+        .match => |match_expr| {
+            for (match_expr.arms) |arm| allocator.free(arm.patterns);
+            allocator.free(match_expr.arms);
+        },
+        .loop_ => |loop_expr| freeDecodedBlockExpr(allocator, loop_expr.body),
+        .while_ => |while_expr| freeDecodedBlockExpr(allocator, while_expr.body),
+        .for_ => |for_expr| {
+            freeDecodedBlockExpr(allocator, for_expr.body);
+            freeDecodedIterKind(allocator, for_expr.iter_kind);
+        },
+        .break_ => |break_expr| {
+            if (break_expr.label) |label| allocator.free(label);
+        },
+        .continue_ => |continue_expr| {
+            if (continue_expr.label) |label| allocator.free(label);
+        },
+        .call => |call| allocator.free(call.args),
+        .method_call => |method_call| allocator.free(method_call.args),
+        .struct_lit => |struct_lit| freeDecodedFieldInits(allocator, struct_lit.fields),
+        .enum_variant => |enum_variant| {
+            allocator.free(enum_variant.variant);
+            allocator.free(enum_variant.tuple_fields);
+            freeDecodedFieldInits(allocator, enum_variant.named_fields);
+        },
+        .field => |field| allocator.free(field.field),
+        .closure => |closure| freeDecodedClosure(allocator, closure),
+        .iterator_chain => |chain| freeDecodedIteratorChain(allocator, chain),
+        .unsupported => |unsupported| freeDecodedUnsupported(allocator, unsupported),
+        else => {},
+    }
+}
+
+fn freeDecodedExpr(allocator: std.mem.Allocator, expression: exprs.Expr) void {
+    freeDecodedExprKind(allocator, expression.kind);
+}
+
+fn freeDecodedExprList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.Expr),
+) void {
+    for (list.items) |expression| freeDecodedExpr(allocator, expression);
+    list.deinit(allocator);
+}
+
+fn freeDecodedPatternKind(allocator: std.mem.Allocator, kind: exprs.PatternKind) void {
+    switch (kind) {
+        .binding => |binding| allocator.free(binding.name),
+        .literal => |literal| freeDecodedLiteral(allocator, literal),
+        .path => |path| {
+            if (path.variant) |variant| allocator.free(variant);
+        },
+        .tuple => |tuple| allocator.free(tuple.elements),
+        .slice => |slice| allocator.free(slice.elements),
+        .struct_pat => |struct_pat| {
+            for (struct_pat.fields) |field| allocator.free(field.field);
+            allocator.free(struct_pat.fields);
+        },
+        .@"or" => |or_pat| allocator.free(or_pat.alternatives),
+        else => {},
+    }
+}
+
+fn freeDecodedPattern(allocator: std.mem.Allocator, pattern: exprs.Pattern) void {
+    freeDecodedPatternKind(allocator, pattern.kind);
+}
+
+fn freeDecodedPatternList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.Pattern),
+) void {
+    for (list.items) |pattern| freeDecodedPattern(allocator, pattern);
+    list.deinit(allocator);
+}
+
+fn freeDecodedStatement(allocator: std.mem.Allocator, statement: exprs.Statement) void {
+    switch (statement.kind) {
+        .let_else => |let_else| freeDecodedBlockExpr(allocator, let_else.else_block),
+        else => {},
+    }
+}
+
+fn freeDecodedStatementList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.Statement),
+) void {
+    for (list.items) |statement| freeDecodedStatement(allocator, statement);
+    list.deinit(allocator);
+}
+
+fn freeDecodedBodyKind(allocator: std.mem.Allocator, body: BodyKind) void {
+    switch (body) {
+        .const_ => |const_body| freeDecodedType(allocator, const_body.ty),
+        .fn_ => |fn_body| {
+            freeDecodedParams(allocator, fn_body.params);
+            freeDecodedType(allocator, fn_body.ret);
+        },
+        .struct_ => |struct_body| freeDecodedFields(allocator, struct_body.fields),
+        else => {},
+    }
+}
+
+fn freeDecodedBodyList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(BodyKind),
+) void {
+    for (list.items) |body| freeDecodedBodyKind(allocator, body);
+    list.deinit(allocator);
+}
+fn freeDecodedBodies(allocator: std.mem.Allocator, bodies: Bodies) void {
+    for (bodies.exprs) |expression| freeDecodedExpr(allocator, expression);
+    allocator.free(bodies.exprs);
+    for (bodies.stmts) |statement| freeDecodedStatement(allocator, statement);
+    allocator.free(bodies.stmts);
+    for (bodies.pats) |pattern| freeDecodedPattern(allocator, pattern);
+    allocator.free(bodies.pats);
+    for (bodies.types) |ty| freeDecodedType(allocator, ty);
+    allocator.free(bodies.types);
+    for (bodies.bodies) |body| freeDecodedBodyKind(allocator, body);
+    allocator.free(bodies.bodies);
+}
+
+fn freeDecodedFieldInitList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.FieldInit),
+) void {
+    for (list.items) |field| allocator.free(field.field);
+    list.deinit(allocator);
+}
+
+fn freeDecodedFieldInits(allocator: std.mem.Allocator, fields: []const exprs.FieldInit) void {
+    for (fields) |field| allocator.free(field.field);
+    allocator.free(fields);
+}
+
+fn freeDecodedFieldPatList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.FieldPat),
+) void {
+    for (list.items) |field| allocator.free(field.field);
+    list.deinit(allocator);
+}
+fn freeDecodedMatchArmList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.MatchArm),
+) void {
+    for (list.items) |arm| allocator.free(arm.patterns);
+    list.deinit(allocator);
+}
+
+fn freeDecodedParam(allocator: std.mem.Allocator, param: items.Param) void {
+    allocator.free(param.name);
+    freeDecodedType(allocator, param.ty);
+}
+
+fn freeDecodedParamList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(items.Param),
+) void {
+    for (list.items) |param| {
+        allocator.free(param.name);
+        freeDecodedType(allocator, param.ty);
+    }
+    list.deinit(allocator);
+}
+
+fn freeDecodedField(allocator: std.mem.Allocator, field: items.Field) void {
+    allocator.free(field.name);
+    freeDecodedType(allocator, field.ty);
+    freeDecodedVisibility(allocator, field.visibility);
+}
+fn freeDecodedFields(allocator: std.mem.Allocator, fields: []const items.Field) void {
+    for (fields) |field| freeDecodedField(allocator, field);
+    allocator.free(fields);
+}
+fn freeDecodedCrateDeps(allocator: std.mem.Allocator, deps: []const graph.CrateDep) void {
+    for (deps) |dependency| {
+        allocator.free(dependency.extern_name);
+        allocator.free(dependency.local_alias);
+    }
+    allocator.free(deps);
+}
+
+fn freeDecodedEntity(allocator: std.mem.Allocator, entity: spine.Entity) void {
+    allocator.free(entity.name);
+    freeDecodedVisibility(allocator, entity.visibility);
+    if (entity.renamed_to) |renamed| allocator.free(renamed);
+    freeDecodedAttributes(allocator, entity.attributes);
+}
+
+fn freeDecodedModule(allocator: std.mem.Allocator, module: graph.Module) void {
+    allocator.free(module.name);
+    if (module.source_path) |source_path| allocator.free(source_path);
+    allocator.free(module.items);
+    freeDecodedAttributes(allocator, module.attributes);
+}
+
+fn freeDecodedUseDecl(allocator: std.mem.Allocator, use_decl: graph.UseDecl) void {
+    allocator.free(use_decl.local_name);
+}
+
+fn freeDecodedParams(allocator: std.mem.Allocator, params: []const items.Param) void {
+    for (params) |param| freeDecodedParam(allocator, param);
+    allocator.free(params);
+}
+
+fn freeDecodedFieldList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(items.Field),
+) void {
+    for (list.items) |field| {
+        allocator.free(field.name);
+        freeDecodedType(allocator, field.ty);
+        freeDecodedVisibility(allocator, field.visibility);
+    }
+    list.deinit(allocator);
+}
+
 fn decodeSpan(v: Json) !spine.Span {
     const o = try getObj(v);
     return .{
@@ -133,7 +530,10 @@ fn decodeVisibility(
     if (std.mem.eql(u8, kind, "super_restricted")) return .super_restricted;
     if (std.mem.eql(u8, kind, "private")) return .private;
     if (std.mem.eql(u8, kind, "in_path")) {
-        return .{ .in_path = try allocator.dupe(u8, try reqStr(o, "path")) };
+        const path_text = try reqStr(o, "path");
+        const path = try allocator.dupe(u8, path_text);
+        errdefer allocator.free(path);
+        return .{ .in_path = path };
     }
     return error.BadWireFormat;
 }
@@ -147,12 +547,18 @@ fn decodeAttributes(
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(spine.Attribute) = .empty;
+    errdefer freeDecodedAttributeList(allocator, &list);
     for (arr.items) |av| {
         const o = try getObj(av);
+        const name = try allocator.dupe(u8, try reqStr(o, "name"));
+        errdefer allocator.free(name);
+        const meta = try allocator.dupe(u8, try reqStr(o, "meta"));
+        errdefer allocator.free(meta);
+        const known = try reqBool(o, "known");
         try list.append(allocator, .{
-            .name = try allocator.dupe(u8, try reqStr(o, "name")),
-            .meta = try allocator.dupe(u8, try reqStr(o, "meta")),
-            .known = try reqBool(o, "known"),
+            .name = name,
+            .meta = meta,
+            .known = known,
         });
     }
     return list.toOwnedSlice(allocator);
@@ -164,6 +570,7 @@ fn decodeIdSlice(allocator: std.mem.Allocator, v: Json) ![]const spine.EntityId 
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    errdefer list.deinit(allocator);
     for (arr.items) |it| {
         const x = switch (it) {
             .integer => |i| i,
@@ -204,38 +611,65 @@ fn decodeEntityKind(s: []const u8) !spine.EntityKind {
 
 fn decodeModule(allocator: std.mem.Allocator, v: Json) !graph.Module {
     const o = try getObj(v);
+    const id: spine.EntityId = @intCast(try reqU32(o, "id"));
+    const kind = try decodeModuleKind(try reqStr(o, "kind"));
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
+    const parent = try optU32(o, "parent");
+    const source_path = if (try optStr(o, "source_path")) |source| blk: {
+        const owned_source = try allocator.dupe(u8, source);
+        break :blk owned_source;
+    } else null;
+    errdefer if (source_path) |source| allocator.free(source);
+    const is_crate = try reqBool(o, "is_crate");
+    const is_extern = try reqBool(o, "is_extern");
+    const span = try decodeSpan(try req(o, "span"));
+    const item_ids = try decodeIdSlice(allocator, try req(o, "items"));
+    errdefer allocator.free(item_ids);
+    const attributes = try decodeAttributes(allocator, try req(o, "attributes"));
+    errdefer freeDecodedAttributes(allocator, attributes);
     return .{
-        .id = @intCast(try reqU32(o, "id")),
-        .kind = try decodeModuleKind(try reqStr(o, "kind")),
-        .name = try allocator.dupe(u8, try reqStr(o, "name")),
-        .parent = try optU32(o, "parent"),
-        .source_path = if (try optStr(o, "source_path")) |sp|
-            try allocator.dupe(u8, sp)
-        else
-            null,
-        .is_crate = try reqBool(o, "is_crate"),
-        .is_extern = try reqBool(o, "is_extern"),
-        .span = try decodeSpan(try req(o, "span")),
-        .items = try decodeIdSlice(allocator, try req(o, "items")),
-        .attributes = try decodeAttributes(allocator, try req(o, "attributes")),
+        .id = id,
+        .kind = kind,
+        .name = name,
+        .parent = parent,
+        .source_path = source_path,
+        .is_crate = is_crate,
+        .is_extern = is_extern,
+        .span = span,
+        .items = item_ids,
+        .attributes = attributes,
     };
 }
 
 fn decodeEntity(allocator: std.mem.Allocator, v: Json) !spine.Entity {
     const o = try getObj(v);
+    const id: spine.EntityId = @intCast(try reqU32(o, "id"));
+    const kind = try decodeEntityKind(try reqStr(o, "kind"));
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
+    const span = try decodeSpan(try req(o, "span"));
+    const visibility = try decodeVisibility(allocator, try req(o, "visibility"));
+    errdefer freeDecodedVisibility(allocator, visibility);
+    const parent = try optU32(o, "parent");
+    const resolved = try optU32(o, "resolved");
+    const renamed_to = if (try optStr(o, "renamed_to")) |renamed| blk: {
+        const owned_renamed = try allocator.dupe(u8, renamed);
+        break :blk owned_renamed;
+    } else null;
+    errdefer if (renamed_to) |renamed| allocator.free(renamed);
+    const attributes = try decodeAttributes(allocator, try req(o, "attributes"));
+    errdefer freeDecodedAttributes(allocator, attributes);
     return .{
-        .id = @intCast(try reqU32(o, "id")),
-        .kind = try decodeEntityKind(try reqStr(o, "kind")),
-        .name = try allocator.dupe(u8, try reqStr(o, "name")),
-        .span = try decodeSpan(try req(o, "span")),
-        .visibility = try decodeVisibility(allocator, try req(o, "visibility")),
-        .parent = try optU32(o, "parent"),
-        .resolved = try optU32(o, "resolved"),
-        .renamed_to = if (try optStr(o, "renamed_to")) |rn|
-            try allocator.dupe(u8, rn)
-        else
-            null,
-        .attributes = try decodeAttributes(allocator, try req(o, "attributes")),
+        .id = id,
+        .kind = kind,
+        .name = name,
+        .span = span,
+        .visibility = visibility,
+        .parent = parent,
+        .resolved = resolved,
+        .renamed_to = renamed_to,
+        .attributes = attributes,
     };
 }
 
@@ -251,13 +685,18 @@ fn decodeUseDecl(allocator: std.mem.Allocator, v: Json) !graph.UseDecl {
         .glob
     else
         return error.BadWireFormat;
+    const id: spine.EntityId = @intCast(try reqU32(o, "id"));
+    const local_name = try allocator.dupe(u8, try reqStr(o, "local_name"));
+    errdefer allocator.free(local_name);
+    const is_pub_export = try reqBool(o, "is_pub_export");
+    const span = try decodeSpan(try req(o, "span"));
     return .{
-        .id = @intCast(try reqU32(o, "id")),
+        .id = id,
         .kind = kind,
-        .local_name = try allocator.dupe(u8, try reqStr(o, "local_name")),
-        .is_pub_export = try reqBool(o, "is_pub_export"),
+        .local_name = local_name,
+        .is_pub_export = is_pub_export,
         .target = target,
-        .span = try decodeSpan(try req(o, "span")),
+        .span = span,
     };
 }
 
@@ -267,12 +706,18 @@ fn decodeDeps(allocator: std.mem.Allocator, v: Json) ![]const graph.CrateDep {
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(graph.CrateDep) = .empty;
+    errdefer freeDecodedCrateDepList(allocator, &list);
     for (arr.items) |dv| {
         const d = try getObj(dv);
+        const extern_name = try allocator.dupe(u8, try reqStr(d, "extern_name"));
+        errdefer allocator.free(extern_name);
+        const local_alias = try allocator.dupe(u8, try reqStr(d, "local_alias"));
+        errdefer allocator.free(local_alias);
+        const id: u32 = @intCast(try reqU32(d, "id"));
         try list.append(allocator, .{
-            .extern_name = try allocator.dupe(u8, try reqStr(d, "extern_name")),
-            .local_alias = try allocator.dupe(u8, try reqStr(d, "local_alias")),
-            .id = @intCast(try reqU32(d, "id")),
+            .extern_name = extern_name,
+            .local_alias = local_alias,
+            .id = id,
         });
     }
     return list.toOwnedSlice(allocator);
@@ -317,6 +762,7 @@ fn decodeIdList(allocator: std.mem.Allocator, v: Json) ![]const exprs.NodeId {
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    errdefer freeDecodedIdList(allocator, &list);
     for (arr.items) |it| {
         const x = switch (it) {
             .integer => |i| i,
@@ -342,29 +788,43 @@ fn decodeIntLit(allocator: std.mem.Allocator, v: Json) !exprs.IntLit {
         .bin
     else
         return error.BadWireFormat;
-    const value: i128 = std.fmt.parseInt(i128, try reqStr(o, "value"), 10) catch return error.BadWireFormat;
+    const value: i128 =
+        std.fmt.parseInt(i128, try reqStr(o, "value"), 10) catch return error.BadWireFormat;
     const suffix = try optStr(o, "ty_suffix");
+    const text = try allocator.dupe(u8, try reqStr(o, "text"));
+    errdefer allocator.free(text);
+    const ty_suffix = if (suffix) |s| blk: {
+        const owned_suffix = try allocator.dupe(u8, s);
+        break :blk owned_suffix;
+    } else null;
+    errdefer if (ty_suffix) |owned_suffix| allocator.free(owned_suffix);
     return .{
-        .text = try allocator.dupe(u8, try reqStr(o, "text")),
+        .text = text,
         .value = value,
         .base = base,
-        .ty_suffix = if (suffix) |s| try allocator.dupe(u8, s) else null,
+        .ty_suffix = ty_suffix,
     };
 }
 
 fn decodeFloatLit(allocator: std.mem.Allocator, v: Json) !exprs.FloatLit {
     const o = try getObj(v);
+    const text = try allocator.dupe(u8, try reqStr(o, "text"));
+    errdefer allocator.free(text);
+    const value = try reqFloat(o, "value");
     return .{
-        .text = try allocator.dupe(u8, try reqStr(o, "text")),
-        .value = try reqFloat(o, "value"),
+        .text = text,
+        .value = value,
     };
 }
 
 fn decodeCharLit(allocator: std.mem.Allocator, v: Json) !exprs.CharLit {
     const o = try getObj(v);
+    const text = try allocator.dupe(u8, try reqStr(o, "text"));
+    errdefer allocator.free(text);
+    const value: u32 = @intCast(try reqU32(o, "value"));
     return .{
-        .text = try allocator.dupe(u8, try reqStr(o, "text")),
-        .value = @intCast(try reqU32(o, "value")),
+        .text = text,
+        .value = value,
     };
 }
 
@@ -380,6 +840,7 @@ fn decodeByteArrayLit(allocator: std.mem.Allocator, v: Json) !exprs.ByteArrayLit
         else => return error.BadWireFormat,
     };
     const out = try allocator.alloc(u8, arr.items.len);
+    errdefer allocator.free(out);
     for (arr.items, 0..) |item, i| {
         out[i] = switch (item) {
             .integer => |x| @intCast(x),
@@ -416,11 +877,18 @@ fn decodePathSegments(allocator: std.mem.Allocator, v: Json) ![]const types.Path
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(types.PathSegment) = .empty;
+    errdefer {
+        for (list.items) |segment| allocator.free(segment.name);
+        list.deinit(allocator);
+    }
     for (arr.items) |it| {
         const o = try getObj(it);
+        const name = try allocator.dupe(u8, try reqStr(o, "name"));
+        errdefer allocator.free(name);
+        const id = try reqOptionalId(o, "id");
         try list.append(allocator, .{
-            .name = try allocator.dupe(u8, try reqStr(o, "name")),
-            .id = try reqOptionalId(o, "id"),
+            .name = name,
+            .id = id,
         });
     }
     return list.toOwnedSlice(allocator);
@@ -432,7 +900,12 @@ fn decodeTypeList(allocator: std.mem.Allocator, v: Json) anyerror![]const types.
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(types.Type) = .empty;
-    for (arr.items) |it| try list.append(allocator, try decodeType(allocator, it));
+    errdefer freeDecodedTypeList(allocator, &list);
+    for (arr.items) |it| {
+        const ty = try decodeType(allocator, it);
+        errdefer freeDecodedType(allocator, ty);
+        try list.append(allocator, ty);
+    }
     return list.toOwnedSlice(allocator);
 }
 
@@ -465,84 +938,125 @@ fn decodeType(allocator: std.mem.Allocator, v: Json) !types.Type {
 
     if (std.mem.eql(u8, tag, "path")) {
         const p = try getObj(val);
-        return .{ .path = .{ .segments = try decodePathSegments(allocator, try req(p, "segments")) } };
+        const segments = try decodePathSegments(allocator, try req(p, "segments"));
+        errdefer freeDecodedPathSegments(allocator, segments);
+        return .{ .path = .{ .segments = segments } };
     }
-    if (std.mem.eql(u8, tag, "prim")) return .{ .prim = try decodePrim(try reqStrArray(val)) };
+    if (std.mem.eql(u8, tag, "prim")) {
+        return .{ .prim = try decodePrim(try reqStrArray(val)) };
+    }
     if (std.mem.eql(u8, tag, "slice")) {
         const p = try getObj(val);
         const inner = try allocator.create(types.Slice);
+        errdefer allocator.destroy(inner);
+        const const_ = try reqBool(p, "const_");
+        const elem = try decodeType(allocator, try req(p, "elem"));
+        errdefer freeDecodedType(allocator, elem);
         inner.* = .{
-            .const_ = try reqBool(p, "const_"),
-            .elem = try decodeType(allocator, try req(p, "elem")),
+            .const_ = const_,
+            .elem = elem,
         };
         return .{ .slice = inner };
     }
     if (std.mem.eql(u8, tag, "reference")) {
         const p = try getObj(val);
         const inner = try allocator.create(types.Ref);
+        errdefer allocator.destroy(inner);
+        const mut = try reqBool(p, "mut");
+        const pointee = try decodeType(allocator, try req(p, "pointee"));
+        errdefer freeDecodedType(allocator, pointee);
         inner.* = .{
-            .mut = try reqBool(p, "mut"),
-            .pointee = try decodeType(allocator, try req(p, "pointee")),
+            .mut = mut,
+            .pointee = pointee,
         };
         return .{ .reference = inner };
     }
     if (std.mem.eql(u8, tag, "raw_ptr")) {
         const p = try getObj(val);
         const inner = try allocator.create(types.RawPtr);
+        errdefer allocator.destroy(inner);
+        const mut = try reqBool(p, "mut");
+        const pointee = try decodeType(allocator, try req(p, "pointee"));
+        errdefer freeDecodedType(allocator, pointee);
         inner.* = .{
-            .mut = try reqBool(p, "mut"),
-            .pointee = try decodeType(allocator, try req(p, "pointee")),
+            .mut = mut,
+            .pointee = pointee,
         };
         return .{ .raw_ptr = inner };
     }
     if (std.mem.eql(u8, tag, "array")) {
         const p = try getObj(val);
         const inner = try allocator.create(types.Array);
+        errdefer allocator.destroy(inner);
         const len_o = try getObj(try req(p, "len"));
+        const elem = try decodeType(allocator, try req(p, "elem"));
+        errdefer freeDecodedType(allocator, elem);
+        const len_kind = try reqStr(len_o, "kind");
+        const len_value = try reqU32(len_o, "value");
         inner.* = .{
-            .elem = try decodeType(allocator, try req(p, "elem")),
-            .len = if (std.mem.eql(u8, try reqStr(len_o, "kind"), "literal"))
-                .{ .literal = try reqU32(len_o, "value") }
+            .elem = elem,
+            .len = if (std.mem.eql(u8, len_kind, "literal"))
+                .{ .literal = len_value }
             else
-                .{ .generic = try reqU32(len_o, "value") },
+                .{ .generic = len_value },
         };
         return .{ .array = inner };
     }
-    if (std.mem.eql(u8, tag, "tuple")) return .{ .tuple = try decodeTypeList(allocator, val) };
+    if (std.mem.eql(u8, tag, "tuple")) {
+        const tuple = try decodeTypeList(allocator, val);
+        errdefer freeDecodedTypeSlice(allocator, tuple);
+        return .{ .tuple = tuple };
+    }
     if (std.mem.eql(u8, tag, "fn_ptr")) {
         const p = try getObj(val);
         const inner = try allocator.create(types.FnPtr);
+        errdefer allocator.destroy(inner);
+        const params = try decodeTypeList(allocator, try req(p, "params"));
+        errdefer freeDecodedTypeSlice(allocator, params);
+        const ret = try decodeType(allocator, try req(p, "ret"));
+        errdefer freeDecodedType(allocator, ret);
         inner.* = .{
-            .params = try decodeTypeList(allocator, try req(p, "params")),
-            .ret = try decodeType(allocator, try req(p, "ret")),
+            .params = params,
+            .ret = ret,
         };
         return .{ .fn_ptr = inner };
     }
     if (std.mem.eql(u8, tag, "generic_inst")) {
         const p = try getObj(val);
         const args_o = try getObj(try req(p, "args"));
+        const decl: spine.EntityId = @intCast(try reqU32(p, "decl"));
+        const params = try decodeTypeList(allocator, try req(args_o, "params"));
+        errdefer freeDecodedTypeSlice(allocator, params);
         return .{ .generic_inst = .{
-            .decl = @intCast(try reqU32(p, "decl")),
-            .args = .{ .params = try decodeTypeList(allocator, try req(args_o, "params")) },
+            .decl = decl,
+            .args = .{ .params = params },
         } };
     }
     if (std.mem.eql(u8, tag, "option")) {
         const inner = try allocator.create(types.Type);
+        errdefer allocator.destroy(inner);
         inner.* = try decodeType(allocator, val);
         return .{ .option = inner };
     }
     if (std.mem.eql(u8, tag, "result")) {
         const p = try getObj(val);
         const inner = try allocator.create(types.Result);
+        errdefer allocator.destroy(inner);
+        const ok = try decodeType(allocator, try req(p, "ok"));
+        errdefer freeDecodedType(allocator, ok);
+        const err = try decodeType(allocator, try req(p, "err"));
+        errdefer freeDecodedType(allocator, err);
+        const is_error_unionable = try reqBool(p, "is_error_unionable");
         inner.* = .{
-            .ok = try decodeType(allocator, try req(p, "ok")),
-            .err = try decodeType(allocator, try req(p, "err")),
-            .is_error_unionable = try reqBool(p, "is_error_unionable"),
+            .ok = ok,
+            .err = err,
+            .is_error_unionable = is_error_unionable,
         };
         return .{ .result = inner };
     }
     if (std.mem.eql(u8, tag, "boxed")) {
         const inner = try allocator.create(types.Type);
+        errdefer allocator.destroy(inner);
         inner.* = try decodeType(allocator, val);
         return .{ .boxed = inner };
     }
@@ -624,10 +1138,18 @@ fn decodeCallKind(v: Json) !exprs.CallKind {
 fn decodeBlockExpr(allocator: std.mem.Allocator, v: Json) !exprs.BlockExpr {
     const o = try getObj(v);
     const labelled = try optStr(o, "labelled");
+    const statements = try decodeIdList(allocator, try req(o, "statements"));
+    errdefer allocator.free(statements);
+    const tail = try reqOptionalId(o, "tail");
+    const owned_labelled = if (labelled) |text| blk: {
+        const owned = try allocator.dupe(u8, text);
+        break :blk owned;
+    } else null;
+    errdefer if (owned_labelled) |text| allocator.free(text);
     return .{
-        .statements = try decodeIdList(allocator, try req(o, "statements")),
-        .tail = try reqOptionalId(o, "tail"),
-        .labelled = if (labelled) |s| try allocator.dupe(u8, s) else null,
+        .statements = statements,
+        .tail = tail,
+        .labelled = owned_labelled,
     };
 }
 
@@ -675,19 +1197,30 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     if (std.mem.eql(u8, tag, "unit")) return .unit;
     if (std.mem.eql(u8, tag, "if_else")) {
         const q = try getObj(val);
+        const cond = try reqU32(q, "cond");
+        const then_ = try decodeBlockExpr(allocator, try req(q, "then"));
+        errdefer freeDecodedBlockExpr(allocator, then_);
+        const else_branch = try decodeElseBranch(allocator, try req(q, "else"));
+        errdefer freeDecodedElseBranch(allocator, else_branch);
         return .{ .if_else = .{
-            .cond = try reqU32(q, "cond"),
-            .then_ = try decodeBlockExpr(allocator, try req(q, "then")),
-            .@"else" = try decodeElseBranch(allocator, try req(q, "else")),
+            .cond = cond,
+            .then_ = then_,
+            .@"else" = else_branch,
         } };
     }
     if (std.mem.eql(u8, tag, "if_let")) {
         const q = try getObj(val);
+        const pattern = try reqU32(q, "pattern");
+        const scrutinee = try reqU32(q, "scrutinee");
+        const then_ = try decodeBlockExpr(allocator, try req(q, "then"));
+        errdefer freeDecodedBlockExpr(allocator, then_);
+        const else_branch = try decodeElseBranch(allocator, try req(q, "else"));
+        errdefer freeDecodedElseBranch(allocator, else_branch);
         return .{ .if_let = .{
-            .pattern = try reqU32(q, "pattern"),
-            .scrutinee = try reqU32(q, "scrutinee"),
-            .then_ = try decodeBlockExpr(allocator, try req(q, "then")),
-            .@"else" = try decodeElseBranch(allocator, try req(q, "else")),
+            .pattern = pattern,
+            .scrutinee = scrutinee,
+            .then_ = then_,
+            .@"else" = else_branch,
         } };
     }
     if (std.mem.eql(u8, tag, "match")) {
@@ -697,18 +1230,30 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             else => return error.BadWireFormat,
         };
         var arms: std.ArrayListUnmanaged(exprs.MatchArm) = .empty;
+        errdefer freeDecodedMatchArmList(allocator, &arms);
         for (arms_arr.items) |av| {
             const ao = try getObj(av);
+            const patterns = try decodeIdList(allocator, try req(ao, "patterns"));
+            errdefer allocator.free(patterns);
+            const guard = try reqOptionalId(ao, "guard");
+            const body = try reqU32(ao, "body");
             try arms.append(allocator, .{
-                .patterns = try decodeIdList(allocator, try req(ao, "patterns")),
-                .guard = try reqOptionalId(ao, "guard"),
-                .body = try reqU32(ao, "body"),
+                .patterns = patterns,
+                .guard = guard,
+                .body = body,
             });
         }
+        const scrutinee = try reqU32(q, "scrutinee");
+        const arm_slice = try arms.toOwnedSlice(allocator);
+        errdefer {
+            for (arm_slice) |arm| allocator.free(arm.patterns);
+            allocator.free(arm_slice);
+        }
+        const option_scrutinee = try reqBool(q, "option_scrutinee");
         return .{ .match = .{
-            .scrutinee = try reqU32(q, "scrutinee"),
-            .arms = try arms.toOwnedSlice(allocator),
-            .option_scrutinee = try reqBool(q, "option_scrutinee"),
+            .scrutinee = scrutinee,
+            .arms = arm_slice,
+            .option_scrutinee = option_scrutinee,
         } };
     }
     if (std.mem.eql(u8, tag, "loop_")) {
@@ -717,27 +1262,43 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     }
     if (std.mem.eql(u8, tag, "while_")) {
         const q = try getObj(val);
+        const cond = try reqU32(q, "cond");
+        const body = try decodeBlockExpr(allocator, try req(q, "body"));
+        errdefer freeDecodedBlockExpr(allocator, body);
+        const capture = try reqOptionalId(q, "capture");
         return .{ .while_ = .{
-            .cond = try reqU32(q, "cond"),
-            .body = try decodeBlockExpr(allocator, try req(q, "body")),
-            .capture = try reqOptionalId(q, "capture"),
+            .cond = cond,
+            .body = body,
+            .capture = capture,
         } };
     }
     if (std.mem.eql(u8, tag, "for_")) {
         const q = try getObj(val);
+        const pattern = try reqU32(q, "pattern");
+        const iterable = try reqU32(q, "iterable");
+        const body = try decodeBlockExpr(allocator, try req(q, "body"));
+        errdefer freeDecodedBlockExpr(allocator, body);
+        const iter_kind = try decodeIterKind(allocator, try req(q, "iter_kind"));
+        errdefer freeDecodedIterKind(allocator, iter_kind);
         return .{ .for_ = .{
-            .pattern = try reqU32(q, "pattern"),
-            .iterable = try reqU32(q, "iterable"),
-            .body = try decodeBlockExpr(allocator, try req(q, "body")),
-            .iter_kind = try decodeIterKind(allocator, try req(q, "iter_kind")),
+            .pattern = pattern,
+            .iterable = iterable,
+            .body = body,
+            .iter_kind = iter_kind,
         } };
     }
     if (std.mem.eql(u8, tag, "break_")) {
         const q = try getObj(val);
         const label = try optStr(q, "label");
+        const owned_label = if (label) |text| blk: {
+            const owned = try allocator.dupe(u8, text);
+            break :blk owned;
+        } else null;
+        errdefer if (owned_label) |text| allocator.free(text);
+        const value = try reqOptionalId(q, "value");
         return .{ .break_ = .{
-            .label = if (label) |s| try allocator.dupe(u8, s) else null,
-            .value = try reqOptionalId(q, "value"),
+            .label = owned_label,
+            .value = value,
         } };
     }
     if (std.mem.eql(u8, tag, "continue_")) {
@@ -768,18 +1329,27 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             else => return error.BadWireFormat,
         };
         var fields: std.ArrayListUnmanaged(exprs.FieldInit) = .empty;
+        errdefer freeDecodedFieldInitList(allocator, &fields);
         for (fields_arr.items) |fv| {
             const fo = try getObj(fv);
+            const field = try allocator.dupe(u8, try reqStr(fo, "field"));
+            errdefer allocator.free(field);
+            const value = try reqU32(fo, "value");
+            const shorthand = try reqBool(fo, "shorthand");
             try fields.append(allocator, .{
-                .field = try allocator.dupe(u8, try reqStr(fo, "field")),
-                .value = try reqU32(fo, "value"),
-                .shorthand = try reqBool(fo, "shorthand"),
+                .field = field,
+                .value = value,
+                .shorthand = shorthand,
             });
         }
+        const def: spine.EntityId = @intCast(try reqU32(q, "def"));
+        const field_slice = try fields.toOwnedSlice(allocator);
+        errdefer freeDecodedFieldInits(allocator, field_slice);
+        const base = try reqOptionalId(q, "base");
         return .{ .struct_lit = .{
-            .def = @intCast(try reqU32(q, "def")),
-            .fields = try fields.toOwnedSlice(allocator),
-            .base = try reqOptionalId(q, "base"),
+            .def = def,
+            .fields = field_slice,
+            .base = base,
         } };
     }
     if (std.mem.eql(u8, tag, "enum_variant")) {
@@ -789,27 +1359,43 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             else => return error.BadWireFormat,
         };
         var named: std.ArrayListUnmanaged(exprs.FieldInit) = .empty;
+        errdefer freeDecodedFieldInitList(allocator, &named);
         for (named_arr.items) |fv| {
             const fo = try getObj(fv);
+            const field = try allocator.dupe(u8, try reqStr(fo, "field"));
+            errdefer allocator.free(field);
+            const value = try reqU32(fo, "value");
+            const shorthand = try reqBool(fo, "shorthand");
             try named.append(allocator, .{
-                .field = try allocator.dupe(u8, try reqStr(fo, "field")),
-                .value = try reqU32(fo, "value"),
-                .shorthand = try reqBool(fo, "shorthand"),
+                .field = field,
+                .value = value,
+                .shorthand = shorthand,
             });
         }
+        const def: spine.EntityId = @intCast(try reqU32(q, "def"));
+        const variant = try allocator.dupe(u8, try reqStr(q, "variant"));
+        errdefer allocator.free(variant);
+        const tuple_fields = try decodeIdList(allocator, try req(q, "tuple_fields"));
+        errdefer allocator.free(tuple_fields);
+        const named_fields = try named.toOwnedSlice(allocator);
+        errdefer freeDecodedFieldInits(allocator, named_fields);
         return .{ .enum_variant = .{
-            .def = @intCast(try reqU32(q, "def")),
-            .variant = try allocator.dupe(u8, try reqStr(q, "variant")),
-            .tuple_fields = try decodeIdList(allocator, try req(q, "tuple_fields")),
-            .named_fields = try named.toOwnedSlice(allocator),
+            .def = def,
+            .variant = variant,
+            .tuple_fields = tuple_fields,
+            .named_fields = named_fields,
         } };
     }
     if (std.mem.eql(u8, tag, "field")) {
         const q = try getObj(val);
+        const base = try reqU32(q, "base");
+        const field = try allocator.dupe(u8, try reqStr(q, "field"));
+        errdefer allocator.free(field);
+        const resolved: spine.EntityId = @intCast(try reqU32(q, "resolved"));
         return .{ .field = .{
-            .base = try reqU32(q, "base"),
-            .field = try allocator.dupe(u8, try reqStr(q, "field")),
-            .resolved = @intCast(try reqU32(q, "resolved")),
+            .base = base,
+            .field = field,
+            .resolved = resolved,
         } };
     }
     if (std.mem.eql(u8, tag, "index")) {
@@ -888,33 +1474,47 @@ fn decodePatternKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !
     if (std.mem.eql(u8, tag, "wildcard")) return .{ .wildcard = {} };
     if (std.mem.eql(u8, tag, "binding")) {
         const b = try getObj(val);
+        const name = try allocator.dupe(u8, try reqStr(b, "name"));
+        errdefer allocator.free(name);
+        const mode = try decodeBindMode(try reqStr(b, "mode"));
+        const mutable = try reqBool(b, "mutable");
         return .{ .binding = .{
-            .name = try allocator.dupe(u8, try reqStr(b, "name")),
-            .mode = try decodeBindMode(try reqStr(b, "mode")),
-            .mutable = try reqBool(b, "mutable"),
+            .name = name,
+            .mode = mode,
+            .mutable = mutable,
         } };
     }
-    if (std.mem.eql(u8, tag, "literal")) return .{ .literal = try decodeLiteral(allocator, val) };
     if (std.mem.eql(u8, tag, "path")) {
         const p = try getObj(val);
-        const variant = try optStr(p, "variant");
+        const def: spine.EntityId = @intCast(try reqU32(p, "def"));
+        const variant = if (try optStr(p, "variant")) |text| blk: {
+            const owned = try allocator.dupe(u8, text);
+            break :blk owned;
+        } else null;
+        errdefer if (variant) |text| allocator.free(text);
         return .{ .path = .{
-            .def = @intCast(try reqU32(p, "def")),
-            .variant = if (variant) |s| try allocator.dupe(u8, s) else null,
+            .def = def,
+            .variant = variant,
         } };
     }
     if (std.mem.eql(u8, tag, "tuple")) {
         const t = try getObj(val);
+        const elements = try decodeIdList(allocator, try req(t, "elements"));
+        errdefer allocator.free(elements);
+        const rest = try reqBool(t, "rest");
         return .{ .tuple = .{
-            .elements = try decodeIdList(allocator, try req(t, "elements")),
-            .rest = try reqBool(t, "rest"),
+            .elements = elements,
+            .rest = rest,
         } };
     }
     if (std.mem.eql(u8, tag, "slice")) {
         const t = try getObj(val);
+        const elements = try decodeIdList(allocator, try req(t, "elements"));
+        errdefer allocator.free(elements);
+        const rest = try reqOptionalId(t, "rest");
         return .{ .slice = .{
-            .elements = try decodeIdList(allocator, try req(t, "elements")),
-            .rest = try reqOptionalId(t, "rest"),
+            .elements = elements,
+            .rest = rest,
         } };
     }
     if (std.mem.eql(u8, tag, "struct_pat")) {
@@ -924,18 +1524,30 @@ fn decodePatternKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !
             else => return error.BadWireFormat,
         };
         var fields: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
+        errdefer freeDecodedFieldPatList(allocator, &fields);
         for (fields_arr.items) |fv| {
             const fo = try getObj(fv);
+            const field = try allocator.dupe(u8, try reqStr(fo, "field"));
+            errdefer allocator.free(field);
+            const pat = try reqOptionalId(fo, "pat");
+            const shorthand = try reqBool(fo, "shorthand");
             try fields.append(allocator, .{
-                .field = try allocator.dupe(u8, try reqStr(fo, "field")),
-                .pat = try reqOptionalId(fo, "pat"),
-                .shorthand = try reqBool(fo, "shorthand"),
+                .field = field,
+                .pat = pat,
+                .shorthand = shorthand,
             });
         }
+        const def: spine.EntityId = @intCast(try reqU32(t, "def"));
+        const field_slice = try fields.toOwnedSlice(allocator);
+        errdefer {
+            for (field_slice) |field| allocator.free(field.field);
+            allocator.free(field_slice);
+        }
+        const rest = try reqBool(t, "rest");
         return .{ .struct_pat = .{
-            .def = @intCast(try reqU32(t, "def")),
-            .fields = try fields.toOwnedSlice(allocator),
-            .rest = try reqBool(t, "rest"),
+            .def = def,
+            .fields = field_slice,
+            .rest = rest,
         } };
     }
     if (std.mem.eql(u8, tag, "reference")) {
@@ -1020,41 +1632,51 @@ fn decodeStatement(allocator: std.mem.Allocator, v: Json) !exprs.Statement {
 
 fn decodeParam(allocator: std.mem.Allocator, v: Json) !items.Param {
     const o = try getObj(v);
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
+    const ty = try decodeType(allocator, try req(o, "ty"));
+    errdefer freeDecodedType(allocator, ty);
+    const span = try decodeSpan(try req(o, "span"));
     return .{
-        .name = try allocator.dupe(u8, try reqStr(o, "name")),
-        .ty = try decodeType(allocator, try req(o, "ty")),
-        .span = try decodeSpan(try req(o, "span")),
+        .name = name,
+        .ty = ty,
+        .span = span,
     };
 }
 fn decodeField(allocator: std.mem.Allocator, v: Json) !items.Field {
     const o = try getObj(v);
-    const name = try reqStr(o, "name");
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
     const ty = try decodeType(allocator, try req(o, "ty"));
+    errdefer freeDecodedType(allocator, ty);
     const vis = if (o.get("vis") orelse o.get("visibility")) |vo|
         try decodeVisibility(allocator, vo)
     else
         spine.Visibility.public;
+    errdefer freeDecodedVisibility(allocator, vis);
     const sp = if (o.get("span")) |sv|
         try decodeSpan(sv)
     else
         spine.Span{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
     return .{
-        .name = try allocator.dupe(u8, name),
+        .name = name,
         .ty = ty,
         .visibility = vis,
         .span = sp,
     };
 }
-
 fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
     const o = try getObj(v);
     const kind_str = try reqStr(o, "kind");
     if (std.mem.eql(u8, kind_str, "none")) return .none;
     if (std.mem.eql(u8, kind_str, "const_")) {
         const co = try getObj(try req(o, "value"));
+        const ty = try decodeType(allocator, try req(co, "ty"));
+        errdefer freeDecodedType(allocator, ty);
+        const init = try reqU32(co, "init");
         return .{ .const_ = .{
-            .ty = try decodeType(allocator, try req(co, "ty")),
-            .init = try reqU32(co, "init"),
+            .ty = ty,
+            .init = init,
         } };
     }
     if (std.mem.eql(u8, kind_str, "fn_")) {
@@ -1064,11 +1686,21 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
             else => return error.BadWireFormat,
         };
         var params_list: std.ArrayListUnmanaged(items.Param) = .empty;
-        for (params_arr.items) |pv| try params_list.append(allocator, try decodeParam(allocator, pv));
+        errdefer freeDecodedParamList(allocator, &params_list);
+        for (params_arr.items) |pv| {
+            const param = try decodeParam(allocator, pv);
+            errdefer freeDecodedParam(allocator, param);
+            try params_list.append(allocator, param);
+        }
+        const params = try params_list.toOwnedSlice(allocator);
+        errdefer freeDecodedParams(allocator, params);
+        const ret = try decodeType(allocator, try req(fo, "ret"));
+        errdefer freeDecodedType(allocator, ret);
+        const body = try reqU32(fo, "body");
         return .{ .fn_ = .{
-            .params = try params_list.toOwnedSlice(allocator),
-            .ret = try decodeType(allocator, try req(fo, "ret")),
-            .body = try reqU32(fo, "body"),
+            .params = params,
+            .ret = ret,
+            .body = body,
         } };
     }
     if (std.mem.eql(u8, kind_str, "struct_")) {
@@ -1081,16 +1713,21 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
                 if (std.mem.eql(u8, ls, "unit")) layout = .unit;
             }
             var fields_list: std.ArrayListUnmanaged(items.Field) = .empty;
+            errdefer freeDecodedFieldList(allocator, &fields_list);
             if (so.get("fields")) |fv| {
                 if (fv == .array) {
                     for (fv.array.items) |item| {
-                        try fields_list.append(allocator, try decodeField(allocator, item));
+                        const field = try decodeField(allocator, item);
+                        errdefer freeDecodedField(allocator, field);
+                        try fields_list.append(allocator, field);
                     }
                 }
             }
+            const fields = try fields_list.toOwnedSlice(allocator);
+            errdefer freeDecodedFields(allocator, fields);
             return .{ .struct_ = .{
                 .layout = layout,
-                .fields = try fields_list.toOwnedSlice(allocator),
+                .fields = fields,
             } };
         }
         return .{ .struct_ = .{} };
@@ -1115,42 +1752,92 @@ fn decodeBodies(allocator: std.mem.Allocator, v: Json) !Bodies {
         else => return error.BadWireFormat,
     };
     var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
-    for (exprs_arr.items) |ev| try exprs_list.append(allocator, try decodeExpr(allocator, ev));
+    errdefer freeDecodedExprList(allocator, &exprs_list);
+    for (exprs_arr.items) |ev| {
+        const expression = try decodeExpr(allocator, ev);
+        errdefer freeDecodedExpr(allocator, expression);
+        try exprs_list.append(allocator, expression);
+    }
 
     const stmts_arr = switch (try req(o, "stmts")) {
         .array => |a| a,
         else => return error.BadWireFormat,
     };
     var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
-    for (stmts_arr.items) |sv| try stmts_list.append(allocator, try decodeStatement(allocator, sv));
+    errdefer freeDecodedStatementList(allocator, &stmts_list);
+    for (stmts_arr.items) |sv| {
+        const statement = try decodeStatement(allocator, sv);
+        errdefer freeDecodedStatement(allocator, statement);
+        try stmts_list.append(allocator, statement);
+    }
 
     const pats_arr = switch (try req(o, "pats")) {
         .array => |a| a,
         else => return error.BadWireFormat,
     };
     var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
-    for (pats_arr.items) |pv| try pats_list.append(allocator, try decodePattern(allocator, pv));
+    errdefer freeDecodedPatternList(allocator, &pats_list);
+    for (pats_arr.items) |pv| {
+        const pattern = try decodePattern(allocator, pv);
+        errdefer freeDecodedPattern(allocator, pattern);
+        try pats_list.append(allocator, pattern);
+    }
 
     const types_arr = switch (try req(o, "types")) {
         .array => |a| a,
         else => return error.BadWireFormat,
     };
     var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
-    for (types_arr.items) |tv| try types_list.append(allocator, try decodeType(allocator, tv));
+    errdefer freeDecodedTypeList(allocator, &types_list);
+    for (types_arr.items) |tv| {
+        const ty = try decodeType(allocator, tv);
+        errdefer freeDecodedType(allocator, ty);
+        try types_list.append(allocator, ty);
+    }
 
     const bodies_arr = switch (try req(o, "bodies")) {
         .array => |a| a,
         else => return error.BadWireFormat,
     };
     var bodies_list: std.ArrayListUnmanaged(BodyKind) = .empty;
-    for (bodies_arr.items) |bv| try bodies_list.append(allocator, try decodeBodyKind(allocator, bv));
+    errdefer freeDecodedBodyList(allocator, &bodies_list);
+    for (bodies_arr.items) |bv| {
+        const body = try decodeBodyKind(allocator, bv);
+        errdefer freeDecodedBodyKind(allocator, body);
+        try bodies_list.append(allocator, body);
+    }
 
+    const exprs_slice = try exprs_list.toOwnedSlice(allocator);
+    errdefer {
+        for (exprs_slice) |expression| freeDecodedExpr(allocator, expression);
+        allocator.free(exprs_slice);
+    }
+    const stmts_slice = try stmts_list.toOwnedSlice(allocator);
+    errdefer {
+        for (stmts_slice) |statement| freeDecodedStatement(allocator, statement);
+        allocator.free(stmts_slice);
+    }
+    const pats_slice = try pats_list.toOwnedSlice(allocator);
+    errdefer {
+        for (pats_slice) |pattern| freeDecodedPattern(allocator, pattern);
+        allocator.free(pats_slice);
+    }
+    const types_slice = try types_list.toOwnedSlice(allocator);
+    errdefer {
+        for (types_slice) |ty| freeDecodedType(allocator, ty);
+        allocator.free(types_slice);
+    }
+    const bodies_slice = try bodies_list.toOwnedSlice(allocator);
+    errdefer {
+        for (bodies_slice) |body| freeDecodedBodyKind(allocator, body);
+        allocator.free(bodies_slice);
+    }
     return .{
-        .exprs = try exprs_list.toOwnedSlice(allocator),
-        .stmts = try stmts_list.toOwnedSlice(allocator),
-        .pats = try pats_list.toOwnedSlice(allocator),
-        .types = try types_list.toOwnedSlice(allocator),
-        .bodies = try bodies_list.toOwnedSlice(allocator),
+        .exprs = exprs_slice,
+        .stmts = stmts_slice,
+        .pats = pats_slice,
+        .types = types_slice,
+        .bodies = bodies_slice,
     };
 }
 
@@ -1179,11 +1866,13 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
     for (crates_arr.items) |cratev| {
         const c = try getObj(cratev);
         const name = try allocator.dupe(u8, try reqStr(c, "name"));
+        errdefer allocator.free(name);
         const edition: u16 = @intCast(try reqU32(c, "edition"));
         const kind = try decodeCrateKind(try reqStr(c, "kind"));
         const root: spine.EntityId = @intCast(try reqU32(c, "root"));
         const is_translated = try reqBool(c, "is_translated");
         const deps = try decodeDeps(allocator, try req(c, "deps"));
+        errdefer freeDecodedCrateDeps(allocator, deps);
 
         // Entities populate the shared symbol table first (dense ids 0..N).
         const entities_arr = switch (try req(c, "entities")) {
@@ -1191,8 +1880,9 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
             else => return error.BadWireFormat,
         };
         for (entities_arr.items) |ev| {
-            const e = try decodeEntity(allocator, ev);
-            _ = try g.symbol_table.add(e);
+            const entity = try decodeEntity(allocator, ev);
+            errdefer freeDecodedEntity(allocator, entity);
+            _ = try g.symbol_table.add(entity);
         }
         // Modules mirror the symbol table (dense id == index).
         const modules_arr = switch (try req(c, "modules")) {
@@ -1200,16 +1890,18 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
             else => return error.BadWireFormat,
         };
         for (modules_arr.items) |mv| {
-            const m = try decodeModule(allocator, mv);
-            _ = try g.addModule(m);
+            const module = try decodeModule(allocator, mv);
+            errdefer freeDecodedModule(allocator, module);
+            _ = try g.addModule(module);
         }
         const uses_arr = switch (try req(c, "uses")) {
             .array => |a| a,
             else => return error.BadWireFormat,
         };
         for (uses_arr.items) |uv| {
-            const u = try decodeUseDecl(allocator, uv);
-            try g.addUse(u);
+            const use_decl = try decodeUseDecl(allocator, uv);
+            errdefer freeDecodedUseDecl(allocator, use_decl);
+            try g.addUse(use_decl);
         }
 
         try g.addCrate(.{
@@ -1495,11 +2187,15 @@ fn encodeCrate(
     }
     try o.put(allocator, "entities", .{ .array = ents });
 
-    var uses = Array.init(allocator);
-    for (g.uses.items) |u| {
-        if (u.id < member.len and member[u.id]) try uses.append(try encodeUseDecl(allocator, u));
+    const source_uses = g.uses.items;
+    var encoded_uses = Array.init(allocator);
+    for (source_uses) |use_decl| {
+        if (use_decl.id < member.len and member[use_decl.id]) {
+            const encoded_use = try encodeUseDecl(allocator, use_decl);
+            try encoded_uses.append(encoded_use);
+        }
     }
-    try o.put(allocator, "uses", .{ .array = uses });
+    try o.put(allocator, "uses", .{ .array = encoded_uses });
 
     return .{ .object = o };
 }
@@ -2403,10 +3099,116 @@ test "7. encode round-trips (crate/module/entity/use counts equal)" {
     try std.testing.expectEqual(g.symbol_table.count(), g2.symbol_table.count());
     try std.testing.expectEqual(g.uses.items.len, g2.uses.items.len);
 }
+test "encode preserves nonempty use payloads" {
+    const allocator = std.testing.allocator;
+    var g = try parseMini(allocator);
+    defer g.deinit();
+
+    const encoded = try encode(allocator, &g);
+    defer allocator.free(encoded);
+    var parsed = std.json.parseFromSlice(Json, allocator, encoded, .{}) catch
+        return error.InvalidJson;
+    defer parsed.deinit();
+
+    const root = try getObj(parsed.value);
+    const crates = switch (try req(root, "crates")) {
+        .array => |array| array,
+        else => return error.BadWireFormat,
+    };
+    const crate = try getObj(crates.items[0]);
+    const uses = switch (try req(crate, "uses")) {
+        .array => |array| array,
+        else => return error.BadWireFormat,
+    };
+    try std.testing.expectEqual(@as(usize, 1), uses.items.len);
+    const use_object = try getObj(uses.items[0]);
+    try std.testing.expectEqualStrings("alias", try reqStr(use_object, "kind"));
+    try std.testing.expectEqualStrings("helper", try reqStr(use_object, "local_name"));
+    try std.testing.expectEqual(@as(u32, 7), try reqU32(use_object, "target"));
+}
 
 test "8. invalid JSON is rejected" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidJson, parse(allocator, "this is not json {"));
+}
+test "decoder releases partially owned values on allocation failure" {
+    const allocator = std.testing.allocator;
+    const attributes_json =
+        \\{"attributes":[{"name":"first","meta":"one","known":true},{"name":"second","meta":"two","known":false}]}
+    ;
+    var parsed_attributes = std.json.parseFromSlice(Json, allocator, attributes_json, .{}) catch
+        return error.InvalidJson;
+    defer parsed_attributes.deinit();
+    const attributes_value = (try getObj(parsed_attributes.value)).get("attributes") orelse
+        return error.BadWireFormat;
+
+    var attribute_fail_index: usize = 0;
+    while (attribute_fail_index < 8) : (attribute_fail_index += 1) {
+        var failing_allocator = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = attribute_fail_index,
+        });
+        const result = decodeAttributes(failing_allocator.allocator(), attributes_value);
+        if (result) |attributes| {
+            freeDecodedAttributes(failing_allocator.allocator(), attributes);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(
+            failing_allocator.allocated_bytes,
+            failing_allocator.freed_bytes,
+        );
+    }
+
+    const nested_type_json =
+        \\{"kind":"result","value":{"ok":{"kind":"path","value":{"segments":[{"name":"Value","id":null}]}}, "err":{"kind":"prim","value":"u8"}, "is_error_unionable":true}}
+    ;
+    var parsed_type = std.json.parseFromSlice(Json, allocator, nested_type_json, .{}) catch
+        return error.InvalidJson;
+    defer parsed_type.deinit();
+    var type_fail_index: usize = 0;
+    while (type_fail_index < 8) : (type_fail_index += 1) {
+        var failing_allocator = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = type_fail_index,
+        });
+        const result = decodeType(failing_allocator.allocator(), parsed_type.value);
+        if (result) |ty| {
+            freeDecodedType(failing_allocator.allocator(), ty);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(
+            failing_allocator.allocated_bytes,
+            failing_allocator.freed_bytes,
+        );
+    }
+}
+
+test "decodeBodies releases each table on final transfer failure" {
+    const allocator = std.testing.allocator;
+    const bodies_json =
+        \\{"exprs":[{"id":0,"span":{"start_line":1,"start_col":1,"end_line":1,"end_col":1},"ty":null,"kind":"unit","value":null}],"stmts":[{"id":0,"span":{"start_line":1,"start_col":1,"end_line":1,"end_col":1},"ty":null,"kind":"expr","value":0}],"pats":[{"id":0,"span":{"start_line":1,"start_col":1,"end_line":1,"end_col":1},"ty":null,"kind":"wildcard","value":null}],"types":[{"kind":"prim","value":"u8"}],"bodies":[{"kind":"none"}]}
+    ;
+    var parsed = std.json.parseFromSlice(Json, allocator, bodies_json, .{}) catch
+        return error.InvalidJson;
+    defer parsed.deinit();
+
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing_allocator = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        const result = decodeBodies(failing_allocator.allocator(), parsed.value);
+        if (result) |bodies| {
+            freeDecodedBodies(failing_allocator.allocator(), bodies);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(
+            failing_allocator.allocated_bytes,
+            failing_allocator.freed_bytes,
+        );
+    }
 }
 
 fn fnvJson(allocator: std.mem.Allocator) ![]const u8 {

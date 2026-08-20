@@ -204,15 +204,15 @@ fn writeFile(
 // ---------------------------------------------------------------------------
 
 fn buildTestPackage() ast.Package {
-    const std_import = ast.Import{ .local_name = "std", .module_or_path = "std" };
+    const std_import: ast.Import = .{ .local_name = "std", .module_or_path = "std" };
 
-    const limit_decl = ast.Decl{ .const_decl = .{
+    const limit_decl: ast.Decl = .{ .const_decl = .{
         .name = "LIMIT",
         .ty = ast.Type{ .prim = .u32 },
         .init = .{ .lit = .{ .int = 42 } },
     } };
 
-    const add_fn = ast.Decl{ .fn_decl = .{
+    const add_fn: ast.Decl = .{ .fn_decl = .{
         .name = "add",
         .params = &.{
             .{ .name = "a", .ty = ast.Type{ .prim = .u32 } },
@@ -228,7 +228,7 @@ fn buildTestPackage() ast.Package {
         },
     } };
 
-    const file = ast.File{
+    const file: ast.File = .{
         .path = "src/root.zig",
         .imports = &.{std_import},
         .decls = &.{ limit_decl, add_fn },

@@ -70,13 +70,17 @@ fn text(e: *const Ext, node: ts.Node) []const u8 {
     return e.ctx.src[node.startByte()..node.endByte()];
 }
 
-/// Add a module-scope named fn entity id lookup — returns the entity id of the
-/// first module-kind-parented symbol with `name`.
+/// Look up a module-scope entity or a `use ... as Local` binding by name.
 fn lookupModuleEntity(e: *const Ext, name: []const u8) ?spine.EntityId {
     for (e.ctx.g.symbol_table.entities.items) |ent| {
         if (std.mem.eql(u8, ent.name, name)) {
             return ent.id;
         }
+    }
+    // `use path as Local` binds the local spelling separately from the
+    // use_ entity's diagnostic path/name.
+    for (e.ctx.g.uses.items) |use| {
+        if (std.mem.eql(u8, use.local_name, name)) return use.id;
     }
     return null;
 }
@@ -89,6 +93,133 @@ fn resolveName(e: *const Ext, name: []const u8) ?spine.EntityId {
         if (std.mem.eql(u8, e.locals.items[i].name, name)) return e.locals.items[i].def;
     }
     if (lookupModuleEntity(e, name)) |def| return def;
+    return null;
+}
+/// Strip trait and generic decorations from an implementation/type name.
+fn nominalName(name: []const u8) []const u8 {
+    var out = std.mem.trim(u8, name, " \t\r\n");
+    if (std.mem.lastIndexOf(u8, out, " for ")) |separator| {
+        out = out[separator + 5 ..];
+    }
+    if (std.mem.indexOfScalar(u8, out, '<')) |generic_start| {
+        out = out[0..generic_start];
+    }
+    return std.mem.trim(u8, out, " \t\r\n");
+}
+
+fn nominalNamesEqual(lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.eql(u8, nominalName(lhs), nominalName(rhs));
+}
+
+/// Resolve the terminal entity of a type path used by an alias body.
+fn resolveTypePath(e: *const Ext, path: types.Path) ?spine.EntityId {
+    if (path.segments.len == 0) return null;
+    const terminal = path.segments[path.segments.len - 1];
+    if (terminal.id) |id| return id;
+    return lookupModuleEntity(e, terminal.name);
+}
+
+/// Follow an imported binding to its resolved target entity.
+fn resolveUseTarget(e: *const Ext, use_id: spine.EntityId) ?spine.EntityId {
+    const use_ent = e.ctx.g.symbol_table.get(use_id) orelse return null;
+    if (use_ent.resolved) |resolved| return resolved;
+    for (e.ctx.g.uses.items) |use| {
+        if (use.id != use_id) continue;
+        return if (use.target != 0) use.target else null;
+    }
+    return null;
+}
+
+/// Return whether an entity can own inherent associated functions.
+fn isNominalEntity(kind: spine.EntityKind) bool {
+    return switch (kind) {
+        .struct_, .enum_, .union_ => true,
+        else => false,
+    };
+}
+
+/// Resolve the nominal target of an alias or imported type binding.
+fn resolveNominalTarget(e: *const Ext, entity_id: spine.EntityId) ?spine.EntityId {
+    var current = entity_id;
+    var hop_count: usize = 0;
+    while (hop_count < e.ctx.g.symbol_table.entities.items.len) : (hop_count += 1) {
+        const entity = e.ctx.g.symbol_table.get(current) orelse return null;
+        if (isNominalEntity(entity.kind)) return current;
+        switch (entity.kind) {
+            .type_alias => {},
+            .use_ => current = resolveUseTarget(e, current) orelse return null,
+            else => return null,
+        }
+        if (entity.kind == .use_) continue;
+        if (current >= e.ctx.bodies_list.items.len) return null;
+        const target = switch (e.ctx.bodies_list.items[current]) {
+            .type_alias => |alias| alias.target,
+            else => return null,
+        };
+        current = switch (target) {
+            .generic_inst => |generic| generic.decl,
+            .path => |path| resolveTypePath(e, path) orelse return null,
+            else => return null,
+        };
+    }
+    return null;
+}
+
+/// Follow aliases or imported type bindings to their nominal method owner.
+fn resolveAliasNominalType(e: *const Ext, entity_id: spine.EntityId) ?spine.EntityId {
+    return resolveNominalTarget(e, entity_id);
+}
+
+/// Resolve an associated function on a nominal type or its implementation.
+fn resolveTypeMethod(
+    e: *const Ext,
+    type_id: spine.EntityId,
+    method: []const u8,
+) ?spine.EntityId {
+    const type_ent = e.ctx.g.symbol_table.get(type_id) orelse return null;
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .fn_) continue;
+        if (!std.mem.eql(u8, ent.name, method)) continue;
+        const parent = ent.parent orelse continue;
+        if (parent == type_id) return ent.id;
+        const parent_ent = e.ctx.g.symbol_table.get(parent) orelse continue;
+        if (parent_ent.kind != .impl_) continue;
+        if (parent_ent.parent == type_id) return ent.id;
+        if (nominalNamesEqual(parent_ent.name, type_ent.name)) return ent.id;
+    }
+    return null;
+}
+
+/// Resolve `Self` for a function nested in an implementation block.
+fn resolveSelfType(e: *const Ext) ?spine.EntityId {
+    var current = e.ctx.g.symbol_table.get(e.fn_id).?.parent;
+    while (current) |id| {
+        const ent = e.ctx.g.symbol_table.get(id) orelse return null;
+        switch (ent.kind) {
+            .struct_, .enum_, .union_ => return ent.id,
+            .impl_ => {
+                if (ent.parent) |parent_id| {
+                    if (e.ctx.g.symbol_table.get(parent_id)) |parent_ent| {
+                        switch (parent_ent.kind) {
+                            .struct_, .enum_, .union_ => return parent_ent.id,
+                            else => {},
+                        }
+                    }
+                }
+                const type_name = nominalName(ent.name);
+                if (lookupModuleEntity(e, type_name)) |type_id| {
+                    if (e.ctx.g.symbol_table.get(type_id)) |type_ent| {
+                        switch (type_ent.kind) {
+                            .struct_, .enum_, .union_ => return type_id,
+                            else => {},
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        current = ent.parent;
+    }
     return null;
 }
 
@@ -1148,10 +1279,66 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     var cdef: ?spine.EntityId = null;
     if (std.mem.eql(u8, callee.kind(), "identifier")) {
         cdef = resolveName(e, text(e, callee));
-    } else if (std.mem.eql(u8, callee.kind(), "scoped_identifier")) {
+    } else if (std.mem.eql(u8, callee.kind(), "scoped_identifier") or
+        std.mem.eql(u8, callee.kind(), "scoped_type_identifier") or
+        std.mem.eql(u8, callee.kind(), "path"))
+    {
         const t = text(e, callee);
-        const last = std.mem.lastIndexOfScalar(u8, t, ':') orelse return unsupported(e, "scoped call");
-        cdef = resolveName(e, t[last + 1 ..]);
+        const sep = std.mem.indexOf(u8, t, "::");
+        if (sep == null) {
+            cdef = resolveName(e, t);
+        } else {
+            const last = std.mem.lastIndexOfScalar(u8, t, ':') orelse
+                return unsupported(e, "scoped call");
+            const base_name = t[0..sep.?];
+            const method_name = t[last + 1 ..];
+            const base_id = if (std.mem.eql(u8, base_name, "Self"))
+                resolveSelfType(e)
+            else if (std.mem.eql(u8, base_name, "crate") or
+                std.mem.eql(u8, base_name, "self") or
+                std.mem.eql(u8, base_name, "super"))
+                null
+            else
+                resolveName(e, base_name);
+            if (base_id) |bid| {
+                const base_ent = e.ctx.g.symbol_table.get(bid) orelse
+                    return unsupported(e, "unresolved associated call");
+                if (resolveAliasNominalType(e, bid)) |type_id| {
+                    if (resolveTypeMethod(e, type_id, method_name)) |method_id| {
+                        return appendExpr(e, .{ .call = .{
+                            .call_kind = .{ .associated = method_id },
+                            .args = try arg_list.toOwnedSlice(e.ctx.alloc),
+                        } });
+                    }
+                    return unsupported(e, "unresolved associated call");
+                }
+
+                // A module-qualified call remains a free call. Imported
+                // module bindings need the same treatment.
+                const module_id = if (base_ent.kind == .use_)
+                    resolveUseTarget(e, bid)
+                else if (base_ent.kind == .module)
+                    bid
+                else
+                    null;
+                if (module_id) |mid| {
+                    const module_ent = e.ctx.g.symbol_table.get(mid) orelse
+                        return unsupported(e, "unresolved scoped module");
+                    if (module_ent.kind != .module) {
+                        return unsupported(e, "unresolved associated call");
+                    }
+                } else if (base_ent.kind != .module) {
+                    return unsupported(e, "unresolved associated call");
+                }
+            } else if (std.mem.eql(u8, base_name, "Self") or
+                (!std.mem.eql(u8, base_name, "crate") and
+                    !std.mem.eql(u8, base_name, "self") and
+                    !std.mem.eql(u8, base_name, "super")))
+            {
+                return unsupported(e, "unresolved associated call");
+            }
+            cdef = resolveName(e, method_name);
+        }
     }
     if (cdef) |def| {
         return appendExpr(e, .{ .call = .{ .call_kind = .{ .free = def }, .args = try arg_list.toOwnedSlice(e.ctx.alloc) } });
@@ -1203,9 +1390,11 @@ fn lowerIf(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         // else may be an inline block or an `else if`.
         const enk = en.kind();
         if (std.mem.eql(u8, enk, "block")) {
-            else_branch = .{ .block = try lowerBlock(e, en) };
+            const block = try lowerBlock(e, en);
+            else_branch = .{ .block = block };
         } else if (std.mem.eql(u8, enk, "if_expression")) {
-            else_branch = .{ .chain = try lowerIf(e, en) };
+            const chain = try lowerIf(e, en);
+            else_branch = .{ .chain = chain };
         }
     }
     return appendExpr(e, .{ .if_else = .{ .cond = cond_id, .then_ = then_blk, .@"else" = else_branch } });
@@ -1729,4 +1918,190 @@ test "lower struct_expression to .struct_lit and match_expression to .match" {
     try std.testing.expectEqual(@as(usize, 2), struct_pat_count); // Circle + Rect
     try std.testing.expect(found_binding_r); // r bound by Circle(r)
     try std.testing.expect(found_float); // 3.14159 in the Circle arm body
+}
+
+test "lower associated constructor through a compatible type alias" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const module_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const fletcher_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try alloc.dupe(u8, "Fletcher"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const alias_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .type_alias,
+        .name = try alloc.dupe(u8, "Fletcher16"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const impl_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try alloc.dupe(u8, "Fletcher<T>"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const new_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "new"),
+        .span = span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const caller_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "make"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = module_id,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{ fletcher_id, alias_id, caller_id },
+        .attributes = &.{},
+    });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .struct_ = .{
+        .generic_params = &.{"T"},
+        .layout = .named,
+        .fields = &.{},
+    } });
+    try bodies_list.append(alloc, .{ .type_alias = .{
+        .target = .{ .generic_inst = .{
+            .decl = fletcher_id,
+            .args = .{ .params = &.{.{ .prim = .u16 }} },
+        } },
+    } });
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+
+    const src =
+        \\fn make() {
+        \\    Missing::new();
+        \\    Fletcher16::new()
+        \\}
+    ;
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = src,
+        .mod_id = module_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, caller_id));
+
+    const body = exprs_list.items[bodies_list.items[caller_id].fn_.body];
+    try std.testing.expect(body.kind == .block);
+    const call_id = body.kind.block.tail orelse return error.MissingTailExpression;
+    switch (exprs_list.items[call_id].kind) {
+        .call => |call| switch (call.call_kind) {
+            .associated => |target| try std.testing.expectEqual(
+                @as(exprs.DefId, new_id),
+                target,
+            ),
+            else => return error.ExpectedAssociatedCall,
+        },
+        else => return error.ExpectedCall,
+    }
+    if (body.kind.block.statements.len == 0) return error.MissingUnsupportedStatement;
+    const missing_stmt_id = body.kind.block.statements[0];
+    const missing_expr_id = switch (stmts_list.items[missing_stmt_id].kind) {
+        .expr => |expr_id| expr_id,
+        else => return error.ExpectedUnsupportedCallStatement,
+    };
+    switch (exprs_list.items[missing_expr_id].kind) {
+        .unsupported => {},
+        else => return error.ExpectedUnsupportedCall,
+    }
+
+    var saw_unsupported = false;
+    var saw_free_new = false;
+    for (exprs_list.items) |expression| {
+        switch (expression.kind) {
+            .unsupported => saw_unsupported = true,
+            .call => |call| switch (call.call_kind) {
+                .free => |target| {
+                    if (target == new_id) saw_free_new = true;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_unsupported);
+    try std.testing.expect(!saw_free_new);
 }

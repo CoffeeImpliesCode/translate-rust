@@ -115,19 +115,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
-    // ── sidecar: drive the v0 Rust producer against a fixture crate ──────
-    // `zig build sidecar` runs tools/sidecar/rustdoc-json.sh on the mini
-    // fixture crate, emitting its raw rustdoc JSON to zig-out/ (the v1
-    // wire-format normalization is a later phase — P4+).
-    const sidecar_step = b.step("sidecar", "Run the Rust sidecar (cargo +nightly rustdoc) on the mini fixture");
-    const sidecar = b.addSystemCommand(&.{
-        "sh",               "tools/sidecar/rustdoc-json.sh",
-        "test/crates/mini", "zig-out",
-    });
-    sidecar_step.dependOn(&sidecar.step);
-
-    // ── source: run the Rust-source driver on a crate dir ─────────────
-    // `zig build source` → cargo +nightly rustdoc (via sidecar) on
+    // `zig build source` invokes the installed source-native CLI on
     // test/crates/fnv, producing zig-out/r2z-fnv/ as a standalone package.
     const source_step = b.step("source", "Run the Rust-source driver on the fnv crate -> zig-out/r2z-fnv");
     const source_cmd = b.addSystemCommand(&.{
@@ -140,9 +128,8 @@ pub fn build(b: *std.Build) void {
     // ── e2e: in-process native translation of Rust source → Zig packages ──
     // Runs test/e2e_test.zig as a normal executable (NOT a b.addTest: Zig's
     // `--listen` test-runner protocol cannot spawn grandchildren, but the e2e
-    // test must run `zig build test` inside each emitted package). Exercises
-    // `driver.translate` on test/crates/{mini,fnv} and asserts the emitted
-    // packages compile + pass `zig build test` with no Rust toolchain.
+    // `driver.translate` on test/crates/{mini,fnv,fletcher} and asserts the emitted
+    // packages compile + pass `zig build test` without Rust tooling.
     const e2e_mod = b.addModule("e2e_test", .{
         .root_source_file = b.path("test/e2e_test.zig"),
         .target = target,
@@ -156,7 +143,7 @@ pub fn build(b: *std.Build) void {
         .root_module = e2e_mod,
     });
     const run_e2e = b.addRunArtifact(e2e_exe);
-    const e2e_step = b.step("test-e2e", "E2E: translate Rust source crates -> working Zig packages");
+    const e2e_step = b.step("test-e2e", "E2E: translate mini/fnv/fletcher Rust source crates -> working Zig packages");
     e2e_step.dependOn(&run_e2e.step);
 
     // ── translate: run the CLI on a wire-format JSON in `zig-out/` ─────
@@ -278,7 +265,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_e2e.step);
     test_crates_step.dependOn(&run_e2e.step);
 
-    // ── golden serialization tests (RustIR + ZigAST snapshots) ─────────────
+    // ── golden serialization tests (RustIr + ZigAST snapshots) ─────────────
     const golden_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/golden_test.zig"),

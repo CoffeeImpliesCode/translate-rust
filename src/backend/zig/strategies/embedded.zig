@@ -21,19 +21,19 @@ pub const EmbeddedStrategy = struct {
         _ = ctx;
         _ = params;
         if (std.mem.eql(u8, name, "Vec")) {
-            return ast.Type{ .named = "std.ArrayListUnmanaged" };
+            return .{ .named = "std.ArrayListUnmanaged" };
         }
         if (std.mem.eql(u8, name, "String")) {
-            return ast.Type{ .named = "[]const u8" };
+            return .{ .named = "[]const u8" };
         }
         if (std.mem.eql(u8, name, "BuildHasherDefault")) {
-            return ast.Type{ .named = "std.hash.BuildHasherDefault" };
+            return .{ .named = "std.hash.BuildHasherDefault" };
         }
         if (std.mem.eql(u8, name, "HashMap") or
             std.mem.eql(u8, name, "HashSet") or
             std.mem.eql(u8, name, "BTreeMap"))
         {
-            return ast.Type{ .named = "std.AutoHashMap" };
+            return .{ .named = "std.AutoHashMap" };
         }
         return null;
     }

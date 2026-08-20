@@ -1,6 +1,6 @@
 //! translate_rust.backend.zig.lower_test — Lowering engine tests.
 //!
-//! Builds a sample RustIR (struct with inherent methods + hoisted impl method,
+//! Builds a sample RustIr (struct with inherent methods + hoisted impl method,
 //! top-level fn with a match expression, and a #[test] fn), lowers it to an
 //! ast.Package, and verifies struct decls, method hoisting, expression shape,
 //! and module-to-file mapping.
@@ -16,7 +16,7 @@ const span: ir.spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .
 const vec_unavailable_reason =
     "Vec literal: allocator-backed Vec adapter unavailable";
 
-// Build the full sample RustIR in-memory. All allocations go to the caller's
+// Build the full sample RustIr in-memory. All allocations go to the caller's
 // `alloc` (the test's long-lived arena), which must outlive lowering.
 const Model = struct {
     alloc: std.mem.Allocator,
@@ -263,7 +263,7 @@ fn buildSampleModel(
         },
     };
 
-    // ── Wire bodies into the RustIR ───────────────────────────────────────
+    // ── Wire bodies into the RustIr ───────────────────────────────────────
     bodies.* = .{
         .exprs = try model.exprs.toOwnedSlice(model.a()),
         .stmts = try model.stmts.toOwnedSlice(model.a()),
@@ -296,7 +296,7 @@ fn buildSampleModel(
     });
 }
 
-test "lowerRustIR: struct methods, hoisting, and expressions" {
+test "lowerRustIr: struct methods, hoisting, and expressions" {
     const backing = std.testing.allocator;
     // One long-lived arena backs both the model and the lowering output.
     var arena = std.heap.ArenaAllocator.init(backing);
@@ -314,7 +314,7 @@ test "lowerRustIR: struct methods, hoisting, and expressions" {
 
     try buildSampleModel(alloc, &graph, &ir_bodies);
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "sample",
         .edition = "2021",
         .graph = graph,
@@ -332,7 +332,7 @@ test "lowerRustIR: struct methods, hoisting, and expressions" {
         },
     };
 
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, &strat);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, &strat);
 
     // ── Package and file mapping ──────────────────────────────────────────
     try std.testing.expectEqualStrings("sample", pkg.name);
@@ -475,6 +475,28 @@ fn buildTypeModel(
         .renamed_to = null,
         .attributes = &.{},
     });
+    const empty_path_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "empty_path",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const recovered_path_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "recovered_path",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
 
     // make_point body: block { tail = Point { x = 1, y = 2 } }
     const e_x = try model.e(litInt(1));
@@ -498,6 +520,10 @@ fn buildTypeModel(
     const point_segments = try alloc.alloc(ir.types.PathSegment, 1);
     point_segments[0] = .{ .name = "Point", .id = point_id };
     const point_type: ir.types.Type = .{ .path = .{ .segments = point_segments } };
+    const empty_path_type: ir.types.Type = .{ .path = .{ .segments = &.{} } };
+    const recovered_segments = try alloc.alloc(ir.types.PathSegment, 1);
+    recovered_segments[0] = .{ .name = "", .id = point_id };
+    const recovered_path_type: ir.types.Type = .{ .path = .{ .segments = recovered_segments } };
 
     // Bodies (indexed by entity id):
     //  id0: Point struct (no fields)
@@ -515,6 +541,18 @@ fn buildTypeModel(
     try model.bodies.append(model.a(), .{ .fn_ = .{
         .params = &.{},
         .ret = .{ .prim = .char },
+        .body = e_char_block,
+    } });
+    // Empty paths lower safely to `unknown`. A malformed name with a valid
+    // entity id retains the recovered entity-name behavior.
+    try model.bodies.append(model.a(), .{ .fn_ = .{
+        .params = &.{},
+        .ret = empty_path_type,
+        .body = e_char_block,
+    } });
+    try model.bodies.append(model.a(), .{ .fn_ = .{
+        .params = &.{},
+        .ret = recovered_path_type,
         .body = e_char_block,
     } });
 
@@ -535,7 +573,7 @@ fn buildTypeModel(
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{ point_id, make_point_id, first_char_id },
+        .items = &.{ point_id, make_point_id, first_char_id, empty_path_id, recovered_path_id },
         .attributes = &.{},
     });
     try graph.addCrate(.{
@@ -564,20 +602,20 @@ test "lower: non-primitive fn return types and block tail preservation" {
     };
     try buildTypeModel(alloc, &graph, &ir_bodies);
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "types",
         .edition = "2021",
         .graph = graph,
         .types = &.{},
         .bodies = ir_bodies,
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
 
     try std.testing.expectEqual(@as(usize, 1), pkg.files.len);
     const file = pkg.files[0];
 
-    // Root decls: Point struct + make_point + first_char.
-    try std.testing.expectEqual(@as(usize, 3), file.decls.len);
+    // Root decls: Point struct plus four functions, including two path cases.
+    try std.testing.expectEqual(@as(usize, 5), file.decls.len);
 
     // make_point returns path "Point" → named "Point", NOT void/anyopaque.
     const make_point = file.decls[1].fn_decl;
@@ -596,6 +634,14 @@ test "lower: non-primitive fn return types and block tail preservation" {
     try std.testing.expectEqual(ast.Prim.u21, first_char.ret_type.prim);
     try std.testing.expect(first_char.body.?.expr != null);
     try std.testing.expect(first_char.body.?.expr.?.* == .lit);
+
+    const empty_path = file.decls[3].fn_decl;
+    try std.testing.expectEqualStrings("empty_path", empty_path.name);
+    try std.testing.expectEqualStrings("unknown", empty_path.ret_type.named);
+
+    const recovered_path = file.decls[4].fn_decl;
+    try std.testing.expectEqualStrings("recovered_path", recovered_path.name);
+    try std.testing.expectEqualStrings("Point", recovered_path.ret_type.named);
 }
 
 /// Build a graph exercising `pub use` re-export lowering:
@@ -792,14 +838,14 @@ test "lower: pub use re-exports — qualified, self-ref, and wildcard" {
     };
     try buildUseModel(alloc, &graph, &ir_bodies);
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "usecrate",
         .edition = "2021",
         .graph = graph,
         .types = &.{},
         .bodies = ir_bodies,
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
 
     // Root module maps to src/root.zig.
     var root_file: ?ast.File = null;
@@ -827,6 +873,44 @@ test "lower: pub use re-exports — qualified, self-ref, and wildcard" {
     try std.testing.expectEqualStrings("helper", fa.field_name);
 }
 
+fn checkLowerUseAllocationFailures(
+    alloc: std.mem.Allocator,
+    rust_ir: *const ir.RustIr,
+) !void {
+    var output_arena = std.heap.ArenaAllocator.init(alloc);
+    defer output_arena.deinit();
+    _ = try lower.lowerRustIr(output_arena.allocator(), rust_ir, null);
+}
+
+test "lower: import ownership survives later allocation failure" {
+    var fixture_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer fixture_arena.deinit();
+    const alloc = fixture_arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var ir_bodies: ir.bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    try buildUseModel(alloc, &graph, &ir_bodies);
+    const rust_ir = ir.RustIr{
+        .crate_name = "usecrate",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = ir_bodies,
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkLowerUseAllocationFailures,
+        .{&rust_ir},
+    );
+}
+
 fn buildGenericModel(
     alloc: std.mem.Allocator,
     graph: *ir.graph.CrateGraph,
@@ -848,6 +932,16 @@ fn buildGenericModel(
     });
 
     const t_path = ir.types.Path{ .segments = &.{.{ .name = "T", .id = null }} };
+    const empty_return_body = try model.e(.{
+        .block = .{ .statements = &.{}, .tail = null, .labelled = null },
+    });
+    const methods = try alloc.dupe(ir.bodies.StructMethod, &[_]ir.bodies.StructMethod{
+        .{
+            .name = "empty_return",
+            .ret = .{ .path = .{ .segments = &.{} } },
+            .body = empty_return_body,
+        },
+    });
 
     // Explicit `generic_params` list on the StructBody (the primary path).
     try model.bodies.append(model.a(), .{
@@ -859,7 +953,7 @@ fn buildGenericModel(
                 .{ .name = "a", .ty = .{ .path = t_path }, .visibility = .public, .span = span },
                 .{ .name = "b", .ty = .{ .path = t_path }, .visibility = .public, .span = span },
             },
-            .methods = &.{},
+            .methods = methods,
             .has_dynamic_resources = false,
         },
     });
@@ -910,14 +1004,14 @@ test "lower: generic struct generic_params populate ast.StructDecl" {
     };
     try buildGenericModel(alloc, &graph, &ir_bodies);
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "fletcher",
         .edition = "2018",
         .graph = graph,
         .types = &.{},
         .bodies = ir_bodies,
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
 
     var root_file: ?ast.File = null;
     for (pkg.files) |f| {
@@ -939,6 +1033,11 @@ test "lower: generic struct generic_params populate ast.StructDecl" {
     try std.testing.expectEqual(@as(usize, 1), sd.generic_params.len);
     try std.testing.expectEqualStrings("T", sd.generic_params[0].name);
     try std.testing.expect(sd.generic_params[0].is_comptime);
+    try std.testing.expectEqual(@as(usize, 1), sd.decls.len);
+    const empty_return = sd.decls[0].fn_decl;
+    try std.testing.expectEqualStrings("empty_return", empty_return.name);
+    try std.testing.expect(empty_return.ret_type == .named);
+    try std.testing.expectEqualStrings("unknown", empty_return.ret_type.named);
     try std.testing.expect(sd.generic_params[0].ty == null);
 }
 
@@ -1025,7 +1124,7 @@ test "lower: const array + primitive initializers emit real Zig values" {
         .is_translated = true,
     });
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "consts",
         .edition = "2021",
         .graph = graph,
@@ -1033,7 +1132,7 @@ test "lower: const array + primitive initializers emit real Zig values" {
         .bodies = ir_bodies,
     };
 
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
 
     const emit = @import("emit.zig");
     var found_a = false;
@@ -1201,14 +1300,14 @@ test "lower: Vec literals stay unsupported and never become Zig arrays" {
         .is_translated = true,
     });
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "vec_contract",
         .edition = "2021",
         .graph = graph,
         .types = &.{},
         .bodies = ir_bodies,
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
 
     var unsupported_count: usize = 0;
     for (pkg.files[0].decls) |decl| {
@@ -1383,14 +1482,14 @@ test "lower: prelude trait methods lower to native Zig expressions" {
         .is_translated = true,
     });
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "sample",
         .edition = "2021",
         .graph = graph,
         .types = &.{},
         .bodies = final_bodies,
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
 
     // data.as_ref() must lower to a plain ident, not an unresolvable method call.
     var found_ident = false;
@@ -1410,7 +1509,7 @@ test "lower: prelude trait methods lower to native Zig expressions" {
     try std.testing.expect(!found_call);
 }
 
-/// Lower one method call whose receiver type is known to the RustIR.
+/// Lower one method call whose receiver type is known to the RustIr.
 /// The fixture keeps the method entity separate from the callable entity so
 /// the body table exercises the same sparse EntityId convention as production.
 fn lowerStdMethodFixture(
@@ -1525,14 +1624,14 @@ fn lowerStdMethodFixture(
         .is_translated = true,
     });
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "std_method_fixture",
         .edition = "2021",
         .graph = graph,
         .types = &.{},
         .bodies = bodies,
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
     const decl = pkg.files[0].decls[0];
     if (decl != .fn_decl) return error.ExpectedFunctionDeclaration;
     const body = decl.fn_decl.body orelse return error.ExpectedFunctionBody;
@@ -1754,7 +1853,7 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
         .is_translated = true,
     });
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "fletcher",
         .edition = "2021",
         .graph = graph,
@@ -1767,7 +1866,7 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
             .bodies = &.{ .none, struct_body },
         },
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
     const struct_decl = pkg.files[0].decls[0].struct_decl;
 
     var saw_constructor = false;
@@ -1895,7 +1994,7 @@ test "lower: qualifies unqualified inherent static calls with Self" {
         .is_translated = true,
     });
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "adler",
         .edition = "2015",
         .graph = graph,
@@ -1908,7 +2007,7 @@ test "lower: qualifies unqualified inherent static calls with Self" {
             .bodies = try model.bodies.toOwnedSlice(model.a()),
         },
     };
-    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
     const struct_decl = pkg.files[0].decls[0].struct_decl;
 
     for (struct_decl.decls) |decl| {
@@ -2051,7 +2150,7 @@ fn lowerSourceFidelityFixture(alloc: std.mem.Allocator) !ast.Package {
         },
     };
 
-    const rust_ir = ir.RustIR{
+    const rust_ir = ir.RustIr{
         .crate_name = "source_fidelity",
         .edition = "2021",
         .graph = graph,
@@ -2064,7 +2163,7 @@ fn lowerSourceFidelityFixture(alloc: std.mem.Allocator) !ast.Package {
             .bodies = try model.bodies.toOwnedSlice(model.a()),
         },
     };
-    return lower.lowerRustIR(alloc, &rust_ir, null);
+    return lower.lowerRustIr(alloc, &rust_ir, null);
 }
 
 fn sourceFidelityRootFile(pkg: ast.Package) !ast.File {

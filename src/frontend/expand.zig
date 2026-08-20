@@ -729,9 +729,26 @@ pub fn findClosingDelimiter(s: []const u8, start: usize) ?usize {
     return null;
 }
 
+const macro_parse_depth_max: usize = 128;
+
 pub fn parseMatcher(alloc: std.mem.Allocator, raw: []const u8) ![]const MatcherElement {
+    return parseMatcherDepth(alloc, raw, 0);
+}
+
+fn parseMatcherDepth(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    depth: usize,
+) ![]const MatcherElement {
+    if (depth >= macro_parse_depth_max) return error.InvalidMacroMatcher;
+
     var list: std.ArrayListUnmanaged(MatcherElement) = .empty;
-    errdefer list.deinit(alloc);
+    errdefer {
+        for (list.items) |element| {
+            if (element == .repetition) freeMatcherElements(alloc, element.repetition.elements);
+        }
+        list.deinit(alloc);
+    }
 
     var i: usize = 0;
     while (i < raw.len) {
@@ -742,7 +759,11 @@ pub fn parseMatcher(alloc: std.mem.Allocator, raw: []const u8) ![]const MatcherE
             const open_idx = i + 1;
             const close_idx = findClosingDelimiter(raw, open_idx) orelse return error.InvalidMacroMatcher;
             const inner_text = raw[open_idx + 1 .. close_idx];
-            const inner_elems = try parseMatcher(alloc, inner_text);
+            const inner_elems = try parseMatcherDepth(alloc, inner_text, depth + 1);
+            var inner_elems_owned = true;
+            errdefer {
+                if (inner_elems_owned) freeMatcherElements(alloc, inner_elems);
+            }
 
             var post = close_idx + 1;
             post = skipWhitespaceAndComments(raw, post);
@@ -765,6 +786,7 @@ pub fn parseMatcher(alloc: std.mem.Allocator, raw: []const u8) ![]const MatcherE
                 }
             }
             try list.append(alloc, .{ .repetition = .{ .elements = inner_elems, .separator = sep, .op = op } });
+            inner_elems_owned = false;
         } else if (raw[i] == '$' and i + 1 < raw.len and isIdentStart(raw[i + 1])) {
             i += 1;
             const var_start = i;
@@ -807,8 +829,23 @@ pub fn parseMatcher(alloc: std.mem.Allocator, raw: []const u8) ![]const MatcherE
 }
 
 pub fn parseTemplate(alloc: std.mem.Allocator, raw: []const u8) ![]const TemplateElement {
+    return parseTemplateDepth(alloc, raw, 0);
+}
+
+fn parseTemplateDepth(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    depth: usize,
+) ![]const TemplateElement {
+    if (depth >= macro_parse_depth_max) return error.InvalidMacroTemplate;
+
     var list: std.ArrayListUnmanaged(TemplateElement) = .empty;
-    errdefer list.deinit(alloc);
+    errdefer {
+        for (list.items) |element| {
+            if (element == .repetition) freeTemplateElements(alloc, element.repetition.elements);
+        }
+        list.deinit(alloc);
+    }
 
     var i: usize = 0;
     var text_start: usize = 0;
@@ -822,7 +859,11 @@ pub fn parseTemplate(alloc: std.mem.Allocator, raw: []const u8) ![]const Templat
                 const open_idx = i + 1;
                 const close_idx = findClosingDelimiter(raw, open_idx) orelse return error.InvalidMacroTemplate;
                 const inner_text = raw[open_idx + 1 .. close_idx];
-                const inner_elems = try parseTemplate(alloc, inner_text);
+                const inner_elems = try parseTemplateDepth(alloc, inner_text, depth + 1);
+                var inner_elems_owned = true;
+                errdefer {
+                    if (inner_elems_owned) freeTemplateElements(alloc, inner_elems);
+                }
 
                 var post = close_idx + 1;
                 post = skipWhitespaceAndComments(raw, post);
@@ -845,6 +886,7 @@ pub fn parseTemplate(alloc: std.mem.Allocator, raw: []const u8) ![]const Templat
                     }
                 }
                 try list.append(alloc, .{ .repetition = .{ .elements = inner_elems, .separator = sep, .op = op } });
+                inner_elems_owned = false;
                 text_start = i;
             } else if (i + 1 < raw.len and isIdentStart(raw[i + 1])) {
                 i += 1;
@@ -1116,7 +1158,8 @@ pub fn expandMacroRules(
             var out: std.ArrayListUnmanaged(u8) = .empty;
             errdefer out.deinit(alloc);
             try expandTemplateElements(alloc, &out, rule.template, &bindings, null);
-            return try out.toOwnedSlice(alloc);
+            const expanded = try out.toOwnedSlice(alloc);
+            return expanded;
         }
     }
     return null;
@@ -1184,7 +1227,7 @@ pub fn parseMacroRulesDefinition(alloc: std.mem.Allocator, raw_def: []const u8) 
         }
     }
 
-    return MacroDef{
+    return .{
         .name = name,
         .rules = try rules_list.toOwnedSlice(alloc),
     };
@@ -1318,4 +1361,91 @@ test "expandPanicMessage" {
         defer alloc.free(msg);
         try std.testing.expectEqualStrings("code: {}, 404", msg);
     }
+}
+
+fn nestedMacroRepetitionTextForTest(
+    alloc: std.mem.Allocator,
+    nesting: usize,
+    leaf: []const u8,
+) ![]const u8 {
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text.deinit(alloc);
+
+    for (0..nesting) |_| try text.appendSlice(alloc, "$(");
+    try text.appendSlice(alloc, leaf);
+    for (0..nesting) |_| try text.appendSlice(alloc, ")*");
+    return text.toOwnedSlice(alloc);
+}
+
+test "parseMatcher and parseTemplate preserve nested repetitions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const matcher_text = try nestedMacroRepetitionTextForTest(alloc, 2, "$value:expr");
+    const matcher = try parseMatcher(alloc, matcher_text);
+    try std.testing.expectEqual(@as(usize, 1), matcher.len);
+    try std.testing.expect(matcher[0] == .repetition);
+    try std.testing.expectEqual(@as(usize, 1), matcher[0].repetition.elements.len);
+    try std.testing.expect(matcher[0].repetition.elements[0] == .repetition);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        matcher[0].repetition.elements[0].repetition.elements.len,
+    );
+    try std.testing.expect(
+        matcher[0].repetition.elements[0].repetition.elements[0] == .metavar,
+    );
+
+    const template_text = try nestedMacroRepetitionTextForTest(alloc, 2, "$value");
+    const template = try parseTemplate(alloc, template_text);
+    try std.testing.expectEqual(@as(usize, 1), template.len);
+    try std.testing.expect(template[0] == .repetition);
+    try std.testing.expectEqual(@as(usize, 1), template[0].repetition.elements.len);
+    try std.testing.expect(template[0].repetition.elements[0] == .repetition);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        template[0].repetition.elements[0].repetition.elements.len,
+    );
+    try std.testing.expect(
+        template[0].repetition.elements[0].repetition.elements[0] == .metavar,
+    );
+}
+
+test "parseMatcher and parseTemplate reject nesting at recursion limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const accepted_nesting = @as(usize, macro_parse_depth_max) - 1;
+    const accepted_matcher_text = try nestedMacroRepetitionTextForTest(
+        alloc,
+        accepted_nesting,
+        "$value:expr",
+    );
+    _ = try parseMatcher(alloc, accepted_matcher_text);
+    const rejected_matcher_text = try nestedMacroRepetitionTextForTest(
+        alloc,
+        macro_parse_depth_max,
+        "$value:expr",
+    );
+    try std.testing.expectError(
+        error.InvalidMacroMatcher,
+        parseMatcher(alloc, rejected_matcher_text),
+    );
+
+    const accepted_template_text = try nestedMacroRepetitionTextForTest(
+        alloc,
+        accepted_nesting,
+        "$value",
+    );
+    _ = try parseTemplate(alloc, accepted_template_text);
+    const rejected_template_text = try nestedMacroRepetitionTextForTest(
+        alloc,
+        macro_parse_depth_max,
+        "$value",
+    );
+    try std.testing.expectError(
+        error.InvalidMacroTemplate,
+        parseTemplate(alloc, rejected_template_text),
+    );
 }

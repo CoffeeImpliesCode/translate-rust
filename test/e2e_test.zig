@@ -135,6 +135,15 @@ pub fn main(init: std.process.Init) !void {
         "r2z_fnv",
         &.{ "FnvHasher", "FnvBuildHasher" },
     );
+    try runCrate(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/fletcher",
+        "zig-out/e2e-test-fletcher",
+        "r2z_fletcher",
+        &.{ "calc_fletcher16", "calc_fletcher64" },
+    );
 
     try writeMsg(io, stdout, "e2e: all crates translated and tested successfully", .{});
 }

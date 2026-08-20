@@ -3,7 +3,7 @@
 //! Orchestrates:
 //! Ingestion -> CST extraction -> Name resolution -> Function body extraction ->
 //! Built-in Macro Expansion -> Type Inference -> Method & Trait Resolution ->
-//! Generic Monomorphization -> returns completed `ir.RustIR`.
+//! Generic Monomorphization -> returns completed `ir.RustIr`.
 //!
 //! Zero backend dependencies: does NOT depend on emit.zig, package.zig, or driver.zig.
 
@@ -87,12 +87,12 @@ fn materializeInferredConstructorTypes(
 /// 6. Type inference (`infer.solve` + constraint propagation).
 /// 7. Method & trait resolution (`resolve_methods.resolveMethods`).
 /// 8. Monomorphization (`monomorphize.collectInstantiations`).
-/// Returns the completed `ir.RustIR`.
+/// Returns the completed `ir.RustIr`.
 pub fn analyzeCrate(
     allocator: std.mem.Allocator,
     io: std.Io,
     crate_dir: []const u8,
-) !ir.RustIR {
+) !ir.RustIr {
     // 1. Ingestion
     const manifest = try ingest.loadCrateManifest(allocator, io, crate_dir);
     const src = try ingest.readFileAlloc(allocator, io, manifest.root_path);
@@ -106,7 +106,7 @@ pub fn analyzeSource(
     crate_name: []const u8,
     edition: []const u8,
     source: []const u8,
-) !ir.RustIR {
+) !ir.RustIr {
     const manifest: ingest.Manifest = .{
         .name = crate_name,
         .edition = edition,
@@ -123,7 +123,7 @@ fn analyzeSourceWithGraph(
     crate_dir: []const u8,
     manifest: ingest.Manifest,
     src: []const u8,
-) !ir.RustIR {
+) !ir.RustIr {
     // 1. Construct root module and symbol table in CrateGraph
     var g = graph.CrateGraph.init(allocator);
 
@@ -267,12 +267,23 @@ fn analyzeSourceWithGraph(
     // releases its map and arena-owned temporary buffers.
     try instantiation_table.mergeInferred(allocator, solved.instantiations);
 
+    const final_exprs = try exprs_list.toOwnedSlice(allocator);
+    errdefer allocator.free(final_exprs);
+    const final_stmts = try stmts_list.toOwnedSlice(allocator);
+    errdefer allocator.free(final_stmts);
+    const final_pats = try pats_list.toOwnedSlice(allocator);
+    errdefer allocator.free(final_pats);
+    const final_types = try types_list.toOwnedSlice(allocator);
+    errdefer allocator.free(final_types);
+    const final_body_kinds = try bodies_list.toOwnedSlice(allocator);
+    errdefer allocator.free(final_body_kinds);
+
     const final_bodies: bodies.Bodies = .{
-        .exprs = try exprs_list.toOwnedSlice(allocator),
-        .stmts = try stmts_list.toOwnedSlice(allocator),
-        .pats = try pats_list.toOwnedSlice(allocator),
-        .types = try types_list.toOwnedSlice(allocator),
-        .bodies = try bodies_list.toOwnedSlice(allocator),
+        .exprs = final_exprs,
+        .stmts = final_stmts,
+        .pats = final_pats,
+        .types = final_types,
+        .bodies = final_body_kinds,
     };
 
     return .{
@@ -328,7 +339,7 @@ test "analyzeSource preserves valid body and refuses cast/reference expressions"
     const rust_ir = try analyzeSource(allocator, "cast_ref", "2021", src);
     const helpers = struct {
         fn findFunction(
-            rust_ir_: *const ir.RustIR,
+            rust_ir_: *const ir.RustIr,
             name: []const u8,
         ) ?spine.Entity {
             for (rust_ir_.graph.symbol_table.entities.items) |entity| {
@@ -339,7 +350,7 @@ test "analyzeSource preserves valid body and refuses cast/reference expressions"
         }
 
         fn findBody(
-            rust_ir_: *const ir.RustIR,
+            rust_ir_: *const ir.RustIr,
             entity: spine.Entity,
         ) ?exprs.BlockExpr {
             if (entity.id >= rust_ir_.bodies.bodies.len) return null;
@@ -439,6 +450,116 @@ test "analyzeSource preserves valid body and refuses cast/reference expressions"
     try std.testing.expect(rust_ir.bodies.exprs[refuse_tail_id].kind == .path);
 }
 
+test "analyzeSource resolves enum variant match patterns and refuses missing scoped path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub enum State {
+        \\    Ready,
+        \\    Done,
+        \\}
+        \\
+        \\pub fn classify(state: State) -> u8 {
+        \\    match state {
+        \\        State::Ready => 1,
+        \\        State::Done => 2,
+        \\    }
+        \\}
+        \\
+        \\pub fn missing(state: State) -> u8 {
+        \\    match state {
+        \\        Missing::Ready => 0,
+        \\        _ => 1,
+        \\    }
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "scoped_patterns", "2021", src);
+    const helpers = struct {
+        fn findEntity(
+            rust_ir_: *const ir.RustIr,
+            kind: spine.EntityKind,
+            name: []const u8,
+        ) ?spine.Entity {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != kind) continue;
+                if (std.mem.eql(u8, entity.name, name)) return entity;
+            }
+            return null;
+        }
+
+        fn findBody(
+            rust_ir_: *const ir.RustIr,
+            entity: spine.Entity,
+        ) ?exprs.BlockExpr {
+            if (entity.id >= rust_ir_.bodies.bodies.len) return null;
+            const fn_body = switch (rust_ir_.bodies.bodies[entity.id]) {
+                .fn_ => |body| body,
+                else => return null,
+            };
+            if (fn_body.body >= rust_ir_.bodies.exprs.len) return null;
+            return switch (rust_ir_.bodies.exprs[fn_body.body].kind) {
+                .block => |block| block,
+                else => null,
+            };
+        }
+    };
+
+    const state_entity = helpers.findEntity(&rust_ir, .enum_, "State") orelse
+        return error.MissingStateEnum;
+    const expected_variants = [_][]const u8{ "Ready", "Done" };
+    try std.testing.expect(state_entity.id != 0);
+
+    const classify_entity = helpers.findEntity(&rust_ir, .fn_, "classify") orelse
+        return error.MissingClassifyFunction;
+    const classify_body = helpers.findBody(&rust_ir, classify_entity) orelse
+        return error.MissingClassifyBody;
+    const classify_tail = classify_body.tail orelse return error.MissingClassifyTail;
+    const classify_match = switch (rust_ir.bodies.exprs[classify_tail].kind) {
+        .match => |match| match,
+        else => return error.ExpectedClassifyMatch,
+    };
+    try std.testing.expectEqual(@as(usize, 2), classify_match.arms.len);
+
+    for (classify_match.arms, expected_variants) |arm, expected_variant| {
+        try std.testing.expectEqual(@as(usize, 1), arm.patterns.len);
+        const pattern_id = arm.patterns[0];
+        try std.testing.expect(pattern_id < rust_ir.bodies.pats.len);
+        const pattern = rust_ir.bodies.pats[pattern_id];
+        const path = switch (pattern.kind) {
+            .path => |path| path,
+            .binding => return error.ScopedVariantPatternBecameBinding,
+            .unsupported => return error.ScopedVariantPatternUnsupported,
+            else => return error.ExpectedScopedVariantPath,
+        };
+        try std.testing.expect(path.def != 0);
+        try std.testing.expectEqual(state_entity.id, path.def);
+        try std.testing.expect(path.variant != null);
+        try std.testing.expectEqualStrings(expected_variant, path.variant.?);
+    }
+
+    const missing_entity = helpers.findEntity(&rust_ir, .fn_, "missing") orelse
+        return error.MissingMissingFunction;
+    const missing_body = helpers.findBody(&rust_ir, missing_entity) orelse
+        return error.MissingMissingBody;
+    try std.testing.expect(missing_body.tail != null);
+
+    var unsupported_pattern_count: usize = 0;
+    for (rust_ir.bodies.pats) |pattern| {
+        switch (pattern.kind) {
+            .unsupported => |unsupported| {
+                unsupported_pattern_count += 1;
+                try std.testing.expect(unsupported.reason.len > 0);
+            },
+            .path => |path| try std.testing.expect(path.def != 0),
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), unsupported_pattern_count);
+}
+
 test "analyzeSource refuses slice match pattern without dropping valid function" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -459,7 +580,7 @@ test "analyzeSource refuses slice match pattern without dropping valid function"
     const rust_ir = try analyzeSource(allocator, "slice_match", "2021", src);
     const helpers = struct {
         fn findFunction(
-            rust_ir_: *const ir.RustIR,
+            rust_ir_: *const ir.RustIr,
             name: []const u8,
         ) ?spine.Entity {
             for (rust_ir_.graph.symbol_table.entities.items) |entity| {
@@ -470,7 +591,7 @@ test "analyzeSource refuses slice match pattern without dropping valid function"
         }
 
         fn findBody(
-            rust_ir_: *const ir.RustIR,
+            rust_ir_: *const ir.RustIr,
             entity: spine.Entity,
         ) ?exprs.BlockExpr {
             if (entity.id >= rust_ir_.bodies.bodies.len) return null;
@@ -741,7 +862,7 @@ test "analyzeSource propagates generic alias constructor type through a local re
     try std.testing.expect(checksum_id != null);
 
     const target_chain = struct {
-        fn hasNode(ir_: *const ir.RustIR, node: exprs.NodeId) bool {
+        fn hasNode(ir_: *const ir.RustIr, node: exprs.NodeId) bool {
             if (node >= ir_.bodies.exprs.len) return false;
             return switch (ir_.bodies.exprs[node].kind) {
                 .unsupported => true,
@@ -767,21 +888,21 @@ test "analyzeSource propagates generic alias constructor type through a local re
             };
         }
 
-        fn hasArgs(ir_: *const ir.RustIR, args: []const exprs.NodeId) bool {
+        fn hasArgs(ir_: *const ir.RustIr, args: []const exprs.NodeId) bool {
             for (args) |arg| {
                 if (hasNode(ir_, arg)) return true;
             }
             return false;
         }
 
-        fn hasFields(ir_: *const ir.RustIR, fields: []const exprs.FieldInit) bool {
+        fn hasFields(ir_: *const ir.RustIr, fields: []const exprs.FieldInit) bool {
             for (fields) |field| {
                 if (hasNode(ir_, field.value)) return true;
             }
             return false;
         }
 
-        fn hasNamedFields(ir_: *const ir.RustIR, fields: []const exprs.FieldInit) bool {
+        fn hasNamedFields(ir_: *const ir.RustIr, fields: []const exprs.FieldInit) bool {
             for (fields) |field| {
                 if (hasNode(ir_, field.value)) return true;
             }
@@ -859,7 +980,7 @@ test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])"
     // module up by scanning `modules[]` and matching its name.
     const find_mod = struct {
         fn find(
-            ir_: *const ir.RustIR,
+            ir_: *const ir.RustIr,
             name_: []const u8,
         ) ?graph.Module {
             for (ir_.graph.modules.items) |m| {
@@ -871,7 +992,7 @@ test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])"
 
     // A root entity for `enter` must exist (root items intact).
     const enter_ent = struct {
-        fn find(ir_: *const ir.RustIR) ?spine.EntityId {
+        fn find(ir_: *const ir.RustIr) ?spine.EntityId {
             for (ir_.graph.symbol_table.entities.items) |ent| {
                 if (std.mem.eql(u8, ent.name, "enter")) return ent.id;
             }
@@ -894,7 +1015,7 @@ test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])"
 
     // A `foo_fn` fn entity exists under module `foo`.
     const foo_fn = struct {
-        fn find(ir_: *const ir.RustIR) ?spine.EntityId {
+        fn find(ir_: *const ir.RustIr) ?spine.EntityId {
             for (ir_.graph.symbol_table.entities.items) |ent| {
                 if (std.mem.eql(u8, ent.name, "foo_fn")) return ent.id;
             }
@@ -945,7 +1066,7 @@ test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
     const rust_ir = try analyzeSource(allocator, "pre_p4", "2021", src);
     const helpers = struct {
         fn findEntity(
-            rust_ir_: *const ir.RustIR,
+            rust_ir_: *const ir.RustIr,
             kind: spine.EntityKind,
             name: []const u8,
         ) ?spine.Entity {
@@ -956,7 +1077,7 @@ test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
             return null;
         }
 
-        fn findModule(rust_ir_: *const ir.RustIR, name: []const u8) ?graph.Module {
+        fn findModule(rust_ir_: *const ir.RustIr, name: []const u8) ?graph.Module {
             for (rust_ir_.graph.modules.items) |module| {
                 if (std.mem.eql(u8, module.name, name)) return module;
             }

@@ -433,12 +433,12 @@ pub const TestDecl = struct {
 };
 
 test "ast: instantiate AST DOM shapes" {
-    const u8_ty = Type{ .prim = .u8 };
-    const slice_ty = Type{ .slice = .{ .elem = &u8_ty, .is_const = true } };
-    const opt_slice_ty = Type{ .opt = &slice_ty };
+    const u8_ty: Type = .{ .prim = .u8 };
+    const slice_ty: Type = .{ .slice = .{ .elem = &u8_ty, .is_const = true } };
+    const opt_slice_ty: Type = .{ .opt = &slice_ty };
 
-    const lit_expr = Expr{ .lit = .{ .str = "hello world" } };
-    const const_d = Decl{
+    const lit_expr: Expr = .{ .lit = .{ .str = "hello world" } };
+    const const_d: Decl = .{
         .const_decl = .{
             .name = "greeting",
             .ty = slice_ty,
@@ -446,7 +446,7 @@ test "ast: instantiate AST DOM shapes" {
         },
     };
 
-    const fn_d = Decl{
+    const fn_d: Decl = .{
         .fn_decl = .{
             .name = "get_greeting",
             .ret_type = opt_slice_ty,
@@ -469,7 +469,7 @@ test "ast: instantiate AST DOM shapes" {
         },
     };
 
-    const struct_d = Decl{
+    const struct_d: Decl = .{
         .struct_decl = .{
             .name = "Greeter",
             .fields = &.{
@@ -479,7 +479,7 @@ test "ast: instantiate AST DOM shapes" {
         },
     };
 
-    const file = File{
+    const file: File = .{
         .path = "src/greeter.zig",
         .imports = &.{
             .{ .local_name = "std", .module_or_path = "std" },
@@ -495,7 +495,7 @@ test "ast: instantiate AST DOM shapes" {
         },
     };
 
-    const pkg = Package{
+    const pkg: Package = .{
         .name = "greeter_pkg",
         .version = "0.1.0",
         .fingerprint = 0x12345678,

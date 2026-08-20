@@ -12,7 +12,7 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
 │ Phase 1: IR Foundation & Serialization                 │
 │ • Establish src/ir/ namespace                          │
 │ • Unify spine, graph, types, exprs, bodies, traits     │
-│ • Add full RustIR JSON serializer / deserializer       │
+│ • Add full RustIr JSON serializer / deserializer       │
 │ • Provide built-in core/alloc/std model registry       │
 └───────────────────────────┬────────────────────────────┘
                             │
@@ -23,7 +23,7 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
 │ • Migrate ingest, cst, submodules, expand              │
 │ • Migrate names, infer, resolve_methods, monomorphize  │
 │ • Ensure Frontend produces ONLY pure, target-less      │
-│   RustIR data structures                               │
+│   RustIr data structures                               │
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
@@ -40,14 +40,14 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
 │ Phase 4: Emitter & Package Decoupling                  │
 │ • Migrate emit.zig to consume ZigAST (pure formatter)  │
 │ • Migrate package.zig & driver pipeline integration    │
-│ • Wire pipeline: Rust Source -> RustIR -> ZigAST ->    │
+│ • Wire pipeline: Rust Source -> RustIr -> ZigAST ->    │
 │   Package on Disk                                      │
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │ Phase 5: Verification, Golden Tests & Cleanup          │
-│ • Add frontend RustIR snapshot golden tests            │
+│ • Add frontend RustIr snapshot golden tests            │
 │ • Add backend ZigAST snapshot golden tests             │
 │ • Update CLI diagnostics (--dump-rustir, --dump-zigast)│
 │ • Full gate & 14 test-crates + e2e validation          │
@@ -73,7 +73,7 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
      - Full de/serialization for `CrateGraph`, `Bodies`, `Types`, `Exprs`, `Statements`, `Patterns`.
      - Roundtrip test verifying byte/structural parity on all 14 test crates.
    - Create `src/ir/std_model.zig`:
-     - In-memory pre-built `RustIR` symbol table for `core`, `alloc`, `std` primitives and standard traits (`Option`, `Result`, `Hasher`, `Iterator`, `Default`, `Clone`).
+     - In-memory pre-built `RustIr` symbol table for `core`, `alloc`, `std` primitives and standard traits (`Option`, `Result`, `Hasher`, `Iterator`, `Default`, `Clone`).
 2. **Verification Gate**: `zig build test` passes on IR serialization roundtrip.
 
 ---
@@ -90,7 +90,7 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
    - `src/frontend/infer.zig`: Type inference & unification solver.
    - `src/frontend/resolve_methods.zig`: Inherent and trait method lookup against `std_model`.
    - `src/frontend/monomorphize.zig`: Generic instantiation detection and naming.
-   - `src/frontend/pipeline.zig`: Single function `analyzeCrate(allocator, src_dir) !ir.RustIR`.
+   - `src/frontend/pipeline.zig`: Single function `analyzeCrate(allocator, src_dir) !ir.RustIr`.
 2. **Purity Check**: Ensure `src/frontend/` imports **only** `src/ir/` and `vendor/tree-sitter-rust`. No references to `std.AutoHashMap`, Zig builtins, or emission formatting.
 3. **Verification Gate**: `zig build test` passes; `--dump-types`, `--dump-names`, `--dump-infer` CLI flags read from frontend pipeline.
 
@@ -114,8 +114,8 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
    - Rust `BuildHasherDefault` → `std.hash.BuildHasherDefault`.
    - Comptime duck typing for generic bounds.
 4. **Implement `src/backend/zig/lower.zig`**:
-   - Pure function: `lowerRustIR(allocator, rust_ir: *const ir.RustIR, strategy: *const LoweringStrategy) !zig.ast.Package`.
-5. **Verification Gate**: Snapshot tests verifying `RustIR` → `ZigAST` generation.
+   - Pure function: `lowerRustIr(allocator, rust_ir: *const ir.RustIr, strategy: *const LoweringStrategy) !zig.ast.Package`.
+5. **Verification Gate**: Snapshot tests verifying `RustIr` → `ZigAST` generation.
 
 ---
 
@@ -129,7 +129,7 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
    - Writes `zig.ast.Package` to disk.
    - Generates directory hierarchy (`src/root.zig`, submodule files, `build.zig`, `build.zig.zon`).
 3. **Create `src/driver/pipeline.zig`**:
-   - Orchestrates `Frontend.analyzeCrate(...)` → `RustIR` → `Backend.lower(...)` → `ZigAST` → `Backend.emit(...)` → Files on disk.
+   - Orchestrates `Frontend.analyzeCrate(...)` → `RustIr` → `Backend.lower(...)` → `ZigAST` → `Backend.emit(...)` → Files on disk.
    - Handles self-healing fingerprinting via build error capture.
 4. **Verification Gate**: `zig build test-e2e` and `zig build test-crates` pass across all 14 test crates.
 
@@ -142,7 +142,7 @@ Target: Progressive, green-at-every-step refactoring of `translate-rust` codebas
    - `test/golden/rust_ir/`: Golden `.rustir.json` files for standard fixtures (`mini`, `fnv`, `hex`).
    - `test/golden/zig_ast/`: Golden `.zigast.json` files for standard fixtures.
 2. **Update CLI Flags**:
-   - `--dump rustir <crate-dir>`: Emits pure serialized `RustIR`.
+   - `--dump rustir <crate-dir>`: Emits pure serialized `RustIr`.
    - `--dump zigast <crate-dir>`: Emits pure serialized `ZigAST`.
    - `--strategy <name>`: Selects backend lowering strategy (`default`, `embedded`).
 3. **Run Full Project Quality Gates**:

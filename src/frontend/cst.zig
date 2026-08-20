@@ -98,9 +98,13 @@ fn parseAttribute(e: *const Ctx, node: ts.Node) !spine.Attribute {
         }
     }
 
+    const name_copy = try e.alloc.dupe(u8, name);
+    errdefer e.alloc.free(name_copy);
+    const meta_copy = try e.alloc.dupe(u8, meta);
+    errdefer e.alloc.free(meta_copy);
     return .{
-        .name = try e.alloc.dupe(u8, name),
-        .meta = try e.alloc.dupe(u8, meta),
+        .name = name_copy,
+        .meta = meta_copy,
         .known = std.mem.eql(u8, name, "cfg") or std.mem.eql(u8, name, "test"),
     };
 }
@@ -153,12 +157,27 @@ fn attributesOf(e: *const Ctx, item: ts.Node) ![]const spine.Attribute {
 fn duplicateAttributes(e: *const Ctx, source: []const spine.Attribute) ![]const spine.Attribute {
     if (source.len == 0) return &.{};
     const result = try e.alloc.alloc(spine.Attribute, source.len);
+    errdefer e.alloc.free(result);
+
+    var initialized_count: usize = 0;
+    errdefer {
+        for (result[0..initialized_count]) |attribute| {
+            e.alloc.free(attribute.name);
+            e.alloc.free(attribute.meta);
+        }
+    }
+
     for (source, 0..) |attribute, index| {
+        const name_copy = try e.alloc.dupe(u8, attribute.name);
+        errdefer e.alloc.free(name_copy);
+        const meta_copy = try e.alloc.dupe(u8, attribute.meta);
+        errdefer e.alloc.free(meta_copy);
         result[index] = .{
-            .name = try e.alloc.dupe(u8, attribute.name),
-            .meta = try e.alloc.dupe(u8, attribute.meta),
+            .name = name_copy,
+            .meta = meta_copy,
             .known = attribute.known,
         };
+        initialized_count += 1;
     }
     return result;
 }
@@ -789,6 +808,7 @@ fn stripIntSuffix(body: []const u8) []const u8 {
     for (int_suffixes) |s| {
         if (body.len > s.len and std.mem.endsWith(u8, body, s)) {
             const pre = body[0 .. body.len - s.len];
+            if (pre.len == 0) continue;
             const last = pre[pre.len - 1];
             if (std.ascii.isDigit(last) or last == '_') return pre;
         }
@@ -870,7 +890,8 @@ fn decodeRawBytes(allocator: std.mem.Allocator, raw: []const u8, prefix_len: usi
     while (i < hash_count) : (i += 1) {
         if (raw[close_start + 1 + i] != '#') return null;
     }
-    return try allocator.dupe(u8, raw[body_start..close_start]);
+    const bytes = try allocator.dupe(u8, raw[body_start..close_start]);
+    return bytes;
 }
 
 /// Decode Rust byte strings (`b"..."`, `br#"..."#`) and byte characters.
@@ -883,14 +904,16 @@ fn decodeRustByteLiteral(allocator: std.mem.Allocator, raw: []const u8) !?[]cons
 
     const quote = raw[prefix_len];
     if (quote == '\'') {
-        if (raw.len < prefix_len + 3 or raw[raw.len - 1] != '\'') return null;
+        if (raw.len < prefix_len + 3) return null;
+        if (raw[raw.len - 1] != '\'') return null;
         const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
         if (bytes.len == 1) return bytes;
         allocator.free(bytes);
         return null;
     }
     if (quote != '"' or raw.len < prefix_len + 2 or raw[raw.len - 1] != '"') return null;
-    return try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+    const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+    return bytes;
 }
 
 /// Lower a string / byte-string const literal. Bytes are decoded before they
@@ -1534,7 +1557,10 @@ fn extractPathFromAttrText(attr_text: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < attr_text.len) {
         if (std.mem.startsWith(u8, attr_text[i..], "path")) {
-            const prev_ok = (i == 0 or !std.ascii.isAlphanumeric(attr_text[i - 1]) and attr_text[i - 1] != '_');
+            const prev_ok = if (i == 0) true else blk: {
+                const previous = attr_text[i - 1];
+                break :blk !std.ascii.isAlphanumeric(previous) and previous != '_';
+            };
             const next_idx = i + 4;
             const next_ok = (next_idx >= attr_text.len or !std.ascii.isAlphanumeric(attr_text[next_idx]) and attr_text[next_idx] != '_');
             if (prev_ok and next_ok) {
@@ -2383,4 +2409,18 @@ test "cst preserves source visibility attributes and trait signatures" {
         .prim => |prim| try std.testing.expectEqual(types.Prim.u64, prim),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "stripIntSuffix preserves a suffix without a numeric body" {
+    try std.testing.expectEqualStrings("u8", stripIntSuffix("u8"));
+}
+
+test "decodeRustByteLiteral rejects a byte quote without a body" {
+    try std.testing.expect((try decodeRustByteLiteral(std.testing.allocator, "b'")) == null);
+}
+
+test "extractPathFromAttrText accepts path at offset zero" {
+    const path = extractPathFromAttrText("path = \"module.rs\"") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("module.rs", path);
 }

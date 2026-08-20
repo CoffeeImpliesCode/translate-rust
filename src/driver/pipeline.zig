@@ -1,7 +1,7 @@
 //! translate_rust.driver.pipeline — full end-to-end translation pipeline.
 //!
 //! Orchestrates the complete pipeline:
-//! Rust Source / Wire JSON -> Frontend Analysis -> RustIR -> Backend Lowering ->
+//! Rust Source / Wire JSON -> Frontend Analysis -> RustIr -> Backend Lowering ->
 //! ZigAST Package -> Package Emission & Disk Writing -> Self-Healing Fingerprint.
 
 const std = @import("std");
@@ -24,8 +24,8 @@ pub fn readFileAlloc(
 }
 
 /// Translate a Rust crate directory into a standalone Zig package at `out_dir`.
-/// 1. Ingest & analyze: frontend analysis on crate source -> `ir.RustIR`.
-/// 2. Lower to ZigAST: backend lowering of `RustIR` -> `backend.zig.ast.Package`.
+/// 1. Ingest & analyze: frontend analysis on crate source -> `ir.RustIr`.
+/// 2. Lower to ZigAST: backend lowering of `RustIr` -> `backend.zig.ast.Package`.
 /// 3. Write package to disk: formats Zig sources and builds manifest files into `out_dir`.
 /// 4. Self-heal fingerprint: runs `zig build` probe to capture and patch package fingerprint.
 pub fn translate(
@@ -43,7 +43,7 @@ pub fn translate(
     defer rust_ir.deinitInstantiations(arena_alloc);
 
     // 2. Lower to ZigAST
-    const pkg = try backend.zig.lower.lowerRustIR(arena_alloc, &rust_ir, null);
+    const pkg = try backend.zig.lower.lowerRustIr(arena_alloc, &rust_ir, null);
 
     // 3. Write package to disk
     try backend.zig.package.writeToDisk(io, &pkg, out_dir);
@@ -54,8 +54,8 @@ pub fn translate(
 
 /// Translate a wire-format v2 JSON dump into a standalone Zig package at `out_dir`.
 /// 1. Read JSON file bytes from `json_path`.
-/// 2. Deserialize JSON -> `ir.RustIR`.
-/// 3. Lower `RustIR` -> `backend.zig.ast.Package`.
+/// 2. Deserialize JSON -> `ir.RustIr`.
+/// 3. Lower `RustIr` -> `backend.zig.ast.Package`.
 /// 4. Write package to disk into `out_dir`.
 /// 5. Self-heal fingerprint in `build.zig.zon`.
 pub fn translateWireJson(
@@ -69,7 +69,7 @@ pub fn translateWireJson(
 
     const rust_ir = try ir.serialize.decode(allocator, json_bytes);
 
-    const pkg = try backend.zig.lower.lowerRustIR(allocator, &rust_ir, null);
+    const pkg = try backend.zig.lower.lowerRustIr(allocator, &rust_ir, null);
 
     try backend.zig.package.writeToDisk(io, &pkg, out_dir);
 

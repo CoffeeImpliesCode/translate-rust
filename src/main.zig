@@ -569,7 +569,7 @@ fn dumpDispatch(
 }
 
 /// `--dump rustir <crate-dir>`: run the full frontend analysis and print the
-/// serialized `ir.RustIR` JSON to stdout.
+/// serialized `ir.RustIr` JSON to stdout.
 fn dumpRustIr(
     io: std.Io,
     init: std.process.Init,
@@ -581,7 +581,7 @@ fn dumpRustIr(
     const allocator = arena.allocator();
 
     const rust_ir = try translate_rust.frontend.analyzeCrate(allocator, io, crate_dir);
-    const ser_ir: translate_rust.ir.serialize.RustIR = .{
+    const ser_ir: translate_rust.ir.serialize.RustIr = .{
         .crate_name = rust_ir.crate_name,
         .edition = rust_ir.edition,
         .graph = rust_ir.graph,
@@ -634,7 +634,7 @@ fn dumpZigAst(
     var strat: translate_rust.backend.strategy.LoweringStrategy = undefined;
     const maybe_strat = resolveStrategy(strategy_name, &strat);
 
-    const pkg = try translate_rust.backend.zig.lower.lowerRustIR(allocator, &rust_ir, maybe_strat);
+    const pkg = try translate_rust.backend.zig.lower.lowerRustIr(allocator, &rust_ir, maybe_strat);
     const json_bytes = try translate_rust.backend.zig.serialize.encode(allocator, &pkg);
     try stdout.writeStreamingAll(io, json_bytes);
     try stdout.writeStreamingAll(io, "\n");

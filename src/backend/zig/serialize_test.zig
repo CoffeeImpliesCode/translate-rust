@@ -315,3 +315,132 @@ test "serialize: whitespace formatting" {
     try testing.expectEqual(@as(usize, 1), decoded.files.len);
     try testing.expectEqualStrings("src/a.zig", decoded.files[0].path);
 }
+
+fn checkImportAllocationFailures(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const decoded = try serialize.decodeImport(allocator, value);
+    defer {
+        allocator.free(decoded.local_name);
+        allocator.free(decoded.module_or_path);
+    }
+}
+
+test "serialize: scalar decoder releases ownership on allocation failure" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        \\{"local_name":"std","module_or_path":"std","is_pub":false}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkImportAllocationFailures,
+        .{parsed.value},
+    );
+}
+
+fn checkGenericTypeAllocationFailures(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const decoded = try serialize.decodeType(allocator, value);
+    defer {
+        allocator.free(decoded.generic.name);
+        allocator.free(decoded.generic.params);
+    }
+}
+
+test "serialize: nested decoder releases malformed and allocation failures" {
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        \\{"kind":"generic","name":"Vec","params":[{"kind":"prim","value":"u8"}]}
+    ,
+        .{},
+    );
+    defer valid.deinit();
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkGenericTypeAllocationFailures,
+        .{valid.value},
+    );
+
+    var malformed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        \\{"kind":"generic","name":"Vec","params":[{"kind":"prim","value":"u8"},{"kind":"invalid"}]}
+    ,
+        .{},
+    );
+    defer malformed.deinit();
+
+    try testing.expectError(
+        error.UnknownTypeKind,
+        serialize.decodeType(testing.allocator, malformed.value),
+    );
+}
+
+fn checkPackageAllocationFailures(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const decoded = try serialize.decodePackage(allocator, value);
+    defer {
+        allocator.free(decoded.name);
+        allocator.free(decoded.version);
+        for (decoded.files) |file| {
+            allocator.free(file.path);
+        }
+        allocator.free(decoded.files);
+        for (decoded.zon_deps) |dep| {
+            allocator.free(dep.name);
+            allocator.free(dep.url);
+            allocator.free(dep.hash);
+        }
+        allocator.free(decoded.zon_deps);
+    }
+}
+
+test "serialize: package decoder releases malformed and allocation failures" {
+    const prefix =
+        \\{"format_version":1,"name":"demo","version":"1.0.0","files":[
+        \\{"path":"src/root.zig","imports":[],"decls":[],"tests":[]}
+        \\],"zon_deps":
+    ;
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        prefix ++
+            \\[{"name":"dep","url":"https://example.invalid","hash":"abc"}]}
+        ,
+        .{},
+    );
+    defer valid.deinit();
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkPackageAllocationFailures,
+        .{valid.value},
+    );
+
+    var malformed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        prefix ++
+            \\{}}
+        ,
+        .{},
+    );
+    defer malformed.deinit();
+
+    try testing.expectError(
+        error.BadWireFormat,
+        serialize.decodePackage(testing.allocator, malformed.value),
+    );
+}

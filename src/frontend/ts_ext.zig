@@ -417,6 +417,20 @@ fn resolveScopedPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
     return resolveScopedPathText(e, text(e, node));
 }
 
+/// Resolve an enum variant path against the enum body table.
+fn enumBodyHasVariant(e: *const Ext, enum_id: spine.EntityId, variant: []const u8) bool {
+    if (@as(usize, enum_id) >= e.ctx.bodies_list.items.len) return false;
+    return switch (e.ctx.bodies_list.items[@as(usize, enum_id)]) {
+        .enum_ => |body| blk: {
+            for (body.variants) |entry| {
+                if (std.mem.eql(u8, entry.name, variant)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 /// Resolve a pattern path, including an enum variant under its exact owner.
 fn resolvePatternPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
     const raw = text(e, node);
@@ -429,6 +443,7 @@ fn resolvePatternPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
                 if (e.ctx.g.symbol_table.get(owner)) |owner_entity| {
                     if (owner_entity.kind == .enum_) {
                         if (resolveVariant(e, owner, variant_name)) |variant| return variant;
+                        return if (enumBodyHasVariant(e, owner, variant_name)) owner else null;
                     }
                 }
             }
@@ -856,7 +871,8 @@ fn isPatternNode(node: ts.Node) bool {
         std.mem.eql(u8, k, "or_pattern") or
         std.mem.eql(u8, k, "scoped_identifier") or
         std.mem.eql(u8, k, "slice_pattern") or
-        std.mem.eql(u8, k, "literal_pattern");
+        std.mem.eql(u8, k, "literal_pattern") or
+        std.mem.eql(u8, k, "char_literal");
 }
 
 /// Classification of a `for` iterable produced by `unwrapIterable`.
@@ -1528,6 +1544,82 @@ fn decodeEscapedBytes(allocator: std.mem.Allocator, body: []const u8) ![]const u
     }
     return bytes.toOwnedSlice(allocator);
 }
+fn isUnicodeScalar(value: u32) bool {
+    return value <= 0x10ffff and !(value >= 0xd800 and value <= 0xdfff);
+}
+
+fn decodeUtf8Codepoint(bytes: []const u8) ?u32 {
+    if (bytes.len == 0) return null;
+    const first = bytes[0];
+    if (first < 0x80) return if (bytes.len == 1) @as(u32, first) else null;
+
+    var width: usize = 0;
+    var value: u32 = 0;
+    var minimum: u32 = 0;
+    if (first >= 0xc2 and first <= 0xdf) {
+        width = 2;
+        value = @as(u32, first & 0x1f);
+        minimum = 0x80;
+    } else if (first >= 0xe0 and first <= 0xef) {
+        width = 3;
+        value = @as(u32, first & 0x0f);
+        minimum = 0x800;
+    } else if (first >= 0xf0 and first <= 0xf4) {
+        width = 4;
+        value = @as(u32, first & 0x07);
+        minimum = 0x10000;
+    } else {
+        return null;
+    }
+
+    if (bytes.len != width) return null;
+    for (bytes[1..width]) |byte| {
+        if (byte < 0x80 or byte > 0xbf) return null;
+        value = (value << 6) | @as(u32, byte & 0x3f);
+    }
+    if (value < minimum or !isUnicodeScalar(value)) return null;
+    return value;
+}
+
+fn decodeRustCharCodepoint(raw: []const u8) ?u32 {
+    if (raw.len < 3 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return null;
+    const body = raw[1 .. raw.len - 1];
+    if (body.len == 0) return null;
+    if (body[0] != '\\') return decodeUtf8Codepoint(body);
+    if (body.len < 2) return null;
+
+    return switch (body[1]) {
+        'n' => 0x0a,
+        'r' => 0x0d,
+        't' => 0x09,
+        '0' => 0,
+        '\\' => '\\',
+        '\'' => '\'',
+        '"' => '"',
+        'x' => blk: {
+            if (body.len != 4) break :blk null;
+            const high = hexDigit(body[2]) orelse break :blk null;
+            const low = hexDigit(body[3]) orelse break :blk null;
+            const value = @as(u32, high) * 16 + @as(u32, low);
+            break :blk if (value <= 0x7f) value else null;
+        },
+        'u' => blk: {
+            if (body.len < 5 or body[2] != '{' or body[body.len - 1] != '}') {
+                break :blk null;
+            }
+            const digits = body[3 .. body.len - 1];
+            if (digits.len == 0 or digits.len > 6) break :blk null;
+            var value: u32 = 0;
+            for (digits) |digit| {
+                const nibble = hexDigit(digit) orelse break :blk null;
+                value = value * 16 + @as(u32, nibble);
+            }
+            if (!isUnicodeScalar(value)) break :blk null;
+            break :blk value;
+        },
+        else => null,
+    };
+}
 
 fn decodeRawBytes(allocator: std.mem.Allocator, raw: []const u8, prefix_len: usize) !?[]const u8 {
     var marker = prefix_len;
@@ -1544,7 +1636,8 @@ fn decodeRawBytes(allocator: std.mem.Allocator, raw: []const u8, prefix_len: usi
     while (i < hash_count) : (i += 1) {
         if (raw[close_start + 1 + i] != '#') return null;
     }
-    return try allocator.dupe(u8, raw[body_start..close_start]);
+    const bytes = try allocator.dupe(u8, raw[body_start..close_start]);
+    return bytes;
 }
 
 /// Decode Rust byte strings (`b"..."`, `br#"..."#`) and byte characters.
@@ -1557,14 +1650,20 @@ fn decodeRustByteLiteral(allocator: std.mem.Allocator, raw: []const u8) !?[]cons
 
     const quote = raw[prefix_len];
     if (quote == '\'') {
-        if (raw.len < prefix_len + 3 or raw[raw.len - 1] != '\'') return null;
-        const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+        if (raw.len < prefix_len + 3) return null;
+        const closing_quote = raw.len - 1;
+        if (raw[closing_quote] != '\'') return null;
+        const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. closing_quote]);
         if (bytes.len == 1) return bytes;
         allocator.free(bytes);
         return null;
     }
-    if (quote != '"' or raw.len < prefix_len + 2 or raw[raw.len - 1] != '"') return null;
-    return try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+    if (quote != '"') return null;
+    if (raw.len < prefix_len + 2) return null;
+    const closing_quote = raw.len - 1;
+    if (raw[closing_quote] != '"') return null;
+    const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. closing_quote]);
+    return bytes;
 }
 
 fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
@@ -1599,13 +1698,10 @@ fn lowerCharLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
     }
     if (is_byte) return unsupported(e, "invalid byte literal");
-    var val: u32 = 0;
-    if (t.len >= 3 and t[0] == '\'' and t[t.len - 1] == '\'') {
-        val = t[1];
-    }
+    const value = decodeRustCharCodepoint(t) orelse return unsupported(e, "invalid char literal");
     return appendExpr(e, .{ .literal = .{ .character = .{
         .text = try e.ctx.alloc.dupe(u8, t),
-        .value = val,
+        .value = value,
     } } });
 }
 
@@ -1752,6 +1848,13 @@ fn lowerFieldPattern(e: *Ext, node: ts.Node) anyerror!exprs.FieldPat {
 
 fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const kind = node.kind();
+    if (std.mem.eql(u8, kind, "literal_pattern")) {
+        if (node.namedChild(0)) |inner| return lowerPattern(e, inner);
+        return appendPat(e, .{ .unsupported = .{
+            .reason = "empty literal pattern",
+            .suggested_version = .v3,
+        } });
+    }
 
     // A generic `pattern` wrapper: unwrap when it simply wraps another
     // pattern, or handle an inline `mutable_specifier`+identifier binding.
@@ -1821,10 +1924,18 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         const t = text(e, node);
         const last = std.mem.lastIndexOfScalar(u8, t, ':');
         const leaf = if (last) |idx| t[idx + 1 ..] else t;
-        const def = if (last != null)
-            (resolvePatternPath(e, node) orelse 0)
+        const def: spine.EntityId = if (last != null)
+            (resolvePatternPath(e, node) orelse
+                return appendPat(e, .{ .unsupported = .{
+                    .reason = "unresolved pattern path",
+                    .suggested_version = .v3,
+                } }))
         else
-            (resolveName(e, leaf) orelse 0);
+            (resolveName(e, leaf) orelse
+                return appendPat(e, .{ .unsupported = .{
+                    .reason = "unresolved pattern path",
+                    .suggested_version = .v3,
+                } }));
         return appendPat(e, .{ .path = .{
             .def = def,
             .variant = try e.ctx.alloc.dupe(u8, leaf),
@@ -1887,13 +1998,17 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 try pat_nodes.append(e.ctx.alloc, c);
             }
         }
-        const def: spine.EntityId = if (type_node) |tn| blk: {
+        const def_opt: ?spine.EntityId = if (type_node) |tn| blk: {
             const raw_type = std.mem.trim(u8, text(e, tn), " \t\r\n");
-            if (raw_type.len == 0) break :blk 0;
+            if (raw_type.len == 0) break :blk null;
             const last_colon = std.mem.lastIndexOfScalar(u8, raw_type, ':');
-            if (last_colon != null) break :blk resolvePatternPath(e, tn) orelse 0;
-            break :blk resolveName(e, raw_type) orelse 0;
-        } else 0;
+            if (last_colon != null) break :blk resolvePatternPath(e, tn);
+            break :blk resolveName(e, raw_type);
+        } else null;
+        const def = def_opt orelse return appendPat(e, .{ .unsupported = .{
+            .reason = "unresolved tuple struct pattern",
+            .suggested_version = .v3,
+        } });
 
         var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
         defer field_pats.deinit(e.ctx.alloc);
@@ -1927,10 +2042,14 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         const raw_type = if (type_node) |tn| text(e, tn) else "";
         const last_colon = std.mem.lastIndexOfScalar(u8, raw_type, ':');
         const leaf = if (last_colon) |idx| raw_type[idx + 1 ..] else raw_type;
-        const def = if (last_colon != null) blk: {
-            if (type_node) |tn| break :blk resolvePatternPath(e, tn) orelse 0;
-            break :blk 0;
-        } else resolveName(e, leaf) orelse 0;
+        const def_opt: ?spine.EntityId = if (last_colon != null) blk: {
+            if (type_node) |tn| break :blk resolvePatternPath(e, tn);
+            break :blk null;
+        } else resolveName(e, leaf);
+        const def = def_opt orelse return appendPat(e, .{ .unsupported = .{
+            .reason = "unresolved struct pattern",
+            .suggested_version = .v3,
+        } });
         var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
         defer field_pats.deinit(e.ctx.alloc);
         var has_rest = false;
@@ -1986,6 +2105,18 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 .inner = pid,
             } });
         }
+    }
+
+    if (std.mem.eql(u8, kind, "char_literal")) {
+        const raw = text(e, node);
+        const value = decodeRustCharCodepoint(raw) orelse return appendPat(e, .{ .unsupported = .{
+            .reason = "invalid char pattern",
+            .suggested_version = .v3,
+        } });
+        return appendPat(e, .{ .literal = .{ .character = .{
+            .text = try e.ctx.alloc.dupe(u8, raw),
+            .value = value,
+        } } });
     }
 
     if (std.mem.eql(u8, kind, "integer_literal")) {
@@ -2441,9 +2572,11 @@ fn lowerIf(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         // else may be an inline block or an `else if`.
         const enk = en.kind();
         if (std.mem.eql(u8, enk, "block")) {
-            else_branch = .{ .block = try lowerBlock(e, en) };
+            const block = try lowerBlock(e, en);
+            else_branch = .{ .block = block };
         } else if (std.mem.eql(u8, enk, "if_expression")) {
-            else_branch = .{ .chain = try lowerIf(e, en) };
+            const chain = try lowerIf(e, en);
+            else_branch = .{ .chain = chain };
         }
     }
     return appendExpr(e, .{ .if_else = .{ .cond = cond_id, .then_ = then_blk, .@"else" = else_branch } });
@@ -2894,6 +3027,127 @@ pub fn extractFunction(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+test "decode byte character at length boundary" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect((try decodeRustByteLiteral(allocator, "b'")) == null);
+
+    const decoded = (try decodeRustByteLiteral(allocator, "b'a'")) orelse
+        return error.ExpectedByteCharacter;
+    defer allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, "a", decoded);
+}
+
+test "lower else-if branches exactly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+
+    const src = "fn choose() { if true { 1 } else if false { 2 } else { 3 } }";
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = src,
+        .mod_id = 0,
+    };
+    var ext: Ext = .{ .ctx = &ctx, .fn_id = 0 };
+    defer ext.deinit();
+
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    if (parser.setLanguage(rust.language())) |_| {} else |_| {}
+    const tree = parser.parseString(src, null) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const function_node = tree.rootNode().namedChild(0) orelse return error.MissingFunction;
+    var block_node: ?ts.Node = null;
+    var child_index: u32 = 0;
+    while (function_node.namedChild(child_index)) |child| : (child_index += 1) {
+        if (std.mem.eql(u8, child.kind(), "block")) {
+            block_node = child;
+            break;
+        }
+    }
+    const raw_if_node = (block_node orelse return error.MissingFunctionBlock).namedChild(0) orelse
+        return error.MissingIfExpression;
+    const if_node = if (std.mem.eql(u8, raw_if_node.kind(), "expression_statement"))
+        raw_if_node.namedChild(0) orelse return error.MissingIfExpression
+    else
+        raw_if_node;
+
+    const outer_id = try lowerIf(&ext, if_node);
+    const outer = switch (exprs_list.items[outer_id].kind) {
+        .if_else => |if_else| if_else,
+        else => return error.ExpectedIfExpression,
+    };
+    switch (exprs_list.items[outer.cond].kind) {
+        .literal => |literal| switch (literal) {
+            .boolean => |value| try std.testing.expect(value),
+            else => return error.ExpectedBooleanCondition,
+        },
+        else => return error.ExpectedBooleanCondition,
+    }
+    const outer_then_id = outer.then_.tail orelse return error.MissingThenTail;
+    switch (exprs_list.items[outer_then_id].kind) {
+        .literal => |literal| switch (literal) {
+            .int => |int| try std.testing.expectEqual(@as(i128, 1), int.value),
+            else => return error.ExpectedIntegerThenTail,
+        },
+        else => return error.ExpectedIntegerThenTail,
+    }
+
+    const inner_id = switch (outer.@"else") {
+        .chain => |chain| chain,
+        else => return error.ExpectedElseIfChain,
+    };
+    const inner = switch (exprs_list.items[inner_id].kind) {
+        .if_else => |if_else| if_else,
+        else => return error.ExpectedNestedIfExpression,
+    };
+    switch (exprs_list.items[inner.cond].kind) {
+        .literal => |literal| switch (literal) {
+            .boolean => |value| try std.testing.expect(!value),
+            else => return error.ExpectedBooleanCondition,
+        },
+        else => return error.ExpectedBooleanCondition,
+    }
+    const inner_then_id = inner.then_.tail orelse return error.MissingNestedThenTail;
+    switch (exprs_list.items[inner_then_id].kind) {
+        .literal => |literal| switch (literal) {
+            .int => |int| try std.testing.expectEqual(@as(i128, 2), int.value),
+            else => return error.ExpectedIntegerThenTail,
+        },
+        else => return error.ExpectedIntegerThenTail,
+    }
+    const final_else = switch (inner.@"else") {
+        .block => |block| block,
+        else => return error.ExpectedFinalElseBlock,
+    };
+    const final_else_id = final_else.tail orelse return error.MissingFinalElseTail;
+    switch (exprs_list.items[final_else_id].kind) {
+        .literal => |literal| switch (literal) {
+            .int => |int| try std.testing.expectEqual(@as(i128, 3), int.value),
+            else => return error.ExpectedIntegerElseTail,
+        },
+        else => return error.ExpectedIntegerElseTail,
+    }
+}
+
 test "lower built-in macro invocations in fn bodies" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3338,6 +3592,12 @@ test "lower struct_expression to .struct_lit and match_expression to .match" {
         \\    }
         \\}
         \\pub fn origin() -> Point {
+        \\    let _character = match 'a' {
+        \\        'a' => 0,
+        \\    };
+        \\    let _number = match 1 {
+        \\        1 => 0,
+        \\    };
         \\    Point { x: 0, y: 0 }
         \\}
     ;
@@ -3359,9 +3619,12 @@ test "lower struct_expression to .struct_lit and match_expression to .match" {
     var found_struct_lit = false;
     var found_match = false;
     var match_arm_count: usize = 0;
+    var match_count: usize = 0;
     var struct_pat_count: usize = 0;
     var found_float = false;
     var found_binding_r = false;
+    var found_character_pattern = false;
+    var found_integer_pattern = false;
     for (exprs_list.items) |ex| {
         switch (ex.kind) {
             .struct_lit => |sl| {
@@ -3373,8 +3636,9 @@ test "lower struct_expression to .struct_lit and match_expression to .match" {
             },
             .match => |me| {
                 found_match = true;
+                match_count += 1;
+                match_arm_count += me.arms.len;
                 try std.testing.expect(!me.option_scrutinee);
-                match_arm_count = me.arms.len;
             },
             .literal => |l| {
                 if (l == .float) found_float = true;
@@ -3392,15 +3656,35 @@ test "lower struct_expression to .struct_lit and match_expression to .match" {
             .binding => |bd| {
                 if (std.mem.eql(u8, bd.name, "r")) found_binding_r = true;
             },
+            .literal => |literal| switch (literal) {
+                .character => |character| {
+                    try std.testing.expectEqual(@as(u32, 'a'), character.value);
+                    try std.testing.expectEqualStrings("'a'", character.text);
+                    found_character_pattern = true;
+                },
+                .int => |integer| {
+                    try std.testing.expectEqual(@as(i128, 1), integer.value);
+                    try std.testing.expectEqualStrings("1", integer.text);
+                    try std.testing.expect(integer.base == .dec);
+                    try std.testing.expect(integer.ty_suffix == null);
+                    found_integer_pattern = true;
+                },
+                else => return error.UnexpectedLiteralPattern,
+            },
+            .wildcard => return error.UnexpectedWildcardPattern,
+            .unsupported => return error.UnexpectedUnsupportedPattern,
             else => {},
         }
     }
     try std.testing.expect(found_struct_lit); // Point { x: 0, y: 0 }
     try std.testing.expect(found_match); // match shape { ... }
-    try std.testing.expectEqual(@as(usize, 2), match_arm_count);
+    try std.testing.expectEqual(@as(usize, 3), match_count);
+    try std.testing.expectEqual(@as(usize, 4), match_arm_count);
     try std.testing.expectEqual(@as(usize, 2), struct_pat_count); // Circle + Rect
     try std.testing.expect(found_binding_r); // r bound by Circle(r)
     try std.testing.expect(found_float); // 3.14159 in the Circle arm body
+    try std.testing.expect(found_character_pattern);
+    try std.testing.expect(found_integer_pattern);
 }
 
 test "lowerCall resolves associated, enum-variant, constructor, and free calls" {
@@ -3773,15 +4057,19 @@ test "resolve scoped constants and forward calls within the owning module" {
     // does not use a global first-name match.
     const wrong_call_id = try add_entity(alloc, &g, .fn_, "wymix", other_mod_id);
     const right_call_id = try add_entity(alloc, &g, .fn_, "wymix", local_mod_id);
+    const right_wyr3_id = try add_entity(alloc, &g, .fn_, "wyr3", local_mod_id);
+    const right_wyr4_id = try add_entity(alloc, &g, .fn_, "wyr4", local_mod_id);
     const hasher_id = try add_entity(alloc, &g, .struct_, "Hasher", local_mod_id);
     const impl_id = try add_entity(alloc, &g, .impl_, "Hasher", hasher_id);
     const wrong_const_id = try add_entity(alloc, &g, .const_, "CONTINUATION_BIT", other_mod_id);
     const right_const_id = try add_entity(alloc, &g, .const_, "CONTINUATION_BIT", impl_id);
     const caller_id = try add_entity(alloc, &g, .fn_, "caller", impl_id);
-    const local_items = try alloc.alloc(spine.EntityId, 3);
+    const local_items = try alloc.alloc(spine.EntityId, 5);
     local_items[0] = right_call_id;
     local_items[1] = hasher_id;
     local_items[2] = impl_id;
+    local_items[3] = right_wyr3_id;
+    local_items[4] = right_wyr4_id;
     g.modules.items[local_mod_id].items = local_items;
     const other_items = try alloc.alloc(spine.EntityId, 2);
     other_items[0] = wrong_call_id;
@@ -3829,7 +4117,9 @@ test "resolve scoped constants and forward calls within the owning module" {
         \\impl Hasher {
         \\fn caller() -> u64 {
         \\    Self::CONTINUATION_BIT;
-        \\    wymix()
+        \\    wymix();
+        \\    wyr3();
+        \\    wyr4()
         \\}
         \\}
         ,
@@ -3839,6 +4129,8 @@ test "resolve scoped constants and forward calls within the owning module" {
 
     var found_constant = false;
     var found_forward_call = false;
+    var found_wyr3_call = false;
+    var found_wyr4_call = false;
     for (exprs_list.items) |expression| {
         switch (expression.kind) {
             .path => |path| {
@@ -3847,6 +4139,8 @@ test "resolve scoped constants and forward calls within the owning module" {
             .call => |call| switch (call.call_kind) {
                 .free => |def| {
                     if (def == right_call_id) found_forward_call = true;
+                    if (def == right_wyr3_id) found_wyr3_call = true;
+                    if (def == right_wyr4_id) found_wyr4_call = true;
                 },
                 else => {},
             },
@@ -3855,6 +4149,8 @@ test "resolve scoped constants and forward calls within the owning module" {
     }
     try std.testing.expect(found_constant);
     try std.testing.expect(found_forward_call);
+    try std.testing.expect(found_wyr3_call);
+    try std.testing.expect(found_wyr4_call);
 }
 
 test "preserve non-generic function body fidelity" {

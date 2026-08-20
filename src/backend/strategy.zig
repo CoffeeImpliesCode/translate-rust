@@ -53,7 +53,7 @@ const MockStrategy = struct {
         _ = ty;
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.lower_type_calls += 1;
-        return ast.Type{ .void_type = {} };
+        return .{ .void_type = {} };
     }
 
     fn lowerStdGeneric(
@@ -65,7 +65,7 @@ const MockStrategy = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.lower_std_calls += 1;
         if (std.mem.eql(u8, name, "Vec")) {
-            return ast.Type{ .named = "std.ArrayListUnmanaged" };
+            return .{ .named = "std.ArrayListUnmanaged" };
         }
         return null;
     }
@@ -74,8 +74,8 @@ const MockStrategy = struct {
 const std = @import("std");
 
 test "strategy: virtual dispatch through vtable" {
-    var mock = MockStrategy{};
-    var strat = LoweringStrategy{
+    var mock: MockStrategy = .{};
+    var strat: LoweringStrategy = .{
         .ptr = &mock,
         .vtable = &.{
             .lowerType = MockStrategy.lowerType,

@@ -132,7 +132,7 @@
                     "patterns": [
                       {
                         "kind": "struct_pat",
-                        "name": "",
+                        "name": "Shape",
                         "fields": [
                           {
                             "name": "0",
@@ -153,7 +153,7 @@
                     "patterns": [
                       {
                         "kind": "struct_pat",
-                        "name": "",
+                        "name": "Shape",
                         "fields": [
                           {
                             "name": "width",

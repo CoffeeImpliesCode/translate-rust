@@ -36,7 +36,7 @@ Scope: Defines the clean separation of frontend (Rust understanding) and backend
                                         │
                                         ▼
                ====================================================
-               BOUNDARY: Serialized RustIR (JSON / Binary)
+               BOUNDARY: Serialized RustIr (JSON / Binary)
                - Completely target-agnostic
                - Full semantic model of the Rust crate
                ====================================================
@@ -108,7 +108,7 @@ The frontend is responsible for ingesting, parsing, expanding, and analyzing Rus
 ### 2.3 Frontend Boundary Interfaces
 
 #### A. Standard Library Model (`core`, `alloc`, `std`)
-Instead of parsing the Rust standard library from source, the frontend loads a pre-constructed, serialized `RustIR` image defining:
+Instead of parsing the Rust standard library from source, the frontend loads a pre-constructed, serialized `RustIr` image defining:
 - Primitive type definitions and fundamental wrappers (`Option<T>`, `Result<T, E>`, `Box<T>`, `Vec<T>`, `String`, `&[T]`, `&str`).
 - Standard language traits:
   - Memory/Identity: `Clone`, `Copy`, `Default`, `Drop`.
@@ -118,11 +118,11 @@ Instead of parsing the Rust standard library from source, the frontend loads a p
   - Operators: `Add`, `Sub`, `Mul`, `Div`, `Index`, `IndexMut`, `Deref`, `DerefMut`.
 
 #### B. External Dependency Interfaces (`DepCrateIR`)
-- Dependencies declared in `Cargo.toml` are satisfied by consuming pre-compiled `RustIR` bundles (`.rustir.json` / binary).
+- Dependencies declared in `Cargo.toml` are satisfied by consuming pre-compiled `RustIr` bundles (`.rustir.json` / binary).
 - `Sema` resolves cross-crate item references, trait implementations, and types directly against the dependency's symbol table without source reprocessing.
 
-#### C. Serializable `RustIR` Specification
-The final artifact of the frontend is `RustIR`, serialized into a deterministic flat JSON or binary structure:
+#### C. Serializable `RustIr` Specification
+The final artifact of the frontend is `RustIr`, serialized into a deterministic flat JSON or binary structure:
 ```json
 {
   "schema_version": "1.0.0",
@@ -155,11 +155,11 @@ The final artifact of the frontend is `RustIR`, serialized into a deterministic 
 
 ## 3. Backend Subsystem: Lowering, Target Repr & Emitter
 
-The backend is strictly decoupled from Rust AST parsing. It consumes `RustIR` and transforms it into the target language package.
+The backend is strictly decoupled from Rust AST parsing. It consumes `RustIr` and transforms it into the target language package.
 
 ```
        ┌────────────────────────┐
-       │   Semantic RustIR      │
+       │   Semantic RustIr      │
        └───────────┬────────────┘
                    │
                    ▼
@@ -264,7 +264,7 @@ src/
 │   ├── exprs.zig                   # Lossless expressions, statements, patterns
 │   ├── bodies.zig                  # Function and item bodies
 │   ├── traits.zig                  # Trait definitions and impl tables
-│   ├── serialize.zig               # JSON / binary de/serializer for RustIR
+│   ├── serialize.zig               # JSON / binary de/serializer for RustIr
 │   └── std_model.zig               # Built-in serialized core/alloc/std models
 │
 ├── frontend/                       # Rust Ingestion, CST & Semantic Analysis
@@ -289,19 +289,19 @@ src/
 │   │   ├── strategies/             # Zig strategy implementations
 │   │   │   ├── default.zig         # Idiomatic standard library mapping
 │   │   │   └── embedded.zig        # Allocator-aware / no_std strategy
-│   │   ├── lower.zig               # RustIR -> ZigAST lowering orchestrator
+│   │   ├── lower.zig               # RustIr -> ZigAST lowering orchestrator
 │   │   ├── emit.zig                # ZigAST -> source text formatter
 │   │   └── package.zig             # Package writer (build.zig, zon, fingerprint)
 │   │
 │   └── c/                          # Future C Target Backend
 │       ├── root.zig
 │       ├── ast.zig                 # C AST Model (Headers, TUs, Types)
-│       ├── lower.zig               # RustIR -> CAST lowering
+│       ├── lower.zig               # RustIr -> CAST lowering
 │       └── emit.zig                # C formatter (Make/CMake, .h, .c)
 │
 ├── driver/                         # Pipeline orchestration
 │   ├── root.zig
-│   └── pipeline.zig                # Orchestrates Frontend -> RustIR -> Backend
+│   └── pipeline.zig                # Orchestrates Frontend -> RustIr -> Backend
 │
 └── runtime/
     └── r2z-core/                   # Standalone Zig-std compat layer
@@ -312,9 +312,9 @@ src/
 ## 5. Verification & Testing Discipline
 
 1. **Frontend Isolation Tests**:
-   - Rust source → `RustIR` assertions. Golden `.rustir.json` test fixtures ensure semantic extraction remains intact regardless of backend changes.
+   - Rust source → `RustIr` assertions. Golden `.rustir.json` test fixtures ensure semantic extraction remains intact regardless of backend changes.
 2. **Backend Lowering Snapshot Tests**:
-   - Pre-canned `RustIR` → `ZigAST` structure assertions. Isolates lowering rules from frontend parser changes.
+   - Pre-canned `RustIr` → `ZigAST` structure assertions. Isolates lowering rules from frontend parser changes.
 3. **End-to-End Package Verification**:
    - Source crate → Full translation → `zig build test` execution inside generated package.
 4. **Gate Compliance**:
