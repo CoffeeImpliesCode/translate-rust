@@ -965,6 +965,13 @@ fn decodePatternKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !
             .inclusive = try reqBool(t, "inclusive"),
         } };
     }
+    if (std.mem.eql(u8, tag, "unsupported")) {
+        const t = try getObj(val);
+        return .{ .unsupported = .{
+            .reason = try allocator.dupe(u8, try reqStr(t, "reason")),
+            .suggested_version = .v1,
+        } };
+    }
     return error.BadWireFormat;
 }
 
@@ -2022,6 +2029,12 @@ fn encodePatternKind(allocator: std.mem.Allocator, kind: exprs.PatternKind) !Jso
             try vo.put(allocator, "lo", encodeOptId(t.lo));
             try vo.put(allocator, "hi", encodeOptId(t.hi));
             try vo.put(allocator, "inclusive", .{ .bool = t.inclusive });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .unsupported => |u| {
+            try o.put(allocator, "kind", .{ .string = "unsupported" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "reason", .{ .string = u.reason });
             try o.put(allocator, "value", .{ .object = vo });
         },
     }

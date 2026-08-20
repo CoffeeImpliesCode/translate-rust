@@ -490,6 +490,43 @@ fn appendPat(e: *Ext, kind: exprs.PatternKind) anyerror!exprs.NodeId {
     try e.ctx.pats.append(e.ctx.alloc, .{ .id = id, .span = span_of, .ty = null, .kind = kind });
     return id;
 }
+fn patternContainsUnsupported(e: *const Ext, pat_id: exprs.NodeId) bool {
+    if (pat_id >= e.ctx.pats.items.len) return false;
+    return switch (e.ctx.pats.items[pat_id].kind) {
+        .unsupported => true,
+        .tuple => |tuple| blk: {
+            for (tuple.elements) |element_id| {
+                if (patternContainsUnsupported(e, element_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .slice => |slice| blk: {
+            for (slice.elements) |element_id| {
+                if (patternContainsUnsupported(e, element_id)) break :blk true;
+            }
+            if (slice.rest) |rest_id| {
+                if (patternContainsUnsupported(e, rest_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .struct_pat => |struct_pat| blk: {
+            for (struct_pat.fields) |field| {
+                if (field.pat) |field_id| {
+                    if (patternContainsUnsupported(e, field_id)) break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .reference => |reference| patternContainsUnsupported(e, reference.inner),
+        .@"or" => |or_pattern| blk: {
+            for (or_pattern.alternatives) |alternative_id| {
+                if (patternContainsUnsupported(e, alternative_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
 
 fn appendType(e: *Ext, t: types.Type) !exprs.TypeId {
     const id: exprs.TypeId = @intCast(e.ctx.types.items.len);
@@ -1793,6 +1830,12 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             .variant = try e.ctx.alloc.dupe(u8, leaf),
         } });
     }
+    if (std.mem.eql(u8, kind, "slice_pattern")) {
+        return appendPat(e, .{ .unsupported = .{
+            .reason = "slice pattern",
+            .suggested_version = .v3,
+        } });
+    }
 
     if (std.mem.eql(u8, kind, "tuple_pattern")) {
         var elems: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
@@ -2006,6 +2049,7 @@ fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     var arms: std.ArrayListUnmanaged(exprs.MatchArm) = .empty;
     defer arms.deinit(e.ctx.alloc);
+    var contains_unsupported_pattern = false;
 
     if (block_node) |bn| {
         var j: u32 = 0;
@@ -2061,6 +2105,12 @@ fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 try pat_ids.append(e.ctx.alloc, try appendPat(e, .{ .wildcard = {} }));
             }
 
+            for (pat_ids.items) |pat_id| {
+                if (patternContainsUnsupported(e, pat_id)) {
+                    contains_unsupported_pattern = true;
+                }
+            }
+
             var guard_id: ?exprs.NodeId = null;
             if (guard_node) |gn| {
                 guard_id = try lowerExpr(e, gn);
@@ -2076,6 +2126,9 @@ fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
     }
 
+    if (contains_unsupported_pattern) {
+        return unsupported(e, "unsupported match pattern");
+    }
     return appendExpr(e, .{ .match = .{
         .scrutinee = scrutinee_id,
         .arms = try arms.toOwnedSlice(e.ctx.alloc),
@@ -4130,4 +4183,120 @@ test "preserve body while refusing unsupported cast and reference expressions" {
 
     const tail_id = body.tail orelse return error.ExpectedFunctionTail;
     try std.testing.expect(exprs_list.items[tail_id].kind == .path);
+}
+
+test "preserve function block while refusing unsupported slice match pattern" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const root_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    const fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "first"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .u8 },
+        .body = 0,
+    } });
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src =
+        \\pub fn first(values: &[u8]) -> u8 {
+        \\    match values {
+        \\        [first, ..] => first,
+        \\    }
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const body_id = bodies_list.items[fn_id].fn_.body;
+    const body = switch (exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    try std.testing.expectEqual(@as(usize, 0), body.statements.len);
+    const match_id = body.tail orelse return error.ExpectedMatchTail;
+    const match_kind = exprs_list.items[match_id].kind;
+    try std.testing.expect(match_kind != .match);
+    const match_reason = switch (match_kind) {
+        .unsupported => |unsupported_expr| unsupported_expr.reason,
+        else => return error.ExpectedUnsupportedMatch,
+    };
+    try std.testing.expect(
+        std.mem.indexOf(u8, match_reason, "unsupported match pattern") != null,
+    );
+
+    var found_slice_pattern = false;
+    for (pats_list.items) |pattern| {
+        switch (pattern.kind) {
+            .wildcard => return error.UnexpectedWildcardSlicePattern,
+            .unsupported => |unsupported_pattern| {
+                if (std.mem.indexOf(u8, unsupported_pattern.reason, "slice pattern") != null) {
+                    found_slice_pattern = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_slice_pattern);
 }

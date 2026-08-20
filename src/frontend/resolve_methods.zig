@@ -348,6 +348,7 @@ const LocalInitializerFinder = struct {
             .@"or" => |or_pattern| for (or_pattern.alternatives) |alternative| {
                 self.visitPattern(alternative, init);
             },
+            .unsupported => {},
             .wildcard, .literal, .path, .range => {},
         }
     }

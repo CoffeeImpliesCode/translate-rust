@@ -441,6 +441,92 @@ test "analyzeSource preserves valid body and refuses cast/reference expressions"
     try std.testing.expect(rust_ir.bodies.exprs[refuse_tail_id].kind == .path);
 }
 
+test "analyzeSource refuses slice match pattern without dropping valid function" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub fn first(values: &[u8]) -> u8 {
+        \\    match values {
+        \\        [first, ..] => first,
+        \\    }
+        \\}
+        \\
+        \\pub fn valid(value: u8) -> u8 {
+        \\    value + 1
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "slice_match", "2021", src);
+    const helpers = struct {
+        fn findFunction(
+            rust_ir_: *const ir.RustIR,
+            name: []const u8,
+        ) ?spine.Entity {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != .fn_) continue;
+                if (std.mem.eql(u8, entity.name, name)) return entity;
+            }
+            return null;
+        }
+
+        fn findBody(
+            rust_ir_: *const ir.RustIR,
+            entity: spine.Entity,
+        ) ?exprs.BlockExpr {
+            if (entity.id >= rust_ir_.bodies.bodies.len) return null;
+            const fn_body = switch (rust_ir_.bodies.bodies[entity.id]) {
+                .fn_ => |body| body,
+                else => return null,
+            };
+            if (fn_body.body >= rust_ir_.bodies.exprs.len) return null;
+            return switch (rust_ir_.bodies.exprs[fn_body.body].kind) {
+                .block => |block| block,
+                else => null,
+            };
+        }
+    };
+
+    const first_entity = helpers.findFunction(&rust_ir, "first") orelse
+        return error.MissingSliceFunction;
+    const valid_entity = helpers.findFunction(&rust_ir, "valid") orelse
+        return error.MissingValidFunction;
+
+    const first_body = helpers.findBody(&rust_ir, first_entity) orelse
+        return error.MissingSliceBody;
+    const first_tail_id = first_body.tail orelse return error.MissingSliceTail;
+    try std.testing.expect(first_tail_id < rust_ir.bodies.exprs.len);
+    const first_tail_kind = rust_ir.bodies.exprs[first_tail_id].kind;
+    const match_reason = switch (first_tail_kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.ExpectedUnsupportedMatch,
+    };
+    try std.testing.expect(
+        std.mem.indexOf(u8, match_reason, "unsupported match pattern") != null,
+    );
+
+    var found_slice_pattern = false;
+    for (rust_ir.bodies.pats) |pattern| {
+        switch (pattern.kind) {
+            .wildcard => return error.UnexpectedWildcardSlicePattern,
+            .unsupported => |unsupported| {
+                if (std.mem.indexOf(u8, unsupported.reason, "slice pattern") != null) {
+                    found_slice_pattern = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_slice_pattern);
+
+    const valid_body = helpers.findBody(&rust_ir, valid_entity) orelse
+        return error.MissingValidBody;
+    const valid_tail_id = valid_body.tail orelse return error.MissingValidTail;
+    try std.testing.expect(valid_tail_id < rust_ir.bodies.exprs.len);
+    try std.testing.expect(rust_ir.bodies.exprs[valid_tail_id].kind != .unsupported);
+}
+
 test "analyzeSource: const array + primitive initializers parsed into const body" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

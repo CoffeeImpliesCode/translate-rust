@@ -254,3 +254,88 @@ test "serialize: repeat Vec literal preserves wire payload and roundtrips" {
     try std.testing.expectEqualSlices(exprs.NodeId, &element_ids, decoded_vec.elements);
     try std.testing.expectEqual(@as(?usize, 13), decoded_vec.repeat);
 }
+
+test "serialize: unsupported pattern preserves reason-only wire payload and roundtrips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const span: spine.Span = .{
+        .start_line = 11,
+        .start_col = 9,
+        .end_line = 11,
+        .end_col = 28,
+    };
+    const patterns = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .unsupported = .{
+            .reason = "slice pattern",
+            .suggested_version = .v1,
+        } },
+    }};
+    const body_kinds = [_]bodies.BodyKind{};
+    const ir_types = [_]types.Type{};
+    const sample_ir: serialize.RustIR = .{
+        .crate_name = "unsupported_pattern",
+        .edition = "2021",
+        .graph = graph.CrateGraph.init(alloc),
+        .types = &ir_types,
+        .bodies = .{
+            .exprs = &.{},
+            .stmts = &.{},
+            .pats = &patterns,
+            .types = &ir_types,
+            .bodies = &body_kinds,
+        },
+    };
+
+    const encoded = try serialize.encode(alloc, &sample_ir);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const root_object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    const body_object = switch (root_object.get("bodies") orelse return error.TestUnexpectedResult) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    const pattern_values = switch (body_object.get("pats") orelse return error.TestUnexpectedResult) {
+        .array => |array| array.items,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), pattern_values.len);
+    const pattern_object = switch (pattern_values[0]) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings(
+        "unsupported",
+        switch (pattern_object.get("kind") orelse return error.TestUnexpectedResult) {
+            .string => |kind| kind,
+            else => return error.TestUnexpectedResult,
+        },
+    );
+    const unsupported_value = switch (pattern_object.get("value") orelse return error.TestUnexpectedResult) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), unsupported_value.count());
+    try std.testing.expectEqualStrings(
+        "slice pattern",
+        switch (unsupported_value.get("reason") orelse return error.TestUnexpectedResult) {
+            .string => |reason| reason,
+            else => return error.TestUnexpectedResult,
+        },
+    );
+
+    var decoded = try serialize.decode(alloc, encoded);
+    defer decoded.graph.deinit();
+    const decoded_unsupported = switch (decoded.bodies.pats[0].kind) {
+        .unsupported => |unsupported| unsupported,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("slice pattern", decoded_unsupported.reason);
+}

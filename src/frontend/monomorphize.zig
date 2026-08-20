@@ -575,6 +575,7 @@ fn collectPat(
     if (id >= b.pats.len or v.pats[id]) return;
     v.pats[id] = true;
     const p = b.pats[id];
+    if (p.kind == .unsupported) return;
     if (p.ty) |tyid| {
         if (tyid < b.types.len) try collectType(table, alloc, b.types[tyid]);
     }
@@ -590,6 +591,7 @@ fn collectPat(
         .struct_pat => |sp| for (sp.fields) |fld| if (fld.pat) |fp| try collectPat(table, alloc, b, v, fp),
         .reference => |r| try collectPat(table, alloc, b, v, r.inner),
         .@"or" => |o| for (o.alternatives) |alt| try collectPat(table, alloc, b, v, alt),
+        .unsupported => {},
         .range => {},
     }
 }

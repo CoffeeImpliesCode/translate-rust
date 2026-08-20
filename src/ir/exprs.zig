@@ -503,6 +503,7 @@ pub const PatternKind = union(enum) {
     reference: ReferencePat, // &pat / &mut pat (rare post-desugar)
     @"or": OrPat, // `a | b`
     range: RangePat, // `1..=5`, `'a'..='z'`
+    unsupported: Unsupported,
     // guard is a MatchArm field, NOT a Pattern.
 };
 
@@ -971,6 +972,15 @@ test "exprs — every PatternKind / StatementKind variant compiles" {
         .ty = null,
         .kind = .{ .range = .{ .lo = null, .hi = null, .inclusive = false } },
     };
+    const pat_unsupported: Pattern = .{
+        .id = 15,
+        .span = span,
+        .ty = null,
+        .kind = .{ .unsupported = .{
+            .reason = "slice pattern",
+            .suggested_version = .v3,
+        } },
+    };
     _ = pat_wild;
     _ = pat_bind;
     _ = pat_lit;
@@ -985,6 +995,7 @@ test "exprs — every PatternKind / StatementKind variant compiles" {
     _ = pat_or;
     _ = pat_range;
     _ = pat_range_open;
+    _ = pat_unsupported;
 
     // §3 — every StatementKind arm
     const stmt_let: Statement = .{

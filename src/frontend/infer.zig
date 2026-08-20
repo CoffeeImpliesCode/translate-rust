@@ -741,6 +741,7 @@ fn bindPattern(
                 try bindPattern(ctx, alternative, init);
             }
         },
+        .unsupported => {},
         .wildcard, .literal, .path, .range => {},
     }
 }
