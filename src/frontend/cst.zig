@@ -60,30 +60,6 @@ fn isComment(node: ts.Node) bool {
     return std.mem.eql(u8, k, "line_comment") or std.mem.eql(u8, k, "block_comment");
 }
 
-/// Append a symbol-table entity + matching `.none` body slot. The caller
-/// overwrites the body slot for items that carry one.
-fn addEntity(e: *Ctx, kind: spine.EntityKind, name: []const u8, parent: ?spine.EntityId) !spine.EntityId {
-    const id = try e.g.symbol_table.add(.{
-        .id = 0,
-        .kind = kind,
-        .name = try e.alloc.dupe(u8, name),
-        .span = span_of,
-        .visibility = .public,
-        .parent = parent,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    try e.bodies_list.append(e.alloc, .none);
-    return id;
-}
-
-fn appendType(e: *Ctx, t: types.Type) !exprs.TypeId {
-    const id: exprs.TypeId = @intCast(e.types_list.items.len);
-    try e.types_list.append(e.alloc, t);
-    return id;
-}
-
 /// Visibility from a tree-sitter visibility_modifier node (or default priv).
 fn visOf(e: *const Ctx, item: ts.Node) spine.Visibility {
     var i: u32 = 0;
@@ -98,6 +74,118 @@ fn visOf(e: *const Ctx, item: ts.Node) spine.Visibility {
 
 fn isPub(e: *const Ctx, item: ts.Node) bool {
     return visOf(e, item) == .public;
+}
+
+fn parseAttribute(e: *const Ctx, node: ts.Node) !spine.Attribute {
+    var inner = std.mem.trim(u8, text(e, node), " \t\r\n");
+    if (std.mem.startsWith(u8, inner, "#![") and std.mem.endsWith(u8, inner, "]")) {
+        inner = inner[3 .. inner.len - 1];
+    } else if (std.mem.startsWith(u8, inner, "#[") and std.mem.endsWith(u8, inner, "]")) {
+        inner = inner[2 .. inner.len - 1];
+    }
+    inner = std.mem.trim(u8, inner, " \t\r\n");
+
+    const name_end = std.mem.indexOfAny(u8, inner, "(= \t\r\n") orelse inner.len;
+    const name = inner[0..name_end];
+    const rest = std.mem.trim(u8, inner[name_end..], " \t\r\n");
+    var meta: []const u8 = "";
+    if (rest.len >= 2 and rest[0] == '(' and rest[rest.len - 1] == ')') {
+        meta = std.mem.trim(u8, rest[1 .. rest.len - 1], " \t\r\n");
+    } else if (rest.len > 0 and rest[0] == '=') {
+        meta = std.mem.trim(u8, rest[1..], " \t\r\n");
+        if (meta.len >= 2 and meta[0] == '"' and meta[meta.len - 1] == '"') {
+            meta = meta[1 .. meta.len - 1];
+        }
+    }
+
+    return .{
+        .name = try e.alloc.dupe(u8, name),
+        .meta = try e.alloc.dupe(u8, meta),
+        .known = std.mem.eql(u8, name, "cfg") or std.mem.eql(u8, name, "test"),
+    };
+}
+
+/// Preserve outer attributes whether the grammar attaches them to the item or
+/// exposes them as preceding siblings.
+fn attributesOf(e: *const Ctx, item: ts.Node) ![]const spine.Attribute {
+    var preceding_count: usize = 0;
+    var prev = item.prevNamedSibling();
+    while (prev) |node| {
+        if (std.mem.eql(u8, node.kind(), "attribute_item")) {
+            preceding_count += 1;
+        } else if (!isComment(node)) {
+            break;
+        }
+        prev = node.prevNamedSibling();
+    }
+
+    var child_count: usize = 0;
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "attribute_item")) child_count += 1;
+    }
+
+    const count = preceding_count + child_count;
+    if (count == 0) return &.{};
+    const attributes = try e.alloc.alloc(spine.Attribute, count);
+
+    var preceding_index = preceding_count;
+    prev = item.prevNamedSibling();
+    while (prev) |node| {
+        if (std.mem.eql(u8, node.kind(), "attribute_item")) {
+            preceding_index -= 1;
+            attributes[preceding_index] = try parseAttribute(e, node);
+        } else if (!isComment(node)) {
+            break;
+        }
+        prev = node.prevNamedSibling();
+    }
+
+    var attribute_index = preceding_count;
+    i = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (!std.mem.eql(u8, child.kind(), "attribute_item")) continue;
+        attributes[attribute_index] = try parseAttribute(e, child);
+        attribute_index += 1;
+    }
+    return attributes;
+}
+fn duplicateAttributes(e: *const Ctx, source: []const spine.Attribute) ![]const spine.Attribute {
+    if (source.len == 0) return &.{};
+    const result = try e.alloc.alloc(spine.Attribute, source.len);
+    for (source, 0..) |attribute, index| {
+        result[index] = .{
+            .name = try e.alloc.dupe(u8, attribute.name),
+            .meta = try e.alloc.dupe(u8, attribute.meta),
+            .known = attribute.known,
+        };
+    }
+    return result;
+}
+
+/// Append a symbol-table entity + matching `.none` body slot. Source-backed
+/// entities take their visibility and attributes from the CST item; synthetic
+/// entities retain the existing public, attribute-free representation.
+fn addEntity(
+    e: *Ctx,
+    kind: spine.EntityKind,
+    name: []const u8,
+    parent: ?spine.EntityId,
+    source_item: ?ts.Node,
+) !spine.EntityId {
+    const id = try e.g.symbol_table.add(.{
+        .id = 0,
+        .kind = kind,
+        .name = try e.alloc.dupe(u8, name),
+        .span = span_of,
+        .visibility = if (source_item) |item| visOf(e, item) else .public,
+        .parent = parent,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = if (source_item) |item| try attributesOf(e, item) else &.{},
+    });
+    try e.bodies_list.append(e.alloc, .none);
+    return id;
 }
 
 // ── type lowering ────────────────────────────────────────────────────────────
@@ -320,7 +408,7 @@ fn mapNamedType(e: *Ctx, node: ts.Node) types.Type {
             }
         }
         if (base_def == 0) {
-            base_def = addEntity(e, .struct_, nm, 0) catch 0;
+            base_def = addEntity(e, .struct_, nm, 0, null) catch 0;
         }
         return .{
             .generic_inst = .{
@@ -389,16 +477,24 @@ fn collectFunctionGenericParams(e: *Ctx, item: ts.Node) ![]const []const u8 {
 fn mapFields(e: *Ctx, node: ts.Node) []const items.Field {
     var fields: std.ArrayListUnmanaged(items.Field) = .empty;
     if (std.mem.eql(u8, node.kind(), "ordered_field_declaration_list")) {
-        // tuple struct fields: each child is a type.
+        var visibility: spine.Visibility = .private;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
-            const nm = allocPrintOrEmpty(e, "{d}", .{i});
+            if (std.mem.eql(u8, c.kind(), "visibility_modifier")) {
+                visibility = .public;
+                continue;
+            }
+            const field_name = node.fieldNameForNamedChild(i) orelse continue;
+            if (!std.mem.eql(u8, field_name, "type")) continue;
+
+            const nm = allocPrintOrEmpty(e, "{d}", .{fields.items.len});
             fields.append(e.alloc, .{
                 .name = nm,
                 .ty = mapType(e, c),
-                .visibility = .public,
+                .visibility = visibility,
                 .span = span_of,
             }) catch break;
+            visibility = .private;
         }
         return fields.toOwnedSlice(e.alloc) catch &.{};
     }
@@ -462,7 +558,7 @@ fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
             tuple = true;
         }
     }
-    const eid = try addEntity(e, .struct_, name, parent);
+    const eid = try addEntity(e, .struct_, name, parent, item);
     const fields = if (fields_node) |fn_| mapFields(e, fn_) else &.{};
     const layout: items.struct_kind = if (fields.len == 0) .unit else if (tuple) .tuple else .named;
     e.bodies_list.items[eid] = .{ .struct_ = .{
@@ -482,7 +578,7 @@ fn enumItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         if (std.mem.eql(u8, k, "type_identifier")) name = text(e, c);
         if (std.mem.eql(u8, k, "enum_variant_list")) variants_node = c;
     }
-    const eid = try addEntity(e, .enum_, name, parent);
+    const eid = try addEntity(e, .enum_, name, parent, item);
     var variants: std.ArrayListUnmanaged(items.Variant) = .empty;
     var kind: items.enum_kind = .c_like;
     if (variants_node) |vn| {
@@ -527,7 +623,7 @@ fn unionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         if (std.mem.eql(u8, c.kind(), "type_identifier")) name = text(e, c);
         if (std.mem.eql(u8, c.kind(), "field_declaration_list")) fields_node = c;
     }
-    const eid = try addEntity(e, .union_, name, parent);
+    const eid = try addEntity(e, .union_, name, parent, item);
     e.bodies_list.items[eid] = .{ .struct_ = .{
         .layout = .named,
         .fields = if (fields_node) |fn_| mapFields(e, fn_) else &.{},
@@ -590,7 +686,7 @@ fn traitItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         if (std.mem.eql(u8, c.kind(), "type_identifier")) name = text(e, c);
         if (std.mem.eql(u8, c.kind(), "declaration_list")) decls = c;
     }
-    const eid = try addEntity(e, .trait_, name, parent);
+    const eid = try addEntity(e, .trait_, name, parent, item);
     var methods: std.ArrayListUnmanaged(bodies.TraitMethodSig) = .empty;
     if (decls) |dl| {
         var j: u32 = 0;
@@ -646,8 +742,14 @@ fn typeAliasItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
             target = mapType(e, c);
         }
     }
-    const eid = try addEntity(e, .type_alias, name, parent);
+    const eid = try addEntity(e, .type_alias, name, parent, item);
     e.bodies_list.items[eid] = .{ .type_alias = .{ .target = target } };
+}
+
+fn appendType(e: *Ctx, t: types.Type) !exprs.TypeId {
+    const id: exprs.TypeId = @intCast(e.types_list.items.len);
+    try e.types_list.append(e.alloc, t);
+    return id;
 }
 
 /// Append an expression node, returning its dense NodeId.
@@ -1019,7 +1121,7 @@ fn constItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         // Any other named child is the initializer expression.
         if (init_node == null) init_node = c;
     }
-    const eid = try addEntity(e, .const_, name, parent);
+    const eid = try addEntity(e, .const_, name, parent, item);
     e.bodies_list.items[eid] = .{ .const_ = .{ .ty = ty, .init = 0 } };
 
     if (init_node) |in| {
@@ -1052,7 +1154,7 @@ fn functionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, is_trait_sig: b
     ret = mapReturnType(e, item);
     const params = mapParams(e, params_node);
     const generic_params = try collectFunctionGenericParams(e, item);
-    const eid = try addEntity(e, .fn_, name, parent);
+    const eid = try addEntity(e, .fn_, name, parent, item);
     e.bodies_list.items[eid] = .{ .fn_ = .{
         .params = params,
         .ret = ret,
@@ -1089,7 +1191,7 @@ fn emitUseItem(
     parent: ?spine.EntityId,
     item_ids: *std.ArrayListUnmanaged(spine.EntityId),
 ) !void {
-    const eid = try addEntity(e, .use_, full_path, parent);
+    const eid = try addEntity(e, .use_, full_path, parent, null);
     e.g.symbol_table.entities.items[eid].visibility = if (is_pub) .public else .private;
     try item_ids.append(e.alloc, eid);
     try e.g.addUse(.{
@@ -1215,10 +1317,15 @@ fn processUseClause(
 /// UseDecl(s). Targets are resolved later by the names pass.
 fn useItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, item_ids: *std.ArrayListUnmanaged(spine.EntityId)) !void {
     const is_pub = isPub(e, item);
+    const first_id = item_ids.items.len;
     var i: u32 = 0;
     while (item.namedChild(i)) |c| : (i += 1) {
         if (std.mem.eql(u8, c.kind(), "visibility_modifier")) continue;
         try processUseClause(e, c, "", is_pub, parent, item_ids);
+    }
+    for (item_ids.items[first_id..]) |id| {
+        e.g.symbol_table.entities.items[id].visibility = visOf(e, item);
+        e.g.symbol_table.entities.items[id].attributes = try attributesOf(e, item);
     }
 }
 fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
@@ -1283,7 +1390,7 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
     // (`impl Trait for Type { ... }`) parent their methods to the resolved
     // target struct, allowing the backend to hoist the methods there.
     const impl_parent = target_id orelse mod_id;
-    const impl_id = try addEntity(e, .impl_, name, impl_parent);
+    const impl_id = try addEntity(e, .impl_, name, impl_parent, item);
 
     if (decl_list) |dl| {
         var j: u32 = 0;
@@ -1563,7 +1670,8 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                 if (std.mem.eql(u8, c.kind(), "identifier")) mname = text(e, c);
                 if (std.mem.eql(u8, c.kind(), "declaration_list")) decls = c;
             }
-            const child_id = try addEntity(e, .module, mname, mod_id);
+            const child_id = try addEntity(e, .module, mname, mod_id, item);
+            const child_attributes = e.g.symbol_table.entities.items[child_id].attributes;
             const child_mod_idx = e.g.modules.items.len;
             if (decls) |dl| {
                 _ = try e.g.addModule(.{
@@ -1576,7 +1684,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                     .is_extern = false,
                     .span = span_of,
                     .items = &.{},
-                    .attributes = &.{},
+                    .attributes = try duplicateAttributes(e, child_attributes),
                 });
                 const child_items = try mapItemsInner(e, dl, child_id);
                 e.g.modules.items[child_mod_idx].items = child_items;
@@ -1631,7 +1739,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                     .is_extern = false,
                     .span = span_of,
                     .items = &.{},
-                    .attributes = &.{},
+                    .attributes = try duplicateAttributes(e, child_attributes),
                 });
                 if (sub_path != null and e.io != null) {
                     if (readFileAlloc(e.alloc, e.io.?, sub_path.?)) |sub_src| {
@@ -2130,4 +2238,132 @@ test "cst preserves file module child directories" {
     const custom_module = try childModuleBaseDir(allocator, "src/custom.rs", "custom_pub");
     defer allocator.free(custom_module);
     try std.testing.expectEqualStrings("src/custom_pub", custom_module);
+}
+test "cst preserves source visibility attributes and trait signatures" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = graph.CrateGraph.init(allocator);
+    defer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\#[cfg(test)]
+        \\mod tests {
+        \\    #[test]
+        \\    fn smoke() {}
+        \\}
+        \\pub fn public_fn() {}
+        \\fn private_fn() {}
+        \\pub trait Processor {
+        \\    fn process(&self, value: u32) -> u64;
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    try std.testing.expectEqual(@as(usize, 4), crate_graph.modules.items[0].items.len);
+
+    var tests_entity: ?spine.Entity = null;
+    var smoke_entity: ?spine.Entity = null;
+    var public_entity: ?spine.Entity = null;
+    var private_entity: ?spine.Entity = null;
+    var trait_entity: ?spine.Entity = null;
+    for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .module and std.mem.eql(u8, entity.name, "tests")) {
+            tests_entity = entity;
+        } else if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "smoke")) {
+            smoke_entity = entity;
+        } else if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "public_fn")) {
+            public_entity = entity;
+        } else if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "private_fn")) {
+            private_entity = entity;
+        } else if (entity.kind == .trait_ and std.mem.eql(u8, entity.name, "Processor")) {
+            trait_entity = entity;
+        }
+    }
+
+    const tests = tests_entity orelse return error.TestUnexpectedResult;
+    try std.testing.expect(tests.visibility == .private);
+    try std.testing.expectEqual(@as(usize, 1), tests.attributes.len);
+    try std.testing.expectEqualStrings("cfg", tests.attributes[0].name);
+    try std.testing.expectEqualStrings("test", tests.attributes[0].meta);
+
+    var tests_module: ?graph.Module = null;
+    for (crate_graph.modules.items) |module| {
+        if (module.id == tests.id) {
+            tests_module = module;
+            break;
+        }
+    }
+    const module = tests_module orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), module.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.attributes.len);
+    try std.testing.expectEqualStrings("cfg", module.attributes[0].name);
+    try std.testing.expectEqualStrings("test", module.attributes[0].meta);
+
+    const smoke = smoke_entity orelse return error.TestUnexpectedResult;
+    try std.testing.expect(smoke.visibility == .private);
+    try std.testing.expectEqual(@as(usize, 1), smoke.attributes.len);
+    try std.testing.expectEqualStrings("test", smoke.attributes[0].name);
+    try std.testing.expectEqualStrings("", smoke.attributes[0].meta);
+
+    const public_fn = public_entity orelse return error.TestUnexpectedResult;
+    try std.testing.expect(public_fn.visibility == .public);
+    const private_fn = private_entity orelse return error.TestUnexpectedResult;
+    try std.testing.expect(private_fn.visibility == .private);
+
+    const trait = trait_entity orelse return error.TestUnexpectedResult;
+    try std.testing.expect(trait.visibility == .public);
+    const trait_body = switch (bodies_list.items[trait.id]) {
+        .trait_ => |body| body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), trait_body.methods.len);
+    const method = trait_body.methods[0];
+    try std.testing.expectEqualStrings("process", method.name);
+    try std.testing.expectEqual(items.Receiver.ref_, method.receiver);
+    try std.testing.expectEqual(@as(usize, 1), method.params.len);
+    try std.testing.expectEqualStrings("value", method.params[0].name);
+    switch (method.params[0].ty) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.u32, prim),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (method.ret) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.u64, prim),
+        else => return error.TestUnexpectedResult,
+    }
 }

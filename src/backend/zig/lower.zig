@@ -508,7 +508,7 @@ const Lowerer = struct {
                 try self.appendUseModuleImport(&imports_list, current_mod_id, item_id);
                 try self.appendUseSiblingImport(&imports_list, current_mod_id, item_id);
             }
-            if (ent.kind == .fn_ and (std.mem.startsWith(u8, ent.name, "test_") or std.mem.eql(u8, ent.name, "test"))) {
+            if (ent.kind == .fn_ and isTestEntity(ent)) {
                 if (try self.lowerTestEntity(item_id, ent)) |td| {
                     try tests_list.append(self.alloc, td);
                     continue;
@@ -560,7 +560,7 @@ const Lowerer = struct {
                 try self.appendUseSiblingImport(&imports_list, 0, entity_id);
             }
 
-            if (ent.kind == .fn_ and (std.mem.startsWith(u8, ent.name, "test_") or std.mem.eql(u8, ent.name, "test"))) {
+            if (ent.kind == .fn_ and isTestEntity(ent)) {
                 if (try self.lowerTestEntity(entity_id, ent)) |td| {
                     try tests_list.append(self.alloc, td);
                     continue;
@@ -606,6 +606,15 @@ const Lowerer = struct {
         }
 
         return true;
+    }
+    /// Return true for a Rust `#[test]` function. The name fallback preserves
+    /// compatibility with older in-memory fixtures that predate attributes.
+    fn isTestEntity(ent: ir.spine.Entity) bool {
+        for (ent.attributes) |attribute| {
+            if (std.mem.eql(u8, attribute.name, "test")) return true;
+        }
+        return std.mem.startsWith(u8, ent.name, "test_") or
+            std.mem.eql(u8, ent.name, "test");
     }
 
     fn lowerEntityDecl(self: *Lowerer, entity_id: ir.spine.EntityId, ent: ir.spine.Entity, current_mod_id: ?ir.spine.EntityId) !?ast.Decl {

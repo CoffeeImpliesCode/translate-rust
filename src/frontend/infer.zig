@@ -826,8 +826,8 @@ fn instantiateGenericDef(
 }
 
 /// Resolve a type after substituting generic parameter names with concrete args,
-/// returning the TypeId of an already-present structural match. Heap-free: scans
-/// `b.types` applying the substitution conceptually rather than allocating.
+/// returning the TypeId of an already-present structural match. Temporary
+/// substitution nodes are released without taking ownership of borrowed types.
 fn substitutedTypeId(
     ctx: *Ctx,
     t: types.Type,
@@ -845,11 +845,108 @@ fn substitutedTypeId(
     if (!typeContainsParam(t, param_names)) {
         return findTypeIndex(ctx.b, t);
     }
-    // Otherwise substitute and look up; discard the temporary.
+    // Otherwise substitute, look up, and release only owned temporary nodes.
     const subst = try substType(ctx.alloc, t, param_names, args);
     const found = findTypeIndex(ctx.b, subst);
-    freeTypeTree(ctx.alloc, subst);
+    freeSubstitutedType(ctx.alloc, t, subst, param_names, args);
     return found;
+}
+
+/// Release only nodes allocated by `substType`; source and argument types stay borrowed.
+fn freeSubstitutedType(
+    alloc: std.mem.Allocator,
+    original: types.Type,
+    substituted: types.Type,
+    param_names: []const []const u8,
+    args: []const types.Type,
+) void {
+    if (param_names.len == 0 or args.len == 0) return;
+    if (isTypeParam(original, param_names) != null) return;
+
+    switch (original) {
+        .reference => |ref| {
+            const sub_ref = switch (substituted) {
+                .reference => |value| value,
+                else => return,
+            };
+            freeSubstitutedType(alloc, ref.pointee, sub_ref.pointee, param_names, args);
+            if (!typeEqual(sub_ref.pointee, ref.pointee)) alloc.destroy(sub_ref);
+        },
+        .raw_ptr => |raw_ptr| {
+            const sub_raw_ptr = switch (substituted) {
+                .raw_ptr => |value| value,
+                else => return,
+            };
+            freeSubstitutedType(alloc, raw_ptr.pointee, sub_raw_ptr.pointee, param_names, args);
+            if (!typeEqual(sub_raw_ptr.pointee, raw_ptr.pointee)) alloc.destroy(sub_raw_ptr);
+        },
+        .slice => |slice| {
+            const sub_slice = switch (substituted) {
+                .slice => |value| value,
+                else => return,
+            };
+            freeSubstitutedType(alloc, slice.elem, sub_slice.elem, param_names, args);
+            if (!typeEqual(sub_slice.elem, slice.elem)) alloc.destroy(sub_slice);
+        },
+        .array => |array| {
+            const sub_array = switch (substituted) {
+                .array => |value| value,
+                else => return,
+            };
+            freeSubstitutedType(alloc, array.elem, sub_array.elem, param_names, args);
+            if (!typeEqual(sub_array.elem, array.elem)) alloc.destroy(sub_array);
+        },
+        .tuple => |tuple| {
+            const sub_tuple = switch (substituted) {
+                .tuple => |value| value,
+                else => return,
+            };
+            if (sub_tuple.len != tuple.len) return;
+
+            var changed = false;
+            for (tuple, sub_tuple) |original_elem, substituted_elem| {
+                freeSubstitutedType(
+                    alloc,
+                    original_elem,
+                    substituted_elem,
+                    param_names,
+                    args,
+                );
+                if (!typeEqual(substituted_elem, original_elem)) changed = true;
+            }
+            if (changed) alloc.free(sub_tuple);
+        },
+        .option => |option| {
+            const sub_option = switch (substituted) {
+                .option => |value| value,
+                else => return,
+            };
+            freeSubstitutedType(alloc, option.*, sub_option.*, param_names, args);
+            if (!typeEqual(sub_option.*, option.*)) alloc.destroy(sub_option);
+        },
+        .result => |result| {
+            const sub_result = switch (substituted) {
+                .result => |value| value,
+                else => return,
+            };
+            freeSubstitutedType(alloc, result.ok, sub_result.ok, param_names, args);
+            freeSubstitutedType(alloc, result.err, sub_result.err, param_names, args);
+            if (!typeEqual(sub_result.ok, result.ok) or
+                !typeEqual(sub_result.err, result.err))
+            {
+                alloc.destroy(sub_result);
+            }
+        },
+        .boxed => |boxed| {
+            const sub_boxed = switch (substituted) {
+                .boxed => |value| value,
+                else => return,
+            };
+            freeSubstitutedType(alloc, boxed.*, sub_boxed.*, param_names, args);
+            if (!typeEqual(sub_boxed.*, boxed.*)) alloc.destroy(sub_boxed);
+        },
+        .prim, .path, .fn_ptr, .generic_inst, .unsupported => {},
+    }
 }
 
 fn typeContainsParam(t: types.Type, param_names: []const []const u8) bool {
@@ -888,55 +985,6 @@ fn typeContainsParam(t: types.Type, param_names: []const []const u8) bool {
             return typeContainsParam(res.ok, param_names) or typeContainsParam(res.err, param_names);
         },
         .boxed => |bx| return typeContainsParam(bx.*, param_names),
-    }
-}
-
-fn freeTypeTree(alloc: std.mem.Allocator, t: types.Type) void {
-    switch (t) {
-        .prim, .path, .unsupported => {},
-        .reference => |r| {
-            freeTypeTree(alloc, r.pointee);
-            alloc.destroy(r);
-        },
-        .raw_ptr => |rp| {
-            freeTypeTree(alloc, rp.pointee);
-            alloc.destroy(rp);
-        },
-        .slice => |s| {
-            freeTypeTree(alloc, s.elem);
-            alloc.destroy(s);
-        },
-        .array => |arr| {
-            freeTypeTree(alloc, arr.elem);
-            alloc.destroy(arr);
-        },
-        .tuple => |tup| {
-            for (tup) |elem| freeTypeTree(alloc, elem);
-            alloc.free(tup);
-        },
-        .fn_ptr => |fp| {
-            for (fp.params) |elem| freeTypeTree(alloc, elem);
-            alloc.free(fp.params);
-            freeTypeTree(alloc, fp.ret);
-            alloc.destroy(fp);
-        },
-        .generic_inst => |gi| {
-            for (gi.args.params) |elem| freeTypeTree(alloc, elem);
-            alloc.free(gi.args.params);
-        },
-        .option => |opt| {
-            freeTypeTree(alloc, opt.*);
-            alloc.destroy(opt);
-        },
-        .result => |res| {
-            freeTypeTree(alloc, res.ok);
-            freeTypeTree(alloc, res.err);
-            alloc.destroy(res);
-        },
-        .boxed => |bx| {
-            freeTypeTree(alloc, bx.*);
-            alloc.destroy(bx);
-        },
     }
 }
 

@@ -1500,3 +1500,206 @@ test "lower: qualifies unqualified inherent static calls with Self" {
     }
     return error.TestUnexpectedResult;
 }
+
+fn lowerSourceFidelityFixture(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const support_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "support",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const private_fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "hidden",
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const test_fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "checks_answer",
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{
+            .{ .name = "test", .meta = "", .known = true },
+        },
+    });
+    const support_use_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .use_,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = support_id,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_module_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{ support_id, private_fn_id, test_fn_id, support_use_id },
+        .attributes = &.{},
+    });
+    const support_module_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .file,
+        .name = "support",
+        .parent = root_id,
+        .source_path = "src/support.rs",
+        .is_crate = false,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    std.debug.assert(root_module_id == root_id);
+    std.debug.assert(support_module_id == support_id);
+
+    try graph.addUse(.{
+        .id = support_use_id,
+        .kind = .{ .plain = support_id },
+        .local_name = "support",
+        .is_pub_export = true,
+        .target = support_id,
+        .span = span,
+    });
+    try graph.addCrate(.{
+        .name = "source_fidelity",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var model = Model.init(alloc);
+    const empty_block = try model.e(.{
+        .block = .{ .statements = &.{}, .tail = null, .labelled = null },
+    });
+    var entity_id: usize = 0;
+    while (entity_id <= support_use_id) : (entity_id += 1) {
+        try model.bodies.append(model.a(), .{ .none = {} });
+    }
+    model.bodies.items[private_fn_id] = .{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = empty_block,
+        },
+    };
+    model.bodies.items[test_fn_id] = .{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = empty_block,
+        },
+    };
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "source_fidelity",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(model.a()),
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = try model.bodies.toOwnedSlice(model.a()),
+        },
+    };
+    return lower.lowerRustIR(alloc, &rust_ir, null);
+}
+
+fn sourceFidelityRootFile(pkg: ast.Package) !ast.File {
+    for (pkg.files) |file| {
+        if (std.mem.eql(u8, file.path, "src/root.zig")) return file;
+    }
+    return error.RootFileMissing;
+}
+
+test "lower: test attribute creates an AST test declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const pkg = try lowerSourceFidelityFixture(arena.allocator());
+    const root_file = try sourceFidelityRootFile(pkg);
+
+    try std.testing.expectEqual(@as(usize, 1), root_file.tests.len);
+    try std.testing.expectEqualStrings("checks_answer", root_file.tests[0].name);
+    for (root_file.decls) |decl| {
+        if (decl != .fn_decl) continue;
+        try std.testing.expect(!std.mem.eql(u8, decl.fn_decl.name, "checks_answer"));
+    }
+}
+
+test "lower: private source function remains non-public" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const pkg = try lowerSourceFidelityFixture(arena.allocator());
+    const root_file = try sourceFidelityRootFile(pkg);
+
+    for (root_file.decls) |decl| {
+        if (decl != .fn_decl) continue;
+        if (!std.mem.eql(u8, decl.fn_decl.name, "hidden")) continue;
+        try std.testing.expect(!decl.fn_decl.is_pub);
+        return;
+    }
+    return error.PrivateFunctionMissing;
+}
+
+test "lower: intra-crate module re-export does not self-alias its import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const pkg = try lowerSourceFidelityFixture(arena.allocator());
+    const root_file = try sourceFidelityRootFile(pkg);
+
+    var support_imports: usize = 0;
+    for (root_file.imports) |import| {
+        if (!std.mem.eql(u8, import.local_name, "support")) continue;
+        support_imports += 1;
+        try std.testing.expect(import.is_pub);
+    }
+    try std.testing.expectEqual(@as(usize, 1), support_imports);
+
+    for (root_file.decls) |decl| {
+        if (decl != .const_decl) continue;
+        try std.testing.expect(!std.mem.eql(u8, decl.const_decl.name, "support"));
+    }
+}

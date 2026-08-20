@@ -34,6 +34,180 @@ fn addEntity(
         .attributes = &.{},
     });
 }
+fn expectUnsupported(expr: *const exprs.Expr) !void {
+    switch (expr.kind) {
+        .unsupported => |u| {
+            try std.testing.expect(u.reason.len > 0);
+            try std.testing.expect(u.reason.len <= 4096);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "trait method dispatch rewrites a unique concrete receiver candidate" {
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    _ = try addEntity(&g, a, .struct_, "Foo", root);
+    _ = try addEntity(&g, a, .trait_, "Display", root);
+    const display_impl = try addEntity(&g, a, .impl_, "Display for Foo", root);
+    const fn_render = try addEntity(&g, a, .fn_, "render", display_impl);
+    const render_ident = try addEntity(&g, a, .fn_, "render", root);
+
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "Foo", .id = null }} } },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .shared,
+                .method = render_ident,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = resolve_methods.resolveMethods(&g, &b);
+    try std.testing.expectEqual(@as(usize, 1), stats.trait_resolved);
+    try std.testing.expectEqual(@as(spine.EntityId, fn_render), b.exprs[1].kind.method_call.method);
+}
+
+test "trait method dispatch marks distinct candidates as unsupported" {
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    _ = try addEntity(&g, a, .struct_, "Foo", root);
+    _ = try addEntity(&g, a, .trait_, "Display", root);
+    _ = try addEntity(&g, a, .trait_, "Debug", root);
+    const display_impl = try addEntity(&g, a, .impl_, "Display for Foo", root);
+    _ = try addEntity(&g, a, .fn_, "render", display_impl);
+    const debug_impl = try addEntity(&g, a, .impl_, "Debug for Foo", root);
+    _ = try addEntity(&g, a, .fn_, "render", debug_impl);
+    const render_ident = try addEntity(&g, a, .fn_, "render", root);
+
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "Foo", .id = null }} } },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .shared,
+                .method = render_ident,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    _ = resolve_methods.resolveMethods(&g, &b);
+    try expectUnsupported(&b.exprs[1]);
+}
+
+test "unknown method dispatch marks only the call as unsupported" {
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    _ = try addEntity(&g, a, .struct_, "Foo", root);
+    const missing_ident = try addEntity(&g, a, .fn_, "missing", root);
+
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "Foo", .id = null }} } },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .shared,
+                .method = missing_ident,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    _ = resolve_methods.resolveMethods(&g, &b);
+    try expectUnsupported(&b.exprs[1]);
+}
+
+test "inherent dispatch normalizes generic impl receiver spelling" {
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    _ = try addEntity(&g, a, .struct_, "Fletcher", root);
+    const fletcher_impl = try addEntity(&g, a, .impl_, "Fletcher<T>", root);
+    const fn_update = try addEntity(&g, a, .fn_, "update", fletcher_impl);
+    const update_ident = try addEntity(&g, a, .fn_, "update", root);
+
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "Fletcher", .id = null }} } },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .mutable,
+                .method = update_ident,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = resolve_methods.resolveMethods(&g, &b);
+    try std.testing.expectEqual(@as(usize, 1), stats.inherent_resolved);
+    try std.testing.expectEqual(@as(spine.EntityId, fn_update), b.exprs[1].kind.method_call.method);
+}
 
 test "inherent method resolution for Fletcher16 new, update, and value" {
     const a = std.testing.allocator;

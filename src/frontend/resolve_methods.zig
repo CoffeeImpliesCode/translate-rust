@@ -65,7 +65,82 @@ pub const ResolutionStats = struct {
     std_resolved: usize = 0,
     constructors_resolved: usize = 0,
     unsupported_methods: usize = 0,
+    unsupported_operators: usize = 0,
 };
+
+const TraitImplParts = struct {
+    trait_name: []const u8,
+    type_name: []const u8,
+};
+
+const TraitMethodLookup = struct {
+    candidate: ?spine.EntityId = null,
+    count: usize = 0,
+};
+
+const reason_method_name_unavailable = "method name unavailable";
+const reason_receiver_unavailable = "method receiver unavailable";
+const reason_method_dispatch_unavailable = "method dispatch unavailable";
+const reason_method_dispatch_ambiguous = "method dispatch ambiguous";
+const reason_operator_operands_unresolved = "operator operands unresolved";
+const reason_operator_requires_primitives = "operator requires primitive operands";
+
+/// Strip references, paths, and generic arguments from a nominal spelling.
+fn normalizeNominalName(name: []const u8) []const u8 {
+    var normalized = std.mem.trim(u8, name, " \t\r\n&*");
+    if (std.mem.startsWith(u8, normalized, "mut ")) normalized = normalized[4..];
+    if (std.mem.startsWith(u8, normalized, "impl ")) normalized = normalized[5..];
+    if (std.mem.indexOf(u8, normalized, "<")) |generic_start| {
+        normalized = normalized[0..generic_start];
+    }
+    if (std.mem.lastIndexOf(u8, normalized, "::")) |path_separator| {
+        normalized = normalized[path_separator + 2 ..];
+    }
+    return std.mem.trim(u8, normalized, " \t\r\n&*");
+}
+
+fn nominalNamesEqual(left: []const u8, right: []const u8) bool {
+    const left_name = normalizeNominalName(left);
+    const right_name = normalizeNominalName(right);
+    return left_name.len > 0 and right_name.len > 0 and std.mem.eql(u8, left_name, right_name);
+}
+
+fn parseTraitImplName(name: []const u8) ?TraitImplParts {
+    const separator = std.mem.indexOf(u8, name, " for ") orelse return null;
+    const trait_name = std.mem.trim(u8, name[0..separator], " \t\r\n");
+    const type_name = std.mem.trim(u8, name[separator + 5 ..], " \t\r\n");
+    if (trait_name.len == 0 or type_name.len == 0) return null;
+    return .{ .trait_name = trait_name, .type_name = type_name };
+}
+
+fn lookupTraitMethodCandidates(
+    g: *const graph.CrateGraph,
+    type_name: []const u8,
+    method_name: []const u8,
+    trait_name: ?[]const u8,
+) TraitMethodLookup {
+    var lookup: TraitMethodLookup = .{};
+    if (normalizeNominalName(type_name).len == 0 or method_name.len == 0) return lookup;
+
+    for (g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .impl_) continue;
+        const parts = parseTraitImplName(ent.name) orelse continue;
+        if (!nominalNamesEqual(parts.type_name, type_name)) continue;
+        if (trait_name) |wanted_trait| {
+            if (!nominalNamesEqual(parts.trait_name, wanted_trait)) continue;
+        }
+
+        for (g.symbol_table.entities.items) |child| {
+            if (child.kind == .fn_ and child.parent == ent.id and
+                std.mem.eql(u8, child.name, method_name))
+            {
+                lookup.candidate = child.id;
+                lookup.count += 1;
+            }
+        }
+    }
+    return lookup;
+}
 
 /// Lookup an inherent method for `type_name` with `method_name`.
 /// Returns the EntityId of the matching `fn` if found.
@@ -76,17 +151,17 @@ pub fn lookupInherentMethod(
 ) ?spine.EntityId {
     std.debug.assert(type_name.len >= 0);
     std.debug.assert(method_name.len >= 0);
-    if (type_name.len == 0 or method_name.len == 0) return null;
+    if (normalizeNominalName(type_name).len == 0 or method_name.len == 0) return null;
 
     for (g.symbol_table.entities.items) |ent| {
-        if (ent.kind == .impl_) {
-            // Inherent impl blocks have name == type_name (not a trait impl containing " for ").
-            const is_trait_impl = std.mem.indexOf(u8, ent.name, " for ") != null;
-            if (!is_trait_impl and std.mem.eql(u8, ent.name, type_name)) {
-                for (g.symbol_table.entities.items) |child| {
-                    if (child.kind == .fn_ and child.parent == ent.id and std.mem.eql(u8, child.name, method_name)) {
-                        return child.id;
-                    }
+        if (ent.kind == .impl_ and parseTraitImplName(ent.name) == null and
+            nominalNamesEqual(ent.name, type_name))
+        {
+            for (g.symbol_table.entities.items) |child| {
+                if (child.kind == .fn_ and child.parent == ent.id and
+                    std.mem.eql(u8, child.name, method_name))
+                {
+                    return child.id;
                 }
             }
         }
@@ -107,28 +182,8 @@ pub fn lookupTraitMethod(
     std.debug.assert(method_name.len >= 0);
     if (trait_name.len == 0 or type_name.len == 0 or method_name.len == 0) return null;
 
-    var count: usize = 0;
-    var candidate: ?spine.EntityId = null;
-
-    for (g.symbol_table.entities.items) |ent| {
-        if (ent.kind == .impl_) {
-            // Check if name is "{trait_name} for {type_name}" or contains both.
-            const has_trait = std.mem.indexOf(u8, ent.name, trait_name) != null;
-            const has_type = std.mem.indexOf(u8, ent.name, type_name) != null;
-            const is_trait_impl = std.mem.indexOf(u8, ent.name, " for ") != null;
-            if (is_trait_impl and has_trait and has_type) {
-                for (g.symbol_table.entities.items) |child| {
-                    if (child.kind == .fn_ and child.parent == ent.id and std.mem.eql(u8, child.name, method_name)) {
-                        candidate = child.id;
-                        count += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // Single candidate -> resolved; multiple candidates (ambiguity) -> null.
-    if (count == 1) return candidate;
+    const lookup = lookupTraitMethodCandidates(g, type_name, method_name, trait_name);
+    if (lookup.count == 1) return lookup.candidate;
     return null;
 }
 
@@ -240,50 +295,197 @@ pub fn getTypeName(g: *const graph.CrateGraph, t: types.Type) ?[]const u8 {
     }
 }
 
+fn inherentImplTypeName(g: *const graph.CrateGraph, target: spine.EntityId) ?[]const u8 {
+    const method = g.symbol_table.get(target) orelse return null;
+    if (method.kind != .fn_) return null;
+    const parent_id = method.parent orelse return null;
+    const impl = g.symbol_table.get(parent_id) orelse return null;
+    if (impl.kind != .impl_ or parseTraitImplName(impl.name) != null) return null;
+
+    const type_name = normalizeNominalName(impl.name);
+    if (type_name.len == 0) return null;
+    return type_name;
+}
+
+fn receiverNominalName(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver_node: exprs.NodeId,
+) ?[]const u8 {
+    if (receiver_node >= b.exprs.len) return null;
+    const receiver = b.exprs[receiver_node];
+
+    if (receiver.ty) |type_id| {
+        if (type_id < b.types.len) {
+            if (getTypeName(g, b.types[type_id])) |type_name| {
+                const nominal_name = normalizeNominalName(type_name);
+                if (nominal_name.len > 0) return nominal_name;
+            }
+        }
+    }
+
+    return switch (receiver.kind) {
+        .call => |call| switch (call.call_kind) {
+            .associated => |target| inherentImplTypeName(g, target),
+            else => null,
+        },
+        .method_call => |method| inherentImplTypeName(g, method.method),
+        else => null,
+    };
+}
+
+fn pathDeclaredType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    path: exprs.PathExpr,
+) ?types.Type {
+    const entity = g.symbol_table.get(path.def) orelse return null;
+    const fn_id = entity.parent orelse return null;
+    if (fn_id >= b.bodies.len) return null;
+    const fn_body = switch (b.bodies[fn_id]) {
+        .fn_ => |body| body,
+        else => return null,
+    };
+    for (fn_body.params) |param| {
+        if (std.mem.eql(u8, param.name, entity.name)) return param.ty;
+    }
+    return null;
+}
+
+fn operandTypeResolved(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+) bool {
+    if (node >= b.exprs.len) return false;
+    const operand = b.exprs[node];
+    if (operand.kind == .unsupported) return false;
+    if (operand.ty) |type_id| {
+        if (type_id >= b.types.len) return false;
+        return b.types[type_id] != .unsupported;
+    }
+    return switch (operand.kind) {
+        .literal => true,
+        .path => |path| pathDeclaredType(g, b, path) != null,
+        else => false,
+    };
+}
+
+fn operandIsPrimitive(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+) bool {
+    if (node >= b.exprs.len) return false;
+    const operand = b.exprs[node];
+    if (operand.ty) |type_id| {
+        if (type_id >= b.types.len) return false;
+        return b.types[type_id] == .prim;
+    }
+    return switch (operand.kind) {
+        .literal => |literal| switch (literal) {
+            .int, .float, .character, .boolean => true,
+            .string, .byte_array => false,
+        },
+        .path => |path| switch (pathDeclaredType(g, b, path) orelse return false) {
+            .prim => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn replaceWithUnsupported(e: *exprs.Expr, reason: []const u8) void {
+    e.kind = .{ .unsupported = .{
+        .reason = reason,
+        .suggested_version = .v1,
+    } };
+}
+
 /// Resolve all method calls in `b.exprs` using the crate graph and types table.
 pub fn resolveMethods(
     g: *const graph.CrateGraph,
     b: *bodies.Bodies,
 ) ResolutionStats {
     var stats: ResolutionStats = .{};
-
     for (@constCast(b.exprs)) |*e| {
         if (e.kind == .method_call) {
             const mc = &e.kind.method_call;
-            const m_ent = g.symbol_table.get(mc.method);
-            const m_name = if (m_ent) |me| me.name else "";
-            if (m_name.len == 0) continue;
+            const method_ent = g.symbol_table.get(mc.method);
+            const method_name = if (method_ent) |ent| ent.name else "";
+            if (method_name.len == 0) {
+                replaceWithUnsupported(e, reason_method_name_unavailable);
+                stats.unsupported_methods += 1;
+                continue;
+            }
+
+            const receiver_node = mc.receiver;
+            if (receiver_node >= b.exprs.len) {
+                replaceWithUnsupported(e, reason_receiver_unavailable);
+                stats.unsupported_methods += 1;
+                continue;
+            }
+
+            const receiver = b.exprs[receiver_node];
+            var receiver_ty: ?types.Type = null;
+            if (receiver.ty) |type_id| {
+                if (type_id < b.types.len) receiver_ty = b.types[type_id];
+            }
+
+            const receiver_name = receiverNominalName(g, b, receiver_node);
+            if (receiver_name == null) {
+                replaceWithUnsupported(e, reason_receiver_unavailable);
+                stats.unsupported_methods += 1;
+                continue;
+            }
 
             var resolved = false;
+            // Inherent methods have precedence over trait methods.
+            if (lookupInherentMethod(g, receiver_name.?, method_name)) |fn_id| {
+                mc.method = fn_id;
+                stats.inherent_resolved += 1;
+                resolved = true;
+            }
 
-            const recv_node = mc.receiver;
-            if (recv_node < b.exprs.len) {
-                const recv_expr = b.exprs[recv_node];
-                if (recv_expr.ty) |tid| {
-                    if (tid < b.types.len) {
-                        const recv_ty = b.types[tid];
-                        if (getTypeName(g, recv_ty)) |ty_name| {
-                            // 1. Try inherent method first.
-                            if (lookupInherentMethod(g, ty_name, m_name)) |fn_id| {
-                                mc.method = fn_id;
-                                stats.inherent_resolved += 1;
-                                resolved = true;
-                            }
-                        }
+            if (!resolved) {
+                const trait_lookup =
+                    lookupTraitMethodCandidates(g, receiver_name.?, method_name, null);
+                if (trait_lookup.count > 1) {
+                    replaceWithUnsupported(e, reason_method_dispatch_ambiguous);
+                    stats.unsupported_methods += 1;
+                    continue;
+                }
+                if (trait_lookup.count == 1) {
+                    if (trait_lookup.candidate) |fn_id| {
+                        mc.method = fn_id;
+                        stats.trait_resolved += 1;
+                        resolved = true;
+                    }
+                }
+            }
 
-                        // 2. Try std method if not resolved as inherent.
-                        if (!resolved) {
-                            if (lookupStdMethod(recv_ty, m_name)) |_| {
-                                stats.std_resolved += 1;
-                                resolved = true;
-                            }
-                        }
+            // Keep the standard-library table as the final method fallback.
+            if (!resolved) {
+                if (receiver_ty) |ty| {
+                    if (lookupStdMethod(ty, method_name) != null) {
+                        stats.std_resolved += 1;
+                        resolved = true;
                     }
                 }
             }
 
             if (!resolved) {
+                replaceWithUnsupported(e, reason_method_dispatch_unavailable);
                 stats.unsupported_methods += 1;
+            }
+        } else if (e.kind == .binary) {
+            const binary = e.kind.binary;
+            if (!operandTypeResolved(g, b, binary.lhs) or !operandTypeResolved(g, b, binary.rhs)) {
+                replaceWithUnsupported(e, reason_operator_operands_unresolved);
+                stats.unsupported_operators += 1;
+            } else if (!operandIsPrimitive(g, b, binary.lhs) or !operandIsPrimitive(g, b, binary.rhs)) {
+                replaceWithUnsupported(e, reason_operator_requires_primitives);
+                stats.unsupported_operators += 1;
             }
         }
     }

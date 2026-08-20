@@ -314,6 +314,91 @@ test "analyzeSource: const array + primitive initializers parsed into const body
     try std.testing.expect(saw_count);
 }
 
+test "analyzeSource resolves generic alias inherent method chain" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub struct Fletcher<T> { state: T }
+        \\pub type Fletcher16 = Fletcher<u16>;
+        \\impl Fletcher<u16> {
+        \\    pub fn new() -> Fletcher<u16> {
+        \\        Fletcher { state: 0u16 }
+        \\    }
+        \\}
+        \\impl<T> Fletcher<T> {
+        \\    pub fn update(self, state: T) -> Fletcher<T> {
+        \\        Fletcher { state }
+        \\    }
+        \\    pub fn value(self) -> T {
+        \\        self.state
+        \\    }
+        \\}
+        \\pub fn calculate(input: u16) -> u16 {
+        \\    Fletcher16::new().update(input + 1).value()
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "fletcher", "2021", src);
+
+    var new_id: ?spine.EntityId = null;
+    var update_id: ?spine.EntityId = null;
+    var value_id: ?spine.EntityId = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind != .fn_) continue;
+        if (std.mem.eql(u8, entity.name, "new")) {
+            new_id = entity.id;
+        } else if (std.mem.eql(u8, entity.name, "update")) {
+            update_id = entity.id;
+        } else if (std.mem.eql(u8, entity.name, "value")) {
+            value_id = entity.id;
+        }
+    }
+    try std.testing.expect(new_id != null);
+    try std.testing.expect(update_id != null);
+    try std.testing.expect(value_id != null);
+
+    var saw_new = false;
+    var saw_update = false;
+    var saw_value = false;
+    var saw_primitive_add = false;
+    for (rust_ir.bodies.exprs) |expression| {
+        try std.testing.expect(expression.kind != .unsupported);
+        switch (expression.kind) {
+            .call => |call| switch (call.call_kind) {
+                .associated => |target| {
+                    try std.testing.expectEqual(new_id.?, target);
+                    saw_new = true;
+                },
+                else => {},
+            },
+            .method_call => |method_call| {
+                const target = rust_ir.graph.symbol_table.get(method_call.method) orelse
+                    return error.TestUnexpectedResult;
+                try std.testing.expect(target.kind == .fn_);
+                if (target.id == update_id.?) {
+                    saw_update = true;
+                } else if (target.id == value_id.?) {
+                    saw_value = true;
+                } else {
+                    return error.TestUnexpectedResult;
+                }
+            },
+            .binary => |binary| {
+                try std.testing.expect(binary.op == .add);
+                saw_primitive_add = true;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_new);
+    try std.testing.expect(saw_update);
+    try std.testing.expect(saw_value);
+    try std.testing.expect(saw_primitive_add);
+}
+
 test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -378,4 +463,245 @@ test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])"
     const custom_mod = find_mod(&rust_ir, "custom_pub") orelse return error.MissingCustomModule;
     try std.testing.expect(custom_mod.source_path != null);
     try std.testing.expect(custom_mod.items.len > 0);
+}
+
+test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\mod state {
+        \\    pub struct State(pub u8);
+        \\
+        \\    pub trait Inspect {
+        \\        fn value(&self) -> u8;
+        \\    }
+        \\
+        \\    pub fn initial() -> State {
+        \\        State(1)
+        \\    }
+        \\}
+        \\
+        \\pub use state::State;
+        \\
+        \\#[cfg(test)]
+        \\mod tests {
+        \\    use super::State;
+        \\
+        \\    #[test]
+        \\    fn state_body_is_lossless() {
+        \\        let mut value = 7;
+        \\        let State(inner) = State(value);
+        \\        value = if true { inner } else { 3 };
+        \\    }
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "pre_p4", "2021", src);
+    const helpers = struct {
+        fn findEntity(
+            rust_ir_: *const ir.RustIR,
+            kind: spine.EntityKind,
+            name: []const u8,
+        ) ?spine.Entity {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != kind) continue;
+                if (std.mem.eql(u8, entity.name, name)) return entity;
+            }
+            return null;
+        }
+
+        fn findModule(rust_ir_: *const ir.RustIR, name: []const u8) ?graph.Module {
+            for (rust_ir_.graph.modules.items) |module| {
+                if (std.mem.eql(u8, module.name, name)) return module;
+            }
+            return null;
+        }
+
+        fn hasAttribute(
+            attributes: []const spine.Attribute,
+            name: []const u8,
+            meta_fragment: []const u8,
+        ) bool {
+            for (attributes) |attribute| {
+                if (!std.mem.eql(u8, attribute.name, name)) continue;
+                if (meta_fragment.len == 0) return true;
+                if (std.mem.indexOf(u8, attribute.meta, meta_fragment) != null) return true;
+            }
+            return false;
+        }
+    };
+
+    const state_module = helpers.findEntity(&rust_ir, .module, "state");
+    try std.testing.expect(state_module != null);
+    const state_module_entity = state_module.?;
+    try std.testing.expect(state_module_entity.visibility == .private);
+    try std.testing.expectEqual(@as(?spine.EntityId, 0), state_module_entity.parent);
+
+    const state_entity = helpers.findEntity(&rust_ir, .struct_, "State");
+    try std.testing.expect(state_entity != null);
+    const state = state_entity.?;
+    try std.testing.expect(state.visibility == .public);
+    try std.testing.expectEqual(@as(?spine.EntityId, state_module_entity.id), state.parent);
+    try std.testing.expect(state.id < rust_ir.bodies.bodies.len);
+    try std.testing.expect(rust_ir.bodies.bodies[state.id] == .struct_);
+    const state_body = rust_ir.bodies.bodies[state.id].struct_;
+    try std.testing.expect(state_body.layout == .tuple);
+    try std.testing.expectEqual(@as(usize, 1), state_body.fields.len);
+    try std.testing.expectEqualStrings("0", state_body.fields[0].name);
+    try std.testing.expect(state_body.fields[0].ty == .prim);
+    try std.testing.expect(state_body.fields[0].ty.prim == .u8);
+
+    const inspect_entity = helpers.findEntity(&rust_ir, .trait_, "Inspect");
+    try std.testing.expect(inspect_entity != null);
+    const inspect = inspect_entity.?;
+    try std.testing.expect(inspect.visibility == .public);
+    try std.testing.expectEqual(@as(?spine.EntityId, state_module_entity.id), inspect.parent);
+    try std.testing.expect(inspect.id < rust_ir.bodies.bodies.len);
+    try std.testing.expect(rust_ir.bodies.bodies[inspect.id] == .trait_);
+    const inspect_body = rust_ir.bodies.bodies[inspect.id].trait_;
+    try std.testing.expectEqual(@as(usize, 1), inspect_body.methods.len);
+    try std.testing.expectEqualStrings("value", inspect_body.methods[0].name);
+    try std.testing.expect(inspect_body.methods[0].receiver == .ref_);
+    try std.testing.expect(inspect_body.methods[0].ret == .prim);
+    try std.testing.expect(inspect_body.methods[0].ret.prim == .u8);
+
+    const initial_entity = helpers.findEntity(&rust_ir, .fn_, "initial");
+    try std.testing.expect(initial_entity != null);
+    const initial = initial_entity.?;
+    try std.testing.expect(initial.visibility == .public);
+    try std.testing.expectEqual(@as(?spine.EntityId, state_module_entity.id), initial.parent);
+    try std.testing.expect(initial.id < rust_ir.bodies.bodies.len);
+    try std.testing.expect(rust_ir.bodies.bodies[initial.id] == .fn_);
+
+    var state_reexport: ?graph.UseDecl = null;
+    for (rust_ir.graph.uses.items) |use_decl| {
+        if (!use_decl.is_pub_export) continue;
+        if (!std.mem.eql(u8, use_decl.local_name, "State")) continue;
+        state_reexport = use_decl;
+        break;
+    }
+    try std.testing.expect(state_reexport != null);
+    const reexport = state_reexport.?;
+    try std.testing.expectEqual(state.id, reexport.target);
+    try std.testing.expect(reexport.kind == .plain);
+    try std.testing.expectEqual(state.id, reexport.kind.plain);
+    const reexport_entity = rust_ir.graph.symbol_table.get(reexport.id);
+    try std.testing.expect(reexport_entity != null);
+    try std.testing.expect(reexport_entity.?.visibility == .public);
+    try std.testing.expectEqual(@as(?spine.EntityId, 0), reexport_entity.?.parent);
+
+    const tests_module = helpers.findEntity(&rust_ir, .module, "tests");
+    try std.testing.expect(tests_module != null);
+    const tests_module_entity = tests_module.?;
+    try std.testing.expect(tests_module_entity.visibility == .private);
+    try std.testing.expect(helpers.hasAttribute(
+        tests_module_entity.attributes,
+        "cfg",
+        "test",
+    ));
+    const tests_module_row = helpers.findModule(&rust_ir, "tests");
+    try std.testing.expect(tests_module_row != null);
+    try std.testing.expect(helpers.hasAttribute(
+        tests_module_row.?.attributes,
+        "cfg",
+        "test",
+    ));
+
+    const test_entity = helpers.findEntity(&rust_ir, .fn_, "state_body_is_lossless");
+    try std.testing.expect(test_entity != null);
+    const test_fn = test_entity.?;
+    try std.testing.expect(test_fn.visibility == .private);
+    try std.testing.expectEqual(@as(?spine.EntityId, tests_module_entity.id), test_fn.parent);
+    try std.testing.expect(helpers.hasAttribute(test_fn.attributes, "test", ""));
+    try std.testing.expect(test_fn.id < rust_ir.bodies.bodies.len);
+    try std.testing.expect(rust_ir.bodies.bodies[test_fn.id] == .fn_);
+
+    const test_body = rust_ir.bodies.bodies[test_fn.id].fn_;
+    try std.testing.expect(test_body.body < rust_ir.bodies.exprs.len);
+    const body_expression = rust_ir.bodies.exprs[test_body.body];
+    try std.testing.expect(body_expression.kind == .block);
+    const body_block = body_expression.kind.block;
+    try std.testing.expectEqual(@as(usize, 3), body_block.statements.len);
+    try std.testing.expect(body_block.tail == null);
+
+    const mutable_statement = rust_ir.bodies.stmts[body_block.statements[0]];
+    try std.testing.expect(mutable_statement.kind == .let);
+    const mutable_let = mutable_statement.kind.let;
+    const mutable_pattern = rust_ir.bodies.pats[mutable_let.pattern];
+    try std.testing.expect(mutable_pattern.kind == .binding);
+    try std.testing.expectEqualStrings("value", mutable_pattern.kind.binding.name);
+    try std.testing.expect(mutable_pattern.kind.binding.mutable);
+    try std.testing.expect(mutable_let.init != null);
+    const seven = rust_ir.bodies.exprs[mutable_let.init.?];
+    try std.testing.expect(seven.kind == .literal);
+    try std.testing.expect(seven.kind.literal == .int);
+    try std.testing.expectEqual(@as(i128, 7), seven.kind.literal.int.value);
+
+    const destructure_statement = rust_ir.bodies.stmts[body_block.statements[1]];
+    try std.testing.expect(destructure_statement.kind == .let);
+    const destructure_let = destructure_statement.kind.let;
+    const destructure_pattern = rust_ir.bodies.pats[destructure_let.pattern];
+    try std.testing.expect(destructure_pattern.kind == .struct_pat);
+    const tuple_pattern = destructure_pattern.kind.struct_pat;
+    try std.testing.expectEqual(state.id, tuple_pattern.def);
+    try std.testing.expectEqual(@as(usize, 1), tuple_pattern.fields.len);
+    try std.testing.expectEqualStrings("0", tuple_pattern.fields[0].field);
+    try std.testing.expect(tuple_pattern.fields[0].pat != null);
+    const inner_pattern = rust_ir.bodies.pats[tuple_pattern.fields[0].pat.?];
+    try std.testing.expect(inner_pattern.kind == .binding);
+    try std.testing.expectEqualStrings("inner", inner_pattern.kind.binding.name);
+    try std.testing.expect(!inner_pattern.kind.binding.mutable);
+
+    try std.testing.expect(destructure_let.init != null);
+    const constructor = rust_ir.bodies.exprs[destructure_let.init.?];
+    try std.testing.expect(constructor.kind == .call);
+    try std.testing.expect(constructor.kind.call.call_kind == .constructor);
+    try std.testing.expectEqual(state.id, constructor.kind.call.call_kind.constructor);
+    try std.testing.expectEqual(@as(usize, 1), constructor.kind.call.args.len);
+    const constructor_arg = rust_ir.bodies.exprs[constructor.kind.call.args[0]];
+    try std.testing.expect(constructor_arg.kind == .path);
+
+    const assignment_statement = rust_ir.bodies.stmts[body_block.statements[2]];
+    try std.testing.expect(assignment_statement.kind == .expr);
+    const assignment = rust_ir.bodies.exprs[assignment_statement.kind.expr];
+    try std.testing.expect(assignment.kind == .assign);
+    try std.testing.expect(assignment.kind.assign.op == .plain);
+    try std.testing.expect(rust_ir.bodies.exprs[assignment.kind.assign.target].kind == .path);
+    const conditional = rust_ir.bodies.exprs[assignment.kind.assign.value];
+    try std.testing.expect(conditional.kind == .if_else);
+    const if_else = conditional.kind.if_else;
+    const condition = rust_ir.bodies.exprs[if_else.cond];
+    try std.testing.expect(condition.kind == .literal);
+    try std.testing.expect(condition.kind.literal == .boolean);
+    try std.testing.expect(condition.kind.literal.boolean);
+    try std.testing.expect(if_else.then_.tail != null);
+    try std.testing.expectEqual(@as(usize, 0), if_else.then_.statements.len);
+    try std.testing.expect(rust_ir.bodies.exprs[if_else.then_.tail.?].kind == .path);
+    try std.testing.expect(if_else.@"else" == .block);
+    const else_block = if_else.@"else".block;
+    try std.testing.expect(else_block.tail != null);
+    try std.testing.expectEqual(@as(usize, 0), else_block.statements.len);
+    const three = rust_ir.bodies.exprs[else_block.tail.?];
+    try std.testing.expect(three.kind == .literal);
+    try std.testing.expect(three.kind.literal == .int);
+    try std.testing.expectEqual(@as(i128, 3), three.kind.literal.int.value);
+
+    const body_expression_ids = [_]exprs.NodeId{
+        test_body.body,
+        mutable_let.init.?,
+        destructure_let.init.?,
+        constructor.kind.call.args[0],
+        assignment_statement.kind.expr,
+        assignment.kind.assign.target,
+        assignment.kind.assign.value,
+        if_else.cond,
+        if_else.then_.tail.?,
+        else_block.tail.?,
+    };
+    for (body_expression_ids) |expression_id| {
+        try std.testing.expect(expression_id < rust_ir.bodies.exprs.len);
+        try std.testing.expect(rust_ir.bodies.exprs[expression_id].kind != .unsupported);
+    }
 }

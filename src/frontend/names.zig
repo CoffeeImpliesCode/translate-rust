@@ -52,6 +52,7 @@ const BaseKind = enum { crate_, self_, super_, bare };
 /// buffer and must free it.
 const ParsedUse = struct {
     base: BaseKind,
+    super_depth: usize = 0,
     segments: std.ArrayListUnmanaged([]const u8) = .empty,
     alias: ?[]const u8 = null,
     glob: bool = false,
@@ -77,7 +78,8 @@ fn parseUsePath(alloc: std.mem.Allocator, src: []const u8) ParsedUse {
         path = std.mem.trim(u8, path[0..ai], " \t\r\n");
     }
 
-    // Explicit base prefix.
+    // Explicit base prefix. Count every `super::` so nested parent traversal
+    // follows the lexical module tree one edge at a time.
     var rest = path;
     if (std.mem.startsWith(u8, path, "crate::")) {
         out.base = .crate_;
@@ -85,10 +87,14 @@ fn parseUsePath(alloc: std.mem.Allocator, src: []const u8) ParsedUse {
     } else if (std.mem.startsWith(u8, path, "self::")) {
         out.base = .self_;
         rest = path["self::".len..];
-    } else if (std.mem.startsWith(u8, path, "super::")) {
-        out.base = .super_;
-        rest = path["super::".len..];
-    } else if (std.mem.startsWith(u8, path, "::")) {
+    } else {
+        while (std.mem.startsWith(u8, rest, "super::")) {
+            out.base = .super_;
+            out.super_depth += 1;
+            rest = rest["super::".len..];
+        }
+    }
+    if (out.super_depth == 0 and std.mem.startsWith(u8, path, "::")) {
         // Absolute `::foo` — treated as bare (resolve from the current scope).
         rest = path[2..];
         out.base = .bare;
@@ -235,15 +241,15 @@ pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
             .crate_ => start = root_id,
             .self_, .bare => start = ent.parent,
             .super_ => {
-                if (ent.parent) |p| {
-                    if (g.symbol_table.get(p)) |own_ent| {
-                        if (own_ent.kind == .module) {
-                            if (moduleForEntity(g, &own_ent)) |own_mod| {
-                                start = own_mod.parent;
-                            }
-                        }
-                    }
+                var cursor = ent.parent;
+                var depth: usize = 0;
+                while (depth < parsed.super_depth) : (depth += 1) {
+                    const module_id = cursor orelse break;
+                    const module_ent = g.symbol_table.get(module_id) orelse break;
+                    if (module_ent.kind != .module) break;
+                    cursor = module_ent.parent;
                 }
+                if (depth == parsed.super_depth) start = cursor;
             },
         }
         const start_id = start orelse root_id;

@@ -132,7 +132,7 @@
                     "patterns": [
                       {
                         "kind": "struct_pat",
-                        "name": "Circle",
+                        "name": "",
                         "fields": [
                           {
                             "name": "0",
@@ -145,34 +145,15 @@
                       }
                     ],
                     "body": {
-                      "kind": "bin_op",
-                      "op": "mul",
-                      "lhs": {
-                        "kind": "bin_op",
-                        "op": "mul",
-                        "lhs": {
-                          "kind": "ident",
-                          "name": "r"
-                        },
-                        "rhs": {
-                          "kind": "ident",
-                          "name": "r"
-                        }
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "float",
-                          "value": 3.14159
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   },
                   {
                     "patterns": [
                       {
                         "kind": "struct_pat",
-                        "name": "Rect",
+                        "name": "",
                         "fields": [
                           {
                             "name": "width",
@@ -192,16 +173,8 @@
                       }
                     ],
                     "body": {
-                      "kind": "bin_op",
-                      "op": "mul",
-                      "lhs": {
-                        "kind": "ident",
-                        "name": "width"
-                      },
-                      "rhs": {
-                        "kind": "ident",
-                        "name": "height"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   }
                 ]

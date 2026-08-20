@@ -15,7 +15,7 @@
         {
           "local_name": "error",
           "module_or_path": "./error.zig",
-          "is_pub": true
+          "is_pub": false
         },
         {
           "local_name": "serde",
@@ -25,7 +25,7 @@
         {
           "local_name": "test",
           "module_or_path": "./test.zig",
-          "is_pub": true
+          "is_pub": false
         }
       ],
       "decls": [
@@ -49,7 +49,7 @@
           "kind": "const_decl",
           "value": {
             "name": "HEX_CHARS_LOWER",
-            "is_pub": true,
+            "is_pub": false,
             "ty": {
               "kind": "array",
               "elem": {
@@ -71,7 +71,7 @@
           "kind": "const_decl",
           "value": {
             "name": "HEX_CHARS_UPPER",
-            "is_pub": true,
+            "is_pub": false,
             "ty": {
               "kind": "array",
               "elem": {
@@ -104,7 +104,7 @@
           "kind": "fn_decl",
           "value": {
             "name": "encode_to_iter",
-            "is_pub": true,
+            "is_pub": false,
             "is_test": false,
             "params": [
               {
@@ -146,36 +146,16 @@
             },
             "body": {
               "label": null,
-              "stmts": [],
-              "expr": {
-                "kind": "call",
-                "callee": {
-                  "kind": "field_access",
-                  "target": {
-                    "kind": "call",
-                    "callee": {
-                      "kind": "field_access",
-                      "target": {
-                        "kind": "ident",
-                        "name": "BytesToHexChars"
-                      },
-                      "field_name": "new"
-                    },
-                    "args": [
-                      {
-                        "kind": "ident",
-                        "name": "source"
-                      },
-                      {
-                        "kind": "ident",
-                        "name": "table"
-                      }
-                    ]
-                  },
-                  "field_name": "collect"
-                },
-                "args": []
-              }
+              "stmts": [
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "method dispatch unavailable"
+                  }
+                }
+              ],
+              "expr": null
             },
             "generic_params": []
           }
@@ -184,7 +164,7 @@
           "kind": "fn_decl",
           "value": {
             "name": "val",
-            "is_pub": true,
+            "is_pub": false,
             "is_test": false,
             "params": [
               {
@@ -302,19 +282,16 @@
             },
             "body": {
               "label": null,
-              "stmts": [],
-              "expr": {
-                "kind": "call",
-                "callee": {
-                  "kind": "field_access",
-                  "target": {
-                    "kind": "ident",
-                    "name": "data"
-                  },
-                  "field_name": "encode_hex"
-                },
-                "args": []
-              }
+              "stmts": [
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "method receiver unavailable"
+                  }
+                }
+              ],
+              "expr": null
             },
             "generic_params": []
           }
@@ -349,19 +326,16 @@
             },
             "body": {
               "label": null,
-              "stmts": [],
-              "expr": {
-                "kind": "call",
-                "callee": {
-                  "kind": "field_access",
-                  "target": {
-                    "kind": "ident",
-                    "name": "data"
-                  },
-                  "field_name": "encode_hex_upper"
-                },
-                "args": []
-              }
+              "stmts": [
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "method receiver unavailable"
+                  }
+                }
+              ],
+              "expr": null
             },
             "generic_params": []
           }
@@ -466,25 +440,69 @@
                   "name": "data",
                   "ty": null,
                   "init": {
-                    "kind": "ident",
-                    "name": "data"
+                    "kind": "unsupported",
+                    "reason": "method receiver unavailable"
                   },
                   "is_mut": false
                 },
                 {
                   "kind": "expr_stmt",
                   "expr": {
-                    "kind": "struct_init",
-                    "type_name": null,
-                    "fields": []
+                    "kind": "if_expr",
+                    "cond": {
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
+                    },
+                    "then_body": {
+                      "kind": "block",
+                      "block": {
+                        "label": null,
+                        "stmts": [
+                          {
+                            "kind": "expr_stmt",
+                            "expr": {
+                              "kind": "return_expr",
+                              "value": {
+                                "kind": "unsupported",
+                                "reason": "unresolved call"
+                              }
+                            }
+                          }
+                        ],
+                        "expr": null
+                      }
+                    },
+                    "else_body": null
                   }
                 },
                 {
                   "kind": "expr_stmt",
                   "expr": {
-                    "kind": "struct_init",
-                    "type_name": null,
-                    "fields": []
+                    "kind": "if_expr",
+                    "cond": {
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
+                    },
+                    "then_body": {
+                      "kind": "block",
+                      "block": {
+                        "label": null,
+                        "stmts": [
+                          {
+                            "kind": "expr_stmt",
+                            "expr": {
+                              "kind": "return_expr",
+                              "value": {
+                                "kind": "unsupported",
+                                "reason": "unresolved call"
+                              }
+                            }
+                          }
+                        ],
+                        "expr": null
+                      }
+                    },
+                    "else_body": null
                   }
                 },
                 {
@@ -526,27 +544,8 @@
                             }
                           },
                           "val": {
-                            "kind": "bin_op",
-                            "op": "bit_or",
-                            "lhs": {
-                              "kind": "bin_op",
-                              "op": "shl",
-                              "lhs": {
-                                "kind": "unsupported",
-                                "reason": "expression"
-                              },
-                              "rhs": {
-                                "kind": "lit",
-                                "value": {
-                                  "kind": "int",
-                                  "value": "4"
-                                }
-                              }
-                            },
-                            "rhs": {
-                              "kind": "unsupported",
-                              "reason": "expression"
-                            }
+                            "kind": "unsupported",
+                            "reason": "operator operands unresolved"
                           },
                           "op": "assign"
                         }
@@ -573,7 +572,7 @@
           "kind": "fn_decl",
           "value": {
             "name": "generate_iter",
-            "is_pub": true,
+            "is_pub": false,
             "is_test": false,
             "params": [
               {
@@ -597,72 +596,16 @@
             },
             "body": {
               "label": null,
-              "stmts": [],
-              "expr": {
-                "kind": "call",
-                "callee": {
-                  "kind": "field_access",
-                  "target": {
-                    "kind": "call",
-                    "callee": {
-                      "kind": "field_access",
-                      "target": {
-                        "kind": "unsupported",
-                        "reason": "expression"
-                      },
-                      "field_name": "step_by"
-                    },
-                    "args": [
-                      {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "int",
-                          "value": "2"
-                        }
-                      }
-                    ]
-                  },
-                  "field_name": "zip"
-                },
-                "args": [
-                  {
-                    "kind": "call",
-                    "callee": {
-                      "kind": "field_access",
-                      "target": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "expression"
-                          },
-                          "field_name": "skip"
-                        },
-                        "args": [
-                          {
-                            "kind": "lit",
-                            "value": {
-                              "kind": "int",
-                              "value": "1"
-                            }
-                          }
-                        ]
-                      },
-                      "field_name": "step_by"
-                    },
-                    "args": [
-                      {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "int",
-                          "value": "2"
-                        }
-                      }
-                    ]
+              "stmts": [
+                {
+                  "kind": "expr_stmt",
+                  "expr": {
+                    "kind": "unsupported",
+                    "reason": "method receiver unavailable"
                   }
-                ]
-              }
+                }
+              ],
+              "expr": null
             },
             "generic_params": []
           }
@@ -671,7 +614,7 @@
           "kind": "fn_decl",
           "value": {
             "name": "byte2hex",
-            "is_pub": true,
+            "is_pub": false,
             "is_test": false,
             "params": [
               {
@@ -724,30 +667,8 @@
                         "name": "table"
                       },
                       {
-                        "kind": "bin_op",
-                        "op": "shr",
-                        "lhs": {
-                          "kind": "bin_op",
-                          "op": "bit_and",
-                          "lhs": {
-                            "kind": "ident",
-                            "name": "byte"
-                          },
-                          "rhs": {
-                            "kind": "lit",
-                            "value": {
-                              "kind": "int",
-                              "value": "0"
-                            }
-                          }
-                        },
-                        "rhs": {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "int",
-                            "value": "4"
-                          }
-                        }
+                        "kind": "unsupported",
+                        "reason": "operator operands unresolved"
                       }
                     ]
                   },
@@ -776,23 +697,29 @@
                           "kind": "lit",
                           "value": {
                             "kind": "int",
-                            "value": "0"
+                            "value": "15"
                           }
                         }
                       }
                     ]
                   },
                   "is_mut": false
-                },
-                {
-                  "kind": "expr_stmt",
-                  "expr": {
-                    "kind": "unsupported",
-                    "reason": "expression"
-                  }
                 }
               ],
-              "expr": null
+              "expr": {
+                "kind": "multi_array",
+                "type_name": null,
+                "elements": [
+                  {
+                    "kind": "ident",
+                    "name": "high"
+                  },
+                  {
+                    "kind": "ident",
+                    "name": "low"
+                  }
+                ]
+              }
             },
             "generic_params": []
           }
@@ -847,9 +774,31 @@
                 {
                   "kind": "expr_stmt",
                   "expr": {
-                    "kind": "struct_init",
-                    "type_name": null,
-                    "fields": []
+                    "kind": "if_expr",
+                    "cond": {
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
+                    },
+                    "then_body": {
+                      "kind": "block",
+                      "block": {
+                        "label": null,
+                        "stmts": [
+                          {
+                            "kind": "expr_stmt",
+                            "expr": {
+                              "kind": "return_expr",
+                              "value": {
+                                "kind": "unsupported",
+                                "reason": "unresolved call"
+                              }
+                            }
+                          }
+                        ],
+                        "expr": null
+                      }
+                    },
+                    "else_body": null
                   }
                 },
                 {
@@ -869,23 +818,8 @@
                         },
                         "args": [
                           {
-                            "kind": "bin_op",
-                            "op": "mul_wrap",
-                            "lhs": {
-                              "kind": "field_access",
-                              "target": {
-                                "kind": "ident",
-                                "name": "input"
-                              },
-                              "field_name": "len"
-                            },
-                            "rhs": {
-                              "kind": "lit",
-                              "value": {
-                                "kind": "int",
-                                "value": "2"
-                              }
-                            }
+                            "kind": "unsupported",
+                            "reason": "operator operands unresolved"
                           }
                         ]
                       }
@@ -1047,7 +981,7 @@
         {
           "local_name": "tests",
           "module_or_path": "./error/tests.zig",
-          "is_pub": true
+          "is_pub": false
         }
       ],
       "decls": [
@@ -1108,7 +1042,7 @@
                 "kind": "fn_decl",
                 "value": {
                   "name": "fmt",
-                  "is_pub": true,
+                  "is_pub": false,
                   "is_test": false,
                   "params": [
                     {
@@ -1239,16 +1173,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "ident",
-                        "name": "result"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1270,21 +1196,13 @@
                   "kind": "unsupported",
                   "reason": "expression"
                 },
-                "is_mut": false
+                "is_mut": true
               },
               {
                 "kind": "expr_stmt",
                 "expr": {
-                  "kind": "call",
-                  "callee": {
-                    "kind": "field_access",
-                    "target": {
-                      "kind": "unsupported",
-                      "reason": "unresolved call"
-                    },
-                    "field_name": "unwrap"
-                  },
-                  "args": []
+                  "kind": "unsupported",
+                  "reason": "method receiver unavailable"
                 }
               },
               {
@@ -1297,19 +1215,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "ident",
-                        "name": "output_1"
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "6b697769"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1322,21 +1229,13 @@
                   "kind": "unsupported",
                   "reason": "expression"
                 },
-                "is_mut": false
+                "is_mut": true
               },
               {
                 "kind": "expr_stmt",
                 "expr": {
-                  "kind": "call",
-                  "callee": {
-                    "kind": "field_access",
-                    "target": {
-                      "kind": "unsupported",
-                      "reason": "unresolved call"
-                    },
-                    "field_name": "unwrap"
-                  },
-                  "args": []
+                  "kind": "unsupported",
+                  "reason": "method receiver unavailable"
                 }
               },
               {
@@ -1349,19 +1248,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "ident",
-                        "name": "output_2"
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "6b69776973"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1374,7 +1262,7 @@
                   "kind": "unsupported",
                   "reason": "expression"
                 },
-                "is_mut": false
+                "is_mut": true
               },
               {
                 "kind": "expr_stmt",
@@ -1386,16 +1274,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1417,21 +1297,13 @@
                   "kind": "unsupported",
                   "reason": "expression"
                 },
-                "is_mut": false
+                "is_mut": true
               },
               {
                 "kind": "expr_stmt",
                 "expr": {
-                  "kind": "call",
-                  "callee": {
-                    "kind": "field_access",
-                    "target": {
-                      "kind": "unsupported",
-                      "reason": "unresolved call"
-                    },
-                    "field_name": "unwrap"
-                  },
-                  "args": []
+                  "kind": "unsupported",
+                  "reason": "method receiver unavailable"
                 }
               },
               {
@@ -1444,19 +1316,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "ident",
-                        "name": "output_1"
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "kiwi"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1469,21 +1330,13 @@
                   "kind": "unsupported",
                   "reason": "expression"
                 },
-                "is_mut": false
+                "is_mut": true
               },
               {
                 "kind": "expr_stmt",
                 "expr": {
-                  "kind": "call",
-                  "callee": {
-                    "kind": "field_access",
-                    "target": {
-                      "kind": "unsupported",
-                      "reason": "unresolved call"
-                    },
-                    "field_name": "unwrap"
-                  },
-                  "args": []
+                  "kind": "unsupported",
+                  "reason": "method receiver unavailable"
                 }
               },
               {
@@ -1496,19 +1349,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "ident",
-                        "name": "output_2"
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "kiwis"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1521,7 +1363,7 @@
                   "kind": "unsupported",
                   "reason": "expression"
                 },
-                "is_mut": false
+                "is_mut": true
               },
               {
                 "kind": "expr_stmt",
@@ -1533,16 +1375,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1566,19 +1400,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "666f6f626172"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1602,16 +1425,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1635,27 +1450,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "foobar"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1670,27 +1466,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "foobar"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1714,27 +1491,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "foobar"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1749,27 +1507,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": "foobar"
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1793,24 +1532,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap_err"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved scoped path"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1825,24 +1548,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap_err"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved scoped path"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1866,24 +1573,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap_err"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved struct type"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1907,27 +1598,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "lit",
-                        "value": {
-                          "kind": "str",
-                          "value": ""
-                        }
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1951,24 +1623,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "unsupported",
-                            "reason": "unresolved call"
-                          },
-                          "field_name": "unwrap_err"
-                        },
-                        "args": []
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved struct type"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -1992,16 +1648,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -2016,16 +1664,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -2049,27 +1689,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "lit",
-                            "value": {
-                              "kind": "str",
-                              "value": "666f6f626172"
-                            }
-                          },
-                          "field_name": "to_string"
-                        },
-                        "args": []
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
@@ -2084,27 +1705,8 @@
                   },
                   "args": [
                     {
-                      "kind": "bin_op",
-                      "op": "equal",
-                      "lhs": {
-                        "kind": "unsupported",
-                        "reason": "unresolved call"
-                      },
-                      "rhs": {
-                        "kind": "call",
-                        "callee": {
-                          "kind": "field_access",
-                          "target": {
-                            "kind": "lit",
-                            "value": {
-                              "kind": "str",
-                              "value": "666F6F626172"
-                            }
-                          },
-                          "field_name": "to_string"
-                        },
-                        "args": []
-                      }
+                      "kind": "unsupported",
+                      "reason": "operator operands unresolved"
                     }
                   ]
                 }
