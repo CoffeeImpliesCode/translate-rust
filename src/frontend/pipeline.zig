@@ -931,3 +931,152 @@ test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
         try std.testing.expect(rust_ir.bodies.exprs[expression_id].kind != .unsupported);
     }
 }
+
+test "analyzeSource fills cfg test body with literal built-in macros" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\#[cfg(test)]
+        \\mod tests {
+        \\    #[test]
+        \\    fn literal_macros_fill() {
+        \\        assert!(true);
+        \\        assert_eq!(1 + 1, 2);
+        \\        let values = vec![1, 2, 3];
+        \\        let repeated = vec![0xff; 4];
+        \\        panic!("expected");
+        \\    }
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "literal_macros", "2021", src);
+
+    var test_entity: ?spine.Entity = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "literal_macros_fill")) {
+            test_entity = entity;
+            break;
+        }
+    }
+    const test_fn = test_entity orelse return error.TestUnexpectedResult;
+    try std.testing.expect(test_fn.id < rust_ir.bodies.bodies.len);
+    const test_body = switch (rust_ir.bodies.bodies[test_fn.id]) {
+        .fn_ => |fn_body| fn_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(test_body.body < rust_ir.bodies.exprs.len);
+    const root_block = switch (rust_ir.bodies.exprs[test_body.body].kind) {
+        .block => |block| block,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(root_block.statements.len > 0);
+    try std.testing.expectEqual(@as(usize, 5), root_block.statements.len);
+
+    const assert_statement = rust_ir.bodies.stmts[root_block.statements[0]];
+    const assert_expression = switch (assert_statement.kind) {
+        .expr => |expression| rust_ir.bodies.exprs[expression],
+        else => return error.TestUnexpectedResult,
+    };
+    const assert_marker = switch (assert_expression.kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, assert_marker, "assertion:"));
+    const assert_condition_id = try std.fmt.parseInt(
+        exprs.NodeId,
+        assert_marker["assertion:".len..],
+        10,
+    );
+    try std.testing.expect(assert_condition_id < rust_ir.bodies.exprs.len);
+    const assert_condition = rust_ir.bodies.exprs[assert_condition_id];
+    try std.testing.expect(assert_condition.kind == .literal);
+    try std.testing.expect(assert_condition.kind.literal == .boolean);
+    try std.testing.expect(assert_condition.kind.literal.boolean);
+
+    const assert_eq_statement = rust_ir.bodies.stmts[root_block.statements[1]];
+    const assert_eq_expression = switch (assert_eq_statement.kind) {
+        .expr => |expression| rust_ir.bodies.exprs[expression],
+        else => return error.TestUnexpectedResult,
+    };
+    const assert_eq_marker = switch (assert_eq_expression.kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, assert_eq_marker, "assertion:"));
+    const assert_eq_condition_id = try std.fmt.parseInt(
+        exprs.NodeId,
+        assert_eq_marker["assertion:".len..],
+        10,
+    );
+    try std.testing.expect(assert_eq_condition_id < rust_ir.bodies.exprs.len);
+    const assert_eq_condition = rust_ir.bodies.exprs[assert_eq_condition_id];
+    const unresolved_reason = switch (assert_eq_condition.kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("operator operands unresolved", unresolved_reason);
+
+    var sum_id: ?exprs.NodeId = null;
+    for (rust_ir.bodies.exprs, 0..) |candidate, candidate_index| {
+        const binary = switch (candidate.kind) {
+            .binary => |binary| binary,
+            else => continue,
+        };
+        if (binary.op != .add) continue;
+
+        try std.testing.expect(sum_id == null);
+        sum_id = @intCast(candidate_index);
+    }
+    const sum = rust_ir.bodies.exprs[sum_id orelse return error.TestUnexpectedResult];
+    try std.testing.expect(sum.kind == .binary);
+    try std.testing.expect(sum.kind.binary.op == .add);
+
+    const values_statement = rust_ir.bodies.stmts[root_block.statements[2]];
+    const values_let = switch (values_statement.kind) {
+        .let => |let_statement| let_statement,
+        else => return error.TestUnexpectedResult,
+    };
+    const values_init = values_let.init orelse return error.TestUnexpectedResult;
+    const values_array = switch (rust_ir.bodies.exprs[values_init].kind) {
+        .array => |array| array,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(?usize, null), values_array.repeat);
+    try std.testing.expectEqual(@as(usize, 3), values_array.elements.len);
+    for (values_array.elements, 1..) |element_id, expected| {
+        const element = rust_ir.bodies.exprs[element_id];
+        try std.testing.expect(element.kind == .literal);
+        try std.testing.expect(element.kind.literal == .int);
+        try std.testing.expectEqual(@as(i128, @intCast(expected)), element.kind.literal.int.value);
+    }
+
+    const repeated_statement = rust_ir.bodies.stmts[root_block.statements[3]];
+    const repeated_let = switch (repeated_statement.kind) {
+        .let => |let_statement| let_statement,
+        else => return error.TestUnexpectedResult,
+    };
+    const repeated_init = repeated_let.init orelse return error.TestUnexpectedResult;
+    const repeated_array = switch (rust_ir.bodies.exprs[repeated_init].kind) {
+        .array => |array| array,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(?usize, 4), repeated_array.repeat);
+    try std.testing.expectEqual(@as(usize, 1), repeated_array.elements.len);
+    const repeated_element = rust_ir.bodies.exprs[repeated_array.elements[0]];
+    try std.testing.expect(repeated_element.kind == .literal);
+    try std.testing.expect(repeated_element.kind.literal == .int);
+    try std.testing.expectEqual(@as(i128, 0xff), repeated_element.kind.literal.int.value);
+
+    const panic_statement = rust_ir.bodies.stmts[root_block.statements[4]];
+    const panic_expression = switch (panic_statement.kind) {
+        .expr => |expression| rust_ir.bodies.exprs[expression],
+        else => return error.TestUnexpectedResult,
+    };
+    const panic_reason = switch (panic_expression.kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("panic: expected", panic_reason);
+}

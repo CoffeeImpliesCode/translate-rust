@@ -1380,6 +1380,77 @@ fn parseIntLiteral(raw: []const u8) ParsedIntLiteral {
     };
 }
 
+fn parseVecRepeatCount(raw: []const u8) ?usize {
+    const trimmed_literal = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed_literal.len == 0) return null;
+
+    var literal = trimmed_literal;
+    if (std.mem.endsWith(u8, literal, "usize")) {
+        const suffix_start = literal.len - "usize".len;
+        if (suffix_start == 0) return null;
+        literal = literal[0..suffix_start];
+        if (literal.len == 0) return null;
+        if (literal[literal.len - 1] == '_') {
+            literal = literal[0 .. literal.len - 1];
+            if (literal.len == 0) return null;
+        }
+    }
+
+    var base: usize = 10;
+    var digits = literal;
+    var has_base_prefix = false;
+    if (literal.len >= 2 and literal[0] == '0') {
+        switch (literal[1]) {
+            'x', 'X' => {
+                base = 16;
+                digits = literal[2..];
+                has_base_prefix = true;
+            },
+            'o', 'O' => {
+                base = 8;
+                digits = literal[2..];
+                has_base_prefix = true;
+            },
+            'b', 'B' => {
+                base = 2;
+                digits = literal[2..];
+                has_base_prefix = true;
+            },
+            else => {},
+        }
+        if (has_base_prefix and digits.len > 0 and digits[0] == '_') {
+            digits = digits[1..];
+        }
+    }
+    if (digits.len == 0) return null;
+
+    var value: usize = 0;
+    var saw_digit = false;
+    var previous_separator = false;
+    for (digits, 0..) |character, index| {
+        if (character == '_') {
+            if (!saw_digit or previous_separator or index + 1 == digits.len) return null;
+            previous_separator = true;
+            continue;
+        }
+
+        const digit: usize = switch (character) {
+            '0'...'9' => character - '0',
+            'a'...'f' => character - 'a' + 10,
+            'A'...'F' => character - 'A' + 10,
+            else => return null,
+        };
+        if (digit >= base) return null;
+        if (value > (std.math.maxInt(usize) - digit) / base) return null;
+        value = value * base + digit;
+        saw_digit = true;
+        previous_separator = false;
+    }
+
+    if (!saw_digit or previous_separator) return null;
+    return value;
+}
+
 fn hexDigit(value: u8) ?u8 {
     if (value >= '0' and value <= '9') return value - '0';
     if (value >= 'a' and value <= 'f') return value - 'a' + 10;
@@ -2524,39 +2595,36 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             return lowerAssertionMarker(e, null);
         },
         .vec => {
-            const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
-            defer e.ctx.alloc.free(args);
-            if (args.len == 0) {
-                return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = try e.ctx.alloc.dupe(u8, &[_]u8{}) } } });
+            var invocation = expand.parseVecInvocation(e.ctx.alloc, raw_tokens) catch |err| switch (err) {
+                error.MalformedVecInvocation => return unsupported(e, "vec macro malformed invocation"),
+                else => return err,
+            };
+            defer invocation.deinit(e.ctx.alloc);
+
+            switch (invocation) {
+                .elements => |elements| {
+                    const lowered = try e.ctx.alloc.alloc(exprs.NodeId, elements.len);
+                    errdefer e.ctx.alloc.free(lowered);
+                    for (elements, 0..) |element, index| {
+                        lowered[index] = try parseAndLowerSubExpr(e, element);
+                    }
+                    return appendExpr(e, .{ .array = .{
+                        .elements = lowered,
+                        .repeat = null,
+                    } });
+                },
+                .repeat => |repeat| {
+                    const count = parseVecRepeatCount(repeat.count) orelse
+                        return unsupported(e, "vec macro nonliteral repeat length");
+                    const lowered = try e.ctx.alloc.alloc(exprs.NodeId, 1);
+                    errdefer e.ctx.alloc.free(lowered);
+                    lowered[0] = try parseAndLowerSubExpr(e, repeat.element);
+                    return appendExpr(e, .{ .array = .{
+                        .elements = lowered,
+                        .repeat = count,
+                    } });
+                },
             }
-            const bytes = try e.ctx.alloc.alloc(u8, args.len);
-            var all_u8 = true;
-            for (args, 0..) |arg, idx| {
-                const trimmed = std.mem.trim(u8, arg, " \t\r\n");
-                var base: u8 = 10;
-                var slice = trimmed;
-                if (slice.len > 2 and slice[0] == '0' and (slice[1] == 'x' or slice[1] == 'X')) {
-                    base = 16;
-                    slice = slice[2..];
-                } else if (slice.len > 2 and slice[0] == '0' and (slice[1] == 'b' or slice[1] == 'B')) {
-                    base = 2;
-                    slice = slice[2..];
-                } else if (slice.len > 2 and slice[0] == '0' and (slice[1] == 'o' or slice[1] == 'O')) {
-                    base = 8;
-                    slice = slice[2..];
-                }
-                if (std.fmt.parseInt(u8, slice, base)) |val| {
-                    bytes[idx] = val;
-                } else |_| {
-                    all_u8 = false;
-                    break;
-                }
-            }
-            if (all_u8) {
-                return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
-            }
-            e.ctx.alloc.free(bytes);
-            return unsupported(e, "vec macro non-byte elements");
         },
         .println, .eprintln, .format => {
             return unsupported(e, try std.fmt.allocPrint(e.ctx.alloc, "macro {s}", .{@tagName(kind)}));
@@ -2880,7 +2948,7 @@ test "lower built-in macro invocations in fn bodies" {
 
     var found_eq = false;
     var found_ne = false;
-    var found_byte_array = false;
+    var found_array = false;
     var found_unsupported = false;
     var found_assert_marker = false;
     var found_debug_assert_ge = false;
@@ -2912,8 +2980,8 @@ test "lower built-in macro invocations in fn bodies" {
                 if (b.op == .ne) found_ne = true;
                 if (b.op == .gt) found_debug_assert_ge = true;
             },
-            .literal => |l| {
-                if (l == .byte_array) found_byte_array = true;
+            .array => |array| {
+                if (array.elements.len == 3 and array.repeat == null) found_array = true;
             },
             .unsupported => |u| {
                 if (std.mem.startsWith(u8, u.reason, "assertion:")) {
@@ -2937,10 +3005,194 @@ test "lower built-in macro invocations in fn bodies" {
     try std.testing.expectEqual(expected_assign_ops.len, statement_assign_count);
     try std.testing.expect(found_eq); // assert_eq! → .eq binary
     try std.testing.expect(found_ne); // assert_ne! → .ne binary
-    try std.testing.expect(found_byte_array); // vec![1,2,3] → byte_array literal
+    try std.testing.expect(found_array); // vec![1,2,3] → non-repeated three-element array
     try std.testing.expect(found_assert_marker); // assert!/debug_assert! → assertion: marker
     try std.testing.expect(found_debug_assert_ge); // debug_assert!(x > 0) → .gt binary
     try std.testing.expect(found_unsupported); // panic!/unreachable!/unresolved → .unsupported
+}
+
+test "lower literal vec macro forms to arrays" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const root_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    const fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "build_vectors"),
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src =
+        \\fn build_vectors() {
+        \\    let explicit = vec![1, (2, 3), 4];
+        \\    let repeated = vec![0xff; 200_000];
+        \\    let suffixed_decimal = vec![0xff; 1_usize];
+        \\    let suffixed_hex = vec![0xff; 0x_FF_usize];
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const body_id = bodies_list.items[fn_id].fn_.body;
+    const body = switch (exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    try std.testing.expectEqual(@as(usize, 4), body.statements.len);
+
+    const explicit_let = switch (stmts_list.items[body.statements[0]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedExplicitVecLet,
+    };
+    const explicit_binding = switch (pats_list.items[explicit_let.pattern].kind) {
+        .binding => |binding| binding,
+        else => return error.ExpectedExplicitVecBinding,
+    };
+    try std.testing.expectEqualStrings("explicit", explicit_binding.name);
+    const explicit_init_id = explicit_let.init orelse return error.ExpectedExplicitVecInitializer;
+    const explicit_init = exprs_list.items[explicit_init_id].kind;
+    try std.testing.expect(explicit_init == .array);
+    try std.testing.expect(explicit_init != .unsupported);
+    const explicit_array = switch (explicit_init) {
+        .array => |array| array,
+        else => return error.ExpectedExplicitVecArray,
+    };
+    try std.testing.expectEqual(@as(usize, 3), explicit_array.elements.len);
+    try std.testing.expect(explicit_array.repeat == null);
+
+    const repeated_let = switch (stmts_list.items[body.statements[1]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedRepeatedVecLet,
+    };
+    const repeated_binding = switch (pats_list.items[repeated_let.pattern].kind) {
+        .binding => |binding| binding,
+        else => return error.ExpectedRepeatedVecBinding,
+    };
+    try std.testing.expectEqualStrings("repeated", repeated_binding.name);
+    const repeated_init_id = repeated_let.init orelse return error.ExpectedRepeatedVecInitializer;
+    const repeated_init = exprs_list.items[repeated_init_id].kind;
+    try std.testing.expect(repeated_init == .array);
+    try std.testing.expect(repeated_init != .unsupported);
+    const repeated_array = switch (repeated_init) {
+        .array => |array| array,
+        else => return error.ExpectedRepeatedVecArray,
+    };
+    try std.testing.expectEqual(@as(usize, 1), repeated_array.elements.len);
+    try std.testing.expectEqual(
+        @as(usize, 200_000),
+        repeated_array.repeat orelse return error.ExpectedRepeatedVecCount,
+    );
+
+    const suffixed_decimal_let = switch (stmts_list.items[body.statements[2]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedSuffixedDecimalVecLet,
+    };
+    const suffixed_decimal_binding = switch (pats_list.items[suffixed_decimal_let.pattern].kind) {
+        .binding => |binding| binding,
+        else => return error.ExpectedSuffixedDecimalVecBinding,
+    };
+    try std.testing.expectEqualStrings("suffixed_decimal", suffixed_decimal_binding.name);
+    const suffixed_decimal_init_id =
+        suffixed_decimal_let.init orelse return error.ExpectedSuffixedDecimalVecInitializer;
+    const suffixed_decimal_init = exprs_list.items[suffixed_decimal_init_id].kind;
+    try std.testing.expect(suffixed_decimal_init == .array);
+    try std.testing.expect(suffixed_decimal_init != .unsupported);
+    const suffixed_decimal_array = switch (suffixed_decimal_init) {
+        .array => |array| array,
+        else => return error.ExpectedSuffixedDecimalVecArray,
+    };
+    try std.testing.expectEqual(@as(usize, 1), suffixed_decimal_array.elements.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        suffixed_decimal_array.repeat orelse return error.ExpectedSuffixedDecimalVecCount,
+    );
+
+    const suffixed_hex_let = switch (stmts_list.items[body.statements[3]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedSuffixedHexVecLet,
+    };
+    const suffixed_hex_binding = switch (pats_list.items[suffixed_hex_let.pattern].kind) {
+        .binding => |binding| binding,
+        else => return error.ExpectedSuffixedHexVecBinding,
+    };
+    try std.testing.expectEqualStrings("suffixed_hex", suffixed_hex_binding.name);
+    const suffixed_hex_init_id =
+        suffixed_hex_let.init orelse return error.ExpectedSuffixedHexVecInitializer;
+    const suffixed_hex_init = exprs_list.items[suffixed_hex_init_id].kind;
+    try std.testing.expect(suffixed_hex_init == .array);
+    try std.testing.expect(suffixed_hex_init != .unsupported);
+    const suffixed_hex_array = switch (suffixed_hex_init) {
+        .array => |array| array,
+        else => return error.ExpectedSuffixedHexVecArray,
+    };
+    try std.testing.expectEqual(@as(usize, 1), suffixed_hex_array.elements.len);
+    try std.testing.expectEqual(
+        @as(usize, 255),
+        suffixed_hex_array.repeat orelse return error.ExpectedSuffixedHexVecCount,
+    );
 }
 
 test "lower struct_expression to .struct_lit and match_expression to .match" {

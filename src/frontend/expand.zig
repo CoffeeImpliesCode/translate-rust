@@ -117,6 +117,30 @@ fn getEnclosedContent(raw_tokens: []const u8) []const u8 {
             continue;
         }
 
+        if (c == '/' and i + 1 < trimmed.len) {
+            if (trimmed[i + 1] == '/') {
+                i += 2;
+                while (i < trimmed.len and trimmed[i] != '\n') : (i += 1) {}
+                if (i == trimmed.len) break;
+                continue;
+            }
+            if (trimmed[i + 1] == '*') {
+                i = findBlockCommentEnd(trimmed, i) orelse return trimmed;
+                continue;
+            }
+        }
+
+        if (c == 'r' or (c == 'b' and i + 1 < trimmed.len and trimmed[i + 1] == 'r')) {
+            const prefix_len: usize = if (c == 'r') 1 else 2;
+            var marker = i + prefix_len;
+            while (marker < trimmed.len and trimmed[marker] == '#') : (marker += 1) {}
+            if (marker < trimmed.len and trimmed[marker] == '"') {
+                const hash_count = marker - i - prefix_len;
+                i = findRawStringEnd(trimmed, marker + 1, hash_count) orelse return trimmed;
+                continue;
+            }
+        }
+
         if (c == '"') {
             in_double_quote = true;
             continue;
@@ -238,6 +262,185 @@ pub fn splitMacroArgs(alloc: std.mem.Allocator, raw_tokens: []const u8) ![]const
 
     const res = try args_list.toOwnedSlice(alloc);
     return res;
+}
+
+/// Parsed token shape for Rust's built-in `vec!` macro.
+///
+/// Element and repeat token slices borrow `raw_tokens`. The outer `elements`
+/// slice is allocator-owned.
+pub const VecInvocation = union(enum) {
+    elements: []const []const u8,
+    repeat: struct {
+        element: []const u8,
+        count: []const u8,
+    },
+
+    pub fn deinit(self: *VecInvocation, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .elements => |items| alloc.free(items),
+            .repeat => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn findBlockCommentEnd(text: []const u8, start: usize) ?usize {
+    var depth: usize = 1;
+    var i = start + 2;
+    while (i + 1 < text.len) {
+        if (text[i] == '/' and text[i + 1] == '*') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if (text[i] == '*' and text[i + 1] == '/') {
+            depth -= 1;
+            if (depth == 0) return i + 1;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn findRawStringEnd(text: []const u8, body_start: usize, hash_count: usize) ?usize {
+    var i = body_start;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != '"') continue;
+        if (i + 1 + hash_count > text.len) return null;
+
+        var matched_hashes: usize = 0;
+        while (matched_hashes < hash_count and text[i + 1 + matched_hashes] == '#') {
+            matched_hashes += 1;
+        }
+        if (matched_hashes == hash_count) return i + hash_count;
+    }
+    return null;
+}
+
+fn findVecRepeatSeparator(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+) !?usize {
+    var delimiters: std.ArrayListUnmanaged(u8) = .empty;
+    defer delimiters.deinit(alloc);
+
+    var separator: ?usize = null;
+    var in_double_quote: bool = false;
+    var escape: bool = false;
+
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+
+        if (escape) {
+            escape = false;
+            continue;
+        }
+
+        if (in_double_quote) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_double_quote = false;
+            }
+            continue;
+        }
+
+        if (c == '/' and i + 1 < text.len) {
+            if (text[i + 1] == '/') {
+                i += 2;
+                while (i < text.len and text[i] != '\n') : (i += 1) {}
+                if (i == text.len) break;
+                continue;
+            }
+            if (text[i + 1] == '*') {
+                i = findBlockCommentEnd(text, i) orelse return error.MalformedVecInvocation;
+                continue;
+            }
+        }
+
+        if (c == 'r' or (c == 'b' and i + 1 < text.len and text[i + 1] == 'r')) {
+            const prefix_len: usize = if (c == 'r') 1 else 2;
+            var marker = i + prefix_len;
+            while (marker < text.len and text[marker] == '#') : (marker += 1) {}
+            if (marker < text.len and text[marker] == '"') {
+                const hash_count = marker - i - prefix_len;
+                i = findRawStringEnd(text, marker + 1, hash_count) orelse
+                    return error.MalformedVecInvocation;
+                continue;
+            }
+        }
+
+        if (c == '"') {
+            in_double_quote = true;
+            continue;
+        }
+
+        if (c == '\'') {
+            if (findCharEnd(text, i)) |end| {
+                i = end;
+                continue;
+            }
+        }
+
+        const expected_closer: ?u8 = switch (c) {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            else => null,
+        };
+        if (expected_closer) |closer| {
+            try delimiters.append(alloc, closer);
+            continue;
+        }
+
+        if (c == ')' or c == ']' or c == '}') {
+            if (delimiters.items.len == 0) return error.MalformedVecInvocation;
+            const last = delimiters.items.len - 1;
+            if (delimiters.items[last] != c) return error.MalformedVecInvocation;
+            delimiters.items.len = last;
+            continue;
+        }
+
+        if (c == ';' and delimiters.items.len == 0) {
+            if (separator != null) return error.MalformedVecInvocation;
+            separator = i;
+        }
+    }
+
+    if (in_double_quote) return error.MalformedVecInvocation;
+    if (escape) return error.MalformedVecInvocation;
+    if (delimiters.items.len != 0) return error.MalformedVecInvocation;
+    return separator;
+}
+
+/// Parse explicit and literal-repeat `vec!` token forms.
+pub fn parseVecInvocation(
+    alloc: std.mem.Allocator,
+    raw_tokens: []const u8,
+) !VecInvocation {
+    const text = getEnclosedContent(raw_tokens);
+    const separator = try findVecRepeatSeparator(alloc, text);
+
+    if (separator) |index| {
+        const element = std.mem.trim(u8, text[0..index], " \t\r\n");
+        const count = std.mem.trim(u8, text[index + 1 ..], " \t\r\n");
+        if (element.len == 0) return error.MalformedVecInvocation;
+        if (count.len == 0) return error.MalformedVecInvocation;
+        return .{ .repeat = .{
+            .element = element,
+            .count = count,
+        } };
+    }
+
+    const elements = try splitMacroArgs(alloc, raw_tokens);
+    errdefer alloc.free(elements);
+    for (elements) |element| {
+        if (element.len == 0) return error.MalformedVecInvocation;
+    }
+    return .{ .elements = elements };
 }
 
 /// Expands panic, todo, and unimplemented message arguments into an allocated message string.

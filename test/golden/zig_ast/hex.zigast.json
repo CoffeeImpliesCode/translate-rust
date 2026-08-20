@@ -1164,8 +1164,50 @@
                 "name": "result",
                 "ty": null,
                 "init": {
-                  "kind": "unsupported",
-                  "reason": "vec macro non-byte elements"
+                  "kind": "multi_array",
+                  "type_name": null,
+                  "elements": [
+                    {
+                      "kind": "multi_array",
+                      "type_name": null,
+                      "elements": [
+                        {
+                          "kind": "lit",
+                          "value": {
+                            "kind": "int",
+                            "value": "0"
+                          }
+                        },
+                        {
+                          "kind": "lit",
+                          "value": {
+                            "kind": "int",
+                            "value": "1"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "multi_array",
+                      "type_name": null,
+                      "elements": [
+                        {
+                          "kind": "lit",
+                          "value": {
+                            "kind": "int",
+                            "value": "2"
+                          }
+                        },
+                        {
+                          "kind": "lit",
+                          "value": {
+                            "kind": "int",
+                            "value": "3"
+                          }
+                        }
+                      ]
+                    }
+                  ]
                 },
                 "is_mut": false
               },

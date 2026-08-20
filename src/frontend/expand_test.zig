@@ -211,6 +211,120 @@ test "splitMacroArgs handles edge cases: escaped quotes, char literals, and trai
     }
 }
 
+test "parseVecInvocation preserves explicit vec element token slices" {
+    const alloc = std.testing.allocator;
+    const raw = "[1, (2, 3), 4]";
+    var invocation: expand.VecInvocation = try expand.parseVecInvocation(alloc, raw);
+    defer invocation.deinit(alloc);
+
+    const elements = switch (invocation) {
+        .elements => |items| items,
+        .repeat => {
+            try std.testing.expect(false);
+            return;
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), elements.len);
+    try std.testing.expectEqualStrings("1", elements[0]);
+    try std.testing.expectEqualStrings("(2, 3)", elements[1]);
+    try std.testing.expectEqualStrings("4", elements[2]);
+    try std.testing.expectEqual(@intFromPtr(raw[1..2].ptr), @intFromPtr(elements[0].ptr));
+    try std.testing.expectEqual(@intFromPtr(raw[4..9].ptr), @intFromPtr(elements[1].ptr));
+    try std.testing.expectEqual(@intFromPtr(raw[12..13].ptr), @intFromPtr(elements[2].ptr));
+}
+
+test "parseVecInvocation recognizes literal repeat tokens" {
+    const alloc = std.testing.allocator;
+    const raw = "[0xff; 200_000]";
+    var invocation: expand.VecInvocation = try expand.parseVecInvocation(alloc, raw);
+    defer invocation.deinit(alloc);
+
+    const repeat = switch (invocation) {
+        .repeat => |parts| parts,
+        .elements => {
+            try std.testing.expect(false);
+            return;
+        },
+    };
+    try std.testing.expectEqualStrings("0xff", repeat.element);
+    try std.testing.expectEqualStrings("200_000", repeat.count);
+    try std.testing.expectEqual(@intFromPtr(raw[1..5].ptr), @intFromPtr(repeat.element.ptr));
+    try std.testing.expectEqual(@intFromPtr(raw[7..14].ptr), @intFromPtr(repeat.count.ptr));
+}
+
+test "parseVecInvocation ignores a semicolon inside a nested block" {
+    const alloc = std.testing.allocator;
+    var invocation: expand.VecInvocation =
+        try expand.parseVecInvocation(alloc, "[{ let value = 1; value }, 2]");
+    defer invocation.deinit(alloc);
+
+    const elements = switch (invocation) {
+        .elements => |items| items,
+        .repeat => {
+            try std.testing.expect(false);
+            return;
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), elements.len);
+    try std.testing.expectEqualStrings("{ let value = 1; value }", elements[0]);
+    try std.testing.expectEqualStrings("2", elements[1]);
+}
+
+test "parseVecInvocation ignores a semicolon inside a string literal" {
+    const alloc = std.testing.allocator;
+    var invocation: expand.VecInvocation =
+        try expand.parseVecInvocation(alloc, "[\"left;right\", 7]");
+    defer invocation.deinit(alloc);
+
+    const elements = switch (invocation) {
+        .elements => |items| items,
+        .repeat => {
+            try std.testing.expect(false);
+            return;
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), elements.len);
+    try std.testing.expectEqualStrings("\"left;right\"", elements[0]);
+    try std.testing.expectEqualStrings("7", elements[1]);
+}
+
+test "parseVecInvocation ignores a semicolon inside a raw string literal" {
+    const alloc = std.testing.allocator;
+    var invocation: expand.VecInvocation =
+        try expand.parseVecInvocation(alloc, "[r#\"left;right\"#, 7]");
+    defer invocation.deinit(alloc);
+
+    const elements = switch (invocation) {
+        .elements => |items| items,
+        .repeat => {
+            try std.testing.expect(false);
+            return;
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), elements.len);
+}
+
+test "parseVecInvocation ignores a semicolon inside a block comment" {
+    const alloc = std.testing.allocator;
+    var invocation: expand.VecInvocation =
+        try expand.parseVecInvocation(alloc, "[1 /* ; */, 2]");
+    defer invocation.deinit(alloc);
+
+    const elements = switch (invocation) {
+        .elements => |items| items,
+        .repeat => {
+            try std.testing.expect(false);
+            return;
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), elements.len);
+}
+
 test "isTestingAssert correctly identifies test assertion macros" {
     try std.testing.expect(expand.isTestingAssert(.assert));
     try std.testing.expect(expand.isTestingAssert(.assert_eq));
@@ -287,8 +401,7 @@ test "expandMacroRules expands itoa impl_Integer pattern" {
     var def = (try expand.parseMacroRulesDefinition(alloc, raw_def)).?;
     defer def.deinit(alloc);
 
-    const expanded = (try expand.expandMacroRules(alloc, def,
-        "(I8_MAX_LEN => i8, U8_MAX_LEN => u8, I16_MAX_LEN => i16 as u32)")).?;
+    const expanded = (try expand.expandMacroRules(alloc, def, "(I8_MAX_LEN => i8, U8_MAX_LEN => u8, I16_MAX_LEN => i16 as u32)")).?;
     defer alloc.free(expanded);
 
     try std.testing.expect(std.mem.indexOf(u8, expanded, "impl Integer for i8") != null);
@@ -300,7 +413,6 @@ test "expandMacroRules expands itoa impl_Integer pattern" {
     // $conv_fn is a top-level metavar — used inside the repetition below.
     try std.testing.expect(std.mem.indexOf(u8, expanded, "self as u32") != null);
 }
-
 
 test "expandMacroRules expands whitespace-separated expr repetition" {
     const alloc = std.testing.allocator;
