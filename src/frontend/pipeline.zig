@@ -202,10 +202,12 @@ fn analyzeSourceWithGraph(
         .bodies = bodies_list.items,
     };
 
+    var instantiation_table: monomorphize.InstantiationTable = .{};
+    defer instantiation_table.deinit(allocator);
     if (infer.solveWithGraph(allocator, &b_temp, &g)) |inferred| {
         inferred.apply(exprs_list.items);
         _ = resolve_methods.resolveMethods(&g, &b_temp);
-        _ = monomorphize.collectInstantiations(allocator, &g, &b_temp) catch null;
+        instantiation_table = monomorphize.collectInstantiations(allocator, &g, &b_temp) catch .{};
     } else |_| {}
 
     const final_bodies: bodies.Bodies = .{
@@ -222,6 +224,7 @@ fn analyzeSourceWithGraph(
         .graph = g,
         .types = final_bodies.types,
         .bodies = final_bodies,
+        .instantiations = try instantiation_table.instantiations.toOwnedSlice(allocator),
     };
 }
 

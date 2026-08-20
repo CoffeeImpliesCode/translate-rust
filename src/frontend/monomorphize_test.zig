@@ -262,3 +262,85 @@ test "collectInstantiations records generic Foo<T> instantiated with u32 and &[u
     try std.testing.expectEqualStrings("_u32", inst0.zig_suffix);
     try std.testing.expectEqualStrings("_u8_slice", inst1.zig_suffix);
 }
+test "collectInstantiations distinguishes Foo primitive and slice call-site qualifiers" {
+    const a = std.testing.allocator;
+
+    const const_slice: types.Slice = .{
+        .const_ = true,
+        .elem = .{ .prim = .u8 },
+    };
+    const mut_slice: types.Slice = .{
+        .const_ = false,
+        .elem = .{ .prim = .u8 },
+    };
+    const args_u32 = [_]types.Type{.{ .prim = .u32 }};
+    const args_const_slice = [_]types.Type{.{ .slice = &const_slice }};
+    const args_mut_slice = [_]types.Type{.{ .slice = &mut_slice }};
+
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &args_u32 } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &args_const_slice } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &args_mut_slice } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{ 0, 1, 2 },
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    const stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 0 } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 1 } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .expr = 2 } },
+    };
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 3,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &bodies_store,
+    };
+
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+    var table = try monomorphize.collectInstantiations(a, &g, &b);
+    defer table.deinit(a);
+
+    try std.testing.expectEqual(@as(usize, 3), table.count());
+    const primitive = table.get(0).?;
+    const const_slice_inst = table.get(1).?;
+    const mut_slice_inst = table.get(2).?;
+    try std.testing.expectEqual(@as(spine.EntityId, 7), primitive.generic_id);
+    try std.testing.expectEqual(@as(spine.EntityId, 7), const_slice_inst.generic_id);
+    try std.testing.expectEqual(@as(spine.EntityId, 7), mut_slice_inst.generic_id);
+    try std.testing.expectEqualStrings("_u32", primitive.zig_suffix);
+    try std.testing.expectEqualStrings("_u8_slice", const_slice_inst.zig_suffix);
+    try std.testing.expectEqualStrings("_u8_mut_slice", mut_slice_inst.zig_suffix);
+    try std.testing.expect(!std.mem.eql(u8, const_slice_inst.zig_suffix, mut_slice_inst.zig_suffix));
+}

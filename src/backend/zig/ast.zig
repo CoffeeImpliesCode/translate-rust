@@ -245,6 +245,9 @@ pub const FieldAccess = struct {
 
 pub const Call = struct {
     callee: *const Expr,
+    /// Concrete type arguments are emitted before ordinary value arguments,
+    /// matching the comptime parameters on generic Zig functions/methods.
+    generic_args: []const Type = &.{},
     args: []const Expr = &.{},
 };
 

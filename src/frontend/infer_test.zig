@@ -1073,3 +1073,134 @@ test "prelude trait methods infer return types (len=usize, clone=self, bitxor=se
     // data.bitxor(o) -> slice (0)
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(3));
 }
+test "solveWithGraph retains explicit generic function path instantiation" {
+    const a = std.testing.allocator;
+
+    const generic_param: types.Type = .{ .path = .{
+        .segments = &.{.{ .name = "T", .id = null }},
+    } };
+    const explicit_args = [_]types.Type{.{ .prim = .u32 }};
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{
+                .def = 1,
+                .generic_args = &explicit_args,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 0,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .unit = {} },
+        },
+    };
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 1,
+        } },
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = generic_param,
+            .generic_params = &.{"T"},
+            .body = 2,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &bodies_store,
+    };
+
+    var cg = ir.graph.CrateGraph.init(a);
+    defer cg.deinit();
+    var inferred = try infer.solveWithGraph(a, &b, &cg);
+    defer inferred.deinit(a);
+
+    const inst = inferred.getInstantiation(0);
+    try std.testing.expect(inst != null);
+    try std.testing.expectEqual(@as(exprs.DefId, 1), inst.?.generic_id);
+    try std.testing.expectEqual(@as(usize, 1), inst.?.args.params.len);
+    switch (inst.?.args.params[0]) {
+        .prim => |p| try std.testing.expectEqual(types.Prim.u32, p),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "solveWithGraph does not default missing generic call arguments to i32" {
+    const a = std.testing.allocator;
+
+    const generic_param: types.Type = .{ .path = .{
+        .segments = &.{.{ .name = "T", .id = null }},
+    } };
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .call = .{
+                .call_kind = .{ .free = 1 },
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 0,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .unit = {} },
+        },
+    };
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 1,
+        } },
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = generic_param,
+            .generic_params = &.{"T"},
+            .body = 2,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &bodies_store,
+    };
+
+    var cg = ir.graph.CrateGraph.init(a);
+    defer cg.deinit();
+    var inferred = try infer.solveWithGraph(a, &b, &cg);
+    defer inferred.deinit(a);
+
+    try std.testing.expect(inferred.getInstantiation(0) == null);
+}

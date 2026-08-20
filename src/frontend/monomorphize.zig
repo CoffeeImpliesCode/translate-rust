@@ -173,7 +173,7 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
         },
         .slice => |s| {
             try appendMangled(alloc, w, s.elem);
-            try w.appendSlice(alloc, "_slice");
+            try w.appendSlice(alloc, if (s.const_) "_slice" else "_mut_slice");
         },
         .array => |a| {
             try appendMangled(alloc, w, a.elem);
@@ -613,6 +613,47 @@ fn collectClosure(
     try collectBlock(table, alloc, b, v, cl.body);
 }
 
+/// Collect only declaration-signature types. This pass is separate from body
+/// traversal so graph entities with no lowered body still contribute their
+/// generic field/parameter/alias instantiations.
+fn collectSignatureKind(
+    table: *InstantiationTable,
+    alloc: std.mem.Allocator,
+    kind: bodies.BodyKind,
+) std.mem.Allocator.Error!void {
+    switch (kind) {
+        .none => {},
+        .trait_ => |trait_body| {
+            for (trait_body.methods) |method| {
+                for (method.params) |param| try collectType(table, alloc, param.ty);
+                try collectType(table, alloc, method.ret);
+            }
+        },
+        .const_ => |constant| try collectType(table, alloc, constant.ty),
+        .fn_ => |function| {
+            for (function.params) |param| try collectType(table, alloc, param.ty);
+            try collectType(table, alloc, function.ret);
+        },
+        .struct_ => |structure| {
+            for (structure.fields) |field| try collectType(table, alloc, field.ty);
+            for (structure.methods) |method| {
+                for (method.params) |param| try collectType(table, alloc, param.ty);
+                try collectType(table, alloc, method.ret);
+            }
+        },
+        .enum_ => |enumeration| {
+            for (enumeration.variants) |variant| {
+                switch (variant.fields) {
+                    .none => {},
+                    .tuple => |fields| for (fields) |field| try collectType(table, alloc, field),
+                    .named => |fields| for (fields) |field| try collectType(table, alloc, field.ty),
+                }
+            }
+        },
+        .type_alias => |alias| try collectType(table, alloc, alias.target),
+    }
+}
+
 /// Collect every instantiation reachable from a single EntityBody (fn body
 /// block, const init) plus the entity's param/ret signature types.
 fn collectBodyKind(
@@ -622,33 +663,28 @@ fn collectBodyKind(
     v: *Visited,
     kind: bodies.BodyKind,
 ) std.mem.Allocator.Error!void {
+    try collectSignatureKind(table, alloc, kind);
     switch (kind) {
-        .none, .struct_, .enum_, .trait_, .type_alias => {},
-        .const_ => |c| {
-            try collectType(table, alloc, c.ty);
-            try collectExpr(table, alloc, b, v, c.init);
-        },
-        .fn_ => |f| {
-            for (f.params) |p| try collectType(table, alloc, p.ty);
-            try collectType(table, alloc, f.ret);
-            try collectExpr(table, alloc, b, v, f.body);
-        },
+        .none, .enum_, .trait_, .type_alias => {},
+        .struct_ => {},
+        .const_ => |c| try collectExpr(table, alloc, b, v, c.init),
+        .fn_ => |f| try collectExpr(table, alloc, b, v, f.body),
     }
 }
 
-/// Scan the crate graph's item signatures (struct fields, enum variants,
-/// fn params/returns) for generic instantiations not carried in bodies.
-fn collectItemTypes(table: *InstantiationTable, alloc: std.mem.Allocator, g: *const graph.CrateGraph) std.mem.Allocator.Error!void {
-    // The graph owns a flat entity list in its symbol table; we only need the
-    // entity ids that have items. items.zig Item data is not directly linked
-    // here (items -> types only), so walk via graph entities conservatively:
-    // register generic signatures already present in the type table is done
-    // through bodies. Graph-level generic fields/fn signatures are captured
-    // on demand by emitting the instantiation table from bodies; the CrateGraph
-    // parameter keeps the contract for downstream callers that pass both.
-    _ = g;
-    _ = alloc;
-    _ = table;
+/// Scan graph-backed declaration signatures as a second guard for sparse body
+/// tables. `BodyKind` is keyed by the same dense EntityId as the graph.
+fn collectItemTypes(
+    table: *InstantiationTable,
+    alloc: std.mem.Allocator,
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+) std.mem.Allocator.Error!void {
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.id < b.bodies.len) {
+            try collectSignatureKind(table, alloc, b.bodies[entity.id]);
+        }
+    }
 }
 
 /// Main entry: build a deduplicated instantiation table from all bodies and
@@ -668,7 +704,7 @@ pub fn collectInstantiations(
         for (b.bodies) |kind| try collectBodyKind(&table, alloc, b, &v, kind);
     }
 
-    try collectItemTypes(&table, alloc, g);
+    try collectItemTypes(&table, alloc, g, b);
     return table;
 }
 

@@ -39,7 +39,8 @@ pub fn translate(
     const arena_alloc = arena.allocator();
 
     // 1. Ingest & analyze
-    const rust_ir = try frontend.pipeline.analyzeCrate(arena_alloc, io, crate_dir);
+    var rust_ir = try frontend.pipeline.analyzeCrate(arena_alloc, io, crate_dir);
+    defer rust_ir.deinitInstantiations(arena_alloc);
 
     // 2. Lower to ZigAST
     const pkg = try backend.zig.lower.lowerRustIR(arena_alloc, &rust_ir, null);

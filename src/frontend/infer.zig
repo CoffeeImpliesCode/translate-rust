@@ -202,44 +202,123 @@ pub fn substType(
             bx_ptr.* = sub_inner;
             return .{ .boxed = bx_ptr };
         },
-        .generic_inst, .fn_ptr, .unsupported => return t,
+        .generic_inst => |gi| {
+            var changed = false;
+            const sub_args = try alloc.alloc(types.Type, gi.args.params.len);
+            for (gi.args.params, 0..) |arg, i| {
+                sub_args[i] = try substType(alloc, arg, param_names, args);
+                if (!typeEqual(sub_args[i], arg)) changed = true;
+            }
+            if (!changed) {
+                alloc.free(sub_args);
+                return t;
+            }
+            return .{ .generic_inst = .{
+                .decl = gi.decl,
+                .args = .{ .params = sub_args },
+            } };
+        },
+        .fn_ptr => |fp| {
+            var changed = false;
+            const sub_params = try alloc.alloc(types.Type, fp.params.len);
+            for (fp.params, 0..) |param, i| {
+                sub_params[i] = try substType(alloc, param, param_names, args);
+                if (!typeEqual(sub_params[i], param)) changed = true;
+            }
+            const sub_ret = try substType(alloc, fp.ret, param_names, args);
+            if (!typeEqual(sub_ret, fp.ret)) changed = true;
+            if (!changed) {
+                alloc.free(sub_params);
+                return t;
+            }
+            const fn_ptr = try alloc.create(types.FnPtr);
+            fn_ptr.* = .{ .params = sub_params, .ret = sub_ret };
+            return .{ .fn_ptr = fn_ptr };
+        },
+        .unsupported => return t,
     }
 }
 
+/// Match one generic signature type against one concrete argument type.
+/// Every repeated parameter occurrence must bind to the same structural type.
+/// A false result rejects the whole instantiation; callers must not fill gaps
+/// with Rust's unrelated integer-literal default.
 fn matchGenericType(
     param_ty: types.Type,
     actual_ty: types.Type,
     param_names: []const []const u8,
     inferred_args: []?types.Type,
-) void {
+) bool {
     if (isTypeParam(param_ty, param_names)) |idx| {
-        if (idx < inferred_args.len and inferred_args[idx] == null) {
-            inferred_args[idx] = actual_ty;
+        if (idx >= inferred_args.len) return false;
+        if (inferred_args[idx]) |previous| {
+            return typeEqual(previous, actual_ty);
         }
-        return;
+        inferred_args[idx] = actual_ty;
+        return true;
     }
+
     const p_tag = std.meta.activeTag(param_ty);
     const a_tag = std.meta.activeTag(actual_ty);
-    if (p_tag != a_tag) return;
-    switch (param_ty) {
-        .reference => |r| matchGenericType(r.pointee, actual_ty.reference.pointee, param_names, inferred_args),
-        .slice => |s| matchGenericType(s.elem, actual_ty.slice.elem, param_names, inferred_args),
-        .array => |arr| matchGenericType(arr.elem, actual_ty.array.elem, param_names, inferred_args),
-        .tuple => |tup| {
-            if (tup.len == actual_ty.tuple.len) {
-                for (tup, actual_ty.tuple) |p_elem, a_elem| {
-                    matchGenericType(p_elem, a_elem, param_names, inferred_args);
-                }
+    if (p_tag != a_tag) return false;
+
+    return switch (param_ty) {
+        .prim => |p| p == actual_ty.prim,
+        .path => |p| {
+            const other = actual_ty.path;
+            if (p.segments.len != other.segments.len) return false;
+            for (p.segments, other.segments) |left, right| {
+                if (!std.mem.eql(u8, left.name, right.name)) return false;
             }
+            return true;
+        },
+        .reference => |r| r.mut == actual_ty.reference.mut and
+            matchGenericType(r.pointee, actual_ty.reference.pointee, param_names, inferred_args),
+        .raw_ptr => |r| r.mut == actual_ty.raw_ptr.mut and
+            matchGenericType(r.pointee, actual_ty.raw_ptr.pointee, param_names, inferred_args),
+        .slice => |s| s.const_ == actual_ty.slice.const_ and
+            matchGenericType(s.elem, actual_ty.slice.elem, param_names, inferred_args),
+        .array => |arr| std.meta.eql(arr.len, actual_ty.array.len) and
+            matchGenericType(arr.elem, actual_ty.array.elem, param_names, inferred_args),
+        .tuple => |tuple| {
+            const other = actual_ty.tuple;
+            if (tuple.len != other.len) return false;
+            for (tuple, other) |left, right| {
+                if (!matchGenericType(left, right, param_names, inferred_args)) return false;
+            }
+            return true;
+        },
+        .fn_ptr => |fp| {
+            const other = actual_ty.fn_ptr;
+            if (fp.params.len != other.params.len) return false;
+            for (fp.params, other.params) |left, right| {
+                if (!matchGenericType(left, right, param_names, inferred_args)) return false;
+            }
+            return matchGenericType(fp.ret, other.ret, param_names, inferred_args);
+        },
+        .generic_inst => |gi| {
+            const other = actual_ty.generic_inst;
+            if (gi.decl != other.decl) return false;
+            if (gi.args.params.len != other.args.params.len) return false;
+            for (gi.args.params, other.args.params) |left, right| {
+                if (!matchGenericType(left, right, param_names, inferred_args)) return false;
+            }
+            return true;
         },
         .option => |opt| matchGenericType(opt.*, actual_ty.option.*, param_names, inferred_args),
         .result => |res| {
-            matchGenericType(res.ok, actual_ty.result.ok, param_names, inferred_args);
-            matchGenericType(res.err, actual_ty.result.err, param_names, inferred_args);
+            const other = actual_ty.result;
+            if (res.is_error_unionable != other.is_error_unionable) return false;
+            if (!matchGenericType(res.ok, other.ok, param_names, inferred_args)) return false;
+            return matchGenericType(res.err, other.err, param_names, inferred_args);
         },
-        .boxed => |bx| matchGenericType(bx.*, actual_ty.boxed.*, param_names, inferred_args),
-        else => {},
-    }
+        .boxed => |boxed| matchGenericType(boxed.*, actual_ty.boxed.*, param_names, inferred_args),
+        .unsupported => |unsupported| {
+            const other = actual_ty.unsupported;
+            return unsupported.reason == other.reason and
+                std.mem.eql(u8, unsupported.message, other.message);
+        },
+    };
 }
 
 const Ctx = struct {
@@ -272,35 +351,68 @@ pub fn primTypeId(b: *const bodies.Bodies, prim: types.Prim) ?exprs.TypeId {
     return null;
 }
 
-/// Structural equality check for types to resolve TypeId in `b.types`.
+/// Structural equality check for types to resolve TypeId in `b.types` and to
+/// validate repeated generic bindings. Qualifiers are part of the identity:
+/// `&[T]` and `&mut [T]` must never unify.
 fn typeEqual(a: types.Type, b: types.Type) bool {
     const a_tag = std.meta.activeTag(a);
     const b_tag = std.meta.activeTag(b);
     if (a_tag != b_tag) return false;
-    switch (a) {
-        .prim => |p| return p == b.prim,
+    return switch (a) {
+        .prim => |p| p == b.prim,
         .path => |p| {
-            if (p.segments.len != b.path.segments.len) return false;
-            for (p.segments, b.path.segments) |s_a, s_b| {
-                if (!std.mem.eql(u8, s_a.name, s_b.name)) return false;
+            const other = b.path;
+            if (p.segments.len != other.segments.len) return false;
+            for (p.segments, other.segments) |left, right| {
+                if (!std.mem.eql(u8, left.name, right.name)) return false;
             }
             return true;
         },
-        .reference => |r| return r.mut == b.reference.mut and typeEqual(r.pointee, b.reference.pointee),
-        .slice => |s| return s.const_ == b.slice.const_ and typeEqual(s.elem, b.slice.elem),
-        .array => |arr| {
-            if (!std.meta.eql(arr.len, b.array.len)) return false;
-            return typeEqual(arr.elem, b.array.elem);
-        },
-        .tuple => |t| {
-            if (t.len != b.tuple.len) return false;
-            for (t, b.tuple) |elem_a, elem_b| {
-                if (!typeEqual(elem_a, elem_b)) return false;
+        .reference => |r| r.mut == b.reference.mut and
+            typeEqual(r.pointee, b.reference.pointee),
+        .raw_ptr => |r| r.mut == b.raw_ptr.mut and
+            typeEqual(r.pointee, b.raw_ptr.pointee),
+        .slice => |s| s.const_ == b.slice.const_ and
+            typeEqual(s.elem, b.slice.elem),
+        .array => |arr| std.meta.eql(arr.len, b.array.len) and
+            typeEqual(arr.elem, b.array.elem),
+        .tuple => |tuple| {
+            if (tuple.len != b.tuple.len) return false;
+            for (tuple, b.tuple) |left, right| {
+                if (!typeEqual(left, right)) return false;
             }
             return true;
         },
-        else => return false,
-    }
+        .fn_ptr => |fp| {
+            const other = b.fn_ptr;
+            if (fp.params.len != other.params.len) return false;
+            for (fp.params, other.params) |left, right| {
+                if (!typeEqual(left, right)) return false;
+            }
+            return typeEqual(fp.ret, other.ret);
+        },
+        .generic_inst => |gi| {
+            const other = b.generic_inst;
+            if (gi.decl != other.decl) return false;
+            if (gi.args.params.len != other.args.params.len) return false;
+            for (gi.args.params, other.args.params) |left, right| {
+                if (!typeEqual(left, right)) return false;
+            }
+            return true;
+        },
+        .option => |opt| typeEqual(opt.*, b.option.*),
+        .result => |res| {
+            const other = b.result;
+            return res.is_error_unionable == other.is_error_unionable and
+                typeEqual(res.ok, other.ok) and typeEqual(res.err, other.err);
+        },
+        .boxed => |boxed| typeEqual(boxed.*, b.boxed.*),
+        .unsupported => |unsupported| {
+            const other = b.unsupported;
+            return unsupported.reason == other.reason and
+                std.mem.eql(u8, unsupported.message, other.message);
+        },
+    };
 }
 
 /// Find the TypeId corresponding to target type in `b.types`.
@@ -659,14 +771,28 @@ fn getGenericParamNames(
     errdefer buf.deinit(alloc);
     switch (ctx.b.bodies[def]) {
         .fn_ => |fb| {
-            for (fb.params) |param| {
-                try collectTypeParamNamesFromType(alloc, ctx.b, &buf, param.ty);
+            if (fb.generic_params.len > 0) {
+                try buf.appendSlice(alloc, fb.generic_params);
+            } else {
+                for (fb.params) |param| {
+                    try collectTypeParamNamesFromType(alloc, ctx.b, &buf, param.ty);
+                }
+                try collectTypeParamNamesFromType(alloc, ctx.b, &buf, fb.ret);
             }
-            try collectTypeParamNamesFromType(alloc, ctx.b, &buf, fb.ret);
         },
         .struct_ => |sb| {
-            for (sb.fields) |field| {
-                try collectTypeParamNamesFromType(alloc, ctx.b, &buf, field.ty);
+            if (sb.generic_params.len > 0) {
+                try buf.appendSlice(alloc, sb.generic_params);
+            } else {
+                for (sb.fields) |field| {
+                    try collectTypeParamNamesFromType(alloc, ctx.b, &buf, field.ty);
+                }
+                for (sb.methods) |method| {
+                    for (method.params) |param| {
+                        try collectTypeParamNamesFromType(alloc, ctx.b, &buf, param.ty);
+                    }
+                    try collectTypeParamNamesFromType(alloc, ctx.b, &buf, method.ret);
+                }
             }
         },
         .const_ => |cb| try collectTypeParamNamesFromType(alloc, ctx.b, &buf, cb.ty),
@@ -695,10 +821,21 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
             .float => |fl| return .{ .prim = floatSuffixPrim(fl.text) },
             .boolean => return .{ .prim = .bool },
             .character => return .{ .prim = .char },
-            .string => return .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
-            .byte_array => return .{ .array = &.{ .len = .{ .literal = @intCast(lit.byte_array.items.len) }, .elem = .{ .prim = .u8 } } },
+            .string => {},
+            .byte_array => return .{
+                .array = &.{
+                    .len = .{ .literal = @intCast(lit.byte_array.items.len) },
+                    .elem = .{ .prim = .u8 },
+                },
+            },
         },
         .path => |p| {
+            if (p.generic_args.len > 0) {
+                return .{ .generic_inst = .{
+                    .decl = p.def,
+                    .args = .{ .params = p.generic_args },
+                } };
+            }
             if (ctx.def_map.get(p.def)) |first| {
                 if (first < ctx.b.exprs.len) {
                     if (ctx.b.exprs[first].ty) |tid| {
@@ -711,6 +848,38 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
     }
     return null;
 }
+/// Recover explicit concrete generic arguments carried by a resolved result
+/// type. The IR keeps path arguments directly on `PathExpr`; call and struct
+/// nodes have no separate callee-type field, so their lowered generic result
+/// type is the only lossless carrier available at this stage.
+fn explicitArgsForNode(ctx: *Ctx, node: exprs.NodeId) ?types.GenericArgs {
+    if (node >= ctx.b.exprs.len) return null;
+    const type_id = ctx.b.exprs[node].ty orelse return null;
+    if (type_id >= ctx.b.types.len) return null;
+    return switch (ctx.b.types[type_id]) {
+        .generic_inst => |generic_inst| generic_inst.args,
+        else => null,
+    };
+}
+/// Check explicit arguments against a known declaration signature. Definitions
+/// without a lowered body cannot be checked here, so their explicit arguments
+/// remain lossless and are preserved for the later monomorphization pass.
+fn explicitArgsMatchSignature(
+    ctx: *Ctx,
+    def: exprs.DefId,
+    args: []const types.Type,
+) bool {
+    if (def >= ctx.b.bodies.len) return true;
+    switch (ctx.b.bodies[def]) {
+        .none => return true,
+        .fn_, .struct_, .const_, .type_alias => {
+            const names = getGenericParamNames(ctx, def) catch return false;
+            defer ctx.alloc.free(names);
+            return names.len == args.len;
+        },
+        .enum_, .trait_ => return false,
+    }
+}
 
 /// Walk a free/associated/constructor call: recurse into args and, when the
 /// callee is generic, unify argument types with instantiated parameter types.
@@ -721,7 +890,14 @@ fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeI
         .associated => |d| d,
         .constructor => |d| d,
     };
-    try instantiateGenericDef(ctx, node, def, null, c.args, &.{});
+    try instantiateGenericDef(
+        ctx,
+        node,
+        def,
+        explicitArgsForNode(ctx, node),
+        c.args,
+        &.{},
+    );
 }
 
 /// Walk a struct literal: recurse into field values and, when the struct is
@@ -729,7 +905,14 @@ fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeI
 fn handleStructLit(ctx: *Ctx, node: exprs.NodeId, s: exprs.StructLit) std.mem.Allocator.Error!void {
     for (s.fields) |f| try walkExpr(ctx, f.value, node);
     if (s.base) |b0| try walkExpr(ctx, b0, node);
-    try instantiateGenericDef(ctx, node, s.def, null, &.{}, s.fields);
+    try instantiateGenericDef(
+        ctx,
+        node,
+        s.def,
+        explicitArgsForNode(ctx, node),
+        &.{},
+        s.fields,
+    );
 }
 
 /// Match argument expression types against the callee's substituted parameter
@@ -744,26 +927,14 @@ fn instantiateGenericDef(
 ) std.mem.Allocator.Error!void {
     if (def >= ctx.b.bodies.len) return;
     const caller_names = getGenericParamNames(ctx, def) catch return;
-    if (caller_names.len == 0) return;
     defer ctx.alloc.free(caller_names);
+    if (caller_names.len == 0) return;
     const param_names = caller_names;
 
-    var param_types: []const types.Type = &.{};
     var ret_ty: ?types.Type = null;
     switch (ctx.b.bodies[def]) {
-        .fn_ => |fb| {
-            const types_buf = ctx.alloc.alloc(types.Type, fb.params.len) catch return;
-            defer ctx.alloc.free(types_buf);
-            for (fb.params, 0..) |p, i| types_buf[i] = p.ty;
-            param_types = types_buf;
-            ret_ty = fb.ret;
-        },
-        .struct_ => |sb| {
-            const types_buf = ctx.alloc.alloc(types.Type, sb.fields.len) catch return;
-            defer ctx.alloc.free(types_buf);
-            for (sb.fields, 0..) |field, i| types_buf[i] = field.ty;
-            param_types = types_buf;
-        },
+        .fn_ => |fb| ret_ty = fb.ret,
+        .struct_ => {},
         else => return,
     }
 
@@ -771,45 +942,83 @@ fn instantiateGenericDef(
     defer ctx.alloc.free(inferred_args);
     for (inferred_args) |*slot| slot.* = null;
 
-    // Seeding from explicit type arguments.
-    if (stashed) |sa| {
-        if (sa.params.len >= param_names.len) {
-            for (sa.params[0..param_names.len], 0..) |t, i| {
-                inferred_args[i] = t;
-            }
-        }
+    // Explicit arguments are authoritative and must have exact arity.
+    if (stashed) |explicit| {
+        if (explicit.params.len != param_names.len) return;
+        for (explicit.params, 0..) |arg, i| inferred_args[i] = arg;
     }
 
-    // Unify argument expressions with instantiated parameter types.
+    var valid = true;
     switch (ctx.b.bodies[def]) {
         .fn_ => |fb| {
-            const arg_count = @min(args.len, fb.params.len);
-            for (0..arg_count) |i| {
-                const actual_ty = getKnownType(ctx, args[i]) orelse continue;
-                matchGenericType(fb.params[i].ty, actual_ty, param_names, inferred_args);
+            if (args.len != fb.params.len) return;
+            for (fb.params, args) |param, arg_node| {
+                const actual_ty = getKnownType(ctx, arg_node) orelse {
+                    valid = false;
+                    break;
+                };
+                if (!matchGenericType(param.ty, actual_ty, param_names, inferred_args)) {
+                    valid = false;
+                    break;
+                }
             }
         },
         .struct_ => |sb| {
-            for (fields) |field| {
-                for (sb.fields) |sb_field| {
-                    if (std.mem.eql(u8, sb_field.name, field.field)) {
-                        if (getKnownType(ctx, field.value)) |actual_ty| {
-                            matchGenericType(sb_field.ty, actual_ty, param_names, inferred_args);
+            if (fields.len > 0) {
+                for (fields) |field| {
+                    var found = false;
+                    for (sb.fields) |struct_field| {
+                        if (!std.mem.eql(u8, struct_field.name, field.field)) continue;
+                        found = true;
+                        const actual_ty = getKnownType(ctx, field.value) orelse {
+                            valid = false;
+                            break;
+                        };
+                        if (!matchGenericType(
+                            struct_field.ty,
+                            actual_ty,
+                            param_names,
+                            inferred_args,
+                        )) {
+                            valid = false;
                         }
+                        break;
+                    }
+                    if (!found) valid = false;
+                    if (!valid) break;
+                }
+            } else if (args.len > 0) {
+                if (args.len != sb.fields.len) return;
+                for (sb.fields, args) |struct_field, arg_node| {
+                    const actual_ty = getKnownType(ctx, arg_node) orelse {
+                        valid = false;
+                        break;
+                    };
+                    if (!matchGenericType(
+                        struct_field.ty,
+                        actual_ty,
+                        param_names,
+                        inferred_args,
+                    )) {
+                        valid = false;
                         break;
                     }
                 }
             }
         },
-        else => {},
+        else => return,
+    }
+    if (!valid) return;
+
+    // Every declared type parameter must be bound by an explicit argument or
+    // by a concrete signature match. Unbound parameters are ambiguous.
+    for (inferred_args) |slot| {
+        if (slot == null) return;
     }
 
-    // Finalize concrete arguments.
     const concrete_args = ctx.alloc.alloc(types.Type, param_names.len) catch return;
     defer ctx.alloc.free(concrete_args);
-    for (inferred_args, 0..) |slot, i| {
-        concrete_args[i] = slot orelse .{ .prim = .i32 };
-    }
+    for (inferred_args, 0..) |slot, i| concrete_args[i] = slot.?;
 
     try addInstantiation(ctx, node, .{
         .generic_id = def,
@@ -817,9 +1026,9 @@ fn instantiateGenericDef(
         .zig_suffix = "",
     });
 
-    // Pin the instantiated return/field type when it resolves to an existing TypeId.
-    if (ret_ty) |rt| {
-        if (try substitutedTypeId(ctx, rt, param_names, concrete_args)) |tid| {
+    // Pin the instantiated return type when it resolves to an existing type.
+    if (ret_ty) |return_ty| {
+        if (try substitutedTypeId(ctx, return_ty, param_names, concrete_args)) |tid| {
             try addPin(ctx, node, tid);
         }
     }
@@ -945,7 +1154,53 @@ fn freeSubstitutedType(
             freeSubstitutedType(alloc, boxed.*, sub_boxed.*, param_names, args);
             if (!typeEqual(sub_boxed.*, boxed.*)) alloc.destroy(sub_boxed);
         },
-        .prim, .path, .fn_ptr, .generic_inst, .unsupported => {},
+        .fn_ptr => |fn_ptr| {
+            const sub_fn_ptr = switch (substituted) {
+                .fn_ptr => |value| value,
+                else => return,
+            };
+            if (sub_fn_ptr.params.len != fn_ptr.params.len) return;
+            var changed = false;
+            for (fn_ptr.params, sub_fn_ptr.params) |original_param, substituted_param| {
+                freeSubstitutedType(
+                    alloc,
+                    original_param,
+                    substituted_param,
+                    param_names,
+                    args,
+                );
+                if (!typeEqual(original_param, substituted_param)) changed = true;
+            }
+            freeSubstitutedType(alloc, fn_ptr.ret, sub_fn_ptr.ret, param_names, args);
+            if (!typeEqual(fn_ptr.ret, sub_fn_ptr.ret)) changed = true;
+            if (changed) {
+                alloc.free(sub_fn_ptr.params);
+                alloc.destroy(sub_fn_ptr);
+            }
+        },
+        .generic_inst => |generic_inst| {
+            const sub_generic_inst = switch (substituted) {
+                .generic_inst => |value| value,
+                else => return,
+            };
+            if (sub_generic_inst.args.params.len != generic_inst.args.params.len) return;
+            var changed = false;
+            for (generic_inst.args.params, sub_generic_inst.args.params) |
+                original_arg,
+                substituted_arg,
+            | {
+                freeSubstitutedType(
+                    alloc,
+                    original_arg,
+                    substituted_arg,
+                    param_names,
+                    args,
+                );
+                if (!typeEqual(original_arg, substituted_arg)) changed = true;
+            }
+            if (changed) alloc.free(sub_generic_inst.args.params);
+        },
+        .prim, .path, .unsupported => {},
     }
 }
 
@@ -1006,7 +1261,9 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .literal => |lit| try walkLiteral(ctx, node, lit),
         .path => |p| {
             try walkPath(ctx, node, p);
-            if (p.generic_args.len > 0) {
+            if (p.generic_args.len > 0 and
+                explicitArgsMatchSignature(ctx, p.def, p.generic_args))
+            {
                 try addInstantiation(ctx, node, .{
                     .generic_id = p.def,
                     .args = .{ .params = p.generic_args },

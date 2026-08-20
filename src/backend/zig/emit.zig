@@ -293,6 +293,16 @@ fn emitFnDecl(
 
     try buf.appendSlice(allocator, "(");
     var first_param = true;
+    var ordinary_param_start: usize = 0;
+    if (fd.params.len > 0 and std.mem.eql(u8, fd.params[0].name, "self")) {
+        const self_param = fd.params[0];
+        if (self_param.is_comptime) try buf.appendSlice(allocator, "comptime ");
+        try emitIdent(allocator, buf, self_param.name);
+        try buf.appendSlice(allocator, ": ");
+        try emitType(allocator, buf, self_param.ty);
+        first_param = false;
+        ordinary_param_start = 1;
+    }
     for (fd.generic_params) |gp| {
         if (!first_param) try buf.appendSlice(allocator, ", ");
         first_param = false;
@@ -305,7 +315,7 @@ fn emitFnDecl(
             try buf.appendSlice(allocator, "type");
         }
     }
-    for (fd.params) |p| {
+    for (fd.params[ordinary_param_start..]) |p| {
         if (!first_param) try buf.appendSlice(allocator, ", ");
         first_param = false;
         if (p.is_comptime) try buf.appendSlice(allocator, "comptime ");
@@ -601,8 +611,15 @@ pub fn emitExpr(
         .call => |c| {
             try emitExpr(allocator, buf, c.callee.*, depth);
             try buf.appendSlice(allocator, "(");
-            for (c.args, 0..) |arg, i| {
-                if (i > 0) try buf.appendSlice(allocator, ", ");
+            var first_arg = true;
+            for (c.generic_args) |generic_arg| {
+                if (!first_arg) try buf.appendSlice(allocator, ", ");
+                first_arg = false;
+                try emitType(allocator, buf, generic_arg);
+            }
+            for (c.args) |arg| {
+                if (!first_arg) try buf.appendSlice(allocator, ", ");
+                first_arg = false;
                 try emitExpr(allocator, buf, arg, depth);
             }
             try buf.appendSlice(allocator, ")");

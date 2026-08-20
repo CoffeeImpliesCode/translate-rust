@@ -38,6 +38,12 @@ const Lowerer = struct {
     /// for nested arithmetic whose operands lack inferred type metadata.
     float_context: bool = false,
 
+    /// Records already consumed by generic call and literal lowering. The
+    /// frontend table is deduplicated by declaration and concrete arguments,
+    /// so this claim bitset preserves distinct call-site choices when calls do
+    /// not carry an inline `PathExpr` argument list.
+    instantiation_claimed: []bool = &.{},
+
     /// Map from target struct/enum EntityId to hoisted method declarations
     hoisted_by_id: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.ArrayListUnmanaged(ast.Decl)) = .empty,
 
@@ -79,13 +85,16 @@ const Lowerer = struct {
         return ptr;
     }
 
-    fn allocBlock(self: *Lowerer, b: ast.Block) !*const ast.Block {
-        const ptr = try self.alloc.create(ast.Block);
-        ptr.* = b;
-        return ptr;
-    }
-
     pub fn lowerPackage(self: *Lowerer) !ast.Package {
+        if (self.ir.instantiations.len > 0) {
+            self.instantiation_claimed = try self.alloc.alloc(bool, self.ir.instantiations.len);
+            @memset(self.instantiation_claimed, false);
+            defer {
+                self.alloc.free(self.instantiation_claimed);
+                self.instantiation_claimed = &.{};
+            }
+        }
+
         try self.collectHoistedMethods();
 
         var files_list: std.ArrayListUnmanaged(ast.File) = .empty;
@@ -407,6 +416,7 @@ const Lowerer = struct {
             owner_name;
         const entity = self.ir.graph.symbol_table.get(entity_id) orelse return resolved;
         const name = entity.renamed_to orelse entity.name;
+
         const target = try self.allocExpr(.{
             .ident = try self.alloc.dupe(u8, target_name),
         });
@@ -414,6 +424,18 @@ const Lowerer = struct {
             .target = target,
             .field_name = try self.alloc.dupe(u8, name),
         } };
+    }
+    fn lowerPathExpr(self: *Lowerer, path: ir.exprs.PathExpr) !ast.Expr {
+        const resolved = try self.lowerResolvedEntity(path.def);
+        if (path.generic_args.len == 0) return resolved;
+
+        return ast.Expr{
+            .call = .{
+                .callee = try self.allocExpr(resolved),
+                .generic_args = try self.lowerGenericArgs(path.def, path.generic_args),
+                .args = &.{},
+            },
+        };
     }
 
     /// Emit a resolved entity as a bare name in its module, or as
@@ -858,18 +880,13 @@ const Lowerer = struct {
                         init_expr = ast.Expr{ .ident = try self.alloc.dupe(u8, n) };
                     },
                     .generic => |g| {
-                        var arg_exprs = try self.alloc.alloc(ast.Expr, g.params.len);
-                        for (g.params, 0..) |p, i| {
-                            arg_exprs[i] = switch (p) {
-                                .named => |pn| ast.Expr{ .ident = try self.alloc.dupe(u8, pn) },
-                                .prim => |pp| ast.Expr{ .ident = try self.alloc.dupe(u8, @tagName(pp)) },
-                                else => ast.Expr{ .ident = "anyopaque" },
-                            };
-                        }
                         init_expr = ast.Expr{
                             .call = .{
-                                .callee = try self.allocExpr(ast.Expr{ .ident = try self.alloc.dupe(u8, g.name) }),
-                                .args = arg_exprs,
+                                .callee = try self.allocExpr(ast.Expr{
+                                    .ident = try self.alloc.dupe(u8, g.name),
+                                }),
+                                .generic_args = g.params,
+                                .args = &.{},
                             },
                         };
                     },
@@ -1248,7 +1265,6 @@ const Lowerer = struct {
         generic_params: []const ast.GenericParam,
     ) !ast.FnDecl {
         var params_list: std.ArrayListUnmanaged(ast.FnParam) = .empty;
-        try self.appendFunctionGenericParams(m.generic_params, &params_list);
         var generic_args: []ast.Type = &.{};
         if (generic_params.len > 0) {
             generic_args = try self.alloc.alloc(ast.Type, generic_params.len);
@@ -1293,6 +1309,7 @@ const Lowerer = struct {
                 .ty = rec_ty,
             });
         }
+        try self.appendFunctionGenericParams(m.generic_params, &params_list);
 
         if (m.is_allocating) {
             try params_list.append(self.alloc, .{
@@ -1491,6 +1508,415 @@ const Lowerer = struct {
         };
     }
 
+    fn pathTypeEquals(a: ir.types.Path, b: ir.types.Path) bool {
+        if (a.segments.len == 0 or b.segments.len == 0) return a.segments.len == b.segments.len;
+        const a_last = a.segments[a.segments.len - 1];
+        const b_last = b.segments[b.segments.len - 1];
+        return std.mem.eql(u8, a_last.name, b_last.name);
+    }
+
+    fn arrayLenEquals(a: ir.types.ArrayLen, b: ir.types.ArrayLen) bool {
+        return switch (a) {
+            .literal => |av| switch (b) {
+                .literal => |bv| av == bv,
+                else => false,
+            },
+            .generic => |av| switch (b) {
+                .generic => |bv| av == bv,
+                else => false,
+            },
+        };
+    }
+
+    fn typeSliceEquals(a: []const ir.types.Type, b: []const ir.types.Type) bool {
+        if (a.len != b.len) return false;
+        for (a, 0..) |value, index| {
+            if (!typeEquals(value, b[index])) return false;
+        }
+        return true;
+    }
+
+    fn typeEquals(a: ir.types.Type, b: ir.types.Type) bool {
+        return switch (a) {
+            .path => |ap| switch (b) {
+                .path => |bp| pathTypeEquals(ap, bp),
+                else => false,
+            },
+            .prim => |ap| switch (b) {
+                .prim => |bp| ap == bp,
+                else => false,
+            },
+            .reference => |ap| switch (b) {
+                .reference => |bp| ap.mut == bp.mut and typeEquals(ap.pointee, bp.pointee),
+                else => false,
+            },
+            .raw_ptr => |ap| switch (b) {
+                .raw_ptr => |bp| ap.mut == bp.mut and typeEquals(ap.pointee, bp.pointee),
+                else => false,
+            },
+            .slice => |ap| switch (b) {
+                .slice => |bp| ap.const_ == bp.const_ and typeEquals(ap.elem, bp.elem),
+                else => false,
+            },
+            .array => |ap| switch (b) {
+                .array => |bp| arrayLenEquals(ap.len, bp.len) and typeEquals(ap.elem, bp.elem),
+                else => false,
+            },
+            .tuple => |ap| switch (b) {
+                .tuple => |bp| typeSliceEquals(ap, bp),
+                else => false,
+            },
+            .fn_ptr => |ap| switch (b) {
+                .fn_ptr => |bp| typeSliceEquals(ap.params, bp.params) and typeEquals(ap.ret, bp.ret),
+                else => false,
+            },
+            .generic_inst => |ap| switch (b) {
+                .generic_inst => |bp| ap.decl == bp.decl and
+                    typeSliceEquals(ap.args.params, bp.args.params),
+                else => false,
+            },
+            .option => |ap| switch (b) {
+                .option => |bp| typeEquals(ap.*, bp.*),
+                else => false,
+            },
+            .result => |ap| switch (b) {
+                .result => |bp| ap.is_error_unionable == bp.is_error_unionable and
+                    typeEquals(ap.ok, bp.ok) and typeEquals(ap.err, bp.err),
+                else => false,
+            },
+            .boxed => |ap| switch (b) {
+                .boxed => |bp| typeEquals(ap.*, bp.*),
+                else => false,
+            },
+            .unsupported => |ap| switch (b) {
+                .unsupported => |bp| ap.reason == bp.reason and
+                    std.mem.eql(u8, ap.message, bp.message),
+                else => false,
+            },
+        };
+    }
+
+    fn genericParamIndex(
+        pattern: ir.types.Type,
+        names: []const []const u8,
+    ) ?usize {
+        return switch (pattern) {
+            .path => |path| if (path.segments.len == 1 and path.segments[0].id == null) blk: {
+                for (names, 0..) |name, index| {
+                    if (std.mem.eql(u8, name, path.segments[0].name)) break :blk index;
+                }
+                break :blk null;
+            } else null,
+            else => null,
+        };
+    }
+
+    fn matchGenericType(
+        pattern: ir.types.Type,
+        actual: ir.types.Type,
+        names: []const []const u8,
+        slots: []?ir.types.Type,
+    ) void {
+        if (genericParamIndex(pattern, names)) |index| {
+            if (slots[index] == null) slots[index] = actual;
+            return;
+        }
+
+        switch (pattern) {
+            .reference => |p| switch (actual) {
+                .reference => |a| matchGenericType(p.pointee, a.pointee, names, slots),
+                else => {},
+            },
+            .raw_ptr => |p| switch (actual) {
+                .raw_ptr => |a| matchGenericType(p.pointee, a.pointee, names, slots),
+                else => {},
+            },
+            .slice => |p| switch (actual) {
+                .slice => |a| matchGenericType(p.elem, a.elem, names, slots),
+                else => {},
+            },
+            .array => |p| switch (actual) {
+                .array => |a| matchGenericType(p.elem, a.elem, names, slots),
+                else => {},
+            },
+            .tuple => |p| switch (actual) {
+                .tuple => |a| {
+                    const count = @min(p.len, a.len);
+                    for (0..count) |index| matchGenericType(p[index], a[index], names, slots);
+                },
+                else => {},
+            },
+            .generic_inst => |p| switch (actual) {
+                .generic_inst => |a| {
+                    if (p.decl != a.decl) return;
+                    const count = @min(p.args.params.len, a.args.params.len);
+                    for (0..count) |index| {
+                        matchGenericType(p.args.params[index], a.args.params[index], names, slots);
+                    }
+                },
+                else => {},
+            },
+            .option => |p| switch (actual) {
+                .option => |a| matchGenericType(p.*, a.*, names, slots),
+                else => {},
+            },
+            .result => |p| switch (actual) {
+                .result => |a| {
+                    matchGenericType(p.ok, a.ok, names, slots);
+                    matchGenericType(p.err, a.err, names, slots);
+                },
+                else => {},
+            },
+            .boxed => |p| switch (actual) {
+                .boxed => |a| matchGenericType(p.*, a.*, names, slots),
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn concreteExprType(self: *Lowerer, expr_id: ir.exprs.NodeId) ?ir.types.Type {
+        if (expr_id >= self.ir.bodies.exprs.len) return null;
+        const expr = self.ir.bodies.exprs[expr_id];
+        const type_id = expr.ty orelse return null;
+        if (type_id < self.ir.types.len) return self.ir.types[type_id];
+        if (type_id < self.ir.bodies.types.len) return self.ir.bodies.types[type_id];
+        return null;
+    }
+
+    fn inferGenericArgs(
+        self: *Lowerer,
+        names: []const []const u8,
+        param_types: []const ir.types.Type,
+        arg_ids: []const ir.exprs.NodeId,
+    ) !?[]const ir.types.Type {
+        if (names.len == 0) return null;
+        const slots = try self.alloc.alloc(?ir.types.Type, names.len);
+        defer self.alloc.free(slots);
+        for (slots) |*slot| slot.* = null;
+
+        const count = @min(param_types.len, arg_ids.len);
+        for (0..count) |index| {
+            if (self.concreteExprType(arg_ids[index])) |actual| {
+                matchGenericType(param_types[index], actual, names, slots);
+            }
+        }
+
+        var complete = true;
+        for (slots) |slot| {
+            if (slot == null) {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete) return null;
+
+        const result = try self.alloc.alloc(ir.types.Type, names.len);
+        for (slots, 0..) |slot, index| result[index] = slot.?;
+        return result;
+    }
+
+    fn genericArgsFromExprType(
+        self: *Lowerer,
+        expr_id: ir.exprs.NodeId,
+        def: ir.spine.EntityId,
+    ) ?[]const ir.types.Type {
+        const actual = self.concreteExprType(expr_id) orelse return null;
+        return switch (actual) {
+            .generic_inst => |inst| if (inst.decl == def) inst.args.params else null,
+            else => null,
+        };
+    }
+
+    fn genericParamsForDef(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+    ) ?[]const []const u8 {
+        if (def >= self.ir.bodies.bodies.len) return null;
+        return switch (self.ir.bodies.bodies[def]) {
+            .fn_ => |fb| if (fb.generic_params.len > 0) fb.generic_params else null,
+            .struct_ => |sb| if (sb.generic_params.len > 0) sb.generic_params else null,
+            else => null,
+        };
+    }
+
+    fn inferredCallArgs(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        arg_ids: []const ir.exprs.NodeId,
+    ) !?[]const ir.types.Type {
+        const names = self.genericParamsForDef(def) orelse return null;
+        if (def >= self.ir.bodies.bodies.len) return null;
+
+        switch (self.ir.bodies.bodies[def]) {
+            .fn_ => |fb| {
+                const param_types = try self.alloc.alloc(ir.types.Type, fb.params.len);
+                defer self.alloc.free(param_types);
+                for (fb.params, 0..) |param, index| param_types[index] = param.ty;
+                return self.inferGenericArgs(names, param_types, arg_ids);
+            },
+            .struct_ => |sb| {
+                const field_types = try self.alloc.alloc(ir.types.Type, sb.fields.len);
+                defer self.alloc.free(field_types);
+                for (sb.fields, 0..) |field, index| field_types[index] = field.ty;
+                return self.inferGenericArgs(names, field_types, arg_ids);
+            },
+            else => return null,
+        }
+    }
+
+    fn structMethodForDef(self: *Lowerer, def: ir.spine.EntityId) ?ir.bodies.StructMethod {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return null;
+        var parent_id = entity.parent;
+        while (parent_id) |id| {
+            if (id < self.ir.bodies.bodies.len) {
+                switch (self.ir.bodies.bodies[id]) {
+                    .struct_ => |sb| {
+                        for (sb.methods) |method| {
+                            if (std.mem.eql(u8, method.name, entity.name)) return method;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            const parent = self.ir.graph.symbol_table.get(id) orelse break;
+            parent_id = parent.parent;
+        }
+        return null;
+    }
+
+    fn inferredMethodArgs(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        arg_ids: []const ir.exprs.NodeId,
+    ) !?[]const ir.types.Type {
+        const method = self.structMethodForDef(def) orelse return null;
+        if (method.generic_params.len == 0) return null;
+        const param_types = try self.alloc.alloc(ir.types.Type, method.params.len);
+        defer self.alloc.free(param_types);
+        for (method.params, 0..) |param, index| param_types[index] = param.ty;
+        return self.inferGenericArgs(method.generic_params, param_types, arg_ids);
+    }
+
+    fn inferredStructLitArgs(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        fields: []const ir.exprs.FieldInit,
+    ) !?[]const ir.types.Type {
+        const names = self.genericParamsForDef(def) orelse return null;
+        if (def >= self.ir.bodies.bodies.len) return null;
+        const sb = switch (self.ir.bodies.bodies[def]) {
+            .struct_ => |body| body,
+            else => return null,
+        };
+
+        const slots = try self.alloc.alloc(?ir.types.Type, names.len);
+        defer self.alloc.free(slots);
+        for (slots) |*slot| slot.* = null;
+        for (fields) |field| {
+            if (self.concreteExprType(field.value)) |actual| {
+                for (sb.fields) |declared| {
+                    if (std.mem.eql(u8, declared.name, field.field)) {
+                        matchGenericType(declared.ty, actual, names, slots);
+                        break;
+                    }
+                }
+            }
+        }
+
+        var complete = true;
+        for (slots) |slot| {
+            if (slot == null) {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete) return null;
+
+        const result = try self.alloc.alloc(ir.types.Type, names.len);
+        for (slots, 0..) |slot, index| result[index] = slot.?;
+        return result;
+    }
+    fn claimInstantiation(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        preferred: ?[]const ir.types.Type,
+    ) ?ir.types.GenericArgs {
+        if (self.ir.instantiations.len == 0) {
+            return if (preferred) |args| .{ .params = args } else null;
+        }
+
+        if (preferred) |args| {
+            for (self.ir.instantiations, 0..) |inst, index| {
+                if (self.instantiation_claimed.len == self.ir.instantiations.len and
+                    self.instantiation_claimed[index])
+                {
+                    continue;
+                }
+                if (inst.generic_id == def and typeSliceEquals(inst.args.params, args)) {
+                    if (self.instantiation_claimed.len == self.ir.instantiations.len) {
+                        self.instantiation_claimed[index] = true;
+                    }
+                    return inst.args;
+                }
+            }
+            return .{ .params = args };
+        }
+
+        for (self.ir.instantiations, 0..) |inst, index| {
+            if (self.instantiation_claimed.len == self.ir.instantiations.len and
+                self.instantiation_claimed[index])
+            {
+                continue;
+            }
+            if (inst.generic_id == def) {
+                if (self.instantiation_claimed.len == self.ir.instantiations.len) {
+                    self.instantiation_claimed[index] = true;
+                }
+                return inst.args;
+            }
+        }
+        return null;
+    }
+
+    fn lowerGenericArgs(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        preferred: ?[]const ir.types.Type,
+    ) ![]const ast.Type {
+        const selected = self.claimInstantiation(def, preferred) orelse return &.{};
+        if (selected.params.len == 0) return &.{};
+        const result = try self.alloc.alloc(ast.Type, selected.params.len);
+        for (selected.params, 0..) |param, index| {
+            result[index] = try self.lowerType(param);
+        }
+        return result;
+    }
+
+    fn lowerCallGenericArgs(
+        self: *Lowerer,
+        expr_id: ir.exprs.NodeId,
+        def: ir.spine.EntityId,
+        arg_ids: []const ir.exprs.NodeId,
+    ) ![]const ast.Type {
+        if (self.concreteExprType(expr_id)) |actual| {
+            switch (actual) {
+                .generic_inst => |inst| {
+                    if (inst.decl == def) {
+                        return self.lowerGenericArgs(def, inst.args.params);
+                    }
+                },
+                else => {},
+            }
+        }
+        if (try self.inferredCallArgs(def, arg_ids)) |inferred| {
+            return self.lowerGenericArgs(def, inferred);
+        }
+        if (try self.inferredMethodArgs(def, arg_ids)) |inferred| {
+            return self.lowerGenericArgs(def, inferred);
+        }
+        return self.lowerGenericArgs(def, null);
+    }
     pub fn lowerType(self: *Lowerer, ir_ty: ir.types.Type) anyerror!ast.Type {
         // Structural lowering is arena-backed and always safe to retain. The
         // pluggable strategy is consulted only for standard generic name
@@ -1857,9 +2283,7 @@ const Lowerer = struct {
                     },
                 };
             },
-            .path => |pe| blk: {
-                break :blk try self.lowerResolvedEntity(pe.def);
-            },
+            .path => |pe| try self.lowerPathExpr(pe),
             .block => |be| ast.Expr{ .block = try self.lowerBlock(be) },
             .unit => ast.Expr{ .struct_init = .{ .type_name = null, .fields = &.{} } },
             .if_else => |ie| blk: {
@@ -2084,10 +2508,12 @@ const Lowerer = struct {
                 for (c.args, 0..) |arg_id, i| {
                     args[i] = try self.lowerExpr(arg_id);
                 }
+                const generic_args = try self.lowerCallGenericArgs(expr_id, callee_def, c.args);
 
                 break :blk ast.Expr{
                     .call = .{
                         .callee = try self.allocExpr(callee_expr),
+                        .generic_args = generic_args,
                         .args = args,
                     },
                 };
@@ -2107,17 +2533,18 @@ const Lowerer = struct {
                 if (try self.lowerStdMethodCall(method_name, mc.receiver, receiver, args)) |lowered| {
                     break :blk lowered.*;
                 }
-
                 const field_access = try self.allocExpr(ast.Expr{
                     .field_access = .{
                         .target = receiver,
                         .field_name = try self.alloc.dupe(u8, method_name),
                     },
                 });
+                const generic_args = try self.lowerCallGenericArgs(expr_id, mc.method, mc.args);
 
                 break :blk ast.Expr{
                     .call = .{
                         .callee = field_access,
+                        .generic_args = generic_args,
                         .args = args,
                     },
                 };
@@ -2135,10 +2562,23 @@ const Lowerer = struct {
                     };
                 }
 
-                const type_name: ?ast.Type = if (self.ir.graph.symbol_table.get(sl.def)) |e|
-                    ast.Type{ .named = try self.alloc.dupe(u8, e.name) }
-                else
-                    null;
+                const inferred_generic_args =
+                    self.genericArgsFromExprType(expr_id, sl.def) orelse
+                    try self.inferredStructLitArgs(sl.def, sl.fields);
+                const lowered_generic_args = try self.lowerGenericArgs(
+                    sl.def,
+                    inferred_generic_args,
+                );
+                const type_name: ?ast.Type = if (self.ir.graph.symbol_table.get(sl.def)) |e| type_name_blk: {
+                    const name = try self.alloc.dupe(u8, e.name);
+                    if (lowered_generic_args.len > 0) {
+                        break :type_name_blk ast.Type{ .generic = .{
+                            .name = name,
+                            .params = lowered_generic_args,
+                        } };
+                    }
+                    break :type_name_blk ast.Type{ .named = name };
+                } else null;
 
                 break :blk ast.Expr{
                     .struct_init = .{
