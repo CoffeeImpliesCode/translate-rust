@@ -308,6 +308,139 @@ test "analyzeSource on simple Rust function" {
     try std.testing.expect(rust_ir.graph.symbol_table.entities.items.len > 0);
 }
 
+test "analyzeSource preserves valid body and refuses cast/reference expressions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub fn good(value: u16) -> u16 {
+        \\    let incremented = value + 1;
+        \\    incremented
+        \\}
+        \\
+        \\pub fn refuse() -> u16 {
+        \\    let value = 7u8;
+        \\    let casted = value as u16;
+        \\    let borrowed = &value;
+        \\    casted
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "cast_ref", "2021", src);
+    const helpers = struct {
+        fn findFunction(
+            rust_ir_: *const ir.RustIR,
+            name: []const u8,
+        ) ?spine.Entity {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != .fn_) continue;
+                if (std.mem.eql(u8, entity.name, name)) return entity;
+            }
+            return null;
+        }
+
+        fn findBody(
+            rust_ir_: *const ir.RustIR,
+            entity: spine.Entity,
+        ) ?exprs.BlockExpr {
+            if (entity.id >= rust_ir_.bodies.bodies.len) return null;
+            const fn_body = switch (rust_ir_.bodies.bodies[entity.id]) {
+                .fn_ => |body| body,
+                else => return null,
+            };
+            if (fn_body.body >= rust_ir_.bodies.exprs.len) return null;
+            return switch (rust_ir_.bodies.exprs[fn_body.body].kind) {
+                .block => |block| block,
+                else => null,
+            };
+        }
+    };
+
+    const good_entity = helpers.findFunction(&rust_ir, "good") orelse
+        return error.MissingGoodFunction;
+    const refuse_entity = helpers.findFunction(&rust_ir, "refuse") orelse
+        return error.MissingRefuseFunction;
+    try std.testing.expect(good_entity.id < rust_ir.bodies.bodies.len);
+    try std.testing.expect(refuse_entity.id < rust_ir.bodies.bodies.len);
+
+    const good_body = helpers.findBody(&rust_ir, good_entity) orelse
+        return error.MissingGoodBody;
+    for (good_body.statements) |statement_id| {
+        try std.testing.expect(statement_id < rust_ir.bodies.stmts.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), good_body.statements.len);
+    const good_statement = rust_ir.bodies.stmts[good_body.statements[0]];
+    const good_let = switch (good_statement.kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedGoodLet,
+    };
+    const good_init = good_let.init orelse return error.ExpectedGoodInitializer;
+    try std.testing.expect(good_init < rust_ir.bodies.exprs.len);
+    const good_expression = rust_ir.bodies.exprs[good_init];
+    const good_binary = switch (good_expression.kind) {
+        .binary => |binary| binary,
+        else => return error.ExpectedGoodBinary,
+    };
+    try std.testing.expect(good_binary.lhs < rust_ir.bodies.exprs.len);
+    try std.testing.expect(good_binary.rhs < rust_ir.bodies.exprs.len);
+    try std.testing.expect(
+        rust_ir.bodies.exprs[good_binary.lhs].kind == .path,
+    );
+    try std.testing.expect(
+        rust_ir.bodies.exprs[good_binary.rhs].kind == .literal,
+    );
+    const good_tail_id = good_body.tail orelse return error.ExpectedGoodTail;
+    try std.testing.expect(good_tail_id < rust_ir.bodies.exprs.len);
+    try std.testing.expect(rust_ir.bodies.exprs[good_tail_id].kind == .path);
+
+    const refuse_body = helpers.findBody(&rust_ir, refuse_entity) orelse
+        return error.MissingRefuseBody;
+    for (refuse_body.statements) |statement_id| {
+        try std.testing.expect(statement_id < rust_ir.bodies.stmts.len);
+    }
+    try std.testing.expectEqual(@as(usize, 3), refuse_body.statements.len);
+
+    const cast_statement = rust_ir.bodies.stmts[refuse_body.statements[1]];
+    const cast_let = switch (cast_statement.kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedCastLet,
+    };
+    const cast_init = cast_let.init orelse return error.ExpectedCastInitializer;
+    try std.testing.expect(cast_init < rust_ir.bodies.exprs.len);
+    const cast_kind = rust_ir.bodies.exprs[cast_init].kind;
+    try std.testing.expect(cast_kind != .path);
+    try std.testing.expect(cast_kind != .unit);
+    const cast_reason = switch (cast_kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.ExpectedUnsupportedCast,
+    };
+    try std.testing.expect(cast_reason.len > 0);
+    try std.testing.expectEqualStrings("cast expression", cast_reason);
+
+    const reference_statement = rust_ir.bodies.stmts[refuse_body.statements[2]];
+    const reference_let = switch (reference_statement.kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedReferenceLet,
+    };
+    const reference_init =
+        reference_let.init orelse return error.ExpectedReferenceInitializer;
+    try std.testing.expect(reference_init < rust_ir.bodies.exprs.len);
+    const reference_kind = rust_ir.bodies.exprs[reference_init].kind;
+    try std.testing.expect(reference_kind != .path);
+    try std.testing.expect(reference_kind != .unit);
+    const reference_reason = switch (reference_kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.ExpectedUnsupportedReference,
+    };
+    try std.testing.expect(reference_reason.len > 0);
+    try std.testing.expectEqualStrings("reference expression", reference_reason);
+
+    const refuse_tail_id = refuse_body.tail orelse return error.ExpectedRefuseTail;
+    try std.testing.expect(refuse_tail_id < rust_ir.bodies.exprs.len);
+    try std.testing.expect(rust_ir.bodies.exprs[refuse_tail_id].kind == .path);
+}
+
 test "analyzeSource: const array + primitive initializers parsed into const body" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -674,7 +674,7 @@
                       },
                       {
                         "kind": "unsupported",
-                        "reason": "operator operands unresolved"
+                        "reason": "cast expression"
                       }
                     ]
                   },
@@ -693,19 +693,8 @@
                         "name": "table"
                       },
                       {
-                        "kind": "bin_op",
-                        "op": "bit_and",
-                        "lhs": {
-                          "kind": "ident",
-                          "name": "byte"
-                        },
-                        "rhs": {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "int",
-                            "value": "15"
-                          }
-                        }
+                        "kind": "unsupported",
+                        "reason": "cast expression"
                       }
                     ]
                   },

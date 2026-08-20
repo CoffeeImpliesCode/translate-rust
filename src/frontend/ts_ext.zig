@@ -1220,11 +1220,7 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
 
     // Cast / block / for / if / return / unary / paren / reference.
-    if (std.mem.eql(u8, kind, "type_cast_expression")) {
-        const val = node.namedChild(0);
-        if (val == null) return appendExpr(e, .{ .unit = {} });
-        return lowerExpr(e, val.?); // cast is a no-op lower for now
-    }
+    if (std.mem.eql(u8, kind, "type_cast_expression")) return unsupported(e, "cast expression");
     if (std.mem.eql(u8, kind, "while_expression")) {
         var cond_node: ?ts.Node = null;
         var body_node: ?ts.Node = null;
@@ -1317,10 +1313,7 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (node.namedChildCount() > 0) return lowerExpr(e, node.namedChild(0).?);
         return appendExpr(e, .{ .unit = {} });
     }
-    if (std.mem.eql(u8, kind, "reference_expression")) {
-        if (node.namedChildCount() > 0) return lowerExpr(e, node.namedChild(0).?);
-        return appendExpr(e, .{ .unit = {} });
-    }
+    if (std.mem.eql(u8, kind, "reference_expression")) return unsupported(e, "reference expression");
 
     return unsupported(e, "expression");
 }
@@ -4014,4 +4007,127 @@ test "preserve non-generic function body fidelity" {
     };
     try std.testing.expectEqual(@as(usize, 2), else_tuple.elements.len);
     try std.testing.expect(exprs_list.items[else_value].kind != .unsupported);
+}
+
+test "preserve body while refusing unsupported cast and reference expressions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const root_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    const fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "refuse"),
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .u16 },
+        .body = 0,
+    } });
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src =
+        \\fn refuse() -> u16 {
+        \\    let value = 7u8;
+        \\    let casted = value as u16;
+        \\    let borrowed = &value;
+        \\    casted
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const body_id = bodies_list.items[fn_id].fn_.body;
+    const body = switch (exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    try std.testing.expectEqual(@as(usize, 3), body.statements.len);
+
+    const cast_let = switch (stmts_list.items[body.statements[1]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedCastLet,
+    };
+    const cast_init = cast_let.init orelse return error.ExpectedCastInitializer;
+    try std.testing.expect(exprs_list.items[cast_init].kind != .path);
+    const cast_reason = switch (exprs_list.items[cast_init].kind) {
+        .unsupported => |unsupported_expr| unsupported_expr.reason,
+        else => return error.ExpectedUnsupportedCast,
+    };
+    try std.testing.expect(cast_reason.len > 0);
+    try std.testing.expectEqualStrings("cast expression", cast_reason);
+
+    const reference_let = switch (stmts_list.items[body.statements[2]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedReferenceLet,
+    };
+    const reference_init = reference_let.init orelse return error.ExpectedReferenceInitializer;
+    try std.testing.expect(exprs_list.items[reference_init].kind != .path);
+    const reference_reason = switch (exprs_list.items[reference_init].kind) {
+        .unsupported => |unsupported_expr| unsupported_expr.reason,
+        else => return error.ExpectedUnsupportedReference,
+    };
+    try std.testing.expect(reference_reason.len > 0);
+    try std.testing.expectEqualStrings("reference expression", reference_reason);
+    try std.testing.expect(!std.mem.eql(u8, cast_reason, reference_reason));
+
+    const tail_id = body.tail orelse return error.ExpectedFunctionTail;
+    try std.testing.expect(exprs_list.items[tail_id].kind == .path);
 }
