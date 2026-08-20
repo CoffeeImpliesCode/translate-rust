@@ -13,6 +13,8 @@ const strategy = @import("../strategy.zig");
 const default_strat = @import("strategies/default.zig");
 
 const span: ir.spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+const vec_unavailable_reason =
+    "Vec literal: allocator-backed Vec adapter unavailable";
 
 // Build the full sample RustIR in-memory. All allocations go to the caller's
 // `alloc` (the test's long-lived arena), which must outlive lowering.
@@ -1065,6 +1067,180 @@ test "lower: const array + primitive initializers emit real Zig values" {
     }
     try std.testing.expect(saw_multi);
     try std.testing.expect(saw_repeat);
+}
+
+test "lower: Vec literals stay unsupported and never become Zig arrays" {
+    const backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const tail_fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "vec_tail",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const statement_fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "vec_statement",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const first = try model.e(litInt(1));
+    const second = try model.e(litInt(2));
+    const explicit_vec = try model.e(.{
+        .vec_lit = .{
+            .elements = &.{ first, second },
+            .repeat = null,
+        },
+    });
+    const tail_block = try model.e(.{
+        .block = .{
+            .statements = &.{},
+            .tail = explicit_vec,
+            .labelled = null,
+        },
+    });
+
+    const repeated_vec = try model.e(.{
+        .vec_lit = .{
+            .elements = &.{first},
+            .repeat = 3,
+        },
+    });
+
+    const explicit_element_ids = [_]ir.exprs.NodeId{ first, second };
+    switch (model.exprs.items[explicit_vec].kind) {
+        .vec_lit => |vec| {
+            try std.testing.expectEqualSlices(
+                ir.exprs.NodeId,
+                &explicit_element_ids,
+                vec.elements,
+            );
+            try std.testing.expectEqual(@as(?usize, null), vec.repeat);
+        },
+        else => return error.ExpectedVecLiteral,
+    }
+    switch (model.exprs.items[repeated_vec].kind) {
+        .vec_lit => |vec| {
+            const repeated_element_ids = [_]ir.exprs.NodeId{first};
+            try std.testing.expectEqualSlices(
+                ir.exprs.NodeId,
+                &repeated_element_ids,
+                vec.elements,
+            );
+            try std.testing.expectEqual(@as(?usize, 3), vec.repeat);
+        },
+        else => return error.ExpectedVecLiteral,
+    }
+    const repeated_vec_statement = try model.stmt(.{ .expr = repeated_vec });
+    const statement_block = try model.e(.{
+        .block = .{
+            .statements = &.{repeated_vec_statement},
+            .tail = null,
+            .labelled = null,
+        },
+    });
+
+    try model.bodies.append(alloc, .{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .u64 },
+            .body = tail_block,
+        },
+    });
+    try model.bodies.append(alloc, .{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = statement_block,
+        },
+    });
+
+    const ir_bodies: ir.bodies.Bodies = .{
+        .exprs = try model.exprs.toOwnedSlice(alloc),
+        .stmts = try model.stmts.toOwnedSlice(alloc),
+        .pats = try model.pats.toOwnedSlice(alloc),
+        .types = &.{},
+        .bodies = try model.bodies.toOwnedSlice(alloc),
+    };
+
+    const root_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{ tail_fn_id, statement_fn_id },
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "vec_contract",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "vec_contract",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = ir_bodies,
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+
+    var unsupported_count: usize = 0;
+    for (pkg.files[0].decls) |decl| {
+        if (decl != .fn_decl) continue;
+        const body = decl.fn_decl.body orelse return error.ExpectedFunctionBody;
+        try std.testing.expect(body.expr == null);
+        try std.testing.expectEqual(@as(usize, 1), body.stmts.len);
+
+        const statement = body.stmts[0];
+        if (statement != .expr_stmt) return error.ExpectedUnsupportedStatement;
+        switch (statement.expr_stmt.*) {
+            .unsupported => |reason| {
+                try std.testing.expectEqualStrings(vec_unavailable_reason, reason);
+                unsupported_count += 1;
+            },
+            .multi_array, .repeat => return error.VecLoweredAsArray,
+            else => return error.ExpectedUnsupportedVec,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), unsupported_count);
+
+    const emit = @import("emit.zig");
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    const emitted_marker =
+        "@panic(\"unsupported: " ++ vec_unavailable_reason ++ "\")";
+    try std.testing.expect(std.mem.indexOf(u8, source, emitted_marker) != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, emitted_marker));
+    try std.testing.expect(std.mem.indexOf(u8, source, "return @panic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "[_]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "multi_array") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "repeat") == null);
 }
 
 test "lower: prelude trait methods lower to native Zig expressions" {

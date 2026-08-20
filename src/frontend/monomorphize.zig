@@ -466,6 +466,7 @@ fn collectExpr(
         .break_ => |br| if (br.value) |bval| try collectExpr(table, alloc, b, v, bval),
         .continue_, .literal, .unit, .unsupported => {},
         .array => |a| for (a.elements) |el| try collectExpr(table, alloc, b, v, el),
+        .vec_lit => |vec| for (vec.elements) |el| try collectExpr(table, alloc, b, v, el),
         .call => |c| for (c.args) |a| try collectExpr(table, alloc, b, v, a),
         .method_call => |mc| {
             try collectExpr(table, alloc, b, v, mc.receiver);

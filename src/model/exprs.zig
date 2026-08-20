@@ -49,6 +49,7 @@ pub const Expr = struct {
 pub const ExprKind = union(enum) {
     // — literals & atoms (§1.1) —
     literal: Literal,
+    vec_lit: VecLit,
     path: PathExpr,
     block: BlockExpr,
     unit: void,
@@ -129,6 +130,15 @@ pub const StringLit = struct {
 /// collapsing to `&[_]u8{V} ** N` when every byte is equal).
 pub const ByteArrayLit = struct {
     items: []const u8,
+};
+
+/// A parsed Rust `vec!` literal, distinct from a fixed-length array literal.
+/// When `repeat` is null, `elements` may contain any number of nodes, including
+/// zero. When `repeat` is non-null, `elements` must contain exactly one node.
+/// This records macro semantics without claiming runtime `Vec` support.
+pub const VecLit = struct {
+    elements: []const NodeId,
+    repeat: ?usize,
 };
 
 /// A resolved reference, not a name. Collapses Rust's `x`, `Foo::Bar` (unit

@@ -2417,6 +2417,7 @@ const Lowerer = struct {
                     },
                 };
             },
+            .vec_lit => ast.Expr{ .unsupported = "Vec literal: allocator-backed Vec adapter unavailable" },
             .path => |pe| try self.lowerPathExpr(pe),
             .block => |be| ast.Expr{ .block = try self.lowerBlock(be) },
             .unit => ast.Expr{ .struct_init = .{ .type_name = null, .fields = &.{} } },

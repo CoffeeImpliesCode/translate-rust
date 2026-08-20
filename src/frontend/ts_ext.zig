@@ -2608,7 +2608,7 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                     for (elements, 0..) |element, index| {
                         lowered[index] = try parseAndLowerSubExpr(e, element);
                     }
-                    return appendExpr(e, .{ .array = .{
+                    return appendExpr(e, .{ .vec_lit = .{
                         .elements = lowered,
                         .repeat = null,
                     } });
@@ -2619,7 +2619,7 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                     const lowered = try e.ctx.alloc.alloc(exprs.NodeId, 1);
                     errdefer e.ctx.alloc.free(lowered);
                     lowered[0] = try parseAndLowerSubExpr(e, repeat.element);
-                    return appendExpr(e, .{ .array = .{
+                    return appendExpr(e, .{ .vec_lit = .{
                         .elements = lowered,
                         .repeat = count,
                     } });
@@ -2948,7 +2948,7 @@ test "lower built-in macro invocations in fn bodies" {
 
     var found_eq = false;
     var found_ne = false;
-    var found_array = false;
+    var found_vec_lit = false;
     var found_unsupported = false;
     var found_assert_marker = false;
     var found_debug_assert_ge = false;
@@ -2980,8 +2980,8 @@ test "lower built-in macro invocations in fn bodies" {
                 if (b.op == .ne) found_ne = true;
                 if (b.op == .gt) found_debug_assert_ge = true;
             },
-            .array => |array| {
-                if (array.elements.len == 3 and array.repeat == null) found_array = true;
+            .vec_lit => |vec_lit| {
+                if (vec_lit.elements.len == 3 and vec_lit.repeat == null) found_vec_lit = true;
             },
             .unsupported => |u| {
                 if (std.mem.startsWith(u8, u.reason, "assertion:")) {
@@ -3005,13 +3005,13 @@ test "lower built-in macro invocations in fn bodies" {
     try std.testing.expectEqual(expected_assign_ops.len, statement_assign_count);
     try std.testing.expect(found_eq); // assert_eq! → .eq binary
     try std.testing.expect(found_ne); // assert_ne! → .ne binary
-    try std.testing.expect(found_array); // vec![1,2,3] → non-repeated three-element array
+    try std.testing.expect(found_vec_lit); // vec![1,2,3] → non-repeated three-element Vec literal
     try std.testing.expect(found_assert_marker); // assert!/debug_assert! → assertion: marker
     try std.testing.expect(found_debug_assert_ge); // debug_assert!(x > 0) → .gt binary
     try std.testing.expect(found_unsupported); // panic!/unreachable!/unresolved → .unsupported
 }
 
-test "lower literal vec macro forms to arrays" {
+test "lower literal vec macro forms to vec literals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3087,6 +3087,7 @@ test "lower literal vec macro forms to arrays" {
         .src =
         \\fn build_vectors() {
         \\    let explicit = vec![1, (2, 3), 4];
+        \\    let empty = vec![];
         \\    let repeated = vec![0xff; 200_000];
         \\    let suffixed_decimal = vec![0xff; 1_usize];
         \\    let suffixed_hex = vec![0xff; 0x_FF_usize];
@@ -3101,7 +3102,7 @@ test "lower literal vec macro forms to arrays" {
         .block => |block| block,
         else => return error.ExpectedFunctionBlock,
     };
-    try std.testing.expectEqual(@as(usize, 4), body.statements.len);
+    try std.testing.expectEqual(@as(usize, 5), body.statements.len);
 
     const explicit_let = switch (stmts_list.items[body.statements[0]].kind) {
         .let => |statement| statement,
@@ -3114,16 +3115,40 @@ test "lower literal vec macro forms to arrays" {
     try std.testing.expectEqualStrings("explicit", explicit_binding.name);
     const explicit_init_id = explicit_let.init orelse return error.ExpectedExplicitVecInitializer;
     const explicit_init = exprs_list.items[explicit_init_id].kind;
-    try std.testing.expect(explicit_init == .array);
+    try std.testing.expect(explicit_init == .vec_lit);
     try std.testing.expect(explicit_init != .unsupported);
-    const explicit_array = switch (explicit_init) {
-        .array => |array| array,
-        else => return error.ExpectedExplicitVecArray,
+    const explicit_vec = switch (explicit_init) {
+        .vec_lit => |vec_lit| vec_lit,
+        else => return error.ExpectedExplicitVecLit,
     };
-    try std.testing.expectEqual(@as(usize, 3), explicit_array.elements.len);
-    try std.testing.expect(explicit_array.repeat == null);
+    try std.testing.expectEqual(@as(usize, 3), explicit_vec.elements.len);
+    try std.testing.expect(explicit_vec.repeat == null);
 
-    const repeated_let = switch (stmts_list.items[body.statements[1]].kind) {
+    const explicit_tuple = switch (exprs_list.items[explicit_vec.elements[1]].kind) {
+        .array => |tuple| tuple,
+        else => return error.ExpectedExplicitVecTuple,
+    };
+    try std.testing.expectEqual(@as(usize, 2), explicit_tuple.elements.len);
+    try std.testing.expect(explicit_tuple.repeat == null);
+
+    const empty_let = switch (stmts_list.items[body.statements[1]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedEmptyVecLet,
+    };
+    const empty_binding = switch (pats_list.items[empty_let.pattern].kind) {
+        .binding => |binding| binding,
+        else => return error.ExpectedEmptyVecBinding,
+    };
+    try std.testing.expectEqualStrings("empty", empty_binding.name);
+    const empty_init_id = empty_let.init orelse return error.ExpectedEmptyVecInitializer;
+    const empty_vec = switch (exprs_list.items[empty_init_id].kind) {
+        .vec_lit => |vec_lit| vec_lit,
+        else => return error.ExpectedEmptyVecLit,
+    };
+    try std.testing.expectEqual(@as(usize, 0), empty_vec.elements.len);
+    try std.testing.expect(empty_vec.repeat == null);
+
+    const repeated_let = switch (stmts_list.items[body.statements[2]].kind) {
         .let => |statement| statement,
         else => return error.ExpectedRepeatedVecLet,
     };
@@ -3134,19 +3159,19 @@ test "lower literal vec macro forms to arrays" {
     try std.testing.expectEqualStrings("repeated", repeated_binding.name);
     const repeated_init_id = repeated_let.init orelse return error.ExpectedRepeatedVecInitializer;
     const repeated_init = exprs_list.items[repeated_init_id].kind;
-    try std.testing.expect(repeated_init == .array);
+    try std.testing.expect(repeated_init == .vec_lit);
     try std.testing.expect(repeated_init != .unsupported);
-    const repeated_array = switch (repeated_init) {
-        .array => |array| array,
-        else => return error.ExpectedRepeatedVecArray,
+    const repeated_vec = switch (repeated_init) {
+        .vec_lit => |vec_lit| vec_lit,
+        else => return error.ExpectedRepeatedVecLit,
     };
-    try std.testing.expectEqual(@as(usize, 1), repeated_array.elements.len);
+    try std.testing.expectEqual(@as(usize, 1), repeated_vec.elements.len);
     try std.testing.expectEqual(
         @as(usize, 200_000),
-        repeated_array.repeat orelse return error.ExpectedRepeatedVecCount,
+        repeated_vec.repeat orelse return error.ExpectedRepeatedVecCount,
     );
 
-    const suffixed_decimal_let = switch (stmts_list.items[body.statements[2]].kind) {
+    const suffixed_decimal_let = switch (stmts_list.items[body.statements[3]].kind) {
         .let => |statement| statement,
         else => return error.ExpectedSuffixedDecimalVecLet,
     };
@@ -3158,19 +3183,19 @@ test "lower literal vec macro forms to arrays" {
     const suffixed_decimal_init_id =
         suffixed_decimal_let.init orelse return error.ExpectedSuffixedDecimalVecInitializer;
     const suffixed_decimal_init = exprs_list.items[suffixed_decimal_init_id].kind;
-    try std.testing.expect(suffixed_decimal_init == .array);
+    try std.testing.expect(suffixed_decimal_init == .vec_lit);
     try std.testing.expect(suffixed_decimal_init != .unsupported);
-    const suffixed_decimal_array = switch (suffixed_decimal_init) {
-        .array => |array| array,
-        else => return error.ExpectedSuffixedDecimalVecArray,
+    const suffixed_decimal_vec = switch (suffixed_decimal_init) {
+        .vec_lit => |vec_lit| vec_lit,
+        else => return error.ExpectedSuffixedDecimalVecLit,
     };
-    try std.testing.expectEqual(@as(usize, 1), suffixed_decimal_array.elements.len);
+    try std.testing.expectEqual(@as(usize, 1), suffixed_decimal_vec.elements.len);
     try std.testing.expectEqual(
         @as(usize, 1),
-        suffixed_decimal_array.repeat orelse return error.ExpectedSuffixedDecimalVecCount,
+        suffixed_decimal_vec.repeat orelse return error.ExpectedSuffixedDecimalVecCount,
     );
 
-    const suffixed_hex_let = switch (stmts_list.items[body.statements[3]].kind) {
+    const suffixed_hex_let = switch (stmts_list.items[body.statements[4]].kind) {
         .let => |statement| statement,
         else => return error.ExpectedSuffixedHexVecLet,
     };
@@ -3182,16 +3207,16 @@ test "lower literal vec macro forms to arrays" {
     const suffixed_hex_init_id =
         suffixed_hex_let.init orelse return error.ExpectedSuffixedHexVecInitializer;
     const suffixed_hex_init = exprs_list.items[suffixed_hex_init_id].kind;
-    try std.testing.expect(suffixed_hex_init == .array);
+    try std.testing.expect(suffixed_hex_init == .vec_lit);
     try std.testing.expect(suffixed_hex_init != .unsupported);
-    const suffixed_hex_array = switch (suffixed_hex_init) {
-        .array => |array| array,
-        else => return error.ExpectedSuffixedHexVecArray,
+    const suffixed_hex_vec = switch (suffixed_hex_init) {
+        .vec_lit => |vec_lit| vec_lit,
+        else => return error.ExpectedSuffixedHexVecLit,
     };
-    try std.testing.expectEqual(@as(usize, 1), suffixed_hex_array.elements.len);
+    try std.testing.expectEqual(@as(usize, 1), suffixed_hex_vec.elements.len);
     try std.testing.expectEqual(
         @as(usize, 255),
-        suffixed_hex_array.repeat orelse return error.ExpectedSuffixedHexVecCount,
+        suffixed_hex_vec.repeat orelse return error.ExpectedSuffixedHexVecCount,
     );
 }
 

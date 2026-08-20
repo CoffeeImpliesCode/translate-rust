@@ -954,6 +954,9 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
     const e = &ctx.b.exprs[node];
     switch (e.kind) {
         .literal => |lit| try walkLiteral(ctx, node, lit),
+        .vec_lit => |vec| {
+            for (vec.elements) |element| try walkExpr(ctx, element, fn_body);
+        },
         .path => |p| {
             try walkPath(ctx, node, p);
             if (p.generic_args.len > 0) {

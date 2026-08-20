@@ -448,6 +448,7 @@ const LocalInitializerFinder = struct {
             .try_ => |try_expr| self.visitExpr(try_expr.inner),
             .return_ => |return_expr| if (return_expr.value) |value| self.visitExpr(value),
             .array => |array| for (array.elements) |element| self.visitExpr(element),
+            .vec_lit => |vec| for (vec.elements) |element| self.visitExpr(element),
             .literal, .unit, .path, .continue_, .closure, .iterator_chain, .unsupported => {},
         }
     }

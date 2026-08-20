@@ -13,6 +13,8 @@ const exprs = @import("exprs.zig");
 const emit = @import("emit.zig");
 
 const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+const vec_unavailable_reason =
+    "Vec literal: allocator-backed Vec adapter unavailable";
 
 /// Minimal model.
 ///
@@ -21,15 +23,24 @@ const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end
 ///   1 = tail_fn   — fn whose block TAIL is an unsupported expr (value pos)
 ///   2 = stmt_fn   — fn whose block contains an unsupported expr STATEMENT
 ///   3 = broken_const — const whose INIT is an unsupported expr (comptime)
+///   4 = vec_tail — fn whose block tail is an explicit vec_lit
+///   5 = vec_statement — fn whose block statement is a repeated vec_lit
+///   6 = vec_const — const whose INIT is a repeated vec_lit (comptime)
 ///
 /// Exprs:
 ///   0 = unsupported{ reason = `he said "hi" \ back` }  (runtime; escaping)
 ///   1 = unsupported{ reason = "unresolved identifier" } (comptime const init)
 ///   2 = BlockExpr{ stmts=[], tail=0 }        — tail_fn body
 ///   3 = BlockExpr{ stmts=[0], tail=null }    — stmt_fn body (stmt 0 = expr 0)
+///   4 = literal 1                            — vec element
+///   5 = vec_lit{ elements=[4, 4], repeat=null } — explicit list
+///   6 = vec_lit{ elements=[4], repeat=3 }    — repeated form
+///   7 = BlockExpr{ stmts=[], tail=5 }        — vec_tail body
+///   8 = BlockExpr{ stmts=[1], tail=null }    — vec_statement body
 ///
 /// Stmts:
 ///   0 = ExprStmt(expr = 0)
+///   1 = ExprStmt(expr = 6)
 const Model = struct {
     g: graph.CrateGraph,
     bodies: emit.Bodies,
@@ -112,10 +123,47 @@ fn buildModel(allocator: std.mem.Allocator) !*Model {
         .attributes = &.{},
     });
 
-    const items_slice = try allocator.alloc(spine.EntityId, 3);
+    const vec_tail_fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "vec_tail"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const vec_statement_fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "vec_statement"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const vec_const_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .const_,
+        .name = try allocator.dupe(u8, "vec_const"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const items_slice = try allocator.alloc(spine.EntityId, 6);
     items_slice[0] = tail_fn_id;
     items_slice[1] = stmt_fn_id;
     items_slice[2] = const_id;
+    items_slice[3] = vec_tail_fn_id;
+    items_slice[4] = vec_statement_fn_id;
+    items_slice[5] = vec_const_id;
     g.modules.items[root_id].items = items_slice;
 
     try g.addCrate(.{
@@ -133,7 +181,7 @@ fn buildModel(allocator: std.mem.Allocator) !*Model {
     types_store[1] = .{ .prim = .unit };
 
     // Exprs.
-    const exprs_store = try allocator.alloc(exprs.Expr, 4);
+    const exprs_store = try allocator.alloc(exprs.Expr, 9);
     exprs_store[0] = .{
         .id = 0,
         .span = span,
@@ -164,22 +212,72 @@ fn buildModel(allocator: std.mem.Allocator) !*Model {
         .ty = null,
         .kind = .{ .block = .{ .statements = &.{0}, .tail = null, .labelled = null } },
     };
+    exprs_store[4] = .{
+        .id = 4,
+        .span = span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "1",
+            .value = 1,
+            .base = .dec,
+            .ty_suffix = null,
+        } } },
+    };
+    exprs_store[5] = .{
+        .id = 5,
+        .span = span,
+        .ty = null,
+        .kind = .{ .vec_lit = .{
+            .elements = &.{ 4, 4 },
+            .repeat = null,
+        } },
+    };
+    exprs_store[6] = .{
+        .id = 6,
+        .span = span,
+        .ty = null,
+        .kind = .{ .vec_lit = .{
+            .elements = &.{4},
+            .repeat = 3,
+        } },
+    };
+    exprs_store[7] = .{
+        .id = 7,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 5, .labelled = null } },
+    };
+    exprs_store[8] = .{
+        .id = 8,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{1}, .tail = null, .labelled = null } },
+    };
 
-    // Stmts: 0 = ExprStmt(expr 0).
-    const stmts_store = try allocator.alloc(exprs.Statement, 1);
+    // Stmts: 0 = ExprStmt(expr 0), 1 = ExprStmt(expr 6).
+    const stmts_store = try allocator.alloc(exprs.Statement, 2);
     stmts_store[0] = .{
         .id = 0,
         .span = span,
         .ty = null,
         .kind = .{ .expr = 0 },
     };
+    stmts_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = 6 },
+    };
 
     // Bodies indexed by entity id.
-    const bodies_arr = try allocator.alloc(emit.BodyKind, 4);
+    const bodies_arr = try allocator.alloc(emit.BodyKind, 7);
     bodies_arr[0] = .none; // root module
     bodies_arr[1] = .{ .fn_ = .{ .params = &.{}, .ret = types_store[1], .body = 2 } };
     bodies_arr[2] = .{ .fn_ = .{ .params = &.{}, .ret = types_store[1], .body = 3 } };
     bodies_arr[3] = .{ .const_ = .{ .ty = types_store[0], .init = 1 } };
+    bodies_arr[4] = .{ .fn_ = .{ .params = &.{}, .ret = types_store[1], .body = 7 } };
+    bodies_arr[5] = .{ .fn_ = .{ .params = &.{}, .ret = types_store[1], .body = 8 } };
+    bodies_arr[6] = .{ .const_ = .{ .ty = types_store[0], .init = 6 } };
 
     m.* = .{
         .g = g,
@@ -192,6 +290,24 @@ fn buildModel(allocator: std.mem.Allocator) !*Model {
         },
     };
     return m;
+}
+
+fn expectVecPayloads(model: *const Model) !void {
+    const explicit = switch (model.bodies.exprs[5].kind) {
+        .vec_lit => |vec| vec,
+        else => return error.ExpectedVecLiteral,
+    };
+    const explicit_element_ids = [_]exprs.NodeId{ 4, 4 };
+    try std.testing.expectEqualSlices(exprs.NodeId, &explicit_element_ids, explicit.elements);
+    try std.testing.expectEqual(@as(?usize, null), explicit.repeat);
+
+    const repeated = switch (model.bodies.exprs[6].kind) {
+        .vec_lit => |vec| vec,
+        else => return error.ExpectedVecLiteral,
+    };
+    const repeated_element_ids = [_]exprs.NodeId{4};
+    try std.testing.expectEqualSlices(exprs.NodeId, &repeated_element_ids, repeated.elements);
+    try std.testing.expectEqual(@as(?usize, 3), repeated.repeat);
 }
 
 /// Assert `text` is syntactically valid Zig (std.zig.Ast.parse accepts it).
@@ -255,4 +371,48 @@ test "unsupported expr in const init emits undefined + comment, never @panic" {
 
     // Overall output still parses as valid Zig.
     try expectValidZig(allocator, out);
+}
+
+test "vec_lit runtime emission preserves the allocator-backed Vec refusal" {
+    const allocator = std.testing.allocator;
+    var model = try buildModel(allocator);
+    defer allocator.destroy(model);
+    defer model.deinit(allocator);
+    try expectVecPayloads(model);
+
+    const out = try emit.emitRich(allocator, &model.g, &model.bodies);
+    defer allocator.free(out);
+
+    const runtime_marker =
+        "if (true) @panic(\"translate-rust: unsupported: " ++ vec_unavailable_reason ++ "\")";
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, runtime_marker));
+    try std.testing.expect(std.mem.indexOf(u8, out, "return @panic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[_]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "multi_array") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "repeat") == null);
+    try expectValidZig(allocator, out);
+}
+
+test "vec_lit comptime emission preserves reason with undefined" {
+    const allocator = std.testing.allocator;
+    var model = try buildModel(allocator);
+    defer allocator.destroy(model);
+    defer model.deinit(allocator);
+    try expectVecPayloads(model);
+
+    const out = try emit.emitRich(allocator, &model.g, &model.bodies);
+    defer allocator.free(out);
+
+    const start = std.mem.indexOf(u8, out, "const vec_const").?;
+    const rest = out[start..];
+    const semi = std.mem.indexOf(u8, rest, ";").?;
+    const init = rest[0..semi];
+
+    const comptime_comment = "// translate-rust: unsupported " ++ vec_unavailable_reason;
+    try std.testing.expect(std.mem.indexOf(u8, init, comptime_comment) != null);
+    try std.testing.expect(std.mem.endsWith(u8, init, "undefined"));
+    try std.testing.expect(std.mem.indexOf(u8, init, "@panic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, init, "[_]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, init, "**") == null);
 }

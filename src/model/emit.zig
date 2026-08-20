@@ -1318,6 +1318,28 @@ fn appendEscapedString(
     }
 }
 
+fn emitUnsupportedExpr(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    reason: []const u8,
+    is_comptime: bool,
+) !void {
+    if (is_comptime) {
+        // Never @panic at comptime: const/static initializers are evaluated
+        // at compile time, where a panic is a compile error.
+        try buf.appendSlice(allocator, "// translate-rust: unsupported ");
+        try appendEscapedString(allocator, buf, reason);
+        try buf.append(allocator, '\n');
+        try buf.appendSlice(allocator, "undefined");
+    } else {
+        // `if (true) @panic(...)` prevents unreachable code errors while
+        // coercing in value positions so downstream references typecheck.
+        try buf.appendSlice(allocator, "if (true) @panic(\"translate-rust: unsupported: ");
+        try appendEscapedString(allocator, buf, reason);
+        try buf.appendSlice(allocator, "\")");
+    }
+}
+
 fn emitExpr(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
@@ -1701,24 +1723,13 @@ fn emitExpr(
             }
             try buf.appendSlice(allocator, " }");
         },
-        .unsupported => |u| {
-            if (is_comptime) {
-                // Never @panic at comptime: const/static initializers are
-                // evaluated at compile time, where a panic is a compile error.
-                // Emit a loud comment plus `undefined`, which coerces to the
-                // declared type of the enclosing initializer.
-                try buf.appendSlice(allocator, "// translate-rust: unsupported ");
-                try appendEscapedString(allocator, buf, u.reason);
-                try buf.append(allocator, '\n');
-                try buf.appendSlice(allocator, "undefined");
-            } else {
-                // `if (true) @panic(...)` prevents unreachable code errors while
-                // coercing in value positions so downstream references typecheck.
-                try buf.appendSlice(allocator, "if (true) @panic(\"translate-rust: unsupported: ");
-                try appendEscapedString(allocator, buf, u.reason);
-                try buf.appendSlice(allocator, "\")");
-            }
-        },
+        .vec_lit => try emitUnsupportedExpr(
+            allocator,
+            buf,
+            "Vec literal: allocator-backed Vec adapter unavailable",
+            is_comptime,
+        ),
+        .unsupported => |u| try emitUnsupportedExpr(allocator, buf, u.reason, is_comptime),
         else => {
             // Genuinely unhandled kinds (closure, iterator_chain, future seams).
             if (is_comptime) {
@@ -1856,7 +1867,7 @@ fn typeIsUnit(ty: types.Type) bool {
 fn isUnsupportedOrEmptyBody(b: *const Bodies, body_id: exprs.NodeId) bool {
     if (body_id >= b.exprs.len) return true;
     const body = b.exprs[body_id];
-    if (body.kind != .block) return body.kind == .unsupported;
+    if (body.kind != .block) return body.kind == .unsupported or body.kind == .vec_lit;
     const block = body.kind.block;
     if (block.statements.len == 0 and block.tail == null) return true;
     if (block.statements.len == 1 and block.tail == null) {
@@ -1865,7 +1876,7 @@ fn isUnsupportedOrEmptyBody(b: *const Bodies, body_id: exprs.NodeId) bool {
             const stmt = b.stmts[sid];
             if (stmt.kind == .expr and stmt.kind.expr < b.exprs.len) {
                 const e = b.exprs[stmt.kind.expr];
-                if (e.kind == .unsupported) return true;
+                if (e.kind == .unsupported or e.kind == .vec_lit) return true;
             }
         }
     }

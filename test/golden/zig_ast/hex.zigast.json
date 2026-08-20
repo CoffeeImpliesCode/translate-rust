@@ -1164,50 +1164,8 @@
                 "name": "result",
                 "ty": null,
                 "init": {
-                  "kind": "multi_array",
-                  "type_name": null,
-                  "elements": [
-                    {
-                      "kind": "multi_array",
-                      "type_name": null,
-                      "elements": [
-                        {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "int",
-                            "value": "0"
-                          }
-                        },
-                        {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "int",
-                            "value": "1"
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "kind": "multi_array",
-                      "type_name": null,
-                      "elements": [
-                        {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "int",
-                            "value": "2"
-                          }
-                        },
-                        {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "int",
-                            "value": "3"
-                          }
-                        }
-                      ]
-                    }
-                  ]
+                  "kind": "unsupported",
+                  "reason": "Vec literal: allocator-backed Vec adapter unavailable"
                 },
                 "is_mut": false
               },

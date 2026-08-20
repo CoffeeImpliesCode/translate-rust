@@ -545,6 +545,7 @@ test "analyzeSource propagates generic alias constructor type through a local re
                 else
                     false,
                 .array => |array| hasArgs(ir_, array.elements),
+                .vec_lit => |vec_lit| hasArgs(ir_, vec_lit.elements),
                 else => false,
             };
         }
@@ -1039,13 +1040,13 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
         else => return error.TestUnexpectedResult,
     };
     const values_init = values_let.init orelse return error.TestUnexpectedResult;
-    const values_array = switch (rust_ir.bodies.exprs[values_init].kind) {
-        .array => |array| array,
+    const values_vec = switch (rust_ir.bodies.exprs[values_init].kind) {
+        .vec_lit => |vec_lit| vec_lit,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqual(@as(?usize, null), values_array.repeat);
-    try std.testing.expectEqual(@as(usize, 3), values_array.elements.len);
-    for (values_array.elements, 1..) |element_id, expected| {
+    try std.testing.expectEqual(@as(?usize, null), values_vec.repeat);
+    try std.testing.expectEqual(@as(usize, 3), values_vec.elements.len);
+    for (values_vec.elements, 1..) |element_id, expected| {
         const element = rust_ir.bodies.exprs[element_id];
         try std.testing.expect(element.kind == .literal);
         try std.testing.expect(element.kind.literal == .int);
@@ -1058,13 +1059,13 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
         else => return error.TestUnexpectedResult,
     };
     const repeated_init = repeated_let.init orelse return error.TestUnexpectedResult;
-    const repeated_array = switch (rust_ir.bodies.exprs[repeated_init].kind) {
-        .array => |array| array,
+    const repeated_vec = switch (rust_ir.bodies.exprs[repeated_init].kind) {
+        .vec_lit => |vec_lit| vec_lit,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqual(@as(?usize, 4), repeated_array.repeat);
-    try std.testing.expectEqual(@as(usize, 1), repeated_array.elements.len);
-    const repeated_element = rust_ir.bodies.exprs[repeated_array.elements[0]];
+    try std.testing.expectEqual(@as(?usize, 4), repeated_vec.repeat);
+    try std.testing.expectEqual(@as(usize, 1), repeated_vec.elements.len);
+    const repeated_element = rust_ir.bodies.exprs[repeated_vec.elements[0]];
     try std.testing.expect(repeated_element.kind == .literal);
     try std.testing.expect(repeated_element.kind.literal == .int);
     try std.testing.expectEqual(@as(i128, 0xff), repeated_element.kind.literal.int.value);

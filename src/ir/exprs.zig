@@ -50,6 +50,7 @@ pub const ExprKind = union(enum) {
     // — literals & atoms (§1.1) —
     literal: Literal,
     array: ArrayExpr,
+    vec_lit: VecLit,
     path: PathExpr,
     block: BlockExpr,
     unit: void,
@@ -139,6 +140,14 @@ pub const ByteArrayLit = struct {
 /// length is `elements.len`. Lossless: element exprs are full `Expr` nodes and
 /// the backend derives Zig `[_]T{ ... }` / `[_]T{ e } ** N` from them.
 pub const ArrayExpr = struct {
+    elements: []const NodeId,
+    repeat: ?usize,
+};
+/// A parsed Rust `vec!` literal, distinct from a fixed-length array literal.
+/// When `repeat` is null, `elements` may contain any number of nodes, including
+/// zero. When `repeat` is non-null, `elements` must contain exactly one node.
+/// This records macro semantics without claiming runtime `Vec` support.
+pub const VecLit = struct {
     elements: []const NodeId,
     repeat: ?usize,
 };
@@ -621,6 +630,9 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     _ = lit_str;
     _ = lit_bool;
 
+    const vec_lit: VecLit = .{ .elements = &.{ 1, 2 }, .repeat = null };
+    const array_expr: ArrayExpr = .{ .elements = &.{ 3, 4 }, .repeat = null };
+
     // §1.1 — Path, Block (BlockExpr is non-recursive via NodeIds)
     const path_expr: PathExpr = .{ .def = 1, .generic_args = &.{} };
     const block_expr: BlockExpr = .{ .statements = &.{}, .tail = null, .labelled = null };
@@ -814,6 +826,8 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
 
     // ── Wrap every ExprKind arm into an Expr (final _ = block) ─────────────
     const e_lit: Expr = .{ .id = 1, .span = span, .ty = null, .kind = .{ .literal = lit_int } };
+    const e_array: Expr = .{ .id = 26, .span = span, .ty = null, .kind = .{ .array = array_expr } };
+    const e_vec: Expr = .{ .id = 24, .span = span, .ty = null, .kind = .{ .vec_lit = vec_lit } };
     const e_path: Expr = .{ .id = 2, .span = span, .ty = null, .kind = .{ .path = path_expr } };
     const e_block: Expr = .{ .id = 3, .span = span, .ty = null, .kind = .{ .block = block_expr } };
     const e_unit: Expr = .{ .id = 4, .span = span, .ty = null, .kind = .{ .unit = {} } };
@@ -838,6 +852,8 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const e_ret: Expr = .{ .id = 23, .span = span, .ty = null, .kind = .{ .return_ = ret_val } };
     const e_unsup: Expr = .{ .id = 25, .span = span, .ty = null, .kind = .{ .unsupported = unsup } };
     _ = e_lit;
+    _ = e_array;
+    _ = e_vec;
     _ = e_path;
     _ = e_block;
     _ = e_unit;

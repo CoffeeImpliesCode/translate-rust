@@ -652,6 +652,18 @@ fn decodeIterKind(allocator: std.mem.Allocator, v: Json) !exprs.IterKind {
 
 fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exprs.ExprKind {
     if (std.mem.eql(u8, tag, "literal")) return .{ .literal = try decodeLiteral(allocator, val) };
+    if (std.mem.eql(u8, tag, "vec_lit")) {
+        const p = try getObj(val);
+        const repeat: ?usize = switch (try req(p, "repeat")) {
+            .integer => |i| @intCast(@max(i, 0)),
+            .null => null,
+            else => return error.BadWireFormat,
+        };
+        return .{ .vec_lit = .{
+            .elements = try decodeIdList(allocator, try req(p, "elements")),
+            .repeat = repeat,
+        } };
+    }
     if (std.mem.eql(u8, tag, "path")) {
         const p = try getObj(val);
         return .{ .path = .{
@@ -1738,6 +1750,13 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
         .literal => |v| {
             try o.put(allocator, "kind", .{ .string = "literal" });
             try o.put(allocator, "value", try encodeLiteralObj(allocator, v));
+        },
+        .vec_lit => |v| {
+            try o.put(allocator, "kind", .{ .string = "vec_lit" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "elements", try encodeIdList(allocator, v.elements));
+            try vo.put(allocator, "repeat", if (v.repeat) |r| mkInt(r) else .{ .null = {} });
+            try o.put(allocator, "value", .{ .object = vo });
         },
         .path => |p| {
             try o.put(allocator, "kind", .{ .string = "path" });
