@@ -31,6 +31,53 @@ const default_span: spine.Span = .{
     .end_col = 1,
 };
 
+fn materializeInferredConstructorTypes(
+    allocator: std.mem.Allocator,
+    type_list: *std.ArrayListUnmanaged(types.Type),
+    expr_list: []exprs.Expr,
+    inferred: std.AutoHashMapUnmanaged(exprs.NodeId, types.Instantiation),
+) !void {
+    var it = inferred.iterator();
+    while (it.next()) |entry| {
+        const node = entry.key_ptr.*;
+        if (node >= expr_list.len) continue;
+        const decl = switch (expr_list[node].kind) {
+            .call => |call| switch (call.call_kind) {
+                .constructor => |constructor| constructor,
+                .free, .associated => continue,
+            },
+            .struct_lit => |literal| literal.def,
+            else => continue,
+        };
+        if (decl != entry.value_ptr.generic_id) continue;
+        var found = false;
+        for (type_list.items, 0..) |existing, existing_id| {
+            switch (existing) {
+                .generic_inst => |generic| {
+                    if (generic.decl == decl and
+                        monomorphize.genericArgsEquals(generic.args, entry.value_ptr.args))
+                    {
+                        expr_list[node].ty = @intCast(existing_id);
+                        found = true;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (!found) {
+            const owned_args = try allocator.dupe(types.Type, entry.value_ptr.args.params);
+            errdefer if (owned_args.len > 0) allocator.free(owned_args);
+            const type_id: exprs.TypeId = @intCast(type_list.items.len);
+            try type_list.append(allocator, .{ .generic_inst = .{
+                .decl = decl,
+                .args = .{ .params = owned_args },
+            } });
+            expr_list[node].ty = type_id;
+        }
+    }
+}
+
 /// Orchestrates the entire frontend analysis on a crate directory:
 /// 1. Ingestion (`Cargo.toml` name/edition/entry point resolution).
 /// 2. CST extraction (`cst.extractFile` across root + submodules).
@@ -134,7 +181,6 @@ fn analyzeSourceWithGraph(
         .io = maybe_io,
     };
     try cst.extractFile(&cst_ctx);
-
     // 3. Name resolution
     try names.resolveGraph(allocator, &g);
 
@@ -205,9 +251,22 @@ fn analyzeSourceWithGraph(
     var instantiation_table: monomorphize.InstantiationTable = .{};
     defer instantiation_table.deinit(allocator);
     if (infer.solveWithGraph(allocator, &b_temp, &g)) |inferred| {
-        inferred.apply(exprs_list.items);
+        var solved = inferred;
+        defer solved.deinit(allocator);
+        solved.apply(exprs_list.items);
+        try materializeInferredConstructorTypes(
+            allocator,
+            &types_list,
+            exprs_list.items,
+            solved.instantiations,
+        );
+        b_temp.types = types_list.items;
         _ = resolve_methods.resolveMethods(&g, &b_temp);
         instantiation_table = monomorphize.collectInstantiations(allocator, &g, &b_temp) catch .{};
+        // Inference records are keyed by source expression. Copy their
+        // concrete argument slices into the long-lived table before `solved`
+        // releases its map and arena-owned temporary buffers.
+        try instantiation_table.mergeInferred(allocator, solved.instantiations);
     } else |_| {}
 
     const final_bodies: bodies.Bodies = .{
@@ -323,19 +382,17 @@ test "analyzeSource resolves generic alias inherent method chain" {
     const allocator = arena_state.allocator();
 
     const src =
-        \\pub struct Fletcher<T> { state: T }
+        \\pub struct Fletcher<T> {}
         \\pub type Fletcher16 = Fletcher<u16>;
-        \\impl Fletcher<u16> {
-        \\    pub fn new() -> Fletcher<u16> {
-        \\        Fletcher { state: 0u16 }
-        \\    }
-        \\}
         \\impl<T> Fletcher<T> {
-        \\    pub fn update(self, state: T) -> Fletcher<T> {
-        \\        Fletcher { state }
+        \\    pub fn new() -> Fletcher<T> {
+        \\        Fletcher {}
         \\    }
-        \\    pub fn value(self) -> T {
-        \\        self.state
+        \\    pub fn update(self, state: u16) -> Fletcher<T> {
+        \\        Fletcher {}
+        \\    }
+        \\    pub fn value(self) -> u16 {
+        \\        0
         \\    }
         \\}
         \\pub fn calculate(input: u16) -> u16 {
@@ -402,6 +459,172 @@ test "analyzeSource resolves generic alias inherent method chain" {
     try std.testing.expect(saw_primitive_add);
 }
 
+test "analyzeSource propagates generic alias constructor type through a local receiver" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub struct Fletcher<T> { state: u16, marker: T }
+        \\pub type Fletcher16 = Fletcher<u16>;
+        \\impl Fletcher<u16> {
+        \\    pub fn new() -> Fletcher<u16> {
+        \\        Fletcher { state: 0u16, marker: 0u16 }
+        \\    }
+        \\}
+        \\impl<T> Fletcher<T> {
+        \\    pub fn update(&mut self, data: &[u8]) {}
+        \\    pub fn value(&self) -> u16 {
+        \\        self.state
+        \\    }
+        \\}
+        \\pub fn calculate(data: &[u8]) {
+        \\    let mut checksum = Fletcher16::new();
+        \\    checksum.update(data);
+        \\    checksum.value();
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "fletcher_local", "2021", src);
+
+    var fletcher_id: ?spine.EntityId = null;
+    var calculate_id: ?spine.EntityId = null;
+    var new_id: ?spine.EntityId = null;
+    var update_id: ?spine.EntityId = null;
+    var value_id: ?spine.EntityId = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .struct_ and std.mem.eql(u8, entity.name, "Fletcher")) {
+            fletcher_id = entity.id;
+        } else if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "calculate")) {
+            calculate_id = entity.id;
+        } else if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "new")) {
+            new_id = entity.id;
+        } else if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "update")) {
+            update_id = entity.id;
+        } else if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "value")) {
+            value_id = entity.id;
+        }
+    }
+    try std.testing.expect(fletcher_id != null);
+    try std.testing.expect(calculate_id != null);
+    try std.testing.expect(new_id != null);
+    try std.testing.expect(update_id != null);
+    try std.testing.expect(value_id != null);
+
+    var checksum_id: ?spine.EntityId = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .field and
+            entity.parent == calculate_id.? and
+            std.mem.eql(u8, entity.name, "checksum"))
+        {
+            checksum_id = entity.id;
+            break;
+        }
+    }
+    try std.testing.expect(checksum_id != null);
+
+    const target_chain = struct {
+        fn hasNode(ir_: *const ir.RustIR, node: exprs.NodeId) bool {
+            if (node >= ir_.bodies.exprs.len) return false;
+            return switch (ir_.bodies.exprs[node].kind) {
+                .unsupported => true,
+                .call => |call| hasArgs(ir_, call.args),
+                .method_call => |method| hasNode(ir_, method.receiver) or
+                    hasArgs(ir_, method.args),
+                .struct_lit => |literal| hasFields(ir_, literal.fields),
+                .enum_variant => |variant| hasArgs(ir_, variant.tuple_fields) or
+                    hasNamedFields(ir_, variant.named_fields),
+                .field => |field| hasNode(ir_, field.base),
+                .index => |index| hasNode(ir_, index.base) or hasNode(ir_, index.index),
+                .binary => |binary| hasNode(ir_, binary.lhs) or hasNode(ir_, binary.rhs),
+                .unary => |unary| hasNode(ir_, unary.operand),
+                .assign => |assign| hasNode(ir_, assign.target) or hasNode(ir_, assign.value),
+                .try_ => |try_expr| hasNode(ir_, try_expr.inner),
+                .return_ => |return_expr| if (return_expr.value) |value|
+                    hasNode(ir_, value)
+                else
+                    false,
+                .array => |array| hasArgs(ir_, array.elements),
+                else => false,
+            };
+        }
+
+        fn hasArgs(ir_: *const ir.RustIR, args: []const exprs.NodeId) bool {
+            for (args) |arg| {
+                if (hasNode(ir_, arg)) return true;
+            }
+            return false;
+        }
+
+        fn hasFields(ir_: *const ir.RustIR, fields: []const exprs.FieldInit) bool {
+            for (fields) |field| {
+                if (hasNode(ir_, field.value)) return true;
+            }
+            return false;
+        }
+
+        fn hasNamedFields(ir_: *const ir.RustIR, fields: []const exprs.FieldInit) bool {
+            for (fields) |field| {
+                if (hasNode(ir_, field.value)) return true;
+            }
+            return false;
+        }
+    }.hasNode;
+
+    var new_node: ?exprs.NodeId = null;
+    var update_node: ?exprs.NodeId = null;
+    var value_node: ?exprs.NodeId = null;
+    var saw_new = false;
+    var saw_update = false;
+    var saw_value = false;
+    for (rust_ir.bodies.exprs) |expression| {
+        switch (expression.kind) {
+            .call => |call| switch (call.call_kind) {
+                .associated => |target| {
+                    try std.testing.expectEqual(new_id.?, target);
+                    new_node = expression.id;
+                    saw_new = true;
+                },
+                else => {},
+            },
+            .method_call => |method_call| {
+                if (method_call.method != update_id.? and method_call.method != value_id.?) {
+                    continue;
+                }
+                try std.testing.expect(method_call.receiver < rust_ir.bodies.exprs.len);
+                const receiver = rust_ir.bodies.exprs[method_call.receiver];
+                try std.testing.expect(receiver.kind == .path);
+                try std.testing.expectEqual(checksum_id.?, receiver.kind.path.def);
+                const target = rust_ir.graph.symbol_table.get(method_call.method) orelse
+                    return error.TestUnexpectedResult;
+                try std.testing.expect(target.kind == .fn_);
+                const owner_id = target.parent orelse return error.TestUnexpectedResult;
+                const owner = rust_ir.graph.symbol_table.get(owner_id) orelse
+                    return error.TestUnexpectedResult;
+                try std.testing.expect(owner.kind == .impl_);
+                try std.testing.expectEqualStrings("Fletcher<T>", owner.name);
+                try std.testing.expectEqual(fletcher_id.?, owner.parent orelse
+                    return error.TestUnexpectedResult);
+
+                if (method_call.method == update_id.?) {
+                    update_node = expression.id;
+                    saw_update = true;
+                } else {
+                    value_node = expression.id;
+                    saw_value = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_new);
+    try std.testing.expect(saw_update);
+    try std.testing.expect(saw_value);
+    try std.testing.expect(!target_chain(&rust_ir, new_node.?));
+    try std.testing.expect(!target_chain(&rust_ir, update_node.?));
+    try std.testing.expect(!target_chain(&rust_ir, value_node.?));
+}
 test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

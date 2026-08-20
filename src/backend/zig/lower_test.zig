@@ -1234,6 +1234,252 @@ test "lower: prelude trait methods lower to native Zig expressions" {
     try std.testing.expect(!found_call);
 }
 
+/// Lower one method call whose receiver type is known to the RustIR.
+/// The fixture keeps the method entity separate from the callable entity so
+/// the body table exercises the same sparse EntityId convention as production.
+fn lowerStdMethodFixture(
+    alloc: std.mem.Allocator,
+    method_name: []const u8,
+    receiver_ty: ir.types.Type,
+    return_ty: ir.types.Type,
+    argument: ?i128,
+) !ast.Expr {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const method_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = method_name,
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const receiver_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .const_,
+        .name = "value",
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const function_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "std_method_fixture",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const types_store = try alloc.alloc(ir.types.Type, 1);
+    types_store[0] = receiver_ty;
+
+    const receiver_expr = try model.e(.{
+        .path = .{ .def = receiver_id, .generic_args = &.{} },
+    });
+    model.exprs.items[receiver_expr].ty = 0;
+
+    var args: []const ir.exprs.NodeId = &.{};
+    if (argument) |value| {
+        const argument_expr = try model.e(litInt(value));
+        const argument_ids = try alloc.alloc(ir.exprs.NodeId, 1);
+        argument_ids[0] = argument_expr;
+        args = argument_ids;
+    }
+
+    const method_expr = try model.e(.{
+        .method_call = .{
+            .receiver = receiver_expr,
+            .receiver_mode = .value,
+            .method = method_id,
+            .args = args,
+        },
+    });
+
+    // Entity 0 is the method name and entity 1 is the receiver binding.
+    try model.bodies.append(model.a(), .{ .none = {} });
+    try model.bodies.append(model.a(), .{ .none = {} });
+    try model.bodies.append(model.a(), .{
+        .fn_ = .{
+            .params = &.{.{
+                .name = "value",
+                .ty = receiver_ty,
+                .span = span,
+            }},
+            .ret = return_ty,
+            .body = method_expr,
+        },
+    });
+
+    const bodies = ir.bodies.Bodies{
+        .exprs = try model.exprs.toOwnedSlice(model.a()),
+        .stmts = try model.stmts.toOwnedSlice(model.a()),
+        .pats = try model.pats.toOwnedSlice(model.a()),
+        .types = types_store,
+        .bodies = try model.bodies.toOwnedSlice(model.a()),
+    };
+    const root_id = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{function_id},
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "std_method_fixture",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const rust_ir = ir.RustIR{
+        .crate_name = "std_method_fixture",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    const pkg = try lower.lowerRustIR(alloc, &rust_ir, null);
+    const decl = pkg.files[0].decls[0];
+    if (decl != .fn_decl) return error.ExpectedFunctionDeclaration;
+    const body = decl.fn_decl.body orelse return error.ExpectedFunctionBody;
+    const expr = body.expr orelse return error.ExpectedBodyExpression;
+    return expr.*;
+}
+
+/// A resolved std method must either have a valid native AST mapping or carry
+/// a method-specific unsupported node. A plain receiver.method(...) call is
+/// never valid because it emits a field call for a method with no field.
+fn expectStdMethodLowering(method_name: []const u8, lowered: ast.Expr) !void {
+    switch (lowered) {
+        .unsupported => |reason| {
+            // `len` already has a valid direct field mapping and must keep it.
+            if (std.mem.eql(u8, method_name, "len")) {
+                try std.testing.expect(false);
+            }
+            try std.testing.expect(std.mem.indexOf(u8, reason, method_name) != null);
+        },
+        .field_access => |access| {
+            try std.testing.expectEqualStrings("len", method_name);
+            try std.testing.expectEqualStrings("len", access.field_name);
+            try std.testing.expect(access.target.* == .ident);
+        },
+        .builtin => |builtin| {
+            try std.testing.expectEqualStrings("count_ones", method_name);
+            try std.testing.expectEqualStrings("popCount", builtin.name);
+            try std.testing.expectEqual(@as(usize, 1), builtin.args.len);
+            try std.testing.expect(builtin.args[0] == .ident);
+        },
+        .bin_op => |bin| {
+            try std.testing.expectEqualStrings("is_some", method_name);
+            try std.testing.expectEqual(ast.BinOpKind.not_equal, bin.op);
+            try std.testing.expect(bin.lhs.* == .ident);
+            try std.testing.expect(bin.rhs.* == .lit);
+            try std.testing.expect(bin.rhs.*.lit == .null_lit);
+        },
+        .call => |call| {
+            // This is the invalid fallback produced by an unmapped std method.
+            try std.testing.expect(call.callee.* == .field_access);
+            try std.testing.expectEqualStrings(
+                method_name,
+                call.callee.*.field_access.field_name,
+            );
+            try std.testing.expect(false);
+        },
+        else => {
+            try std.testing.expect(false);
+        },
+    }
+}
+
+test "lower: resolver-recognized numeric and slice std methods avoid field-call fallbacks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const count_ones = try lowerStdMethodFixture(
+        alloc,
+        "count_ones",
+        .{ .prim = .u32 },
+        .{ .prim = .u32 },
+        null,
+    );
+    try expectStdMethodLowering("count_ones", count_ones);
+
+    const saturating_mul = try lowerStdMethodFixture(
+        alloc,
+        "saturating_mul",
+        .{ .prim = .u32 },
+        .{ .prim = .u32 },
+        2,
+    );
+    try expectStdMethodLowering("saturating_mul", saturating_mul);
+
+    const elem = try alloc.create(ir.types.Type);
+    elem.* = .{ .prim = .u8 };
+    const slice_info = try alloc.create(ir.types.Slice);
+    slice_info.* = .{ .const_ = true, .elem = elem.* };
+    const slice_ty: ir.types.Type = .{ .slice = slice_info };
+
+    const iter = try lowerStdMethodFixture(
+        alloc,
+        "iter",
+        slice_ty,
+        .{ .unsupported = .{
+            .reason = .iterators,
+            .message = "slice iter",
+            .span = span,
+        } },
+        null,
+    );
+    try expectStdMethodLowering("iter", iter);
+
+    const len = try lowerStdMethodFixture(
+        alloc,
+        "len",
+        slice_ty,
+        .{ .prim = .usize },
+        null,
+    );
+    try expectStdMethodLowering("len", len);
+}
+
+test "lower: resolver-recognized Option is_some avoids field-call fallbacks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const option_elem = try alloc.create(ir.types.Type);
+    option_elem.* = .{ .prim = .u8 };
+    const option_ty: ir.types.Type = .{ .option = option_elem };
+
+    const is_some = try lowerStdMethodFixture(
+        alloc,
+        "is_some",
+        option_ty,
+        .{ .prim = .bool },
+        null,
+    );
+    try expectStdMethodLowering("is_some", is_some);
+}
+
 test "lower: generic methods resolve Self and associated type qualifiers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

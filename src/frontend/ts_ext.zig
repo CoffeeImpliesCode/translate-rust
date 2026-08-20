@@ -497,6 +497,18 @@ fn appendType(e: *Ext, t: types.Type) !exprs.TypeId {
     return id;
 }
 
+fn isSliceTypeNode(node: ts.Node) bool {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "slice_type")) return true;
+    if (!std.mem.eql(u8, kind, "array_type")) return false;
+
+    var i: u32 = 0;
+    while (node.child(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), ";")) return false;
+    }
+    return true;
+}
+
 // ── type lowering ───────────────────────────────────────────────────────────
 
 /// Lower a tree-sitter type node to a wire `types.Type`. Handles primitives,
@@ -531,13 +543,15 @@ fn mapCstType(e: *const Ext, node: ts.Node) types.Type {
             }
         }
         if (inner) |inn| {
-            const in_kind = inn.kind();
-            if (std.mem.eql(u8, in_kind, "slice_type") or std.mem.eql(u8, in_kind, "array_type")) {
-                return mapCstType(e, inn);
+            if (isSliceTypeNode(inn)) {
+                var elem: types.Type = .{ .prim = .unit };
+                if (inn.namedChildCount() > 0) elem = mapCstType(e, inn.namedChild(0).?);
+                return cstSlice(e, elem, !mut);
             }
-            if (std.mem.eql(u8, in_kind, "primitive_type") and std.mem.eql(u8, text(e, inn), "str")) {
-                return cstSlice(e, .{ .prim = .u8 }, true);
+            if (std.mem.eql(u8, inn.kind(), "primitive_type") and std.mem.eql(u8, text(e, inn), "str")) {
+                return cstSlice(e, .{ .prim = .u8 }, !mut);
             }
+            if (std.mem.eql(u8, inn.kind(), "array_type")) return mapCstType(e, inn);
             const r = e.ctx.alloc.create(types.Ref) catch return unsupportedCstType();
             r.* = .{ .mut = mut, .pointee = mapCstType(e, inn) };
             return .{ .reference = r };
@@ -551,14 +565,13 @@ fn mapCstType(e: *const Ext, node: ts.Node) types.Type {
     }
     if (std.mem.eql(u8, kind, "array_type")) {
         var elem: types.Type = .{ .prim = .unit };
+        if (node.namedChild(0)) |elem_node| elem = mapCstType(e, elem_node);
+        if (isSliceTypeNode(node)) return cstSlice(e, elem, true);
+
         var len_lit: u32 = 0;
-        var i: u32 = 0;
-        while (node.namedChild(i)) |c| : (i += 1) {
-            const k = c.kind();
-            if (std.mem.eql(u8, k, "integer_literal")) {
-                len_lit = std.fmt.parseInt(u32, text(e, c), 10) catch 0;
-            } else {
-                elem = mapCstType(e, c);
+        if (node.namedChild(1)) |len_node| {
+            if (std.mem.eql(u8, len_node.kind(), "integer_literal")) {
+                len_lit = std.fmt.parseInt(u32, text(e, len_node), 10) catch 0;
             }
         }
         const a = e.ctx.alloc.create(types.Array) catch return unsupportedCstType();
@@ -2006,8 +2019,72 @@ fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     } });
 }
 
+fn lowerGenericCallArgs(e: *Ext, node: ts.Node) anyerror![]const types.Type {
+    var args: std.ArrayListUnmanaged(types.Type) = .empty;
+    var type_args_node: ?ts.Node = node.childByFieldName("type_arguments");
+    if (type_args_node == null) {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            if (std.mem.eql(u8, child.kind(), "type_arguments")) {
+                type_args_node = child;
+                break;
+            }
+        }
+    }
+    if (type_args_node) |type_args| {
+        var i: u32 = 0;
+        while (type_args.namedChild(i)) |arg| : (i += 1) {
+            try args.append(e.ctx.alloc, mapCstType(e, arg));
+        }
+    }
+    return args.toOwnedSlice(e.ctx.alloc);
+}
+
+fn appendGenericCall(
+    e: *Ext,
+    call_kind: exprs.CallKind,
+    args: []const exprs.NodeId,
+    generic_args: []const types.Type,
+) anyerror!exprs.NodeId {
+    const id = try appendExpr(e, .{ .call = .{
+        .call_kind = call_kind,
+        .args = args,
+    } });
+    if (generic_args.len > 0) {
+        const owned_args = try e.ctx.alloc.dupe(types.Type, generic_args);
+        errdefer e.ctx.alloc.free(owned_args);
+        const type_id = try appendType(e, .{ .generic_inst = .{
+            .decl = switch (call_kind) {
+                .free => |def| def,
+                .associated => |def| def,
+                .constructor => |def| def,
+            },
+            .args = .{ .params = owned_args },
+        } });
+        e.ctx.exprs.items[id].ty = type_id;
+    }
+    return id;
+}
+
 fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const callee = node.namedChild(0) orelse return appendExpr(e, .{ .unit = {} });
+    var callee_base = callee;
+    var generic_args: []const types.Type = &.{};
+    if (std.mem.eql(u8, callee.kind(), "generic_function")) {
+        if (callee.childByFieldName("function")) |function_node| {
+            callee_base = function_node;
+        } else {
+            var child_index: u32 = 0;
+            while (callee.namedChild(child_index)) |child| : (child_index += 1) {
+                if (std.mem.eql(u8, child.kind(), "type_arguments")) continue;
+                callee_base = child;
+                break;
+            }
+        }
+        generic_args = try lowerGenericCallArgs(e, callee);
+    }
+    defer if (generic_args.len > 0) e.ctx.alloc.free(generic_args);
+
     var args_node: ?ts.Node = null;
     var i: u32 = 0;
     while (node.namedChild(i)) |c| : (i += 1) {
@@ -2015,16 +2092,29 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
 
     // method call: recv.method(args)
-    if (std.mem.eql(u8, callee.kind(), "field_expression")) {
-        const recv = callee.namedChild(0) orelse return appendExpr(e, .{ .unit = {} });
-        const method = callee.namedChild(1) orelse return appendExpr(e, .{ .unit = {} });
+    if (std.mem.eql(u8, callee_base.kind(), "field_expression")) {
+        const recv = callee_base.namedChild(0) orelse return appendExpr(e, .{ .unit = {} });
+        const method = callee_base.namedChild(1) orelse return appendExpr(e, .{ .unit = {} });
         const mname = text(e, method);
         // Rust `x.wrapping_mul(y)` → Zig `x *% y` (wrapping binary).
-        if (std.mem.eql(u8, mname, "wrapping_mul") or std.mem.eql(u8, mname, "wrapping_add") or std.mem.eql(u8, mname, "wrapping_sub")) {
+        if (std.mem.eql(u8, mname, "wrapping_mul") or
+            std.mem.eql(u8, mname, "wrapping_add") or
+            std.mem.eql(u8, mname, "wrapping_sub"))
+        {
             const lhs = try lowerExpr(e, recv);
             const rhs = try lowerExpr(e, firstArg(e, args_node) orelse return unsupported(e, "wrapping arg"));
-            const op: exprs.BinaryOp = if (std.mem.eql(u8, mname, "wrapping_mul")) .mul else if (std.mem.eql(u8, mname, "wrapping_add")) .add else .sub;
-            return appendExpr(e, .{ .binary = .{ .op = op, .overflow = .wrapping, .lhs = lhs, .rhs = rhs } });
+            const op: exprs.BinaryOp = if (std.mem.eql(u8, mname, "wrapping_mul"))
+                .mul
+            else if (std.mem.eql(u8, mname, "wrapping_add"))
+                .add
+            else
+                .sub;
+            return appendExpr(e, .{ .binary = .{
+                .op = op,
+                .overflow = .wrapping,
+                .lhs = lhs,
+                .rhs = rhs,
+            } });
         }
         const method_def = try pushLocal(e, mname);
         const args = try lowerArgs(e, args_node);
@@ -2047,16 +2137,16 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
     const args = try arg_list.toOwnedSlice(e.ctx.alloc);
 
-    if (std.mem.eql(u8, callee.kind(), "scoped_identifier")) {
+    if (std.mem.eql(u8, callee_base.kind(), "scoped_identifier")) {
         // Struct::method(...) / Enum::Variant(...) / Self::method(...) /
         // Type::constructor(...). Split the scoped path at "::".
-        const t = text(e, callee);
+        const t = text(e, callee_base);
         // Resolve the complete path before interpreting the first segment as
         // a type name. A path-qualified function is free, but a type-qualified
         // function must continue through the associated lookup below. This
         // distinction matters when a resolver can see a method through an
         // alias or re-export.
-        if (resolveScopedPath(e, callee)) |path_def| {
+        if (resolveScopedPath(e, callee_base)) |path_def| {
             if (e.ctx.g.symbol_table.get(path_def)) |path_ent| {
                 if (path_ent.kind == .fn_) {
                     const sep = std.mem.indexOf(u8, t, "::");
@@ -2077,10 +2167,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                         }
                     }
                     if (!is_type_qualified) {
-                        return appendExpr(e, .{ .call = .{
-                            .call_kind = .{ .free = path_def },
-                            .args = args,
-                        } });
+                        return appendGenericCall(e, .{ .free = path_def }, args, generic_args);
                     }
                 }
             }
@@ -2121,10 +2208,12 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                         type_ent.kind == .enum_)
                     {
                         if (resolveTypeMethod(e, type_id, leaf)) |method_id| {
-                            return appendExpr(e, .{ .call = .{
-                                .call_kind = .{ .associated = method_id },
-                                .args = args,
-                            } });
+                            return appendGenericCall(
+                                e,
+                                .{ .associated = method_id },
+                                args,
+                                generic_args,
+                            );
                         }
                     }
                 }
@@ -2136,17 +2225,17 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return unsupported(e, "unresolved call");
     }
 
-    if (std.mem.eql(u8, callee.kind(), "identifier")) {
-        const name = text(e, callee);
+    if (std.mem.eql(u8, callee_base.kind(), "identifier")) {
+        const name = text(e, callee_base);
         if (resolveName(e, name)) |def| {
             // An identifier resolving to a type used directly as a
             // constructor: `Fletcher(...)` → constructor call on the type.
             if (e.ctx.g.symbol_table.get(def)) |ent| {
                 if (ent.kind == .struct_ or ent.kind == .enum_ or ent.kind == .union_) {
-                    return appendExpr(e, .{ .call = .{ .call_kind = .{ .constructor = def }, .args = args } });
+                    return appendGenericCall(e, .{ .constructor = def }, args, generic_args);
                 }
             }
-            return appendExpr(e, .{ .call = .{ .call_kind = .{ .free = def }, .args = args } });
+            return appendGenericCall(e, .{ .free = def }, args, generic_args);
         }
         std.debug.print("unresolved call text={s}\n", .{text(e, node)});
         return unsupported(e, "unresolved call");

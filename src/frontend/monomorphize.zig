@@ -272,13 +272,14 @@ pub fn mangleSuffix(alloc: std.mem.Allocator, args: types.GenericArgs) ![]const 
 
 // ── §3 Instantiation table ──────────────────────────────────────────────────
 
-/// Deduplicated list of instantiation records. Owns its buffer + each mangled
-/// suffix slice; `deinit` frees them all.
+/// Deduplicated list of instantiation records. Owns its buffer, each concrete
+/// argument slice, and each mangled suffix slice; `deinit` frees them all.
 pub const InstantiationTable = struct {
     instantiations: std.ArrayListUnmanaged(types.Instantiation) = .empty,
 
     pub fn deinit(self: *InstantiationTable, alloc: std.mem.Allocator) void {
         for (self.instantiations.items) |inst| {
+            if (inst.args.params.len > 0) alloc.free(inst.args.params);
             if (inst.zig_suffix.len > 0) alloc.free(inst.zig_suffix);
         }
         self.instantiations.deinit(alloc);
@@ -305,14 +306,30 @@ pub const InstantiationTable = struct {
         for (self.instantiations.items, 0..) |inst, i| {
             if (inst.generic_id == generic_id and genericArgsEquals(inst.args, args)) return i;
         }
+        const owned_args = try alloc.dupe(types.Type, args.params);
+        errdefer if (owned_args.len > 0) alloc.free(owned_args);
         const suffix = try mangleSuffix(alloc, args);
         errdefer if (suffix.len > 0) alloc.free(suffix);
         try self.instantiations.append(alloc, .{
             .generic_id = generic_id,
-            .args = args,
+            .args = .{ .params = owned_args },
             .zig_suffix = suffix,
         });
         return self.instantiations.items.len - 1;
+    }
+
+    /// Copy every inference record into the owned table before the inference
+    /// result is released. The source map is keyed by expression node, while
+    /// the public table is deduplicated by declaration and concrete args.
+    pub fn mergeInferred(
+        self: *InstantiationTable,
+        alloc: std.mem.Allocator,
+        source: std.AutoHashMapUnmanaged(exprs.NodeId, types.Instantiation),
+    ) !void {
+        var it = source.iterator();
+        while (it.next()) |entry| {
+            _ = try self.addOrGet(alloc, entry.value_ptr.generic_id, entry.value_ptr.args);
+        }
     }
 };
 

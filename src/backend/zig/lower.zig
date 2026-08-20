@@ -38,12 +38,6 @@ const Lowerer = struct {
     /// for nested arithmetic whose operands lack inferred type metadata.
     float_context: bool = false,
 
-    /// Records already consumed by generic call and literal lowering. The
-    /// frontend table is deduplicated by declaration and concrete arguments,
-    /// so this claim bitset preserves distinct call-site choices when calls do
-    /// not carry an inline `PathExpr` argument list.
-    instantiation_claimed: []bool = &.{},
-
     /// Map from target struct/enum EntityId to hoisted method declarations
     hoisted_by_id: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.ArrayListUnmanaged(ast.Decl)) = .empty,
 
@@ -86,15 +80,6 @@ const Lowerer = struct {
     }
 
     pub fn lowerPackage(self: *Lowerer) !ast.Package {
-        if (self.ir.instantiations.len > 0) {
-            self.instantiation_claimed = try self.alloc.alloc(bool, self.ir.instantiations.len);
-            @memset(self.instantiation_claimed, false);
-            defer {
-                self.alloc.free(self.instantiation_claimed);
-                self.instantiation_claimed = &.{};
-            }
-        }
-
         try self.collectHoistedMethods();
 
         var files_list: std.ArrayListUnmanaged(ast.File) = .empty;
@@ -1837,46 +1822,21 @@ const Lowerer = struct {
         for (slots, 0..) |slot, index| result[index] = slot.?;
         return result;
     }
+    /// Select concrete arguments for this expression only. A missing
+    /// preference is intentionally not resolved by declaration-wide order:
+    /// two call sites may instantiate the same generic with different types.
     fn claimInstantiation(
         self: *Lowerer,
         def: ir.spine.EntityId,
         preferred: ?[]const ir.types.Type,
     ) ?ir.types.GenericArgs {
-        if (self.ir.instantiations.len == 0) {
-            return if (preferred) |args| .{ .params = args } else null;
-        }
-
-        if (preferred) |args| {
-            for (self.ir.instantiations, 0..) |inst, index| {
-                if (self.instantiation_claimed.len == self.ir.instantiations.len and
-                    self.instantiation_claimed[index])
-                {
-                    continue;
-                }
-                if (inst.generic_id == def and typeSliceEquals(inst.args.params, args)) {
-                    if (self.instantiation_claimed.len == self.ir.instantiations.len) {
-                        self.instantiation_claimed[index] = true;
-                    }
-                    return inst.args;
-                }
-            }
-            return .{ .params = args };
-        }
-
-        for (self.ir.instantiations, 0..) |inst, index| {
-            if (self.instantiation_claimed.len == self.ir.instantiations.len and
-                self.instantiation_claimed[index])
-            {
-                continue;
-            }
-            if (inst.generic_id == def) {
-                if (self.instantiation_claimed.len == self.ir.instantiations.len) {
-                    self.instantiation_claimed[index] = true;
-                }
+        const args = preferred orelse return null;
+        for (self.ir.instantiations) |inst| {
+            if (inst.generic_id == def and typeSliceEquals(inst.args.params, args)) {
                 return inst.args;
             }
         }
-        return null;
+        return .{ .params = args };
     }
 
     fn lowerGenericArgs(
@@ -1917,6 +1877,49 @@ const Lowerer = struct {
         }
         return self.lowerGenericArgs(def, null);
     }
+    /// Lower a tuple-struct constructor as a typed struct literal. A
+    /// constructor's generic arguments belong to the type application
+    /// (`Foo(T)`), while its source arguments initialize tuple fields.
+    fn lowerTupleStructConstructor(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        generic_args: []const ast.Type,
+        args: []const ast.Expr,
+    ) !?ast.Expr {
+        if (def >= self.ir.bodies.bodies.len) return null;
+        const struct_body = switch (self.ir.bodies.bodies[def]) {
+            .struct_ => |body| body,
+            else => return null,
+        };
+        if (struct_body.layout != .tuple) return null;
+
+        const entity = self.ir.graph.symbol_table.get(def) orelse return null;
+        const name = try self.alloc.dupe(u8, entity.renamed_to orelse entity.name);
+        errdefer self.alloc.free(name);
+        const type_name: ast.Type = if (generic_args.len > 0)
+            ast.Type{ .generic = .{ .name = name, .params = generic_args } }
+        else
+            ast.Type{ .named = name };
+
+        var fields = try self.alloc.alloc(ast.StructInitField, args.len);
+        errdefer self.alloc.free(fields);
+        for (args, 0..) |arg, index| {
+            const field_name = try std.fmt.allocPrint(self.alloc, "{d}", .{index});
+            errdefer self.alloc.free(field_name);
+            fields[index] = .{
+                .name = field_name,
+                .expr = arg,
+            };
+        }
+
+        return ast.Expr{
+            .struct_init = .{
+                .type_name = type_name,
+                .fields = fields,
+            },
+        };
+    }
+
     pub fn lowerType(self: *Lowerer, ir_ty: ir.types.Type) anyerror!ast.Type {
         // Structural lowering is arena-backed and always safe to retain. The
         // pluggable strategy is consulted only for standard generic name
@@ -1945,24 +1948,20 @@ const Lowerer = struct {
             },
             .array => |a| blk: {
                 const elem_ty = try self.allocType(try self.lowerType(a.elem));
-                const len = switch (a.len) {
-                    .literal => |n| n,
-                    .generic => 0,
-                };
-                if (len == 0) {
-                    break :blk ast.Type{
+                switch (a.len) {
+                    .literal => |len| break :blk ast.Type{
+                        .array = .{
+                            .elem = elem_ty,
+                            .len = len,
+                        },
+                    },
+                    .generic => break :blk ast.Type{
                         .slice = .{
                             .elem = elem_ty,
                             .is_const = true,
                         },
-                    };
-                }
-                break :blk ast.Type{
-                    .array = .{
-                        .elem = elem_ty,
-                        .len = len,
                     },
-                };
+                }
             },
             .option => |opt| ast.Type{
                 .opt = try self.allocType(try self.lowerType(opt.*)),
@@ -2104,11 +2103,118 @@ const Lowerer = struct {
         }
         return receiver;
     }
+    const RecognizedStdMethod = enum {
+        option_is_some,
+        option_is_none,
+        option_unwrap,
+        option_unwrap_or,
+        option_map,
+        option_as_ref,
+        option_take,
 
-    /// Lower a prelude method call to native Zig. Returns the lowered
-    /// expression when `method_name` is a recognised std prelude trait method
-    /// (identity/slice coercion, clone, len, or an operator trait); returns
-    /// null to fall through to the default method-call emission.
+        result_is_ok,
+        result_is_err,
+        result_unwrap,
+        result_unwrap_or,
+        result_map,
+        result_map_err,
+        result_as_ref,
+
+        slice_len,
+        slice_is_empty,
+        slice_as_bytes,
+        slice_as_slice,
+        slice_iter,
+
+        num_wrapping_add,
+        num_wrapping_sub,
+        num_wrapping_mul,
+        num_saturating_add,
+        num_saturating_sub,
+        num_saturating_mul,
+        num_count_ones,
+        num_leading_zeros,
+        num_trailing_zeros,
+
+        default,
+        clone,
+    };
+
+    /// Classify a resolver-recognized standard method from the typed receiver.
+    /// Keeping this type-aware prevents an inherent method with the same name
+    /// from being mistaken for a prelude method.
+    fn lookupRecognizedStdMethod(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+        method_name: []const u8,
+    ) ?RecognizedStdMethod {
+        const receiver_ty = self.exprType(receiver_node) orelse return null;
+        var cur_t = receiver_ty;
+        while (true) {
+            switch (cur_t) {
+                .reference => |r| cur_t = r.pointee,
+                .raw_ptr => |ptr| cur_t = ptr.pointee,
+                .boxed => |boxed| cur_t = boxed.*,
+                else => break,
+            }
+        }
+
+        switch (cur_t) {
+            .option => {
+                if (std.mem.eql(u8, method_name, "is_some")) return .option_is_some;
+                if (std.mem.eql(u8, method_name, "is_none")) return .option_is_none;
+                if (std.mem.eql(u8, method_name, "unwrap")) return .option_unwrap;
+                if (std.mem.eql(u8, method_name, "unwrap_or")) return .option_unwrap_or;
+                if (std.mem.eql(u8, method_name, "map")) return .option_map;
+                if (std.mem.eql(u8, method_name, "as_ref")) return .option_as_ref;
+                if (std.mem.eql(u8, method_name, "take")) return .option_take;
+            },
+            .result => {
+                if (std.mem.eql(u8, method_name, "is_ok")) return .result_is_ok;
+                if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
+                if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
+                if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
+                if (std.mem.eql(u8, method_name, "map")) return .result_map;
+                if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
+                if (std.mem.eql(u8, method_name, "as_ref")) return .result_as_ref;
+            },
+            .slice, .array => {
+                if (std.mem.eql(u8, method_name, "len")) return .slice_len;
+                if (std.mem.eql(u8, method_name, "is_empty")) return .slice_is_empty;
+                if (std.mem.eql(u8, method_name, "as_bytes")) return .slice_as_bytes;
+                if (std.mem.eql(u8, method_name, "as_slice")) return .slice_as_slice;
+                if (std.mem.eql(u8, method_name, "iter")) return .slice_iter;
+            },
+            .prim => |prim| switch (prim) {
+                .u8, .u16, .u32, .u64, .u128, .usize, .i8, .i16, .i32, .i64, .i128, .isize => {
+                    if (std.mem.eql(u8, method_name, "wrapping_add")) return .num_wrapping_add;
+                    if (std.mem.eql(u8, method_name, "wrapping_sub")) return .num_wrapping_sub;
+                    if (std.mem.eql(u8, method_name, "wrapping_mul")) return .num_wrapping_mul;
+                    if (std.mem.eql(u8, method_name, "saturating_add")) return .num_saturating_add;
+                    if (std.mem.eql(u8, method_name, "saturating_sub")) return .num_saturating_sub;
+                    if (std.mem.eql(u8, method_name, "saturating_mul")) return .num_saturating_mul;
+                    if (std.mem.eql(u8, method_name, "count_ones")) return .num_count_ones;
+                    if (std.mem.eql(u8, method_name, "leading_zeros")) return .num_leading_zeros;
+                    if (std.mem.eql(u8, method_name, "trailing_zeros")) return .num_trailing_zeros;
+                },
+                else => {},
+            },
+            else => {},
+        }
+
+        if (std.mem.eql(u8, method_name, "default")) return .default;
+        if (std.mem.eql(u8, method_name, "clone")) return .clone;
+        return null;
+    }
+
+    fn lowerUnsupportedStdMethod(self: *Lowerer, method_name: []const u8) !*const ast.Expr {
+        const reason = try std.fmt.allocPrint(self.alloc, "unsupported std method: {s}", .{method_name});
+        return try self.allocExpr(.{ .unsupported = reason });
+    }
+
+    /// Lower a prelude method call to native Zig or an explicit unsupported
+    /// node. Returns null only for an ordinary method that the resolver did
+    /// not classify as a standard-library method.
     fn lowerStdMethodCall(
         self: *Lowerer,
         method_name: []const u8,
@@ -2116,6 +2222,7 @@ const Lowerer = struct {
         receiver: *const ast.Expr,
         args: []const ast.Expr,
     ) anyerror!?*const ast.Expr {
+        const recognized_std_method = self.lookupRecognizedStdMethod(receiver_node, method_name);
         if (std.mem.eql(u8, method_name, "as_ref") or
             std.mem.eql(u8, method_name, "as_bytes") or
             std.mem.eql(u8, method_name, "borrow") or
@@ -2149,6 +2256,30 @@ const Lowerer = struct {
             return try self.allocExpr(ast.Expr{
                 .bin_op = .{ .op = .equal, .lhs = len, .rhs = zero },
             });
+        }
+        if (recognized_std_method) |std_method| {
+            switch (std_method) {
+                .option_is_some => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    const null_value = try self.allocExpr(ast.Expr{ .lit = .null_lit });
+                    return try self.allocExpr(ast.Expr{
+                        .bin_op = .{
+                            .op = .not_equal,
+                            .lhs = receiver,
+                            .rhs = null_value,
+                        },
+                    });
+                },
+                .num_count_ones => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    var builtin_args = try self.alloc.alloc(ast.Expr, 1);
+                    builtin_args[0] = receiver.*;
+                    return try self.allocExpr(ast.Expr{
+                        .builtin = .{ .name = "popCount", .args = builtin_args },
+                    });
+                },
+                else => {},
+            }
         }
         const bin_kind: ?ast.BinOpKind = if (std.mem.eql(u8, method_name, "bitxor"))
             .bit_xor
@@ -2199,6 +2330,9 @@ const Lowerer = struct {
             return try self.allocExpr(ast.Expr{
                 .unary_op = .{ .op = .bit_not, .operand = receiver },
             });
+        }
+        if (recognized_std_method != null) {
+            return try self.lowerUnsupportedStdMethod(method_name);
         }
         return null;
     }
@@ -2509,6 +2643,11 @@ const Lowerer = struct {
                     args[i] = try self.lowerExpr(arg_id);
                 }
                 const generic_args = try self.lowerCallGenericArgs(expr_id, callee_def, c.args);
+                if (c.call_kind == .constructor) {
+                    if (try self.lowerTupleStructConstructor(callee_def, generic_args, args)) |lowered| {
+                        break :blk lowered;
+                    }
+                }
 
                 break :blk ast.Expr{
                     .call = .{

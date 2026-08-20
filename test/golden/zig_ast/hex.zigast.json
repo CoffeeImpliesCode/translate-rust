@@ -282,16 +282,19 @@
             },
             "body": {
               "label": null,
-              "stmts": [
-                {
-                  "kind": "expr_stmt",
-                  "expr": {
-                    "kind": "unsupported",
-                    "reason": "method receiver unavailable"
-                  }
-                }
-              ],
-              "expr": null
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "field_access",
+                  "target": {
+                    "kind": "ident",
+                    "name": "data"
+                  },
+                  "field_name": "encode_hex"
+                },
+                "args": []
+              }
             },
             "generic_params": []
           }
@@ -326,16 +329,19 @@
             },
             "body": {
               "label": null,
-              "stmts": [
-                {
-                  "kind": "expr_stmt",
-                  "expr": {
-                    "kind": "unsupported",
-                    "reason": "method receiver unavailable"
-                  }
-                }
-              ],
-              "expr": null
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "field_access",
+                  "target": {
+                    "kind": "ident",
+                    "name": "data"
+                  },
+                  "field_name": "encode_hex_upper"
+                },
+                "args": []
+              }
             },
             "generic_params": []
           }
@@ -419,7 +425,7 @@
                     "kind": "prim",
                     "value": "u8"
                   },
-                  "is_const": true
+                  "is_const": false
                 },
                 "is_comptime": false
               }
@@ -441,7 +447,7 @@
                   "ty": null,
                   "init": {
                     "kind": "unsupported",
-                    "reason": "method receiver unavailable"
+                    "reason": "method dispatch unavailable"
                   },
                   "is_mut": false
                 },
@@ -755,7 +761,7 @@
                     "kind": "prim",
                     "value": "u8"
                   },
-                  "is_const": true
+                  "is_const": false
                 },
                 "is_comptime": false
               }

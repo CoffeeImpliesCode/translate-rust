@@ -328,7 +328,13 @@ const Ctx = struct {
     cg: ?*const graph.CrateGraph = null,
     bool_ty: ?exprs.TypeId = null,
     def_map: std.AutoHashMapUnmanaged(exprs.DefId, exprs.NodeId) = .empty,
-
+    /// Concrete signature types for local parameters, keyed by their resolved
+    /// field entity. This keeps a path argument's type available before the
+    /// unification result has been applied to the expression table.
+    local_types: std.AutoHashMapUnmanaged(exprs.DefId, types.Type) = .empty,
+    current_fn: ?exprs.DefId = null,
+    local_defs: []exprs.DefId = &.{},
+    local_claimed: []bool = &.{},
     fn boolId(self: *Ctx) ?exprs.TypeId {
         if (self.bool_ty) |t| return t;
         const t = primTypeId(self.b, .bool) orelse return null;
@@ -336,7 +342,67 @@ const Ctx = struct {
         return t;
     }
 
+    fn clearLocals(self: *Ctx) void {
+        if (self.local_defs.len > 0) self.alloc.free(self.local_defs);
+        if (self.local_claimed.len > 0) self.alloc.free(self.local_claimed);
+        self.local_defs = &.{};
+        self.local_claimed = &.{};
+        self.local_types.clearRetainingCapacity();
+        self.current_fn = null;
+    }
+
+    fn prepareLocals(
+        self: *Ctx,
+        fn_id: exprs.DefId,
+        params: []const items.Param,
+    ) std.mem.Allocator.Error!void {
+        self.clearLocals();
+        self.current_fn = fn_id;
+        const cg = self.cg orelse return;
+
+        var count: usize = 0;
+        for (cg.symbol_table.entities.items) |entity| {
+            if (entity.kind == .field and entity.parent == fn_id) count += 1;
+        }
+        if (count == 0) return;
+
+        self.local_defs = try self.alloc.alloc(exprs.DefId, count);
+        errdefer {
+            self.alloc.free(self.local_defs);
+            self.local_defs = &.{};
+        }
+        self.local_claimed = try self.alloc.alloc(bool, count);
+        for (self.local_claimed) |*claimed| claimed.* = false;
+
+        var index: usize = 0;
+        for (cg.symbol_table.entities.items) |entity| {
+            if (entity.kind == .field and entity.parent == fn_id) {
+                self.local_defs[index] = entity.id;
+                index += 1;
+            }
+        }
+        for (params) |param| {
+            if (self.claimLocal(param.name)) |def| {
+                try self.local_types.put(self.alloc, def, param.ty);
+            }
+        }
+    }
+
+    fn claimLocal(self: *Ctx, name: []const u8) ?exprs.DefId {
+        const cg = self.cg orelse return null;
+        for (self.local_defs, 0..) |def, index| {
+            if (self.local_claimed[index]) continue;
+            const entity = cg.symbol_table.get(def) orelse continue;
+            if (!std.mem.eql(u8, entity.name, name)) continue;
+            self.local_claimed[index] = true;
+            return def;
+        }
+        return null;
+    }
+
     fn deinit(self: *Ctx) void {
+        self.clearLocals();
+        self.local_types.deinit(self.alloc);
         self.def_map.deinit(self.alloc);
         self.* = undefined;
     }
@@ -624,8 +690,58 @@ fn walkMatch(ctx: *Ctx, node: exprs.NodeId, m: exprs.MatchExpr, fn_body: exprs.N
     std.debug.assert(m.scrutinee < ctx.b.exprs.len);
     try walkExpr(ctx, m.scrutinee, fn_body);
     for (m.arms) |arm| {
+        for (arm.patterns) |pattern| try bindPattern(ctx, pattern, null);
+        if (arm.guard) |guard| try walkExpr(ctx, guard, fn_body);
         try addEq(ctx, node, arm.body);
         try walkExpr(ctx, arm.body, fn_body);
+    }
+}
+
+/// Claim local entities in a pattern in lowering order. `let` bindings map
+/// their resolved EntityId to the initializer; other patterns only reserve the
+/// entity so later shadowed bindings keep their distinct ids.
+fn bindPattern(
+    ctx: *Ctx,
+    pattern_id: exprs.NodeId,
+    init: ?exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    if (pattern_id >= ctx.b.pats.len) return;
+    switch (ctx.b.pats[pattern_id].kind) {
+        .binding => |binding| {
+            const def_id = ctx.claimLocal(binding.name) orelse blk: {
+                if (ctx.cg == null) break :blk @as(?exprs.DefId, @intCast(pattern_id));
+                break :blk null;
+            };
+            if (init) |init_node| {
+                if (def_id) |def| try ctx.def_map.put(ctx.alloc, def, init_node);
+            }
+        },
+        .tuple => |tuple| {
+            for (tuple.elements) |element| try bindPattern(ctx, element, init);
+        },
+        .slice => |slice| {
+            for (slice.elements) |element| try bindPattern(ctx, element, init);
+            if (slice.rest) |rest| try bindPattern(ctx, rest, init);
+        },
+        .struct_pat => |struct_pat| {
+            for (struct_pat.fields) |field| {
+                if (field.pat) |field_pattern| {
+                    try bindPattern(ctx, field_pattern, init);
+                } else if (field.shorthand) {
+                    const def_id = ctx.claimLocal(field.field);
+                    if (init) |init_node| {
+                        if (def_id) |def| try ctx.def_map.put(ctx.alloc, def, init_node);
+                    }
+                }
+            }
+        },
+        .reference => |reference| try bindPattern(ctx, reference.inner, init),
+        .@"or" => |or_pattern| {
+            for (or_pattern.alternatives) |alternative| {
+                try bindPattern(ctx, alternative, init);
+            }
+        },
+        .wildcard, .literal, .path, .range => {},
     }
 }
 
@@ -638,19 +754,14 @@ fn walkStmt(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             if (ls.init) |init| {
                 if (ls.ty) |ty| try addPin(ctx, init, ty);
                 try walkExpr(ctx, init, fn_body);
-                // Link init with def_id if pattern is a binding.
-                if (ls.pattern < ctx.b.pats.len) {
-                    const pat = &ctx.b.pats[ls.pattern];
-                    if (pat.kind == .binding) {
-                        // The binding def_id can be tracked via the pattern id.
-                        const def_key: exprs.DefId = @intCast(ls.pattern);
-                        try ctx.def_map.put(ctx.alloc, def_key, init);
-                    }
-                }
+                try bindPattern(ctx, ls.pattern, init);
+            } else {
+                try bindPattern(ctx, ls.pattern, null);
             }
         },
         .let_else => |le| {
             try walkExpr(ctx, le.init, fn_body);
+            try bindPattern(ctx, le.pattern, le.init);
             try walkBlock(ctx, le.else_block, fn_body, null);
         },
         .expr => |n| try walkExpr(ctx, n, fn_body),
@@ -807,10 +918,26 @@ fn getGenericParamNames(
 fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
     if (node >= ctx.b.exprs.len) return null;
     const e = ctx.b.exprs[node];
-    if (e.ty) |tid| {
-        if (tid < ctx.b.types.len) return ctx.b.types[tid];
-    }
     switch (e.kind) {
+        .path => |p| {
+            if (ctx.local_types.get(p.def)) |local_ty| return local_ty;
+            if (p.generic_args.len > 0) {
+                return .{ .generic_inst = .{
+                    .decl = p.def,
+                    .args = .{ .params = p.generic_args },
+                } };
+            }
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
+            }
+            if (ctx.def_map.get(p.def)) |first| {
+                if (first < ctx.b.exprs.len) {
+                    if (ctx.b.exprs[first].ty) |tid| {
+                        if (tid < ctx.b.types.len) return ctx.b.types[tid];
+                    }
+                }
+            }
+        },
         .literal => |lit| switch (lit) {
             .int => |il| {
                 if (il.ty_suffix) |s| {
@@ -829,22 +956,11 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                 },
             },
         },
-        .path => |p| {
-            if (p.generic_args.len > 0) {
-                return .{ .generic_inst = .{
-                    .decl = p.def,
-                    .args = .{ .params = p.generic_args },
-                } };
-            }
-            if (ctx.def_map.get(p.def)) |first| {
-                if (first < ctx.b.exprs.len) {
-                    if (ctx.b.exprs[first].ty) |tid| {
-                        if (tid < ctx.b.types.len) return ctx.b.types[tid];
-                    }
-                }
+        else => {
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
             }
         },
-        else => {},
     }
     return null;
 }
@@ -858,6 +974,26 @@ fn explicitArgsForNode(ctx: *Ctx, node: exprs.NodeId) ?types.GenericArgs {
     if (type_id >= ctx.b.types.len) return null;
     return switch (ctx.b.types[type_id]) {
         .generic_inst => |generic_inst| generic_inst.args,
+        else => null,
+    };
+}
+/// Recover the expected generic result for a tail call. This is deliberately
+/// limited to the enclosing block tail: using a function's return type for an
+/// arbitrary nested call would bind unrelated call sites to the same record.
+fn expectedGenericTypeForTail(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    fn_body: exprs.NodeId,
+    def: exprs.DefId,
+) ?types.Type {
+    if (fn_body >= ctx.b.exprs.len) return null;
+    const body_expr = ctx.b.exprs[fn_body];
+    if (body_expr.kind != .block) return null;
+    if (body_expr.kind.block.tail != node) return null;
+    const type_id = findFnRetTypeId(ctx.b, fn_body) orelse return null;
+    if (type_id >= ctx.b.types.len) return null;
+    return switch (ctx.b.types[type_id]) {
+        .generic_inst => |inst| if (inst.decl == def) ctx.b.types[type_id] else null,
         else => null,
     };
 }
@@ -890,14 +1026,29 @@ fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeI
         .associated => |d| d,
         .constructor => |d| d,
     };
+    const expected_type = expectedGenericTypeForTail(ctx, node, fn_body, def);
+    const explicit: ?types.GenericArgs = if (explicitArgsForNode(ctx, node)) |args|
+        args
+    else if (expected_type) |expected|
+        switch (expected) {
+            .generic_inst => |inst| inst.args,
+            else => null,
+        }
+    else
+        null;
     try instantiateGenericDef(
         ctx,
         node,
         def,
-        explicitArgsForNode(ctx, node),
+        explicit,
         c.args,
         &.{},
     );
+    if (expected_type) |expected| {
+        if (findTypeIndex(ctx.b, expected)) |type_id| {
+            try addPin(ctx, node, type_id);
+        }
+    }
 }
 
 /// Walk a struct literal: recurse into field values and, when the struct is
@@ -928,8 +1079,6 @@ fn instantiateGenericDef(
     if (def >= ctx.b.bodies.len) return;
     const caller_names = getGenericParamNames(ctx, def) catch return;
     defer ctx.alloc.free(caller_names);
-    if (caller_names.len == 0) return;
-    const param_names = caller_names;
 
     var ret_ty: ?types.Type = null;
     switch (ctx.b.bodies[def]) {
@@ -937,6 +1086,19 @@ fn instantiateGenericDef(
         .struct_ => {},
         else => return,
     }
+
+    // Non-generic functions still carry useful concrete nominal return types.
+    // Preserve those types on call nodes so a following local binding can
+    // propagate the constructor result through its resolved EntityId.
+    if (caller_names.len == 0) {
+        if (ret_ty) |return_ty| {
+            if (findTypeIndex(ctx.b, return_ty)) |return_type_id| {
+                try addPin(ctx, node, return_type_id);
+            }
+        }
+        return;
+    }
+    const param_names = caller_names;
 
     const inferred_args = ctx.alloc.alloc(?types.Type, param_names.len) catch return;
     defer ctx.alloc.free(inferred_args);
@@ -1251,6 +1413,11 @@ fn walkPath(ctx: *Ctx, node: exprs.NodeId, p: exprs.PathExpr) std.mem.Allocator.
     } else {
         try ctx.def_map.put(ctx.alloc, p.def, node);
     }
+    if (ctx.local_types.get(p.def)) |local_ty| {
+        if (findTypeIndex(ctx.b, local_ty)) |type_id| {
+            try addPin(ctx, node, type_id);
+        }
+    }
 }
 
 /// Recursively walk an expression node in the graph.
@@ -1259,6 +1426,7 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
     const e = &ctx.b.exprs[node];
     switch (e.kind) {
         .literal => |lit| try walkLiteral(ctx, node, lit),
+        .unit => {},
         .path => |p| {
             try walkPath(ctx, node, p);
             if (p.generic_args.len > 0 and
@@ -1272,10 +1440,10 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             }
         },
         .block => |blk| try walkBlock(ctx, blk, fn_body, node),
-        .unit => {},
         .if_else => |ie| try walkIf(ctx, node, ie, fn_body),
         .if_let => |il| {
             try walkExpr(ctx, il.scrutinee, fn_body);
+            try bindPattern(ctx, il.pattern, null);
             try walkBlock(ctx, il.then_, fn_body, null);
             switch (il.@"else") {
                 .none => {},
@@ -1286,11 +1454,13 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .match => |m| try walkMatch(ctx, node, m, fn_body),
         .loop_ => |l| try walkBlock(ctx, l.body, fn_body, null),
         .while_ => |w| {
+            if (w.capture) |capture| try bindPattern(ctx, capture, null);
             if (ctx.boolId()) |bid| try addPin(ctx, w.cond, bid);
             try walkExpr(ctx, w.cond, fn_body);
             try walkBlock(ctx, w.body, fn_body, null);
         },
         .for_ => |f| {
+            try bindPattern(ctx, f.pattern, null);
             try walkExpr(ctx, f.iterable, fn_body);
             try walkBlock(ctx, f.body, fn_body, null);
         },
@@ -1502,10 +1672,12 @@ pub fn genWithGraph(alloc: std.mem.Allocator, b: *const bodies.Bodies, cg: ?*con
     };
     defer ctx.deinit();
 
-    for (b.bodies) |bk| {
+    for (b.bodies, 0..) |bk, fn_index| {
         switch (bk) {
             .fn_ => |fb| {
+                const fn_id: exprs.DefId = @intCast(fn_index);
                 ctx.def_map.clearRetainingCapacity();
+                try ctx.prepareLocals(fn_id, fb.params);
                 if (fb.body < b.exprs.len) {
                     if (b.exprs[fb.body].kind == .block) {
                         try walkBlock(&ctx, b.exprs[fb.body].kind.block, fb.body, fb.body);

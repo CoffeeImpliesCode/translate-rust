@@ -111,3 +111,84 @@ test "golden: fnv" {
 test "golden: hex" {
     try runGoldenFixture("hex", "test/crates/hex");
 }
+
+test "source pipeline preserves generic instantiations through Zig emission" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub struct Foo<T>(pub T);
+        \\
+        \\pub fn make_u32(value: u32) -> Foo<u32> {
+        \\    Foo::<u32>(value)
+        \\}
+        \\
+        \\pub fn make_slice(value: &[u8]) -> Foo<&[u8]> {
+        \\    Foo(value)
+        \\}
+    ;
+
+    const rust_ir = try frontend.pipeline.analyzeSource(
+        allocator,
+        "generic_source",
+        "2021",
+        src,
+    );
+
+    var foo_id: ?ir.spine.EntityId = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind != .struct_ or !std.mem.eql(u8, entity.name, "Foo")) continue;
+        try std.testing.expect(foo_id == null);
+        foo_id = entity.id;
+    }
+    const expected_foo_id = foo_id orelse return error.FooEntityMissing;
+
+    try std.testing.expectEqual(@as(usize, 2), rust_ir.instantiations.len);
+    var saw_u32 = false;
+    var saw_u8_slice = false;
+    for (rust_ir.instantiations) |instantiation| {
+        try std.testing.expectEqual(expected_foo_id, instantiation.generic_id);
+        try std.testing.expectEqual(@as(usize, 1), instantiation.args.params.len);
+
+        switch (instantiation.args.params[0]) {
+            .prim => |prim| {
+                try std.testing.expectEqual(ir.types.Prim.u32, prim);
+                try std.testing.expectEqualStrings("_u32", instantiation.zig_suffix);
+                try std.testing.expect(!saw_u32);
+                saw_u32 = true;
+            },
+            .slice => |slice| {
+                try std.testing.expect(slice.const_);
+                switch (slice.elem) {
+                    .prim => |prim| try std.testing.expectEqual(ir.types.Prim.u8, prim),
+                    else => return error.UnexpectedFooSliceElement,
+                }
+                try std.testing.expectEqualStrings("_u8_slice", instantiation.zig_suffix);
+                try std.testing.expect(!saw_u8_slice);
+                saw_u8_slice = true;
+            },
+            else => return error.UnexpectedFooInstantiation,
+        }
+    }
+    try std.testing.expect(saw_u32);
+    try std.testing.expect(saw_u8_slice);
+
+    const pkg = try backend.zig.lower.lowerRustIR(allocator, &rust_ir, null);
+    var emitted_root: ?[]const u8 = null;
+    for (pkg.files) |*file| {
+        if (!std.mem.eql(u8, file.path, "src/root.zig")) continue;
+        emitted_root = try backend.zig.emit.emitFile(allocator, file);
+        break;
+    }
+    const emitted = emitted_root orelse return error.RootFileMissing;
+    defer allocator.free(emitted);
+
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(comptime T: type)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(u32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo([]const u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, ") Foo {") == null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(value)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(u32, value)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo([]const u8, value)") == null);
+}

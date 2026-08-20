@@ -52,17 +52,20 @@
                     "label": null,
                     "stmts": [],
                     "expr": {
-                      "kind": "call",
-                      "callee": {
-                        "kind": "ident",
+                      "kind": "struct_init",
+                      "type_name": {
+                        "kind": "named",
                         "name": "FnvHasher"
                       },
-                      "args": [
+                      "fields": [
                         {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "int",
-                            "value": "14695981039346656037"
+                          "name": "0",
+                          "expr": {
+                            "kind": "lit",
+                            "value": {
+                              "kind": "int",
+                              "value": "14695981039346656037"
+                            }
                           }
                         }
                       ]
@@ -95,15 +98,18 @@
                     "label": null,
                     "stmts": [],
                     "expr": {
-                      "kind": "call",
-                      "callee": {
-                        "kind": "ident",
+                      "kind": "struct_init",
+                      "type_name": {
+                        "kind": "named",
                         "name": "FnvHasher"
                       },
-                      "args": [
+                      "fields": [
                         {
-                          "kind": "ident",
-                          "name": "key"
+                          "name": "0",
+                          "expr": {
+                            "kind": "ident",
+                            "name": "key"
+                          }
                         }
                       ]
                     }
@@ -264,15 +270,18 @@
                           }
                         },
                         "val": {
-                          "kind": "call",
-                          "callee": {
-                            "kind": "ident",
+                          "kind": "struct_init",
+                          "type_name": {
+                            "kind": "named",
                             "name": "FnvHasher"
                           },
-                          "args": [
+                          "fields": [
                             {
-                              "kind": "ident",
-                              "name": "hash"
+                              "name": "0",
+                              "expr": {
+                                "kind": "ident",
+                                "name": "hash"
+                              }
                             }
                           ]
                         },

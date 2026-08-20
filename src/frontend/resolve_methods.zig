@@ -307,6 +307,228 @@ fn inherentImplTypeName(g: *const graph.CrateGraph, target: spine.EntityId) ?[]c
     return type_name;
 }
 
+const LocalInitializerFinder = struct {
+    b: *const bodies.Bodies,
+    target_name: []const u8,
+    target_ordinal: usize,
+    binding_ordinal: usize,
+    result: ?exprs.NodeId = null,
+
+    fn visitPattern(self: *LocalInitializerFinder, pattern_id: exprs.NodeId, init: ?exprs.NodeId) void {
+        if (self.result != null or pattern_id >= self.b.pats.len) return;
+        switch (self.b.pats[pattern_id].kind) {
+            .binding => |binding| {
+                if (std.mem.eql(u8, binding.name, self.target_name)) {
+                    if (self.binding_ordinal == self.target_ordinal) {
+                        self.result = init;
+                        return;
+                    }
+                    self.binding_ordinal += 1;
+                }
+            },
+            .tuple => |tuple| for (tuple.elements) |element| self.visitPattern(element, init),
+            .slice => |slice| {
+                for (slice.elements) |element| self.visitPattern(element, init);
+                if (slice.rest) |rest| self.visitPattern(rest, init);
+            },
+            .struct_pat => |struct_pat| for (struct_pat.fields) |field| {
+                if (field.pat) |field_pattern| {
+                    self.visitPattern(field_pattern, init);
+                } else if (field.shorthand) {
+                    if (std.mem.eql(u8, field.field, self.target_name)) {
+                        if (self.binding_ordinal == self.target_ordinal) {
+                            self.result = init;
+                            return;
+                        }
+                        self.binding_ordinal += 1;
+                    }
+                }
+            },
+            .reference => |reference| self.visitPattern(reference.inner, init),
+            .@"or" => |or_pattern| for (or_pattern.alternatives) |alternative| {
+                self.visitPattern(alternative, init);
+            },
+            .wildcard, .literal, .path, .range => {},
+        }
+    }
+
+    fn visitBlock(self: *LocalInitializerFinder, block: exprs.BlockExpr) void {
+        if (self.result != null) return;
+        for (block.statements) |statement| self.visitStmt(statement);
+        if (block.tail) |tail| self.visitExpr(tail);
+    }
+
+    fn visitStmt(self: *LocalInitializerFinder, statement_id: exprs.NodeId) void {
+        if (self.result != null or statement_id >= self.b.stmts.len) return;
+        switch (self.b.stmts[statement_id].kind) {
+            .let => |let_stmt| {
+                if (let_stmt.init) |init| self.visitExpr(init);
+                self.visitPattern(let_stmt.pattern, let_stmt.init);
+            },
+            .let_else => |let_else| {
+                self.visitExpr(let_else.init);
+                self.visitPattern(let_else.pattern, let_else.init);
+                self.visitBlock(let_else.else_block);
+            },
+            .expr => |expression| self.visitExpr(expression),
+            .item => {},
+        }
+    }
+
+    fn visitElse(self: *LocalInitializerFinder, branch: exprs.ElseBranch) void {
+        switch (branch) {
+            .none => {},
+            .block => |block| self.visitBlock(block),
+            .chain => |node| self.visitExpr(node),
+        }
+    }
+
+    fn visitExpr(self: *LocalInitializerFinder, node: exprs.NodeId) void {
+        if (self.result != null or node >= self.b.exprs.len) return;
+        switch (self.b.exprs[node].kind) {
+            .block => |block| self.visitBlock(block),
+            .if_else => |if_expr| {
+                self.visitExpr(if_expr.cond);
+                self.visitBlock(if_expr.then_);
+                self.visitElse(if_expr.@"else");
+            },
+            .if_let => |if_let| {
+                self.visitExpr(if_let.scrutinee);
+                self.visitPattern(if_let.pattern, null);
+                self.visitBlock(if_let.then_);
+                self.visitElse(if_let.@"else");
+            },
+            .match => |match_expr| {
+                self.visitExpr(match_expr.scrutinee);
+                for (match_expr.arms) |arm| {
+                    for (arm.patterns) |pattern| self.visitPattern(pattern, null);
+                    if (arm.guard) |guard| self.visitExpr(guard);
+                    self.visitExpr(arm.body);
+                }
+            },
+            .loop_ => |loop_expr| self.visitBlock(loop_expr.body),
+            .while_ => |while_expr| {
+                self.visitExpr(while_expr.cond);
+                if (while_expr.capture) |capture| self.visitPattern(capture, null);
+                self.visitBlock(while_expr.body);
+            },
+            .for_ => |for_expr| {
+                self.visitPattern(for_expr.pattern, null);
+                self.visitExpr(for_expr.iterable);
+                self.visitBlock(for_expr.body);
+            },
+            .break_ => |break_expr| if (break_expr.value) |value| self.visitExpr(value),
+            .call => |call| for (call.args) |arg| self.visitExpr(arg),
+            .method_call => |method| {
+                self.visitExpr(method.receiver);
+                for (method.args) |arg| self.visitExpr(arg);
+            },
+            .struct_lit => |literal| {
+                for (literal.fields) |field| self.visitExpr(field.value);
+                if (literal.base) |base| self.visitExpr(base);
+            },
+            .enum_variant => |variant| {
+                for (variant.tuple_fields) |field| self.visitExpr(field);
+                for (variant.named_fields) |field| self.visitExpr(field.value);
+            },
+            .field => |field| self.visitExpr(field.base),
+            .index => |index| {
+                self.visitExpr(index.base);
+                self.visitExpr(index.index);
+            },
+            .binary => |binary| {
+                self.visitExpr(binary.lhs);
+                self.visitExpr(binary.rhs);
+            },
+            .unary => |unary| self.visitExpr(unary.operand),
+            .assign => |assign| {
+                self.visitExpr(assign.target);
+                self.visitExpr(assign.value);
+            },
+            .try_ => |try_expr| self.visitExpr(try_expr.inner),
+            .return_ => |return_expr| if (return_expr.value) |value| self.visitExpr(value),
+            .array => |array| for (array.elements) |element| self.visitExpr(element),
+            .literal, .unit, .path, .continue_, .closure, .iterator_chain, .unsupported => {},
+        }
+    }
+};
+
+fn findLocalInitializer(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    path: exprs.PathExpr,
+) ?exprs.NodeId {
+    const entity = g.symbol_table.get(path.def) orelse return null;
+    const fn_id = entity.parent orelse return null;
+    if (fn_id >= b.bodies.len) return null;
+    const fn_body = switch (b.bodies[fn_id]) {
+        .fn_ => |body| body,
+        else => return null,
+    };
+
+    var target_ordinal: usize = 0;
+    for (g.symbol_table.entities.items) |candidate| {
+        if (candidate.id == path.def) break;
+        if (candidate.kind == .field and candidate.parent == fn_id and
+            std.mem.eql(u8, candidate.name, entity.name))
+        {
+            target_ordinal += 1;
+        }
+    }
+    var parameter_ordinal: usize = 0;
+    for (fn_body.params) |param| {
+        if (std.mem.eql(u8, param.name, entity.name)) parameter_ordinal += 1;
+    }
+
+    var finder: LocalInitializerFinder = .{
+        .b = b,
+        .target_name = entity.name,
+        .target_ordinal = target_ordinal,
+        .binding_ordinal = parameter_ordinal,
+    };
+    finder.visitExpr(fn_body.body);
+    return finder.result orelse null;
+}
+
+fn initializerReturnType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    path: exprs.PathExpr,
+) ?types.Type {
+    const init = findLocalInitializer(g, b, path) orelse return null;
+    if (init >= b.exprs.len) return null;
+    return switch (b.exprs[init].kind) {
+        .call => |call| switch (call.call_kind) {
+            .associated, .free => |target| if (target < b.bodies.len)
+                switch (b.bodies[target]) {
+                    .fn_ => |fn_body| fn_body.ret,
+                    else => null,
+                }
+            else
+                null,
+            .constructor => null,
+        },
+        else => null,
+    };
+}
+
+fn initializerNominalName(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    path: exprs.PathExpr,
+) ?[]const u8 {
+    const init = findLocalInitializer(g, b, path) orelse return null;
+    if (init >= b.exprs.len) return null;
+    return switch (b.exprs[init].kind) {
+        .call => |call| switch (call.call_kind) {
+            .associated => |target| inherentImplTypeName(g, target),
+            .constructor => |target| if (g.symbol_table.get(target)) |entity| entity.name else null,
+            .free => null,
+        },
+        else => null,
+    };
+}
+
 fn receiverNominalName(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
@@ -315,12 +537,28 @@ fn receiverNominalName(
     if (receiver_node >= b.exprs.len) return null;
     const receiver = b.exprs[receiver_node];
 
+    var receiver_ty: ?types.Type = null;
     if (receiver.ty) |type_id| {
-        if (type_id < b.types.len) {
-            if (getTypeName(g, b.types[type_id])) |type_name| {
-                const nominal_name = normalizeNominalName(type_name);
-                if (nominal_name.len > 0) return nominal_name;
-            }
+        if (type_id < b.types.len) receiver_ty = b.types[type_id];
+    } else if (receiver.kind == .path) {
+        // The path's resolved EntityId is the local binding identity. Use its
+        // declaration/inferred type directly; never infer a type from spelling.
+        receiver_ty = pathDeclaredType(g, b, receiver.kind.path);
+    }
+    if (receiver_ty) |ty| {
+        if (getTypeName(g, ty)) |type_name| {
+            const nominal_name = normalizeNominalName(type_name);
+            if (nominal_name.len > 0) return nominal_name;
+        }
+    }
+
+    if (receiver.kind == .path) {
+        // A local initializer can carry the only available nominal linkage
+        // when inference has not materialized a TypeId. Follow that exact
+        // associated-call EntityId; never infer from the local's spelling.
+        if (initializerNominalName(g, b, receiver.kind.path)) |type_name| {
+            const nominal_name = normalizeNominalName(type_name);
+            if (nominal_name.len > 0) return nominal_name;
         }
     }
 
@@ -349,7 +587,19 @@ fn pathDeclaredType(
     for (fn_body.params) |param| {
         if (std.mem.eql(u8, param.name, entity.name)) return param.ty;
     }
-    return null;
+
+    // Local bindings have no declaration-type slot in the body model. If a
+    // sibling occurrence of the same resolved EntityId was already inferred,
+    // reuse that concrete type for this path as well.
+    for (b.exprs) |expression| {
+        if (expression.kind != .path) continue;
+        if (expression.kind.path.def != path.def) continue;
+        const type_id = expression.ty orelse continue;
+        if (type_id < b.types.len) return b.types[type_id];
+    }
+    // If no sibling path was assigned a TypeId, preserve the local's exact
+    // initializer return type for nominal dispatch and primitive checks.
+    return initializerReturnType(g, b, path);
 }
 
 fn operandTypeResolved(
@@ -430,6 +680,8 @@ pub fn resolveMethods(
             var receiver_ty: ?types.Type = null;
             if (receiver.ty) |type_id| {
                 if (type_id < b.types.len) receiver_ty = b.types[type_id];
+            } else if (receiver.kind == .path) {
+                receiver_ty = pathDeclaredType(g, b, receiver.kind.path);
             }
 
             const receiver_name = receiverNominalName(g, b, receiver_node);

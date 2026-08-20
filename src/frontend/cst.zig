@@ -212,6 +212,18 @@ fn mapPrim(nm: []const u8) ?types.Prim {
     return null;
 }
 
+fn isSliceTypeNode(node: ts.Node) bool {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "slice_type")) return true;
+    if (!std.mem.eql(u8, kind, "array_type")) return false;
+
+    var i: u32 = 0;
+    while (node.child(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), ";")) return false;
+    }
+    return true;
+}
+
 /// Lower a tree-sitter type node into a wire `types.Type`.
 fn mapType(e: *Ctx, node: ts.Node) types.Type {
     const kind = node.kind();
@@ -243,19 +255,21 @@ fn mapType(e: *Ctx, node: ts.Node) types.Type {
             }
         }
         if (inner) |inn| {
-            const in_kind = inn.kind();
-            if (std.mem.eql(u8, in_kind, "slice_type") or std.mem.eql(u8, in_kind, "array_type")) {
-                return mapType(e, inn);
-            }
-            if (std.mem.eql(u8, in_kind, "primitive_type") and std.mem.eql(u8, text(e, inn), "str")) {
+            if (isSliceTypeNode(inn)) {
+                var elem: types.Type = .{ .prim = .unit };
+                if (inn.namedChildCount() > 0) elem = mapType(e, inn.namedChild(0).?);
                 const s = e.alloc.create(types.Slice) catch return unsupportedTy();
-                s.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+                s.* = .{ .const_ = !mut, .elem = elem };
                 return .{ .slice = s };
             }
-            const pointee = mapType(e, inn);
-            if (pointee == .slice) return pointee;
+            if (std.mem.eql(u8, inn.kind(), "primitive_type") and std.mem.eql(u8, text(e, inn), "str")) {
+                const s = e.alloc.create(types.Slice) catch return unsupportedTy();
+                s.* = .{ .const_ = !mut, .elem = .{ .prim = .u8 } };
+                return .{ .slice = s };
+            }
+            if (std.mem.eql(u8, inn.kind(), "array_type")) return mapType(e, inn);
             const r = e.alloc.create(types.Ref) catch return unsupportedTy();
-            r.* = .{ .mut = mut, .pointee = pointee };
+            r.* = .{ .mut = mut, .pointee = mapType(e, inn) };
             return .{ .reference = r };
         }
         return unsupportedTy();
@@ -269,14 +283,17 @@ fn mapType(e: *Ctx, node: ts.Node) types.Type {
     }
     if (std.mem.eql(u8, kind, "array_type")) {
         var elem: types.Type = .{ .prim = .unit };
+        if (node.namedChild(0)) |elem_node| elem = mapType(e, elem_node);
+        if (isSliceTypeNode(node)) {
+            const s = e.alloc.create(types.Slice) catch return unsupportedTy();
+            s.* = .{ .const_ = true, .elem = elem };
+            return .{ .slice = s };
+        }
+
         var len_lit: u32 = 0;
-        var i: u32 = 0;
-        while (node.namedChild(i)) |c| : (i += 1) {
-            const k = c.kind();
-            if (std.mem.eql(u8, k, "integer_literal")) {
-                len_lit = std.fmt.parseInt(u32, text(e, c), 10) catch 0;
-            } else {
-                elem = mapType(e, c);
+        if (node.namedChild(1)) |len_node| {
+            if (std.mem.eql(u8, len_node.kind(), "integer_literal")) {
+                len_lit = std.fmt.parseInt(u32, text(e, len_node), 10) catch 0;
             }
         }
         const a = e.alloc.create(types.Array) catch return unsupportedTy();

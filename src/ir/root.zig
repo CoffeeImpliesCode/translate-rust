@@ -23,12 +23,13 @@ pub const RustIR = struct {
     graph: graph.CrateGraph,
     types: []const types.Type = &.{},
     bodies: bodies.Bodies,
-    /// Owned record slice. Argument type trees borrow from `types`/`bodies`;
-    /// suffixes and the record buffer use the frontend allocator.
+    /// Owned record slice. Each concrete argument slice and suffix use the
+    /// frontend allocator; nested type payloads borrow from `types`/`bodies`.
     instantiations: []const types.Instantiation = &.{},
 
     pub fn deinitInstantiations(self: *RustIR, allocator: std.mem.Allocator) void {
         for (self.instantiations) |instantiation| {
+            if (instantiation.args.params.len > 0) allocator.free(instantiation.args.params);
             if (instantiation.zig_suffix.len > 0) allocator.free(instantiation.zig_suffix);
         }
         if (self.instantiations.len > 0) allocator.free(self.instantiations);
