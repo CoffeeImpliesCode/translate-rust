@@ -1,59 +1,86 @@
 # translate-rust
 
-Exploration of a **translate-c-style tool for Rust → Zig**: a program that
-takes a Rust crate and emits correct, idiomatic Zig — the Rust analogue of
-Zig's `translate-c` (clang AST → Zig source). Harder than C: module system,
-generics, traits, ownership/borrowing, macros, and the std surface all need
-translation strategies, not just syntax mapping.
-
-Scaffolded to the same conventions as `~/projects/{notui, skript, ztex}`.
+`translate-rust` explores a `translate-c`-style Rust-to-Zig tool. It translates a supported Rust subset into standalone Zig packages.
 
 ## Status
 
-**Research phase.** The scaffold builds and runs; no translation pipeline
-yet. Findings live in `notes/research/`:
+This repository contains a research implementation with a live in-process source pipeline:
 
-- `prior-work.md` — existing Rust→Zig efforts and lessons from analogous
-  transpilers (C→Rust, C++→Rust, …)
-- `parsing-tooling.md` — linkable Rust parsers / semantic sources
-  (tree-sitter-rust, syn, rustc_interface, rust-analyzer, rustdoc JSON) and
-  how translate-c itself is built
-- `idiom-mapping.md` — Rust language features → correct, proper Zig
-  (enums → tagged unions, Result → error unions, traits → comptime/vtables, …)
-- `approaches.md` — architectures: full translation vs. FFI boundary vs.
-  pull-in-deps, and the recommended exploration path
-
-## Stack
-
-- **Language**: Zig 0.16 (module API, `std.Io`, Juicy Main)
-- **VCS**: jj — DO NOT USE GIT COMMANDS
-- **Dev env**: devenv + direnv (`.envrc` → `use devenv`)
-- **Linting**: zlint (`zlint.json` rules) + `zig fmt --check`
-
-## Structure
-
+```text
+Rust source -> tree-sitter -> frontend -> canonical RustIr -> ZigAST
+            -> staged package validation -> zig build test -> atomic promotion
 ```
-build.zig          # build graph: translate_rust module → exe → run/test steps
-build.zig.zon      # package manifest (fingerprint, paths)
-devenv.nix         # nix dev environment (zig, pkg-config)
-.envrc             # direnv → devenv hook
-AGENTS.md          # agent rules
+
+Canonical wire format v5 JSON enters the same pipeline at `RustIr`. The translator rejects all other wire versions before package creation.
+
+Older sidecar JSON is diagnostic inventory for `--dump model`. It is not accepted translation input.
+
+Current positive end-to-end paths are:
+
+- The `mini` source fixture produces a validated standalone package.
+- The canonical v5 `mini` wire fixture produces a validated standalone package.
+- The `fnv` source fixture translates and runs all 203 original assertions.
+
+Current rejection coverage is:
+
+- The `fletcher` and `crc16` source fixtures reject macros outside the supported subset.
+- The legacy wire corpus rejects `fnv`, `fletcher`, `hex`, `wyhash`, `adler`, `xxhash-rust`, and `seahash`.
+- It also rejects `crc16`, `atoi`, `leb128`, `itoa`, `siphasher`, `percent-encoding`, and `syn`.
+
+Cargo dependencies enter `RustIr` as metadata only. The translator does not translate dependency crates.
+
+Macro expansion, trait resolution, and ownership semantics cover bounded subsets. These paths do not promise general Rust support or complete Rust semantics.
+
+## Modules
+
+```text
+build.zig          # build graph for the CLI, tests, fixtures, and corpus checks
+build.zig.zon      # package manifest and pinned dependencies
 src/
-├── main.zig       # CLI skeleton (std.process.Init)
-└── root.zig       # library root + unit tests
-notes/             # design research (notes/research/*.md)
+├── main.zig       # CLI and diagnostic dump modes
+├── ir/            # canonical target-independent RustIr and v5 JSON boundary
+├── frontend/      # tree-sitter ingestion and Rust analysis
+├── backend/zig/   # ZigAST lowering, source emission, and package generation
+├── driver/        # source and wire orchestration with staged promotion
+└── model/         # legacy sidecar diagnostic inventory
+r2z-core/          # generated-package runtime compatibility layer
+test/              # fixtures, snapshots, integration tests, and rejection corpus
+notes/README.md    # navigation index for private research and archived plans
 ```
+
+The project uses Zig 0.16, devenv with direnv, and Jujutsu for version control. Use the [notes index](notes/README.md) to locate project records.
 
 ## Commands
 
 ```bash
-direnv allow        # enter devenv shell (first time / after devenv.nix edits)
-zig build           # Debug build → zig-out/bin/translate-rust
-zig build run       # build + run
-zig build run -- --help   # CLI skeleton help
-zig build test      # unit tests
-zig fmt --check .   # formatting gate
-zlint               # lint (prefer ~/.local/bin/zlint; devenv nixpkgs is fallback)
-gate                # all quality gates (fmt, build, test, ast-check, lint)
-jj st               # working-copy status (never git)
+direnv allow
+zig build
+zig build run -- --help
+
+# Translate supported Rust source to a standalone package.
+zig build run -- test/crates/mini -o zig-out/r2z-mini
+
+# Emit source from canonical v5 wire JSON.
+zig build translate -- test/mini.json
+
+# Inspect canonical frontend and backend representations.
+zig build run -- --dump rustir test/crates/mini
+zig build run -- --dump zigast test/crates/mini
+
+# Inspect legacy sidecar inventory. This command does not translate it.
+zig build run -- --dump model test/fnv.json
+
+# Run unit, golden, source, wire, and end-to-end tests.
+zig build test
+
+# Run mini wire translation, source E2E, runtime tests, and all legacy rejects.
+zig build test-crates
+
+# Run correctness gates; run translation checks only if they pass.
+gate
+
+# Rebuild the gate wrapper after devenv configuration changes, then run it.
+devenv shell -- gate
+
+jj st
 ```

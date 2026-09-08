@@ -22,3 +22,4 @@ __pycache__/
 
 # cargo (fixture crates)
 target/
+/agent-notes

@@ -20,12 +20,9 @@ rec {
   # https://devenv.sh/languages/
   # languages.zig.enable = true;
 
-  # `gate` runs the shared zig-gate (src/ correctness) THEN verifies the
-  # *translation output*: `zig build test-crates` regenerates every r2z
-  # package and ast-checks + builds + tests it. Without this, "gate passes"
-  # would only prove the translator's source is valid, never that its emitted
-  # Zig is (the actual product).
+  # Check translator correctness, then generated packages and fixture refusals.
   scripts.gate.exec = ''
+    set -e
     zig-gate
     echo
     echo "== translation output check (zig build test-crates) =="
