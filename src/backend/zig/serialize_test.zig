@@ -316,6 +316,60 @@ test "serialize: whitespace formatting" {
     try testing.expectEqualStrings("src/a.zig", decoded.files[0].path);
 }
 
+test "serialize: defer and errdefer statements roundtrip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const normal_stmt: ast.Stmt = .{ .defer_stmt = .{
+        .expr = .{ .call = .{
+            .callee = &ast.Expr{ .ident = "release" },
+        } },
+    } };
+    const error_stmt: ast.Stmt = .{ .defer_stmt = .{
+        .expr = .{ .call = .{
+            .callee = &ast.Expr{ .ident = "rollback" },
+        } },
+        .is_errdefer = true,
+    } };
+    const pkg = ast.Package{
+        .name = "defer_roundtrip",
+        .files = &.{.{
+            .path = "src/root.zig",
+            .decls = &.{.{ .fn_decl = .{
+                .name = "work",
+                .ret_type = .{ .void_type = {} },
+                .body = .{ .stmts = &.{ normal_stmt, error_stmt } },
+            } }},
+        }},
+    };
+
+    const json_bytes = try serialize.encode(allocator, &pkg);
+    try testing.expect(std.mem.indexOf(u8, json_bytes, "\"kind\": \"defer_stmt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_bytes, "\"is_errdefer\": false") != null);
+    try testing.expect(std.mem.indexOf(u8, json_bytes, "\"is_errdefer\": true") != null);
+
+    const decoded = try serialize.decode(allocator, json_bytes);
+    const stmts = decoded.files[0].decls[0].fn_decl.body.?.stmts;
+    try testing.expectEqual(@as(usize, 2), stmts.len);
+
+    try testing.expect(stmts[0] == .defer_stmt);
+    try testing.expect(!stmts[0].defer_stmt.is_errdefer);
+    try testing.expect(stmts[0].defer_stmt.expr == .call);
+    try testing.expectEqualStrings(
+        "release",
+        stmts[0].defer_stmt.expr.call.callee.*.ident,
+    );
+
+    try testing.expect(stmts[1] == .defer_stmt);
+    try testing.expect(stmts[1].defer_stmt.is_errdefer);
+    try testing.expect(stmts[1].defer_stmt.expr == .call);
+    try testing.expectEqualStrings(
+        "rollback",
+        stmts[1].defer_stmt.expr.call.callee.*.ident,
+    );
+}
+
 fn checkImportAllocationFailures(
     allocator: std.mem.Allocator,
     value: std.json.Value,

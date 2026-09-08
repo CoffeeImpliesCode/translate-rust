@@ -1204,3 +1204,558 @@ test "solveWithGraph does not default missing generic call arguments to i32" {
 
     try std.testing.expect(inferred.getInstantiation(0) == null);
 }
+test "scalar casts propagate their primitive target type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const reference = try alloc.create(types.Ref);
+    reference.* = .{ .mut = false, .pointee = .{ .prim = .u8 } };
+    const types_store = try alloc.alloc(types.Type, 3);
+    types_store[0] = .{ .prim = .u8 };
+    types_store[1] = .{ .prim = .u64 };
+    types_store[2] = .{ .reference = reference };
+
+    const exprs_store = try alloc.alloc(exprs.Expr, 4);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = 2,
+        .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .unary = .{ .op = .deref, .operand = 0 } },
+    };
+    exprs_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = 1,
+        .kind = .{ .cast = .{
+            .operand = 1,
+            .source_type = .{ .prim = .u8 },
+            .target = 1,
+        } },
+    };
+    exprs_store[3] = .{
+        .id = 3,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{},
+            .tail = 2,
+            .labelled = null,
+        } },
+    };
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .u64 },
+            .body = 3,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solve(alloc, &b);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(@as(exprs.TypeId, 1), inferred.getType(2).?);
+}
+
+test "scalar casts reject reference sources" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const reference = try alloc.create(types.Ref);
+    reference.* = .{ .mut = false, .pointee = .{ .prim = .u8 } };
+    const types_store = try alloc.alloc(types.Type, 2);
+    types_store[0] = .{ .prim = .u64 };
+    types_store[1] = .{ .reference = reference };
+
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .cast = .{
+                .operand = 0,
+                .source_type = .{ .reference = reference },
+                .target = 0,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 1,
+                .labelled = null,
+            } },
+        },
+    };
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .u64 },
+            .body = 2,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = types_store,
+        .bodies = &bodies_store,
+    };
+
+    try std.testing.expectError(error.InvalidCast, infer.solve(alloc, &b));
+}
+
+test "scalar casts reject non-scalar targets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const reference = try alloc.create(types.Ref);
+    reference.* = .{ .mut = false, .pointee = .{ .prim = .u8 } };
+    const types_store = try alloc.alloc(types.Type, 2);
+    types_store[0] = .{ .reference = reference };
+    types_store[1] = .{ .prim = .u8 };
+
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .cast = .{
+                .operand = 0,
+                .source_type = .{ .prim = .u8 },
+                .target = 0,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 1,
+                .labelled = null,
+            } },
+        },
+    };
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .u8 },
+            .body = 2,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = types_store,
+        .bodies = &bodies_store,
+    };
+
+    try std.testing.expectError(error.InvalidCast, infer.solve(alloc, &b));
+}
+
+test "reference loop pattern binds the dereferenced slice element" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var graph_store = ir.graph.CrateGraph.init(alloc);
+    defer graph_store.deinit();
+    const function_id = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "sum"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const bytes_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "bytes"),
+        .span = span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const byte_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "byte"),
+        .span = span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const slice = try alloc.create(types.Slice);
+    slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const bytes_reference = try alloc.create(types.Ref);
+    bytes_reference.* = .{ .mut = false, .pointee = .{ .slice = slice } };
+    const types_store = [_]types.Type{
+        .{ .prim = .u8 },
+        .{ .prim = .u64 },
+        .{ .reference = bytes_reference },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 2,
+            .kind = .{ .path = .{ .def = bytes_def, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = byte_def, .generic_args = &.{} } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .cast = .{
+                .operand = 1,
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = 1,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .for_ = .{
+                .pattern = 1,
+                .iterable = 0,
+                .body = .{ .statements = &.{0}, .tail = null, .labelled = null },
+                .iter_kind = .{ .slice = {} },
+            } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{1},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    const stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 2 } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 3 } },
+    };
+    const pats_store = [_]exprs.Pattern{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .binding = .{
+                .name = "byte",
+                .mode = .{ .value = {} },
+                .mutable = false,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .reference = .{
+                .mode = .{ .value = {} },
+                .inner = 0,
+            } },
+        },
+    };
+    const params = [_]items.Param{
+        .{ .name = "bytes", .ty = types_store[2], .span = span },
+    };
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &params,
+            .ret = .{ .prim = .unit },
+            .body = 4,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solveWithGraph(alloc, &b, &graph_store);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, exprs_store[2].kind.cast.source_type);
+}
+
+test "explicit u64 annotation constrains an unsuffixed integer expression" {
+    const alloc = std.testing.allocator;
+    const types_store = [_]types.Type{
+        .{ .prim = .u64 },
+        .{ .prim = .i32 },
+    };
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "1",
+                .value = 1,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "2",
+                .value = 2,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .binary = .{
+                .op = .add,
+                .overflow = .checked,
+                .lhs = 0,
+                .rhs = 1,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    const pats_store = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "x",
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } },
+    }};
+    const stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .let = .{
+            .pattern = 0,
+            .init = 2,
+            .ty = 0,
+        } },
+    }};
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 3,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solve(alloc, &b);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(2));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(0));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(1));
+}
+
+test "by-value array iteration binds the element value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var graph_store = ir.graph.CrateGraph.init(alloc);
+    defer graph_store.deinit();
+    const function_id = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "sum"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const data_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "data"),
+        .span = span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const byte_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "byte"),
+        .span = span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const array = try alloc.create(types.Array);
+    array.* = .{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .literal = 2 },
+    };
+    const types_store = [_]types.Type{
+        .{ .prim = .u8 },
+        .{ .prim = .u64 },
+        .{ .array = array },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 2,
+            .kind = .{ .path = .{ .def = data_def, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = byte_def, .generic_args = &.{} } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .cast = .{
+                .operand = 1,
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = 1,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .for_ = .{
+                .pattern = 0,
+                .iterable = 0,
+                .body = .{ .statements = &.{0}, .tail = null, .labelled = null },
+                .iter_kind = .{ .slice = {} },
+            } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{1},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    const stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 2 } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 3 } },
+    };
+    const pats_store = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "byte",
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } },
+    }};
+    const params = [_]items.Param{
+        .{ .name = "data", .ty = types_store[2], .span = span },
+    };
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &params,
+            .ret = .{ .prim = .unit },
+            .body = 4,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solveWithGraph(alloc, &b, &graph_store);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, exprs_store[2].kind.cast.source_type);
+}

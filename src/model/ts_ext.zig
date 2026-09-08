@@ -682,14 +682,21 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return appendExpr(e, .{ .return_ = .{ .value = val } });
     }
     if (std.mem.eql(u8, kind, "unary_expression")) {
-        const op = node.namedChild(0);
-        const operand = node.namedChild(1);
-        if (op == null or operand == null) return appendExpr(e, .{ .unit = {} });
-        const ot = text(e, op.?);
-        const oid = try lowerExpr(e, operand.?);
-        if (std.mem.eql(u8, ot, "!")) return appendExpr(e, .{ .unary = .{ .op = .logical_not, .operand = oid } });
-        if (std.mem.eql(u8, ot, "-")) return appendExpr(e, .{ .unary = .{ .op = .negate, .operand = oid } });
-        return oid;
+        const operand = node.namedChild(0) orelse return unsupported(e, "unary operand");
+        const operator_text = opOf(e, node);
+        const operator: exprs.UnaryOp = if (std.mem.eql(u8, operator_text, "!"))
+            .logical_not
+        else if (std.mem.eql(u8, operator_text, "-"))
+            .negate
+        else
+            return unsupported(e, "unary operator");
+        return appendExpr(e, .{ .unary = .{
+            .op = operator,
+            .operand = try lowerExpr(e, operand),
+        } });
+    }
+    if (std.mem.eql(u8, kind, "unit_expression")) {
+        return appendExpr(e, .{ .unit = {} });
     }
     if (std.mem.eql(u8, kind, "parenthesized_expression")) {
         if (node.namedChildCount() > 0) return lowerExpr(e, node.namedChild(0).?);
@@ -748,7 +755,7 @@ fn parseIntText(raw: []const u8) ?ParsedInt {
 
 fn lowerIntLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const t = text(e, node);
-    const parsed = parseIntText(t) orelse return unsupported(e, "integer literal");
+    const parsed = parseIntText(t) orelse return unsupported(e, "integer literal out of range");
     const suffix = if (parsed.suffix.len == 0) null else try e.ctx.alloc.dupe(u8, parsed.suffix);
     return appendExpr(e, .{ .literal = .{ .int = .{
         .text = try e.ctx.alloc.dupe(u8, t),
@@ -766,7 +773,7 @@ fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 }
 fn lowerFloatLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const t = text(e, node);
-    const value = std.fmt.parseFloat(f64, t) catch 0.0;
+    const value = std.fmt.parseFloat(f64, t) catch return unsupported(e, "invalid float literal");
     return appendExpr(e, .{ .literal = .{ .float = .{
         .text = try e.ctx.alloc.dupe(u8, t),
         .value = value,
@@ -1657,10 +1664,7 @@ pub fn extractFunction(
         // Lossless partial lower: keep the full lowered body even when
         // sub-expressions are `.unsupported`; emit renders those as loud
         // runtime `@panic` unsoundness markers (never a silent wrong value).
-        const fb = ctx.bodies_list.items[fn_entity];
-        var fn_body = fb.fn_;
-        fn_body.body = body_expr;
-        ctx.bodies_list.items[fn_entity] = .{ .fn_ = fn_body };
+        ctx.bodies_list.items[fn_entity].fn_.body = body_expr;
         return true;
     }
     return false;
@@ -2104,4 +2108,162 @@ test "lower associated constructor through a compatible type alias" {
     }
     try std.testing.expect(saw_unsupported);
     try std.testing.expect(!saw_free_new);
+}
+
+test "refuse rejected numeric and unknown unary expressions while preserving unit and return controls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const module_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const function_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "check"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = module_id,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{function_id},
+        .attributes = &.{},
+    });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+
+    const src =
+        \\fn check() {
+        \\    340282366920938463463374607431768211455u128;
+        \\    1.25f32;
+        \\    -7i32;
+        \\    !false;
+        \\    *1;
+        \\    ();
+        \\    return;
+        \\}
+    ;
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src = src,
+        .mod_id = module_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, function_id));
+
+    const body_id = bodies_list.items[function_id].fn_.body;
+    const block = switch (exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedBlockExpression,
+    };
+    try std.testing.expectEqual(@as(usize, 7), block.statements.len);
+
+    const numeric_reasons = [_][]const u8{
+        "integer literal out of range",
+        "invalid float literal",
+    };
+    for (block.statements[0..2], numeric_reasons) |statement_id, expected_reason| {
+        const expression_id = switch (stmts_list.items[statement_id].kind) {
+            .expr => |expression_id| expression_id,
+            else => return error.ExpectedExpressionStatement,
+        };
+        switch (exprs_list.items[expression_id].kind) {
+            .unsupported => |rejection| {
+                try std.testing.expectEqualStrings(expected_reason, rejection.reason);
+            },
+            else => return error.ExpectedUnsupportedExpression,
+        }
+    }
+
+    const expected_unary_ops = [_]std.meta.Tag(exprs.UnaryOp){
+        .negate,
+        .logical_not,
+    };
+    for (block.statements[2..4], expected_unary_ops) |statement_id, expected_op| {
+        const expression_id = switch (stmts_list.items[statement_id].kind) {
+            .expr => |expression_id| expression_id,
+            else => return error.ExpectedExpressionStatement,
+        };
+        switch (exprs_list.items[expression_id].kind) {
+            .unary => |unary| {
+                try std.testing.expectEqual(expected_op, std.meta.activeTag(unary.op));
+            },
+            else => return error.ExpectedUnaryExpression,
+        }
+    }
+
+    const unknown_unary_id = switch (stmts_list.items[block.statements[4]].kind) {
+        .expr => |expression_id| expression_id,
+        else => return error.ExpectedExpressionStatement,
+    };
+    switch (exprs_list.items[unknown_unary_id].kind) {
+        .unsupported => |rejection| {
+            try std.testing.expectEqualStrings("unary operator", rejection.reason);
+        },
+        else => return error.ExpectedUnsupportedUnary,
+    }
+
+    const unit_id = switch (stmts_list.items[block.statements[5]].kind) {
+        .expr => |expression_id| expression_id,
+        else => return error.ExpectedExpressionStatement,
+    };
+    try std.testing.expect(exprs_list.items[unit_id].kind == .unit);
+
+    const return_id = switch (stmts_list.items[block.statements[6]].kind) {
+        .expr => |expression_id| expression_id,
+        else => return error.ExpectedExpressionStatement,
+    };
+    switch (exprs_list.items[return_id].kind) {
+        .return_ => |return_expression| {
+            try std.testing.expect(return_expression.value == null);
+        },
+        else => return error.ExpectedReturnExpression,
+    }
 }

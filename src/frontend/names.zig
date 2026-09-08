@@ -13,8 +13,9 @@
 //!   - `super::`  -> the parent of the use's own module
 //!   - bare / leading `::` -> the use's own module, falling back to the crate
 //!     root for the first segment when it is not found locally
-//! Any unresolved or ambiguous path degrades to `target = 0` with
-//! `.kind = .{ .plain = 0 }` rather than aborting the pass.
+//! Any unresolved non-external path degrades to `target = 0` with
+//! `.kind = .{ .plain = 0 }`; unresolved rooted `core`/`std`/`alloc` non-glob
+//! use `.kind = .external` and retain their full path.
 
 const std = @import("std");
 const ir = @import("translate_rust.ir");
@@ -62,15 +63,6 @@ fn parseUsePath(alloc: std.mem.Allocator, src: []const u8) ParsedUse {
     var out: ParsedUse = .{ .base = .bare };
     var path = src;
 
-    // Trailing glob: `path::*`
-    if (std.mem.endsWith(u8, path, "*")) {
-        out.glob = true;
-        var end: usize = path.len - 1;
-        while (end > 0 and (path[end - 1] == ' ' or path[end - 1] == '\t')) end -= 1;
-        if (end >= 2 and path[end - 1] == ':' and path[end - 2] == ':') end -= 2;
-        path = path[0..end];
-    }
-
     // Alias: `path as Alias`
     if (std.mem.indexOf(u8, path, " as ")) |ai| {
         const alias = std.mem.trim(u8, path[ai + 4 ..], " \t\r\n");
@@ -98,6 +90,15 @@ fn parseUsePath(alloc: std.mem.Allocator, src: []const u8) ParsedUse {
         // Absolute `::foo` — treated as bare (resolve from the current scope).
         rest = path[2..];
         out.base = .bare;
+    }
+
+    // Strip the trailing glob only after recognizing its explicit base.
+    if (std.mem.endsWith(u8, rest, "*")) {
+        out.glob = true;
+        var end: usize = rest.len - 1;
+        while (end > 0 and (rest[end - 1] == ' ' or rest[end - 1] == '\t')) end -= 1;
+        if (end >= 2 and rest[end - 1] == ':' and rest[end - 2] == ':') end -= 2;
+        rest = rest[0..end];
     }
 
     // Split the remainder into path segments.
@@ -156,7 +157,7 @@ fn resolvePath(
     bare_fallback: bool,
     need_module: bool,
 ) ?spine.EntityId {
-    if (segs.len == 0) return null;
+    if (segs.len == 0) return if (need_module) start else null;
     var cur = start;
     for (segs, 0..) |seg, i| {
         const sc = scopeAt(scopes, cur) orelse return null;
@@ -182,10 +183,46 @@ fn setLocalName(alloc: std.mem.Allocator, u: *graph.UseDecl, new: []const u8) vo
     u.local_name = alloc.dupe(u8, new) catch "";
 }
 
+fn clearExternalKind(alloc: std.mem.Allocator, u: *graph.UseDecl) void {
+    switch (u.kind) {
+        .external => |external| {
+            for (external.path) |segment| alloc.free(segment);
+            if (external.path.len > 0) alloc.free(external.path);
+        },
+        else => {},
+    }
+    u.kind = .{ .plain = 0 };
+}
+
+fn isExternalRootedUse(parsed: ParsedUse) bool {
+    if (parsed.base != .bare or parsed.glob or parsed.segments.items.len == 0) return false;
+    const root = parsed.segments.items[0];
+    return std.mem.eql(u8, root, "core") or std.mem.eql(u8, root, "std") or
+        std.mem.eql(u8, root, "alloc");
+}
+
+fn duplicateExternalPath(
+    alloc: std.mem.Allocator,
+    segments: []const []const u8,
+) ![]const []const u8 {
+    var path = try alloc.alloc([]const u8, segments.len);
+    var copied: usize = 0;
+    errdefer {
+        for (path[0..copied]) |segment| alloc.free(segment);
+        alloc.free(path);
+    }
+    for (segments, 0..) |segment, index| {
+        path[index] = try alloc.dupe(u8, segment);
+        copied += 1;
+    }
+    return path;
+}
+
 /// Resolve every `use` declaration in the graph against per-module scopes.
 /// Fills each `UseDecl.kind`/`.target` and sets the matching `use_` entity's
-/// `.resolved` field. Unresolvable paths degrade to `target = 0` (leaving
-/// `.resolved` untouched) rather than erroring the pass.
+/// `.resolved` field. An unresolved non-glob path rooted at `core`, `std`, or
+/// `alloc` becomes `.external` with an owned path; every other unresolved path
+/// stays plain.
 pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
     const root_id = findRootEntity(g) orelse 0;
 
@@ -233,6 +270,9 @@ pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
     // Resolve each use declaration.
     for (g.uses.items) |*u| {
         const ent = g.symbol_table.get(u.id) orelse continue;
+        if (u.id < g.symbol_table.entities.items.len) {
+            g.symbol_table.entities.items[u.id].resolved = null;
+        }
         var parsed = parseUsePath(alloc, ent.name);
         defer parsed.segments.deinit(alloc);
 
@@ -265,6 +305,7 @@ pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
         );
 
         if (target) |t| {
+            clearExternalKind(alloc, u);
             u.target = t;
             if (parsed.glob) {
                 // The target is the module EntityId that the glob enumerates.
@@ -283,9 +324,14 @@ pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
             if (u.id < g.symbol_table.entities.items.len)
                 g.symbol_table.entities.items[u.id].resolved = t;
         } else {
-            // Unresolved: degrade to target 0, leave `.resolved` untouched.
+            clearExternalKind(alloc, u);
             u.target = 0;
-            u.kind = .{ .plain = 0 };
+            if (isExternalRootedUse(parsed)) {
+                const external_path = try duplicateExternalPath(alloc, parsed.segments.items);
+                u.kind = .{ .external = .{
+                    .path = external_path,
+                } };
+            }
         }
     }
 }

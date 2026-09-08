@@ -79,35 +79,21 @@ fn findCharEnd(s: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Helper function to check if raw tokens are fully enclosed by a matching delimiter pair.
-fn getEnclosedContent(raw_tokens: []const u8) []const u8 {
-    const trimmed: []const u8 = std.mem.trim(u8, raw_tokens, " \t\r\n");
-    if (trimmed.len < 2) return trimmed;
-
-    const first: u8 = trimmed[0];
-    const last: u8 = trimmed[trimmed.len - 1];
-
-    const is_pair: bool = (first == '(' and last == ')') or
-        (first == '[' and last == ']') or
-        (first == '{' and last == '}');
-
-    if (!is_pair) return trimmed;
-
-    var paren_depth: usize = 0;
-    var bracket_depth: usize = 0;
-    var brace_depth: usize = 0;
-    var in_double_quote: bool = false;
-    var escape: bool = false;
-
+/// Validate token-tree structure before any splitter or matcher consumes it.
+/// The old implementation treated malformed delimiters and quotes as plain
+/// text, which allowed malformed macro invocations to disappear downstream.
+fn validateMacroTokenStream(raw_tokens: []const u8) !void {
+    var delimiters: [macro_parse_depth_max]u8 = undefined;
+    var delimiter_count: usize = 0;
+    var in_double_quote = false;
+    var escape = false;
     var i: usize = 0;
-    while (i < trimmed.len) : (i += 1) {
-        const c: u8 = trimmed[i];
-
+    while (i < raw_tokens.len) : (i += 1) {
+        const c = raw_tokens[i];
         if (escape) {
             escape = false;
             continue;
         }
-
         if (in_double_quote) {
             if (c == '\\') {
                 escape = true;
@@ -117,26 +103,27 @@ fn getEnclosedContent(raw_tokens: []const u8) []const u8 {
             continue;
         }
 
-        if (c == '/' and i + 1 < trimmed.len) {
-            if (trimmed[i + 1] == '/') {
+        if (c == '/' and i + 1 < raw_tokens.len) {
+            if (raw_tokens[i + 1] == '/') {
                 i += 2;
-                while (i < trimmed.len and trimmed[i] != '\n') : (i += 1) {}
-                if (i == trimmed.len) break;
+                while (i < raw_tokens.len and raw_tokens[i] != '\n') : (i += 1) {}
                 continue;
             }
-            if (trimmed[i + 1] == '*') {
-                i = findBlockCommentEnd(trimmed, i) orelse return trimmed;
+            if (raw_tokens[i + 1] == '*') {
+                i = findBlockCommentEnd(raw_tokens, i) orelse
+                    return error.MalformedMacroInvocation;
                 continue;
             }
         }
 
-        if (c == 'r' or (c == 'b' and i + 1 < trimmed.len and trimmed[i + 1] == 'r')) {
+        if (c == 'r' or (c == 'b' and i + 1 < raw_tokens.len and raw_tokens[i + 1] == 'r')) {
             const prefix_len: usize = if (c == 'r') 1 else 2;
             var marker = i + prefix_len;
-            while (marker < trimmed.len and trimmed[marker] == '#') : (marker += 1) {}
-            if (marker < trimmed.len and trimmed[marker] == '"') {
+            while (marker < raw_tokens.len and raw_tokens[marker] == '#') : (marker += 1) {}
+            if (marker < raw_tokens.len and raw_tokens[marker] == '"') {
                 const hash_count = marker - i - prefix_len;
-                i = findRawStringEnd(trimmed, marker + 1, hash_count) orelse return trimmed;
+                i = findRawStringEnd(raw_tokens, marker + 1, hash_count) orelse
+                    return error.MalformedMacroInvocation;
                 continue;
             }
         }
@@ -145,50 +132,163 @@ fn getEnclosedContent(raw_tokens: []const u8) []const u8 {
             in_double_quote = true;
             continue;
         }
-
         if (c == '\'') {
-            // Skip a char literal (e.g. `','`, `'\''`, `'\n'`) so its body is
-            // not mistaken for delimiters or its closing quote treated as a
-            // string opener. Unmatched single quotes (lifetimes) are left as-is.
-            if (findCharEnd(trimmed, i)) |end| {
+            if (findCharEnd(raw_tokens, i)) |end| {
                 i = end;
                 continue;
             }
+            // Rust lifetimes are the only valid unmatched single-quote form.
+            if (i + 1 < raw_tokens.len and isIdentStart(raw_tokens[i + 1])) continue;
+            return error.MalformedMacroInvocation;
         }
 
-        if (c == '(') {
-            paren_depth += 1;
-        } else if (c == ')') {
-            if (paren_depth > 0) paren_depth -= 1;
-        } else if (c == '[') {
-            bracket_depth += 1;
-        } else if (c == ']') {
-            if (bracket_depth > 0) bracket_depth -= 1;
-        } else if (c == '{') {
-            brace_depth += 1;
-        } else if (c == '}') {
-            if (brace_depth > 0) brace_depth -= 1;
-        }
-
-        // If all depths reach zero before the final character, it is not a single outer pair.
-        if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0 and i < trimmed.len - 1) {
-            return trimmed;
+        switch (c) {
+            '(' => {
+                if (delimiter_count == delimiters.len) return error.MalformedMacroInvocation;
+                delimiters[delimiter_count] = ')';
+                delimiter_count += 1;
+            },
+            '[' => {
+                if (delimiter_count == delimiters.len) return error.MalformedMacroInvocation;
+                delimiters[delimiter_count] = ']';
+                delimiter_count += 1;
+            },
+            '{' => {
+                if (delimiter_count == delimiters.len) return error.MalformedMacroInvocation;
+                delimiters[delimiter_count] = '}';
+                delimiter_count += 1;
+            },
+            ')', ']', '}' => {
+                if (delimiter_count == 0) return error.MalformedMacroInvocation;
+                if (delimiters[delimiter_count - 1] != c) return error.MalformedMacroInvocation;
+                delimiter_count -= 1;
+            },
+            else => {},
         }
     }
-
-    if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
-        return std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    if (in_double_quote or escape or delimiter_count != 0) {
+        return error.MalformedMacroInvocation;
     }
-
-    return trimmed;
 }
 
-/// Splits macro arguments by top-level commas.
+/// Return the content of a single outer delimiter pair after validating the
+/// complete token stream. Bare token streams remain unchanged.
+fn getEnclosedContent(raw_tokens: []const u8) ![]const u8 {
+    const trimmed: []const u8 = std.mem.trim(u8, raw_tokens, " \t\r\n");
+    try validateMacroTokenStream(trimmed);
+    if (trimmed.len < 2) return trimmed;
+
+    const first: u8 = trimmed[0];
+    const last: u8 = trimmed[trimmed.len - 1];
+    const is_pair: bool = (first == '(' and last == ')') or
+        (first == '[' and last == ']') or
+        (first == '{' and last == '}');
+    if (!is_pair) return trimmed;
+
+    const close_idx = findClosingDelimiterChecked(trimmed, 0) catch
+        return error.MalformedMacroInvocation;
+    if (close_idx != trimmed.len - 1) return trimmed;
+    return std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+}
+
+fn findClosingDelimiterChecked(s: []const u8, start: usize) !usize {
+    if (start >= s.len) return error.MalformedMacroInvocation;
+    const opener = s[start];
+    if (opener != '(' and opener != '[' and opener != '{') {
+        return error.MalformedMacroInvocation;
+    }
+    var delimiters: [macro_parse_depth_max]u8 = undefined;
+    var delimiter_count: usize = 0;
+    var in_double_quote = false;
+    var escape = false;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_double_quote) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_double_quote = false;
+            }
+            continue;
+        }
+        if (c == '/' and i + 1 < s.len) {
+            if (s[i + 1] == '/') {
+                i += 2;
+                while (i < s.len and s[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (s[i + 1] == '*') {
+                i = findBlockCommentEnd(s, i) orelse return error.MalformedMacroInvocation;
+                continue;
+            }
+        }
+        if (c == 'r' or (c == 'b' and i + 1 < s.len and s[i + 1] == 'r')) {
+            const prefix_len: usize = if (c == 'r') 1 else 2;
+            var marker = i + prefix_len;
+            while (marker < s.len and s[marker] == '#') : (marker += 1) {}
+            if (marker < s.len and s[marker] == '"') {
+                const hash_count = marker - i - prefix_len;
+                i = findRawStringEnd(s, marker + 1, hash_count) orelse
+                    return error.MalformedMacroInvocation;
+                continue;
+            }
+        }
+        if (c == '"') {
+            in_double_quote = true;
+            continue;
+        }
+        if (c == '\'') {
+            if (findCharEnd(s, i)) |end| {
+                i = end;
+                continue;
+            }
+            if (i + 1 < s.len and isIdentStart(s[i + 1])) continue;
+            return error.MalformedMacroInvocation;
+        }
+
+        switch (c) {
+            '(' => {
+                if (delimiter_count == delimiters.len) return error.MalformedMacroInvocation;
+                delimiters[delimiter_count] = ')';
+                delimiter_count += 1;
+            },
+            '[' => {
+                if (delimiter_count == delimiters.len) return error.MalformedMacroInvocation;
+                delimiters[delimiter_count] = ']';
+                delimiter_count += 1;
+            },
+            '{' => {
+                if (delimiter_count == delimiters.len) return error.MalformedMacroInvocation;
+                delimiters[delimiter_count] = '}';
+                delimiter_count += 1;
+            },
+            ')', ']', '}' => {
+                if (delimiter_count == 0) return error.MalformedMacroInvocation;
+                if (delimiters[delimiter_count - 1] != c) return error.MalformedMacroInvocation;
+                delimiter_count -= 1;
+                if (delimiter_count == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return error.MalformedMacroInvocation;
+}
+
+/// Return the matching delimiter or reject malformed nesting and literals.
+pub fn findClosingDelimiter(s: []const u8, start: usize) !usize {
+    return findClosingDelimiterChecked(s, start);
+}
+
 /// Trims outer delimiter pairs `(...)`, `[...]`, `{...}` if present.
 /// Respects nested parenthesis, brackets, braces, strings, and char literals.
 /// Returns an allocated slice of trimmed argument token slices.
 pub fn splitMacroArgs(alloc: std.mem.Allocator, raw_tokens: []const u8) ![]const []const u8 {
-    const text: []const u8 = getEnclosedContent(raw_tokens);
+    const text: []const u8 = try getEnclosedContent(raw_tokens);
     if (text.len == 0) {
         const empty = try alloc.alloc([]const u8, 0);
         return empty;
@@ -421,7 +521,7 @@ pub fn parseVecInvocation(
     alloc: std.mem.Allocator,
     raw_tokens: []const u8,
 ) !VecInvocation {
-    const text = getEnclosedContent(raw_tokens);
+    const text = try getEnclosedContent(raw_tokens);
     const separator = try findVecRepeatSeparator(alloc, text);
 
     if (separator) |index| {
@@ -554,13 +654,16 @@ pub const MacroDef = struct {
     name: []const u8,
     rules: []const MacroRule,
 
-    /// Deep-free matcher/template slices including nested repetition arrays.
+    /// Deep-free matcher/template and owned source slices.
     pub fn deinit(self: *MacroDef, alloc: std.mem.Allocator) void {
         for (self.rules) |rule| {
             freeMatcherElements(alloc, rule.matcher);
             freeTemplateElements(alloc, rule.template);
+            alloc.free(rule.raw_matcher);
+            alloc.free(rule.raw_template);
         }
         alloc.free(self.rules);
+        alloc.free(self.name);
         self.* = undefined;
     }
 };
@@ -637,6 +740,9 @@ pub const Bindings = struct {
         }
         return null;
     }
+    pub fn hasRep(self: *const Bindings, name: []const u8) bool {
+        return self.rep_vars.get(name) != null;
+    }
 
     pub fn getRepLen(self: *const Bindings, name: []const u8) usize {
         if (self.rep_vars.get(name)) |list| {
@@ -679,59 +785,10 @@ pub fn skipWhitespaceAndComments(s: []const u8, start: usize) usize {
     return i;
 }
 
-pub fn findClosingDelimiter(s: []const u8, start: usize) ?usize {
-    if (start >= s.len) return null;
-    const open_char = s[start];
-    const close_char: u8 = switch (open_char) {
-        '(' => ')',
-        '[' => ']',
-        '{' => '}',
-        else => return null,
-    };
-
-    var depth: usize = 0;
-    var in_double_quote: bool = false;
-    var escape: bool = false;
-    var i: usize = start;
-
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_double_quote) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_double_quote = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_double_quote = true;
-            continue;
-        }
-        if (c == '\'') {
-            if (findCharEnd(s, i)) |end| {
-                i = end;
-                continue;
-            }
-        }
-
-        if (c == open_char) {
-            depth += 1;
-        } else if (c == close_char) {
-            if (depth > 0) depth -= 1;
-            if (depth == 0) return i;
-        }
-    }
-    return null;
-}
-
 const macro_parse_depth_max: usize = 128;
 
 pub fn parseMatcher(alloc: std.mem.Allocator, raw: []const u8) ![]const MatcherElement {
+    validateMacroTokenStream(raw) catch return error.InvalidMacroMatcher;
     return parseMatcherDepth(alloc, raw, 0);
 }
 
@@ -757,9 +814,11 @@ fn parseMatcherDepth(
 
         if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '(') {
             const open_idx = i + 1;
-            const close_idx = findClosingDelimiter(raw, open_idx) orelse return error.InvalidMacroMatcher;
+            const close_idx = findClosingDelimiterChecked(raw, open_idx) catch
+                return error.InvalidMacroMatcher;
             const inner_text = raw[open_idx + 1 .. close_idx];
             const inner_elems = try parseMatcherDepth(alloc, inner_text, depth + 1);
+            if (inner_elems.len == 0) return error.InvalidMacroMatcher;
             var inner_elems_owned = true;
             errdefer {
                 if (inner_elems_owned) freeMatcherElements(alloc, inner_elems);
@@ -769,21 +828,17 @@ fn parseMatcherDepth(
             post = skipWhitespaceAndComments(raw, post);
             var sep: ?[]const u8 = null;
             var op: RepetitionOp = .zero_or_more;
-
             if (post < raw.len and (raw[post] == '*' or raw[post] == '+' or raw[post] == '?')) {
                 op = if (raw[post] == '*') .zero_or_more else if (raw[post] == '+') .one_or_more else .zero_or_one;
                 i = post + 1;
             } else {
                 var op_idx = post;
                 while (op_idx < raw.len and raw[op_idx] != '*' and raw[op_idx] != '+' and raw[op_idx] != '?') : (op_idx += 1) {}
-                if (op_idx < raw.len) {
-                    const raw_sep = std.mem.trim(u8, raw[post..op_idx], " \t\r\n");
-                    sep = if (raw_sep.len > 0) raw_sep else null;
-                    op = if (raw[op_idx] == '*') .zero_or_more else if (raw[op_idx] == '+') .one_or_more else .zero_or_one;
-                    i = op_idx + 1;
-                } else {
-                    i = post;
-                }
+                if (op_idx >= raw.len) return error.InvalidMacroMatcher;
+                const raw_sep = std.mem.trim(u8, raw[post..op_idx], " \t\r\n");
+                sep = if (raw_sep.len > 0) raw_sep else null;
+                op = if (raw[op_idx] == '*') .zero_or_more else if (raw[op_idx] == '+') .one_or_more else .zero_or_one;
+                i = op_idx + 1;
             }
             try list.append(alloc, .{ .repetition = .{ .elements = inner_elems, .separator = sep, .op = op } });
             inner_elems_owned = false;
@@ -794,25 +849,19 @@ fn parseMatcherDepth(
             const var_name = raw[var_start..i];
 
             var kind: MetavarKind = .ident;
-            const saved_i = i;
             const after_ws = skipWhitespaceAndComments(raw, i);
             if (after_ws < raw.len and raw[after_ws] == ':') {
                 var kind_pos = skipWhitespaceAndComments(raw, after_ws + 1);
                 const kind_start = kind_pos;
                 while (kind_pos < raw.len and isIdentChar(raw[kind_pos])) : (kind_pos += 1) {}
-                if (kind_pos > kind_start) {
-                    const kind_name = raw[kind_start..kind_pos];
-                    if (MetavarKind.fromString(kind_name)) |k| {
-                        kind = k;
-                        i = kind_pos;
-                    } else {
-                        i = saved_i;
-                    }
-                } else {
-                    i = saved_i;
-                }
+                if (kind_pos == kind_start) return error.InvalidMacroMatcher;
+                const kind_name = raw[kind_start..kind_pos];
+                kind = MetavarKind.fromString(kind_name) orelse return error.InvalidMacroMatcher;
+                i = kind_pos;
             }
             try list.append(alloc, .{ .metavar = .{ .name = var_name, .kind = kind } });
+        } else if (raw[i] == '$') {
+            return error.InvalidMacroMatcher;
         } else {
             const tok_start = i;
             if (i + 1 < raw.len and (std.mem.startsWith(u8, raw[i..], "=>") or std.mem.startsWith(u8, raw[i..], "->") or std.mem.startsWith(u8, raw[i..], "::"))) {
@@ -827,8 +876,8 @@ fn parseMatcherDepth(
     }
     return list.toOwnedSlice(alloc);
 }
-
 pub fn parseTemplate(alloc: std.mem.Allocator, raw: []const u8) ![]const TemplateElement {
+    validateMacroTokenStream(raw) catch return error.InvalidMacroTemplate;
     return parseTemplateDepth(alloc, raw, 0);
 }
 
@@ -857,9 +906,11 @@ fn parseTemplateDepth(
             }
             if (i + 1 < raw.len and raw[i + 1] == '(') {
                 const open_idx = i + 1;
-                const close_idx = findClosingDelimiter(raw, open_idx) orelse return error.InvalidMacroTemplate;
+                const close_idx = findClosingDelimiterChecked(raw, open_idx) catch
+                    return error.InvalidMacroTemplate;
                 const inner_text = raw[open_idx + 1 .. close_idx];
                 const inner_elems = try parseTemplateDepth(alloc, inner_text, depth + 1);
+                if (inner_elems.len == 0) return error.InvalidMacroTemplate;
                 var inner_elems_owned = true;
                 errdefer {
                     if (inner_elems_owned) freeTemplateElements(alloc, inner_elems);
@@ -876,14 +927,11 @@ fn parseTemplateDepth(
                 } else {
                     var op_idx = post;
                     while (op_idx < raw.len and raw[op_idx] != '*' and raw[op_idx] != '+' and raw[op_idx] != '?') : (op_idx += 1) {}
-                    if (op_idx < raw.len) {
-                        const raw_sep = std.mem.trim(u8, raw[post..op_idx], " \t\r\n");
-                        sep = if (raw_sep.len > 0) raw_sep else null;
-                        op = if (raw[op_idx] == '*') .zero_or_more else if (raw[op_idx] == '+') .one_or_more else .zero_or_one;
-                        i = op_idx + 1;
-                    } else {
-                        i = post;
-                    }
+                    if (op_idx >= raw.len) return error.InvalidMacroTemplate;
+                    const raw_sep = std.mem.trim(u8, raw[post..op_idx], " \t\r\n");
+                    sep = if (raw_sep.len > 0) raw_sep else null;
+                    op = if (raw[op_idx] == '*') .zero_or_more else if (raw[op_idx] == '+') .one_or_more else .zero_or_one;
+                    i = op_idx + 1;
                 }
                 try list.append(alloc, .{ .repetition = .{ .elements = inner_elems, .separator = sep, .op = op } });
                 inner_elems_owned = false;
@@ -896,7 +944,7 @@ fn parseTemplateDepth(
                 try list.append(alloc, .{ .metavar = var_name });
                 text_start = i;
             } else {
-                i += 1;
+                return error.InvalidMacroTemplate;
             }
         } else {
             i += 1;
@@ -1026,6 +1074,7 @@ pub fn matchPattern(
             .repetition => |rep| {
                 const next_elem = if (elem_idx + 1 < elements.len) elements[elem_idx + 1] else null;
                 const follow_tok = if (next_elem != null and next_elem.? == .token) next_elem.?.token else null;
+                var repetition_count: usize = 0;
 
                 while (true) {
                     input_idx = skipWhitespaceAndComments(input_text, input_idx);
@@ -1033,6 +1082,7 @@ pub fn matchPattern(
                     if (follow_tok) |ft| {
                         if (std.mem.startsWith(u8, input_text[input_idx..], ft)) break;
                     }
+                    const repetition_start = input_idx;
 
                     for (rep.elements, 0..) |inner_elem, j| {
                         input_idx = skipWhitespaceAndComments(input_text, input_idx);
@@ -1053,10 +1103,13 @@ pub fn matchPattern(
                                 }
                             },
                             .repetition => {
-                                return false; // Nested matcher repetition not yet required
+                                return error.InvalidMacroRepetition;
                             },
                         }
                     }
+                    if (input_idx == repetition_start) return false;
+                    repetition_count += 1;
+                    if (rep.op == .zero_or_one) break;
 
                     input_idx = skipWhitespaceAndComments(input_text, input_idx);
                     if (rep.separator) |s| {
@@ -1064,13 +1117,12 @@ pub fn matchPattern(
                             input_idx += s.len;
                         } else if (follow_tok != null and std.mem.startsWith(u8, input_text[input_idx..], follow_tok.?)) {
                             break;
-                        } else if (input_idx >= input_text.len) {
-                            break;
                         } else {
                             break;
                         }
                     }
                 }
+                if (rep.op == .one_or_more and repetition_count == 0) return false;
                 elem_idx += 1;
             },
         }
@@ -1083,21 +1135,37 @@ pub fn matchPattern(
     return (input_idx >= input_text.len and elem_idx >= elements.len);
 }
 
-fn findRepCount(elem: TemplateElement, bindings: *const Bindings, count: *usize) void {
-    switch (elem) {
-        .metavar => |var_name| {
-            const len = bindings.getRepLen(var_name);
-            if (len > count.*) {
-                count.* = len;
-            }
-        },
-        .repetition => |rep| {
-            for (rep.elements) |child| {
-                findRepCount(child, bindings, count);
-            }
-        },
-        .text => {},
+fn templateRepetitionCount(
+    elements: []const TemplateElement,
+    bindings: *const Bindings,
+) !usize {
+    var count: ?usize = null;
+    var found_repetition_binding = false;
+    for (elements) |elem| {
+        switch (elem) {
+            .text => {},
+            .metavar => |var_name| {
+                if (bindings.hasRep(var_name)) {
+                    const len = bindings.getRepLen(var_name);
+                    if (count) |existing| {
+                        if (existing != len) return error.InvalidMacroRepetition;
+                    } else {
+                        count = len;
+                    }
+                    found_repetition_binding = true;
+                } else if (bindings.getTop(var_name) == null) {
+                    return error.UnboundMacroRepetition;
+                }
+            },
+            .repetition => {
+                // Matching nested repetitions is not supported by the flat
+                // binding store. Reject instead of guessing an index.
+                return error.InvalidMacroRepetition;
+            },
+        }
     }
+    if (!found_repetition_binding) return error.UnboundMacroRepetition;
+    return count.?;
 }
 
 fn expandTemplateElements(
@@ -1114,23 +1182,30 @@ fn expandTemplateElements(
             },
             .metavar => |var_name| {
                 if (rep_idx) |idx| {
-                    if (bindings.getRep(var_name, idx)) |val| {
+                    if (bindings.hasRep(var_name)) {
+                        const val = bindings.getRep(var_name, idx) orelse
+                            return error.UnboundMacroRepetition;
                         try out.appendSlice(alloc, val);
-                        continue;
+                    } else if (bindings.getTop(var_name)) |val| {
+                        try out.appendSlice(alloc, val);
+                    } else {
+                        return error.UnboundMacroVariable;
                     }
-                }
-                if (bindings.getTop(var_name)) |val| {
+                } else if (bindings.getTop(var_name)) |val| {
                     try out.appendSlice(alloc, val);
-                } else if (rep_idx == null and bindings.getRepLen(var_name) > 0) {
-                    if (bindings.getRep(var_name, 0)) |val| {
-                        try out.appendSlice(alloc, val);
-                    }
+                } else if (bindings.hasRep(var_name)) {
+                    return error.UnboundMacroRepetition;
+                } else {
+                    return error.UnboundMacroVariable;
                 }
             },
             .repetition => |rep| {
-                var count: usize = 0;
-                for (rep.elements) |child| {
-                    findRepCount(child, bindings, &count);
+                const count = try templateRepetitionCount(rep.elements, bindings);
+                if (rep.op == .one_or_more and count == 0) {
+                    return error.InvalidMacroRepetition;
+                }
+                if (rep.op == .zero_or_one and count > 1) {
+                    return error.InvalidMacroRepetition;
                 }
                 for (0..count) |idx| {
                     if (idx > 0 and rep.separator != null) {
@@ -1148,8 +1223,9 @@ pub fn expandMacroRules(
     alloc: std.mem.Allocator,
     def: MacroDef,
     raw_args: []const u8,
-) !?[]const u8 {
-    const trimmed_args = getEnclosedContent(raw_args);
+) ![]const u8 {
+    const trimmed_args = try getEnclosedContent(raw_args);
+    if (def.rules.len == 0) return error.InvalidMacroDefinition;
     for (def.rules) |rule| {
         var bindings = Bindings.init(alloc);
         defer bindings.deinit();
@@ -1158,78 +1234,126 @@ pub fn expandMacroRules(
             var out: std.ArrayListUnmanaged(u8) = .empty;
             errdefer out.deinit(alloc);
             try expandTemplateElements(alloc, &out, rule.template, &bindings, null);
-            const expanded = try out.toOwnedSlice(alloc);
+            if (std.mem.trim(u8, out.items, " \t\r\n").len == 0) {
+                return error.EmptyMacroExpansion;
+            }
+            const expanded: []const u8 = try out.toOwnedSlice(alloc);
             return expanded;
         }
     }
-    return null;
+    return error.UnmatchedMacroRule;
 }
 
-pub fn parseMacroRulesDefinition(alloc: std.mem.Allocator, raw_def: []const u8) !?MacroDef {
+pub fn parseMacroRulesDefinition(alloc: std.mem.Allocator, raw_def: []const u8) !MacroDef {
+    validateMacroTokenStream(raw_def) catch return error.InvalidMacroDefinition;
+
     var i = skipWhitespaceAndComments(raw_def, 0);
-    if (std.mem.startsWith(u8, raw_def[i..], "macro_rules!")) {
-        i += "macro_rules!".len;
+    if (!std.mem.startsWith(u8, raw_def[i..], "macro_rules!")) {
+        return error.InvalidMacroDefinition;
     }
+    i += "macro_rules!".len;
     i = skipWhitespaceAndComments(raw_def, i);
-    if (i >= raw_def.len or !isIdentStart(raw_def[i])) return null;
+    if (i >= raw_def.len or !isIdentStart(raw_def[i])) return error.InvalidMacroDefinition;
 
     const name_start = i;
     while (i < raw_def.len and isIdentChar(raw_def[i])) : (i += 1) {}
     const name = raw_def[name_start..i];
 
     i = skipWhitespaceAndComments(raw_def, i);
-    if (i >= raw_def.len or (raw_def[i] != '{' and raw_def[i] != '(' and raw_def[i] != '[')) return null;
+    if (i >= raw_def.len or (raw_def[i] != '{' and raw_def[i] != '(' and raw_def[i] != '[')) {
+        return error.InvalidMacroDefinition;
+    }
 
     const body_open = i;
-    const body_close = findClosingDelimiter(raw_def, body_open) orelse return null;
+    const body_close = findClosingDelimiterChecked(raw_def, body_open) catch
+        return error.InvalidMacroDefinition;
     const rules_body = raw_def[body_open + 1 .. body_close];
+    i = skipWhitespaceAndComments(raw_def, body_close + 1);
+    if (i < raw_def.len and raw_def[i] == ';') {
+        i = skipWhitespaceAndComments(raw_def, i + 1);
+    }
+    if (i != raw_def.len) return error.InvalidMacroDefinition;
 
     var rules_list: std.ArrayListUnmanaged(MacroRule) = .empty;
-    errdefer rules_list.deinit(alloc);
+    errdefer {
+        for (rules_list.items) |rule| {
+            freeMatcherElements(alloc, rule.matcher);
+            freeTemplateElements(alloc, rule.template);
+            alloc.free(rule.raw_matcher);
+            alloc.free(rule.raw_template);
+        }
+        rules_list.deinit(alloc);
+    }
 
     var idx: usize = 0;
     while (idx < rules_body.len) {
         idx = skipWhitespaceAndComments(rules_body, idx);
         if (idx >= rules_body.len) break;
-        if (rules_body[idx] == ';') {
-            idx += 1;
-            continue;
-        }
+        if (rules_body[idx] == ';') return error.InvalidMacroDefinition;
         if (rules_body[idx] != '(' and rules_body[idx] != '[' and rules_body[idx] != '{') {
-            break;
+            return error.InvalidMacroDefinition;
         }
+
         const matcher_open = idx;
-        const matcher_close = findClosingDelimiter(rules_body, matcher_open) orelse break;
+        const matcher_close = findClosingDelimiterChecked(rules_body, matcher_open) catch
+            return error.InvalidMacroDefinition;
         const raw_matcher = rules_body[matcher_open + 1 .. matcher_close];
         idx = matcher_close + 1;
         idx = skipWhitespaceAndComments(rules_body, idx);
-        if (idx + 2 > rules_body.len or !std.mem.startsWith(u8, rules_body[idx..], "=>")) break;
+        if (idx + 2 > rules_body.len or !std.mem.startsWith(u8, rules_body[idx..], "=>")) {
+            return error.InvalidMacroDefinition;
+        }
         idx += 2;
         idx = skipWhitespaceAndComments(rules_body, idx);
-        if (idx >= rules_body.len or (rules_body[idx] != '{' and rules_body[idx] != '(' and rules_body[idx] != '[')) break;
+        if (idx >= rules_body.len or (rules_body[idx] != '{' and rules_body[idx] != '(' and rules_body[idx] != '[')) {
+            return error.InvalidMacroDefinition;
+        }
         const tmpl_open = idx;
-        const tmpl_close = findClosingDelimiter(rules_body, tmpl_open) orelse break;
+        const tmpl_close = findClosingDelimiterChecked(rules_body, tmpl_open) catch
+            return error.InvalidMacroDefinition;
         const raw_tmpl = rules_body[tmpl_open + 1 .. tmpl_close];
         idx = tmpl_close + 1;
 
-        const matcher_elems = try parseMatcher(alloc, raw_matcher);
-        const tmpl_elems = try parseTemplate(alloc, raw_tmpl);
+        const owned_matcher = try alloc.dupe(u8, raw_matcher);
+        var matcher_source_owned = true;
+        errdefer if (matcher_source_owned) alloc.free(owned_matcher);
+        const owned_template = try alloc.dupe(u8, raw_tmpl);
+        var template_source_owned = true;
+        errdefer if (template_source_owned) alloc.free(owned_template);
+        const matcher_elems = try parseMatcher(alloc, owned_matcher);
+        var matcher_owned = true;
+        errdefer if (matcher_owned) freeMatcherElements(alloc, matcher_elems);
+        const tmpl_elems = try parseTemplate(alloc, owned_template);
+        var template_owned = true;
+        errdefer if (template_owned) freeTemplateElements(alloc, tmpl_elems);
         try rules_list.append(alloc, .{
             .matcher = matcher_elems,
             .template = tmpl_elems,
-            .raw_matcher = raw_matcher,
-            .raw_template = raw_tmpl,
+            .raw_matcher = owned_matcher,
+            .raw_template = owned_template,
         });
+        matcher_owned = false;
+        template_owned = false;
+        matcher_source_owned = false;
+        template_source_owned = false;
 
         idx = skipWhitespaceAndComments(rules_body, idx);
         if (idx < rules_body.len and rules_body[idx] == ';') {
             idx += 1;
+            idx = skipWhitespaceAndComments(rules_body, idx);
+            if (idx < rules_body.len and rules_body[idx] == ';') {
+                return error.InvalidMacroDefinition;
+            }
         }
     }
+    if (rules_list.items.len == 0) return error.InvalidMacroDefinition;
 
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_rules = try rules_list.toOwnedSlice(alloc);
     return .{
-        .name = name,
-        .rules = try rules_list.toOwnedSlice(alloc),
+        .name = owned_name,
+        .rules = owned_rules,
     };
 }
 
@@ -1242,6 +1366,10 @@ pub const MacroTable = struct {
     }
 
     pub fn deinit(self: *MacroTable) void {
+        var values = self.macros.valueIterator();
+        while (values.next()) |def| {
+            def.deinit(self.alloc);
+        }
         self.macros.deinit(self.alloc);
         self.* = undefined;
     }
@@ -1255,6 +1383,7 @@ pub const MacroTable = struct {
         if (std.mem.endsWith(u8, clean_name, "!")) {
             clean_name = clean_name[0 .. clean_name.len - 1];
         }
+        if (std.mem.indexOf(u8, clean_name, "::") != null) return null;
         return self.macros.get(clean_name);
     }
 };

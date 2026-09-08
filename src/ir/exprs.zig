@@ -51,6 +51,7 @@ pub const ExprKind = union(enum) {
     literal: Literal,
     array: ArrayExpr,
     vec_lit: VecLit,
+    range: RangeExpr,
     path: PathExpr,
     block: BlockExpr,
     unit: void,
@@ -75,7 +76,10 @@ pub const ExprKind = union(enum) {
     field: FieldExpr,
     index: IndexExpr,
 
-    // — operators (§1.5) —
+    // — scalar conversions (§1.5) —
+    cast: CastExpr,
+
+    // — operators (§1.6) —
     binary: BinaryExpr,
     unary: UnaryExpr,
     assign: AssignExpr,
@@ -88,6 +92,15 @@ pub const ExprKind = union(enum) {
 
     // — explicit refusal —
     unsupported: Unsupported,
+};
+pub const FieldExpr = struct {
+    base: NodeId,
+    field: []const u8,
+    resolved: DefId,
+};
+pub const IndexExpr = struct {
+    base: NodeId,
+    index: NodeId,
 };
 
 // §1.1 Literals & atoms ─────────────────────────────────────────────────────
@@ -150,6 +163,15 @@ pub const ArrayExpr = struct {
 pub const VecLit = struct {
     elements: []const NodeId,
     repeat: ?usize,
+};
+
+/// A bounded range expression (`start..end` or `start..=end`).
+/// Both bounds are expression-table references so nested lowering passes
+/// preserve the canonical node graph.
+pub const RangeExpr = struct {
+    start: NodeId,
+    end: NodeId,
+    inclusive: bool = false,
 };
 
 /// A resolved reference, not a name. Collapses Rust's `x`, `Foo::Bar` (unit
@@ -312,23 +334,28 @@ pub const EnumVariant = struct {
     named_fields: []const FieldInit,
 };
 
-// §1.4 Access ───────────────────────────────────────────────────────────────
+// §1.5 Scalar conversions ───────────────────────────────────────────────────
 
-pub const FieldExpr = struct {
-    /// Base expression index (expr table).
-    base: NodeId,
-    field: []const u8,
-    resolved: DefId,
+pub const ConversionKind = enum {
+    as_,
+    primitive_from,
 };
 
-pub const IndexExpr = struct {
-    /// Base expression index (expr table).
-    base: NodeId,
-    /// Index expression index (expr table).
-    index: NodeId,
+/// A validated primitive scalar conversion (`value as Target`).
+pub const CastExpr = struct {
+    /// Conversion syntax and semantics.
+    kind: ConversionKind = .as_,
+    /// Source expression index (expr table).
+    operand: NodeId,
+    /// Validated source type. This is explicit because transient composite
+    /// types (for example a loop capture reference) are not guaranteed to be
+    /// interned in `Bodies.types`.
+    source_type: types.Type,
+    /// Primitive target type index (type table).
+    target: TypeId,
 };
 
-// §1.5 Operators ────────────────────────────────────────────────────────────
+// §1.6 Operators ────────────────────────────────────────────────────────────
 
 /// Per-site overflow mode: sidecar-decided so emit is deterministic and never
 /// "relies on defaults".
@@ -447,15 +474,26 @@ pub const CaptureMode = enum {
 
 /// The backend lowers each adapter to an explicit loop; sealed union so
 /// `analyse` rejects unknown adapters loudly but v3 only adds arms.
+pub const IteratorTerminal = enum {
+    /// Leave the adapter chain as an iterator value.
+    iterator,
+    /// Materialize the chain into an owned `Vec`.
+    collect_vec,
+};
+
 pub const IteratorChainExpr = struct {
     /// Base iterable expression index (expr table).
     source: NodeId,
     adapters: []const IteratorAdapter,
+    /// Terminal operation. The default preserves deferred iterator fixtures.
+    terminal: IteratorTerminal = .iterator,
 };
 
 pub const IteratorAdapter = union(enum) {
     map: MapAdapter,
     filter: FilterAdapter,
+    /// Apply a closure and flatten each returned iterator.
+    flat_map: ClosureExpr,
     enumerate: void, // → for (xs, 0..)
     zip: ZipAdapter,
     range_rev: void, // .rev() on a range
@@ -633,6 +671,7 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
 
     const vec_lit: VecLit = .{ .elements = &.{ 1, 2 }, .repeat = null };
     const array_expr: ArrayExpr = .{ .elements = &.{ 3, 4 }, .repeat = null };
+    const range_expr: RangeExpr = .{ .start = 5, .end = 6, .inclusive = false };
 
     // §1.1 — Path, Block (BlockExpr is non-recursive via NodeIds)
     const path_expr: PathExpr = .{ .def = 1, .generic_args = &.{} };
@@ -829,6 +868,7 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const e_lit: Expr = .{ .id = 1, .span = span, .ty = null, .kind = .{ .literal = lit_int } };
     const e_array: Expr = .{ .id = 26, .span = span, .ty = null, .kind = .{ .array = array_expr } };
     const e_vec: Expr = .{ .id = 24, .span = span, .ty = null, .kind = .{ .vec_lit = vec_lit } };
+    const e_range: Expr = .{ .id = 27, .span = span, .ty = null, .kind = .{ .range = range_expr } };
     const e_path: Expr = .{ .id = 2, .span = span, .ty = null, .kind = .{ .path = path_expr } };
     const e_block: Expr = .{ .id = 3, .span = span, .ty = null, .kind = .{ .block = block_expr } };
     const e_unit: Expr = .{ .id = 4, .span = span, .ty = null, .kind = .{ .unit = {} } };
@@ -854,6 +894,7 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const e_unsup: Expr = .{ .id = 25, .span = span, .ty = null, .kind = .{ .unsupported = unsup } };
     _ = e_lit;
     _ = e_array;
+    _ = e_range;
     _ = e_vec;
     _ = e_path;
     _ = e_block;
@@ -1075,13 +1116,15 @@ test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter
     const map_ad: MapAdapter = .{ .closure = closure };
     const filter_ad: FilterAdapter = .{ .closure = closure };
     const zip_ad: ZipAdapter = .{ .other = 10 };
+    const range: RangeExpr = .{ .start = 1, .end = 2, .inclusive = true };
 
     // Unsupported (consumed by IteratorAdapter.other below)
     const unsup: Unsupported = .{ .reason = "scan", .suggested_version = .v3 };
 
-    // IteratorAdapter — all 6 variants
+    // IteratorAdapter — all 7 variants
     const ia_map: IteratorAdapter = .{ .map = map_ad };
     const ia_filter: IteratorAdapter = .{ .filter = filter_ad };
+    const ia_flat_map: IteratorAdapter = .{ .flat_map = closure };
     const ia_enum: IteratorAdapter = .{ .enumerate = {} };
     const ia_zip: IteratorAdapter = .{ .zip = zip_ad };
     const ia_rev: IteratorAdapter = .{ .range_rev = {} };
@@ -1092,16 +1135,27 @@ test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter
     _ = ia_rev;
     _ = ia_other;
 
+    const terminal_iterator: IteratorTerminal = .iterator;
+    const terminal_collect_vec: IteratorTerminal = .collect_vec;
+    _ = terminal_iterator;
+    _ = terminal_collect_vec;
+
     // IteratorChainExpr (consumed by IterKind.adapter below)
-    const chain: IteratorChainExpr = .{ .source = 11, .adapters = &.{ia_map} };
+    const chain: IteratorChainExpr = .{
+        .source = 11,
+        .adapters = &.{ ia_map, ia_flat_map },
+        .terminal = .collect_vec,
+    };
 
     // IterKind.adapter variant (the deferred escape)
     const ik_adapter: IterKind = .{ .adapter = chain };
     _ = ik_adapter;
 
-    // Wrap closure & iterator_chain in their Expr arms
+    // Wrap range, closure & iterator_chain in their Expr arms
+    const e_range: Expr = .{ .id = 29, .span = span, .ty = null, .kind = .{ .range = range } };
     const e_closure: Expr = .{ .id = 30, .span = span, .ty = null, .kind = .{ .closure = closure } };
     const e_chain: Expr = .{ .id = 31, .span = span, .ty = null, .kind = .{ .iterator_chain = chain } };
+    _ = e_range;
     _ = e_closure;
     _ = e_chain;
 }

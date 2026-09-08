@@ -1,6 +1,7 @@
-//! translate_rust — exploration of a translate-c-style tool for Rust → Zig.
-//! Pipeline not built yet; findings in notes/research/.
-//! The Rust grammar front-end (tree-sitter) lives in `rust.zig`.
+//! translate_rust — Rust → Zig translation pipeline.
+//! The canonical path is Rust source / wire JSON → RustIr → ZigAST → package.
+//! Tree-sitter provides the syntax front-end; `src/model` remains a read-only
+//! wire inventory/parser support layer for diagnostics and legacy fixtures.
 
 const std = @import("std");
 

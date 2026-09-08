@@ -7,23 +7,22 @@ const std = @import("std");
 const spine = @import("spine.zig");
 const graph = @import("graph.zig");
 const bodies = @import("bodies.zig");
-const json = @import("json.zig");
 const emit = @import("emit.zig");
 
 /// A single generated source or build file in a package.
-pub const GeneratedFile = struct {
+const GeneratedFile = struct {
     path: []const u8, // relative path e.g. "build.zig", "build.zig.zon", "src/root.zig", "src/util.zig"
     content: []const u8, // formatted Zig source text
 };
 
 /// A generated, standalone Zig package directory structure.
-pub const GeneratedPackage = struct {
+const GeneratedPackage = struct {
     crate_name: []const u8,
     package_name: []const u8, // "r2z-<crate_name>"
     files: []const GeneratedFile,
     allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *GeneratedPackage) void {
+    fn deinit(self: *GeneratedPackage) void {
         for (self.files) |f| {
             self.allocator.free(f.path);
             self.allocator.free(f.content);
@@ -35,7 +34,7 @@ pub const GeneratedPackage = struct {
     }
 
     /// Write all generated package files to disk at `dest_dir_path` using std.Io.
-    pub fn writeToDisk(self: *const GeneratedPackage, io: std.Io, dest_dir_path: []const u8) !void {
+    fn writeToDisk(self: *const GeneratedPackage, io: std.Io, dest_dir_path: []const u8) !void {
         var dir = std.Io.Dir.cwd();
         try dir.createDirPath(io, dest_dir_path);
 
@@ -172,7 +171,7 @@ fn isModuleInCrate(g: *const graph.CrateGraph, mod_id: spine.EntityId, root_id: 
 }
 
 /// Generate a complete standalone Zig package from a CrateGraph and optional Bodies.
-pub fn generatePackage(
+fn generatePackage(
     allocator: std.mem.Allocator,
     g: *const graph.CrateGraph,
     b: ?*const bodies.Bodies,
@@ -250,186 +249,4 @@ pub fn generatePackage(
         .files = try file_list.toOwnedSlice(allocator),
         .allocator = allocator,
     };
-}
-
-// ── Tests ──────────────────────────────────────────────────────────────────
-
-fn readFixture(allocator: std.mem.Allocator, test_io: std.Io, path: []const u8) ![]const u8 {
-    var io_buf: [4096]u8 = undefined;
-    var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(test_io, path, .{});
-    defer file.close(test_io);
-    var reader = file.reader(test_io, &io_buf);
-    return reader.interface.allocRemaining(allocator, .limited(1 << 30));
-}
-
-test "generatePackage: mini fixture generates multi-file package with imports and build files" {
-    const allocator = std.testing.allocator;
-    const test_io = std.testing.io;
-
-    const mini_json_bytes = try readFixture(allocator, test_io, "test/mini.json");
-    defer allocator.free(mini_json_bytes);
-
-    var g = try json.parse(allocator, mini_json_bytes);
-    defer g.deinit();
-
-    var pkg = try generatePackage(allocator, &g, null, 0);
-    defer pkg.deinit();
-
-    try std.testing.expectEqualStrings("mini", pkg.crate_name);
-    try std.testing.expectEqualStrings("r2z-mini", pkg.package_name);
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[1].content, "r2z_mini") != null);
-
-    // Verify files generated
-    try std.testing.expectEqualStrings("build.zig", pkg.files[0].path);
-    try std.testing.expectEqualStrings("build.zig.zon", pkg.files[1].path);
-    try std.testing.expectEqualStrings("src/root.zig", pkg.files[2].path);
-    try std.testing.expectEqualStrings("src/util.zig", pkg.files[3].path);
-
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[1].content, "0.16.0") != null);
-
-    // Verify build.zig content
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[0].content, "b.addModule(\"r2z-mini\"") != null);
-
-    // Verify src/root.zig imports util.zig and emits root items
-    try std.testing.expect(
-        std.mem.indexOf(u8, pkg.files[2].content, "pub const util = @import(\"util.zig\");") != null,
-    );
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub const Point = struct {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub const Shape = enum(u8) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub fn area()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub const helper = util.helper;") != null);
-
-    // Verify src/util.zig contains util submodule's items
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[3].content, "pub fn helper()") != null);
-}
-
-test "generatePackage: fnv fixture generates single-module package with body lowering" {
-    const test_io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const fnv_json_bytes = try readFixture(allocator, test_io, "test/fnv.json");
-    var parsed = try json.parseFull(allocator, fnv_json_bytes);
-    const pkg = try generatePackage(allocator, &parsed.graph, &parsed.bodies, 0);
-    try std.testing.expectEqualStrings("fnv", pkg.crate_name);
-    try std.testing.expectEqualStrings("r2z-fnv", pkg.package_name);
-    try std.testing.expectEqual(@as(usize, 3), pkg.files.len);
-
-    // Verify files generated
-    try std.testing.expectEqualStrings("build.zig", pkg.files[0].path);
-    try std.testing.expectEqualStrings("build.zig.zon", pkg.files[1].path);
-    try std.testing.expectEqualStrings("src/root.zig", pkg.files[2].path);
-
-    // Verify src/root.zig contains fnv hash function and constants
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "pub fn fnv1a_hash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "const FNV_OFFSET_BASIS:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pkg.files[2].content, "const FNV_PRIME:") != null);
-}
-
-test "generatePackage: fletcher fixture generates standalone package with all 6 tests" {
-    const test_io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const fletcher_json_bytes = try readFixture(allocator, test_io, "test/fletcher.json");
-    const parsed = try json.parseFull(allocator, fletcher_json_bytes);
-    const pkg = try generatePackage(allocator, &parsed.graph, &parsed.bodies, 0);
-
-    try std.testing.expectEqualStrings("fletcher", pkg.crate_name);
-    try std.testing.expectEqualStrings("r2z-fletcher", pkg.package_name);
-
-    // Single-module package: build.zig, build.zig.zon, src/root.zig.
-    try std.testing.expectEqual(@as(usize, 3), pkg.files.len);
-    try std.testing.expectEqualStrings("src/root.zig", pkg.files[2].path);
-
-    // src/root.zig contains the checksum fns, constants, and all 6 test vectors.
-    const root = pkg.files[2].content;
-    try std.testing.expect(std.mem.indexOf(u8, root, "calc_fletcher16") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "reduce") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "BIT_MASK") != null);
-    // The 6 translated test blocks and their expected checksum vectors.
-    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_ascii_data") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_underflow") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_overflow") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_issue_8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "fletcher16_wiki_example") != null);
-    // The 6 expected checksum values appear as literals in the emitted tests.
-    try std.testing.expect(std.mem.indexOf(u8, root, "0xC8F0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "0x2057") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "0x0627") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "0x3FAD") != null);
-    try std.testing.expect(std.mem.indexOf(u8, root, "0x0063") != null);
-}
-
-test "generatePackage: hex fixture generates multi-module package with error.zig" {
-    const test_io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const hex_json_bytes = try readFixture(allocator, test_io, "test/hex.json");
-    const parsed = try json.parseFull(allocator, hex_json_bytes);
-    const pkg = try generatePackage(allocator, &parsed.graph, &parsed.bodies, 0);
-
-    try std.testing.expectEqualStrings("hex", pkg.crate_name);
-    try std.testing.expectEqualStrings("r2z-hex", pkg.package_name);
-
-    // Multi-module: root + error submodule, plus the two build files.
-    try std.testing.expectEqual(@as(usize, 4), pkg.files.len);
-    var has_build = false;
-    var has_zon = false;
-    var has_root = false;
-    var has_error = false;
-    for (pkg.files) |f| {
-        if (std.mem.eql(u8, f.path, "build.zig")) has_build = true;
-        if (std.mem.eql(u8, f.path, "build.zig.zon")) has_zon = true;
-        if (std.mem.eql(u8, f.path, "src/root.zig")) has_root = true;
-        if (std.mem.eql(u8, f.path, "src/error.zig")) has_error = true;
-    }
-    try std.testing.expect(has_build);
-    try std.testing.expect(has_zon);
-    try std.testing.expect(has_root);
-    try std.testing.expect(has_error);
-
-    // Error enum lands in its own module file.
-    for (pkg.files) |f| {
-        if (std.mem.eql(u8, f.path, "src/error.zig")) {
-            try std.testing.expect(std.mem.indexOf(u8, f.content, "FromHexError") != null);
-        }
-    }
-}
-
-test "GeneratedPackage.writeToDisk writes files safely" {
-    const test_io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const mini_json_bytes = try readFixture(allocator, test_io, "test/mini.json");
-    var g = try json.parse(allocator, mini_json_bytes);
-    const pkg = try generatePackage(allocator, &g, null, 0);
-
-    const test_dest = "zig-out/test-package-mini";
-    try pkg.writeToDisk(test_io, test_dest);
-
-    // Verify written files exist and match content
-    var io_buf: [4096]u8 = undefined;
-    var dir = std.Io.Dir.cwd();
-    for (pkg.files) |f| {
-        const full_path = try std.fs.path.join(allocator, &.{ test_dest, f.path });
-        defer allocator.free(full_path);
-
-        const file = try dir.openFile(test_io, full_path, .{});
-        defer file.close(test_io);
-
-        var reader = file.reader(test_io, &io_buf);
-        const disk_content = try reader.interface.allocRemaining(allocator, .limited(1 << 30));
-        defer allocator.free(disk_content);
-
-        try std.testing.expectEqualStrings(f.content, disk_content);
-    }
 }

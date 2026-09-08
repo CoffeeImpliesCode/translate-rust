@@ -33,6 +33,16 @@ pub fn typeEquals(a: types.Type, b: types.Type) bool {
             .path => |bp| pathEquals(ap, bp),
             else => false,
         },
+        .external_nominal => |ae| switch (b) {
+            .external_nominal => |be| {
+                if (ae.path.len != be.path.len or ae.args.len != be.args.len) return false;
+                for (ae.path, be.path) |left, right| {
+                    if (!std.mem.eql(u8, left, right)) return false;
+                }
+                return typesSliceEqual(ae.args, be.args);
+            },
+            else => false,
+        },
         .prim => |ap| switch (b) {
             .prim => |bp| ap == bp,
             else => false,
@@ -162,6 +172,17 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
     }
     switch (ty) {
         .path => |p| try appendMangledPath(alloc, w, p),
+        .external_nominal => |external| {
+            try w.appendSlice(alloc, "ext");
+            for (external.path) |segment| {
+                try w.append(alloc, '_');
+                try appendMangledName(alloc, w, segment);
+            }
+            for (external.args) |arg| {
+                try w.append(alloc, '_');
+                try appendMangled(alloc, w, arg);
+            }
+        },
         .prim => |p| try w.appendSlice(alloc, @tagName(p)),
         .reference => |r| {
             try appendMangled(alloc, w, r.pointee);
@@ -381,6 +402,9 @@ fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, ty: types.T
             }
             for (g.args.params) |a| try collectType(table, alloc, a);
         },
+        .external_nominal => |external| {
+            for (external.args) |arg| try collectType(table, alloc, arg);
+        },
         .reference => |r| try collectType(table, alloc, r.pointee),
         .raw_ptr => |r| try collectType(table, alloc, r.pointee),
         .slice => |s| try collectType(table, alloc, s.elem),
@@ -467,6 +491,10 @@ fn collectExpr(
         .continue_, .literal, .unit, .unsupported => {},
         .array => |a| for (a.elements) |el| try collectExpr(table, alloc, b, v, el),
         .vec_lit => |vec| for (vec.elements) |el| try collectExpr(table, alloc, b, v, el),
+        .range => |range| {
+            try collectExpr(table, alloc, b, v, range.start);
+            try collectExpr(table, alloc, b, v, range.end);
+        },
         .call => |c| for (c.args) |a| try collectExpr(table, alloc, b, v, a),
         .method_call => |mc| {
             try collectExpr(table, alloc, b, v, mc.receiver);
@@ -485,6 +513,7 @@ fn collectExpr(
             try collectExpr(table, alloc, b, v, ix.base);
             try collectExpr(table, alloc, b, v, ix.index);
         },
+        .cast => |cast| try collectExpr(table, alloc, b, v, cast.operand),
         .binary => |bin| {
             try collectExpr(table, alloc, b, v, bin.lhs);
             try collectExpr(table, alloc, b, v, bin.rhs);
@@ -617,6 +646,7 @@ fn collectIterator(
     switch (ad) {
         .map => |m| try collectClosure(table, alloc, b, v, m.closure),
         .filter => |f| try collectClosure(table, alloc, b, v, f.closure),
+        .flat_map => |closure| try collectClosure(table, alloc, b, v, closure),
         .enumerate, .range_rev, .other => {},
         .zip => |z| try collectExpr(table, alloc, b, v, z.other),
     }

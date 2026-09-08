@@ -1,11 +1,18 @@
 //! CLI for the Rust → Zig translation tool.
-//! P1: `--dump model <crate.json>` parses a sidecar wire-format dump into the
-//! semantic IR (translate_rust.model) and prints the crate/module inventory.
+//! Source and canonical wire inputs use the driver pipeline. `--dump model`
+//! reads legacy sidecar data for crate/module inventory diagnostics only.
 
 const std = @import("std");
 const translate_rust = @import("translate_rust");
 
 pub fn main(init: std.process.Init) !void {
+    run(init) catch |err| {
+        std.log.err("translate-rust failed: {s}", .{@errorName(err)});
+        return err;
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const io = init.io;
     const stdout = std.Io.File.stdout();
 
@@ -13,19 +20,24 @@ pub fn main(init: std.process.Init) !void {
     defer arg_it.deinit();
 
     // argv[0] — program name.
-    _ = arg_it.next();
+    if (arg_it.next() == null) {
+        try printUsage(io, stdout);
+        return error.MissingCliArgument;
+    }
 
     const arg = arg_it.next() orelse {
         try printUsage(io, stdout);
-        return;
+        return error.MissingCliArgument;
     };
     const arg_slice = arg;
 
     if (std.mem.eql(u8, arg_slice, "--version")) {
+        try expectNoMoreArguments(io, stdout, &arg_it);
         try stdout.writeStreamingAll(io, "translate-rust " ++ translate_rust.version ++ "\n");
         return;
     }
     if (std.mem.eql(u8, arg_slice, "--help") or std.mem.eql(u8, arg_slice, "-h")) {
+        try expectNoMoreArguments(io, stdout, &arg_it);
         try printUsage(io, stdout);
         return;
     }
@@ -34,25 +46,26 @@ pub fn main(init: std.process.Init) !void {
     var strategy_name: ?[]const u8 = null;
     var first = arg_slice;
     if (std.mem.eql(u8, first, "--strategy")) {
-        const sn = arg_it.next() orelse {
-            try stdout.writeStreamingAll(io, "usage: translate-rust --strategy <default|embedded>\n");
-            return;
+        const strategy = arg_it.next() orelse {
+            try stdout.writeStreamingAll(
+                io,
+                "usage: translate-rust --strategy <default|embedded> --dump <mode> <path>\n",
+            );
+            return error.MissingCliArgument;
         };
-        if (!validateStrategy(sn)) {
-            const emsg = try std.fmt.allocPrint(init.gpa,
-                \\translate-rust: unknown strategy '{s}'
-                \\usage: --strategy <default|embedded>
-                \\
-                \\
-            , .{sn});
-            defer init.gpa.free(emsg);
-            try stdout.writeStreamingAll(io, emsg);
-            return;
+        if (!validateStrategy(strategy)) {
+            try stdout.writeStreamingAll(io, "translate-rust: unknown strategy '");
+            try stdout.writeStreamingAll(io, strategy);
+            try stdout.writeStreamingAll(
+                io,
+                "'\nusage: translate-rust --strategy <default|embedded> --dump <mode> <path>\n",
+            );
+            return error.UnknownStrategy;
         }
-        strategy_name = sn;
+        strategy_name = strategy;
         first = arg_it.next() orelse {
             try printUsage(io, stdout);
-            return;
+            return error.MissingCliArgument;
         };
     }
 
@@ -63,72 +76,180 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, first, "--dump-types")) {
         const path = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump-types <crate-dir>\n");
-            return;
+            return error.MissingCliArgument;
         };
+        if (path.len == 0 or std.mem.startsWith(u8, path, "-")) {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump-types <crate-dir>\n");
+            return error.MissingCliArgument;
+        }
+        try expectNoMoreArguments(io, stdout, &arg_it);
         try dumpTypes(io, init, stdout, path);
         return;
     }
     if (std.mem.eql(u8, first, "--dump-names")) {
-        const p = arg_it.next() orelse {
+        const path = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump-names <crate-dir>\n");
-            return;
+            return error.MissingCliArgument;
         };
-        try dumpNames(io, init, stdout, p);
+        if (path.len == 0 or std.mem.startsWith(u8, path, "-")) {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump-names <crate-dir>\n");
+            return error.MissingCliArgument;
+        }
+        try expectNoMoreArguments(io, stdout, &arg_it);
+        try dumpNames(io, init, stdout, path);
         return;
     }
     if (std.mem.eql(u8, first, "--dump-infer")) {
-        const p = arg_it.next() orelse {
+        const path = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump-infer <crate-dir>\n");
-            return;
+            return error.MissingCliArgument;
         };
-        try dumpInfer(io, init, stdout, p);
+        if (path.len == 0 or std.mem.startsWith(u8, path, "-")) {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump-infer <crate-dir>\n");
+            return error.MissingCliArgument;
+        }
+        try expectNoMoreArguments(io, stdout, &arg_it);
+        try dumpInfer(io, init, stdout, path);
         return;
     }
-    if (std.mem.eql(u8, first, "--translate") or std.mem.eql(u8, first, "--emit-package")) {
+    if (std.mem.eql(u8, first, "--translate")) {
         const path = arg_it.next() orelse {
             try printUsage(io, stdout);
-            return;
+            return error.MissingCliArgument;
         };
-        var out_dir: ?[]const u8 = null;
-        if (arg_it.next()) |next_arg| {
-            if (std.mem.eql(u8, next_arg, "-o") or std.mem.eql(u8, next_arg, "--output")) {
-                out_dir = arg_it.next();
-            }
+        if (path.len == 0 or std.mem.startsWith(u8, path, "-")) {
+            try printUsage(io, stdout);
+            return error.MissingCliArgument;
         }
+        const out_dir = try parseOutputArgument(io, stdout, &arg_it, false);
+        try translateCrate(io, init, stdout, path, out_dir);
+        return;
+    }
+    if (std.mem.eql(u8, first, "--emit-package")) {
+        const path = arg_it.next() orelse {
+            try printUsage(io, stdout);
+            return error.MissingCliArgument;
+        };
+        if (path.len == 0 or std.mem.startsWith(u8, path, "-")) {
+            try printUsage(io, stdout);
+            return error.MissingCliArgument;
+        }
+        const out_dir = (try parseOutputArgument(io, stdout, &arg_it, true)).?;
         try translateCrate(io, init, stdout, path, out_dir);
         return;
     }
 
     // Default positional behavior: if passed a .json file, translate it.
     if (std.mem.endsWith(u8, first, ".json")) {
-        var out_dir: ?[]const u8 = null;
-        if (arg_it.next()) |next_arg| {
-            if (std.mem.eql(u8, next_arg, "-o") or std.mem.eql(u8, next_arg, "--output")) {
-                out_dir = arg_it.next();
-            }
-        }
+        const out_dir = try parseOutputArgument(io, stdout, &arg_it, false);
         try translateCrate(io, init, stdout, first, out_dir);
         return;
     }
 
-    // Non-`.json` positional arg → treat it as a Rust crate directory and run
-    // the source driver (cargo +nightly rustdoc → r2z package). Requires -o.
-    var crate_out_dir: ?[]const u8 = null;
-    if (arg_it.next()) |next_arg| {
-        if (std.mem.eql(u8, next_arg, "-o") or std.mem.eql(u8, next_arg, "--output")) {
-            crate_out_dir = arg_it.next();
-        }
+    if (std.mem.startsWith(u8, first, "-")) {
+        try stdout.writeStreamingAll(io, "translate-rust: unknown option '");
+        try stdout.writeStreamingAll(io, first);
+        try stdout.writeStreamingAll(io, "'\n");
+        try printUsage(io, stdout);
+        return error.UnknownOption;
     }
-    if (crate_out_dir == null) {
-        try stdout.writeStreamingAll(io,
-            \\translate-rust: crate-directory mode requires -o <out-dir>
-            \\usage: translate-rust <crate-dir> -o <out-dir>
-            \\
+
+    // A non-JSON positional path selects the source-native frontend.
+    // Package output requires -o.
+    const out_dir = (try parseOutputArgument(io, stdout, &arg_it, true)).?;
+    try translate_rust.driver.translate(init.gpa, io, first, out_dir);
+}
+
+fn expectNoMoreArguments(
+    io: std.Io,
+    stdout: std.Io.File,
+    arg_it: *std.process.Args.Iterator,
+) !void {
+    const unexpected = arg_it.next() orelse return;
+    try stdout.writeStreamingAll(io, "translate-rust: unexpected argument '");
+    try stdout.writeStreamingAll(io, unexpected);
+    try stdout.writeStreamingAll(io, "'\n");
+    try printUsage(io, stdout);
+    return error.UnexpectedCliArgument;
+}
+
+fn parseOutputArgument(
+    io: std.Io,
+    stdout: std.Io.File,
+    arg_it: *std.process.Args.Iterator,
+    required: bool,
+) !?[]const u8 {
+    const flag = arg_it.next() orelse {
+        if (!required) return null;
+        try stdout.writeStreamingAll(
+            io,
+            "translate-rust: package mode requires -o <out-dir>\n",
         );
-        return;
+        try printUsage(io, stdout);
+        return error.OutputPathRequired;
+    };
+    if (!std.mem.eql(u8, flag, "-o") and !std.mem.eql(u8, flag, "--output")) {
+        try stdout.writeStreamingAll(io, "translate-rust: unexpected argument '");
+        try stdout.writeStreamingAll(io, flag);
+        try stdout.writeStreamingAll(io, "'\n");
+        try printUsage(io, stdout);
+        return error.UnexpectedCliArgument;
     }
-    try translate_rust.driver.translate(init.gpa, io, first, crate_out_dir.?);
-    return;
+
+    const out_dir = arg_it.next() orelse {
+        try stdout.writeStreamingAll(io, "translate-rust: -o requires an output path\n");
+        try printUsage(io, stdout);
+        return error.OutputPathMissing;
+    };
+    if (out_dir.len == 0 or std.mem.startsWith(u8, out_dir, "-")) {
+        try stdout.writeStreamingAll(io, "translate-rust: -o requires an output path\n");
+        try printUsage(io, stdout);
+        return error.OutputPathMissing;
+    }
+    try expectNoMoreArguments(io, stdout, arg_it);
+    return out_dir;
+}
+
+fn resolveLibSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    crate_dir: []const u8,
+) ![]const u8 {
+    for ([_][]const u8{ "src/lib.rs", "lib.rs" }) |candidate| {
+        const joined = try std.fs.path.join(allocator, &.{ crate_dir, candidate });
+        const file = std.Io.Dir.cwd().openFile(io, joined, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return error.SourceRootReadFailed,
+        };
+        file.close(io);
+        return joined;
+    }
+    return error.SourceRootNotFound;
+}
+
+fn reportSourceRootError(
+    io: std.Io,
+    stdout: std.Io.File,
+    crate_dir: []const u8,
+    err: anyerror,
+) !void {
+    switch (err) {
+        error.SourceRootNotFound => {
+            try stdout.writeStreamingAll(io, "translate-rust: no lib source found in ");
+            try stdout.writeStreamingAll(io, crate_dir);
+            try stdout.writeStreamingAll(io, "\n");
+        },
+        error.SourceRootReadFailed => {
+            try stdout.writeStreamingAll(io, "translate-rust: unable to read source root ");
+            try stdout.writeStreamingAll(io, crate_dir);
+            try stdout.writeStreamingAll(io, "\n");
+        },
+        else => {
+            try stdout.writeStreamingAll(io, "translate-rust: unable to read source root ");
+            try stdout.writeStreamingAll(io, crate_dir);
+            try stdout.writeStreamingAll(io, "\n");
+        },
+    }
 }
 
 /// `--dump-types <crate-dir>`: parse the crate's source with tree-sitter and
@@ -141,28 +262,24 @@ fn dumpTypes(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
     const model = translate_rust.model;
 
     // Resolve the lib source file (src/lib.rs or lib.rs).
-    var lib_path: ?[]const u8 = null;
-    for ([_][]const u8{ "src/lib.rs", "lib.rs" }) |c| {
-        const joined = try std.fs.path.join(allocator, &.{ crate_dir, c });
-        if (std.Io.Dir.cwd().openFile(io, joined, .{})) |f| {
-            f.close(io);
-            lib_path = joined;
-            break;
-        } else |_| {}
-    }
-    const path = lib_path orelse {
-        const msg = try std.fmt.allocPrint(allocator, "no lib source found in {s}\n", .{crate_dir});
-        try stdout.writeStreamingAll(io, msg);
-        return;
+    const path = resolveLibSource(allocator, io, crate_dir) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
     };
     const lib_dir = std.fs.path.dirname(path) orelse crate_dir;
 
     var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(io, path, .{});
+    const file = dir.openFile(io, path, .{}) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
+    };
     defer file.close(io);
     var io_buf: [4096]u8 = undefined;
     var reader = file.reader(io, &io_buf);
-    const src = try reader.interface.allocRemaining(allocator, .limited(1 << 24));
+    const src = reader.interface.allocRemaining(allocator, .limited(1 << 24)) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
+    };
 
     // Build a fresh graph + tables.
     var g = model.graph.CrateGraph.init(allocator);
@@ -219,12 +336,19 @@ fn dumpEntities(
     mod_id: translate_rust.model.spine.EntityId,
     depth: usize,
 ) !void {
-    const m = g.module(mod_id) orelse return;
+    _ = g.symbol_table.get(mod_id) orelse return error.IncompleteDiagnosticGraph;
+    const m = g.module(mod_id) orelse return error.IncompleteDiagnosticGraph;
     for (m.items) |item_id| {
-        const e = g.symbol_table.get(item_id) orelse continue;
+        const e = g.symbol_table.get(item_id) orelse return error.IncompleteDiagnosticGraph;
         try buf.appendNTimes(allocator, ' ', depth * 2);
         const line = try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ @tagName(e.kind), e.name });
         try buf.appendSlice(allocator, line);
+        if (e.kind == .use_) {
+            const use_decl = g.useById(item_id) orelse return error.IncompleteDiagnosticGraph;
+            if (use_decl.target != 0) {
+                _ = g.symbol_table.get(use_decl.target) orelse return error.IncompleteDiagnosticGraph;
+            }
+        }
         if (e.kind == .module) {
             try dumpEntities(allocator, buf, g, item_id, depth + 1);
         }
@@ -243,28 +367,24 @@ fn dumpNames(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
     const model = translate_rust.model;
 
     // Resolve the lib source file (src/lib.rs or lib.rs).
-    var lib_path: ?[]const u8 = null;
-    for ([_][]const u8{ "src/lib.rs", "lib.rs" }) |c| {
-        const joined = try std.fs.path.join(allocator, &.{ crate_dir, c });
-        if (std.Io.Dir.cwd().openFile(io, joined, .{})) |f| {
-            f.close(io);
-            lib_path = joined;
-            break;
-        } else |_| {}
-    }
-    const path = lib_path orelse {
-        const msg = try std.fmt.allocPrint(allocator, "no lib source found in {s}\n", .{crate_dir});
-        try stdout.writeStreamingAll(io, msg);
-        return;
+    const path = resolveLibSource(allocator, io, crate_dir) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
     };
     const lib_dir = std.fs.path.dirname(path) orelse crate_dir;
 
     var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(io, path, .{});
+    const file = dir.openFile(io, path, .{}) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
+    };
     defer file.close(io);
     var io_buf: [4096]u8 = undefined;
     var reader = file.reader(io, &io_buf);
-    const src = try reader.interface.allocRemaining(allocator, .limited(1 << 24));
+    const src = reader.interface.allocRemaining(allocator, .limited(1 << 24)) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
+    };
 
     // Build a fresh graph + tables (mirrors dumpTypes).
     var g = model.graph.CrateGraph.init(allocator);
@@ -314,14 +434,13 @@ fn dumpNames(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     for (g.uses.items) |u| {
-        const e = g.symbol_table.get(u.id) orelse continue;
+        const e = g.symbol_table.get(u.id) orelse return error.IncompleteDiagnosticGraph;
         try out.appendSlice(allocator, "use ");
         try out.appendSlice(allocator, e.name);
         try out.appendSlice(allocator, " -> ");
         if (u.target != 0) {
-            if (g.symbol_table.get(u.target)) |t| {
-                try out.appendSlice(allocator, t.name);
-            }
+            const target = g.symbol_table.get(u.target) orelse return error.IncompleteDiagnosticGraph;
+            try out.appendSlice(allocator, target.name);
         } else {
             try out.appendSlice(allocator, "<unresolved>");
         }
@@ -340,28 +459,24 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
     const model = translate_rust.model;
 
     // Resolve the lib source file (src/lib.rs or lib.rs).
-    var lib_path: ?[]const u8 = null;
-    for ([_][]const u8{ "src/lib.rs", "lib.rs" }) |c| {
-        const joined = try std.fs.path.join(allocator, &.{ crate_dir, c });
-        if (std.Io.Dir.cwd().openFile(io, joined, .{})) |f| {
-            f.close(io);
-            lib_path = joined;
-            break;
-        } else |_| {}
-    }
-    const path = lib_path orelse {
-        const msg = try std.fmt.allocPrint(allocator, "no lib source found in {s}\n", .{crate_dir});
-        try stdout.writeStreamingAll(io, msg);
-        return;
+    const path = resolveLibSource(allocator, io, crate_dir) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
     };
     const lib_dir = std.fs.path.dirname(path) orelse crate_dir;
 
     var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(io, path, .{});
+    const file = dir.openFile(io, path, .{}) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
+    };
     defer file.close(io);
     var io_buf: [4096]u8 = undefined;
     var reader = file.reader(io, &io_buf);
-    const src = try reader.interface.allocRemaining(allocator, .limited(1 << 24));
+    const src = reader.interface.allocRemaining(allocator, .limited(1 << 24)) catch |err| {
+        try reportSourceRootError(io, stdout, crate_dir, err);
+        return err;
+    };
 
     // Build a fresh graph + tables.
     var g = model.graph.CrateGraph.init(allocator);
@@ -416,17 +531,20 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
         if (m.id == 0) continue;
         if (m.source_path) |sp| {
             var mdir = std.Io.Dir.cwd();
-            if (mdir.openFile(io, sp, .{})) |mf| {
-                defer mf.close(io);
-                var mio_buf: [4096]u8 = undefined;
-                var mreader = mf.reader(io, &mio_buf);
-                if (mreader.interface.allocRemaining(allocator, .limited(1 << 24))) |m_src| {
-                    try module_srcs.put(allocator, m.id, m_src);
-                } else |_| {}
-            } else |_| {}
+            const mf = mdir.openFile(io, sp, .{}) catch |err| {
+                try reportSourceRootError(io, stdout, crate_dir, err);
+                return err;
+            };
+            defer mf.close(io);
+            var mio_buf: [4096]u8 = undefined;
+            var mreader = mf.reader(io, &mio_buf);
+            const m_src = mreader.interface.allocRemaining(allocator, .limited(1 << 24)) catch |err| {
+                try reportSourceRootError(io, stdout, crate_dir, err);
+                return err;
+            };
+            try module_srcs.put(allocator, m.id, m_src);
         }
     }
-
     var ts_ctx: model.ts_ext.Ctx = .{
         .alloc = allocator,
         .g = &g,
@@ -441,7 +559,7 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
 
     for (g.symbol_table.entities.items) |ent| {
         if (ent.kind != .fn_) continue;
-        var cur = ent.parent orelse continue;
+        var cur = ent.parent orelse return error.IncompleteDiagnosticGraph;
         var m_src: ?[]const u8 = null;
         while (g.module(cur)) |m| {
             if (module_srcs.get(cur)) |s| {
@@ -450,10 +568,11 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
             }
             cur = m.parent orelse break;
         }
-        const fn_src = m_src orelse continue;
+        const fn_src = m_src orelse return error.IncompleteDiagnosticGraph;
         ts_ctx.src = fn_src;
         ts_ctx.mod_id = ent.parent.?;
-        _ = model.ts_ext.extractFunction(&ts_ctx, ent.id) catch false;
+        const extracted = try model.ts_ext.extractFunction(&ts_ctx, ent.id);
+        if (!extracted) return error.IncompleteDiagnosticGraph;
     }
 
     const b: model.bodies.Bodies = .{
@@ -469,18 +588,20 @@ fn dumpInfer(io: std.Io, init: std.process.Init, stdout: std.Io.File, crate_dir:
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
-
     for (b.exprs, 0..) |e, idx| {
-        const ty_str = if (inferred.getType(@intCast(idx))) |tid| blk: {
-            if (tid < b.types.len) {
-                const t = b.types[tid];
-                switch (t) {
-                    .prim => |p| break :blk @tagName(p),
-                    else => break :blk @tagName(t),
-                }
-            } else break :blk "unknown_type_id";
-        } else "untyped";
-        const line = try std.fmt.allocPrint(allocator, "expr {d} ({s}): {s}\n", .{ idx, @tagName(e.kind), ty_str });
+        const tid = inferred.getType(@intCast(idx)) orelse
+            return error.IncompleteDiagnosticGraph;
+        if (tid >= b.types.len) return error.IncompleteDiagnosticGraph;
+        const t = b.types[tid];
+        const ty_str = switch (t) {
+            .prim => |p| @tagName(p),
+            else => @tagName(t),
+        };
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "expr {d} ({s}): {s}\n",
+            .{ idx, @tagName(e.kind), ty_str },
+        );
         try out.appendSlice(allocator, line);
     }
 
@@ -496,19 +617,36 @@ fn dumpJsonModel(
     path: []const u8,
 ) !void {
     var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(io, path, .{});
+    const file = dir.openFile(io, path, .{}) catch |err| {
+        try stdout.writeStreamingAll(io, "translate-rust: unable to read dump file ");
+        try stdout.writeStreamingAll(io, path);
+        try stdout.writeStreamingAll(io, "\n");
+        return err;
+    };
     defer file.close(io);
     var io_buf: [4096]u8 = undefined;
     var reader = file.reader(io, &io_buf);
-    const bytes = try reader.interface.allocRemaining(init.gpa, .limited(1 << 30));
+    const bytes = reader.interface.allocRemaining(init.gpa, .limited(1 << 30)) catch |err| {
+        try stdout.writeStreamingAll(io, "translate-rust: unable to read dump file ");
+        try stdout.writeStreamingAll(io, path);
+        try stdout.writeStreamingAll(io, "\n");
+        return err;
+    };
     defer init.gpa.free(bytes);
 
-    var g = try translate_rust.model.json.parse(init.gpa, bytes);
+    var g = translate_rust.model.json.parse(init.gpa, bytes) catch |err| {
+        try stdout.writeStreamingAll(io, "translate-rust: invalid or incomplete diagnostic graph\n");
+        return err;
+    };
     defer g.deinit();
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(init.gpa);
 
+    if (g.crates.items.len == 0) {
+        try stdout.writeStreamingAll(io, "translate-rust: incomplete diagnostic graph\n");
+        return error.IncompleteDiagnosticGraph;
+    }
     for (g.crates.items) |c| {
         try buf.appendSlice(init.gpa, "crate ");
         try buf.appendSlice(init.gpa, c.name);
@@ -536,11 +674,19 @@ fn dumpDispatch(
             \\usage: translate-rust --dump <model|rustir|zigast> <path>
             \\
         );
-        return;
+        return error.MissingCliArgument;
     };
 
     if (std.mem.eql(u8, mode, "model")) {
-        const path = arg_it.next() orelse return error.UsageMissingJsonPath;
+        const path = arg_it.next() orelse {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump model <file.json>\n");
+            return error.MissingCliArgument;
+        };
+        if (path.len == 0 or std.mem.startsWith(u8, path, "-")) {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump model <file.json>\n");
+            return error.MissingCliArgument;
+        }
+        try expectNoMoreArguments(io, stdout, arg_it);
         try dumpJsonModel(io, init, stdout, path);
         return;
     }
@@ -548,8 +694,13 @@ fn dumpDispatch(
     if (std.mem.eql(u8, mode, "rustir")) {
         const crate_dir = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump rustir <crate-dir>\n");
-            return;
+            return error.MissingCliArgument;
         };
+        if (crate_dir.len == 0 or std.mem.startsWith(u8, crate_dir, "-")) {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump rustir <crate-dir>\n");
+            return error.MissingCliArgument;
+        }
+        try expectNoMoreArguments(io, stdout, arg_it);
         try dumpRustIr(io, init, stdout, crate_dir);
         return;
     }
@@ -557,15 +708,25 @@ fn dumpDispatch(
     if (std.mem.eql(u8, mode, "zigast")) {
         const crate_dir = arg_it.next() orelse {
             try stdout.writeStreamingAll(io, "usage: translate-rust --dump zigast <crate-dir>\n");
-            return;
+            return error.MissingCliArgument;
         };
+        if (crate_dir.len == 0 or std.mem.startsWith(u8, crate_dir, "-")) {
+            try stdout.writeStreamingAll(io, "usage: translate-rust --dump zigast <crate-dir>\n");
+            return error.MissingCliArgument;
+        }
+        try expectNoMoreArguments(io, stdout, arg_it);
         try dumpZigAst(io, init, stdout, crate_dir, strategy_name);
         return;
     }
 
-    const msg = try std.fmt.allocPrint(init.gpa, "translate-rust: unknown dump mode '{s}'\n", .{mode});
-    defer init.gpa.free(msg);
-    try stdout.writeStreamingAll(io, msg);
+    try stdout.writeStreamingAll(io, "translate-rust: unknown dump mode '");
+    try stdout.writeStreamingAll(io, mode);
+    try stdout.writeStreamingAll(io, "'\n");
+    try stdout.writeStreamingAll(
+        io,
+        "usage: translate-rust --dump <model|rustir|zigast> <path>\n",
+    );
+    return error.UnknownDumpMode;
 }
 
 /// `--dump rustir <crate-dir>`: run the full frontend analysis and print the
@@ -581,13 +742,7 @@ fn dumpRustIr(
     const allocator = arena.allocator();
 
     const rust_ir = try translate_rust.frontend.analyzeCrate(allocator, io, crate_dir);
-    const ser_ir: translate_rust.ir.serialize.RustIr = .{
-        .crate_name = rust_ir.crate_name,
-        .edition = rust_ir.edition,
-        .graph = rust_ir.graph,
-        .types = rust_ir.types,
-        .bodies = rust_ir.bodies,
-    };
+    const ser_ir: translate_rust.ir.serialize.RustIr = rust_ir;
     const json_bytes = try translate_rust.ir.serialize.encode(allocator, &ser_ir);
     try stdout.writeStreamingAll(io, json_bytes);
     try stdout.writeStreamingAll(io, "\n");
@@ -598,11 +753,12 @@ fn dumpRustIr(
 fn resolveStrategy(
     name: ?[]const u8,
     out: *translate_rust.backend.strategy.LoweringStrategy,
+    context: *anyopaque,
 ) ?*const translate_rust.backend.strategy.LoweringStrategy {
     if (name) |n| {
         if (std.mem.eql(u8, n, "embedded")) {
             out.* = .{
-                .ptr = undefined,
+                .ptr = context,
                 .vtable = &.{
                     .lowerType = translate_rust.backend.zig.strategies.embedded.EmbeddedStrategy.lowerType,
                     .lowerStdGeneric = translate_rust.backend.zig.strategies.embedded.EmbeddedStrategy.lowerStdGeneric,
@@ -610,8 +766,7 @@ fn resolveStrategy(
             };
             return out;
         }
-        // "default" (and any other validated name) falls through to the engine
-        // default by returning null.
+        // "default" falls through to the engine default by returning null.
     }
     return null;
 }
@@ -630,9 +785,17 @@ fn dumpZigAst(
     const allocator = arena.allocator();
 
     const rust_ir = try translate_rust.frontend.analyzeCrate(allocator, io, crate_dir);
+    try translate_rust.ir.validateForTranslation(&rust_ir);
 
-    var strat: translate_rust.backend.strategy.LoweringStrategy = undefined;
-    const maybe_strat = resolveStrategy(strategy_name, &strat);
+    var default_strategy: translate_rust.backend.zig.strategies.default.DefaultStrategy = .{};
+    var strat: translate_rust.backend.strategy.LoweringStrategy = .{
+        .ptr = &default_strategy,
+        .vtable = &.{
+            .lowerType = translate_rust.backend.zig.strategies.embedded.EmbeddedStrategy.lowerType,
+            .lowerStdGeneric = translate_rust.backend.zig.strategies.embedded.EmbeddedStrategy.lowerStdGeneric,
+        },
+    };
+    const maybe_strat = resolveStrategy(strategy_name, &strat, &default_strategy);
 
     const pkg = try translate_rust.backend.zig.lower.lowerRustIr(allocator, &rust_ir, maybe_strat);
     const json_bytes = try translate_rust.backend.zig.serialize.encode(allocator, &pkg);
@@ -651,10 +814,11 @@ fn dumpModule(
     mod_id: translate_rust.model.spine.EntityId,
     depth: usize,
 ) !void {
-    const m = g.module(mod_id) orelse return;
+    _ = g.symbol_table.get(mod_id) orelse return error.IncompleteDiagnosticGraph;
+    const m = g.module(mod_id) orelse return error.IncompleteDiagnosticGraph;
 
     for (m.items) |item_id| {
-        const e = g.symbol_table.get(item_id) orelse continue;
+        const e = g.symbol_table.get(item_id) orelse return error.IncompleteDiagnosticGraph;
 
         try buf.appendNTimes(gpa, ' ', depth * 2);
         switch (e.kind) {
@@ -668,10 +832,13 @@ fn dumpModule(
                 try buf.appendSlice(gpa, "use ");
                 try buf.appendSlice(gpa, e.name);
                 try buf.appendSlice(gpa, " -> ");
-                if (g.useById(item_id)) |u| {
-                    if (g.symbol_table.get(u.target)) |t| {
-                        try buf.appendSlice(gpa, t.name);
-                    }
+                const use_decl = g.useById(item_id) orelse return error.IncompleteDiagnosticGraph;
+                if (use_decl.target != 0) {
+                    const target = g.symbol_table.get(use_decl.target) orelse
+                        return error.IncompleteDiagnosticGraph;
+                    try buf.appendSlice(gpa, target.name);
+                } else {
+                    try buf.appendSlice(gpa, "<unresolved>");
                 }
                 try buf.appendSlice(gpa, "\n");
             },
@@ -720,52 +887,23 @@ fn translateCrate(
     path: []const u8,
     out_dir: ?[]const u8,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(init.gpa);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var dir = std.Io.Dir.cwd();
-    const file = try dir.openFile(io, path, .{});
-    defer file.close(io);
-    var io_buf: [4096]u8 = undefined;
-    var reader = file.reader(io, &io_buf);
-    const bytes = try reader.interface.allocRemaining(allocator, .limited(1 << 30));
-
-    // Wire format v2 carries bodies; parseFull + emitRich produce full Zig.
-    var model = try translate_rust.model.json.parseFull(allocator, bytes);
-
     if (out_dir) |dest| {
-        // Package emission mode: generate multi-file package directory
-        for (0..model.graph.crates.items.len) |crate_idx| {
-            const pkg = try translate_rust.model.package.generatePackage(
-                allocator,
-                &model.graph,
-                &model.bodies,
-                crate_idx,
-            );
-            try pkg.writeToDisk(io, dest);
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "emitted package {s} to {s} ({d} files)\n",
-                .{ pkg.package_name, dest, pkg.files.len },
-            );
-            try stdout.writeStreamingAll(io, msg);
-        }
-    } else {
-        // Single-stream stdout emission mode
-        const raw_source = try translate_rust.model.emit.emitRich(allocator, &model.graph, &model.bodies);
-        const formatted = try translate_rust.model.emit.formatZig(allocator, raw_source);
-        try stdout.writeStreamingAll(io, formatted);
+        try translate_rust.driver.translateWireJson(init.gpa, io, path, dest);
+        const msg = try std.fmt.allocPrint(init.gpa, "translated {s} to {s}\n", .{ path, dest });
+        defer init.gpa.free(msg);
+        try stdout.writeStreamingAll(io, msg);
+        return;
     }
+    try translate_rust.driver.emitWireJson(init.gpa, io, stdout, path);
 }
 
 fn printUsage(io: std.Io, stdout: std.Io.File) !void {
     try stdout.writeStreamingAll(io,
-        \\translate-rust — Rust → Zig translation (research phase, no full pipeline yet)
+        \\translate-rust — Rust → Zig translation pipeline
         \\
-        \\usage: translate-rust <crate-dir> -o <dir>  translate a Rust crate (cargo +nightly rustdoc) to an r2z package
-        \\       translate-rust <file.json> [-o dir]  translate a wire-format JSON dump (stdout or package dir)
-        \\       translate-rust --emit-package <file.json> -o <dir>  emit standalone Zig package
+        \\usage: translate-rust <crate-dir> -o <dir>  translate Rust source to a Zig package
+        \\       translate-rust <file.json> [-o dir]  translate canonical v5 wire JSON
+        \\       translate-rust --emit-package <file.json> -o <dir>  emit a standalone Zig package
         \\       translate-rust --dump model <file>   parse a sidecar wire-format JSON dump and print
         \\                                            the crate/module inventory
         \\       translate-rust --dump rustir <crate-dir>  run the frontend analysis and print the

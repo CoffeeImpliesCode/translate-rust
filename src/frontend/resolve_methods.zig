@@ -44,6 +44,7 @@ pub const StdMethod = enum {
     slice_as_bytes,
     slice_as_slice,
     slice_iter,
+    slice_iter_mut,
 
     num_wrapping_add,
     num_wrapping_sub,
@@ -240,6 +241,7 @@ pub fn lookupStdMethod(
             if (std.mem.eql(u8, method_name, "as_bytes")) return .slice_as_bytes;
             if (std.mem.eql(u8, method_name, "as_slice")) return .slice_as_slice;
             if (std.mem.eql(u8, method_name, "iter")) return .slice_iter;
+            if (std.mem.eql(u8, method_name, "iter_mut")) return .slice_iter_mut;
         },
         .prim => |p| {
             switch (p) {
@@ -281,6 +283,10 @@ pub fn getTypeName(g: *const graph.CrateGraph, t: types.Type) ?[]const u8 {
         },
         .generic_inst => |gi| {
             if (g.symbol_table.get(gi.decl)) |ent| return ent.name;
+            return null;
+        },
+        .external_nominal => |external| {
+            if (external.path.len > 0) return external.path[external.path.len - 1];
             return null;
         },
         .prim => |p| return @tagName(p),
@@ -416,6 +422,42 @@ const LocalInitializerFinder = struct {
         }
     }
 
+    fn visitClosure(self: *LocalInitializerFinder, closure: exprs.ClosureExpr, depth: usize) void {
+        if (self.result != null or self.depth_exceeded) return;
+        if (depth >= local_initializer_depth_max) {
+            self.depth_exceeded = true;
+            return;
+        }
+        for (closure.params) |param| self.visitPattern(param, null, depth + 1);
+        self.visitBlock(closure.body, depth + 1);
+    }
+
+    fn visitIteratorChain(self: *LocalInitializerFinder, chain: exprs.IteratorChainExpr, depth: usize) void {
+        if (self.result != null or self.depth_exceeded) return;
+        if (depth >= local_initializer_depth_max) {
+            self.depth_exceeded = true;
+            return;
+        }
+        self.visitExpr(chain.source, depth + 1);
+        for (chain.adapters) |adapter| {
+            switch (adapter) {
+                .map => |map| self.visitClosure(map.closure, depth + 1),
+                .filter => |filter| self.visitClosure(filter.closure, depth + 1),
+                .flat_map => |closure| self.visitClosure(closure, depth + 1),
+                .enumerate, .range_rev, .other => {},
+                .zip => |zip| self.visitExpr(zip.other, depth + 1),
+            }
+        }
+    }
+
+    fn visitIterKind(self: *LocalInitializerFinder, iter_kind: exprs.IterKind, depth: usize) void {
+        switch (iter_kind) {
+            .range, .slice, .enumerate => {},
+            .multi => |ids| for (ids) |id| self.visitExpr(id, depth + 1),
+            .adapter => |chain| self.visitIteratorChain(chain, depth + 1),
+        }
+    }
+
     fn visitExpr(self: *LocalInitializerFinder, node: exprs.NodeId, depth: usize) void {
         if (self.result != null or self.depth_exceeded or node >= self.b.exprs.len) return;
         if (depth >= local_initializer_depth_max) {
@@ -453,6 +495,7 @@ const LocalInitializerFinder = struct {
                 self.visitPattern(for_expr.pattern, null, depth + 1);
                 self.visitExpr(for_expr.iterable, depth + 1);
                 self.visitBlock(for_expr.body, depth + 1);
+                self.visitIterKind(for_expr.iter_kind, depth + 1);
             },
             .break_ => |break_expr| if (break_expr.value) |value| self.visitExpr(value, depth + 1),
             .call => |call| for (call.args) |arg| self.visitExpr(arg, depth + 1),
@@ -473,6 +516,7 @@ const LocalInitializerFinder = struct {
                 self.visitExpr(index.base, depth + 1);
                 self.visitExpr(index.index, depth + 1);
             },
+            .cast => |cast| self.visitExpr(cast.operand, depth + 1),
             .binary => |binary| {
                 self.visitExpr(binary.lhs, depth + 1);
                 self.visitExpr(binary.rhs, depth + 1);
@@ -486,7 +530,13 @@ const LocalInitializerFinder = struct {
             .return_ => |return_expr| if (return_expr.value) |value| self.visitExpr(value, depth + 1),
             .array => |array| for (array.elements) |element| self.visitExpr(element, depth + 1),
             .vec_lit => |vec| for (vec.elements) |element| self.visitExpr(element, depth + 1),
-            .literal, .unit, .path, .continue_, .closure, .iterator_chain, .unsupported => {},
+            .range => |range| {
+                self.visitExpr(range.start, depth + 1);
+                self.visitExpr(range.end, depth + 1);
+            },
+            .closure => |closure| self.visitClosure(closure, depth + 1),
+            .iterator_chain => |chain| self.visitIteratorChain(chain, depth + 1),
+            .literal, .unit, .path, .continue_, .unsupported => {},
         }
     }
 };
@@ -626,6 +676,11 @@ fn pathDeclaredType(
     for (fn_body.params) |param| {
         if (std.mem.eql(u8, param.name, entity.name)) return param.ty;
     }
+    if (entity.kind == .field) {
+        if (matchedVariantFieldType(g, b, entity.name, localBindingOrdinal(g, entity))) |ty| {
+            return ty;
+        }
+    }
 
     // Local bindings have no declaration-type slot in the body model. If a
     // sibling occurrence of the same resolved EntityId was already inferred,
@@ -639,6 +694,104 @@ fn pathDeclaredType(
     // If no sibling path was assigned a TypeId, preserve the local's exact
     // initializer return type for nominal dispatch and primitive checks.
     return initializerReturnType(g, b, path);
+}
+
+fn matchedVariantFieldType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    binding_name: []const u8,
+    binding_ordinal: usize,
+) ?types.Type {
+    var seen: usize = 0;
+    for (b.pats, 0..) |pattern, pattern_id| {
+        const binding = switch (pattern.kind) {
+            .binding => |value| value,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, binding.name, binding_name)) continue;
+        if (seen != binding_ordinal) {
+            seen += 1;
+            continue;
+        }
+        for (b.pats) |container| {
+            const struct_pat = switch (container.kind) {
+                .struct_pat => |value| value,
+                else => continue,
+            };
+            const nominal = g.symbol_table.get(struct_pat.def) orelse continue;
+            if (nominal.kind != .enum_) continue;
+            if (struct_pat.def >= b.bodies.len) continue;
+            const enum_body = switch (b.bodies[struct_pat.def]) {
+                .enum_ => |value| value,
+                else => continue,
+            };
+
+            var matched_fields: ?items.VariantFields = null;
+            for (enum_body.variants) |candidate| {
+                const matches = switch (candidate.fields) {
+                    .tuple => |fields| blk: {
+                        if (fields.len != struct_pat.fields.len) break :blk false;
+                        for (struct_pat.fields, 0..) |field, index| {
+                            const parsed = std.fmt.parseInt(usize, field.field, 10) catch break :blk false;
+                            if (parsed != index) break :blk false;
+                        }
+                        break :blk true;
+                    },
+                    .named => |fields| blk: {
+                        if (fields.len != struct_pat.fields.len) break :blk false;
+                        for (struct_pat.fields) |field| {
+                            var found = false;
+                            for (fields) |candidate_field| {
+                                if (std.mem.eql(u8, candidate_field.name, field.field)) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) break :blk false;
+                        }
+                        break :blk true;
+                    },
+                    .none => struct_pat.fields.len == 0,
+                };
+                if (!matches) continue;
+                if (matched_fields != null) return null;
+                matched_fields = candidate.fields;
+            }
+            const variant_fields = matched_fields orelse continue;
+            for (struct_pat.fields) |field| {
+                if (field.pat == null or field.pat.? != pattern_id) continue;
+                return switch (variant_fields) {
+                    .tuple => |fields| blk: {
+                        const index = std.fmt.parseInt(usize, field.field, 10) catch break :blk null;
+                        if (index >= fields.len) break :blk null;
+                        break :blk fields[index];
+                    },
+                    .named => |fields| blk: {
+                        for (fields) |candidate| {
+                            if (std.mem.eql(u8, candidate.name, field.field)) break :blk candidate.ty;
+                        }
+                        break :blk null;
+                    },
+                    .none => null,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+fn localBindingOrdinal(
+    g: *const graph.CrateGraph,
+    local: spine.Entity,
+) usize {
+    const parent = local.parent orelse return 0;
+    var ordinal: usize = 0;
+    for (g.symbol_table.entities.items) |candidate| {
+        if (candidate.id == local.id) break;
+        if (candidate.kind != .field or candidate.parent != parent) continue;
+        if (std.mem.eql(u8, candidate.name, local.name)) ordinal += 1;
+    }
+    return ordinal;
 }
 
 fn operandTypeResolved(
@@ -656,6 +809,8 @@ fn operandTypeResolved(
     return switch (operand.kind) {
         .literal => true,
         .path => |path| pathDeclaredType(g, b, path) != null,
+        .binary => |binary| operandTypeResolved(g, b, binary.lhs) and operandTypeResolved(g, b, binary.rhs),
+        .cast => |cast| operandTypeResolved(g, b, cast.operand),
         else => false,
     };
 }
@@ -680,6 +835,8 @@ fn operandIsPrimitive(
             .prim => true,
             else => false,
         },
+        .binary => |binary| operandIsPrimitive(g, b, binary.lhs) and operandIsPrimitive(g, b, binary.rhs),
+        .cast => true,
         else => false,
     };
 }
@@ -689,6 +846,40 @@ fn replaceWithUnsupported(e: *exprs.Expr, reason: []const u8) void {
         .reason = reason,
         .suggested_version = .v1,
     } };
+}
+
+fn isRetainedIteratorProjection(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver_node: exprs.NodeId,
+) bool {
+    var projection_node = receiver_node;
+    var depth: usize = 0;
+    while (depth < b.exprs.len) : (depth += 1) {
+        if (projection_node >= b.exprs.len) return false;
+        const method_call = switch (b.exprs[projection_node].kind) {
+            .method_call => |value| value,
+            else => return false,
+        };
+        const method = g.symbol_table.get(method_call.method) orelse return false;
+        if (std.mem.eql(u8, method.name, "iter") or
+            std.mem.eql(u8, method.name, "iter_mut"))
+        {
+            if (method_call.receiver >= b.exprs.len) return false;
+            const receiver = b.exprs[method_call.receiver];
+            const receiver_ty = if (receiver.ty) |type_id|
+                if (type_id < b.types.len) b.types[type_id] else null
+            else if (receiver.kind == .path)
+                pathDeclaredType(g, b, receiver.kind.path)
+            else
+                null;
+            const std_method = lookupStdMethod(receiver_ty orelse return false, method.name) orelse return false;
+            return std_method == .slice_iter or std_method == .slice_iter_mut;
+        }
+        if (!std.mem.eql(u8, method.name, "cloned")) return false;
+        projection_node = method_call.receiver;
+    }
+    return false;
 }
 
 /// Resolve all method calls in `b.exprs` using the crate graph and types table.
@@ -723,34 +914,41 @@ pub fn resolveMethods(
                 receiver_ty = pathDeclaredType(g, b, receiver.kind.path);
             }
 
-            const receiver_name = receiverNominalName(g, b, receiver_node);
-            if (receiver_name == null) {
-                replaceWithUnsupported(e, reason_receiver_unavailable);
-                stats.unsupported_methods += 1;
+            const iterator_projection = isRetainedIteratorProjection(g, b, receiver_node);
+            if (iterator_projection) {
+                if (std.mem.eql(u8, method_name, "cloned")) {
+                    stats.std_resolved += 1;
+                } else {
+                    replaceWithUnsupported(e, reason_method_dispatch_unavailable);
+                    stats.unsupported_methods += 1;
+                }
                 continue;
             }
 
+            const receiver_name = receiverNominalName(g, b, receiver_node);
             var resolved = false;
-            // Inherent methods have precedence over trait methods.
-            if (lookupInherentMethod(g, receiver_name.?, method_name)) |fn_id| {
-                mc.method = fn_id;
-                stats.inherent_resolved += 1;
-                resolved = true;
-            }
-
-            if (!resolved) {
-                const trait_lookup =
-                    lookupTraitMethodCandidates(g, receiver_name.?, method_name, null);
-                if (trait_lookup.count > 1) {
-                    replaceWithUnsupported(e, reason_method_dispatch_ambiguous);
-                    stats.unsupported_methods += 1;
-                    continue;
+            if (receiver_name) |name| {
+                // Inherent methods have precedence over trait methods.
+                if (lookupInherentMethod(g, name, method_name)) |fn_id| {
+                    mc.method = fn_id;
+                    stats.inherent_resolved += 1;
+                    resolved = true;
                 }
-                if (trait_lookup.count == 1) {
-                    if (trait_lookup.candidate) |fn_id| {
-                        mc.method = fn_id;
-                        stats.trait_resolved += 1;
-                        resolved = true;
+
+                if (!resolved) {
+                    const trait_lookup =
+                        lookupTraitMethodCandidates(g, name, method_name, null);
+                    if (trait_lookup.count > 1) {
+                        replaceWithUnsupported(e, reason_method_dispatch_ambiguous);
+                        stats.unsupported_methods += 1;
+                        continue;
+                    }
+                    if (trait_lookup.count == 1) {
+                        if (trait_lookup.candidate) |fn_id| {
+                            mc.method = fn_id;
+                            stats.trait_resolved += 1;
+                            resolved = true;
+                        }
                     }
                 }
             }
@@ -766,7 +964,11 @@ pub fn resolveMethods(
             }
 
             if (!resolved) {
-                replaceWithUnsupported(e, reason_method_dispatch_unavailable);
+                const reason = if (receiver_name == null and receiver_ty == null)
+                    reason_receiver_unavailable
+                else
+                    reason_method_dispatch_unavailable;
+                replaceWithUnsupported(e, reason);
                 stats.unsupported_methods += 1;
             }
         } else if (e.kind == .binary) {
@@ -785,6 +987,31 @@ pub fn resolveMethods(
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+const method_resolution_test_span: spine.Span = .{
+    .start_line = 1,
+    .start_col = 1,
+    .end_line = 1,
+    .end_col = 1,
+};
+
+fn addMethodForTest(
+    allocator: std.mem.Allocator,
+    g: *graph.CrateGraph,
+    name: []const u8,
+) !spine.EntityId {
+    return g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, name),
+        .span = method_resolution_test_span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+}
 
 test "lookupInherentMethod and lookupConstructor" {
     const allocator = std.testing.allocator;
@@ -907,6 +1134,7 @@ test "lookupStdMethod coverage" {
 
     const slice_ty: types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
     try std.testing.expectEqual(StdMethod.slice_len, lookupStdMethod(slice_ty, "len"));
+    try std.testing.expectEqual(StdMethod.slice_iter_mut, lookupStdMethod(slice_ty, "iter_mut"));
 
     const ref_slice: types.Type = .{ .reference = &.{ .mut = false, .pointee = slice_ty } };
     try std.testing.expectEqual(StdMethod.slice_is_empty, lookupStdMethod(ref_slice, "is_empty"));
@@ -917,6 +1145,273 @@ test "lookupStdMethod coverage" {
 
     try std.testing.expectEqual(StdMethod.clone, lookupStdMethod(prim_ty, "clone"));
     try std.testing.expectEqual(StdMethod.default, lookupStdMethod(prim_ty, "default"));
+}
+
+test "resolveMethods keeps local iterator projections dispatchable" {
+    const allocator = std.testing.allocator;
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const source_impl = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try allocator.dupe(u8, "Source"),
+        .span = method_resolution_test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const iter_method = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "iter"),
+        .span = method_resolution_test_span,
+        .visibility = .public,
+        .parent = source_impl,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const cursor_impl = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try allocator.dupe(u8, "Cursor"),
+        .span = method_resolution_test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const value_method = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "value"),
+        .span = method_resolution_test_span,
+        .visibility = .public,
+        .parent = cursor_impl,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    var source_segments = [_]types.PathSegment{.{ .name = "Source", .id = null }};
+    var cursor_segments = [_]types.PathSegment{.{ .name = "Cursor", .id = null }};
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &source_segments } },
+        .{ .path = .{ .segments = &cursor_segments } },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = method_resolution_test_span,
+            .ty = 0,
+            .kind = .{ .unit = {} },
+        },
+        .{
+            .id = 1,
+            .span = method_resolution_test_span,
+            .ty = 1,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .value,
+                .method = iter_method,
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = method_resolution_test_span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 1,
+                .receiver_mode = .value,
+                .method = value_method,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 2), stats.inherent_resolved);
+    try std.testing.expectEqual(@as(usize, 0), stats.unsupported_methods);
+    const value_call = switch (b.exprs[2].kind) {
+        .method_call => |method_call| method_call,
+        else => return error.ExpectedLocalValueMethodCall,
+    };
+    try std.testing.expectEqual(value_method, value_call.method);
+}
+
+test "resolveMethods uses typed slice standard iteration" {
+    const allocator = std.testing.allocator;
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const iter_method = try addMethodForTest(allocator, &g, "iter");
+    var slice_type: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_type }};
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = method_resolution_test_span,
+            .ty = 0,
+            .kind = .{ .unit = {} },
+        },
+        .{
+            .id = 1,
+            .span = method_resolution_test_span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .shared,
+                .method = iter_method,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 0), stats.unsupported_methods);
+    const iter_call = switch (b.exprs[1].kind) {
+        .method_call => |method_call| method_call,
+        else => return error.ExpectedSliceIterMethodCall,
+    };
+    try std.testing.expectEqual(iter_method, iter_call.method);
+}
+
+test "resolveMethods preserves cloned projection on typed slice iterator" {
+    const allocator = std.testing.allocator;
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const iter_method = try addMethodForTest(allocator, &g, "iter");
+    const cloned_method = try addMethodForTest(allocator, &g, "cloned");
+    var slice_type: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_type }};
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = method_resolution_test_span,
+            .ty = 0,
+            .kind = .{ .unit = {} },
+        },
+        .{
+            .id = 1,
+            .span = method_resolution_test_span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .shared,
+                .method = iter_method,
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = method_resolution_test_span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 1,
+                .receiver_mode = .value,
+                .method = cloned_method,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 2), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 0), stats.unsupported_methods);
+    const cloned_call = switch (b.exprs[2].kind) {
+        .method_call => |method_call| method_call,
+        else => return error.ExpectedClonedMethodCall,
+    };
+    try std.testing.expectEqual(cloned_method, cloned_call.method);
+}
+
+test "resolveMethods rejects unknown iterator projection" {
+    const allocator = std.testing.allocator;
+    var g = graph.CrateGraph.init(allocator);
+    defer g.deinit();
+
+    const iter_method = try addMethodForTest(allocator, &g, "iter");
+    const unknown_method = try addMethodForTest(allocator, &g, "unknown_projection");
+    var slice_type: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_type }};
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = method_resolution_test_span,
+            .ty = 0,
+            .kind = .{ .unit = {} },
+        },
+        .{
+            .id = 1,
+            .span = method_resolution_test_span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 0,
+                .receiver_mode = .shared,
+                .method = iter_method,
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = method_resolution_test_span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 1,
+                .receiver_mode = .value,
+                .method = unknown_method,
+                .args = &.{},
+            } },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 1), stats.unsupported_methods);
+    const unsupported = switch (b.exprs[2].kind) {
+        .unsupported => |value| value,
+        else => return error.ExpectedUnsupportedIteratorProjection,
+    };
+    try std.testing.expectEqualStrings(reason_method_dispatch_unavailable, unsupported.reason);
 }
 
 test "resolveMethods pass updates method_call entity id and gathers stats" {

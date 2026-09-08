@@ -35,13 +35,17 @@ pub const Module = struct {
 
 pub const CrateKind = enum { lib, bin };
 
-/// A dependency edge to an external crate (deps layer, deferred for v1).
-/// Records both the dependency's own crate name and the alias a `use` can
-/// refer to it by.
+/// An external crate dependency and its Cargo source metadata.
 pub const CrateDep = struct {
     extern_name: []const u8,
     local_alias: []const u8,
     id: u32,
+    version: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    git: ?[]const u8 = null,
+    optional: bool = false,
+    default_features: ?bool = null,
+    features: []const []const u8 = &.{},
 };
 
 /// A crate in the graph (a workspace / dependency set). v1 fills exactly one.
@@ -54,10 +58,16 @@ pub const Crate = struct {
     is_translated: bool,
 };
 
+pub const ExternalUse = struct {
+    /// The rooted Rust path that has no translated graph entity.
+    path: []const []const u8,
+};
+
 pub const UseKind = union(enum) {
     plain: spine.EntityId, // use a::b::C;        → target
     alias: spine.EntityId, // use a::b as X;      → target, local name X
     glob, //                  use a::b::*;        → marked, backend enumerates
+    external: ExternalUse, // unresolved rooted alloc/core/std path; target stays 0
 };
 
 /// A `use` / `pub use` declaration (data-model/crate-graph.md §2.3, §3.4).
@@ -70,7 +80,8 @@ pub const UseDecl = struct {
     kind: UseKind,
     local_name: []const u8, // name binding into the current scope
     is_pub_export: bool,
-    target: spine.EntityId, // the resolved definition
+    // The resolved definition, or zero for glob/unresolved external uses.
+    target: spine.EntityId,
     span: spine.Span,
 };
 
@@ -94,6 +105,24 @@ pub const Path = struct {
     prefix: ?PathPrefix, // null → relative to current scope
     segments: []const []const u8,
     resolution: ?spine.EntityId,
+};
+
+pub const TopologyError = error{
+    NoCrate,
+    MissingRootModule,
+    InvalidEntityId,
+    InvalidModuleId,
+    InvalidModuleEntity,
+    InvalidParent,
+    InvalidResolvedEntity,
+    UnknownModuleItem,
+    MissingModuleItem,
+    DuplicateModuleItem,
+    InvalidModuleItemParent,
+    MissingUseMetadata,
+    InvalidUseMetadata,
+    InvalidDependency,
+    UnownedEntity,
 };
 
 /// Top of the model: the set of crates, their modules, and the global symbol
@@ -127,6 +156,11 @@ pub const CrateGraph = struct {
             for (c.deps) |d| {
                 a.free(d.extern_name);
                 a.free(d.local_alias);
+                if (d.version) |version| a.free(version);
+                if (d.path) |path| a.free(path);
+                if (d.git) |git| a.free(git);
+                for (d.features) |feature| a.free(feature);
+                if (d.features.len > 0) a.free(d.features);
             }
             a.free(c.deps);
         }
@@ -140,7 +174,16 @@ pub const CrateGraph = struct {
         }
         self.modules.deinit(a);
 
-        for (self.uses.items) |*u| a.free(u.local_name);
+        for (self.uses.items) |*u| {
+            a.free(u.local_name);
+            switch (u.kind) {
+                .external => |external| {
+                    for (external.path) |segment| a.free(segment);
+                    if (external.path.len > 0) a.free(external.path);
+                },
+                else => {},
+            }
+        }
         self.uses.deinit(a);
 
         // Free per-entity strings, then the symbol table's backing array.
@@ -173,12 +216,269 @@ pub const CrateGraph = struct {
         return id;
     }
 
-    /// Look up a Module by EntityId.
-    pub fn module(self: *const CrateGraph, id: spine.EntityId) ?Module {
-        for (self.modules.items) |m| {
-            if (m.id == id) return m;
+    /// Look up the module row owned by an entity, rejecting ambiguous rows.
+    pub fn moduleForEntity(
+        self: *const CrateGraph,
+        entity_id: spine.EntityId,
+    ) ?*const Module {
+        const entity = self.symbol_table.get(entity_id) orelse return null;
+        if (entity.kind != .module) return null;
+        return self.moduleForEntityFields(entity.parent, entity.name);
+    }
+
+    /// Return the entity id that owns a module row.
+    ///
+    /// Module rows have a dense row id, while their parent and item edges use
+    /// symbol-table entity ids. Match the stable module name and parent edge
+    /// instead of confusing those two id spaces.
+    pub fn moduleEntityId(self: *const CrateGraph, module_row: *const Module) ?spine.EntityId {
+        var result: ?spine.EntityId = null;
+        for (self.symbol_table.entities.items) |entity| {
+            if (entity.kind != .module) continue;
+            if (entity.parent != module_row.parent) continue;
+            if (!std.mem.eql(u8, entity.name, module_row.name)) continue;
+            if (result != null) return null;
+            result = entity.id;
         }
-        return null;
+        return result;
+    }
+
+    fn moduleForEntityFields(
+        self: *const CrateGraph,
+        parent: ?spine.EntityId,
+        name: []const u8,
+    ) ?*const Module {
+        var result: ?*const Module = null;
+        for (self.modules.items) |*module_row| {
+            if (module_row.parent != parent) continue;
+            if (!std.mem.eql(u8, module_row.name, name)) continue;
+            if (result != null) return null;
+            result = module_row;
+        }
+        return result;
+    }
+
+    /// Look up a Module by its owning entity, or by a dense row id when the
+    /// symbol table is not populated (as in small graph-only fixtures).
+    pub fn module(self: *const CrateGraph, id: spine.EntityId) ?Module {
+        if (self.symbol_table.get(id)) |entity| {
+            if (entity.kind == .module) {
+                const module_row = self.moduleForEntity(id) orelse return null;
+                return module_row.*;
+            }
+        }
+        const module_row = self.moduleById(id) orelse return null;
+        return module_row.*;
+    }
+
+    /// Return the dense module row for an EntityId.
+    ///
+    /// A validator and backend must not silently accept a missing module row.
+    /// The dense table is authoritative, so an id that does not equal its
+    /// row index is malformed even if a later linear scan would find it.
+    pub fn moduleById(self: *const CrateGraph, id: spine.EntityId) ?*const Module {
+        if (@as(usize, id) >= self.modules.items.len) return null;
+        const module_row = &self.modules.items[@as(usize, id)];
+        if (module_row.id != id) return null;
+        return module_row;
+    }
+
+    /// Return whether a module explicitly owns an item id.
+    pub fn moduleHasItem(
+        self: *const CrateGraph,
+        module_id: spine.EntityId,
+        item_id: spine.EntityId,
+    ) bool {
+        const module_row = self.moduleForEntity(module_id) orelse return false;
+        for (module_row.items) |candidate| {
+            if (candidate == item_id) return true;
+        }
+        return false;
+    }
+
+    /// Return whether an entity is rooted at the specified crate root.
+    ///
+    /// This walks parent edges, not module-row indices. A malformed cycle or
+    /// missing parent is reported as not belonging to the root.
+    pub fn entityBelongsToRoot(
+        self: *const CrateGraph,
+        entity_id: spine.EntityId,
+        root_id: spine.EntityId,
+    ) bool {
+        var current = entity_id;
+        var steps: usize = 0;
+        while (steps <= self.symbol_table.entities.items.len) : (steps += 1) {
+            if (current == root_id) return true;
+            const entity = self.symbol_table.get(current) orelse return false;
+            current = entity.parent orelse return false;
+        }
+        return false;
+    }
+
+    /// Reject every malformed graph edge before serialization or lowering.
+    pub fn validateTopology(self: *const CrateGraph) TopologyError!void {
+        if (self.crates.items.len == 0) return error.NoCrate;
+        if (self.modules.items.len == 0) return error.MissingRootModule;
+
+        for (self.symbol_table.entities.items, 0..) |entity, index| {
+            if (@as(usize, entity.id) != index) return error.InvalidEntityId;
+        }
+        for (self.modules.items, 0..) |module_row, index| {
+            if (@as(usize, module_row.id) != index) return error.InvalidModuleId;
+            if (self.moduleEntityId(&module_row) == null) return error.InvalidModuleEntity;
+        }
+
+        for (self.crates.items, 0..) |crate, crate_index| {
+            if (@as(usize, crate.root) >= self.symbol_table.entities.items.len) {
+                return error.MissingRootModule;
+            }
+            const root_entity = self.symbol_table.entities.items[crate.root];
+            const root_module = self.moduleForEntity(crate.root) orelse
+                return error.MissingRootModule;
+            if (root_entity.kind != .module or
+                root_module.kind != .root or
+                !root_module.is_crate or
+                root_module.is_extern or
+                root_module.parent != null)
+            {
+                return error.MissingRootModule;
+            }
+            for (self.crates.items[0..crate_index]) |prior| {
+                if (prior.root == crate.root) return error.MissingRootModule;
+            }
+            for (crate.deps, 0..) |dependency, dependency_index| {
+                if (dependency_index >= @as(usize, std.math.maxInt(u32))) {
+                    return error.InvalidDependency;
+                }
+                if (dependency.id != @as(u32, @intCast(dependency_index + 1))) {
+                    return error.InvalidDependency;
+                }
+            }
+        }
+
+        for (self.modules.items) |module_row| {
+            const module_entity_id = self.moduleEntityId(&module_row) orelse
+                return error.InvalidModuleEntity;
+            if (module_row.parent) |parent_id| {
+                if (@as(usize, parent_id) >= self.symbol_table.entities.items.len) {
+                    return error.InvalidParent;
+                }
+                if (self.symbol_table.entities.items[parent_id].kind != .module) {
+                    return error.InvalidParent;
+                }
+                if (self.moduleForEntity(parent_id) == null) return error.InvalidParent;
+            } else if (!module_row.is_extern) {
+                var is_crate_root = false;
+                for (self.crates.items) |crate| {
+                    if (crate.root == module_entity_id) {
+                        is_crate_root = true;
+                        break;
+                    }
+                }
+                if (!is_crate_root or module_row.kind != .root or !module_row.is_crate) {
+                    return error.MissingRootModule;
+                }
+            }
+
+            for (module_row.items, 0..) |item_id, item_index| {
+                if (@as(usize, item_id) >= self.symbol_table.entities.items.len) {
+                    return error.UnknownModuleItem;
+                }
+                const item = self.symbol_table.entities.items[item_id];
+                if (item.parent != module_entity_id) return error.InvalidModuleItemParent;
+                for (module_row.items[0..item_index]) |prior| {
+                    if (prior == item_id) return error.DuplicateModuleItem;
+                }
+            }
+        }
+
+        for (self.symbol_table.entities.items) |entity| {
+            if (entity.parent) |parent_id| {
+                if (@as(usize, parent_id) >= self.symbol_table.entities.items.len) {
+                    return error.InvalidParent;
+                }
+                const parent = self.symbol_table.entities.items[parent_id];
+                if (parent.kind == .module) {
+                    if (self.moduleForEntity(parent_id) == null) return error.InvalidModuleEntity;
+                    if (!self.moduleHasItem(parent_id, entity.id)) {
+                        return error.MissingModuleItem;
+                    }
+                }
+                if (entity.kind == .use_ or entity.kind == .extern_crate) {
+                    if (parent.kind != .module) return error.InvalidModuleItemParent;
+                }
+            } else if (entity.kind != .module and entity.kind != .crate_) {
+                return error.MissingModuleItem;
+            }
+            if (entity.resolved) |resolved_id| {
+                if (@as(usize, resolved_id) >= self.symbol_table.entities.items.len) {
+                    return error.InvalidResolvedEntity;
+                }
+            }
+            if (entity.kind == .module and self.moduleForEntity(entity.id) == null) {
+                return error.InvalidModuleEntity;
+            }
+        }
+
+        for (self.symbol_table.entities.items) |entity| {
+            var rooted = false;
+            for (self.crates.items) |crate| {
+                if (self.entityBelongsToRoot(entity.id, crate.root)) {
+                    rooted = true;
+                    break;
+                }
+            }
+            if (!rooted) {
+                for (self.modules.items) |module_row| {
+                    if (!module_row.is_extern or module_row.parent != null) continue;
+                    const extern_root_id = self.moduleEntityId(&module_row) orelse
+                        return error.InvalidModuleEntity;
+                    if (self.entityBelongsToRoot(entity.id, extern_root_id)) {
+                        rooted = true;
+                        break;
+                    }
+                }
+            }
+            if (!rooted) return error.UnownedEntity;
+        }
+
+        for (self.uses.items, 0..) |use_decl, use_index| {
+            if (@as(usize, use_decl.id) >= self.symbol_table.entities.items.len) {
+                return error.InvalidUseMetadata;
+            }
+            const use_entity = self.symbol_table.entities.items[use_decl.id];
+            if (use_entity.kind != .use_) return error.InvalidUseMetadata;
+            if (use_decl.kind != .external and
+                @as(usize, use_decl.target) >= self.symbol_table.entities.items.len)
+            {
+                return error.InvalidUseMetadata;
+            }
+            if (use_entity.resolved) |resolved_id| {
+                if (resolved_id != use_decl.target) return error.InvalidUseMetadata;
+            }
+            for (self.uses.items[0..use_index]) |prior| {
+                if (prior.id == use_decl.id) return error.InvalidUseMetadata;
+            }
+            switch (use_decl.kind) {
+                .plain => |target| if (target != use_decl.target) return error.InvalidUseMetadata,
+                .alias => |target| if (target != use_decl.target) return error.InvalidUseMetadata,
+                .glob => {},
+                .external => |external| {
+                    if (use_decl.target != 0 or use_entity.resolved != null) {
+                        return error.InvalidUseMetadata;
+                    }
+                    if (external.path.len == 0) return error.InvalidUseMetadata;
+                    for (external.path) |segment| {
+                        if (segment.len == 0) return error.InvalidUseMetadata;
+                    }
+                },
+            }
+        }
+        for (self.symbol_table.entities.items) |entity| {
+            if (entity.kind == .use_ and self.useById(entity.id) == null) {
+                return error.MissingUseMetadata;
+            }
+        }
     }
 
     pub fn findCrate(self: *const CrateGraph, name: []const u8) ?Crate {
@@ -210,17 +510,21 @@ pub const CrateGraph = struct {
         allocator: std.mem.Allocator,
         mod_id: spine.EntityId,
     ) ![]spine.EntityId {
+        try self.validateTopology();
         const m = self.module(mod_id) orelse return error.UnknownModule;
+        const module_entity_id = self.moduleEntityId(
+            self.moduleForEntity(mod_id) orelse return error.UnknownModule,
+        ) orelse return error.InvalidModuleEntity;
         var out: std.ArrayListUnmanaged(spine.EntityId) = .empty;
         errdefer out.deinit(allocator);
         for (m.items) |item_id| {
-            if (self.symbol_table.get(item_id)) |e| {
-                const is_public = switch (e.visibility) {
-                    .public => true,
-                    else => false,
-                };
-                if (is_public) try out.append(allocator, item_id);
-            }
+            const e = self.symbol_table.get(item_id) orelse return error.UnknownModuleItem;
+            if (e.parent != module_entity_id) return error.InvalidModuleItemParent;
+            const is_public = switch (e.visibility) {
+                .public => true,
+                else => false,
+            };
+            if (is_public) try out.append(allocator, item_id);
         }
         return out.toOwnedSlice(allocator);
     }
@@ -273,14 +577,17 @@ test "exportedSurface collects only public items" {
     const allocator = std.testing.allocator;
     var g = CrateGraph.init(allocator);
     defer g.deinit();
-    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
 
-    const foo_name = try allocator.dupe(u8, "foo");
-    const bar_name = try allocator.dupe(u8, "bar");
-    const foo_id = try g.symbol_table.add(.{
+    const root_id = try g.symbol_table.add(.{
         .id = 0,
-        .kind = .fn_,
-        .name = foo_name,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
         .span = span,
         .visibility = .public,
         .parent = null,
@@ -288,35 +595,114 @@ test "exportedSurface collects only public items" {
         .renamed_to = null,
         .attributes = &.{},
     });
-    const bar_id = try g.symbol_table.add(.{
+    const foo_id = try g.symbol_table.add(.{
         .id = 0,
         .kind = .fn_,
-        .name = bar_name,
+        .name = try allocator.dupe(u8, "foo"),
         .span = span,
-        .visibility = .private,
-        .parent = null,
+        .visibility = .public,
+        .parent = root_id,
         .resolved = null,
         .renamed_to = null,
         .attributes = &.{},
     });
-    const items = try allocator.alloc(spine.EntityId, 2);
-    items[0] = foo_id;
-    items[1] = bar_id;
-    const root_id = try g.addModule(.{
+    const bar_id = try g.symbol_table.add(.{
         .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "bar"),
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const module_items = try allocator.dupe(spine.EntityId, &.{ foo_id, bar_id });
+    _ = try g.addModule(.{
+        .id = root_id,
         .kind = .root,
-        .name = "",
+        .name = try allocator.dupe(u8, ""),
         .parent = null,
         .source_path = null,
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = items,
+        .items = module_items,
         .attributes = &.{},
+    });
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "surface"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
     });
 
     const surface = try g.exportedSurface(allocator, root_id);
     defer allocator.free(surface);
     try std.testing.expectEqual(@as(usize, 1), surface.len);
     try std.testing.expectEqual(foo_id, surface[0]);
+}
+
+test "exportedSurface rejects malformed item endpoints" {
+    const allocator = std.testing.allocator;
+    var g = CrateGraph.init(allocator);
+    defer g.deinit();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const root_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const item_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "orphan"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const module_items = try allocator.dupe(spine.EntityId, &.{item_id});
+    _ = try g.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = try allocator.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = module_items,
+        .attributes = &.{},
+    });
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "surface"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    module_items[0] = 99;
+    try std.testing.expectError(
+        error.UnknownModuleItem,
+        g.exportedSurface(allocator, root_id),
+    );
 }

@@ -62,6 +62,8 @@ pub const FnvHasher = struct {
         return .{ .state = FNV_OFFSET_BASIS };
     }
 
+    pub const default = init;
+
     pub fn write(self: *FnvHasher, bytes: []const u8) void {
         for (bytes) |byte| {
             self.state ^= byte;
@@ -95,6 +97,26 @@ pub const FnvHasher = struct {
     }
 };
 
+/// Rust `BuildHasherDefault<H>`: a zero-sized builder that constructs a
+/// fresh `H` through its default constructor for every request.
+pub fn BuildHasherDefault(comptime H: type) type {
+    return struct {
+        const Self = @This();
+
+        pub fn new() Self {
+            return .{};
+        }
+
+        pub fn default() Self {
+            return .{};
+        }
+
+        pub fn build_hasher(self: Self) H {
+            _ = self;
+            return H.default();
+        }
+    };
+}
 // ── Rust `core::num` → Zig operators / builtins ──────────────────────────
 //
 // Rust's inherent integer methods (`.wrapping_add`, `.rotate_left`, ...)
@@ -474,6 +496,19 @@ test "core::hash Hasher / FnvHasher" {
     const dyn_hasher = fnv2.hasher();
     dyn_hasher.write("hello world");
     try std.testing.expectEqual(h1, dyn_hasher.finish());
+
+    // `default` aliases the fresh offset-basis constructor, and each builder
+    // call must create an independent hasher.
+    var default_hasher = FnvHasher.default();
+    try std.testing.expectEqual(FnvHasher.FNV_OFFSET_BASIS, default_hasher.finish());
+    const Builder = BuildHasherDefault(FnvHasher);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(Builder));
+    const builder = Builder.new();
+    var built_a = builder.build_hasher();
+    var built_b = Builder.default().build_hasher();
+    built_a.write("a");
+    try std.testing.expectEqual(@as(u64, 0xaf63dc4c8601ec8c), built_a.finish());
+    try std.testing.expectEqual(FnvHasher.FNV_OFFSET_BASIS, built_b.finish());
 }
 
 test "assertions and panic helpers" {

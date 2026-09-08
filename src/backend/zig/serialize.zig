@@ -236,6 +236,12 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
             freeDecodedExpr(allocator, unary_op.operand.*);
             allocator.destroy(@constCast(unary_op.operand));
         },
+        .cast => |cast| {
+            freeDecodedType(allocator, cast.target);
+            if (cast.source) |source| freeDecodedType(allocator, source);
+            freeDecodedExpr(allocator, cast.operand.*);
+            allocator.destroy(@constCast(cast.operand));
+        },
         .struct_init => |struct_init| {
             if (struct_init.type_name) |type_name| freeDecodedType(allocator, type_name);
             for (struct_init.fields) |field| {
@@ -344,6 +350,9 @@ fn freeDecodedStmt(allocator: std.mem.Allocator, stmt: ast.Stmt) void {
         .assign => |assign| {
             freeDecodedExpr(allocator, assign.target);
             freeDecodedExpr(allocator, assign.val);
+        },
+        .defer_stmt => |defer_stmt| {
+            freeDecodedExpr(allocator, defer_stmt.expr);
         },
         .expr_stmt => |expr| {
             freeDecodedExpr(allocator, expr.*);
@@ -517,6 +526,7 @@ fn freeDecodedZonDep(allocator: std.mem.Allocator, dep: ast.ZonDep) void {
     freeDecodedBytes(allocator, dep.name);
     freeDecodedBytes(allocator, dep.url);
     freeDecodedBytes(allocator, dep.hash);
+    if (dep.path) |path| freeDecodedBytes(allocator, path);
 }
 
 fn freeDecodedZonDepSlice(
@@ -547,6 +557,18 @@ fn appendDecodedExpr(
     const decoded = try decodeExpr(allocator, value);
     var owns_decoded = true;
     errdefer if (owns_decoded) freeDecodedExpr(allocator, decoded);
+    try list.append(allocator, decoded);
+    owns_decoded = false;
+}
+
+fn appendDecodedStmt(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.Stmt),
+    value: Json,
+) !void {
+    const decoded = try decodeStmt(allocator, value);
+    var owns_decoded = true;
+    errdefer if (owns_decoded) freeDecodedStmt(allocator, decoded);
     try list.append(allocator, decoded);
     owns_decoded = false;
 }
@@ -596,6 +618,14 @@ fn freeDecodedExprList(
     list: *std.ArrayListUnmanaged(ast.Expr),
 ) void {
     for (list.items) |expr| freeDecodedExpr(allocator, expr);
+    list.deinit(allocator);
+}
+
+fn freeDecodedStmtList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.Stmt),
+) void {
+    for (list.items) |stmt| freeDecodedStmt(allocator, stmt);
     list.deinit(allocator);
 }
 
@@ -1248,6 +1278,16 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
             }
             try o.put(allocator, "arms", .{ .array = arms_arr });
         },
+        .cast => |cast| {
+            try o.put(allocator, "kind", .{ .string = "cast" });
+            try o.put(allocator, "target", try encodeType(allocator, cast.target));
+            if (cast.source) |source| {
+                try o.put(allocator, "source", try encodeType(allocator, source));
+            } else {
+                try o.put(allocator, "source", .{ .null = {} });
+            }
+            try o.put(allocator, "operand", try encodeExpr(allocator, cast.operand.*));
+        },
         .bin_op => |b| {
             try o.put(allocator, "kind", .{ .string = "bin_op" });
             try o.put(allocator, "op", .{ .string = encodeBinOpKind(b.op) });
@@ -1483,6 +1523,22 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 .arms = try arms_list.toOwnedSlice(allocator),
             },
         };
+    } else if (std.mem.eql(u8, kind, "cast")) {
+        const target = try decodeType(allocator, try req(o, "target"));
+        errdefer freeDecodedType(allocator, target);
+        const source = if (o.get("source")) |source_value| switch (source_value) {
+            .null => null,
+            else => try decodeType(allocator, source_value),
+        } else null;
+        errdefer if (source) |source_type| freeDecodedType(allocator, source_type);
+        const operand_ptr = try allocator.create(ast.Expr);
+        errdefer allocator.destroy(operand_ptr);
+        operand_ptr.* = try decodeExpr(allocator, try req(o, "operand"));
+        return .{ .cast = .{
+            .target = target,
+            .source = source,
+            .operand = operand_ptr,
+        } };
     } else if (std.mem.eql(u8, kind, "bin_op")) {
         const op_str = try reqStr(o, "op");
         const op = try decodeBinOpKind(op_str);
@@ -1797,6 +1853,7 @@ pub fn encodeBlock(allocator: std.mem.Allocator, b: ast.Block) anyerror!Json {
 pub fn decodeBlock(allocator: std.mem.Allocator, v: Json) anyerror!ast.Block {
     const o = try getObj(v);
     const label = if (try optStr(o, "label")) |l| try allocator.dupe(u8, l) else null;
+    errdefer if (label) |owned_label| freeDecodedBytes(allocator, owned_label);
 
     const stmts_v = try req(o, "stmts");
     const stmts_arr = switch (stmts_v) {
@@ -1804,22 +1861,33 @@ pub fn decodeBlock(allocator: std.mem.Allocator, v: Json) anyerror!ast.Block {
         else => return error.BadWireFormat,
     };
     var stmts_list: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+    errdefer freeDecodedStmtList(allocator, &stmts_list);
     for (stmts_arr.items) |sv| {
-        try stmts_list.append(allocator, try decodeStmt(allocator, sv));
+        try appendDecodedStmt(allocator, &stmts_list, sv);
     }
 
-    const expr_ptr: ?*const ast.Expr = if (o.get("expr")) |ev| (switch (ev) {
-        .null => null,
-        else => blk: {
-            const ep = try allocator.create(ast.Expr);
-            ep.* = try decodeExpr(allocator, ev);
-            break :blk ep;
-        },
-    }) else null;
+    var expr_ptr: ?*const ast.Expr = null;
+    errdefer if (expr_ptr) |expr| {
+        freeDecodedExpr(allocator, expr.*);
+        allocator.destroy(@constCast(expr));
+    };
+    if (o.get("expr")) |ev| {
+        switch (ev) {
+            .null => {},
+            else => {
+                const ep = try allocator.create(ast.Expr);
+                errdefer allocator.destroy(ep);
+                ep.* = try decodeExpr(allocator, ev);
+                expr_ptr = ep;
+            },
+        }
+    }
 
+    const stmts = try stmts_list.toOwnedSlice(allocator);
+    errdefer freeDecodedStmtSlice(allocator, stmts);
     return .{
         .label = label,
-        .stmts = try stmts_list.toOwnedSlice(allocator),
+        .stmts = stmts,
         .expr = expr_ptr,
     };
 }
@@ -1843,6 +1911,11 @@ pub fn encodeStmt(allocator: std.mem.Allocator, stmt: ast.Stmt) anyerror!Json {
             try o.put(allocator, "target", try encodeExpr(allocator, asg.target));
             try o.put(allocator, "val", try encodeExpr(allocator, asg.val));
             try o.put(allocator, "op", .{ .string = encodeAssignOp(asg.op) });
+        },
+        .defer_stmt => |defer_stmt| {
+            try o.put(allocator, "kind", .{ .string = "defer_stmt" });
+            try o.put(allocator, "expr", try encodeExpr(allocator, defer_stmt.expr));
+            try o.put(allocator, "is_errdefer", .{ .bool = defer_stmt.is_errdefer });
         },
         .expr_stmt => |ex| {
             try o.put(allocator, "kind", .{ .string = "expr_stmt" });
@@ -1886,6 +1959,18 @@ pub fn decodeStmt(allocator: std.mem.Allocator, v: Json) anyerror!ast.Stmt {
                 .target = target,
                 .val = val,
                 .op = op,
+            },
+        };
+    } else if (std.mem.eql(u8, kind, "defer_stmt")) {
+        const is_errdefer = if (o.get("is_errdefer")) |value| switch (value) {
+            .bool => |flag| flag,
+            else => return error.BadWireFormat,
+        } else false;
+        const expr = try decodeExpr(allocator, try req(o, "expr"));
+        return .{
+            .defer_stmt = .{
+                .expr = expr,
+                .is_errdefer = is_errdefer,
             },
         };
     } else if (std.mem.eql(u8, kind, "expr_stmt")) {
@@ -2590,6 +2675,7 @@ pub fn encodeZonDep(allocator: std.mem.Allocator, zd: ast.ZonDep) anyerror!Json 
     try o.put(allocator, "name", .{ .string = zd.name });
     try o.put(allocator, "url", .{ .string = zd.url });
     try o.put(allocator, "hash", .{ .string = zd.hash });
+    try o.put(allocator, "path", encodeOptStr(zd.path));
     return .{ .object = o };
 }
 
@@ -2600,12 +2686,15 @@ pub fn decodeZonDep(allocator: std.mem.Allocator, v: Json) anyerror!ast.ZonDep {
     errdefer freeDecodedBytes(allocator, url);
     const hash = if (try optStr(o, "hash")) |h| try allocator.dupe(u8, h) else "";
     errdefer freeDecodedBytes(allocator, hash);
+    const path = if (try optStr(o, "path")) |p| try allocator.dupe(u8, p) else null;
+    errdefer if (path) |value| allocator.free(value);
     const name_owned = try allocator.dupe(u8, name);
     errdefer allocator.free(name_owned);
     return .{
         .name = name_owned,
         .url = url,
         .hash = hash,
+        .path = path,
     };
 }
 

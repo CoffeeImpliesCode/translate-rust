@@ -10,6 +10,9 @@ const spine = @import("spine.zig");
 /// §4 — The type tagged union every field/param/return references.
 pub const Type = union(enum) {
     path: Path,
+    /// A nominal type supplied by Rust `alloc`/`core`/`std`, not declared in this
+    /// crate. Its path is provenance-only: it has no graph entity id.
+    external_nominal: ExternalNominal,
     prim: Prim,
     reference: *const Ref,
     raw_ptr: *const RawPtr,
@@ -22,6 +25,16 @@ pub const Type = union(enum) {
     result: *const Result,
     boxed: *const Type,
     unsupported: spine.Unsupported,
+};
+
+/// A nominal Rust type outside the translated crate.
+///
+/// `path` retains every Rust segment, in source order. Unlike `Path`, the
+/// segments have no nullable `EntityId`; external names are never graph
+/// entities. Generic arguments remain first-class IR types.
+pub const ExternalNominal = struct {
+    path: []const []const u8,
+    args: []const Type = &.{},
 };
 
 /// §4.1 — Primitives. `()` → `void`, `!` → `noreturn`; `char` → `u21` at emit.

@@ -1,9 +1,10 @@
 //! translate_rust.frontend.pipeline — full frontend orchestration pipeline.
 //!
 //! Orchestrates:
-//! Ingestion -> CST extraction -> Name resolution -> Function body extraction ->
-//! Built-in Macro Expansion -> Type Inference -> Method & Trait Resolution ->
-//! Generic Monomorphization -> returns completed `ir.RustIr`.
+//! Ingestion -> CST extraction -> Name resolution -> Declaration type binding ->
+//! Function body extraction -> Built-in Macro Expansion -> Type Inference ->
+//! Method & Trait Resolution -> Generic Monomorphization -> returns completed
+//! `ir.RustIr`.
 //!
 //! Zero backend dependencies: does NOT depend on emit.zig, package.zig, or driver.zig.
 
@@ -24,6 +25,10 @@ pub const infer = @import("infer.zig");
 pub const resolve_methods = @import("resolve_methods.zig");
 pub const monomorphize = @import("monomorphize.zig");
 
+pub const AnalysisOptions = struct {
+    include_tests: bool = false,
+    cfg: cst.CfgOptions = .{},
+};
 const default_span: spine.Span = .{
     .start_line = 1,
     .start_col = 1,
@@ -81,7 +86,7 @@ fn materializeInferredConstructorTypes(
 /// Orchestrates the entire frontend analysis on a crate directory:
 /// 1. Ingestion (`Cargo.toml` name/edition/entry point resolution).
 /// 2. CST extraction (`cst.extractFile` across root + submodules).
-/// 3. Name resolution (`names.resolveGraph`).
+/// 3. Name resolution and declaration type-path binding (`cst.extractFile`).
 /// 4. Body lowering (`ts_ext.extractFunction` across fn entities).
 /// 5. Macro expansion (`expand`).
 /// 6. Type inference (`infer.solve` + constraint propagation).
@@ -93,11 +98,21 @@ pub fn analyzeCrate(
     io: std.Io,
     crate_dir: []const u8,
 ) !ir.RustIr {
+    return analyzeCrateWithOptions(allocator, io, crate_dir, .{ .cfg = .{} });
+}
+
+/// Analyze a crate directory with explicit frontend options.
+pub fn analyzeCrateWithOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    crate_dir: []const u8,
+    options: AnalysisOptions,
+) !ir.RustIr {
     // 1. Ingestion
     const manifest = try ingest.loadCrateManifest(allocator, io, crate_dir);
     const src = try ingest.readFileAlloc(allocator, io, manifest.root_path);
 
-    return analyzeSourceWithGraph(allocator, io, crate_dir, manifest, src);
+    return analyzeSourceWithGraph(allocator, io, crate_dir, manifest, src, options);
 }
 
 /// Analyze a crate when source is already loaded in memory.
@@ -107,6 +122,17 @@ pub fn analyzeSource(
     edition: []const u8,
     source: []const u8,
 ) !ir.RustIr {
+    return analyzeSourceWithOptions(allocator, crate_name, edition, source, .{ .cfg = .{} });
+}
+
+/// Analyze source with explicit frontend options.
+pub fn analyzeSourceWithOptions(
+    allocator: std.mem.Allocator,
+    crate_name: []const u8,
+    edition: []const u8,
+    source: []const u8,
+    options: AnalysisOptions,
+) !ir.RustIr {
     const manifest: ingest.Manifest = .{
         .name = crate_name,
         .edition = edition,
@@ -114,7 +140,560 @@ pub fn analyzeSource(
         .root_path = "src/lib.rs",
         .is_bin = false,
     };
-    return analyzeSourceWithGraph(allocator, null, ".", manifest, source);
+    return analyzeSourceWithGraph(allocator, null, ".", manifest, source, options);
+}
+
+fn manifestEdition(edition: []const u8) !u16 {
+    const value = std.fmt.parseUnsigned(u16, edition, 10) catch return error.InvalidEdition;
+    return switch (value) {
+        2015, 2018, 2021, 2024 => value,
+        else => error.InvalidEdition,
+    };
+}
+
+const ModuleSources = std.AutoHashMapUnmanaged(spine.EntityId, []const u8);
+
+fn moduleForEntity(g: *const graph.CrateGraph, module_id: spine.EntityId) ?graph.Module {
+    const ent = g.symbol_table.get(module_id) orelse return null;
+    if (ent.kind != .module) return null;
+    for (g.modules.items) |module| {
+        if (module.parent == ent.parent and std.mem.eql(u8, module.name, ent.name)) {
+            return module;
+        }
+    }
+    return null;
+}
+
+fn sourceForFunction(
+    g: *const graph.CrateGraph,
+    module_sources: *const ModuleSources,
+    fn_id: spine.EntityId,
+) ![]const u8 {
+    const ent = g.symbol_table.get(fn_id) orelse return error.FunctionBodyMissing;
+    var module_id = ent.parent orelse return error.FunctionModuleSourceMissing;
+    var depth: usize = 0;
+    while (depth < g.symbol_table.entities.items.len) : (depth += 1) {
+        const owner = g.symbol_table.get(module_id) orelse return error.FunctionModuleSourceMissing;
+        if (owner.kind != .module) {
+            module_id = owner.parent orelse return error.FunctionModuleSourceMissing;
+            continue;
+        }
+        const module = moduleForEntity(g, module_id) orelse return error.FunctionModuleSourceMissing;
+        if (module_sources.get(module.id)) |source| return source;
+        switch (module.kind) {
+            .root => return error.FunctionModuleSourceMissing,
+            .file, .directory => return error.FunctionModuleSourceMissing,
+            .@"inline" => module_id = module.parent orelse return error.FunctionModuleSourceMissing,
+        }
+    }
+    return error.FunctionModuleSourceMissing;
+}
+
+fn assertionConditionForNode(
+    reason: []const u8,
+    node: exprs.NodeId,
+    expr_count: usize,
+) ?exprs.NodeId {
+    const prefix = "assertion:";
+    if (!std.mem.startsWith(u8, reason, prefix)) return null;
+
+    const suffix = reason[prefix.len..];
+    if (suffix.len == 0) return null;
+    for (suffix) |character| {
+        if (character < '0' or character > '9') return null;
+    }
+
+    const condition = std.fmt.parseInt(exprs.NodeId, suffix, 10) catch return null;
+    if (condition >= expr_count or condition == node) return null;
+    return condition;
+}
+
+const CollectionEffectScanner = struct {
+    exprs: []const exprs.Expr,
+    stmts: []const exprs.Statement,
+
+    fn exprAllocates(self: *const CollectionEffectScanner, node_id: exprs.NodeId) bool {
+        if (@as(usize, node_id) >= self.exprs.len) return false;
+        return switch (self.exprs[node_id].kind) {
+            .literal, .path, .unit, .continue_ => false,
+            .array => |array| self.nodeListAllocates(array.elements),
+            .vec_lit => |vec| self.nodeListAllocates(vec.elements),
+            .range => |range| self.exprAllocates(range.start) or self.exprAllocates(range.end),
+            .block => |block| self.blockAllocates(block),
+            .if_else => |if_expr| self.ifElseAllocates(if_expr),
+            .if_let => |if_let| self.ifLetAllocates(if_let),
+            .match => |match_expr| self.matchAllocates(match_expr),
+            .loop_ => |loop_expr| self.blockAllocates(loop_expr.body),
+            .while_ => |while_expr| self.exprAllocates(while_expr.cond) or self.blockAllocates(while_expr.body),
+            .for_ => |for_expr| self.exprAllocates(for_expr.iterable) or
+                self.blockAllocates(for_expr.body) or
+                self.iterKindAllocates(for_expr.iter_kind),
+            .break_ => |break_expr| if (break_expr.value) |value| self.exprAllocates(value) else false,
+            .call => |call| self.nodeListAllocates(call.args),
+            .method_call => |method_call| self.exprAllocates(method_call.receiver) or
+                self.nodeListAllocates(method_call.args),
+            .struct_lit => |literal| self.structLiteralAllocates(literal),
+            .enum_variant => |variant| self.enumVariantAllocates(variant),
+            .field => |field| self.exprAllocates(field.base),
+            .index => |index| self.exprAllocates(index.base) or self.exprAllocates(index.index),
+            .cast => |cast| self.exprAllocates(cast.operand),
+            .binary => |binary| self.exprAllocates(binary.lhs) or self.exprAllocates(binary.rhs),
+            .unary => |unary| self.exprAllocates(unary.operand),
+            .assign => |assign| self.exprAllocates(assign.target) or self.exprAllocates(assign.value),
+            .try_ => |try_expr| self.exprAllocates(try_expr.inner),
+            .return_ => |return_expr| if (return_expr.value) |value| self.exprAllocates(value) else false,
+            .closure => |closure| self.blockAllocates(closure.body),
+            .iterator_chain => |chain| self.iteratorChainAllocates(chain),
+            .unsupported => |unsupported| if (assertionConditionForNode(
+                unsupported.reason,
+                node_id,
+                self.exprs.len,
+            )) |condition| self.exprAllocates(condition) else false,
+        };
+    }
+
+    fn nodeListAllocates(self: *const CollectionEffectScanner, node_ids: []const exprs.NodeId) bool {
+        for (node_ids) |node_id| {
+            if (self.exprAllocates(node_id)) return true;
+        }
+        return false;
+    }
+
+    fn blockAllocates(self: *const CollectionEffectScanner, block: exprs.BlockExpr) bool {
+        for (block.statements) |statement_id| {
+            if (@as(usize, statement_id) >= self.stmts.len) continue;
+            if (self.statementAllocates(self.stmts[statement_id])) return true;
+        }
+        if (block.tail) |tail| return self.exprAllocates(tail);
+        return false;
+    }
+
+    fn statementAllocates(self: *const CollectionEffectScanner, statement: exprs.Statement) bool {
+        return switch (statement.kind) {
+            .let => |let_statement| if (let_statement.init) |init| self.exprAllocates(init) else false,
+            .let_else => |let_else| self.exprAllocates(let_else.init) or self.blockAllocates(let_else.else_block),
+            .expr => |expression| self.exprAllocates(expression),
+            .item => false,
+        };
+    }
+
+    fn ifElseAllocates(self: *const CollectionEffectScanner, if_expr: exprs.IfExpr) bool {
+        if (self.exprAllocates(if_expr.cond)) return true;
+        if (self.blockAllocates(if_expr.then_)) return true;
+        return self.elseAllocates(if_expr.@"else");
+    }
+
+    fn ifLetAllocates(self: *const CollectionEffectScanner, if_let: exprs.IfLetExpr) bool {
+        if (self.exprAllocates(if_let.scrutinee)) return true;
+        if (self.blockAllocates(if_let.then_)) return true;
+        return self.elseAllocates(if_let.@"else");
+    }
+
+    fn elseAllocates(self: *const CollectionEffectScanner, branch: exprs.ElseBranch) bool {
+        return switch (branch) {
+            .none => false,
+            .block => |block| self.blockAllocates(block),
+            .chain => |chain| self.exprAllocates(chain),
+        };
+    }
+
+    fn matchAllocates(self: *const CollectionEffectScanner, match_expr: exprs.MatchExpr) bool {
+        if (self.exprAllocates(match_expr.scrutinee)) return true;
+        for (match_expr.arms) |arm| {
+            if (arm.guard) |guard| {
+                if (self.exprAllocates(guard)) return true;
+            }
+            if (self.exprAllocates(arm.body)) return true;
+        }
+        return false;
+    }
+
+    fn structLiteralAllocates(self: *const CollectionEffectScanner, literal: exprs.StructLit) bool {
+        for (literal.fields) |field| {
+            if (self.exprAllocates(field.value)) return true;
+        }
+        if (literal.base) |base| return self.exprAllocates(base);
+        return false;
+    }
+
+    fn enumVariantAllocates(self: *const CollectionEffectScanner, variant: exprs.EnumVariant) bool {
+        if (self.nodeListAllocates(variant.tuple_fields)) return true;
+        for (variant.named_fields) |field| {
+            if (self.exprAllocates(field.value)) return true;
+        }
+        return false;
+    }
+
+    fn iterKindAllocates(self: *const CollectionEffectScanner, iter_kind: exprs.IterKind) bool {
+        return switch (iter_kind) {
+            .range, .slice, .enumerate => false,
+            .multi => |nodes| self.nodeListAllocates(nodes),
+            .adapter => |chain| self.iteratorChainAllocates(chain),
+        };
+    }
+
+    fn iteratorChainAllocates(
+        self: *const CollectionEffectScanner,
+        chain: exprs.IteratorChainExpr,
+    ) bool {
+        if (chain.terminal == .collect_vec) return true;
+        if (self.exprAllocates(chain.source)) return true;
+        for (chain.adapters) |adapter| {
+            if (self.adapterAllocates(adapter)) return true;
+        }
+        return false;
+    }
+
+    fn adapterAllocates(self: *const CollectionEffectScanner, adapter: exprs.IteratorAdapter) bool {
+        return switch (adapter) {
+            .map => |map| self.blockAllocates(map.closure.body),
+            .filter => |filter| self.blockAllocates(filter.closure.body),
+            .flat_map => |closure| self.blockAllocates(closure.body),
+            .enumerate, .range_rev, .other => false,
+            .zip => |zip| self.exprAllocates(zip.other),
+        };
+    }
+};
+
+fn markDirectCollectionEffects(
+    bodies_list: *std.ArrayListUnmanaged(bodies.BodyKind),
+    expr_table: []const exprs.Expr,
+    stmt_table: []const exprs.Statement,
+) void {
+    const scanner: CollectionEffectScanner = .{
+        .exprs = expr_table,
+        .stmts = stmt_table,
+    };
+    for (bodies_list.items) |*body| {
+        switch (body.*) {
+            .fn_ => |*function| {
+                if (scanner.exprAllocates(function.body)) function.is_allocating = true;
+            },
+            .struct_ => |*structure| {
+                for (@constCast(structure.methods)) |*method| {
+                    if (scanner.exprAllocates(method.body)) method.is_allocating = true;
+                }
+            },
+            else => {},
+        }
+    }
+}
+const ResolvedCallEffectScanner = struct {
+    exprs: []const exprs.Expr,
+    stmts: []const exprs.Statement,
+    bodies: []const bodies.BodyKind,
+
+    fn exprCallsAllocating(self: *const ResolvedCallEffectScanner, node_id: exprs.NodeId) bool {
+        if (@as(usize, node_id) >= self.exprs.len) return false;
+        return switch (self.exprs[node_id].kind) {
+            .literal, .path, .unit, .continue_ => false,
+            .array => |array| self.nodeListCallsAllocating(array.elements),
+            .vec_lit => |vec| self.nodeListCallsAllocating(vec.elements),
+            .range => |range| self.exprCallsAllocating(range.start) or self.exprCallsAllocating(range.end),
+            .block => |block| self.blockCallsAllocating(block),
+            .if_else => |if_expr| self.exprCallsAllocating(if_expr.cond) or
+                self.blockCallsAllocating(if_expr.then_) or
+                self.elseCallsAllocating(if_expr.@"else"),
+            .if_let => |if_let| self.exprCallsAllocating(if_let.scrutinee) or
+                self.blockCallsAllocating(if_let.then_) or
+                self.elseCallsAllocating(if_let.@"else"),
+            .match => |match_expr| self.matchCallsAllocating(match_expr),
+            .loop_ => |loop_expr| self.blockCallsAllocating(loop_expr.body),
+            .while_ => |while_expr| self.exprCallsAllocating(while_expr.cond) or
+                self.blockCallsAllocating(while_expr.body),
+            .for_ => |for_expr| self.exprCallsAllocating(for_expr.iterable) or
+                self.blockCallsAllocating(for_expr.body) or
+                self.iterKindCallsAllocating(for_expr.iter_kind),
+            .break_ => |break_expr| if (break_expr.value) |value| self.exprCallsAllocating(value) else false,
+            .call => |call| self.callTargetAllocates(call.call_kind) or
+                self.nodeListCallsAllocating(call.args),
+            .method_call => |method_call| self.methodTargetAllocates(method_call.method) or
+                self.exprCallsAllocating(method_call.receiver) or
+                self.nodeListCallsAllocating(method_call.args),
+            .struct_lit => |literal| self.structLiteralCallsAllocating(literal),
+            .enum_variant => |variant| self.enumVariantCallsAllocating(variant),
+            .field => |field| self.exprCallsAllocating(field.base),
+            .index => |index| self.exprCallsAllocating(index.base) or self.exprCallsAllocating(index.index),
+            .cast => |cast| self.exprCallsAllocating(cast.operand),
+            .binary => |binary| self.exprCallsAllocating(binary.lhs) or self.exprCallsAllocating(binary.rhs),
+            .unary => |unary| self.exprCallsAllocating(unary.operand),
+            .assign => |assign| self.exprCallsAllocating(assign.target) or self.exprCallsAllocating(assign.value),
+            .try_ => |try_expr| self.exprCallsAllocating(try_expr.inner),
+            .return_ => |return_expr| if (return_expr.value) |value| self.exprCallsAllocating(value) else false,
+            .closure => |closure| self.blockCallsAllocating(closure.body),
+            .iterator_chain => |chain| self.iteratorChainCallsAllocating(chain),
+            .unsupported => |unsupported| if (assertionConditionForNode(
+                unsupported.reason,
+                node_id,
+                self.exprs.len,
+            )) |condition| self.exprCallsAllocating(condition) else false,
+        };
+    }
+
+    fn nodeListCallsAllocating(self: *const ResolvedCallEffectScanner, node_ids: []const exprs.NodeId) bool {
+        for (node_ids) |node_id| {
+            if (self.exprCallsAllocating(node_id)) return true;
+        }
+        return false;
+    }
+
+    fn blockCallsAllocating(self: *const ResolvedCallEffectScanner, block: exprs.BlockExpr) bool {
+        for (block.statements) |statement_id| {
+            if (@as(usize, statement_id) >= self.stmts.len) continue;
+            if (self.statementCallsAllocating(self.stmts[statement_id])) return true;
+        }
+        if (block.tail) |tail| return self.exprCallsAllocating(tail);
+        return false;
+    }
+
+    fn statementCallsAllocating(self: *const ResolvedCallEffectScanner, statement: exprs.Statement) bool {
+        return switch (statement.kind) {
+            .let => |let_statement| if (let_statement.init) |init| self.exprCallsAllocating(init) else false,
+            .let_else => |let_else| self.exprCallsAllocating(let_else.init) or
+                self.blockCallsAllocating(let_else.else_block),
+            .expr => |expression| self.exprCallsAllocating(expression),
+            .item => false,
+        };
+    }
+
+    fn elseCallsAllocating(self: *const ResolvedCallEffectScanner, branch: exprs.ElseBranch) bool {
+        return switch (branch) {
+            .none => false,
+            .block => |block| self.blockCallsAllocating(block),
+            .chain => |chain| self.exprCallsAllocating(chain),
+        };
+    }
+
+    fn matchCallsAllocating(self: *const ResolvedCallEffectScanner, match_expr: exprs.MatchExpr) bool {
+        if (self.exprCallsAllocating(match_expr.scrutinee)) return true;
+        for (match_expr.arms) |arm| {
+            if (arm.guard) |guard| {
+                if (self.exprCallsAllocating(guard)) return true;
+            }
+            if (self.exprCallsAllocating(arm.body)) return true;
+        }
+        return false;
+    }
+
+    fn structLiteralCallsAllocating(self: *const ResolvedCallEffectScanner, literal: exprs.StructLit) bool {
+        for (literal.fields) |field| {
+            if (self.exprCallsAllocating(field.value)) return true;
+        }
+        if (literal.base) |base| return self.exprCallsAllocating(base);
+        return false;
+    }
+
+    fn enumVariantCallsAllocating(self: *const ResolvedCallEffectScanner, variant: exprs.EnumVariant) bool {
+        if (self.nodeListCallsAllocating(variant.tuple_fields)) return true;
+        for (variant.named_fields) |field| {
+            if (self.exprCallsAllocating(field.value)) return true;
+        }
+        return false;
+    }
+
+    fn iterKindCallsAllocating(self: *const ResolvedCallEffectScanner, iter_kind: exprs.IterKind) bool {
+        return switch (iter_kind) {
+            .range, .slice, .enumerate => false,
+            .multi => |nodes| self.nodeListCallsAllocating(nodes),
+            .adapter => |chain| self.iteratorChainCallsAllocating(chain),
+        };
+    }
+
+    fn iteratorChainCallsAllocating(
+        self: *const ResolvedCallEffectScanner,
+        chain: exprs.IteratorChainExpr,
+    ) bool {
+        if (self.exprCallsAllocating(chain.source)) return true;
+        for (chain.adapters) |adapter| {
+            switch (adapter) {
+                .map => |map| {
+                    if (self.blockCallsAllocating(map.closure.body)) return true;
+                },
+                .filter => |filter| {
+                    if (self.blockCallsAllocating(filter.closure.body)) return true;
+                },
+                .flat_map => |closure| {
+                    if (self.blockCallsAllocating(closure.body)) return true;
+                },
+                .enumerate, .range_rev, .other => {},
+                .zip => |zip| {
+                    if (self.exprCallsAllocating(zip.other)) return true;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn callTargetAllocates(self: *const ResolvedCallEffectScanner, call_kind: exprs.CallKind) bool {
+        return switch (call_kind) {
+            .free => |target| self.bodyAllocates(target),
+            .associated => |target| self.bodyAllocates(target),
+            .constructor => false,
+        };
+    }
+
+    fn methodTargetAllocates(self: *const ResolvedCallEffectScanner, target: exprs.DefId) bool {
+        return self.bodyAllocates(target);
+    }
+
+    fn bodyAllocates(self: *const ResolvedCallEffectScanner, target: spine.EntityId) bool {
+        if (@as(usize, target) >= self.bodies.len) return false;
+        return switch (self.bodies[target]) {
+            .fn_ => |function| function.is_allocating,
+            else => false,
+        };
+    }
+};
+
+fn markStructMethodAllocating(
+    bodies_list: *std.ArrayListUnmanaged(bodies.BodyKind),
+    g: *const graph.CrateGraph,
+    fn_id: spine.EntityId,
+) bool {
+    const entity = g.symbol_table.get(fn_id) orelse return false;
+    if (entity.kind != .fn_) return false;
+    if (fn_id >= bodies_list.items.len) return false;
+    const method_body = switch (bodies_list.items[fn_id]) {
+        .fn_ => |function| function.body,
+        else => return false,
+    };
+
+    var parent_id = entity.parent;
+    while (parent_id) |id| {
+        const parent = g.symbol_table.get(id) orelse return false;
+        if (parent.kind == .struct_ or parent.kind == .enum_ or parent.kind == .union_) {
+            if (id >= bodies_list.items.len) return false;
+            const body = &bodies_list.items[id];
+            switch (body.*) {
+                .struct_ => |*structure| {
+                    var changed = false;
+                    for (@constCast(structure.methods)) |*method| {
+                        if (method.body != method_body) continue;
+                        if (!method.is_allocating) {
+                            method.is_allocating = true;
+                            changed = true;
+                        }
+                    }
+                    return changed;
+                },
+                else => return false,
+            }
+        }
+        parent_id = parent.parent;
+    }
+    return false;
+}
+
+fn markFunctionAllocating(
+    bodies_list: *std.ArrayListUnmanaged(bodies.BodyKind),
+    g: *const graph.CrateGraph,
+    fn_id: spine.EntityId,
+) bool {
+    if (fn_id >= bodies_list.items.len) return false;
+    var changed = false;
+    const body = &bodies_list.items[fn_id];
+    switch (body.*) {
+        .fn_ => |*function| {
+            if (!function.is_allocating) {
+                function.is_allocating = true;
+                changed = true;
+            }
+        },
+        else => return false,
+    }
+    if (markStructMethodAllocating(bodies_list, g, fn_id)) changed = true;
+    return changed;
+}
+
+fn propagateResolvedCallEffects(
+    bodies_list: *std.ArrayListUnmanaged(bodies.BodyKind),
+    expr_table: []const exprs.Expr,
+    stmt_table: []const exprs.Statement,
+    g: *const graph.CrateGraph,
+) void {
+    const scanner: ResolvedCallEffectScanner = .{
+        .exprs = expr_table,
+        .stmts = stmt_table,
+        .bodies = bodies_list.items,
+    };
+    var round: usize = 0;
+    while (round < bodies_list.items.len) : (round += 1) {
+        var changed = false;
+        for (bodies_list.items, 0..) |body, owner_id| {
+            switch (body) {
+                .fn_ => |function| {
+                    if (scanner.exprCallsAllocating(function.body) and
+                        markFunctionAllocating(bodies_list, g, @intCast(owner_id)))
+                    {
+                        changed = true;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (!changed) break;
+    }
+}
+
+fn manifestDependency(
+    allocator: std.mem.Allocator,
+    dependency: ingest.Dependency,
+    index: usize,
+) !graph.CrateDep {
+    var result: graph.CrateDep = undefined;
+    result.extern_name = try allocator.dupe(u8, dependency.package orelse dependency.name);
+    errdefer allocator.free(result.extern_name);
+    result.local_alias = try allocator.dupe(u8, dependency.name);
+    result.id = @intCast(index + 1);
+    result.version = if (dependency.version) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (result.version) |value| allocator.free(value);
+    result.path = if (dependency.path) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (result.path) |value| allocator.free(value);
+    result.git = if (dependency.git) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (result.git) |value| allocator.free(value);
+    result.optional = dependency.optional;
+    result.default_features = dependency.default_features;
+    var owned_features: [][]const u8 = &.{};
+    if (dependency.features.len > 0) {
+        owned_features = try allocator.alloc([]const u8, dependency.features.len);
+        var initialized_features: usize = 0;
+        errdefer {
+            for (owned_features[0..initialized_features]) |feature| allocator.free(feature);
+            allocator.free(owned_features);
+        }
+        for (dependency.features, 0..) |feature, feature_index| {
+            owned_features[feature_index] = try allocator.dupe(u8, feature);
+            initialized_features += 1;
+        }
+    }
+    result.features = owned_features;
+    return result;
+}
+
+fn manifestDependencies(
+    allocator: std.mem.Allocator,
+    dependencies: []const ingest.Dependency,
+) ![]const graph.CrateDep {
+    if (dependencies.len == 0) return &.{};
+    const result = try allocator.alloc(graph.CrateDep, dependencies.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |entry| {
+            allocator.free(entry.extern_name);
+            allocator.free(entry.local_alias);
+            if (entry.version) |version| allocator.free(version);
+            if (entry.path) |path| allocator.free(path);
+            if (entry.git) |git| allocator.free(git);
+            for (entry.features) |feature| allocator.free(feature);
+            if (entry.features.len > 0) allocator.free(entry.features);
+        }
+        allocator.free(result);
+    }
+    for (dependencies, 0..) |dependency, index| {
+        result[index] = try manifestDependency(allocator, dependency, index);
+        initialized += 1;
+    }
+    return result;
 }
 
 fn analyzeSourceWithGraph(
@@ -123,7 +702,9 @@ fn analyzeSourceWithGraph(
     crate_dir: []const u8,
     manifest: ingest.Manifest,
     src: []const u8,
+    options: AnalysisOptions,
 ) !ir.RustIr {
+    const edition = try manifestEdition(manifest.edition);
     // 1. Construct root module and symbol table in CrateGraph
     var g = graph.CrateGraph.init(allocator);
 
@@ -151,12 +732,13 @@ fn analyzeSourceWithGraph(
         .items = &.{},
         .attributes = &.{},
     });
+    const crate_deps = try manifestDependencies(allocator, manifest.dependencies);
     try g.addCrate(.{
         .name = try allocator.dupe(u8, manifest.name),
-        .edition = 2021,
+        .edition = edition,
         .kind = if (manifest.is_bin) .bin else .lib,
         .root = 0,
-        .deps = &.{},
+        .deps = crate_deps,
         .is_translated = true,
     });
 
@@ -169,6 +751,15 @@ fn analyzeSourceWithGraph(
     var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
 
     // 2. CST extraction across root and submodules
+    var fn_origins: cst.FunctionOriginTable = .empty;
+    defer {
+        var it = fn_origins.valueIterator();
+        while (it.next()) |origin| {
+            allocator.free(origin.source);
+        }
+        fn_origins.deinit(allocator);
+    }
+
     const root_dir = std.fs.path.dirname(manifest.root_path) orelse crate_dir;
     var cst_ctx: cst.Ctx = .{
         .alloc = allocator,
@@ -179,29 +770,16 @@ fn analyzeSourceWithGraph(
         .exprs_list = &exprs_list,
         .base_dir = root_dir,
         .io = maybe_io,
+        .include_tests = options.include_tests,
+        .cfg = options.cfg,
+        .function_origins = &fn_origins,
     };
+    // `extractFile` resolves names and binds declaration types before return.
     try cst.extractFile(&cst_ctx);
-    // 3. Name resolution
-    try names.resolveGraph(allocator, &g);
 
     // 4. Function body lowering
     var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
     var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
-
-    // Cache module sources for submodules
-    var module_srcs: std.AutoHashMapUnmanaged(spine.EntityId, []const u8) = .empty;
-    defer module_srcs.deinit(allocator);
-    try module_srcs.put(allocator, 0, src);
-
-    if (maybe_io) |io| {
-        for (g.modules.items) |m| {
-            if (m.id == 0) continue;
-            if (m.source_path) |sp| {
-                const m_src = try ingest.readFileAlloc(allocator, io, sp);
-                try module_srcs.put(allocator, m.id, m_src);
-            }
-        }
-    }
 
     var ts_ctx: ts_ext.Ctx = .{
         .alloc = allocator,
@@ -222,22 +800,15 @@ fn analyzeSourceWithGraph(
     }
 
     for (fn_ids.items) |fn_id| {
-        const ent = g.symbol_table.get(fn_id) orelse continue;
-        var cur = ent.parent orelse continue;
-        var m_src: ?[]const u8 = null;
-        while (g.module(cur)) |m| {
-            if (module_srcs.get(cur)) |s| {
-                m_src = s;
-                break;
-            }
-            cur = m.parent orelse break;
-        }
-        const fn_src = m_src orelse src;
-        ts_ctx.src = fn_src;
-        ts_ctx.mod_id = ent.parent.?;
+        if (fn_id >= bodies_list.items.len) return error.FunctionBodyMissing;
+        const origin = fn_origins.get(fn_id) orelse return error.FunctionModuleSourceMissing;
+        ts_ctx.src = origin.source;
+        ts_ctx.mod_id = origin.lexical_module;
         const extracted = try ts_ext.extractFunction(&ts_ctx, fn_id);
-        if (!extracted) continue;
+        if (!extracted) return error.FunctionBodyMissing;
     }
+    // Seed allocation effects from direct collection producers.
+    markDirectCollectionEffects(&bodies_list, exprs_list.items, stmts_list.items);
 
     // 5. Type inference, method resolution, and generic monomorphization
     var b_temp: bodies.Bodies = .{
@@ -261,6 +832,7 @@ fn analyzeSourceWithGraph(
     );
     b_temp.types = types_list.items;
     _ = resolve_methods.resolveMethods(&g, &b_temp);
+    propagateResolvedCallEffects(&bodies_list, exprs_list.items, stmts_list.items, &g);
     instantiation_table = try monomorphize.collectInstantiations(allocator, &g, &b_temp);
     // Inference records are keyed by source expression. Copy their
     // concrete argument slices into the long-lived table before `solved`
@@ -296,6 +868,23 @@ fn analyzeSourceWithGraph(
     };
 }
 
+fn writeTestFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    relative_path: []const u8,
+    content: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ root, relative_path });
+    defer allocator.free(path);
+    if (std.fs.path.dirname(path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
+}
+
 test "analyzeSource on simple Rust function" {
     // The pipeline's internal allocations (cst param names, infer result
     // types) are arena-owned like the reference driver; use an arena here so
@@ -305,6 +894,8 @@ test "analyzeSource on simple Rust function" {
     const allocator = arena_state.allocator();
 
     const src =
+        \\//! Root documentation is CST trivia.
+        \\#![no_std]
         \\pub fn add(a: i32, b: i32) -> i32 {
         \\    a + b
         \\}
@@ -314,10 +905,281 @@ test "analyzeSource on simple Rust function" {
 
     try std.testing.expectEqualStrings("mini", rust_ir.crate_name);
     try std.testing.expectEqualStrings("2021", rust_ir.edition);
+    try std.testing.expectEqual(@as(usize, 1), rust_ir.graph.modules.items[0].attributes.len);
+    try std.testing.expectEqualStrings("no_std", rust_ir.graph.modules.items[0].attributes[0].name);
     try std.testing.expect(rust_ir.graph.symbol_table.entities.items.len > 0);
 }
 
-test "analyzeSource preserves valid body and refuses cast/reference expressions" {
+test "analyzeSourceWithOptions includes cfg test module and function body" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const source =
+        \\fn normal() {}
+        \\
+        \\#[cfg(test)]
+        \\mod tests {
+        \\    #[test]
+        \\    fn smoke() {
+        \\        assert_eq!(1, 1);
+        \\    }
+        \\}
+    ;
+
+    const options: AnalysisOptions = .{ .include_tests = true };
+    const rust_ir = try analyzeSourceWithOptions(
+        allocator,
+        "include_tests",
+        "2021",
+        source,
+        options,
+    );
+    const helpers = struct {
+        fn findEntity(
+            rust_ir_: *const ir.RustIr,
+            kind: spine.EntityKind,
+            name: []const u8,
+        ) ?spine.Entity {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != kind) continue;
+                if (std.mem.eql(u8, entity.name, name)) return entity;
+            }
+            return null;
+        }
+
+        fn hasAttribute(attributes: []const spine.Attribute, name: []const u8) bool {
+            for (attributes) |attribute| {
+                if (std.mem.eql(u8, attribute.name, name)) return true;
+            }
+            return false;
+        }
+    };
+
+    try std.testing.expect(helpers.findEntity(&rust_ir, .fn_, "normal") != null);
+
+    const tests_module = helpers.findEntity(&rust_ir, .module, "tests") orelse
+        return error.TestUnexpectedResult;
+    const smoke = helpers.findEntity(&rust_ir, .fn_, "smoke") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?spine.EntityId, tests_module.id), smoke.parent);
+    try std.testing.expect(helpers.hasAttribute(smoke.attributes, "test"));
+
+    try std.testing.expect(smoke.id < rust_ir.bodies.bodies.len);
+    const smoke_body = switch (rust_ir.bodies.bodies[smoke.id]) {
+        .fn_ => |function_body| function_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(smoke_body.body < rust_ir.bodies.exprs.len);
+    const root_block = switch (rust_ir.bodies.exprs[smoke_body.body].kind) {
+        .block => |block| block,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), root_block.statements.len);
+
+    const assertion_statement_id = root_block.statements[0];
+    try std.testing.expect(assertion_statement_id < rust_ir.bodies.stmts.len);
+    const assertion_expression_id = switch (rust_ir.bodies.stmts[assertion_statement_id].kind) {
+        .expr => |expression_id| expression_id,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(assertion_expression_id < rust_ir.bodies.exprs.len);
+    const assertion_marker = switch (rust_ir.bodies.exprs[assertion_expression_id].kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, assertion_marker, "assertion:"));
+
+    const assertion_condition_id = try std.fmt.parseInt(
+        exprs.NodeId,
+        assertion_marker["assertion:".len..],
+        10,
+    );
+    try std.testing.expect(assertion_condition_id < rust_ir.bodies.exprs.len);
+    const assertion_condition = switch (rust_ir.bodies.exprs[assertion_condition_id].kind) {
+        .binary => |binary| binary,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(assertion_condition.op == .eq);
+    try std.testing.expect(assertion_condition.lhs < rust_ir.bodies.exprs.len);
+    try std.testing.expect(assertion_condition.rhs < rust_ir.bodies.exprs.len);
+
+    const lhs = rust_ir.bodies.exprs[assertion_condition.lhs];
+    try std.testing.expect(lhs.kind == .literal);
+    try std.testing.expect(lhs.kind.literal == .int);
+    try std.testing.expectEqual(@as(i128, 1), lhs.kind.literal.int.value);
+
+    const rhs = rust_ir.bodies.exprs[assertion_condition.rhs];
+    try std.testing.expect(rhs.kind == .literal);
+    try std.testing.expect(rhs.kind.literal == .int);
+    try std.testing.expectEqual(@as(i128, 1), rhs.kind.literal.int.value);
+}
+
+test "analyzeSourceWithOptions selects configured feature-gated entity" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const source =
+        \\#[cfg(feature = "alloc")]
+        \\pub struct AllocOnly;
+    ;
+
+    const configured_ir = try analyzeSourceWithOptions(
+        allocator,
+        "configured_cfg",
+        "2021",
+        source,
+        .{ .cfg = .{ .features = &.{"alloc"} } },
+    );
+    const default_ir = try analyzeSource(
+        allocator,
+        "default_cfg",
+        "2021",
+        source,
+    );
+    const helpers = struct {
+        fn hasEntity(
+            rust_ir_: *const ir.RustIr,
+            kind: spine.EntityKind,
+            name: []const u8,
+        ) bool {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != kind) continue;
+                if (std.mem.eql(u8, entity.name, name)) return true;
+            }
+            return false;
+        }
+    };
+
+    try std.testing.expect(helpers.hasEntity(&configured_ir, .struct_, "AllocOnly"));
+    try std.testing.expect(!helpers.hasEntity(&default_ir, .struct_, "AllocOnly"));
+}
+
+test "analyzeSource rejects invalid edition metadata" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub fn valid() {}
+    ;
+    try std.testing.expectError(
+        error.InvalidEdition,
+        analyzeSource(allocator, "invalid_edition", "not-an-edition", src),
+    );
+}
+
+test "analyzeSource rejects a bodyless function declaration during parsing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub fn missing()
+    ;
+    try std.testing.expectError(
+        error.ParseFailed,
+        analyzeSource(allocator, "missing_body", "2021", src),
+    );
+}
+
+test "analysis rejects a function whose module source is unavailable" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = graph.CrateGraph.init(allocator);
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = default_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = try allocator.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = default_span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 1,
+        .kind = .module,
+        .name = try allocator.dupe(u8, "missing"),
+        .span = default_span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 1,
+        .kind = .file,
+        .name = try allocator.dupe(u8, "missing"),
+        .parent = 0,
+        .source_path = try allocator.dupe(u8, "missing.rs"),
+        .is_crate = false,
+        .is_extern = false,
+        .span = default_span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    const function_id = try crate_graph.symbol_table.add(.{
+        .id = 2,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "missing_source"),
+        .span = default_span,
+        .visibility = .public,
+        .parent = 1,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    var module_sources: ModuleSources = .empty;
+    try module_sources.put(allocator, 0, "root module source");
+    defer module_sources.deinit(allocator);
+
+    try std.testing.expectError(
+        error.FunctionModuleSourceMissing,
+        sourceForFunction(&crate_graph, &module_sources, function_id),
+    );
+}
+
+test "analyzeSource rejects malformed expressions and patterns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const malformed_sources = [_][]const u8{
+        "pub fn broken() -> u8 { 1 + }",
+        "pub fn broken(value: u8) -> u8 { match value { mut => 1 } }",
+        "pub fn broken(value: u8) -> u8 { match value { => 1 } }",
+        "pub fn broken() { missing( }",
+        "pub fn broken() { if { 1 } }",
+        "pub fn broken() { let mut = 1; }",
+        "pub fn broken(values: [u8; 1]) { for in values {} }",
+    };
+    for (malformed_sources) |source| {
+        try std.testing.expectError(
+            error.ParseFailed,
+            analyzeSource(allocator, "malformed", "2021", source),
+        );
+    }
+}
+
+test "analyzeSource preserves valid body and lowers scalar casts and shared references" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -417,15 +1279,17 @@ test "analyzeSource preserves valid body and refuses cast/reference expressions"
     };
     const cast_init = cast_let.init orelse return error.ExpectedCastInitializer;
     try std.testing.expect(cast_init < rust_ir.bodies.exprs.len);
-    const cast_kind = rust_ir.bodies.exprs[cast_init].kind;
-    try std.testing.expect(cast_kind != .path);
-    try std.testing.expect(cast_kind != .unit);
-    const cast_reason = switch (cast_kind) {
-        .unsupported => |unsupported| unsupported.reason,
-        else => return error.ExpectedUnsupportedCast,
+    const cast_expr = switch (rust_ir.bodies.exprs[cast_init].kind) {
+        .cast => |cast| cast,
+        else => return error.ExpectedSupportedCast,
     };
-    try std.testing.expect(cast_reason.len > 0);
-    try std.testing.expectEqualStrings("cast expression", cast_reason);
+    try std.testing.expect(cast_expr.operand < rust_ir.bodies.exprs.len);
+    try std.testing.expect(cast_expr.target < rust_ir.bodies.types.len);
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u16 },
+        rust_ir.bodies.types[cast_expr.target],
+    );
+    try std.testing.expectEqual(cast_expr.target, rust_ir.bodies.exprs[cast_init].ty.?);
 
     const reference_statement = rust_ir.bodies.stmts[refuse_body.statements[2]];
     const reference_let = switch (reference_statement.kind) {
@@ -438,16 +1302,125 @@ test "analyzeSource preserves valid body and refuses cast/reference expressions"
     const reference_kind = rust_ir.bodies.exprs[reference_init].kind;
     try std.testing.expect(reference_kind != .path);
     try std.testing.expect(reference_kind != .unit);
-    const reference_reason = switch (reference_kind) {
-        .unsupported => |unsupported| unsupported.reason,
-        else => return error.ExpectedUnsupportedReference,
+    const reference = switch (reference_kind) {
+        .unary => |unary| unary,
+        else => return error.ExpectedSharedReference,
     };
-    try std.testing.expect(reference_reason.len > 0);
-    try std.testing.expectEqualStrings("reference expression", reference_reason);
+    switch (reference.op) {
+        .ref => |mode| try std.testing.expect(mode == .shared),
+        else => return error.ExpectedSharedReference,
+    }
+    try std.testing.expect(reference.operand < rust_ir.bodies.exprs.len);
+    try std.testing.expect(
+        rust_ir.bodies.exprs[reference.operand].kind == .path,
+    );
 
     const refuse_tail_id = refuse_body.tail orelse return error.ExpectedRefuseTail;
     try std.testing.expect(refuse_tail_id < rust_ir.bodies.exprs.len);
     try std.testing.expect(rust_ir.bodies.exprs[refuse_tail_id].kind == .path);
+}
+
+test "analyzeSource retains literal and empty macro refusals without dropping valid function" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const src =
+        \\pub fn oversized_literal() -> u128 {
+        \\    340282366920938463463374607431768211455u128
+        \\}
+        \\
+        \\pub fn empty_macro_argument() {
+        \\    vec![1,,2]
+        \\}
+        \\
+        \\pub fn valid() -> u8 {
+        \\    7
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "expr_refusal", "2021", src);
+    const helpers = struct {
+        fn functionBlock(
+            rust_ir_: *const ir.RustIr,
+            name: []const u8,
+        ) ?exprs.BlockExpr {
+            var function: ?spine.Entity = null;
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != .fn_) continue;
+                if (std.mem.eql(u8, entity.name, name)) {
+                    function = entity;
+                    break;
+                }
+            }
+            const entity = function orelse return null;
+            if (entity.id >= rust_ir_.bodies.bodies.len) return null;
+            const fn_body = switch (rust_ir_.bodies.bodies[entity.id]) {
+                .fn_ => |body| body,
+                else => return null,
+            };
+            if (fn_body.body >= rust_ir_.bodies.exprs.len) return null;
+            return switch (rust_ir_.bodies.exprs[fn_body.body].kind) {
+                .block => |block| block,
+                else => null,
+            };
+        }
+
+        fn tailExpression(
+            rust_ir_: *const ir.RustIr,
+            name: []const u8,
+        ) ?exprs.Expr {
+            const block = functionBlock(rust_ir_, name) orelse return null;
+            const tail = block.tail orelse return null;
+            if (tail >= rust_ir_.bodies.exprs.len) return null;
+            return rust_ir_.bodies.exprs[tail];
+        }
+
+        fn onlyStatementExpression(
+            rust_ir_: *const ir.RustIr,
+            name: []const u8,
+        ) ?exprs.Expr {
+            const block = functionBlock(rust_ir_, name) orelse return null;
+            if (block.tail != null or block.statements.len != 1) return null;
+            const statement_id = block.statements[0];
+            if (statement_id >= rust_ir_.bodies.stmts.len) return null;
+            const expression_id = switch (rust_ir_.bodies.stmts[statement_id].kind) {
+                .expr => |expression| expression,
+                else => return null,
+            };
+            if (expression_id >= rust_ir_.bodies.exprs.len) return null;
+            return rust_ir_.bodies.exprs[expression_id];
+        }
+    };
+
+    const oversized = helpers.tailExpression(&rust_ir, "oversized_literal") orelse
+        return error.MissingOversizedLiteralBody;
+    const oversized_reason = switch (oversized.kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.ExpectedOversizedLiteralRefusal,
+    };
+    try std.testing.expect(oversized_reason.len > 0);
+    try std.testing.expectEqualStrings("integer literal out of range", oversized_reason);
+
+    const empty_macro = helpers.onlyStatementExpression(&rust_ir, "empty_macro_argument") orelse
+        return error.MissingEmptyMacroBody;
+    const empty_macro_reason = switch (empty_macro.kind) {
+        .unsupported => |unsupported| unsupported.reason,
+        else => return error.ExpectedEmptyMacroArgumentRefusal,
+    };
+    try std.testing.expect(empty_macro_reason.len > 0);
+    try std.testing.expectEqualStrings("empty macro argument", empty_macro_reason);
+
+    const valid = helpers.tailExpression(&rust_ir, "valid") orelse
+        return error.MissingValidBody;
+    const valid_literal = switch (valid.kind) {
+        .literal => |literal| switch (literal) {
+            .int => |integer| integer,
+            else => return error.ExpectedValidIntegerLiteral,
+        },
+        else => return error.ExpectedValidLiteralBody,
+    };
+    try std.testing.expectEqual(@as(i128, 7), valid_literal.value);
 }
 
 test "analyzeSource resolves enum variant match patterns and refuses missing scoped path" {
@@ -872,6 +1845,7 @@ test "analyzeSource propagates generic alias constructor type through a local re
                 .struct_lit => |literal| hasFields(ir_, literal.fields),
                 .enum_variant => |variant| hasArgs(ir_, variant.tuple_fields) or
                     hasNamedFields(ir_, variant.named_fields),
+                .cast => |cast| hasNode(ir_, cast.operand),
                 .field => |field| hasNode(ir_, field.base),
                 .index => |index| hasNode(ir_, index.base) or hasNode(ir_, index.index),
                 .binary => |binary| hasNode(ir_, binary.lhs) or hasNode(ir_, binary.rhs),
@@ -964,6 +1938,152 @@ test "analyzeSource propagates generic alias constructor type through a local re
     try std.testing.expect(!target_chain(&rust_ir, update_node.?));
     try std.testing.expect(!target_chain(&rust_ir, value_node.?));
 }
+test "cst.extractFile resolves hex error module before rejecting strict core nominal type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const error_source_path = "test/crates/hex/src/error.rs";
+    var crate_graph = graph.CrateGraph.init(allocator);
+    defer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = default_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = default_span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var cst_ctx: cst.Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\#[cfg(feature = "serde")]
+        \\pub mod serde;
+        \\#[cfg(feature = "std")]
+        \\impl Missing { fn fail() {} }
+        \\mod error;
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+        .base_dir = "test/crates/hex/src",
+        .io = std.testing.io,
+    };
+
+    try std.testing.expectError(
+        error.UnresolvedNominalType,
+        cst.extractFile(&cst_ctx),
+    );
+    var error_module_id: ?spine.EntityId = null;
+    var error_type_id: ?spine.EntityId = null;
+    var display_impl_parent: ?spine.EntityId = null;
+    var saw_serde_module = false;
+    var saw_tests_module = false;
+    var saw_std_error_impl = false;
+    for (crate_graph.modules.items) |module| {
+        if (std.mem.eql(u8, module.name, "serde")) {
+            saw_serde_module = true;
+            continue;
+        }
+        if (!std.mem.eql(u8, module.name, "error")) continue;
+        try std.testing.expectEqualStrings(error_source_path, module.source_path orelse
+            return error.MissingHexErrorSource);
+        try std.testing.expect(module.items.len > 0);
+    }
+    for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .module and std.mem.eql(u8, entity.name, "error")) {
+            error_module_id = entity.id;
+        }
+        if (entity.kind == .module and std.mem.eql(u8, entity.name, "tests")) {
+            saw_tests_module = true;
+        }
+        if (entity.kind == .enum_ and std.mem.eql(u8, entity.name, "FromHexError")) {
+            error_type_id = entity.id;
+        }
+        if (entity.kind == .impl_ and
+            std.mem.eql(u8, entity.name, "fmt::Display for FromHexError"))
+        {
+            display_impl_parent = entity.parent;
+        }
+        if (entity.kind == .impl_ and
+            std.mem.indexOf(u8, entity.name, "std::error::Error") != null)
+        {
+            saw_std_error_impl = true;
+        }
+    }
+    const module_id = error_module_id orelse return error.MissingHexErrorModule;
+    const error_id = error_type_id orelse return error.MissingHexErrorType;
+    const error_entity = crate_graph.symbol_table.get(error_id) orelse
+        return error.MissingHexErrorType;
+    try std.testing.expectEqual(module_id, error_entity.parent orelse
+        return error.MissingHexErrorModule);
+    try std.testing.expectEqual(error_id, display_impl_parent orelse
+        return error.MissingHexDisplayImpl);
+    try std.testing.expect(!saw_serde_module);
+    try std.testing.expect(!saw_tests_module);
+    try std.testing.expect(!saw_std_error_impl);
+}
+
+test "analyzeCrate preserves inactive dependency feature metadata" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", &tmp.sub_path },
+    );
+    try writeTestFile(
+        allocator,
+        io,
+        root,
+        "Cargo.toml",
+        \\[package]
+        \\name = "consumer"
+        \\
+        \\[dependencies]
+        \\helper = { default-features = false, features = ["derive", "std"] }
+        ,
+    );
+    try writeTestFile(allocator, io, root, "src/lib.rs", "pub fn marker() {}\n");
+
+    const rust_ir = try analyzeCrate(allocator, io, root);
+
+    try std.testing.expectEqual(@as(usize, 1), rust_ir.graph.crates.items.len);
+    const crate = rust_ir.graph.crates.items[0];
+    try std.testing.expectEqual(@as(usize, 1), crate.deps.len);
+    const dependency = crate.deps[0];
+    try std.testing.expectEqualStrings("helper", dependency.local_alias);
+    try std.testing.expect(dependency.default_features != null);
+    try std.testing.expect(!dependency.default_features.?);
+    try std.testing.expectEqual(@as(usize, 2), dependency.features.len);
+    try std.testing.expectEqualStrings("derive", dependency.features[0]);
+    try std.testing.expectEqualStrings("std", dependency.features[1]);
+}
+
 test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1030,6 +2150,136 @@ test "analyzeCrate: recursive multi-file submodule discovery (nested + #[path])"
     try std.testing.expect(custom_mod.items.len > 0);
 }
 
+test "analyzeCrate lowers out-of-line impl methods and disambiguates inline ranges" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", &tmp.sub_path },
+    );
+
+    try writeTestFile(
+        allocator,
+        io,
+        root,
+        "Cargo.toml",
+        \\[package]
+        \\name = "cross_file_impl"
+        \\edition = "2021"
+        ,
+    );
+    try writeTestFile(
+        allocator,
+        io,
+        root,
+        "src/lib.rs",
+        \\pub struct RootType;
+        \\
+        \\mod methods;
+        ,
+    );
+    try writeTestFile(
+        allocator,
+        io,
+        root,
+        "src/methods.rs",
+        \\impl crate::RootType {
+        \\    pub fn from_module(&self) -> u32 {
+        \\        37
+        \\    }
+        \\}
+        \\
+        \\mod first {
+        \\    pub fn same_name() -> u32 {
+        \\        11
+        \\    }
+        \\}
+        \\
+        \\mod second {
+        \\    pub fn same_name() -> u32 {
+        \\        22
+        \\    }
+        \\}
+        ,
+    );
+
+    const rust_ir = try analyzeCrate(allocator, io, root);
+    const helpers = struct {
+        fn findEntity(
+            rust_ir_: *const ir.RustIr,
+            kind: spine.EntityKind,
+            name: []const u8,
+        ) ?spine.Entity {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != kind) continue;
+                if (std.mem.eql(u8, entity.name, name)) return entity;
+            }
+            return null;
+        }
+
+        fn tailInteger(
+            rust_ir_: *const ir.RustIr,
+            entity: spine.Entity,
+        ) !i128 {
+            if (entity.id >= rust_ir_.bodies.bodies.len) return error.MissingFunctionBody;
+            const function_body = switch (rust_ir_.bodies.bodies[entity.id]) {
+                .fn_ => |body| body,
+                else => return error.ExpectedFunctionBody,
+            };
+            if (function_body.body >= rust_ir_.bodies.exprs.len) {
+                return error.MissingFunctionBlock;
+            }
+            const block = switch (rust_ir_.bodies.exprs[function_body.body].kind) {
+                .block => |value| value,
+                else => return error.ExpectedFunctionBlock,
+            };
+            const tail = block.tail orelse return error.ExpectedFunctionTail;
+            if (tail >= rust_ir_.bodies.exprs.len) return error.MissingFunctionTail;
+            return switch (rust_ir_.bodies.exprs[tail].kind) {
+                .literal => |literal| switch (literal) {
+                    .int => |value| value.value,
+                    else => error.ExpectedIntegerTail,
+                },
+                else => error.ExpectedIntegerTail,
+            };
+        }
+    };
+
+    const root_type = helpers.findEntity(&rust_ir, .struct_, "RootType") orelse
+        return error.MissingRootType;
+    const method = helpers.findEntity(&rust_ir, .fn_, "from_module") orelse
+        return error.MissingCrossFileMethod;
+    const impl_id = method.parent orelse return error.MissingMethodImpl;
+    const impl_entity = rust_ir.graph.symbol_table.get(impl_id) orelse
+        return error.MissingMethodImpl;
+    try std.testing.expectEqual(spine.EntityKind.impl_, impl_entity.kind);
+    try std.testing.expectEqual(root_type.id, impl_entity.parent orelse
+        return error.MissingImplTarget);
+    try std.testing.expectEqual(
+        @as(i128, 37),
+        try helpers.tailInteger(&rust_ir, method),
+    );
+
+    var same_name_values: [2]i128 = undefined;
+    var same_name_count: usize = 0;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind != .fn_ or !std.mem.eql(u8, entity.name, "same_name")) continue;
+        if (same_name_count == same_name_values.len) return error.UnexpectedDuplicateFunction;
+        same_name_values[same_name_count] = try helpers.tailInteger(&rust_ir, entity);
+        same_name_count += 1;
+    }
+    try std.testing.expectEqual(same_name_values.len, same_name_count);
+    try std.testing.expect(
+        (same_name_values[0] == 11 and same_name_values[1] == 22) or
+            (same_name_values[0] == 22 and same_name_values[1] == 11),
+    );
+}
+
 test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1050,7 +2300,6 @@ test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
         \\
         \\pub use state::State;
         \\
-        \\#[cfg(test)]
         \\mod tests {
         \\    use super::State;
         \\
@@ -1161,18 +2410,10 @@ test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
     try std.testing.expect(tests_module != null);
     const tests_module_entity = tests_module.?;
     try std.testing.expect(tests_module_entity.visibility == .private);
-    try std.testing.expect(helpers.hasAttribute(
-        tests_module_entity.attributes,
-        "cfg",
-        "test",
-    ));
+    try std.testing.expectEqual(@as(usize, 0), tests_module_entity.attributes.len);
     const tests_module_row = helpers.findModule(&rust_ir, "tests");
     try std.testing.expect(tests_module_row != null);
-    try std.testing.expect(helpers.hasAttribute(
-        tests_module_row.?.attributes,
-        "cfg",
-        "test",
-    ));
+    try std.testing.expectEqual(@as(usize, 0), tests_module_row.?.attributes.len);
 
     const test_entity = helpers.findEntity(&rust_ir, .fn_, "state_body_is_lossless");
     try std.testing.expect(test_entity != null);
@@ -1271,17 +2512,15 @@ test "analyzeSource: pre-P4 declarations and body graph stay lossless" {
     }
 }
 
-test "analyzeSource fills cfg test body with literal built-in macros" {
+test "analyzeSource fills test body with literal built-in macros" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
     const src =
-        \\#[cfg(test)]
         \\mod tests {
         \\    #[test]
         \\    fn literal_macros_fill() {
-        \\        assert!(true);
         \\        assert_eq!(1 + 1, 2);
         \\        let values = vec![1, 2, 3];
         \\        let repeated = vec![0xff; 4];
@@ -1311,30 +2550,9 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(root_block.statements.len > 0);
-    try std.testing.expectEqual(@as(usize, 5), root_block.statements.len);
+    try std.testing.expectEqual(@as(usize, 4), root_block.statements.len);
 
-    const assert_statement = rust_ir.bodies.stmts[root_block.statements[0]];
-    const assert_expression = switch (assert_statement.kind) {
-        .expr => |expression| rust_ir.bodies.exprs[expression],
-        else => return error.TestUnexpectedResult,
-    };
-    const assert_marker = switch (assert_expression.kind) {
-        .unsupported => |unsupported| unsupported.reason,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(std.mem.startsWith(u8, assert_marker, "assertion:"));
-    const assert_condition_id = try std.fmt.parseInt(
-        exprs.NodeId,
-        assert_marker["assertion:".len..],
-        10,
-    );
-    try std.testing.expect(assert_condition_id < rust_ir.bodies.exprs.len);
-    const assert_condition = rust_ir.bodies.exprs[assert_condition_id];
-    try std.testing.expect(assert_condition.kind == .literal);
-    try std.testing.expect(assert_condition.kind.literal == .boolean);
-    try std.testing.expect(assert_condition.kind.literal.boolean);
-
-    const assert_eq_statement = rust_ir.bodies.stmts[root_block.statements[1]];
+    const assert_eq_statement = rust_ir.bodies.stmts[root_block.statements[0]];
     const assert_eq_expression = switch (assert_eq_statement.kind) {
         .expr => |expression| rust_ir.bodies.exprs[expression],
         else => return error.TestUnexpectedResult,
@@ -1351,11 +2569,8 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
     );
     try std.testing.expect(assert_eq_condition_id < rust_ir.bodies.exprs.len);
     const assert_eq_condition = rust_ir.bodies.exprs[assert_eq_condition_id];
-    const unresolved_reason = switch (assert_eq_condition.kind) {
-        .unsupported => |unsupported| unsupported.reason,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqualStrings("operator operands unresolved", unresolved_reason);
+    try std.testing.expect(assert_eq_condition.kind == .binary);
+    try std.testing.expect(assert_eq_condition.kind.binary.op == .eq);
 
     var sum_id: ?exprs.NodeId = null;
     for (rust_ir.bodies.exprs, 0..) |candidate, candidate_index| {
@@ -1372,7 +2587,7 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
     try std.testing.expect(sum.kind == .binary);
     try std.testing.expect(sum.kind.binary.op == .add);
 
-    const values_statement = rust_ir.bodies.stmts[root_block.statements[2]];
+    const values_statement = rust_ir.bodies.stmts[root_block.statements[1]];
     const values_let = switch (values_statement.kind) {
         .let => |let_statement| let_statement,
         else => return error.TestUnexpectedResult,
@@ -1391,7 +2606,7 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
         try std.testing.expectEqual(@as(i128, @intCast(expected)), element.kind.literal.int.value);
     }
 
-    const repeated_statement = rust_ir.bodies.stmts[root_block.statements[3]];
+    const repeated_statement = rust_ir.bodies.stmts[root_block.statements[2]];
     const repeated_let = switch (repeated_statement.kind) {
         .let => |let_statement| let_statement,
         else => return error.TestUnexpectedResult,
@@ -1408,7 +2623,7 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
     try std.testing.expect(repeated_element.kind.literal == .int);
     try std.testing.expectEqual(@as(i128, 0xff), repeated_element.kind.literal.int.value);
 
-    const panic_statement = rust_ir.bodies.stmts[root_block.statements[4]];
+    const panic_statement = rust_ir.bodies.stmts[root_block.statements[3]];
     const panic_expression = switch (panic_statement.kind) {
         .expr => |expression| rust_ir.bodies.exprs[expression],
         else => return error.TestUnexpectedResult,
@@ -1418,4 +2633,238 @@ test "analyzeSource fills cfg test body with literal built-in macros" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings("panic: expected", panic_reason);
+}
+test "analyzeSource exposes bound declaration paths before inference" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const source =
+        \\pub struct Shape {}
+        \\pub struct Point {
+        \\    shape: crate::Shape,
+        \\}
+    ;
+    const rust_ir = try analyzeSource(allocator, "declaration_paths", "2021", source);
+
+    var shape_id: ?spine.EntityId = null;
+    var point_id: ?spine.EntityId = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind != .struct_) continue;
+        if (std.mem.eql(u8, entity.name, "Shape")) shape_id = entity.id;
+        if (std.mem.eql(u8, entity.name, "Point")) point_id = entity.id;
+    }
+    const shape = shape_id orelse return error.TestUnexpectedResult;
+    const point = point_id orelse return error.TestUnexpectedResult;
+    const point_body = switch (rust_ir.bodies.bodies[point]) {
+        .struct_ => |body| body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), point_body.fields.len);
+    const path = switch (point_body.fields[0].ty) {
+        .path => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), path.segments.len);
+    try std.testing.expectEqual(shape, path.segments[1].id.?);
+}
+
+test "analyzeSource rejects unresolved declaration paths" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source = "pub struct Point { shape: Missing }";
+    try std.testing.expectError(
+        error.UnresolvedNominalType,
+        analyzeSource(allocator, "unresolved_declaration_path", "2021", source),
+    );
+}
+test "analyzeSource lowers FNV dereference scalar cast" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const source =
+        \\pub fn hash_byte(bytes: &[u8]) -> u64 {
+        \\    for byte in bytes.iter() {
+        \\        return *byte as u64;
+        \\    }
+        \\    0u64
+        \\}
+    ;
+    const rust_ir = try analyzeSource(allocator, "fnv_cast", "2021", source);
+
+    var found_cast = false;
+    for (rust_ir.bodies.exprs) |expression| {
+        if (expression.kind != .cast) continue;
+        const cast = expression.kind.cast;
+        try std.testing.expectEqual(cast.source_type, types.Type{ .prim = .u8 });
+        try std.testing.expectEqual(cast.target, expression.ty.?);
+        try std.testing.expect(cast.operand < rust_ir.bodies.exprs.len);
+        try std.testing.expectEqual(
+            types.Type{ .prim = .u64 },
+            rust_ir.bodies.types[cast.target],
+        );
+        switch (rust_ir.bodies.exprs[cast.operand].kind) {
+            .unary => |unary| try std.testing.expect(unary.op == .deref),
+            else => return error.ExpectedDereferenceOperand,
+        }
+        found_cast = true;
+    }
+    try std.testing.expect(found_cast);
+}
+
+test "analyzeSource propagates allocation effects through resolved free calls" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const source =
+        \\#[cfg(test)]
+        \\#[test]
+        \\fn repeat_bytes_assert_test(bytes: &[u8]) {
+        \\    assert!(repeat_bytes_transitive(bytes));
+        \\}
+        \\
+        \\#[cfg(test)]
+        \\#[test]
+        \\fn repeat_bytes_assert_eq_test(bytes: &[u8]) {
+        \\    assert_eq!(repeat_bytes_transitive(bytes), repeat_bytes_transitive(bytes));
+        \\}
+        \\
+        \\#[cfg(test)]
+        \\#[test]
+        \\fn direct_collection_assertion(bytes: &[u8]) {
+        \\    assert!((0..4).flat_map(|_| bytes.iter().cloned()).collect());
+        \\}
+        \\
+        \\#[cfg(test)]
+        \\#[test]
+        \\fn invalid_assertions() {
+        \\    assert!();
+        \\    assert_eq!();
+        \\    panic!("ordinary unsupported");
+        \\}
+        \\
+        \\fn repeat_bytes_transitive(bytes: &[u8]) {
+        \\    repeat_bytes_caller(bytes);
+        \\}
+        \\
+        \\fn repeat_bytes_caller(bytes: &[u8]) {
+        \\    repeat_bytes(bytes);
+        \\}
+        \\
+        \\fn repeat_bytes(bytes: &[u8]) {
+        \\    (0..4).flat_map(|_| bytes.iter().cloned()).collect()
+        \\}
+        \\
+        \\fn collect_nothing() {}
+    ;
+    const rust_ir = try analyzeSourceWithOptions(
+        allocator,
+        "free_collection_effect",
+        "2021",
+        source,
+        .{ .include_tests = true },
+    );
+
+    var producer_effect: ?bool = null;
+    var direct_caller_effect: ?bool = null;
+    var transitive_caller_effect: ?bool = null;
+    var assert_test_effect: ?bool = null;
+    var assert_eq_test_effect: ?bool = null;
+    var invalid_assertion_effect: ?bool = null;
+    var direct_assertion_effect: ?bool = null;
+    var ordinary_effect: ?bool = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind != .fn_) continue;
+        const function_body = switch (rust_ir.bodies.bodies[entity.id]) {
+            .fn_ => |body| body,
+            else => return error.TestUnexpectedResult,
+        };
+        if (std.mem.eql(u8, entity.name, "repeat_bytes")) {
+            producer_effect = function_body.is_allocating;
+        } else if (std.mem.eql(u8, entity.name, "repeat_bytes_caller")) {
+            direct_caller_effect = function_body.is_allocating;
+        } else if (std.mem.eql(u8, entity.name, "repeat_bytes_transitive")) {
+            transitive_caller_effect = function_body.is_allocating;
+        } else if (std.mem.eql(u8, entity.name, "repeat_bytes_assert_test")) {
+            assert_test_effect = function_body.is_allocating;
+        } else if (std.mem.eql(u8, entity.name, "repeat_bytes_assert_eq_test")) {
+            assert_eq_test_effect = function_body.is_allocating;
+        } else if (std.mem.eql(u8, entity.name, "direct_collection_assertion")) {
+            direct_assertion_effect = function_body.is_allocating;
+        } else if (std.mem.eql(u8, entity.name, "invalid_assertions")) {
+            invalid_assertion_effect = function_body.is_allocating;
+        } else if (std.mem.eql(u8, entity.name, "collect_nothing")) {
+            ordinary_effect = function_body.is_allocating;
+        }
+    }
+
+    try std.testing.expect(producer_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(direct_caller_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(transitive_caller_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(assert_test_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(assert_eq_test_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(direct_assertion_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(!(invalid_assertion_effect orelse return error.TestUnexpectedResult));
+    try std.testing.expect(!(ordinary_effect orelse return error.TestUnexpectedResult));
+}
+
+test "analyzeSource propagates allocation effects through resolved struct methods" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const source =
+        \\struct Collector {}
+        \\
+        \\impl Collector {
+        \\    fn repeat_again(&self, other: &Collector, bytes: &[u8]) {
+        \\        other.repeat(bytes);
+        \\    }
+        \\
+        \\    fn repeat_associated(other: &Collector, bytes: &[u8]) {
+        \\        Collector::repeat(other, bytes);
+        \\    }
+        \\
+        \\    fn repeat(&self, bytes: &[u8]) {
+        \\        (0..4).flat_map(|_| bytes.iter().cloned()).collect()
+        \\    }
+        \\
+        \\    fn collect_nothing(&self) {}
+        \\}
+    ;
+    const rust_ir = try analyzeSource(allocator, "method_collection_effect", "2021", source);
+
+    var collector_id: ?spine.EntityId = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind != .struct_) continue;
+        if (std.mem.eql(u8, entity.name, "Collector")) collector_id = entity.id;
+    }
+    const collector_body = switch (rust_ir.bodies.bodies[collector_id orelse return error.TestUnexpectedResult]) {
+        .struct_ => |body| body,
+        else => return error.TestUnexpectedResult,
+    };
+
+    var producer_effect: ?bool = null;
+    var method_caller_effect: ?bool = null;
+    var associated_caller_effect: ?bool = null;
+    var ordinary_effect: ?bool = null;
+    for (collector_body.methods) |method| {
+        if (std.mem.eql(u8, method.name, "repeat")) {
+            producer_effect = method.is_allocating;
+        } else if (std.mem.eql(u8, method.name, "repeat_again")) {
+            method_caller_effect = method.is_allocating;
+        } else if (std.mem.eql(u8, method.name, "repeat_associated")) {
+            associated_caller_effect = method.is_allocating;
+        } else if (std.mem.eql(u8, method.name, "collect_nothing")) {
+            ordinary_effect = method.is_allocating;
+        }
+    }
+
+    try std.testing.expect(producer_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(method_caller_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(associated_caller_effect orelse return error.TestUnexpectedResult);
+    try std.testing.expect(!(ordinary_effect orelse return error.TestUnexpectedResult));
 }

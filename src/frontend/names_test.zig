@@ -207,6 +207,100 @@ test "resolveGraph resolves a super:: glob use to its target module" {
     try std.testing.expectEqual(fx.util, e.resolved orelse return error.NotResolved);
 }
 
+test "resolveGraph resolves a self-only glob to its current module" {
+    const a = std.testing.allocator;
+    var fx = try buildFixture(a);
+    defer fx.g.deinit();
+
+    const use_id = try addPendingUseInModule(
+        a,
+        &fx.g,
+        &fx.g.modules.items[1],
+        fx.util,
+        "self::*",
+        "",
+    );
+    try names.resolveGraph(a, &fx.g);
+
+    const u = fx.g.useById(use_id) orelse return error.MissingUse;
+    try std.testing.expectEqual(fx.util, u.target);
+    switch (u.kind) {
+        .glob => {},
+        else => return error.ExpectedGlobKind,
+    }
+    try std.testing.expectEqual(
+        fx.util,
+        (fx.g.symbol_table.get(use_id) orelse return error.MissingEntity).resolved orelse
+            return error.NotResolved,
+    );
+}
+
+test "resolveGraph resolves a super-only glob to its parent module" {
+    const a = std.testing.allocator;
+    var fx = try buildFixture(a);
+    defer fx.g.deinit();
+
+    const use_id = try addPendingUseInModule(
+        a,
+        &fx.g,
+        &fx.g.modules.items[1],
+        fx.util,
+        "super::*",
+        "",
+    );
+    try names.resolveGraph(a, &fx.g);
+
+    const u = fx.g.useById(use_id) orelse return error.MissingUse;
+    try std.testing.expectEqual(fx.root, u.target);
+    switch (u.kind) {
+        .glob => {},
+        else => return error.ExpectedGlobKind,
+    }
+    try std.testing.expectEqual(
+        fx.root,
+        (fx.g.symbol_table.get(use_id) orelse return error.MissingEntity).resolved orelse
+            return error.NotResolved,
+    );
+}
+
+test "resolveGraph resolves a crate-only glob to the crate root module" {
+    const a = std.testing.allocator;
+    var fx = try buildFixture(a);
+    defer fx.g.deinit();
+
+    const use_id = try addPendingUseInModule(
+        a,
+        &fx.g,
+        &fx.g.modules.items[1],
+        fx.util,
+        "crate::*",
+        "",
+    );
+    try names.resolveGraph(a, &fx.g);
+
+    const u = fx.g.useById(use_id) orelse return error.MissingUse;
+    try std.testing.expectEqual(fx.root, u.target);
+    switch (u.kind) {
+        .glob => {},
+        else => return error.ExpectedGlobKind,
+    }
+    try std.testing.expectEqual(
+        fx.root,
+        (fx.g.symbol_table.get(use_id) orelse return error.MissingEntity).resolved orelse
+            return error.NotResolved,
+    );
+}
+
+test "resolveGraph keeps an unresolved plain path at target zero" {
+    const a = std.testing.allocator;
+    var fx = try buildFixture(a);
+    defer fx.g.deinit();
+
+    try names.resolveGraph(a, &fx.g);
+
+    try expectUnresolvedPlain(&fx.g, fx.use_missing);
+}
+
 test "resolveGraph degrades an unresolved use without error" {
     const a = std.testing.allocator;
     var fx = try buildFixture(a);
@@ -219,4 +313,201 @@ test "resolveGraph degrades an unresolved use without error" {
     try std.testing.expectEqual(@as(spine.EntityId, 0), u.target);
     const e = fx.g.symbol_table.get(fx.use_missing) orelse return error.MissingEntity;
     try std.testing.expectEqual(null, e.resolved);
+}
+
+fn appendModuleItem(
+    a: std.mem.Allocator,
+    module: *graph.Module,
+    item_id: spine.EntityId,
+) !void {
+    const old_items = module.items;
+    const new_items = try a.alloc(spine.EntityId, old_items.len + 1);
+    @memcpy(new_items[0..old_items.len], old_items);
+    new_items[old_items.len] = item_id;
+    a.free(old_items);
+    module.items = new_items;
+}
+
+fn addPendingUse(
+    a: std.mem.Allocator,
+    g: *graph.CrateGraph,
+    root: spine.EntityId,
+    source: []const u8,
+    local_name: []const u8,
+) !spine.EntityId {
+    const use_id = try addEntity(g, a, .use_, source, root);
+    try g.addUse(.{
+        .id = use_id,
+        .kind = .{ .plain = 0 },
+        .local_name = try a.dupe(u8, local_name),
+        .is_pub_export = false,
+        .target = 0,
+        .span = span,
+    });
+    try appendModuleItem(a, &g.modules.items[0], use_id);
+    return use_id;
+}
+
+fn addPendingUseInModule(
+    a: std.mem.Allocator,
+    g: *graph.CrateGraph,
+    module: *graph.Module,
+    parent: spine.EntityId,
+    source: []const u8,
+    local_name: []const u8,
+) !spine.EntityId {
+    const use_id = try addEntity(g, a, .use_, source, parent);
+    try g.addUse(.{
+        .id = use_id,
+        .kind = .{ .plain = 0 },
+        .local_name = try a.dupe(u8, local_name),
+        .is_pub_export = false,
+        .target = 0,
+        .span = span,
+    });
+    try appendModuleItem(a, module, use_id);
+    return use_id;
+}
+
+fn expectUnresolvedPlain(g: *const graph.CrateGraph, use_id: spine.EntityId) !void {
+    const use_decl = g.useById(use_id) orelse return error.MissingUse;
+    try std.testing.expectEqual(@as(spine.EntityId, 0), use_decl.target);
+    switch (use_decl.kind) {
+        .plain => |target| try std.testing.expectEqual(@as(spine.EntityId, 0), target),
+        else => return error.ExpectedPlainKind,
+    }
+    const entity = g.symbol_table.get(use_id) orelse return error.MissingEntity;
+    try std.testing.expectEqual(null, entity.resolved);
+}
+
+test "resolveGraph classifies unresolved rooted core and std non-glob uses as external" {
+    const a = std.testing.allocator;
+    var fx = try buildFixture(a);
+    defer fx.g.deinit();
+
+    const core_hasher = try addPendingUse(
+        a,
+        &fx.g,
+        fx.root,
+        "core::hash::Hasher",
+        "Hasher",
+    );
+    const std_default = try addPendingUse(
+        a,
+        &fx.g,
+        fx.root,
+        "std::default::Default as RustDefault",
+        "RustDefault",
+    );
+
+    try names.resolveGraph(a, &fx.g);
+
+    const core_use = fx.g.useById(core_hasher) orelse return error.MissingUse;
+    try std.testing.expectEqual(@as(spine.EntityId, 0), core_use.target);
+    const core_external = switch (core_use.kind) {
+        .external => |external| external,
+        else => return error.ExpectedExternalKind,
+    };
+    try std.testing.expectEqual(@as(usize, 3), core_external.path.len);
+    try std.testing.expectEqualStrings("core", core_external.path[0]);
+    try std.testing.expectEqualStrings("hash", core_external.path[1]);
+    try std.testing.expectEqualStrings("Hasher", core_external.path[2]);
+    try std.testing.expectEqualStrings("Hasher", core_use.local_name);
+    try std.testing.expectEqual(
+        null,
+        (fx.g.symbol_table.get(core_hasher) orelse return error.MissingEntity).resolved,
+    );
+
+    const std_use = fx.g.useById(std_default) orelse return error.MissingUse;
+    const std_external = switch (std_use.kind) {
+        .external => |external| external,
+        else => return error.ExpectedExternalKind,
+    };
+    try std.testing.expectEqualStrings("std", std_external.path[0]);
+    try std.testing.expectEqualStrings("default", std_external.path[1]);
+    try std.testing.expectEqualStrings("Default", std_external.path[2]);
+    try std.testing.expectEqualStrings("RustDefault", std_use.local_name);
+    try std.testing.expectEqual(@as(spine.EntityId, 0), std_use.target);
+    try std.testing.expectEqual(
+        null,
+        (fx.g.symbol_table.get(std_default) orelse return error.MissingEntity).resolved,
+    );
+}
+
+test "resolveGraph gives local scope priority and keeps non-external shapes unresolved" {
+    const a = std.testing.allocator;
+    var fx = try buildFixture(a);
+    defer fx.g.deinit();
+
+    const std_module = try addEntity(&fx.g, a, .module, "std", fx.root);
+    const local_hasher = try addEntity(&fx.g, a, .struct_, "Hasher", std_module);
+    _ = try fx.g.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = try a.dupe(u8, "std"),
+        .parent = fx.root,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = false,
+        .span = span,
+        .items = try a.dupe(spine.EntityId, &.{local_hasher}),
+        .attributes = &.{},
+    });
+    try appendModuleItem(a, &fx.g.modules.items[0], std_module);
+
+    const shadowed = try addPendingUse(a, &fx.g, fx.root, "std::Hasher", "Hasher");
+    const glob = try addPendingUse(a, &fx.g, fx.root, "core::hash::*", "");
+    const crate_relative = try addPendingUse(
+        a,
+        &fx.g,
+        fx.root,
+        "crate::core::hash::Hasher",
+        "Hasher",
+    );
+    const unknown_root = try addPendingUse(
+        a,
+        &fx.g,
+        fx.root,
+        "unknown::collections::VecDeque",
+        "VecDeque",
+    );
+    const alloc_vec_deque = try addPendingUse(
+        a,
+        &fx.g,
+        fx.root,
+        "alloc::collections::VecDeque",
+        "VecDeque",
+    );
+
+    try names.resolveGraph(a, &fx.g);
+
+    const shadowed_use = fx.g.useById(shadowed) orelse return error.MissingUse;
+    try std.testing.expectEqual(local_hasher, shadowed_use.target);
+    switch (shadowed_use.kind) {
+        .plain => |target| try std.testing.expectEqual(local_hasher, target),
+        else => return error.ExpectedPlainKind,
+    }
+    try std.testing.expectEqual(
+        local_hasher,
+        (fx.g.symbol_table.get(shadowed) orelse return error.MissingEntity).resolved orelse
+            return error.NotResolved,
+    );
+    try expectUnresolvedPlain(&fx.g, glob);
+    try expectUnresolvedPlain(&fx.g, crate_relative);
+    try expectUnresolvedPlain(&fx.g, unknown_root);
+    const alloc_use = fx.g.useById(alloc_vec_deque) orelse return error.MissingUse;
+    try std.testing.expectEqual(@as(spine.EntityId, 0), alloc_use.target);
+    const alloc_external = switch (alloc_use.kind) {
+        .external => |external| external,
+        else => return error.ExpectedExternalKind,
+    };
+    try std.testing.expectEqual(@as(usize, 3), alloc_external.path.len);
+    try std.testing.expectEqualStrings("alloc", alloc_external.path[0]);
+    try std.testing.expectEqualStrings("collections", alloc_external.path[1]);
+    try std.testing.expectEqualStrings("VecDeque", alloc_external.path[2]);
+    try std.testing.expectEqualStrings("VecDeque", alloc_use.local_name);
+    try std.testing.expectEqual(
+        null,
+        (fx.g.symbol_table.get(alloc_vec_deque) orelse return error.MissingEntity).resolved,
+    );
 }

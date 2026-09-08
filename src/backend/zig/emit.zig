@@ -13,7 +13,12 @@ const ast = @import("ast.zig");
 
 /// Emits a single `ast.File` as a complete Zig source code string.
 /// The returned slice is owned by `allocator`.
-pub fn emitFile(allocator: std.mem.Allocator, file: *const ast.File) std.mem.Allocator.Error![]const u8 {
+pub fn emitFile(
+    allocator: std.mem.Allocator,
+    file: *const ast.File,
+) (std.mem.Allocator.Error || ast.ValidationError)![]const u8 {
+    try ast.validateFileForTranslation(file);
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
@@ -25,9 +30,15 @@ pub fn emitFile(allocator: std.mem.Allocator, file: *const ast.File) std.mem.All
             }
             try buf.appendSlice(allocator, "const ");
             try emitIdent(allocator, &buf, imp.local_name);
-            try buf.appendSlice(allocator, " = @import(\"");
-            try buf.appendSlice(allocator, imp.module_or_path);
-            try buf.appendSlice(allocator, "\");\n");
+            if (std.mem.startsWith(u8, imp.module_or_path, "std.")) {
+                try buf.appendSlice(allocator, " = ");
+                try buf.appendSlice(allocator, imp.module_or_path);
+            } else {
+                try buf.appendSlice(allocator, " = @import(\"");
+                try buf.appendSlice(allocator, imp.module_or_path);
+                try buf.appendSlice(allocator, "\")");
+            }
+            try buf.appendSlice(allocator, ";\n");
         }
         try buf.appendSlice(allocator, "\n");
     }
@@ -150,8 +161,7 @@ pub fn emitIdent(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8),
         return;
     }
 
-    // If the identifier contains dots (e.g. "std.AutoHashMap" or "std.hash.BuildHasherDefault"),
-    // emit it as dotted identifiers without quoting the dots.
+    // Dotted identifiers are emitted as nested Zig declarations.
     if (std.mem.indexOfScalar(u8, name, '.') != null) {
         var it = std.mem.splitScalar(u8, name, '.');
         var first = true;
@@ -192,7 +202,7 @@ fn emitEscapedString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(
             '\n' => try buf.appendSlice(allocator, "\\n"),
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
-            0 => try buf.appendSlice(allocator, "\\0"),
+            0 => try buf.appendSlice(allocator, "\\x00"),
             else => {
                 if (c >= 0x20 and c <= 0x7e) {
                     try buf.append(allocator, c);
@@ -529,6 +539,17 @@ pub fn emitStmt(
     stmt: ast.Stmt,
     depth: usize,
 ) std.mem.Allocator.Error!void {
+    const context: EmitContext = .{};
+    try emitStmtScoped(&context, allocator, buf, stmt, depth);
+}
+
+fn emitStmtScoped(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    stmt: ast.Stmt,
+    depth: usize,
+) std.mem.Allocator.Error!void {
     switch (stmt) {
         .let_stmt => |ls| {
             try emitIndent(allocator, buf, depth);
@@ -543,17 +564,20 @@ pub fn emitStmt(
                 try emitType(allocator, buf, t);
             }
             try buf.appendSlice(allocator, " = ");
-            try emitExpr(allocator, buf, ls.init, depth);
+            try emitExprScoped(context, allocator, buf, ls.init, depth);
             try buf.appendSlice(allocator, ";\n");
         },
         .assign => |as| {
             try emitIndent(allocator, buf, depth);
-            try emitExpr(allocator, buf, as.target, depth);
+            try emitExprScoped(context, allocator, buf, as.target, depth);
             const op_str = switch (as.op) {
                 .assign => " = ",
                 .add_assign => " += ",
+                .add_assign_wrap => " +%= ",
                 .sub_assign => " -= ",
+                .sub_assign_wrap => " -%= ",
                 .mul_assign => " *= ",
+                .mul_assign_wrap => " *%= ",
                 .div_assign => " /= ",
                 .mod_assign => " %= ",
                 .bit_and_assign => " &= ",
@@ -563,18 +587,20 @@ pub fn emitStmt(
                 .shr_assign => " >>= ",
             };
             try buf.appendSlice(allocator, op_str);
-            try emitExpr(allocator, buf, as.val, depth);
+            try emitExprScoped(context, allocator, buf, as.val, depth);
+            try buf.appendSlice(allocator, ";\n");
+        },
+        .defer_stmt => |defer_stmt| {
+            try emitIndent(allocator, buf, depth);
+            const keyword = if (defer_stmt.is_errdefer) "errdefer " else "defer ";
+            try buf.appendSlice(allocator, keyword);
+            try emitExprScoped(context, allocator, buf, defer_stmt.expr, depth);
             try buf.appendSlice(allocator, ";\n");
         },
         .expr_stmt => |es| {
             try emitIndent(allocator, buf, depth);
-            try emitExpr(allocator, buf, es.*, depth);
-            if (!isStatementLike(es.*) and
-                es.* != .match_expr and
-                es.* != .return_expr and
-                es.* != .break_expr and
-                es.* != .continue_expr)
-            {
+            try emitExprScoped(context, allocator, buf, es.*, depth);
+            if (!isStatementLike(es.*) and es.* != .if_expr and es.* != .match_expr) {
                 try buf.appendSlice(allocator, ";");
             }
             try buf.appendSlice(allocator, "\n");
@@ -584,17 +610,363 @@ pub fn emitStmt(
 
 fn isStatementLike(expr: ast.Expr) bool {
     return switch (expr) {
-        .while_expr, .for_expr => true,
-        .if_expr => |ie| ie.then_body.* == .block and (ie.else_body == null or ie.else_body.?.* == .block or ie.else_body.?.* == .if_expr),
+        .block, .while_expr, .for_expr => true,
         else => false,
     };
+}
+
+const GeneratedMatchName = struct {
+    base: []const u8,
+    suffix: usize = 0,
+};
+
+const EmitContext = struct {
+    active_names: []const GeneratedMatchName = &.{},
+};
+
+const match_payload_base = "__r2z_match_payload";
+const match_arm_base = "__r2z_match_arm";
+
+fn generatedMatchNameText(
+    buffer: *[64]u8,
+    name: GeneratedMatchName,
+) []const u8 {
+    if (name.suffix == 0) return name.base;
+    return std.fmt.bufPrint(buffer, "{s}_{d}", .{ name.base, name.suffix }) catch unreachable;
+}
+
+fn generatedMatchNameEquals(value: []const u8, name: GeneratedMatchName) bool {
+    var buffer: [64]u8 = undefined;
+    return std.mem.eql(u8, value, generatedMatchNameText(&buffer, name));
+}
+
+fn generatedMatchNamesEqual(
+    left: GeneratedMatchName,
+    right: GeneratedMatchName,
+) bool {
+    return left.suffix == right.suffix and std.mem.eql(u8, left.base, right.base);
+}
+
+fn emitGeneratedMatchName(
+    allocator: std.mem.Allocator,
+    buffer: *std.ArrayListUnmanaged(u8),
+    name: GeneratedMatchName,
+) std.mem.Allocator.Error!void {
+    var name_buffer: [64]u8 = undefined;
+    try emitIdent(allocator, buffer, generatedMatchNameText(&name_buffer, name));
+}
+
+fn lexicalRoot(value: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, value, '.') orelse value.len;
+    return value[0..end];
+}
+fn typeContainsGeneratedMatchName(ty: ast.Type, name: GeneratedMatchName) bool {
+    return switch (ty) {
+        .prim, .any_opaque, .void_type => false,
+        .ptr => |pointer| typeContainsGeneratedMatchName(pointer.elem.*, name),
+        .slice => |slice| typeContainsGeneratedMatchName(slice.elem.*, name),
+        .opt => |inner| typeContainsGeneratedMatchName(inner.*, name),
+        .err_union => |error_union| {
+            if (error_union.err_set) |error_set| {
+                if (generatedMatchNameEquals(lexicalRoot(error_set), name)) return true;
+            }
+            return typeContainsGeneratedMatchName(error_union.payload.*, name);
+        },
+        .named => |value| generatedMatchNameEquals(lexicalRoot(value), name),
+        .generic => |generic| {
+            if (generatedMatchNameEquals(lexicalRoot(generic.name), name)) return true;
+            for (generic.params) |param| {
+                if (typeContainsGeneratedMatchName(param, name)) return true;
+            }
+            return false;
+        },
+        .array => |array| typeContainsGeneratedMatchName(array.elem.*, name),
+        .tuple => |tuple| {
+            for (tuple) |element| {
+                if (typeContainsGeneratedMatchName(element, name)) return true;
+            }
+            return false;
+        },
+        .anon_struct => |anonymous| {
+            for (anonymous.fields) |field| {
+                if (typeContainsGeneratedMatchName(field.ty, name)) return true;
+                if (field.default_val) |value| {
+                    if (exprContainsGeneratedMatchName(value.*, name)) return true;
+                }
+            }
+            return false;
+        },
+    };
+}
+
+fn patternContainsGeneratedMatchName(pattern: ast.Pattern, name: GeneratedMatchName) bool {
+    return switch (pattern) {
+        .wildcard, .lit => false,
+        .binding, .enum_literal => |value| generatedMatchNameEquals(lexicalRoot(value), name),
+        .tuple => |patterns| {
+            for (patterns) |child| {
+                if (patternContainsGeneratedMatchName(child, name)) return true;
+            }
+            return false;
+        },
+        .struct_pat => |struct_pattern| {
+            if (struct_pattern.name) |value| {
+                if (generatedMatchNameEquals(lexicalRoot(value), name)) return true;
+            }
+            for (struct_pattern.fields) |field| {
+                if (generatedMatchNameEquals(lexicalRoot(field.name), name)) return true;
+                if (patternContainsGeneratedMatchName(field.pat, name)) return true;
+            }
+            return false;
+        },
+    };
+}
+
+fn stmtContainsGeneratedMatchName(stmt: ast.Stmt, name: GeneratedMatchName) bool {
+    return switch (stmt) {
+        .let_stmt => |let_statement| {
+            if (generatedMatchNameEquals(lexicalRoot(let_statement.name), name)) return true;
+            if (let_statement.ty) |ty| {
+                if (typeContainsGeneratedMatchName(ty, name)) return true;
+            }
+            return exprContainsGeneratedMatchName(let_statement.init, name);
+        },
+        .assign => |assignment| {
+            return exprContainsGeneratedMatchName(assignment.target, name) or
+                exprContainsGeneratedMatchName(assignment.val, name);
+        },
+        .defer_stmt => |defer_statement| exprContainsGeneratedMatchName(defer_statement.expr, name),
+        .expr_stmt => |expression| exprContainsGeneratedMatchName(expression.*, name),
+    };
+}
+
+fn blockContainsGeneratedMatchName(block: ast.Block, name: GeneratedMatchName) bool {
+    if (block.label) |label| {
+        if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+    }
+    for (block.stmts) |stmt| {
+        if (stmtContainsGeneratedMatchName(stmt, name)) return true;
+    }
+    if (block.expr) |expression| return exprContainsGeneratedMatchName(expression.*, name);
+    return false;
+}
+
+fn matchContainsGeneratedMatchName(match: ast.Match, name: GeneratedMatchName) bool {
+    if (exprContainsGeneratedMatchName(match.target.*, name)) return true;
+    for (match.arms) |arm| {
+        for (arm.patterns) |pattern| {
+            if (patternContainsGeneratedMatchName(pattern, name)) return true;
+        }
+        if (exprContainsGeneratedMatchName(arm.body, name)) return true;
+    }
+    return false;
+}
+
+fn exprContainsGeneratedMatchName(expression: ast.Expr, name: GeneratedMatchName) bool {
+    return switch (expression) {
+        .lit, .unsupported, .continue_expr => false,
+        .ident => |value| generatedMatchNameEquals(lexicalRoot(value), name),
+        .field_access => |field_access| exprContainsGeneratedMatchName(field_access.target.*, name),
+        .call => |call| {
+            if (exprContainsGeneratedMatchName(call.callee.*, name)) return true;
+            for (call.generic_args) |argument| {
+                if (typeContainsGeneratedMatchName(argument, name)) return true;
+            }
+            for (call.args) |argument| {
+                if (exprContainsGeneratedMatchName(argument, name)) return true;
+            }
+            return false;
+        },
+        .block => |block| blockContainsGeneratedMatchName(block, name),
+        .match_expr => |match| matchContainsGeneratedMatchName(match, name),
+        .bin_op => |binary| exprContainsGeneratedMatchName(binary.lhs.*, name) or
+            exprContainsGeneratedMatchName(binary.rhs.*, name),
+        .unary_op => |unary| exprContainsGeneratedMatchName(unary.operand.*, name),
+        .cast => |cast| typeContainsGeneratedMatchName(cast.target, name) or
+            exprContainsGeneratedMatchName(cast.operand.*, name),
+        .struct_init => |literal| {
+            if (literal.type_name) |ty| {
+                if (typeContainsGeneratedMatchName(ty, name)) return true;
+            }
+            for (literal.fields) |field| {
+                if (generatedMatchNameEquals(lexicalRoot(field.name), name)) return true;
+                if (exprContainsGeneratedMatchName(field.expr, name)) return true;
+            }
+            return false;
+        },
+        .array_init => |array| {
+            if (array.type_name) |ty| {
+                if (typeContainsGeneratedMatchName(ty, name)) return true;
+            }
+            for (array.elements) |element| {
+                if (exprContainsGeneratedMatchName(element, name)) return true;
+            }
+            return false;
+        },
+        .repeat => |repeat| {
+            if (repeat.type_name) |ty| {
+                if (typeContainsGeneratedMatchName(ty, name)) return true;
+            }
+            return exprContainsGeneratedMatchName(repeat.elem.*, name);
+        },
+        .multi_array => |array| {
+            if (array.type_name) |ty| {
+                if (typeContainsGeneratedMatchName(ty, name)) return true;
+            }
+            for (array.elements) |element| {
+                if (exprContainsGeneratedMatchName(element, name)) return true;
+            }
+            return false;
+        },
+        .builtin => |builtin| {
+            if (generatedMatchNameEquals(lexicalRoot(builtin.name), name)) return true;
+            for (builtin.args) |argument| {
+                if (exprContainsGeneratedMatchName(argument, name)) return true;
+            }
+            return false;
+        },
+        .if_expr => |if_expression| {
+            if (exprContainsGeneratedMatchName(if_expression.cond.*, name)) return true;
+            if (exprContainsGeneratedMatchName(if_expression.then_body.*, name)) return true;
+            if (if_expression.else_body) |else_body| {
+                return exprContainsGeneratedMatchName(else_body.*, name);
+            }
+            return false;
+        },
+        .while_expr => |while_expression| {
+            if (exprContainsGeneratedMatchName(while_expression.cond.*, name)) return true;
+            if (while_expression.captures) |captures| {
+                for (captures) |capture| {
+                    if (generatedMatchNameEquals(lexicalRoot(capture), name)) return true;
+                }
+            }
+            if (while_expression.continue_expr) |continue_expression| {
+                if (exprContainsGeneratedMatchName(continue_expression.*, name)) return true;
+            }
+            if (blockContainsGeneratedMatchName(while_expression.body, name)) return true;
+            if (while_expression.else_body) |else_body| {
+                return exprContainsGeneratedMatchName(else_body.*, name);
+            }
+            return false;
+        },
+        .for_expr => |for_expression| {
+            for (for_expression.inputs) |input| {
+                if (exprContainsGeneratedMatchName(input, name)) return true;
+            }
+            for (for_expression.captures) |capture| {
+                if (generatedMatchNameEquals(lexicalRoot(capture), name)) return true;
+            }
+            if (blockContainsGeneratedMatchName(for_expression.body, name)) return true;
+            if (for_expression.else_body) |else_body| {
+                return exprContainsGeneratedMatchName(else_body.*, name);
+            }
+            return false;
+        },
+        .range => |range| {
+            if (exprContainsGeneratedMatchName(range.start.*, name)) return true;
+            if (range.end) |end| return exprContainsGeneratedMatchName(end.*, name);
+            return false;
+        },
+        .return_expr, .break_expr => |value| {
+            if (value) |inner| return exprContainsGeneratedMatchName(inner.*, name);
+            return false;
+        },
+    };
+}
+
+fn freshGeneratedMatchName(
+    match: ast.Match,
+    active_names: []const GeneratedMatchName,
+    base: []const u8,
+) GeneratedMatchName {
+    var suffix: usize = 0;
+    while (suffix < 1024) : (suffix += 1) {
+        const candidate: GeneratedMatchName = .{ .base = base, .suffix = suffix };
+        var active = false;
+        for (active_names) |name| {
+            if (generatedMatchNamesEqual(candidate, name)) {
+                active = true;
+                break;
+            }
+        }
+        if (!active and !matchContainsGeneratedMatchName(match, candidate)) return candidate;
+    }
+    @panic("exhausted generated match names");
+}
+
+pub fn emitExpr(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    expr: ast.Expr,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    const context: EmitContext = .{};
+    try emitExprScoped(&context, allocator, buf, expr, depth);
 }
 
 // ---------------------------------------------------------------------------
 // Expression Emission
 // ---------------------------------------------------------------------------
 
-pub fn emitExpr(
+fn emitChunkLoop(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    loop: ast.ForExpr,
+    depth: usize,
+) !bool {
+    const iterable = loop.inputs[0];
+    const ChunkLoop = struct {
+        target: ast.Expr,
+        size: ast.Expr,
+    };
+    const chunks: ChunkLoop = switch (iterable) {
+        .builtin => |builtin| blk: {
+            if (!std.mem.eql(u8, builtin.name, "sliceChunks") or builtin.args.len != 2) {
+                return false;
+            }
+            break :blk .{ .target = builtin.args[0], .size = builtin.args[1] };
+        },
+        .call => |call| switch (call.callee.*) {
+            .builtin => |builtin| blk: {
+                if (!std.mem.eql(u8, builtin.name, "sliceChunks") or builtin.args.len != 2) {
+                    return false;
+                }
+                break :blk .{ .target = builtin.args[0], .size = builtin.args[1] };
+            },
+            else => return false,
+        },
+        else => return false,
+    };
+
+    const capture = if (loop.captures.len > 0) loop.captures[0] else "chunk";
+    try buf.appendSlice(allocator, "var __chunk_index: usize = 0;\n");
+    try emitIndent(allocator, buf, depth);
+    try buf.appendSlice(allocator, "while (");
+    try emitExprScoped(context, allocator, buf, chunks.target, depth);
+    try buf.appendSlice(allocator, ".len > __chunk_index) : (__chunk_index += ");
+    try emitExprScoped(context, allocator, buf, chunks.size, depth);
+    try buf.appendSlice(allocator, ") {\n");
+    try emitIndent(allocator, buf, depth + 1);
+    try buf.appendSlice(allocator, "const ");
+    try emitIdent(allocator, buf, capture);
+    try buf.appendSlice(allocator, " = ");
+    try emitExprScoped(context, allocator, buf, chunks.target, depth + 1);
+    try buf.appendSlice(allocator, "[__chunk_index..@min(__chunk_index + ");
+    try emitExprScoped(context, allocator, buf, chunks.size, depth + 1);
+    try buf.appendSlice(allocator, ", ");
+    try emitExprScoped(context, allocator, buf, chunks.target, depth + 1);
+    try buf.appendSlice(allocator, ".len)];\n");
+    for (loop.body.stmts) |stmt| {
+        try emitStmtScoped(context, allocator, buf, stmt, depth + 1);
+    }
+    try emitIndent(allocator, buf, depth);
+    try buf.appendSlice(allocator, "}");
+    return true;
+}
+
+fn emitExprScoped(
+    context: *const EmitContext,
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     expr: ast.Expr,
@@ -604,12 +976,16 @@ pub fn emitExpr(
         .lit => |l| try emitLiteral(allocator, buf, l),
         .ident => |id| try emitIdent(allocator, buf, id),
         .field_access => |fa| {
-            try emitExpr(allocator, buf, fa.target.*, depth);
+            if (fa.target.* == .ident and std.mem.eql(u8, fa.target.ident, "error")) {
+                try buf.appendSlice(allocator, "error");
+            } else {
+                try emitExprScoped(context, allocator, buf, fa.target.*, depth);
+            }
             try buf.appendSlice(allocator, ".");
             try emitIdent(allocator, buf, fa.field_name);
         },
         .call => |c| {
-            try emitExpr(allocator, buf, c.callee.*, depth);
+            try emitExprScoped(context, allocator, buf, c.callee.*, depth);
             try buf.appendSlice(allocator, "(");
             var first_arg = true;
             for (c.generic_args) |generic_arg| {
@@ -620,17 +996,24 @@ pub fn emitExpr(
             for (c.args) |arg| {
                 if (!first_arg) try buf.appendSlice(allocator, ", ");
                 first_arg = false;
-                try emitExpr(allocator, buf, arg, depth);
+                try emitExprScoped(context, allocator, buf, arg, depth);
             }
             try buf.appendSlice(allocator, ")");
         },
         .block => |b| {
-            try emitBlock(allocator, buf, b, depth);
+            try emitBlockScoped(context, allocator, buf, b, depth);
         },
-        .match_expr => |match| try emitMatchExpr(allocator, buf, match, depth),
+        .match_expr => |match| try emitMatchExpr(context, allocator, buf, match, depth),
+        .cast => |cast| {
+            try buf.appendSlice(allocator, "@as(");
+            try emitType(allocator, buf, cast.target);
+            try buf.appendSlice(allocator, ", ");
+            try emitExprScoped(context, allocator, buf, cast.operand.*, depth);
+            try buf.appendSlice(allocator, ")");
+        },
         .bin_op => |bo| {
             try buf.appendSlice(allocator, "(");
-            try emitExpr(allocator, buf, bo.lhs.*, depth);
+            try emitExprScoped(context, allocator, buf, bo.lhs.*, depth);
             const op_sym = switch (bo.op) {
                 .add => " + ",
                 .sub => " - ",
@@ -657,34 +1040,34 @@ pub fn emitExpr(
                 .sub_sat => " -| ",
             };
             try buf.appendSlice(allocator, op_sym);
-            try emitExpr(allocator, buf, bo.rhs.*, depth);
+            try emitExprScoped(context, allocator, buf, bo.rhs.*, depth);
             try buf.appendSlice(allocator, ")");
         },
         .unary_op => |uo| {
             switch (uo.op) {
                 .negate => {
                     try buf.appendSlice(allocator, "-");
-                    try emitExpr(allocator, buf, uo.operand.*, depth);
+                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
                 },
                 .bit_not => {
                     try buf.appendSlice(allocator, "~");
-                    try emitExpr(allocator, buf, uo.operand.*, depth);
+                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
                 },
                 .bool_not => {
                     try buf.appendSlice(allocator, "!");
-                    try emitExpr(allocator, buf, uo.operand.*, depth);
+                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
                 },
                 .deref => {
-                    try emitExpr(allocator, buf, uo.operand.*, depth);
+                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
                     try buf.appendSlice(allocator, ".*");
                 },
                 .addr_of => {
                     try buf.appendSlice(allocator, "&");
-                    try emitExpr(allocator, buf, uo.operand.*, depth);
+                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
                 },
                 .try_op => {
                     try buf.appendSlice(allocator, "try ");
-                    try emitExpr(allocator, buf, uo.operand.*, depth);
+                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
                 },
             }
         },
@@ -702,7 +1085,7 @@ pub fn emitExpr(
                     try buf.appendSlice(allocator, ".");
                     try emitIdent(allocator, buf, f.name);
                     try buf.appendSlice(allocator, " = ");
-                    try emitExpr(allocator, buf, f.expr, depth);
+                    try emitExprScoped(context, allocator, buf, f.expr, depth);
                 }
                 try buf.appendSlice(allocator, " ");
             }
@@ -719,7 +1102,7 @@ pub fn emitExpr(
                 try buf.appendSlice(allocator, " ");
                 for (ai.elements, 0..) |elem, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try emitExpr(allocator, buf, elem, depth);
+                    try emitExprScoped(context, allocator, buf, elem, depth);
                 }
                 try buf.appendSlice(allocator, " ");
             }
@@ -737,7 +1120,7 @@ pub fn emitExpr(
                 try buf.appendSlice(allocator, " ");
                 for (ma.elements, 0..) |elem, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try emitExpr(allocator, buf, elem, depth);
+                    try emitExprScoped(context, allocator, buf, elem, depth);
                 }
                 try buf.appendSlice(allocator, " ");
             }
@@ -751,7 +1134,7 @@ pub fn emitExpr(
                 try buf.appendSlice(allocator, ".");
             }
             try buf.appendSlice(allocator, "{ ");
-            try emitExpr(allocator, buf, rp.elem.*, depth);
+            try emitExprScoped(context, allocator, buf, rp.elem.*, depth);
             try buf.appendSlice(allocator, " } ** ");
             var len_buf: [32]u8 = undefined;
             const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{rp.len}) catch unreachable;
@@ -759,17 +1142,22 @@ pub fn emitExpr(
         },
         .builtin => |bi| {
             if (std.mem.eql(u8, bi.name, "index") and bi.args.len == 2) {
-                try emitExpr(allocator, buf, bi.args[0], depth);
+                try emitExprScoped(context, allocator, buf, bi.args[0], depth);
                 try buf.appendSlice(allocator, "[");
-                try emitExpr(allocator, buf, bi.args[1], depth);
+                try emitExprScoped(context, allocator, buf, bi.args[1], depth);
                 try buf.appendSlice(allocator, "]");
+            } else if (std.mem.eql(u8, bi.name, "sliceChunks") and bi.args.len == 2) {
+                try emitExprScoped(context, allocator, buf, bi.args[0], depth);
+                try buf.appendSlice(allocator, ".chunks(");
+                try emitExprScoped(context, allocator, buf, bi.args[1], depth);
+                try buf.appendSlice(allocator, ")");
             } else {
                 try buf.appendSlice(allocator, "@");
                 try buf.appendSlice(allocator, bi.name);
                 try buf.appendSlice(allocator, "(");
                 for (bi.args, 0..) |arg, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try emitExpr(allocator, buf, arg, depth);
+                    try emitExprScoped(context, allocator, buf, arg, depth);
                 }
                 try buf.appendSlice(allocator, ")");
             }
@@ -781,17 +1169,17 @@ pub fn emitExpr(
         },
         .if_expr => |ie| {
             try buf.appendSlice(allocator, "if (");
-            try emitExpr(allocator, buf, ie.cond.*, depth);
+            try emitExprScoped(context, allocator, buf, ie.cond.*, depth);
             try buf.appendSlice(allocator, ") ");
-            try emitExpr(allocator, buf, ie.then_body.*, depth);
+            try emitExprScoped(context, allocator, buf, ie.then_body.*, depth);
             if (ie.else_body) |eb| {
                 try buf.appendSlice(allocator, " else ");
-                try emitExpr(allocator, buf, eb.*, depth);
+                try emitExprScoped(context, allocator, buf, eb.*, depth);
             }
         },
         .while_expr => |we| {
             try buf.appendSlice(allocator, "while (");
-            try emitExpr(allocator, buf, we.cond.*, depth);
+            try emitExprScoped(context, allocator, buf, we.cond.*, depth);
             try buf.appendSlice(allocator, ")");
             if (we.captures) |caps| {
                 try buf.appendSlice(allocator, " |");
@@ -803,21 +1191,22 @@ pub fn emitExpr(
             }
             if (we.continue_expr) |ce| {
                 try buf.appendSlice(allocator, " : (");
-                try emitExpr(allocator, buf, ce.*, depth);
+                try emitExprScoped(context, allocator, buf, ce.*, depth);
                 try buf.appendSlice(allocator, ")");
             }
             try buf.appendSlice(allocator, " ");
-            try emitBlock(allocator, buf, we.body, depth);
+            try emitBlockScoped(context, allocator, buf, we.body, depth);
             if (we.else_body) |eb| {
                 try buf.appendSlice(allocator, " else ");
-                try emitExpr(allocator, buf, eb.*, depth);
+                try emitExprScoped(context, allocator, buf, eb.*, depth);
             }
         },
         .for_expr => |fe| {
+            if (try emitChunkLoop(context, allocator, buf, fe, depth)) return;
             try buf.appendSlice(allocator, "for (");
             for (fe.inputs, 0..) |inp, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
-                try emitExpr(allocator, buf, inp, depth);
+                try emitExprScoped(context, allocator, buf, inp, depth);
             }
             try buf.appendSlice(allocator, ") |");
             for (fe.captures, 0..) |cap, i| {
@@ -825,21 +1214,21 @@ pub fn emitExpr(
                 try emitIdent(allocator, buf, cap);
             }
             try buf.appendSlice(allocator, "| ");
-            try emitBlock(allocator, buf, fe.body, depth);
+            try emitBlockScoped(context, allocator, buf, fe.body, depth);
             if (fe.else_body) |eb| {
                 try buf.appendSlice(allocator, " else ");
-                try emitExpr(allocator, buf, eb.*, depth);
+                try emitExprScoped(context, allocator, buf, eb.*, depth);
             }
         },
         .range => |r| {
-            try emitExpr(allocator, buf, r.start.*, depth);
+            try emitExprScoped(context, allocator, buf, r.start.*, depth);
             try buf.appendSlice(allocator, "..");
-            if (r.end) |en| try emitExpr(allocator, buf, en.*, depth);
+            if (r.end) |en| try emitExprScoped(context, allocator, buf, en.*, depth);
         },
         .return_expr => |re| {
             if (re) |val| {
                 try buf.appendSlice(allocator, "return ");
-                try emitExpr(allocator, buf, val.*, depth);
+                try emitExprScoped(context, allocator, buf, val.*, depth);
             } else {
                 try buf.appendSlice(allocator, "return");
             }
@@ -847,7 +1236,7 @@ pub fn emitExpr(
         .break_expr => |be| {
             if (be) |val| {
                 try buf.appendSlice(allocator, "break ");
-                try emitExpr(allocator, buf, val.*, depth);
+                try emitExprScoped(context, allocator, buf, val.*, depth);
             } else {
                 try buf.appendSlice(allocator, "break");
             }
@@ -858,17 +1247,19 @@ pub fn emitExpr(
     }
 }
 
-const match_payload_name = "match payload";
-const match_arm_label = "match arm";
-
 fn emitMatchExpr(
+    context: *const EmitContext,
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     match: ast.Match,
     depth: usize,
 ) std.mem.Allocator.Error!void {
+    var active_names: std.ArrayListUnmanaged(GeneratedMatchName) = .empty;
+    defer active_names.deinit(allocator);
+    try active_names.appendSlice(allocator, context.active_names);
+
     try buf.appendSlice(allocator, "switch (");
-    try emitExpr(allocator, buf, match.target.*, depth);
+    try emitExprScoped(context, allocator, buf, match.target.*, depth);
     try buf.appendSlice(allocator, ") {\n");
 
     for (match.arms) |arm| {
@@ -896,9 +1287,12 @@ fn emitMatchExpr(
             }
         }
 
-        const direct_binding = matchDirectBinding(arm);
+        const body_is_unsupported = arm.body == .unsupported;
+        const direct_binding = if (body_is_unsupported) null else matchDirectBinding(arm);
         const struct_pattern = matchStructPattern(arm);
-        const needs_destructure = if (struct_pattern) |pattern|
+        const needs_destructure = if (body_is_unsupported)
+            false
+        else if (struct_pattern) |pattern|
             matchNeedsDestructure(pattern)
         else
             false;
@@ -908,23 +1302,38 @@ fn emitMatchExpr(
             try buf.appendSlice(allocator, " |");
             try emitIdent(allocator, buf, binding);
             try buf.appendSlice(allocator, "|");
-        } else if (needs_destructure) {
-            try buf.appendSlice(allocator, " |");
-            try emitIdent(allocator, buf, match_payload_name);
-            try buf.appendSlice(allocator, "|");
         }
-        try buf.appendSlice(allocator, " ");
-
         if (needs_destructure) {
+            const payload_name = freshGeneratedMatchName(
+                match,
+                active_names.items,
+                match_payload_base,
+            );
+            try active_names.append(allocator, payload_name);
+            const arm_name = freshGeneratedMatchName(
+                match,
+                active_names.items,
+                match_arm_base,
+            );
+            try active_names.append(allocator, arm_name);
+            const arm_context: EmitContext = .{ .active_names = active_names.items };
+
+            try buf.appendSlice(allocator, " |");
+            try emitGeneratedMatchName(allocator, buf, payload_name);
+            try buf.appendSlice(allocator, "| ");
             try emitMatchDestructureBody(
+                &arm_context,
                 allocator,
                 buf,
                 struct_pattern.?,
                 arm.body,
+                payload_name,
+                arm_name,
                 depth,
             );
         } else {
-            try emitExpr(allocator, buf, arm.body, depth + 1);
+            try buf.appendSlice(allocator, " ");
+            try emitExprScoped(context, allocator, buf, arm.body, depth + 1);
         }
         try buf.appendSlice(allocator, ",\n");
     }
@@ -987,13 +1396,16 @@ fn matchNeedsDestructure(pattern: ast.StructPattern) bool {
 }
 
 fn emitMatchDestructureBody(
+    context: *const EmitContext,
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     pattern: ast.StructPattern,
     body: ast.Expr,
+    payload_name: GeneratedMatchName,
+    arm_name: GeneratedMatchName,
     depth: usize,
 ) std.mem.Allocator.Error!void {
-    try emitIdent(allocator, buf, match_arm_label);
+    try emitGeneratedMatchName(allocator, buf, arm_name);
     try buf.appendSlice(allocator, ": {\n");
     for (pattern.fields) |field| {
         const binding = switch (field.pat) {
@@ -1004,7 +1416,7 @@ fn emitMatchDestructureBody(
         try buf.appendSlice(allocator, "const ");
         try emitIdent(allocator, buf, binding);
         try buf.appendSlice(allocator, " = ");
-        try emitIdent(allocator, buf, match_payload_name);
+        try emitGeneratedMatchName(allocator, buf, payload_name);
         try buf.appendSlice(allocator, ".");
         try emitIdent(allocator, buf, field.name);
         try buf.appendSlice(allocator, ";\n");
@@ -1013,14 +1425,14 @@ fn emitMatchDestructureBody(
     try emitIndent(allocator, buf, depth + 2);
     switch (body) {
         .return_expr, .break_expr, .continue_expr => {
-            try emitExpr(allocator, buf, body, depth + 2);
+            try emitExprScoped(context, allocator, buf, body, depth + 2);
             try buf.appendSlice(allocator, ";\n");
         },
         else => {
             try buf.appendSlice(allocator, "break :");
-            try emitIdent(allocator, buf, match_arm_label);
+            try emitGeneratedMatchName(allocator, buf, arm_name);
             try buf.appendSlice(allocator, " ");
-            try emitExpr(allocator, buf, body, depth + 2);
+            try emitExprScoped(context, allocator, buf, body, depth + 2);
             try buf.appendSlice(allocator, ";\n");
         },
     }
@@ -1031,36 +1443,55 @@ fn emitMatchDestructureBody(
 fn emitBlock(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
-    b: ast.Block,
+    block: ast.Block,
     depth: usize,
 ) std.mem.Allocator.Error!void {
-    if (b.label) |lbl| {
-        try emitIdent(allocator, buf, lbl);
+    const context: EmitContext = .{};
+    try emitBlockScoped(&context, allocator, buf, block, depth);
+}
+
+fn emitBlockScoped(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    block: ast.Block,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    var generated_label_buffer: [64]u8 = undefined;
+    const value_label: ?[]const u8 = if (block.label) |label|
+        label
+    else if (block.expr) |tail|
+        if (tail.* == .return_expr or tail.* == .break_expr or tail.* == .continue_expr)
+            null
+        else
+            std.fmt.bufPrint(
+                &generated_label_buffer,
+                "__r2z_value_block_{d}",
+                .{depth},
+            ) catch unreachable
+    else
+        null;
+    if (value_label) |label| {
+        try emitIdent(allocator, buf, label);
         try buf.appendSlice(allocator, ": ");
     }
     try buf.appendSlice(allocator, "{\n");
-    for (b.stmts) |stmt| {
-        try emitStmt(allocator, buf, stmt, depth + 1);
+    for (block.stmts) |stmt| {
+        try emitStmtScoped(context, allocator, buf, stmt, depth + 1);
     }
-    if (b.expr) |tail| {
+    if (block.expr) |tail| {
         try emitIndent(allocator, buf, depth + 1);
-        if (b.label) |lbl| {
+        if (tail.* == .return_expr or tail.* == .break_expr or tail.* == .continue_expr) {
+            try emitExprScoped(context, allocator, buf, tail.*, depth + 1);
+            try buf.appendSlice(allocator, ";\n");
+        } else if (value_label) |label| {
             try buf.appendSlice(allocator, "break :");
-            try emitIdent(allocator, buf, lbl);
+            try emitIdent(allocator, buf, label);
             try buf.appendSlice(allocator, " ");
-            try emitExpr(allocator, buf, tail.*, depth + 1);
+            try emitExprScoped(context, allocator, buf, tail.*, depth + 1);
             try buf.appendSlice(allocator, ";\n");
         } else {
-            try emitExpr(allocator, buf, tail.*, depth + 1);
-            if (!isStatementLike(tail.*) and
-                tail.* != .match_expr and
-                tail.* != .return_expr and
-                tail.* != .break_expr and
-                tail.* != .continue_expr)
-            {
-                // In Zig statement block, if expression is used as statement:
-                try buf.appendSlice(allocator, ";");
-            }
+            try emitExprScoped(context, allocator, buf, tail.*, depth + 1);
             try buf.appendSlice(allocator, "\n");
         }
     }
@@ -1115,7 +1546,7 @@ fn emitLiteral(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), l
             } else if (c == '\t') {
                 try buf.appendSlice(allocator, "\\t");
             } else if (c == 0) {
-                try buf.appendSlice(allocator, "\\0");
+                try buf.appendSlice(allocator, "\\x00");
             } else if (c >= 0x20 and c <= 0x7e) {
                 try buf.append(allocator, @intCast(c));
             } else {
@@ -1281,4 +1712,229 @@ pub fn emitType(
         .any_opaque => try buf.appendSlice(allocator, "anyopaque"),
         .void_type => try buf.appendSlice(allocator, "void"),
     }
+}
+
+test "emitFile: rejects generated tests without std and empty test bodies" {
+    const no_std: ast.File = .{
+        .path = "src/root.zig",
+        .tests = &.{.{ .name = "missing std", .body = .{
+            .expr = &ast.Expr{ .continue_expr = {} },
+        } }},
+    };
+    try std.testing.expectError(
+        error.MissingStdImport,
+        emitFile(std.testing.allocator, &no_std),
+    );
+
+    const empty_test: ast.File = .{
+        .path = "src/root.zig",
+        .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+        .tests = &.{.{ .name = "empty", .body = .{} }},
+    };
+    try std.testing.expectError(
+        error.EmptyTranslatedBody,
+        emitFile(std.testing.allocator, &empty_test),
+    );
+}
+
+test "emitFile: accepts a file with zero generated tests" {
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .const_decl = .{
+            .name = "answer",
+            .ty = .{ .prim = .u8 },
+            .init = .{ .lit = .{ .int = 42 } },
+        } }},
+    };
+    const output = try emitFile(std.testing.allocator, &file);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "answer") != null);
+}
+
+test "emitFile: rejects explicit unsupported expressions" {
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .const_decl = .{
+            .name = "missing",
+            .init = .{ .unsupported = "fixture" },
+        } }},
+    };
+    try std.testing.expectError(
+        error.UnsupportedTranslationNode,
+        emitFile(std.testing.allocator, &file),
+    );
+}
+test "emitFile: emits validated scalar casts" {
+    const operand: ast.Expr = .{ .ident = "byte" };
+    const cast: ast.Expr = .{ .cast = .{
+        .target = .{ .prim = .u64 },
+        .operand = &operand,
+    } };
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .const_decl = .{
+            .name = "value",
+            .ty = .{ .prim = .u64 },
+            .init = cast,
+        } }},
+    };
+    const output = try emitFile(std.testing.allocator, &file);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "@as(u64, byte)") != null);
+}
+
+test "emitFile: accepts tuple-position field names" {
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .struct_decl = .{
+            .name = "Pair",
+            .fields = &.{
+                .{ .name = "0", .ty = .{ .prim = .u8 } },
+                .{ .name = "1", .ty = .{ .prim = .u8 } },
+            },
+        } }},
+    };
+    const source = try emitFile(std.testing.allocator, &file);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "@\"0\": u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "@\"1\": u8") != null);
+}
+
+test "emitFile: emits defer and errdefer cleanup statements" {
+    const owner: ast.Expr = .{ .ident = "owner" };
+    const deinit_callee: ast.Expr = .{ .field_access = .{
+        .target = &owner,
+        .field_name = "deinit",
+    } };
+    const cleanup_call: ast.Expr = .{ .call = .{
+        .callee = &deinit_callee,
+        .args = &.{.{ .ident = "allocator" }},
+    } };
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "cleanup",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .stmts = &.{
+                .{ .defer_stmt = .{ .expr = cleanup_call } },
+                .{ .defer_stmt = .{
+                    .expr = cleanup_call,
+                    .is_errdefer = true,
+                } },
+            } },
+        } }},
+    };
+    const source = try emitFile(std.testing.allocator, &file);
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqualStrings(
+        \\pub fn cleanup() void {
+        \\    defer owner.deinit(allocator);
+        \\    errdefer owner.deinit(allocator);
+        \\}
+        \\
+    ,
+        source,
+    );
+}
+
+test "emitFile: source expectEqual declarations do not collide with helpers" {
+    const operand: ast.Expr = .{ .lit = .{ .int = 1 } };
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+        .decls = &.{.{ .const_decl = .{
+            .name = "expectEqual",
+            .ty = .{ .prim = .u8 },
+            .init = operand,
+        } }},
+        .tests = &.{.{ .name = "collision", .body = .{
+            .stmts = &.{.{ .expr_stmt = &ast.Expr{ .call = .{
+                .callee = &ast.Expr{ .field_access = .{
+                    .target = &ast.Expr{ .field_access = .{
+                        .target = &ast.Expr{ .ident = "std" },
+                        .field_name = "testing",
+                    } },
+                    .field_name = "expect",
+                } },
+                .args = &.{.{ .lit = .{ .bool_lit = true } }},
+            } } }},
+        } }},
+    };
+    const source = try emitFile(std.testing.allocator, &file);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const expectEqual =") == null);
+}
+
+test "emitExpr: custom chunks methods are not rewritten as slice loops" {
+    const target: ast.Expr = .{ .ident = "custom" };
+    const method: ast.Expr = .{ .field_access = .{
+        .target = &target,
+        .field_name = "chunks",
+    } };
+    const iterable: ast.Expr = .{ .call = .{
+        .callee = &method,
+        .args = &.{.{ .lit = .{ .int = 4 } }},
+    } };
+    const body_expr: ast.Expr = .{ .struct_init = .{ .fields = &.{} } };
+    const loop: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{iterable},
+        .captures = &.{"chunk"},
+        .body = .{ .stmts = &.{.{ .expr_stmt = &body_expr }} },
+    } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, loop, 0);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "custom.chunks(4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__chunk_index") == null);
+}
+
+test "emitExpr: resolved slice chunks use the chunk loop lowering" {
+    const target: ast.Expr = .{ .ident = "bytes" };
+    const chunks: ast.Expr = .{ .builtin = .{
+        .name = "sliceChunks",
+        .args = &.{ target, .{ .lit = .{ .int = 4 } } },
+    } };
+    const body_expr: ast.Expr = .{ .struct_init = .{ .fields = &.{} } };
+    const loop: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{chunks},
+        .captures = &.{"chunk"},
+        .body = .{ .stmts = &.{.{ .expr_stmt = &body_expr }} },
+    } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, loop, 0);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__chunk_index") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "while (bytes.len") != null);
+}
+
+test "emitExpr: nested value blocks use distinct labels" {
+    const inner_value: ast.Expr = .{ .lit = .{ .int = 1 } };
+    const inner: ast.Expr = .{ .block = .{ .expr = &inner_value } };
+    const outer: ast.Expr = .{ .block = .{ .expr = &inner } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, outer, 0);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__r2z_value_block_0:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__r2z_value_block_1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "block:") == null);
+}
+
+test "emitStmt: block expression statements omit trailing semicolons" {
+    const value: ast.Expr = .{ .lit = .{ .int = 1 } };
+    const block: ast.Expr = .{ .block = .{ .expr = &value } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    try emitStmt(
+        std.testing.allocator,
+        &buffer,
+        .{ .expr_stmt = &block },
+        0,
+    );
+    try std.testing.expectEqualStrings(
+        "__r2z_value_block_0: {\n" ++
+            "    break :__r2z_value_block_0 1;\n" ++
+            "}\n",
+        buffer.items,
+    );
 }

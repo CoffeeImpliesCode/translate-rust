@@ -35,13 +35,14 @@ pub const Module = struct {
 
 pub const CrateKind = enum { lib, bin };
 
-/// A dependency edge to an external crate (deps layer, deferred for v1).
-/// Records both the dependency's own crate name and the alias a `use` can
-/// refer to it by.
+/// A dependency edge to an external crate. `features` is ordered and all
+/// strings are owned by the containing CrateGraph.
 pub const CrateDep = struct {
     extern_name: []const u8,
     local_alias: []const u8,
     id: u32,
+    default_features: ?bool = null,
+    features: []const []const u8 = &.{},
 };
 
 /// A crate in the graph (a workspace / dependency set). v1 fills exactly one.
@@ -127,6 +128,8 @@ pub const CrateGraph = struct {
             for (c.deps) |d| {
                 a.free(d.extern_name);
                 a.free(d.local_alias);
+                for (d.features) |feature| a.free(feature);
+                a.free(d.features);
             }
             a.free(c.deps);
         }

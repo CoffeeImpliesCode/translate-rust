@@ -9,6 +9,10 @@
             .url = "git+https://github.com/tree-sitter/zig-tree-sitter#b562510b5563dcf3b7fcac4a5fe9d60834c84667",
             .hash = "tree_sitter-0.26.0-8heIf-vDAQDh0HhAAUVwVZFmLrwSKMZl5gRaVFqtas0W",
         },
+        .serde = .{
+            .url = "git+https://github.com/OrlovEvgeny/serde.zig#dd8cc6f97c240c7fb73c69dad2722c806e59a81b",
+            .hash = "serde-1.0.1-1DszT3MjEADZkgXH6IsH3gs1Pm12UGyhagpV22EEch7x",
+        },
     },
     .paths = .{
         "build.zig",

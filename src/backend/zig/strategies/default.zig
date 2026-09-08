@@ -1,8 +1,9 @@
 //! translate_rust.backend.zig.strategies.default — standard Zig lowering rules.
 //!
 //! Implements the default `LoweringStrategy`: faithful primitive/slice/option
-//! mapping, error unions for unionable `Result`, and standard Rust collection
-//! mapping (`HashMap` → `std.AutoHashMap`, `Vec` → `std.ArrayListUnmanaged`, ...).
+//! mapping, error unions for unionable `Result`, and selected standard Rust
+//! collection mapping (`BTreeMap` → `std.AutoHashMap`, `Vec` →
+//! `std.ArrayListUnmanaged`, ...).
 //! Generics lower via comptime duck typing (bounds erased at emit).
 //!
 //! Boxed types owned by a returned `ast.Type` (`.opt`, `.err_union`,
@@ -12,6 +13,7 @@
 //! lowering call stays valid until the next lowering call on the same owner —
 //! sufficient for the single-call lowering pattern the engine uses.
 
+const std = @import("std");
 const ir = @import("translate_rust.ir");
 const ast = @import("../ast.zig");
 
@@ -30,6 +32,7 @@ pub const DefaultStrategy = struct {
         return switch (ty) {
             .prim => |p| ast.Type{ .prim = primToAst(p) },
             .path => |p| lowerPath(p),
+            .external_nominal => |external| try lowerExternal(ctx, external),
             .reference => |r| makePtr(!r.mut, .one, try lowerTypeImpl(ctx, r.pointee)),
             .raw_ptr => |r| makePtr(!r.mut, .many, try lowerTypeImpl(ctx, r.pointee)),
             .slice => |s| makeSlice(s.const_, try lowerTypeImpl(ctx, s.elem)),
@@ -57,6 +60,36 @@ pub const DefaultStrategy = struct {
             .unsupported => ast.Type.any_opaque,
         };
     }
+    fn externalPathEqual(path: []const []const u8, expected: []const []const u8) bool {
+        if (path.len != expected.len) return false;
+        for (path, expected) |actual, wanted| {
+            if (!std.mem.eql(u8, actual, wanted)) return false;
+        }
+        return true;
+    }
+
+    fn lowerExternal(ctx: *anyopaque, external: ir.types.ExternalNominal) anyerror!ast.Type {
+        if (externalPathEqual(external.path, &.{ "core", "option", "Option" }) or
+            externalPathEqual(external.path, &.{ "std", "option", "Option" }))
+        {
+            if (external.args.len != 1) return error.GenericArgumentArityMismatch;
+            return .{ .opt = box(try lowerTypeImpl(ctx, external.args[0])) };
+        }
+        if (externalPathEqual(external.path, &.{ "core", "result", "Result" }) or
+            externalPathEqual(external.path, &.{ "std", "result", "Result" }))
+        {
+            if (external.args.len != 2) return error.GenericArgumentArityMismatch;
+            return .{ .err_union = .{
+                .err_set = null,
+                .payload = box(try lowerTypeImpl(ctx, external.args[0])),
+            } };
+        }
+        if (externalPathEqual(external.path, &.{ "std", "string", "String" })) {
+            if (external.args.len != 0) return error.GenericArgumentArityMismatch;
+            return .{ .named = "[]const u8" };
+        }
+        return error.UnsupportedExternalNominalType;
+    }
 
     pub fn lowerStdGeneric(
         ctx: *anyopaque,
@@ -68,13 +101,7 @@ pub const DefaultStrategy = struct {
         if (std.mem.eql(u8, name, "Vec") or std.mem.eql(u8, name, "String")) {
             return .{ .named = "std.ArrayListUnmanaged" };
         }
-        if (std.mem.eql(u8, name, "BuildHasherDefault")) {
-            return .{ .named = "std.hash.BuildHasherDefault" };
-        }
-        if (std.mem.eql(u8, name, "HashMap") or
-            std.mem.eql(u8, name, "HashSet") or
-            std.mem.eql(u8, name, "BTreeMap"))
-        {
+        if (std.mem.eql(u8, name, "BTreeMap")) {
             return .{ .named = "std.AutoHashMap" };
         }
         return null;
@@ -245,13 +272,19 @@ test "default: lower short and long tuples into caller storage" {
 }
 
 test "default: standard generic mapping" {
-    const generic = try DefaultStrategy.lowerStdGeneric(
+    const hash_set = try DefaultStrategy.lowerStdGeneric(
         undefined,
         "HashSet",
         &.{ ir.types.Type{ .prim = .u64 }, ir.types.Type{ .prim = .f32 } },
     );
-    try std.testing.expect(generic != null);
-    try std.testing.expectEqualStrings("std.AutoHashMap", generic.?.named);
+    try std.testing.expect(hash_set == null);
+
+    const hash_map = try DefaultStrategy.lowerStdGeneric(
+        undefined,
+        "HashMap",
+        &.{ ir.types.Type{ .prim = .u64 }, ir.types.Type{ .prim = .f32 } },
+    );
+    try std.testing.expect(hash_map == null);
 
     const vec = try DefaultStrategy.lowerStdGeneric(
         undefined,
@@ -265,4 +298,23 @@ test "default: standard generic mapping" {
     try std.testing.expect(unknown == null);
 }
 
-const std = @import("std");
+test "default: external nominal mapping is explicit and fail-loud" {
+    var strategy: DefaultStrategy = .{};
+    const option = try DefaultStrategy.lowerType(&strategy, .{
+        .external_nominal = .{
+            .path = &.{ "core", "option", "Option" },
+            .args = &.{.{ .prim = .u8 }},
+        },
+    });
+    try std.testing.expectEqual(ast.Prim.u8, option.opt.*.prim);
+
+    try std.testing.expectError(
+        error.UnsupportedExternalNominalType,
+        DefaultStrategy.lowerType(&strategy, .{
+            .external_nominal = .{
+                .path = &.{ "alloc", "collections", "VecDeque" },
+                .args = &.{.{ .prim = .u8 }},
+            },
+        }),
+    );
+}

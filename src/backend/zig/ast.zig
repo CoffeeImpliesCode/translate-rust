@@ -13,11 +13,12 @@ pub const Package = struct {
     zon_deps: []const ZonDep = &.{},
 };
 
-/// A dependency in build.zig.zon.
+/// A dependency declared in the generated `build.zig.zon`.
 pub const ZonDep = struct {
     name: []const u8,
     url: []const u8 = "",
     hash: []const u8 = "",
+    path: ?[]const u8 = null,
 };
 
 /// A single source file in the package.
@@ -223,6 +224,7 @@ pub const Expr = union(enum) {
     match_expr: Match,
     bin_op: BinOp,
     unary_op: UnaryOp,
+    cast: Cast,
     struct_init: StructInit,
     array_init: ArrayInit,
     repeat: Repeat,
@@ -367,6 +369,13 @@ pub const BuiltinCall = struct {
     args: []const Expr = &.{},
 };
 
+pub const Cast = struct {
+    target: Type,
+    operand: *const Expr,
+    /// Raw-pointer casts retain source provenance for AST-boundary validation.
+    source: ?Type = null,
+};
+
 pub const IfExpr = struct {
     cond: *const Expr,
     then_body: *const Expr,
@@ -397,8 +406,11 @@ pub const Range = struct {
 pub const AssignOp = enum {
     assign,
     add_assign,
+    add_assign_wrap,
     sub_assign,
+    sub_assign_wrap,
     mul_assign,
+    mul_assign_wrap,
     div_assign,
     mod_assign,
     bit_and_assign,
@@ -421,9 +433,15 @@ pub const LetStmt = struct {
     is_mut: bool = false,
 };
 
+pub const DeferStmt = struct {
+    expr: Expr,
+    is_errdefer: bool = false,
+};
+
 pub const Stmt = union(enum) {
     let_stmt: LetStmt,
     assign: AssignStmt,
+    defer_stmt: DeferStmt,
     expr_stmt: *const Expr,
 };
 
@@ -431,6 +449,730 @@ pub const TestDecl = struct {
     name: []const u8,
     body: Block,
 };
+
+/// Errors raised when a package or file is not complete enough for translation
+/// output. Canonical AST serialization remains lossless; these errors apply only
+/// at output boundaries.
+pub const ValidationError = error{
+    MissingRootFile,
+    DuplicateFilePath,
+    InvalidFilePath,
+    InvalidPackageName,
+    DuplicateDependencyName,
+    InvalidDependencyName,
+    MissingFingerprint,
+    DependencySourceUnavailable,
+    MissingStdImport,
+    EmptyTranslatedFunction,
+    EmptyTranslatedBody,
+    EmptyTranslatedContainer,
+    UnnamedMatchSelector,
+    MissingTypedLiteralIdentity,
+    UnsupportedTranslationNode,
+    InvalidIdentifier,
+};
+
+fn isIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const first = name[0];
+    if (!((first >= 'a' and first <= 'z') or
+        (first >= 'A' and first <= 'Z') or first == '_'))
+    {
+        return false;
+    }
+    for (name[1..]) |c| {
+        if (!((c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '-'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn normalizedNameEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_char, right_char| {
+        const normalized_left = if (left_char == '-') '_' else left_char;
+        const normalized_right = if (right_char == '-') '_' else right_char;
+        if (normalized_left != normalized_right) return false;
+    }
+    return true;
+}
+
+fn validateName(name: []const u8) ValidationError!void {
+    if (!isIdentifier(name)) return error.InvalidIdentifier;
+}
+
+fn validateQualifiedName(name: []const u8) ValidationError!void {
+    if (name.len == 0) return error.InvalidIdentifier;
+    var components = std.mem.splitScalar(u8, name, '.');
+    while (components.next()) |component| try validateName(component);
+}
+
+fn validateFieldName(name: []const u8) ValidationError!void {
+    if (name.len == 0) return error.InvalidIdentifier;
+    var all_digits = true;
+    for (name) |character| {
+        if (character < '0' or character > '9') {
+            all_digits = false;
+            break;
+        }
+    }
+    if (!all_digits) try validateName(name);
+}
+
+fn validateTypeName(name: []const u8) ValidationError!void {
+    if (name.len == 0) return error.InvalidIdentifier;
+    if (std.mem.eql(u8, name, "unsupported type")) {
+        return error.UnsupportedTranslationNode;
+    }
+}
+
+fn validatePackageName(name: []const u8) ValidationError!void {
+    if (!isIdentifier(name)) return error.InvalidPackageName;
+}
+
+fn validManifestString(value: []const u8) bool {
+    for (value) |character| {
+        if (character == '"' or character == '\\' or character < 0x20) return false;
+    }
+    return true;
+}
+
+fn validateFilePath(path: []const u8) ValidationError!void {
+    if (path.len == 0 or
+        !std.mem.startsWith(u8, path, "src/") or
+        path[0] == '/' or
+        std.mem.indexOfScalar(u8, path, '\\') != null)
+    {
+        return error.InvalidFilePath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0) return error.InvalidFilePath;
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+            return error.InvalidFilePath;
+        }
+    }
+}
+
+fn validateType(ty: Type) ValidationError!void {
+    switch (ty) {
+        .prim, .any_opaque, .void_type => {},
+        .ptr => |ptr| try validateType(ptr.elem.*),
+        .slice => |slice| try validateType(slice.elem.*),
+        .opt => |inner| try validateType(inner.*),
+        .err_union => |err_union| {
+            if (err_union.err_set) |err_set| try validateName(err_set);
+            try validateType(err_union.payload.*);
+        },
+        .named => |name| try validateTypeName(name),
+        .generic => |generic| {
+            try validateTypeName(generic.name);
+            for (generic.params) |param| try validateType(param);
+        },
+        .array => |array| try validateType(array.elem.*),
+        .tuple => |tuple| for (tuple) |item| try validateType(item),
+        .anon_struct => |anon| {
+            for (anon.fields) |field| {
+                try validateFieldName(field.name);
+                try validateType(field.ty);
+                if (field.default_val) |value| try validateExpr(value.*);
+            }
+        },
+    }
+}
+
+fn sameTypeSlice(left: []const Type, right: []const Type) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_type, right_type| {
+        if (!sameType(left_type, right_type)) return false;
+    }
+    return true;
+}
+
+fn sameType(left: Type, right: Type) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .prim => |left_primitive| left_primitive == right.prim,
+        .ptr => |left_pointer| {
+            const right_pointer = right.ptr;
+            return left_pointer.is_const == right_pointer.is_const and
+                left_pointer.is_allowzero == right_pointer.is_allowzero and
+                left_pointer.size == right_pointer.size and
+                sameType(left_pointer.elem.*, right_pointer.elem.*);
+        },
+        .slice => |left_slice| {
+            const right_slice = right.slice;
+            return left_slice.is_const == right_slice.is_const and
+                sameType(left_slice.elem.*, right_slice.elem.*);
+        },
+        .opt => |left_inner| sameType(left_inner.*, right.opt.*),
+        .err_union => |left_union| {
+            const right_union = right.err_union;
+            if (left_union.err_set == null or right_union.err_set == null) {
+                if (left_union.err_set != null or right_union.err_set != null) return false;
+            } else if (!std.mem.eql(u8, left_union.err_set.?, right_union.err_set.?)) {
+                return false;
+            }
+            return sameType(left_union.payload.*, right_union.payload.*);
+        },
+        .named => |left_name| std.mem.eql(u8, left_name, right.named),
+        .generic => |left_generic| {
+            const right_generic = right.generic;
+            return std.mem.eql(u8, left_generic.name, right_generic.name) and
+                sameTypeSlice(left_generic.params, right_generic.params);
+        },
+        .array => |left_array| {
+            const right_array = right.array;
+            return left_array.len == right_array.len and
+                sameType(left_array.elem.*, right_array.elem.*);
+        },
+        .tuple => |left_tuple| sameTypeSlice(left_tuple, right.tuple),
+        .anon_struct => |left_struct| {
+            const right_struct = right.anon_struct;
+            if (left_struct.fields.len != right_struct.fields.len) return false;
+            for (left_struct.fields, right_struct.fields) |left_field, right_field| {
+                if (!std.mem.eql(u8, left_field.name, right_field.name) or
+                    !sameType(left_field.ty, right_field.ty))
+                {
+                    return false;
+                }
+            }
+            return true;
+        },
+        .any_opaque, .void_type => true,
+    };
+}
+const ScalarPointeeLayout = enum {
+    byte_1,
+    byte_2,
+    byte_4,
+    byte_8,
+    byte_16,
+    pointer,
+};
+
+fn scalarPointeeLayout(primitive: Prim) ?ScalarPointeeLayout {
+    return switch (primitive) {
+        .u8, .i8, .bool => .byte_1,
+        .u16, .i16 => .byte_2,
+        .u21, .u32, .i32, .f32 => .byte_4,
+        .u64, .i64, .f64 => .byte_8,
+        .u128, .i128 => .byte_16,
+        .usize, .isize => .pointer,
+        .void_type, .noreturn_type, .type_type, .anyerror_type => null,
+    };
+}
+
+fn pointerPointeesCompatible(source: Type, target: Type) bool {
+    return switch (source) {
+        .prim => |source_primitive| switch (target) {
+            .prim => |target_primitive| {
+                const source_layout = scalarPointeeLayout(source_primitive) orelse return false;
+                const target_layout = scalarPointeeLayout(target_primitive) orelse return false;
+                return source_layout == target_layout;
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+fn validPointerCastShape(source: Ptr, target: Ptr, operand: Expr) bool {
+    const pointer_cast = switch (operand) {
+        .builtin => |builtin| blk: {
+            if (!std.mem.eql(u8, builtin.name, "ptrCast")) return false;
+            if (builtin.args.len != 1) return false;
+            break :blk builtin;
+        },
+        else => return false,
+    };
+    const pointer_operand = pointer_cast.args[0];
+    const const_cast = switch (pointer_operand) {
+        .builtin => |builtin| if (std.mem.eql(u8, builtin.name, "constCast"))
+            builtin
+        else
+            null,
+        else => null,
+    };
+    const removes_const = source.is_const and !target.is_const;
+    if (removes_const != (const_cast != null)) return false;
+    if (const_cast) |builtin| {
+        if (builtin.args.len != 1) return false;
+    }
+    return true;
+}
+
+fn validateLiteral(_: Literal) ValidationError!void {}
+
+fn validatePattern(pattern: Pattern) ValidationError!void {
+    switch (pattern) {
+        .wildcard => {},
+        .binding => |name| try validateName(name),
+        .lit => |literal| try validateLiteral(literal),
+        .enum_literal => |name| {
+            if (name.len == 0) return error.MissingTypedLiteralIdentity;
+            try validateName(name);
+        },
+        .tuple => |patterns| for (patterns) |item| try validatePattern(item),
+        .struct_pat => |struct_pat| {
+            const name = struct_pat.name orelse return error.UnnamedMatchSelector;
+            if (name.len == 0) return error.UnnamedMatchSelector;
+            try validateName(name);
+            for (struct_pat.fields) |field| {
+                try validateFieldName(field.name);
+                try validatePattern(field.pat);
+            }
+        },
+    }
+}
+
+fn validateBlock(block: Block) ValidationError!void {
+    if (block.stmts.len == 0 and block.expr == null) return error.EmptyTranslatedBody;
+    if (block.label) |label| try validateName(label);
+    for (block.stmts) |stmt| {
+        switch (stmt) {
+            .let_stmt => |let_stmt| {
+                try validateName(let_stmt.name);
+                if (let_stmt.ty) |ty| try validateType(ty);
+                try validateExpr(let_stmt.init);
+            },
+            .assign => |assign| {
+                try validateExpr(assign.target);
+                try validateExpr(assign.val);
+            },
+            .defer_stmt => |defer_stmt| try validateExpr(defer_stmt.expr),
+            .expr_stmt => |expr| try validateExpr(expr.*),
+        }
+    }
+    if (block.expr) |expr| try validateExpr(expr.*);
+}
+
+fn validateExpr(expr: Expr) ValidationError!void {
+    switch (expr) {
+        .lit => |literal| try validateLiteral(literal),
+        .ident => |name| try validateQualifiedName(name),
+        .field_access => |field_access| {
+            try validateExpr(field_access.target.*);
+            try validateFieldName(field_access.field_name);
+        },
+        .call => |call| {
+            try validateExpr(call.callee.*);
+            for (call.generic_args) |arg| try validateType(arg);
+            for (call.args) |arg| try validateExpr(arg);
+        },
+        .block => |block| try validateBlock(block),
+        .match_expr => |match| {
+            try validateExpr(match.target.*);
+            if (match.arms.len == 0) return error.EmptyTranslatedBody;
+            for (match.arms) |arm| {
+                if (arm.patterns.len == 0) return error.UnnamedMatchSelector;
+                for (arm.patterns) |pattern| try validatePattern(pattern);
+                try validateExpr(arm.body);
+            }
+        },
+        .cast => |cast| {
+            switch (cast.target) {
+                .prim => |primitive| switch (primitive) {
+                    .u8, .u16, .u21, .u32, .u64, .u128, .usize, .i8, .i16, .i32, .i64, .i128, .isize, .f32, .f64 => {},
+                    .bool, .void_type, .noreturn_type, .type_type, .anyerror_type => return error.UnsupportedTranslationNode,
+                },
+                .ptr => |target_pointer| {
+                    if (target_pointer.size != .many) return error.UnsupportedTranslationNode;
+                    const source = cast.source orelse return error.UnsupportedTranslationNode;
+                    const source_pointer = switch (source) {
+                        .ptr => |pointer| pointer,
+                        else => return error.UnsupportedTranslationNode,
+                    };
+                    if (source_pointer.size != .many or
+                        !pointerPointeesCompatible(source_pointer.elem.*, target_pointer.elem.*))
+                    {
+                        return error.UnsupportedTranslationNode;
+                    }
+                    if (!validPointerCastShape(source_pointer, target_pointer, cast.operand.*)) {
+                        return error.UnsupportedTranslationNode;
+                    }
+                    try validateType(source);
+                    try validateType(cast.target);
+                },
+                else => return error.UnsupportedTranslationNode,
+            }
+            try validateExpr(cast.operand.*);
+        },
+        .bin_op => |bin_op| {
+            try validateExpr(bin_op.lhs.*);
+            try validateExpr(bin_op.rhs.*);
+        },
+        .unary_op => |unary_op| try validateExpr(unary_op.operand.*),
+        .struct_init => |struct_init| {
+            if (struct_init.fields.len > 0 and struct_init.type_name == null) {
+                return error.MissingTypedLiteralIdentity;
+            }
+            if (struct_init.type_name) |type_name| try validateType(type_name);
+            for (struct_init.fields) |field| {
+                try validateFieldName(field.name);
+                try validateExpr(field.expr);
+            }
+        },
+        .array_init => |array_init| {
+            if (array_init.type_name == null) return error.MissingTypedLiteralIdentity;
+            if (array_init.type_name) |type_name| try validateType(type_name);
+            for (array_init.elements) |element| try validateExpr(element);
+        },
+        .repeat => |repeat| {
+            if (repeat.type_name == null) return error.MissingTypedLiteralIdentity;
+            if (repeat.type_name) |type_name| try validateType(type_name);
+            try validateExpr(repeat.elem.*);
+        },
+        .multi_array => |multi_array| {
+            if (multi_array.type_name == null) return error.MissingTypedLiteralIdentity;
+            if (multi_array.type_name) |type_name| try validateType(type_name);
+            for (multi_array.elements) |element| try validateExpr(element);
+        },
+        .builtin => |builtin| {
+            try validateQualifiedName(builtin.name);
+            for (builtin.args) |arg| try validateExpr(arg);
+        },
+        .unsupported => return error.UnsupportedTranslationNode,
+        .if_expr => |if_expr| {
+            try validateExpr(if_expr.cond.*);
+            try validateExpr(if_expr.then_body.*);
+            if (if_expr.else_body) |else_body| try validateExpr(else_body.*);
+        },
+        .while_expr => |while_expr| {
+            try validateExpr(while_expr.cond.*);
+            if (while_expr.continue_expr) |continue_expr| try validateExpr(continue_expr.*);
+            if (while_expr.captures) |captures| for (captures) |capture| try validateName(capture);
+            try validateBlock(while_expr.body);
+            if (while_expr.else_body) |else_body| try validateExpr(else_body.*);
+        },
+        .for_expr => |for_expr| {
+            if (for_expr.inputs.len == 0 or for_expr.captures.len == 0) {
+                return error.EmptyTranslatedBody;
+            }
+            for (for_expr.inputs) |input| try validateExpr(input);
+            for (for_expr.captures) |capture| try validateName(capture);
+            try validateBlock(for_expr.body);
+            if (for_expr.else_body) |else_body| try validateExpr(else_body.*);
+        },
+        .range => |range| {
+            try validateExpr(range.start.*);
+            if (range.end) |end| try validateExpr(end.*);
+        },
+        .return_expr => |value| if (value) |expr_ptr| try validateExpr(expr_ptr.*),
+        .break_expr => |value| if (value) |expr_ptr| try validateExpr(expr_ptr.*),
+        .continue_expr => {},
+    }
+}
+
+fn validateDecl(decl: Decl) ValidationError!void {
+    switch (decl) {
+        .comment => {},
+        .const_decl => |const_decl| {
+            try validateName(const_decl.name);
+            if (const_decl.ty) |ty| try validateType(ty);
+            try validateExpr(const_decl.init);
+        },
+        .var_decl => |var_decl| {
+            try validateName(var_decl.name);
+            if (var_decl.ty) |ty| try validateType(ty);
+            try validateExpr(var_decl.init);
+        },
+        .fn_decl => |fn_decl| {
+            try validateName(fn_decl.name);
+            if (fn_decl.body == null) return error.EmptyTranslatedFunction;
+            if (fn_decl.body.?.stmts.len == 0 and fn_decl.body.?.expr == null) {
+                return error.EmptyTranslatedBody;
+            }
+            for (fn_decl.params) |param| {
+                try validateName(param.name);
+                try validateType(param.ty);
+            }
+            for (fn_decl.generic_params) |param| {
+                try validateName(param.name);
+                if (param.ty) |ty| try validateType(ty);
+            }
+            try validateType(fn_decl.ret_type);
+            try validateBlock(fn_decl.body.?);
+        },
+        .struct_decl => |struct_decl| {
+            try validateName(struct_decl.name);
+            if (struct_decl.fields.len == 0 and struct_decl.decls.len == 0) {
+                return error.EmptyTranslatedContainer;
+            }
+            for (struct_decl.fields) |field| {
+                try validateFieldName(field.name);
+                try validateType(field.ty);
+                if (field.default_val) |value| try validateExpr(value.*);
+            }
+            for (struct_decl.generic_params) |param| {
+                try validateName(param.name);
+                if (param.ty) |ty| try validateType(ty);
+            }
+            for (struct_decl.decls) |inner| try validateDecl(inner);
+        },
+        .enum_decl => |enum_decl| {
+            try validateName(enum_decl.name);
+            if (enum_decl.variants.len == 0 and enum_decl.decls.len == 0) {
+                return error.EmptyTranslatedContainer;
+            }
+            if (enum_decl.tag_type) |tag_type| try validateType(tag_type);
+            for (enum_decl.variants) |variant| {
+                try validateName(variant.name);
+                if (variant.value) |value| try validateExpr(value.*);
+            }
+            for (enum_decl.decls) |inner| try validateDecl(inner);
+        },
+        .union_decl => |union_decl| {
+            try validateName(union_decl.name);
+            if (union_decl.fields.len == 0 and union_decl.decls.len == 0) {
+                return error.EmptyTranslatedContainer;
+            }
+            if (union_decl.tag_type) |tag_type| try validateType(tag_type);
+            for (union_decl.fields) |field| {
+                try validateName(field.name);
+                try validateType(field.ty);
+            }
+            for (union_decl.decls) |inner| try validateDecl(inner);
+        },
+    }
+}
+
+pub fn validateFileForTranslation(file: *const File) ValidationError!void {
+    try validateFilePath(file.path);
+    var has_std = false;
+    for (file.imports) |import| {
+        try validateName(import.local_name);
+        if (import.module_or_path.len == 0) return error.InvalidIdentifier;
+        if (std.mem.eql(u8, import.local_name, "std") and
+            std.mem.eql(u8, import.module_or_path, "std"))
+        {
+            has_std = true;
+        }
+    }
+    if (file.tests.len > 0 and !has_std) return error.MissingStdImport;
+    for (file.decls) |decl| try validateDecl(decl);
+    for (file.tests) |test_decl| {
+        if (test_decl.name.len == 0) return error.InvalidIdentifier;
+        try validateBlock(test_decl.body);
+    }
+}
+
+pub fn validateForTranslation(pkg: *const Package) ValidationError!void {
+    try validatePackageName(pkg.name);
+    if (pkg.fingerprint == null) return error.MissingFingerprint;
+
+    var root_count: usize = 0;
+    for (pkg.files, 0..) |file, index| {
+        try validateFileForTranslation(&file);
+        if (std.mem.eql(u8, file.path, "src/root.zig")) root_count += 1;
+        for (pkg.files[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, file.path, other.path)) return error.DuplicateFilePath;
+        }
+    }
+    if (root_count != 1) return error.MissingRootFile;
+    if (normalizedNameEqual(pkg.name, "r2z-core")) {
+        return error.DuplicateDependencyName;
+    }
+    for (pkg.zon_deps, 0..) |dependency, index| {
+        if (!isIdentifier(dependency.name)) return error.InvalidDependencyName;
+        if (normalizedNameEqual(pkg.name, dependency.name)) {
+            return error.DuplicateDependencyName;
+        }
+        if (dependency.path) |path| {
+            if (path.len == 0 or !validManifestString(path)) {
+                return error.DependencySourceUnavailable;
+            }
+        } else {
+            if (dependency.url.len == 0 or dependency.hash.len == 0) {
+                return error.DependencySourceUnavailable;
+            }
+            if (!validManifestString(dependency.url) or !validManifestString(dependency.hash)) {
+                return error.DependencySourceUnavailable;
+            }
+        }
+        for (pkg.zon_deps[index + 1 ..]) |other| {
+            if (normalizedNameEqual(dependency.name, other.name)) {
+                return error.DuplicateDependencyName;
+            }
+        }
+    }
+}
+
+test "ast validation: distinguishes zero tests from empty test bodies" {
+    const no_tests: File = .{ .path = "src/root.zig" };
+    try validateFileForTranslation(&no_tests);
+
+    const empty_test: File = .{
+        .path = "src/root.zig",
+        .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+        .tests = &.{.{ .name = "empty", .body = .{} }},
+    };
+    try std.testing.expectError(error.EmptyTranslatedBody, validateFileForTranslation(&empty_test));
+}
+
+test "ast validation: rejects missing std import for generated tests" {
+    const file: File = .{
+        .path = "src/root.zig",
+        .tests = &.{.{ .name = "test", .body = .{ .expr = &Expr{ .continue_expr = {} } } }},
+    };
+    try std.testing.expectError(error.MissingStdImport, validateFileForTranslation(&file));
+}
+
+test "ast validation: rejects empty functions, containers, match selectors, and typed literals" {
+    const empty_fn: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "empty",
+            .ret_type = .{ .void_type = {} },
+            .body = .{},
+        } }},
+    };
+    try std.testing.expectError(error.EmptyTranslatedBody, validateFileForTranslation(&empty_fn));
+
+    const empty_container: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .struct_decl = .{ .name = "Empty" } }},
+    };
+    try std.testing.expectError(
+        error.EmptyTranslatedContainer,
+        validateFileForTranslation(&empty_container),
+    );
+
+    const unnamed_match: Expr = .{ .match_expr = .{
+        .target = &Expr{ .ident = "value" },
+        .arms = &.{.{ .patterns = &.{.{ .struct_pat = .{} }}, .body = .{ .continue_expr = {} } }},
+    } };
+    try std.testing.expectError(error.UnnamedMatchSelector, validateExpr(unnamed_match));
+
+    const untyped_literal: Expr = .{ .struct_init = .{
+        .fields = &.{.{ .name = "value", .expr = .{ .lit = .{ .int = 1 } } }},
+    } };
+    try std.testing.expectError(
+        error.MissingTypedLiteralIdentity,
+        validateExpr(untyped_literal),
+    );
+
+    const untyped_array: Expr = .{ .multi_array = .{
+        .elements = &.{.{ .lit = .{ .int = 1 } }},
+    } };
+    try std.testing.expectError(
+        error.MissingTypedLiteralIdentity,
+        validateExpr(untyped_array),
+    );
+}
+
+test "ast validation: accepts defer and errdefer calls at file and package boundaries" {
+    const release_call: Expr = .{ .call = .{
+        .callee = &Expr{ .ident = "release" },
+    } };
+    const rollback_call: Expr = .{ .call = .{
+        .callee = &Expr{ .ident = "rollback" },
+    } };
+    const normal_cleanup: Stmt = .{ .defer_stmt = .{ .expr = release_call } };
+    const error_cleanup: Stmt = .{
+        .defer_stmt = .{
+            .expr = rollback_call,
+            .is_errdefer = true,
+        },
+    };
+    try std.testing.expect(!normal_cleanup.defer_stmt.is_errdefer);
+    try std.testing.expect(error_cleanup.defer_stmt.is_errdefer);
+
+    const file: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "work",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .stmts = &.{ normal_cleanup, error_cleanup } },
+        } }},
+    };
+    try validateFileForTranslation(&file);
+
+    const pkg: Package = .{
+        .name = "cleanup_contract",
+        .fingerprint = 0x1234,
+        .files = &.{file},
+    };
+    try validateForTranslation(&pkg);
+}
+
+test "ast validation: rejects malformed defer and errdefer cleanup expressions" {
+    const malformed_cleanup: Expr = .{ .unsupported = "invalid cleanup" };
+    const malformed_defer: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "malformed_defer",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .stmts = &.{.{
+                .defer_stmt = .{ .expr = malformed_cleanup },
+            }} },
+        } }},
+    };
+    try std.testing.expectError(
+        error.UnsupportedTranslationNode,
+        validateFileForTranslation(&malformed_defer),
+    );
+
+    const malformed_errdefer: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "malformed_errdefer",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .stmts = &.{.{
+                .defer_stmt = .{
+                    .expr = malformed_cleanup,
+                    .is_errdefer = true,
+                },
+            }} },
+        } }},
+    };
+    try std.testing.expectError(
+        error.UnsupportedTranslationNode,
+        validateFileForTranslation(&malformed_errdefer),
+    );
+}
+
+test "ast validation: accepts numeric tuple fields and rejects invalid names" {
+    const numeric_tuple: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .struct_decl = .{
+            .name = "Pair",
+            .fields = &.{
+                .{ .name = "0", .ty = .{ .prim = .u8 } },
+                .{ .name = "1", .ty = .{ .prim = .u8 } },
+            },
+        } }},
+    };
+    try validateFileForTranslation(&numeric_tuple);
+
+    const invalid_field: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .struct_decl = .{
+            .name = "Pair",
+            .fields = &.{.{ .name = "0x", .ty = .{ .prim = .u8 } }},
+        } }},
+    };
+    try std.testing.expectError(
+        error.InvalidIdentifier,
+        validateFileForTranslation(&invalid_field),
+    );
+
+    const empty_field: File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .struct_decl = .{
+            .name = "Pair",
+            .fields = &.{.{ .name = "", .ty = .{ .prim = .u8 } }},
+        } }},
+    };
+    try std.testing.expectError(
+        error.InvalidIdentifier,
+        validateFileForTranslation(&empty_field),
+    );
+}
 
 test "ast: instantiate AST DOM shapes" {
     const u8_ty: Type = .{ .prim = .u8 };

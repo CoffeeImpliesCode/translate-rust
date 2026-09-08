@@ -10,6 +10,13 @@ fn emitFile(a: std.mem.Allocator, file: ast.File) ![]const u8 {
     return emit.emitFile(a, &file);
 }
 
+fn emitExpression(a: std.mem.Allocator, expression: ast.Expr) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    try emit.emitExpr(a, &buf, expression, 0);
+    return buf.toOwnedSlice(a);
+}
+
 test "emitFile: emits imports, struct with fields and methods" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -310,4 +317,199 @@ test "emitType: unsupported type name is a valid Zig type" {
 
     try emit.emitType(std.testing.allocator, &buf, .{ .named = "unsupported type" });
     try std.testing.expectEqualStrings("anyopaque", buf.items);
+}
+
+test "emitExpr: destructuring match uses ordinary fresh names and direct captures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const expression: ast.Expr = .{ .match_expr = .{
+        .target = &ast.Expr{ .ident = "input" },
+        .arms = &.{
+            .{
+                .patterns = &.{.{ .struct_pat = .{
+                    .name = "pair",
+                    .fields = &.{
+                        .{ .name = "left", .pat = .{ .binding = "left" } },
+                        .{ .name = "right", .pat = .{ .binding = "right" } },
+                    },
+                } }},
+                .body = .{ .bin_op = .{
+                    .op = .add,
+                    .lhs = &ast.Expr{ .ident = "left" },
+                    .rhs = &ast.Expr{ .ident = "right" },
+                } },
+            },
+            .{
+                .patterns = &.{.{ .struct_pat = .{
+                    .name = "one",
+                    .fields = &.{.{
+                        .name = "0",
+                        .pat = .{ .binding = "value" },
+                    }},
+                } }},
+                .body = .{ .ident = "value" },
+            },
+            .{
+                .patterns = &.{.{ .struct_pat = .{
+                    .name = "broken",
+                    .fields = &.{
+                        .{ .name = "left", .pat = .{ .binding = "left" } },
+                        .{ .name = "right", .pat = .{ .binding = "right" } },
+                    },
+                } }},
+                .body = .{ .unsupported = "broken arm" },
+            },
+            .{
+                .patterns = &.{.{ .binding = "whole" }},
+                .body = .{ .ident = "whole" },
+            },
+        },
+    } };
+
+    const out = try emitExpression(a, expression);
+    const expected =
+        "switch (input) {\n" ++
+        "    .pair => |__r2z_match_payload| __r2z_match_arm: {\n" ++
+        "        const left = __r2z_match_payload.left;\n" ++
+        "        const right = __r2z_match_payload.right;\n" ++
+        "        break :__r2z_match_arm (left + right);\n" ++
+        "    },\n" ++
+        "    .one => |value| value,\n" ++
+        "    .broken => @panic(\"unsupported: broken arm\"),\n" ++
+        "    else => |whole| whole,\n" ++
+        "}";
+    try std.testing.expectEqualStrings(expected, out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@\"match payload\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@\"match arm\"") == null);
+}
+
+test "emitExpr: match fresh names skip source identifiers bindings and labels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const expression: ast.Expr = .{ .match_expr = .{
+        .target = &ast.Expr{ .ident = "__r2z_match_payload" },
+        .arms = &.{.{
+            .patterns = &.{.{ .struct_pat = .{
+                .name = "pair",
+                .fields = &.{
+                    .{
+                        .name = "left",
+                        .pat = .{ .binding = "__r2z_match_arm" },
+                    },
+                    .{
+                        .name = "right",
+                        .pat = .{ .binding = "__r2z_match_arm_1" },
+                    },
+                },
+            } }},
+            .body = .{ .block = .{
+                .label = "__r2z_match_arm",
+                .expr = &ast.Expr{ .block = .{
+                    .label = "__r2z_match_arm_1",
+                    .expr = &ast.Expr{ .bin_op = .{
+                        .op = .add,
+                        .lhs = &ast.Expr{ .ident = "__r2z_match_payload" },
+                        .rhs = &ast.Expr{ .ident = "__r2z_match_payload_1" },
+                    } },
+                } },
+            } },
+        }},
+    } };
+
+    const out = try emitExpression(a, expression);
+    const expected =
+        "switch (__r2z_match_payload) {\n" ++
+        "    .pair => |__r2z_match_payload_2| __r2z_match_arm_2: {\n" ++
+        "        const __r2z_match_arm = __r2z_match_payload_2.left;\n" ++
+        "        const __r2z_match_arm_1 = __r2z_match_payload_2.right;\n" ++
+        "        break :__r2z_match_arm_2 __r2z_match_arm: {\n" ++
+        "            break :__r2z_match_arm __r2z_match_arm_1: {\n" ++
+        "                break :__r2z_match_arm_1 " ++
+        "(__r2z_match_payload + __r2z_match_payload_1);\n" ++
+        "            };\n" ++
+        "        };\n" ++
+        "    },\n" ++
+        "}";
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "emitExpr: nested repeated destructuring names follow source order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const expression: ast.Expr = .{ .match_expr = .{
+        .target = &ast.Expr{ .ident = "outer" },
+        .arms = &.{.{
+            .patterns = &.{.{ .struct_pat = .{
+                .name = "outer",
+                .fields = &.{
+                    .{ .name = "nested", .pat = .{ .binding = "nested" } },
+                    .{ .name = "fallback", .pat = .{ .binding = "fallback" } },
+                },
+            } }},
+            .body = .{ .match_expr = .{
+                .target = &ast.Expr{ .ident = "nested" },
+                .arms = &.{
+                    .{
+                        .patterns = &.{.{ .struct_pat = .{
+                            .name = "first",
+                            .fields = &.{
+                                .{ .name = "a", .pat = .{ .binding = "a" } },
+                                .{ .name = "b", .pat = .{ .binding = "b" } },
+                            },
+                        } }},
+                        .body = .{ .bin_op = .{
+                            .op = .add,
+                            .lhs = &ast.Expr{ .ident = "a" },
+                            .rhs = &ast.Expr{ .ident = "b" },
+                        } },
+                    },
+                    .{
+                        .patterns = &.{.{ .struct_pat = .{
+                            .name = "second",
+                            .fields = &.{
+                                .{ .name = "c", .pat = .{ .binding = "c" } },
+                                .{ .name = "d", .pat = .{ .binding = "d" } },
+                            },
+                        } }},
+                        .body = .{ .bin_op = .{
+                            .op = .add,
+                            .lhs = &ast.Expr{ .ident = "c" },
+                            .rhs = &ast.Expr{ .ident = "d" },
+                        } },
+                    },
+                },
+            } },
+        }},
+    } };
+
+    const first = try emitExpression(a, expression);
+    const second = try emitExpression(a, expression);
+    try std.testing.expectEqualStrings(first, second);
+
+    const expected =
+        "switch (outer) {\n" ++
+        "    .outer => |__r2z_match_payload| __r2z_match_arm: {\n" ++
+        "        const nested = __r2z_match_payload.nested;\n" ++
+        "        const fallback = __r2z_match_payload.fallback;\n" ++
+        "        break :__r2z_match_arm switch (nested) {\n" ++
+        "            .first => |__r2z_match_payload_1| __r2z_match_arm_1: {\n" ++
+        "                const a = __r2z_match_payload_1.a;\n" ++
+        "                const b = __r2z_match_payload_1.b;\n" ++
+        "                break :__r2z_match_arm_1 (a + b);\n" ++
+        "            },\n" ++
+        "            .second => |__r2z_match_payload_2| __r2z_match_arm_2: {\n" ++
+        "                const c = __r2z_match_payload_2.c;\n" ++
+        "                const d = __r2z_match_payload_2.d;\n" ++
+        "                break :__r2z_match_arm_2 (c + d);\n" ++
+        "            },\n" ++
+        "        };\n" ++
+        "    },\n" ++
+        "}";
+    try std.testing.expectEqualStrings(expected, first);
 }

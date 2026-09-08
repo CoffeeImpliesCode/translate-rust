@@ -62,12 +62,14 @@ pub const Gen = struct {
     edges: std.ArrayListUnmanaged(Edge) = .empty,
     classes: std.AutoHashMapUnmanaged(exprs.NodeId, Class) = .empty,
     instantiations: std.AutoHashMapUnmanaged(exprs.NodeId, types.Instantiation) = .empty,
+    invalid_casts: std.ArrayListUnmanaged(exprs.NodeId) = .empty,
 
     pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
         self.pins.deinit(alloc);
         self.edges.deinit(alloc);
         self.classes.deinit(alloc);
         deinitInstantiationMap(alloc, &self.instantiations);
+        self.invalid_casts.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -202,6 +204,22 @@ pub fn substType(
             bx_ptr.* = sub_inner;
             return .{ .boxed = bx_ptr };
         },
+        .external_nominal => |external| {
+            var changed = false;
+            const sub_args = try alloc.alloc(types.Type, external.args.len);
+            for (external.args, 0..) |arg, i| {
+                sub_args[i] = try substType(alloc, arg, param_names, args);
+                if (!typeEqual(sub_args[i], arg)) changed = true;
+            }
+            if (!changed) {
+                alloc.free(sub_args);
+                return t;
+            }
+            return .{ .external_nominal = .{
+                .path = external.path,
+                .args = sub_args,
+            } };
+        },
         .generic_inst => |gi| {
             var changed = false;
             const sub_args = try alloc.alloc(types.Type, gi.args.params.len);
@@ -269,6 +287,21 @@ fn matchGenericType(
             if (p.segments.len != other.segments.len) return false;
             for (p.segments, other.segments) |left, right| {
                 if (!std.mem.eql(u8, left.name, right.name)) return false;
+            }
+            return true;
+        },
+        .external_nominal => |external| {
+            const other = actual_ty.external_nominal;
+            if (external.path.len != other.path.len or
+                external.args.len != other.args.len)
+            {
+                return false;
+            }
+            for (external.path, other.path) |left, right| {
+                if (!std.mem.eql(u8, left, right)) return false;
+            }
+            for (external.args, other.args) |left, right| {
+                if (!matchGenericType(left, right, param_names, inferred_args)) return false;
             }
             return true;
         },
@@ -431,6 +464,21 @@ fn typeEqual(a: types.Type, b: types.Type) bool {
             if (p.segments.len != other.segments.len) return false;
             for (p.segments, other.segments) |left, right| {
                 if (!std.mem.eql(u8, left.name, right.name)) return false;
+            }
+            return true;
+        },
+        .external_nominal => |external| {
+            const other = b.external_nominal;
+            if (external.path.len != other.path.len or
+                external.args.len != other.args.len)
+            {
+                return false;
+            }
+            for (external.path, other.path) |left, right| {
+                if (!std.mem.eql(u8, left, right)) return false;
+            }
+            for (external.args, other.args) |left, right| {
+                if (!typeEqual(left, right)) return false;
             }
             return true;
         },
@@ -623,6 +671,9 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
     std.debug.assert(bin.rhs < ctx.b.exprs.len);
     try walkExpr(ctx, bin.lhs, fn_body);
     try walkExpr(ctx, bin.rhs, fn_body);
+    if (ctx.b.exprs[node].ty) |type_id| {
+        try addPin(ctx, node, type_id);
+    }
     switch (bin.op) {
         .add,
         .sub,
@@ -690,7 +741,7 @@ fn walkMatch(ctx: *Ctx, node: exprs.NodeId, m: exprs.MatchExpr, fn_body: exprs.N
     std.debug.assert(m.scrutinee < ctx.b.exprs.len);
     try walkExpr(ctx, m.scrutinee, fn_body);
     for (m.arms) |arm| {
-        for (arm.patterns) |pattern| try bindPattern(ctx, pattern, null);
+        for (arm.patterns) |pattern| try bindMatchPattern(ctx, pattern);
         if (arm.guard) |guard| try walkExpr(ctx, guard, fn_body);
         try addEq(ctx, node, arm.body);
         try walkExpr(ctx, arm.body, fn_body);
@@ -704,6 +755,7 @@ fn bindPattern(
     ctx: *Ctx,
     pattern_id: exprs.NodeId,
     init: ?exprs.NodeId,
+    known_ty: ?types.Type,
 ) std.mem.Allocator.Error!void {
     if (pattern_id >= ctx.b.pats.len) return;
     switch (ctx.b.pats[pattern_id].kind) {
@@ -712,21 +764,38 @@ fn bindPattern(
                 if (ctx.cg == null) break :blk @as(?exprs.DefId, @intCast(pattern_id));
                 break :blk null;
             };
-            if (init) |init_node| {
-                if (def_id) |def| try ctx.def_map.put(ctx.alloc, def, init_node);
+            if (def_id) |def| {
+                if (init) |init_node| try ctx.def_map.put(ctx.alloc, def, init_node);
+                if (known_ty) |ty| try ctx.local_types.put(ctx.alloc, def, ty);
             }
         },
         .tuple => |tuple| {
-            for (tuple.elements) |element| try bindPattern(ctx, element, init);
+            for (tuple.elements, 0..) |element, index| {
+                const element_ty: ?types.Type = if (known_ty) |ty| switch (ty) {
+                    .tuple => |elements| if (index < elements.len) elements[index] else null,
+                    else => null,
+                } else null;
+                try bindPattern(ctx, element, init, element_ty);
+            }
         },
         .slice => |slice| {
-            for (slice.elements) |element| try bindPattern(ctx, element, init);
-            if (slice.rest) |rest| try bindPattern(ctx, rest, init);
+            const element_ty: ?types.Type = if (known_ty) |ty| switch (ty) {
+                .slice => |value| value.elem,
+                .array => |value| value.elem,
+                .reference => |value| switch (value.pointee) {
+                    .slice => |slice_ty| slice_ty.elem,
+                    .array => |array_ty| array_ty.elem,
+                    else => null,
+                },
+                else => null,
+            } else null;
+            for (slice.elements) |element| try bindPattern(ctx, element, init, element_ty);
+            if (slice.rest) |rest| try bindPattern(ctx, rest, init, known_ty);
         },
         .struct_pat => |struct_pat| {
             for (struct_pat.fields) |field| {
                 if (field.pat) |field_pattern| {
-                    try bindPattern(ctx, field_pattern, init);
+                    try bindPattern(ctx, field_pattern, init, null);
                 } else if (field.shorthand) {
                     const def_id = ctx.claimLocal(field.field);
                     if (init) |init_node| {
@@ -735,14 +804,86 @@ fn bindPattern(
                 }
             }
         },
-        .reference => |reference| try bindPattern(ctx, reference.inner, init),
+        .reference => |reference| {
+            const inner_ty = if (known_ty) |ty| switch (ty) {
+                .reference => |matched| matched.pointee,
+                else => ty,
+            } else null;
+            try bindPattern(ctx, reference.inner, init, inner_ty);
+        },
         .@"or" => |or_pattern| {
             for (or_pattern.alternatives) |alternative| {
-                try bindPattern(ctx, alternative, init);
+                try bindPattern(ctx, alternative, init, known_ty);
             }
         },
         .unsupported => {},
         .wildcard, .literal, .path, .range => {},
+    }
+}
+
+/// Bind a match-arm capture to its enum-variant field type.
+fn bindMatchPattern(ctx: *Ctx, pattern_id: exprs.NodeId) std.mem.Allocator.Error!void {
+    if (pattern_id >= ctx.b.pats.len) return;
+    const pattern = ctx.b.pats[pattern_id];
+    switch (pattern.kind) {
+        .binding => |binding| {
+            _ = ctx.claimLocal(binding.name);
+        },
+        .struct_pat => |struct_pat| {
+            const cg = ctx.cg orelse return;
+            const variant = cg.symbol_table.get(struct_pat.def) orelse return;
+            if (variant.kind != .variant) return;
+            const enum_id = variant.parent orelse return;
+            if (enum_id >= ctx.b.bodies.len) return;
+            const enum_body = switch (ctx.b.bodies[enum_id]) {
+                .enum_ => |body| body,
+                else => return,
+            };
+            const fields = for (enum_body.variants) |candidate| {
+                if (std.mem.eql(u8, candidate.name, variant.name)) break candidate.fields;
+            } else return;
+            for (struct_pat.fields) |field| {
+                const field_ty: ?types.Type = switch (fields) {
+                    .tuple => |tuple| blk: {
+                        const index = std.fmt.parseInt(usize, field.field, 10) catch break :blk null;
+                        if (index >= tuple.len) break :blk null;
+                        break :blk tuple[index];
+                    },
+                    .named => |named| blk: {
+                        for (named) |candidate| {
+                            if (std.mem.eql(u8, candidate.name, field.field)) break :blk candidate.ty;
+                        }
+                        break :blk null;
+                    },
+                    .none => null,
+                };
+                if (field.pat) |field_pattern| {
+                    try bindMatchPatternType(ctx, field_pattern, field_ty);
+                } else if (field.shorthand) {
+                    if (field_ty) |ty| {
+                        if (ctx.claimLocal(field.field)) |def| try ctx.local_types.put(ctx.alloc, def, ty);
+                    } else {
+                        _ = ctx.claimLocal(field.field);
+                    }
+                }
+            }
+        },
+        .tuple => |tuple| for (tuple.elements) |element| try bindMatchPattern(ctx, element),
+        .reference => |reference| try bindMatchPattern(ctx, reference.inner),
+        .@"or" => |or_pattern| for (or_pattern.alternatives) |alternative| try bindMatchPattern(ctx, alternative),
+        .wildcard, .literal, .path, .slice, .range, .unsupported => {},
+    }
+}
+
+fn bindMatchPatternType(ctx: *Ctx, pattern_id: exprs.NodeId, ty: ?types.Type) std.mem.Allocator.Error!void {
+    if (pattern_id >= ctx.b.pats.len) return;
+    switch (ctx.b.pats[pattern_id].kind) {
+        .binding => |binding| {
+            if (ctx.claimLocal(binding.name)) |def| {
+                if (ty) |known| try ctx.local_types.put(ctx.alloc, def, known);
+            }
+        },
+        else => try bindMatchPattern(ctx, pattern_id),
     }
 }
 
@@ -755,14 +896,16 @@ fn walkStmt(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             if (ls.init) |init| {
                 if (ls.ty) |ty| try addPin(ctx, init, ty);
                 try walkExpr(ctx, init, fn_body);
-                try bindPattern(ctx, ls.pattern, init);
+                const known_ty = getKnownType(ctx, init);
+                try bindPattern(ctx, ls.pattern, init, known_ty);
             } else {
-                try bindPattern(ctx, ls.pattern, null);
+                try bindPattern(ctx, ls.pattern, null, null);
             }
         },
         .let_else => |le| {
             try walkExpr(ctx, le.init, fn_body);
-            try bindPattern(ctx, le.pattern, le.init);
+            const known_ty = getKnownType(ctx, le.init);
+            try bindPattern(ctx, le.pattern, le.init, known_ty);
             try walkBlock(ctx, le.else_block, fn_body, null);
         },
         .expr => |n| try walkExpr(ctx, n, fn_body),
@@ -777,6 +920,28 @@ fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?
     if (blk.tail) |t| {
         if (blk_node) |bn| try addEq(ctx, bn, t);
         try walkExpr(ctx, t, fn_body);
+    }
+}
+
+fn walkClosure(ctx: *Ctx, closure: exprs.ClosureExpr, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
+    for (closure.params) |param| try bindPattern(ctx, param, null, null);
+    try walkBlock(ctx, closure.body, fn_body, null);
+}
+
+fn walkIteratorChain(
+    ctx: *Ctx,
+    chain: exprs.IteratorChainExpr,
+    fn_body: exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    try walkExpr(ctx, chain.source, fn_body);
+    for (chain.adapters) |adapter| {
+        switch (adapter) {
+            .map => |map| try walkClosure(ctx, map.closure, fn_body),
+            .filter => |filter| try walkClosure(ctx, filter.closure, fn_body),
+            .flat_map => |closure| try walkClosure(ctx, closure, fn_body),
+            .enumerate, .range_rev, .other => {},
+            .zip => |zip| try walkExpr(ctx, zip.other, fn_body),
+        }
     }
 }
 
@@ -850,6 +1015,11 @@ fn collectTypeParamNamesFromType(
                 }
             }
         },
+        .external_nominal => |external| {
+            for (external.args) |arg| {
+                try collectTypeParamNamesFromType(alloc, b, buf, arg);
+            }
+        },
         .reference => |r| try collectTypeParamNamesFromType(alloc, b, buf, r.pointee),
         .raw_ptr => |rp| try collectTypeParamNamesFromType(alloc, b, buf, rp.pointee),
         .slice => |s| try collectTypeParamNamesFromType(alloc, b, buf, s.elem),
@@ -919,6 +1089,35 @@ fn getGenericParamNames(
     return names;
 }
 
+fn isIntegerType(ty: types.Type) bool {
+    return switch (ty) {
+        .prim => |primitive| switch (primitive) {
+            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => true,
+            .f32, .f64, .bool, .char, .unit, .never => false,
+        },
+        else => false,
+    };
+}
+
+fn isLenReceiverType(ty: types.Type) bool {
+    return switch (ty) {
+        .slice, .array => true,
+        .reference => |reference| switch (reference.pointee) {
+            .slice, .array => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+fn indexedElementType(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .array => |array| array.elem,
+        .slice => |slice| slice.elem,
+        .reference => |reference| indexedElementType(reference.pointee),
+        else => null,
+    };
+}
+
 /// Derive a concrete Type for an argument expression node where possible.
 fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
     if (node >= ctx.b.exprs.len) return null;
@@ -936,13 +1135,51 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                 if (tid < ctx.b.types.len) return ctx.b.types[tid];
             }
             if (ctx.def_map.get(p.def)) |first| {
-                if (first < ctx.b.exprs.len) {
-                    if (ctx.b.exprs[first].ty) |tid| {
-                        if (tid < ctx.b.types.len) return ctx.b.types[tid];
-                    }
+                if (first != node and first < ctx.b.exprs.len) {
+                    return getKnownType(ctx, first);
                 }
             }
         },
+        .method_call => |method| {
+            if (getMethodName(ctx, method.method)) |method_name| {
+                if (std.mem.eql(u8, method_name, "len")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (isLenReceiverType(receiver_ty)) {
+                            return .{ .prim = .usize };
+                        }
+                    }
+                }
+            }
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
+            }
+        },
+        .binary => |binary| {
+            if (knownBinaryType(ctx, binary)) |known| return known;
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
+            }
+        },
+        .index => |index| {
+            if (getKnownType(ctx, index.base)) |base_type| {
+                if (indexedElementType(base_type)) |element_type| return element_type;
+            }
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
+            }
+            return null;
+        },
+        .unary => |unary| return switch (unary.op) {
+            .deref => if (getKnownType(ctx, unary.operand)) |operand_ty| switch (operand_ty) {
+                .reference => |reference| reference.pointee,
+                .raw_ptr => |raw_ptr| raw_ptr.pointee,
+                else => null,
+            } else null,
+            .negate, .bit_not => getKnownType(ctx, unary.operand),
+            .logical_not => @as(?types.Type, .{ .prim = .bool }),
+            .ref => null,
+        },
+        .cast => |cast| return if (cast.target < ctx.b.types.len) ctx.b.types[cast.target] else null,
         .literal => |lit| switch (lit) {
             .int => |il| {
                 if (il.ty_suffix) |s| {
@@ -969,6 +1206,148 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
     }
     return null;
 }
+fn knownBinaryType(ctx: *Ctx, binary: exprs.BinaryExpr) ?types.Type {
+    const lhs = getKnownType(ctx, binary.lhs) orelse return null;
+    const rhs = getKnownType(ctx, binary.rhs) orelse return null;
+    return switch (binary.op) {
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .rem,
+        .bit_and,
+        .bit_or,
+        .bit_xor,
+        => if (isScalarCastType(lhs) and isScalarCastType(rhs) and typeEqual(lhs, rhs)) lhs else null,
+        .shl, .shr => if (isScalarCastType(lhs) and isIntegerType(rhs)) lhs else null,
+        else => null,
+    };
+}
+fn isScalarCastType(ty: types.Type) bool {
+    return switch (ty) {
+        .prim => |primitive| switch (primitive) {
+            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize, .f32, .f64, .char => true,
+            .bool, .unit, .never => false,
+        },
+        else => false,
+    };
+}
+const ScalarPointeeLayout = enum {
+    byte_1,
+    byte_2,
+    byte_4,
+    byte_8,
+    byte_16,
+    pointer,
+};
+
+fn scalarPointeeLayout(primitive: types.Prim) ?ScalarPointeeLayout {
+    return switch (primitive) {
+        .i8, .u8, .bool => .byte_1,
+        .i16, .u16 => .byte_2,
+        .i32, .u32, .f32, .char => .byte_4,
+        .i64, .u64, .f64 => .byte_8,
+        .i128, .u128 => .byte_16,
+        .isize, .usize => .pointer,
+        .unit, .never => null,
+    };
+}
+
+fn pointerPointeesCompatible(source: types.Type, target: types.Type) bool {
+    return switch (source) {
+        .prim => |source_primitive| switch (target) {
+            .prim => |target_primitive| {
+                const source_layout = scalarPointeeLayout(source_primitive) orelse return false;
+                const target_layout = scalarPointeeLayout(target_primitive) orelse return false;
+                return source_layout == target_layout;
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn unsignedPrimitiveWidth(primitive: types.Prim) ?u16 {
+    return switch (primitive) {
+        .u8 => 8,
+        .u16 => 16,
+        .u32 => 32,
+        .u64 => 64,
+        .u128 => 128,
+        .usize => 64,
+        else => null,
+    };
+}
+
+fn isValidPrimitiveFrom(source: types.Type, target: types.Type) bool {
+    const source_primitive = switch (source) {
+        .prim => |primitive| primitive,
+        else => return false,
+    };
+    const target_primitive = switch (target) {
+        .prim => |primitive| primitive,
+        else => return false,
+    };
+    const source_width = unsignedPrimitiveWidth(source_primitive) orelse return false;
+    const target_width = unsignedPrimitiveWidth(target_primitive) orelse return false;
+    return source_width <= target_width;
+}
+
+fn isValidCast(
+    kind: exprs.ConversionKind,
+    source_type: types.Type,
+    target: types.Type,
+    operand_type: ?types.Type,
+) bool {
+    const known_source = operand_type orelse return false;
+    if (!typeEqual(source_type, known_source)) return false;
+    return switch (kind) {
+        .as_ => switch (target) {
+            .prim => isScalarCastType(source_type) and isScalarCastType(target),
+            .raw_ptr => |target_pointer| switch (source_type) {
+                .raw_ptr => |source_pointer| pointerPointeesCompatible(
+                    source_pointer.pointee,
+                    target_pointer.pointee,
+                ),
+                else => false,
+            },
+            else => false,
+        },
+        .primitive_from => isValidPrimitiveFrom(source_type, target),
+    };
+}
+
+fn loopElementType(ctx: *Ctx, iterable: exprs.NodeId, iter_kind: exprs.IterKind) ?types.Type {
+    if (iterable >= ctx.b.exprs.len) return null;
+    const iterable_source = switch (ctx.b.exprs[iterable].kind) {
+        .method_call => |method| method.receiver,
+        else => iterable,
+    };
+    const iterable_ty = getKnownType(ctx, iterable_source) orelse return null;
+    const element = switch (iterable_ty) {
+        .slice => |slice| slice.elem,
+        .array => |array| array.elem,
+        .reference => |reference| switch (reference.pointee) {
+            .slice => |slice| slice.elem,
+            .array => |array| array.elem,
+            else => return null,
+        },
+        else => return null,
+    };
+    if (switch (iterable_ty) {
+        .array => true,
+        else => false,
+    }) return element;
+    switch (iter_kind) {
+        .slice => {
+            const reference = ctx.alloc.create(types.Ref) catch return null;
+            reference.* = .{ .mut = false, .pointee = element };
+            return .{ .reference = reference };
+        },
+        else => return element,
+    }
+}
+
 /// Recover explicit concrete generic arguments carried by a resolved result
 /// type. The IR keeps path arguments directly on `PathExpr`; call and struct
 /// nodes have no separate callee-type field, so their lowered generic result
@@ -1373,6 +1752,19 @@ fn freeSubstitutedType(
             }
             if (changed) alloc.free(sub_generic_inst.args.params);
         },
+        .external_nominal => |external| {
+            const sub_external = switch (substituted) {
+                .external_nominal => |value| value,
+                else => return,
+            };
+            if (sub_external.args.len != external.args.len) return;
+            var changed = false;
+            for (external.args, sub_external.args) |original_arg, substituted_arg| {
+                freeSubstitutedType(alloc, original_arg, substituted_arg, param_names, args);
+                if (!typeEqual(original_arg, substituted_arg)) changed = true;
+            }
+            if (changed) alloc.free(sub_external.args);
+        },
         .prim, .path, .unsupported => {},
     }
 }
@@ -1383,6 +1775,12 @@ fn typeContainsParam(t: types.Type, param_names: []const []const u8) bool {
         .path => |p| {
             if (p.segments.len == 1) {
                 return isTypeParam(t, param_names) != null;
+            }
+            return false;
+        },
+        .external_nominal => |external| {
+            for (external.args) |arg| {
+                if (typeContainsParam(arg, param_names)) return true;
             }
             return false;
         },
@@ -1431,6 +1829,22 @@ fn walkPath(ctx: *Ctx, node: exprs.NodeId, p: exprs.PathExpr) std.mem.Allocator.
     }
 }
 
+/// Parse a valid assertion marker and return its referenced expression node.
+fn parseAssertionCondition(reason: []const u8, expr_count: usize) ?exprs.NodeId {
+    const prefix = "assertion:";
+    if (!std.mem.startsWith(u8, reason, prefix)) return null;
+
+    const suffix = reason[prefix.len..];
+    if (suffix.len == 0) return null;
+    for (suffix) |character| {
+        if (character < '0' or character > '9') return null;
+    }
+
+    const condition = std.fmt.parseInt(exprs.NodeId, suffix, 10) catch return null;
+    if (condition >= expr_count) return null;
+    return condition;
+}
+
 /// Recursively walk an expression node in the graph.
 fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
     if (node >= ctx.b.exprs.len) return;
@@ -1454,7 +1868,7 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .if_else => |ie| try walkIf(ctx, node, ie, fn_body),
         .if_let => |il| {
             try walkExpr(ctx, il.scrutinee, fn_body);
-            try bindPattern(ctx, il.pattern, null);
+            try bindPattern(ctx, il.pattern, null, null);
             try walkBlock(ctx, il.then_, fn_body, null);
             switch (il.@"else") {
                 .none => {},
@@ -1465,15 +1879,21 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .match => |m| try walkMatch(ctx, node, m, fn_body),
         .loop_ => |l| try walkBlock(ctx, l.body, fn_body, null),
         .while_ => |w| {
-            if (w.capture) |capture| try bindPattern(ctx, capture, null);
+            if (w.capture) |capture| try bindPattern(ctx, capture, null, null);
             if (ctx.boolId()) |bid| try addPin(ctx, w.cond, bid);
             try walkExpr(ctx, w.cond, fn_body);
             try walkBlock(ctx, w.body, fn_body, null);
         },
         .for_ => |f| {
-            try bindPattern(ctx, f.pattern, null);
             try walkExpr(ctx, f.iterable, fn_body);
+            const element_ty = loopElementType(ctx, f.iterable, f.iter_kind);
+            try bindPattern(ctx, f.pattern, null, element_ty);
             try walkBlock(ctx, f.body, fn_body, null);
+            switch (f.iter_kind) {
+                .range, .slice, .enumerate => {},
+                .multi => |ids| for (ids) |id| try walkExpr(ctx, id, fn_body),
+                .adapter => |chain| try walkIteratorChain(ctx, chain, fn_body),
+            }
         },
         .break_ => |br| {
             if (br.value) |v| try walkExpr(ctx, v, fn_body);
@@ -1499,6 +1919,30 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             try walkExpr(ctx, ix.base, fn_body);
             try walkExpr(ctx, ix.index, fn_body);
         },
+        .cast => |cast| {
+            try walkExpr(ctx, cast.operand, fn_body);
+            const source = getKnownType(ctx, cast.operand);
+            var source_type = cast.source_type;
+            if (source) |known_source| {
+                // CST lowering cannot know loop-capture types. Resolve the
+                // transient source after the local/pattern environment has
+                // been walked, then persist it on the cast itself.
+                if (std.meta.activeTag(source_type) == .unsupported) {
+                    @constCast(ctx.b.exprs)[node].kind.cast.source_type = known_source;
+                    source_type = known_source;
+                }
+            }
+            if (cast.target >= ctx.b.types.len) {
+                try ctx.g.invalid_casts.append(ctx.alloc, node);
+            } else {
+                const target = ctx.b.types[cast.target];
+                if (!isValidCast(cast.kind, source_type, target, source)) {
+                    try ctx.g.invalid_casts.append(ctx.alloc, node);
+                } else {
+                    try addPin(ctx, node, cast.target);
+                }
+            }
+        },
         .binary => |bin| try walkBinary(ctx, node, bin, fn_body),
         .unary => |u| {
             try walkExpr(ctx, u.operand, fn_body);
@@ -1510,7 +1954,14 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
                         try addPin(ctx, node, bid);
                     }
                 },
-                .deref, .ref => {},
+                .deref => {
+                    if (getKnownType(ctx, node)) |known| {
+                        if (findTypeIndex(ctx.b, known)) |type_id| {
+                            try addPin(ctx, node, type_id);
+                        }
+                    }
+                },
+                .ref => {},
             }
         },
         .assign => |a| {
@@ -1527,9 +1978,21 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
                 try addEq(ctx, node, v);
             }
         },
-        .closure, .iterator_chain, .unsupported => {},
+        .closure => |closure| try walkClosure(ctx, closure, fn_body),
+        .iterator_chain => |chain| try walkIteratorChain(ctx, chain, fn_body),
+        .unsupported => |unsupported| {
+            if (parseAssertionCondition(unsupported.reason, ctx.b.exprs.len)) |condition| {
+                if (condition != node) try walkExpr(ctx, condition, fn_body);
+            }
+        },
         .array => |a| for (a.elements) |el| try walkExpr(ctx, el, fn_body),
         .vec_lit => |vec| for (vec.elements) |el| try walkExpr(ctx, el, fn_body),
+        .range => |range| {
+            try walkExpr(ctx, range.start, fn_body);
+            try walkExpr(ctx, range.end, fn_body);
+            try addEq(ctx, node, range.start);
+            try addEq(ctx, node, range.end);
+        },
     }
 }
 
@@ -1559,10 +2022,14 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
 
     const m_name = getMethodName(ctx, m.method) orelse return;
 
-    // .len() -> usize
+    // .len() -> usize when the receiver has a slice/array shape.
     if (std.mem.eql(u8, m_name, "len")) {
-        if (primTypeId(ctx.b, .usize)) |uid| {
-            try addPin(ctx, node, uid);
+        if (getKnownType(ctx, m.receiver)) |receiver_ty| {
+            if (isLenReceiverType(receiver_ty)) {
+                if (primTypeId(ctx.b, .usize)) |uid| {
+                    try addPin(ctx, node, uid);
+                }
+            }
         }
         return;
     }
@@ -1774,7 +2241,8 @@ pub fn solveWithGen(
     alloc: std.mem.Allocator,
     b: *const bodies.Bodies,
     g: *const Gen,
-) std.mem.Allocator.Error!Inferred {
+) !Inferred {
+    if (g.invalid_casts.items.len > 0) return error.InvalidCast;
     const num_exprs = b.exprs.len;
     if (num_exprs == 0) {
         // Zero exprs: still hand over any recorded instantiations (rare no-body case).
@@ -1891,11 +2359,15 @@ pub fn solveWithGen(
 }
 
 /// Generate constraints and run full unification solver with defaults on `b`.
-pub fn solve(alloc: std.mem.Allocator, b: *const bodies.Bodies) std.mem.Allocator.Error!Inferred {
+pub fn solve(alloc: std.mem.Allocator, b: *const bodies.Bodies) !Inferred {
     return solveWithGraph(alloc, b, null);
 }
 
-pub fn solveWithGraph(alloc: std.mem.Allocator, b: *const bodies.Bodies, cg: ?*const graph.CrateGraph) std.mem.Allocator.Error!Inferred {
+pub fn solveWithGraph(
+    alloc: std.mem.Allocator,
+    b: *const bodies.Bodies,
+    cg: ?*const graph.CrateGraph,
+) !Inferred {
     std.debug.assert(b.exprs.len >= 0);
     var g = try genWithGraph(alloc, b, cg);
     defer g.deinit(alloc);
@@ -1911,6 +2383,263 @@ fn testPrimPath(alloc: std.mem.Allocator, name: []const u8) !types.Type {
 
 // Compile-time span reused across fixtures.
 const test_span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+const CastInferenceFixture = struct {
+    b: bodies.Bodies,
+    graph_store: graph.CrateGraph,
+    cast_id: exprs.NodeId,
+    expected_source: types.Type,
+    expected_kind: exprs.ConversionKind,
+};
+
+fn pendingCastSourceTypeForTest() types.Type {
+    return .{ .unsupported = .{
+        .reason = .iterators,
+        .message = "cast source type pending inference",
+        .span = test_span,
+    } };
+}
+
+fn makeCastInferenceFixture(
+    alloc: std.mem.Allocator,
+    source_primitive: types.Prim,
+    target_primitive: types.Prim,
+    indexed_source: bool,
+    conversion_kind: exprs.ConversionKind,
+) !CastInferenceFixture {
+    var graph_store = graph.CrateGraph.init(alloc);
+    errdefer graph_store.deinit();
+    const function_name = try alloc.dupe(u8, "primitive_cast");
+    const function_id = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = function_name,
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    std.debug.assert(function_id == 0);
+    const value_name = try alloc.dupe(u8, if (indexed_source) "bytes" else "value");
+    const value_id = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = value_name,
+        .span = test_span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    std.debug.assert(value_id == 1);
+
+    const type_count: usize = if (indexed_source) 3 else 2;
+    const types_store = try alloc.alloc(types.Type, type_count);
+    const source_type: types.Type = .{ .prim = source_primitive };
+    types_store[1] = .{ .prim = target_primitive };
+    var expected_source = source_type;
+    var parameter_type = source_type;
+    if (indexed_source) {
+        const slice = try alloc.create(types.Slice);
+        slice.* = .{ .const_ = true, .elem = source_type };
+        parameter_type = .{ .slice = slice };
+        types_store[0] = parameter_type;
+        types_store[2] = source_type;
+        expected_source = types_store[2];
+    } else {
+        types_store[0] = source_type;
+    }
+
+    const parameter_name: []const u8 = if (indexed_source) "bytes" else "value";
+    const params = try alloc.alloc(items.Param, 1);
+    params[0] = .{ .name = parameter_name, .ty = parameter_type, .span = test_span };
+
+    const expression_count: usize = if (indexed_source) 5 else 3;
+    const exprs_store = try alloc.alloc(exprs.Expr, expression_count);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .path = .{ .def = value_id, .generic_args = &.{} } },
+    };
+    var operand_id: exprs.NodeId = 0;
+    var cast_id: exprs.NodeId = 1;
+    var block_id: exprs.NodeId = 2;
+    if (indexed_source) {
+        exprs_store[1] = .{
+            .id = 1,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "0",
+                .value = 0,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        };
+        exprs_store[2] = .{
+            .id = 2,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .index = .{ .base = 0, .index = 1 } },
+        };
+        operand_id = 2;
+        cast_id = 3;
+        block_id = 4;
+    }
+    exprs_store[cast_id] = .{
+        .id = cast_id,
+        .span = test_span,
+        .ty = 1,
+        .kind = .{ .cast = .{
+            .kind = conversion_kind,
+            .operand = operand_id,
+            .source_type = pendingCastSourceTypeForTest(),
+            .target = 1,
+        } },
+    };
+    exprs_store[block_id] = .{
+        .id = block_id,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = null,
+            .labelled = null,
+        } },
+    };
+
+    const stmts_store = try alloc.alloc(exprs.Statement, 1);
+    stmts_store[0] = .{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .expr = cast_id },
+    };
+    const bodies_store = try alloc.alloc(bodies.BodyKind, 1);
+    bodies_store[0] = .{ .fn_ = .{
+        .params = params,
+        .ret = .{ .prim = .unit },
+        .body = block_id,
+    } };
+
+    return .{
+        .b = .{
+            .exprs = exprs_store,
+            .stmts = stmts_store,
+            .pats = &.{},
+            .types = types_store,
+            .bodies = bodies_store,
+        },
+        .graph_store = graph_store,
+        .cast_id = cast_id,
+        .expected_source = expected_source,
+        .expected_kind = conversion_kind,
+    };
+}
+
+fn expectAcceptedCastInference(
+    alloc: std.mem.Allocator,
+    fixture: *CastInferenceFixture,
+) !void {
+    var generated = try genWithGraph(alloc, &fixture.b, &fixture.graph_store);
+    defer generated.deinit(alloc);
+    const cast = fixture.b.exprs[fixture.cast_id].kind.cast;
+    try std.testing.expectEqual(fixture.expected_source, cast.source_type);
+    try std.testing.expectEqual(fixture.expected_kind, cast.kind);
+    try std.testing.expectEqual(@as(usize, 0), generated.invalid_casts.items.len);
+
+    var inferred = try solveWithGen(alloc, &fixture.b, &generated);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 1), inferred.getType(fixture.cast_id));
+}
+
+test "primitive_from accepts unsigned identity conversion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fixture = try makeCastInferenceFixture(
+        arena_state.allocator(),
+        .u64,
+        .u64,
+        false,
+        .primitive_from,
+    );
+    defer fixture.graph_store.deinit();
+    try expectAcceptedCastInference(arena_state.allocator(), &fixture);
+}
+
+test "primitive_from accepts unsigned widening conversion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fixture = try makeCastInferenceFixture(
+        arena_state.allocator(),
+        .u64,
+        .u128,
+        false,
+        .primitive_from,
+    );
+    defer fixture.graph_store.deinit();
+    try expectAcceptedCastInference(arena_state.allocator(), &fixture);
+}
+
+test "primitive_from accepts an index-derived u8 source" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fixture = try makeCastInferenceFixture(
+        arena_state.allocator(),
+        .u8,
+        .u64,
+        true,
+        .primitive_from,
+    );
+    defer fixture.graph_store.deinit();
+    try expectAcceptedCastInference(arena_state.allocator(), &fixture);
+}
+
+test "primitive_from rejects unsigned narrowing conversion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fixture = try makeCastInferenceFixture(
+        arena_state.allocator(),
+        .u64,
+        .u8,
+        false,
+        .primitive_from,
+    );
+    defer fixture.graph_store.deinit();
+
+    var generated = try genWithGraph(
+        arena_state.allocator(),
+        &fixture.b,
+        &fixture.graph_store,
+    );
+    defer generated.deinit(arena_state.allocator());
+    const cast = fixture.b.exprs[fixture.cast_id].kind.cast;
+    try std.testing.expectEqual(fixture.expected_source, cast.source_type);
+    try std.testing.expectEqual(fixture.expected_kind, cast.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated.invalid_casts.items.len);
+    try std.testing.expectError(
+        error.InvalidCast,
+        solveWithGen(arena_state.allocator(), &fixture.b, &generated),
+    );
+}
+
+test "explicit u128 as u64 remains accepted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fixture = try makeCastInferenceFixture(
+        arena_state.allocator(),
+        .u128,
+        .u64,
+        false,
+        .as_,
+    );
+    defer fixture.graph_store.deinit();
+    try expectAcceptedCastInference(arena_state.allocator(), &fixture);
+}
+
 test "generic PathExpr with type arguments records an instantiation" {
     const a = std.testing.allocator;
 
@@ -2217,4 +2946,507 @@ test "substType substitutes generic type parameters structurally" {
         a.destroy(subst.reference);
         break :init_heap;
     }
+}
+
+test "typed call let binding informs method receiver inference" {
+    const alloc = std.testing.allocator;
+    const slice_payload: types.Slice = .{
+        .const_ = true,
+        .elem = .{ .prim = .u8 },
+    };
+    const slice_ty: types.Type = .{ .slice = &slice_payload };
+    const types_store = [_]types.Type{
+        slice_ty,
+        .{ .prim = .u8 },
+        .{ .prim = .usize },
+        .{ .prim = .unit },
+    };
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = test_span,
+            .ty = 0,
+            .kind = .{ .call = .{
+                .call_kind = .{ .free = 99 },
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .path = .{
+                .def = 0,
+                .generic_args = &.{},
+            } },
+        },
+        .{
+            .id = 3,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 2,
+                .receiver_mode = .shared,
+                .method = 1,
+                .args = &.{},
+            } },
+        },
+    };
+    const pats_store = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "data",
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } },
+    }};
+    const stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .let = .{
+            .pattern = 0,
+            .init = 1,
+            .ty = null,
+        } },
+    }};
+    const methods = [_]bodies.StructMethod{.{
+        .name = "as_bytes",
+        .ret = slice_ty,
+        .body = 0,
+    }};
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 0,
+        } },
+        .{ .struct_ = .{ .methods = &methods } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var generated: Gen = .{};
+    defer generated.deinit(alloc);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .b = &b,
+        .g = &generated,
+    };
+    defer ctx.deinit();
+
+    try walkStmt(&ctx, 0, 0);
+    try std.testing.expectEqual(slice_ty, ctx.local_types.get(0).?);
+    try walkExpr(&ctx, 3, 0);
+
+    var receiver_pinned = false;
+    var method_result_pinned = false;
+    for (generated.pins.items) |pin| {
+        if (pin.node == 2 and pin.ty == 0) receiver_pinned = true;
+        if (pin.node == 3 and pin.ty == 0) method_result_pinned = true;
+    }
+    try std.testing.expect(receiver_pinned);
+    try std.testing.expect(method_result_pinned);
+}
+
+test "assertion markers walk valid equality conditions only" {
+    const alloc = std.testing.allocator;
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .unsupported = .{
+                .reason = "assertion:1",
+                .suggested_version = .v3,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .binary = .{
+                .op = .eq,
+                .overflow = .checked,
+                .lhs = 2,
+                .rhs = 3,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "1",
+                .value = 1,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 3,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "2",
+                .value = 2,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 4,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .unsupported = .{
+                .reason = "assertion:not-a-node",
+                .suggested_version = .v3,
+            } },
+        },
+        .{
+            .id = 5,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .unsupported = .{
+                .reason = "assertion:99",
+                .suggested_version = .v3,
+            } },
+        },
+        .{
+            .id = 6,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .unsupported = .{
+                .reason = "ordinary unsupported",
+                .suggested_version = .v3,
+            } },
+        },
+    };
+    const types_store = [_]types.Type{
+        .{ .prim = .bool },
+        .{ .prim = .i32 },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    var generated: Gen = .{};
+    defer generated.deinit(alloc);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .b = &b,
+        .g = &generated,
+    };
+    defer ctx.deinit();
+
+    try walkExpr(&ctx, 0, 0);
+    try std.testing.expectEqual(Class.integer, generated.classes.get(2).?);
+    try std.testing.expectEqual(Class.integer, generated.classes.get(3).?);
+    try std.testing.expectEqual(@as(usize, 2), generated.classes.count());
+    try std.testing.expectEqual(@as(usize, 1), generated.edges.items.len);
+    try std.testing.expectEqual(@as(usize, 1), generated.pins.items.len);
+    try std.testing.expectEqual(@as(exprs.NodeId, 1), generated.pins.items[0].node);
+    try std.testing.expectEqual(@as(exprs.TypeId, 0), generated.pins.items[0].ty);
+
+    try walkExpr(&ctx, 4, 0);
+    try walkExpr(&ctx, 5, 0);
+    try walkExpr(&ctx, 6, 0);
+    try std.testing.expectEqual(@as(usize, 2), generated.classes.count());
+    try std.testing.expectEqual(@as(usize, 1), generated.edges.items.len);
+    try std.testing.expectEqual(@as(usize, 1), generated.pins.items.len);
+}
+
+test "source analysis infers binary and length cast sources" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var graph_store = graph.CrateGraph.init(alloc);
+    defer graph_store.deinit();
+    const function_id = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "numeric_cast_sources"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const a_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "a"),
+        .span = test_span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const b_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "b"),
+        .span = test_span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const bytes_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "bytes"),
+        .span = test_span,
+        .visibility = .private,
+        .parent = function_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const len_def = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "len"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const bytes_slice = try alloc.create(types.Slice);
+    bytes_slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const types_store = [_]types.Type{
+        .{ .prim = .u64 },
+        .{ .prim = .u128 },
+        .{ .slice = bytes_slice },
+        .{ .prim = .u8 },
+        .{ .prim = .usize },
+    };
+    const params = try alloc.alloc(items.Param, 3);
+    params[0] = .{ .name = "a", .ty = types_store[0], .span = test_span };
+    params[1] = .{ .name = "b", .ty = types_store[0], .span = test_span };
+    params[2] = .{ .name = "bytes", .ty = types_store[2], .span = test_span };
+
+    const exprs_store = try alloc.alloc(exprs.Expr, 13);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = test_span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = a_def, .generic_args = &.{} } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = test_span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = b_def, .generic_args = &.{} } },
+    };
+    // These call-shaped operands stand for the two `u128::from` results.
+    exprs_store[2] = .{
+        .id = 2,
+        .span = test_span,
+        .ty = 1,
+        .kind = .{ .call = .{
+            .call_kind = .{ .associated = 100 },
+            .args = &.{0},
+        } },
+    };
+    exprs_store[3] = .{
+        .id = 3,
+        .span = test_span,
+        .ty = 1,
+        .kind = .{ .call = .{
+            .call_kind = .{ .associated = 101 },
+            .args = &.{1},
+        } },
+    };
+    exprs_store[4] = .{
+        .id = 4,
+        .span = test_span,
+        .ty = 1,
+        .kind = .{ .binary = .{
+            .op = .mul,
+            .overflow = .checked,
+            .lhs = 2,
+            .rhs = 3,
+        } },
+    };
+    exprs_store[5] = .{
+        .id = 5,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "64",
+            .value = 64,
+            .base = .dec,
+            .ty_suffix = null,
+        } } },
+    };
+    exprs_store[6] = .{
+        .id = 6,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .binary = .{
+            .op = .shr,
+            .overflow = .checked,
+            .lhs = 4,
+            .rhs = 5,
+        } },
+    };
+    exprs_store[7] = .{
+        .id = 7,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .binary = .{
+            .op = .bit_xor,
+            .overflow = .checked,
+            .lhs = 6,
+            .rhs = 4,
+        } },
+    };
+    exprs_store[8] = .{
+        .id = 8,
+        .span = test_span,
+        .ty = 0,
+        .kind = .{ .cast = .{
+            .operand = 7,
+            .source_type = types.Type{ .unsupported = .{
+                .reason = .iterators,
+                .message = "cast source type pending inference",
+                .span = test_span,
+            } },
+            .target = 0,
+        } },
+    };
+    exprs_store[9] = .{
+        .id = 9,
+        .span = test_span,
+        .ty = 2,
+        .kind = .{ .path = .{ .def = bytes_def, .generic_args = &.{} } },
+    };
+    exprs_store[10] = .{
+        .id = 10,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .method_call = .{
+            .receiver = 9,
+            .receiver_mode = .shared,
+            .method = len_def,
+            .args = &.{},
+        } },
+    };
+    exprs_store[11] = .{
+        .id = 11,
+        .span = test_span,
+        .ty = 0,
+        .kind = .{ .cast = .{
+            .operand = 10,
+            .source_type = types.Type{ .unsupported = .{
+                .reason = .iterators,
+                .message = "cast source type pending inference",
+                .span = test_span,
+            } },
+            .target = 0,
+        } },
+    };
+    exprs_store[12] = .{
+        .id = 12,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{ 0, 1 },
+            .tail = null,
+            .labelled = null,
+        } },
+    };
+    const stmts_store = [_]exprs.Statement{
+        .{
+            .id = 0,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .expr = 8 },
+        },
+        .{
+            .id = 1,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .expr = 11 },
+        },
+    };
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = params,
+            .ret = types_store[0],
+            .body = 12,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+    var generated: Gen = .{};
+    defer generated.deinit(alloc);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .b = &b,
+        .g = &generated,
+        .cg = &graph_store,
+    };
+    defer ctx.deinit();
+    try std.testing.expectEqual(types_store[1], getKnownType(&ctx, 7).?);
+    try std.testing.expectEqual(types_store[4], getKnownType(&ctx, 10).?);
+
+    var inferred = try solveWithGraph(alloc, &b, &graph_store);
+
+    defer inferred.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?exprs.TypeId, 1), inferred.getType(7));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 4), inferred.getType(10));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(8));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(11));
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u128 },
+        exprs_store[8].kind.cast.source_type,
+    );
+    try std.testing.expectEqual(
+        types.Type{ .prim = .usize },
+        exprs_store[11].kind.cast.source_type,
+    );
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u128 },
+        types_store[inferred.getType(7).?],
+    );
+    try std.testing.expectEqual(
+        types.Type{ .prim = .usize },
+        types_store[inferred.getType(10).?],
+    );
 }

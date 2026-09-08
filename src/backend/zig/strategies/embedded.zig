@@ -26,13 +26,7 @@ pub const EmbeddedStrategy = struct {
         if (std.mem.eql(u8, name, "String")) {
             return .{ .named = "[]const u8" };
         }
-        if (std.mem.eql(u8, name, "BuildHasherDefault")) {
-            return .{ .named = "std.hash.BuildHasherDefault" };
-        }
-        if (std.mem.eql(u8, name, "HashMap") or
-            std.mem.eql(u8, name, "HashSet") or
-            std.mem.eql(u8, name, "BTreeMap"))
-        {
+        if (std.mem.eql(u8, name, "BTreeMap")) {
             return .{ .named = "std.AutoHashMap" };
         }
         return null;
