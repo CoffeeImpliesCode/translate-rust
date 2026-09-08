@@ -1,5 +1,5 @@
 {
-  "format_version": 2,
+  "format_version": 3,
   "sidecar": "translate-rust-p3-hex-fixture",
   "toolchain": "1.77.0",
   "crates": [

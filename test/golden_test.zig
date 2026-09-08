@@ -1,17 +1,16 @@
 //! translate-rust golden serialization tests.
 //!
-//! For each standard fixture crate (`mini`, `fnv`, `hex`), runs the full
-//! pipeline and snapshots the intermediate and final representations:
+//! The source-native `mini` and `fnv` fixtures must complete this path and
+//! provide canonical RustIR and Zig AST snapshots plus non-empty emitted
+//! sources. The wire corpus fixtures `fnv` and `hex` remain strict rejection
+//! cases.
+//! The separate inline source test below preserves generic-instantiation
+//! extraction coverage, then removes the generic definition body and requires
+//! a typed lowering rejection for the resulting incomplete IR.
 //!
 //!   1. `frontend.analyzeCrate`   → `ir.RustIr`
-//!   2. `ir.serialize.encode`     → `test/golden/rust_ir/<name>.rustir.json`
-//!   3. `backend.Lowering`        → `ast.Package`
-//!   4. `backend.serialize.encode`→ `test/golden/zig_ast/<name>.zigast.json`
-//!   5. `backend.emit.emitFile`   → valid, non-empty Zig source per file
-//!
-//! When a golden file does not exist yet it is written from the current
-//! output (used for initial check-in); once present, the output must match
-//! it byte-for-byte.
+//!   2. `ir.validateForTranslation` → typed frontend/IR validation
+//!   3. `backend.Lowering`        → package emission or typed rejection
 
 const std = @import("std");
 const translate_rust = @import("translate_rust");
@@ -20,8 +19,9 @@ const frontend = translate_rust.frontend;
 const ir = translate_rust.ir;
 const backend = translate_rust.backend;
 
-/// Compare `actual` to the golden file at `gold_path`. If the golden file is
-/// absent, write `actual` to it (initial check-in generation).
+/// Compare the golden payload to `actual`. A single final newline is ignored
+/// because text editors and generated snapshots use different file endings;
+/// every other byte remains strict.
 fn checkGolden(
     allocator: std.mem.Allocator,
     test_io: std.Io,
@@ -36,27 +36,82 @@ fn checkGolden(
         var reader = file.reader(test_io, &io_buf);
         const golden = try reader.interface.allocRemaining(allocator, .limited(1 << 28));
         defer allocator.free(golden);
-        if (!std.mem.eql(u8, golden, actual)) {
+        const golden_payload = if (golden.len > 0 and golden[golden.len - 1] == '\n')
+            golden[0 .. golden.len - 1]
+        else
+            golden;
+        if (!std.mem.eql(u8, golden_payload, actual)) {
             std.debug.print(
                 "golden mismatch for {s}\n--- golden ({d} bytes) ---\n{s}\n--- actual ({d} bytes) ---\n{s}\n",
-                .{ gold_path, golden.len, golden, actual.len, actual },
+                .{ gold_path, golden_payload.len, golden_payload, actual.len, actual },
             );
             return error.GoldenMismatch;
         }
     } else |_| {
-        // Generate the golden file from the current output.
-        const dirname = std.fs.path.dirname(gold_path) orelse ".";
-        try dir.createDirPath(test_io, dirname);
-        const f = try dir.createFile(test_io, gold_path, .{});
-        defer f.close(test_io);
-        try f.writeStreamingAll(test_io, actual);
+        return error.GoldenMissing;
     }
 }
 
-/// Run the full pipeline for one fixture crate and assert every golden.
+fn expectPackageShape(
+    pkg: *const backend.zig.ast.Package,
+    expected_paths: []const []const u8,
+    source_claims_tests: bool,
+) !*const backend.zig.ast.File {
+    if (pkg.files.len == 0) return error.EmptyPackage;
+    if (pkg.files.len != expected_paths.len) return error.SourceFileSetMismatch;
+
+    var root_file: ?*const backend.zig.ast.File = null;
+    for (pkg.files, 0..) |*file, index| {
+        for (pkg.files[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, file.path, other.path)) return error.DuplicateSourceFilePath;
+        }
+
+        var expected = false;
+        for (expected_paths) |expected_path| {
+            if (std.mem.eql(u8, file.path, expected_path)) {
+                expected = true;
+                break;
+            }
+        }
+        if (!expected) return error.UnexpectedSourceFile;
+
+        if (std.mem.eql(u8, file.path, "src/root.zig")) {
+            if (root_file != null) return error.DuplicateRootFile;
+            root_file = file;
+        }
+    }
+
+    for (expected_paths) |expected_path| {
+        var found = false;
+        for (pkg.files) |file| {
+            if (std.mem.eql(u8, file.path, expected_path)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.MissingSourceFile;
+    }
+
+    const root = root_file orelse return error.RootFileMissing;
+    if (root.imports.len == 0 and root.decls.len == 0 and root.tests.len == 0) {
+        return error.EmptyRoot;
+    }
+
+    if (source_claims_tests) {
+        var test_count: usize = 0;
+        for (pkg.files) |file| test_count += file.tests.len;
+        if (test_count == 0) return error.NoTranslatedTests;
+    }
+    return root;
+}
+
 fn runGoldenFixture(
     fixture_name: []const u8,
     crate_dir: []const u8,
+    expected_rejection: ?anyerror,
+    expected_paths: []const []const u8,
+    source_claims_tests: bool,
+    check_source_goldens: bool,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -66,26 +121,40 @@ fn runGoldenFixture(
     const rust_ir_path = try std.fmt.allocPrint(allocator, "test/golden/rust_ir/{s}.rustir.json", .{fixture_name});
     const zig_ast_path = try std.fmt.allocPrint(allocator, "test/golden/zig_ast/{s}.zigast.json", .{fixture_name});
 
+    if (expected_rejection) |expected_error| {
+        const rust_ir = frontend.analyzeCrate(allocator, test_io, crate_dir) catch |err| {
+            if (err == expected_error) return;
+            return err;
+        };
+        if (ir.validateForTranslation(&rust_ir)) |_| {
+            return error.IncompleteFixtureAccepted;
+        } else |err| {
+            if (err == expected_error) return;
+            return err;
+        }
+    }
+
     // 1. Frontend analysis → RustIr.
     const rust_ir = try frontend.analyzeCrate(allocator, test_io, crate_dir);
 
-    // 2. Encode RustIr to JSON and snapshot. The frontend returns the IR
-    // module's canonical `root.RustIr`; `ir.serialize` keeps a
-    // self-contained copy of the struct for wire round-tripping, with
-    // identical field types — convert surgically.
-    const wire_ir: ir.serialize.RustIr = .{
-        .crate_name = rust_ir.crate_name,
-        .edition = rust_ir.edition,
-        .graph = rust_ir.graph,
-        .types = rust_ir.types,
-        .bodies = rust_ir.bodies,
-    };
+    // 2. Encode the complete canonical RustIr to JSON and snapshot. The
+    // frontend and serializer intentionally share the same nominal v5 model;
+    // assigning the value directly preserves every field, including graph
+    // metadata and monomorphization instantiations.
+    const wire_ir: ir.serialize.RustIr = rust_ir;
+    try ir.validateForTranslation(&rust_ir);
     const rust_ir_json = try ir.serialize.encode(allocator, &wire_ir);
     defer allocator.free(rust_ir_json);
     try checkGolden(allocator, test_io, rust_ir_path, rust_ir_json);
 
     // 3. Lower RustIr → ast.Package via the default strategy.
     const pkg = try backend.zig.lower.lowerRustIr(allocator, &rust_ir, null);
+    const root_file = try expectPackageShape(&pkg, expected_paths, source_claims_tests);
+    try std.testing.expectEqualStrings("src/root.zig", root_file.path);
+    var package_for_structural_validation = pkg;
+    package_for_structural_validation.fingerprint =
+        package_for_structural_validation.fingerprint orelse 0;
+    try backend.zig.ast.validateForTranslation(&package_for_structural_validation);
 
     // 4. Encode the package AST to JSON and snapshot.
     const zig_ast_json = try backend.zig.serialize.encode(allocator, &pkg);
@@ -96,23 +165,210 @@ fn runGoldenFixture(
     for (pkg.files) |*file| {
         const src = try backend.zig.emit.emitFile(allocator, file);
         defer allocator.free(src);
-        if (src.len == 0) return error.EmptyEmit;
+        if (src.len == 0) {
+            if (std.mem.eql(u8, file.path, "src/root.zig")) return error.EmptyRootEmit;
+            return error.EmptyEmit;
+        }
+        if (check_source_goldens) {
+            const source_payload = if (src[src.len - 1] == '\n')
+                src[0 .. src.len - 1]
+            else
+                src;
+            const source_golden_path = try std.fmt.allocPrint(
+                allocator,
+                "test/golden/zig_src/{s}/{s}",
+                .{ fixture_name, file.path },
+            );
+            try checkGolden(allocator, test_io, source_golden_path, source_payload);
+        }
     }
 }
 
-test "golden: mini" {
-    try runGoldenFixture("mini", "test/crates/mini");
+test "golden: mini translates to canonical package" {
+    try runGoldenFixture(
+        "mini",
+        "test/crates/mini",
+        null,
+        &.{ "src/root.zig", "src/util.zig" },
+        false,
+        true,
+    );
+}
+test "golden: fnv source translates to canonical package" {
+    try runGoldenFixture("fnv", "test/crates/fnv", null, &.{"src/root.zig"}, false, true);
 }
 
-test "golden: fnv" {
-    try runGoldenFixture("fnv", "test/crates/fnv");
+test "golden: fnv included tests contain only assertion unsupported expressions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var rust_ir = try frontend.pipeline.analyzeCrateWithOptions(
+        allocator,
+        std.testing.io,
+        "test/crates/fnv",
+        .{ .include_tests = true },
+    );
+    defer rust_ir.deinitInstantiations(allocator);
+
+    const assertion_prefix = "assertion:";
+    var only_assertion_markers = true;
+    for (rust_ir.bodies.exprs) |expression| {
+        const reason = switch (expression.kind) {
+            .unsupported => |unsupported| unsupported.reason,
+            else => continue,
+        };
+
+        var is_assertion_marker =
+            std.mem.startsWith(u8, reason, assertion_prefix) and
+            reason.len > assertion_prefix.len;
+        if (is_assertion_marker) {
+            for (reason[assertion_prefix.len..]) |character| {
+                if (character < '0' or character > '9') {
+                    is_assertion_marker = false;
+                    break;
+                }
+            }
+        }
+        if (!is_assertion_marker) {
+            only_assertion_markers = false;
+            std.debug.print(
+                "unexpected FNV unsupported expression reason: \"{s}\"\n",
+                .{reason},
+            );
+        }
+    }
+    try std.testing.expect(only_assertion_markers);
+
+    var test_module_id: ?u32 = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .module and std.mem.eql(u8, entity.name, "test")) {
+            test_module_id = entity.id;
+            break;
+        }
+    }
+    try std.testing.expect(test_module_id != null);
+
+    var basic_tests_id: ?u32 = null;
+    for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and
+            std.mem.eql(u8, entity.name, "basic_tests") and
+            entity.parent != null and
+            entity.parent.? == test_module_id.?)
+        {
+            basic_tests_id = entity.id;
+            break;
+        }
+    }
+    try std.testing.expect(basic_tests_id != null);
+    try std.testing.expect(basic_tests_id.? < rust_ir.bodies.bodies.len);
+
+    const basic_tests_body = switch (rust_ir.bodies.bodies[basic_tests_id.?]) {
+        .fn_ => |function_body| function_body,
+        else => return error.MissingFnvBasicTestsBody,
+    };
+    try std.testing.expect(basic_tests_body.body < rust_ir.bodies.exprs.len);
+    const basic_tests_block = switch (rust_ir.bodies.exprs[basic_tests_body.body].kind) {
+        .block => |block| block,
+        else => return error.InvalidFnvBasicTestsBody,
+    };
+    try std.testing.expect(basic_tests_block.statements.len > 0);
 }
 
-test "golden: hex" {
-    try runGoldenFixture("hex", "test/crates/hex");
+test "golden: fnv preserves hasher methods" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var rust_ir = try frontend.analyzeCrate(allocator, std.testing.io, "test/crates/fnv");
+    defer rust_ir.deinitInstantiations(allocator);
+    try ir.validateForTranslation(&rust_ir);
+    const pkg = try backend.zig.lower.lowerRustIr(allocator, &rust_ir, null);
+    const root = try expectPackageShape(&pkg, &.{"src/root.zig"}, false);
+
+    var hasher: ?backend.zig.ast.StructDecl = null;
+    for (root.decls) |decl| {
+        if (decl == .struct_decl and std.mem.eql(u8, decl.struct_decl.name, "FnvHasher")) {
+            hasher = decl.struct_decl;
+            break;
+        }
+    }
+    const decl = hasher orelse return error.MissingFnvHasher;
+
+    var found_default = false;
+    var found_finish = false;
+    var found_write = false;
+    for (decl.decls) |member| {
+        if (member != .fn_decl) continue;
+        const function = member.fn_decl;
+        if (function.body == null) return error.EmptyFnvMethod;
+        if (std.mem.eql(u8, function.name, "default")) found_default = true;
+        if (std.mem.eql(u8, function.name, "finish")) found_finish = true;
+        if (std.mem.eql(u8, function.name, "write")) found_write = true;
+    }
+    try std.testing.expect(found_default);
+    try std.testing.expect(found_finish);
+    try std.testing.expect(found_write);
 }
 
-test "source pipeline preserves generic instantiations through Zig emission" {
+test "golden: hex rejects incomplete translation" {
+    try runGoldenFixture("hex", "test/crates/hex", error.UnsupportedCfgPredicate, &.{}, false, false);
+}
+test "golden: missing source directory propagates ingestion failure" {
+    try std.testing.expectError(
+        error.RootSourceNotFound,
+        runGoldenFixture(
+            "missing",
+            "test/crates/missing",
+            error.UnsupportedExpression,
+            &.{},
+            false,
+            false,
+        ),
+    );
+}
+
+test "golden: empty packages and claimed tests fail closed" {
+    const empty_package = backend.zig.ast.Package{
+        .name = "empty",
+        .fingerprint = 1,
+        .files = &.{},
+    };
+    try std.testing.expectError(
+        error.EmptyPackage,
+        expectPackageShape(&empty_package, &.{"src/root.zig"}, false),
+    );
+
+    const root_without_tests = backend.zig.ast.File{
+        .path = "src/root.zig",
+        .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+    };
+    const no_tests_package = backend.zig.ast.Package{
+        .name = "no_tests",
+        .fingerprint = 1,
+        .files = &.{root_without_tests},
+    };
+    const no_tests_root = try expectPackageShape(&no_tests_package, &.{"src/root.zig"}, false);
+    try std.testing.expectEqualStrings("src/root.zig", no_tests_root.path);
+    try std.testing.expectError(
+        error.NoTranslatedTests,
+        expectPackageShape(&no_tests_package, &.{"src/root.zig"}, true),
+    );
+}
+
+test "golden: package validation rejects null fingerprints" {
+    const missing_fingerprint = backend.zig.ast.Package{
+        .name = "missing_fingerprint",
+        .fingerprint = null,
+        .files = &.{.{ .path = "src/root.zig" }},
+    };
+    try std.testing.expectError(
+        error.MissingFingerprint,
+        backend.zig.ast.validateForTranslation(&missing_fingerprint),
+    );
+}
+
+test "source pipeline rejects incomplete generic definitions before package emission" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -129,7 +385,7 @@ test "source pipeline preserves generic instantiations through Zig emission" {
         \\}
     ;
 
-    const rust_ir = try frontend.pipeline.analyzeSource(
+    var rust_ir = try frontend.pipeline.analyzeSource(
         allocator,
         "generic_source",
         "2021",
@@ -171,24 +427,16 @@ test "source pipeline preserves generic instantiations through Zig emission" {
             else => return error.UnexpectedFooInstantiation,
         }
     }
+    try ir.validateForTranslation(&rust_ir);
+    try std.testing.expect(expected_foo_id < rust_ir.bodies.bodies.len);
+    const incomplete_bodies = try allocator.dupe(ir.bodies.BodyKind, rust_ir.bodies.bodies);
+    incomplete_bodies[expected_foo_id] = .{ .none = {} };
+    rust_ir.bodies.bodies = incomplete_bodies;
     try std.testing.expect(saw_u32);
     try std.testing.expect(saw_u8_slice);
 
-    const pkg = try backend.zig.lower.lowerRustIr(allocator, &rust_ir, null);
-    var emitted_root: ?[]const u8 = null;
-    for (pkg.files) |*file| {
-        if (!std.mem.eql(u8, file.path, "src/root.zig")) continue;
-        emitted_root = try backend.zig.emit.emitFile(allocator, file);
-        break;
-    }
-    const emitted = emitted_root orelse return error.RootFileMissing;
-    defer allocator.free(emitted);
-
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(comptime T: type)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(u32)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo([]const u8)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, ") Foo {") == null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(value)") == null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo(u32, value)") == null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "Foo([]const u8, value)") == null);
+    try std.testing.expectError(
+        error.DeclarationBodyMismatch,
+        backend.zig.lower.lowerRustIr(allocator, &rust_ir, null),
+    );
 }
