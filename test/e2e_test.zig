@@ -442,7 +442,7 @@ pub fn main(init: std.process.Init) !void {
         stdout,
         "test/crates/fletcher",
         "zig-out/e2e-rejected-source-fletcher",
-        error.UnknownMacro,
+        error.ExternalMacroSourceUnavailable,
     );
     try expectSourceCrateRejectedWithError(
         init.gpa,
@@ -450,7 +450,7 @@ pub fn main(init: std.process.Init) !void {
         stdout,
         "test/crates/crc16",
         "zig-out/e2e-rejected-source-crc16",
-        error.UnknownMacro,
+        error.BuildScriptArtifactUnavailable,
     );
     try expectWireCrateRejected(
         init.gpa,

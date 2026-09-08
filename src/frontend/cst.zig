@@ -103,6 +103,18 @@ pub const FunctionOrigin = struct {
 
 pub const FunctionOriginTable = std.AutoHashMapUnmanaged(spine.EntityId, FunctionOrigin);
 
+pub const UnsupportedMacroReason = enum {
+    dependency_source_unavailable,
+    build_script_not_executed,
+    source_unavailable,
+};
+
+pub const UnsupportedMacro = struct {
+    name: []const u8,
+    reason: UnsupportedMacroReason,
+    artifact_path: ?[]const u8 = null,
+};
+
 pub const Ctx = struct {
     alloc: std.mem.Allocator,
     g: *graph.CrateGraph,
@@ -127,7 +139,17 @@ pub const Ctx = struct {
     function_origins: ?*FunctionOriginTable = null,
     /// Generic applications wait here until every nominal declaration exists.
     pending_generics: ?*std.ArrayListUnmanaged(PendingGenericApplication) = null,
+    /// The most recent typed macro-source refusal. Slices are owned by `alloc`.
+    unsupported_macro: ?UnsupportedMacro = null,
 };
+
+fn clearUnsupportedMacro(e: *Ctx) void {
+    if (e.unsupported_macro) |diagnostic| {
+        e.alloc.free(diagnostic.name);
+        if (diagnostic.artifact_path) |path| e.alloc.free(path);
+    }
+    e.unsupported_macro = null;
+}
 fn parseRustTree(parser: *ts.Parser, source: []const u8) !*ts.Tree {
     parser.setLanguage(rust.language()) catch return error.ParserSetupFailed;
     return parser.parseString(source, null) orelse error.ParseFailed;
@@ -3399,6 +3421,134 @@ fn childModuleBaseDir(
     return std.fs.path.join(allocator, &.{ source_dir, module_name });
 }
 
+fn setUnsupportedMacro(
+    e: *Ctx,
+    name: []const u8,
+    reason: UnsupportedMacroReason,
+    artifact_path: ?[]const u8,
+) !void {
+    e.unsupported_macro = .{
+        .name = try e.alloc.dupe(u8, name),
+        .reason = reason,
+        .artifact_path = if (artifact_path) |path| try e.alloc.dupe(u8, path) else null,
+    };
+}
+
+fn macroBaseName(path: []const u8) []const u8 {
+    var name = std.mem.trim(u8, path, " \t\r\n");
+    if (std.mem.lastIndexOf(u8, name, "::")) |separator| {
+        name = name[separator + 2 ..];
+    }
+    if (std.mem.endsWith(u8, name, "!")) name = name[0 .. name.len - 1];
+    return std.mem.trim(u8, name, " \t\r\n");
+}
+
+fn lastStringLiteral(raw: []const u8) ?[]const u8 {
+    const end = std.mem.lastIndexOfScalar(u8, raw, '"') orelse return null;
+    if (end == 0) return null;
+    const start = std.mem.lastIndexOfScalar(u8, raw[0..end], '"') orelse return null;
+    return raw[start + 1 .. end];
+}
+
+fn artifactIncludePath(
+    e: *const Ctx,
+    token_tree: ts.Node,
+) ?[]const u8 {
+    const raw = text(e, token_tree);
+    const has_out_dir = std.mem.indexOf(u8, raw, "OUT_DIR") != null;
+    const has_concat = std.mem.indexOf(u8, raw, "concat!") != null;
+    const literal = lastStringLiteral(raw);
+    if (has_out_dir or has_concat) {
+        const path = literal orelse return "generated artifact";
+        const trimmed = std.mem.trim(u8, path, " \t\r\n/");
+        if (trimmed.len == 0) return "generated artifact";
+        return std.fs.path.basename(trimmed);
+    }
+    if (literal) |path| {
+        const trimmed = std.mem.trim(u8, path, " \t\r\n/");
+        if (trimmed.len == 0) return "generated artifact";
+        return std.fs.path.basename(trimmed);
+    }
+    return null;
+}
+
+fn validateGeneratedItems(node: ts.Node) !void {
+    var i: u32 = 0;
+    while (node.namedChild(i)) |item| : (i += 1) {
+        var item2 = item;
+        if (std.mem.eql(u8, item.kind(), "expression_statement")) {
+            item2 = item.namedChild(0) orelse return error.ParseFailed;
+        }
+        const kind = item2.kind();
+        if (std.mem.eql(u8, kind, "static_item") or
+            std.mem.eql(u8, kind, "foreign_mod_item"))
+        {
+            return error.UnsupportedItem;
+        }
+        if (std.mem.eql(u8, kind, "mod_item")) {
+            if (item2.childByFieldName("body")) |body| {
+                try validateGeneratedItems(body);
+            }
+        }
+    }
+}
+
+const MacroExpansionCheckpoint = struct {
+    entity_count: usize,
+    module_count: usize,
+    use_count: usize,
+    body_count: usize,
+    type_count: usize,
+    expression_count: usize,
+    item_count: usize,
+    pending_impl_count: usize,
+    pending_generic_count: usize,
+    function_origin_count: usize,
+};
+
+fn rollbackMacroExpansion(
+    e: *Ctx,
+    item_ids: *std.ArrayListUnmanaged(spine.EntityId),
+    checkpoint: MacroExpansionCheckpoint,
+) void {
+    e.g.symbol_table.entities.items.len = checkpoint.entity_count;
+    e.g.modules.items.len = checkpoint.module_count;
+    e.g.uses.items.len = checkpoint.use_count;
+    e.bodies_list.items.len = checkpoint.body_count;
+    e.types_list.items.len = checkpoint.type_count;
+    e.exprs_list.items.len = checkpoint.expression_count;
+    item_ids.items.len = checkpoint.item_count;
+    if (e.pending_impls) |pending| {
+        while (pending.items.len > checkpoint.pending_impl_count) {
+            const impl = pending.pop().?;
+            e.alloc.free(impl.target_path);
+            e.alloc.free(impl.methods);
+        }
+    }
+    if (e.pending_generics) |pending| {
+        while (pending.items.len > checkpoint.pending_generic_count) {
+            const application = pending.pop().?;
+            freePendingGenericPath(e.alloc, application.path);
+        }
+    }
+    if (e.function_origins) |origins| {
+        var stale_ids: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+        defer stale_ids.deinit(e.alloc);
+        var iterator = origins.iterator();
+        while (iterator.next()) |entry| {
+            if (@as(usize, entry.key_ptr.*) >= checkpoint.entity_count) {
+                stale_ids.append(e.alloc, entry.key_ptr.*) catch return;
+            }
+        }
+        for (stale_ids.items) |id| {
+            if (origins.fetchRemove(id)) |entry| e.alloc.free(entry.value.source);
+        }
+    }
+    _ = checkpoint.module_count;
+    _ = checkpoint.use_count;
+    _ = checkpoint.function_origin_count;
+}
+
 /// Register a `macro_rules! name { … }` definition into the shared macro
 /// table so item-level invocations can be expanded later in this pass.
 fn registerMacroDefinition(e: *Ctx, item: ts.Node) !void {
@@ -3438,7 +3588,30 @@ fn expandMacroInvocationItems(
         return error.MalformedMacroInvocation;
     const path_text = std.mem.trim(u8, invocation_text[0..bang_idx], " \t\r\n");
     if (path_text.len == 0) return error.MalformedMacroInvocation;
-    const def = table.get(path_text) orelse return error.UnknownMacro;
+    const def = table.get(path_text) orelse {
+        const macro_name = macroBaseName(path_text);
+        if (std.mem.eql(u8, macro_name, "include")) {
+            const artifact_path = artifactIncludePath(e, tt);
+            try setUnsupportedMacro(
+                e,
+                macro_name,
+                if (artifact_path != null)
+                    .build_script_not_executed
+                else
+                    .source_unavailable,
+                artifact_path,
+            );
+            return error.BuildScriptArtifactUnavailable;
+        }
+        if (exp.identifyMacro(path_text) != .custom) return error.UnknownMacro;
+        try setUnsupportedMacro(
+            e,
+            macro_name,
+            .dependency_source_unavailable,
+            null,
+        );
+        return error.ExternalMacroSourceUnavailable;
+    };
     const expanded = try exp.expandMacroRules(e.alloc, def, text(e, tt));
     const initial_macro_count = table.macros.count();
     defer e.alloc.free(expanded);
@@ -3448,6 +3621,8 @@ fn expandMacroInvocationItems(
     defer parser.destroy();
     const tree = try parseRustTree(parser, expanded);
     defer tree.destroy();
+    if (tree.rootNode().hasError()) return error.ParseFailed;
+    try validateGeneratedItems(tree.rootNode());
     var generated_environment = try copyConstEnvironment(e, e.const_environment);
     defer generated_environment.deinit(e.alloc);
     var exp_ctx: Ctx = .{
@@ -3467,10 +3642,25 @@ fn expandMacroInvocationItems(
         .pending_generics = e.pending_generics,
         .function_origins = e.function_origins,
     };
-    const initial_entity_count = e.g.symbol_table.entities.items.len;
-    const generated = try mapItemsInner(&exp_ctx, tree.rootNode(), mod_id);
+    const checkpoint: MacroExpansionCheckpoint = .{
+        .entity_count = e.g.symbol_table.entities.items.len,
+        .module_count = e.g.modules.items.len,
+        .use_count = e.g.uses.items.len,
+        .body_count = e.bodies_list.items.len,
+        .type_count = e.types_list.items.len,
+        .expression_count = e.exprs_list.items.len,
+        .item_count = item_ids.items.len,
+        .pending_impl_count = if (e.pending_impls) |pending| pending.items.len else 0,
+        .pending_generic_count = if (e.pending_generics) |pending| pending.items.len else 0,
+        .function_origin_count = if (e.function_origins) |origins| origins.count() else 0,
+    };
+    errdefer rollbackMacroExpansion(e, item_ids, checkpoint);
+    const generated = mapItemsInner(&exp_ctx, tree.rootNode(), mod_id) catch |err| {
+        if (exp_ctx.unsupported_macro) |diagnostic| e.unsupported_macro = diagnostic;
+        return err;
+    };
     defer e.alloc.free(generated);
-    if (e.g.symbol_table.entities.items.len == initial_entity_count and
+    if (e.g.symbol_table.entities.items.len == checkpoint.entity_count and
         table.macros.count() == initial_macro_count)
     {
         return error.EmptyMacroExpansion;
@@ -3870,6 +4060,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
 /// Entry: parse `src` and build the type model into `ctx`. The root module
 /// (id 0) must already exist. Returns the root module's item list.
 pub fn extractFile(ctx: *Ctx) !void {
+    clearUnsupportedMacro(ctx);
     var local_table: exp.MacroTable = undefined;
     var has_local = false;
     if (ctx.macro_table == null) {
@@ -5252,4 +5443,176 @@ test "cst resolves an inline impl before its later root type" {
         }
     }
     try std.testing.expect(found_impl);
+}
+
+const MacroFailureObservation = struct {
+    failure: anyerror,
+    diagnostic: ?UnsupportedMacro,
+    entity_count: usize,
+    module_count: usize,
+    module_item_count: usize,
+    use_count: usize,
+    body_count: usize,
+    type_count: usize,
+    expression_count: usize,
+    function_origin_count: usize,
+};
+
+fn deinitMacroFailureObservation(observation: *MacroFailureObservation) void {
+    if (observation.diagnostic) |diagnostic| {
+        std.testing.allocator.free(diagnostic.name);
+        if (diagnostic.artifact_path) |path| std.testing.allocator.free(path);
+    }
+    observation.* = undefined;
+}
+
+fn observeMacroFailure(
+    source: []const u8,
+    base_dir: ?[]const u8,
+) !MacroFailureObservation {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = graph.CrateGraph.init(allocator);
+    defer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = try allocator.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var function_origins: FunctionOriginTable = .empty;
+    defer function_origins.deinit(allocator);
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src = source,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+        .base_dir = base_dir,
+        .io = if (base_dir != null) std.testing.io else null,
+        .function_origins = &function_origins,
+    };
+    var failure: ?anyerror = null;
+    extractFile(&ctx) catch |err| {
+        failure = err;
+    };
+    const diagnostic = if (ctx.unsupported_macro) |source_diagnostic|
+        UnsupportedMacro{
+            .name = try std.testing.allocator.dupe(u8, source_diagnostic.name),
+            .reason = source_diagnostic.reason,
+            .artifact_path = if (source_diagnostic.artifact_path) |path|
+                try std.testing.allocator.dupe(u8, path)
+            else
+                null,
+        }
+    else
+        null;
+    return .{
+        .failure = failure orelse return error.ExpectedMacroFailure,
+        .diagnostic = diagnostic,
+        .entity_count = crate_graph.symbol_table.entities.items.len,
+        .module_count = crate_graph.modules.items.len,
+        .module_item_count = crate_graph.modules.items[0].items.len,
+        .use_count = crate_graph.uses.items.len,
+        .body_count = bodies_list.items.len,
+        .type_count = types_list.items.len,
+        .expression_count = exprs_list.items.len,
+        .function_origin_count = function_origins.count(),
+    };
+}
+
+test "cst reports unavailable source for external item macro" {
+    var result = try observeMacroFailure(
+        "#[macro_use]\nextern crate quickcheck;\nquickcheck! { fn property() -> bool { true } }",
+        null,
+    );
+    defer deinitMacroFailureObservation(&result);
+    try std.testing.expectEqual(error.ExternalMacroSourceUnavailable, result.failure);
+    const diagnostic = result.diagnostic orelse return error.ExpectedMacroDiagnostic;
+    try std.testing.expectEqualStrings("quickcheck", diagnostic.name);
+    try std.testing.expectEqual(
+        UnsupportedMacroReason.dependency_source_unavailable,
+        diagnostic.reason,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), diagnostic.artifact_path);
+}
+
+test "cst reports build artifacts unavailable without build script execution" {
+    var out_dir_result = try observeMacroFailure(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/tables.rs\"));",
+        "test/crates/crc16/src",
+    );
+    defer deinitMacroFailureObservation(&out_dir_result);
+    try std.testing.expectEqual(error.BuildScriptArtifactUnavailable, out_dir_result.failure);
+    const out_dir_diagnostic =
+        out_dir_result.diagnostic orelse return error.ExpectedMacroDiagnostic;
+    try std.testing.expectEqualStrings("include", out_dir_diagnostic.name);
+    try std.testing.expectEqual(
+        UnsupportedMacroReason.build_script_not_executed,
+        out_dir_diagnostic.reason,
+    );
+    try std.testing.expectEqualStrings(
+        "tables.rs",
+        out_dir_diagnostic.artifact_path orelse return error.ExpectedArtifactPath,
+    );
+
+    var outside_result = try observeMacroFailure(
+        "include!(\"../generated.rs\");",
+        "test/crates/crc16/src",
+    );
+    defer deinitMacroFailureObservation(&outside_result);
+    try std.testing.expectEqual(error.BuildScriptArtifactUnavailable, outside_result.failure);
+    const outside_diagnostic =
+        outside_result.diagnostic orelse return error.ExpectedMacroDiagnostic;
+    try std.testing.expectEqualStrings(
+        "generated.rs",
+        outside_diagnostic.artifact_path orelse return error.ExpectedArtifactPath,
+    );
+    try std.testing.expectEqual(
+        UnsupportedMacroReason.build_script_not_executed,
+        outside_diagnostic.reason,
+    );
+}
+
+test "cst item macro expansion failure is atomic" {
+    var result = try observeMacroFailure(
+        "macro_rules! partial { () => { fn generated() {} static BAD: u8 = 1; }; } partial!();",
+        null,
+    );
+    defer deinitMacroFailureObservation(&result);
+    try std.testing.expectEqual(error.UnsupportedItem, result.failure);
+    try std.testing.expectEqual(@as(?UnsupportedMacro, null), result.diagnostic);
+    try std.testing.expectEqual(@as(usize, 1), result.entity_count);
+    try std.testing.expectEqual(@as(usize, 1), result.module_count);
+    try std.testing.expectEqual(@as(usize, 0), result.module_item_count);
+    try std.testing.expectEqual(@as(usize, 0), result.use_count);
+    try std.testing.expectEqual(@as(usize, 1), result.body_count);
+    try std.testing.expectEqual(@as(usize, 0), result.type_count);
+    try std.testing.expectEqual(@as(usize, 0), result.expression_count);
+    try std.testing.expectEqual(@as(usize, 0), result.function_origin_count);
 }

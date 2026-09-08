@@ -620,6 +620,12 @@ pub const RepetitionOp = enum {
     zero_or_one, // ?
 };
 
+/// Maximum runtime repetition nesting. Matching fails if a macro exceeds it.
+pub const macro_repetition_depth_max: usize = 16;
+
+/// Maximum number of output tokens emitted by one macro expansion.
+pub const macro_output_token_max: usize = 16_384;
+
 pub const MatcherElement = union(enum) {
     token: []const u8,
     metavar: struct {
@@ -683,26 +689,177 @@ fn freeTemplateElements(alloc: std.mem.Allocator, elems: []const TemplateElement
 }
 
 fn isIdentifier(s: []const u8) bool {
-    if (s.len == 0 or !isIdentStart(s[0])) return false;
-    for (s[1..]) |c| {
+    var value = s;
+    if (std.mem.startsWith(u8, value, "r#")) value = value[2..];
+    if (value.len == 0 or !isIdentStart(value[0])) return false;
+    for (value[1..]) |c| {
         if (!isIdentChar(c)) return false;
     }
     return true;
 }
 
-fn metavarAccepts(kind: MetavarKind, val: []const u8) bool {
-    return switch (kind) {
-        .ident => isIdentifier(val),
-        .lifetime => val.len > 0 and val[0] == '\'' and isIdentifier(val[1..]),
-        .literal => val.len > 0 and (std.ascii.isDigit(val[0]) or val[0] == '"' or val[0] == '\'' or val[0] == 'b' or val[0] == 'r'),
-        .ty, .expr, .path, .tt, .pat, .stmt, .block, .item, .vis => true,
+fn tokenStreamIsValid(value: []const u8) bool {
+    if (value.len == 0) return false;
+    validateMacroTokenStream(value) catch return false;
+    return true;
+}
+
+fn isPathFragment(value: []const u8) bool {
+    var rest = value;
+    if (std.mem.startsWith(u8, rest, "::")) rest = rest[2..];
+    if (rest.len == 0) return false;
+    while (rest.len > 0) {
+        const separator = std.mem.indexOf(u8, rest, "::");
+        const part = if (separator) |index| rest[0..index] else rest;
+        if (!isIdentifier(part) and
+            !std.mem.eql(u8, part, "self") and
+            !std.mem.eql(u8, part, "Self") and
+            !std.mem.eql(u8, part, "crate") and
+            !std.mem.eql(u8, part, "super"))
+        {
+            return false;
+        }
+        if (separator) |index| {
+            rest = rest[index + 2 ..];
+            if (rest.len == 0) return false;
+        } else {
+            break;
+        }
+    }
+    return true;
+}
+
+fn isLiteralFragment(value: []const u8) bool {
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "false")) return true;
+    if (value.len >= 2 and
+        ((value[0] == '"' and value[value.len - 1] == '"') or
+            (value[0] == '\'' and value[value.len - 1] == '\'')))
+    {
+        return tokenStreamIsValid(value);
+    }
+    if (std.mem.startsWith(u8, value, "r\"") or
+        std.mem.startsWith(u8, value, "r#\"") or
+        std.mem.startsWith(u8, value, "b\"") or
+        std.mem.startsWith(u8, value, "br\"") or
+        std.mem.startsWith(u8, value, "br#\""))
+    {
+        return tokenStreamIsValid(value);
+    }
+    if (value.len == 0 or !std.ascii.isDigit(value[0])) return false;
+    for (value) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.')) return false;
+    }
+    return true;
+}
+
+fn isExpressionFragment(value: []const u8) bool {
+    if (!tokenStreamIsValid(value)) return false;
+    if (std.mem.eql(u8, value, "???") or std.mem.indexOf(u8, value, "??") != null) return false;
+    if (value[0] == ';' or value[0] == ',' or value[0] == '+') return false;
+    const keywords = [_][]const u8{
+        "const", "enum",   "extern", "fn",    "impl", "let",   "mod",
+        "pub",   "static", "struct", "trait", "type", "union", "use",
     };
+    for (keywords) |keyword| {
+        if (std.mem.eql(u8, value, keyword)) return false;
+        if (std.mem.startsWith(u8, value, keyword) and value.len > keyword.len) {
+            const next = value[keyword.len];
+            if (std.ascii.isWhitespace(next) or next == '(') return false;
+        }
+    }
+    const last = value[value.len - 1];
+    if (last == '+' or last == '-' or last == '*' or last == '/' or
+        last == '%' or last == '=' or last == '&' or last == '|' or
+        last == '^' or last == '<' or last == '>' or last == '.')
+    {
+        return false;
+    }
+    return true;
+}
+
+fn isTypeFragment(value: []const u8) bool {
+    if (!tokenStreamIsValid(value)) return false;
+    if (std.mem.eql(u8, value, "???") or std.mem.indexOf(u8, value, "??") != null) return false;
+    const first = value[0];
+    if (std.ascii.isDigit(first) or first == ';' or first == ',') return false;
+    return true;
+}
+
+fn isBlockFragment(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
+        return false;
+    }
+    return tokenStreamIsValid(trimmed);
+}
+
+fn isItemFragment(value: []const u8) bool {
+    if (!tokenStreamIsValid(value)) return false;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const item_keywords = [_][]const u8{
+        "const ",  "enum ",   "extern ", "fn ",   "impl ",  "mod ", "pub ",
+        "static ", "struct ", "trait ",  "type ", "union ", "use ",
+    };
+    for (item_keywords) |keyword| {
+        if (std.mem.startsWith(u8, trimmed, keyword)) return true;
+    }
+    return false;
+}
+
+fn isVisibilityFragment(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    return std.mem.eql(u8, trimmed, "pub") or
+        std.mem.startsWith(u8, trimmed, "pub(") or
+        std.mem.eql(u8, trimmed, "crate") or
+        std.mem.eql(u8, trimmed, "self") or
+        std.mem.eql(u8, trimmed, "super");
+}
+
+fn validateMetavar(kind: MetavarKind, value: []const u8) !void {
+    const valid = switch (kind) {
+        .ident => isIdentifier(value),
+        .ty => isTypeFragment(value),
+        .expr => isExpressionFragment(value),
+        .path => isPathFragment(value),
+        .tt => tokenStreamIsValid(value),
+        .pat => isExpressionFragment(value),
+        .stmt => isExpressionFragment(value),
+        .block => isBlockFragment(value),
+        .item => isItemFragment(value),
+        .literal => isLiteralFragment(value),
+        .lifetime => value.len > 1 and value[0] == '\'' and isIdentifier(value[1..]),
+        .vis => isVisibilityFragment(value),
+    };
+    if (!valid) return error.FragmentMismatch;
+}
+
+const CapturePath = struct {
+    len: usize = 0,
+    indices: [macro_repetition_depth_max]usize = undefined,
+};
+
+const Capture = struct {
+    path: CapturePath,
+    value: []const u8,
+};
+
+const CaptureList = std.ArrayListUnmanaged(Capture);
+
+fn pathHasPrefix(path: CapturePath, prefix: CapturePath) bool {
+    if (path.len < prefix.len) return false;
+    for (0..prefix.len) |index| {
+        if (path.indices[index] != prefix.indices[index]) return false;
+    }
+    return true;
 }
 
 pub const Bindings = struct {
     alloc: std.mem.Allocator,
     top_vars: std.StringHashMapUnmanaged([]const u8) = .empty,
     rep_vars: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    captures: std.StringHashMapUnmanaged(CaptureList) = .empty,
+    capture_log: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) Bindings {
         return .{ .alloc = alloc };
@@ -710,11 +867,13 @@ pub const Bindings = struct {
 
     pub fn deinit(self: *Bindings) void {
         self.top_vars.deinit(self.alloc);
-        var it = self.rep_vars.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit(self.alloc);
-        }
+        var rep_it = self.rep_vars.iterator();
+        while (rep_it.next()) |entry| entry.value_ptr.deinit(self.alloc);
         self.rep_vars.deinit(self.alloc);
+        var capture_it = self.captures.iterator();
+        while (capture_it.next()) |entry| entry.value_ptr.deinit(self.alloc);
+        self.captures.deinit(self.alloc);
+        self.capture_log.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -724,31 +883,88 @@ pub const Bindings = struct {
 
     pub fn addRep(self: *Bindings, name: []const u8, val: []const u8) !void {
         var gop = try self.rep_vars.getOrPut(self.alloc, name);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
-        }
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.alloc, val);
     }
 
+    fn addCapture(self: *Bindings, name: []const u8, value: []const u8, path: CapturePath) !void {
+        var gop = try self.captures.getOrPut(self.alloc, name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try self.capture_log.append(self.alloc, name);
+        errdefer self.capture_log.items.len -= 1;
+        try gop.value_ptr.append(self.alloc, .{ .path = path, .value = value });
+    }
+
+    fn mark(self: *const Bindings) usize {
+        return self.capture_log.items.len;
+    }
+
+    fn rollback(self: *Bindings, checkpoint: usize) void {
+        while (self.capture_log.items.len > checkpoint) {
+            const name = self.capture_log.items[self.capture_log.items.len - 1];
+            self.capture_log.items.len -= 1;
+            const list = self.captures.getPtr(name) orelse continue;
+            list.items.len -= 1;
+            if (list.items.len == 0) {
+                list.deinit(self.alloc);
+                _ = self.captures.remove(name);
+            }
+        }
+    }
+
+    fn hasCapture(self: *const Bindings, name: []const u8) bool {
+        return self.captures.get(name) != null;
+    }
+
+    fn getCapture(self: *const Bindings, name: []const u8, path: CapturePath) ?[]const u8 {
+        const list = self.captures.get(name) orelse return null;
+        var index = list.items.len;
+        while (index > 0) {
+            index -= 1;
+            const capture = list.items[index];
+            if (capture.path.len <= path.len and pathHasPrefix(path, capture.path)) {
+                return capture.value;
+            }
+        }
+        return null;
+    }
+
+    fn repetitionCount(self: *const Bindings, name: []const u8, prefix: CapturePath) ?usize {
+        const list = self.captures.get(name) orelse return null;
+        var found = false;
+        var count: usize = 0;
+        for (list.items) |capture| {
+            if (capture.path.len <= prefix.len or !pathHasPrefix(capture.path, prefix)) continue;
+            const index = capture.path.indices[prefix.len];
+            if (!found or index + 1 > count) count = index + 1;
+            found = true;
+        }
+        return if (found) count else null;
+    }
     pub fn getTop(self: *const Bindings, name: []const u8) ?[]const u8 {
-        return self.top_vars.get(name);
+        if (self.top_vars.get(name)) |value| return value;
+        const path: CapturePath = .{};
+        return self.getCapture(name, path);
     }
 
     pub fn getRep(self: *const Bindings, name: []const u8, idx: usize) ?[]const u8 {
         if (self.rep_vars.get(name)) |list| {
             if (idx < list.items.len) return list.items[idx];
         }
-        return null;
+        var path: CapturePath = .{};
+        path.len = 1;
+        path.indices[0] = idx;
+        return self.getCapture(name, path);
     }
+
     pub fn hasRep(self: *const Bindings, name: []const u8) bool {
-        return self.rep_vars.get(name) != null;
+        return self.rep_vars.get(name) != null or self.hasCapture(name);
     }
 
     pub fn getRepLen(self: *const Bindings, name: []const u8) usize {
-        if (self.rep_vars.get(name)) |list| {
-            return list.items.len;
-        }
-        return 0;
+        if (self.rep_vars.get(name)) |list| return list.items.len;
+        const path: CapturePath = .{};
+        return self.repetitionCount(name, path) orelse 0;
     }
 };
 
@@ -957,6 +1173,45 @@ fn parseTemplateDepth(
     return list.toOwnedSlice(alloc);
 }
 
+fn tokenPrefixMatches(input_text: []const u8, input_idx: usize, token: []const u8) bool {
+    if (token.len == 0 or input_idx + token.len > input_text.len) return false;
+    if (!std.mem.startsWith(u8, input_text[input_idx..], token)) return false;
+
+    const token_end = input_idx + token.len;
+    if (isIdentChar(token[token.len - 1]) and
+        token_end < input_text.len and
+        isIdentChar(input_text[token_end]))
+    {
+        return false;
+    }
+    if (token.len > 1 and token_end < input_text.len) {
+        const next = input_text[token_end];
+        switch (token[token.len - 1]) {
+            '=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', ':', '.' => {
+                if (next == token[token.len - 1]) return false;
+            },
+            else => {},
+        }
+    }
+    if (token.len == 1 and token_end < input_text.len) {
+        const next = input_text[token_end];
+        switch (token[0]) {
+            '=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', ':', '.' => {
+                if (next == token[0] or
+                    (token[0] == '=' and next == '>') or
+                    (token[0] == '-' and next == '>') or
+                    (token[0] == ':' and next == ':') or
+                    (token[0] == '.' and next == '.'))
+                {
+                    return false;
+                }
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
 fn scanUntilDelimited(
     input_text: []const u8,
     start: usize,
@@ -1013,30 +1268,146 @@ fn scanUntilDelimited(
             if (brace_depth > 0) brace_depth -= 1;
         } else if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
             if (next_elem) |ne| {
-                if (ne == .token) {
-                    if (std.mem.startsWith(u8, input_text[i..], ne.token)) {
-                        return i;
-                    }
+                if (ne == .token and tokenPrefixMatches(input_text, i, ne.token)) {
+                    return i;
                 }
             }
             if (sep) |s| {
-                if (std.mem.startsWith(u8, input_text[i..], s)) {
-                    return i;
-                }
+                if (tokenPrefixMatches(input_text, i, s)) return i;
             } else if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
-                // No explicit separator: a whitespace-separated repetition
-                // matcher like `$($len:expr)+` yields one value per token.
                 return i;
             }
             if (follow_tok) |ft| {
-                if (std.mem.startsWith(u8, input_text[i..], ft)) {
-                    return i;
-                }
+                if (tokenPrefixMatches(input_text, i, ft)) return i;
             }
         }
         i += 1;
     }
     return i;
+}
+
+const MacroMatchError = error{
+    OutOfMemory,
+    FragmentMismatch,
+    MacroRepetitionDepthExceeded,
+};
+
+fn pathWithIndex(path: CapturePath, index: usize) MacroMatchError!CapturePath {
+    if (path.len >= macro_repetition_depth_max) return error.MacroRepetitionDepthExceeded;
+    var result = path;
+    result.indices[result.len] = index;
+    result.len += 1;
+    return result;
+}
+
+fn matchSequence(
+    alloc: std.mem.Allocator,
+    elements: []const MatcherElement,
+    input_text: []const u8,
+    start: usize,
+    bindings: *Bindings,
+    path: CapturePath,
+    separator: ?[]const u8,
+    follow_tok: ?[]const u8,
+) MacroMatchError!?usize {
+    var input_idx = start;
+    for (elements, 0..) |elem, elem_idx| {
+        input_idx = skipWhitespaceAndComments(input_text, input_idx);
+        switch (elem) {
+            .token => |tok| {
+                if (!tokenPrefixMatches(input_text, input_idx, tok)) return null;
+                input_idx += tok.len;
+            },
+            .metavar => |mv| {
+                const next_elem = if (elem_idx + 1 < elements.len) elements[elem_idx + 1] else null;
+                const value_start = input_idx;
+                input_idx = scanUntilDelimited(
+                    input_text,
+                    input_idx,
+                    next_elem,
+                    separator,
+                    follow_tok,
+                );
+                const value = std.mem.trim(u8, input_text[value_start..input_idx], " \t\r\n");
+                if (value.len == 0) return null;
+                try validateMetavar(mv.kind, value);
+                try bindings.addCapture(mv.name, value, path);
+            },
+            .repetition => |rep| {
+                const next_elem = if (elem_idx + 1 < elements.len) elements[elem_idx + 1] else null;
+                const next_token = if (next_elem != null and next_elem.? == .token)
+                    next_elem.?.token
+                else
+                    separator;
+                input_idx = (try matchRepetition(
+                    alloc,
+                    rep,
+                    input_text,
+                    input_idx,
+                    bindings,
+                    path,
+                    next_token,
+                )) orelse return null;
+            },
+        }
+    }
+    return input_idx;
+}
+
+fn matchRepetition(
+    alloc: std.mem.Allocator,
+    repetition: @FieldType(MatcherElement, "repetition"),
+    input_text: []const u8,
+    start: usize,
+    bindings: *Bindings,
+    path: CapturePath,
+    follow_tok: ?[]const u8,
+) MacroMatchError!?usize {
+    var repetition_count: usize = 0;
+    var input_idx = start;
+    var next_start = start;
+
+    while (true) {
+        next_start = skipWhitespaceAndComments(input_text, next_start);
+        if (next_start >= input_text.len) break;
+        if (follow_tok) |token| {
+            if (tokenPrefixMatches(input_text, next_start, token)) break;
+        }
+
+        const binding_mark = bindings.mark();
+        const iteration_path = try pathWithIndex(path, repetition_count);
+        const iteration_end = (try matchSequence(
+            alloc,
+            repetition.elements,
+            input_text,
+            next_start,
+            bindings,
+            iteration_path,
+            repetition.separator orelse follow_tok,
+            follow_tok,
+        )) orelse {
+            bindings.rollback(binding_mark);
+            break;
+        };
+        if (iteration_end <= next_start) {
+            bindings.rollback(binding_mark);
+            break;
+        }
+        input_idx = iteration_end;
+        repetition_count += 1;
+        if (repetition.op == .zero_or_one) break;
+
+        if (repetition.separator) |separator| {
+            const separator_start = skipWhitespaceAndComments(input_text, input_idx);
+            if (!tokenPrefixMatches(input_text, separator_start, separator)) break;
+            next_start = separator_start + separator.len;
+        } else {
+            next_start = input_idx;
+        }
+    }
+
+    if (repetition.op == .one_or_more and repetition_count == 0) return null;
+    return input_idx;
 }
 
 pub fn matchPattern(
@@ -1045,174 +1416,126 @@ pub fn matchPattern(
     input_text: []const u8,
     bindings: *Bindings,
 ) !bool {
-    _ = alloc;
-    var input_idx: usize = 0;
-    var elem_idx: usize = 0;
-
-    while (elem_idx < elements.len) {
-        input_idx = skipWhitespaceAndComments(input_text, input_idx);
-        const elem = elements[elem_idx];
-
-        switch (elem) {
-            .token => |tok| {
-                if (input_idx + tok.len <= input_text.len and std.mem.startsWith(u8, input_text[input_idx..], tok)) {
-                    input_idx += tok.len;
-                    elem_idx += 1;
-                } else {
-                    return false;
-                }
-            },
-            .metavar => |mv| {
-                const next_elem = if (elem_idx + 1 < elements.len) elements[elem_idx + 1] else null;
-                const val_start = input_idx;
-                input_idx = scanUntilDelimited(input_text, input_idx, next_elem, null, null);
-                const val = std.mem.trim(u8, input_text[val_start..input_idx], " \t\r\n");
-                if (val.len == 0 or !metavarAccepts(mv.kind, val)) return false;
-                try bindings.setTop(mv.name, val);
-                elem_idx += 1;
-            },
-            .repetition => |rep| {
-                const next_elem = if (elem_idx + 1 < elements.len) elements[elem_idx + 1] else null;
-                const follow_tok = if (next_elem != null and next_elem.? == .token) next_elem.?.token else null;
-                var repetition_count: usize = 0;
-
-                while (true) {
-                    input_idx = skipWhitespaceAndComments(input_text, input_idx);
-                    if (input_idx >= input_text.len) break;
-                    if (follow_tok) |ft| {
-                        if (std.mem.startsWith(u8, input_text[input_idx..], ft)) break;
-                    }
-                    const repetition_start = input_idx;
-
-                    for (rep.elements, 0..) |inner_elem, j| {
-                        input_idx = skipWhitespaceAndComments(input_text, input_idx);
-                        switch (inner_elem) {
-                            .metavar => |mv| {
-                                const inner_next = if (j + 1 < rep.elements.len) rep.elements[j + 1] else null;
-                                const val_start = input_idx;
-                                input_idx = scanUntilDelimited(input_text, input_idx, inner_next, rep.separator, follow_tok);
-                                const val = std.mem.trim(u8, input_text[val_start..input_idx], " \t\r\n");
-                                if (val.len == 0 or !metavarAccepts(mv.kind, val)) return false;
-                                try bindings.addRep(mv.name, val);
-                            },
-                            .token => |tok| {
-                                if (input_idx + tok.len <= input_text.len and std.mem.startsWith(u8, input_text[input_idx..], tok)) {
-                                    input_idx += tok.len;
-                                } else {
-                                    return false;
-                                }
-                            },
-                            .repetition => {
-                                return error.InvalidMacroRepetition;
-                            },
-                        }
-                    }
-                    if (input_idx == repetition_start) return false;
-                    repetition_count += 1;
-                    if (rep.op == .zero_or_one) break;
-
-                    input_idx = skipWhitespaceAndComments(input_text, input_idx);
-                    if (rep.separator) |s| {
-                        if (input_idx + s.len <= input_text.len and std.mem.startsWith(u8, input_text[input_idx..], s)) {
-                            input_idx += s.len;
-                        } else if (follow_tok != null and std.mem.startsWith(u8, input_text[input_idx..], follow_tok.?)) {
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                if (rep.op == .one_or_more and repetition_count == 0) return false;
-                elem_idx += 1;
-            },
-        }
-    }
-
-    input_idx = skipWhitespaceAndComments(input_text, input_idx);
-    if (input_idx < input_text.len and (input_text[input_idx] == ',' or input_text[input_idx] == ';')) {
-        input_idx = skipWhitespaceAndComments(input_text, input_idx + 1);
-    }
-    return (input_idx >= input_text.len and elem_idx >= elements.len);
+    const path: CapturePath = .{};
+    const end = (try matchSequence(
+        alloc,
+        elements,
+        input_text,
+        0,
+        bindings,
+        path,
+        null,
+        null,
+    )) orelse return false;
+    const input_idx = skipWhitespaceAndComments(input_text, end);
+    return input_idx >= input_text.len;
 }
+
+const OutputBudget = struct {
+    token_count: usize = 0,
+    in_word: bool = false,
+    in_string: bool = false,
+    escaped: bool = false,
+
+    fn append(
+        self: *OutputBudget,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        text: []const u8,
+    ) !void {
+        for (text) |c| {
+            if (self.in_string) {
+                if (self.escaped) {
+                    self.escaped = false;
+                } else if (c == '\\') {
+                    self.escaped = true;
+                } else if (c == '"') {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                if (!self.in_word) self.token_count += 1;
+                self.in_string = true;
+                self.in_word = false;
+            } else if (std.ascii.isWhitespace(c)) {
+                self.in_word = false;
+            } else if (isIdentChar(c) or std.ascii.isDigit(c)) {
+                if (!self.in_word) self.token_count += 1;
+                self.in_word = true;
+            } else {
+                self.token_count += 1;
+                self.in_word = false;
+            }
+            if (self.token_count > macro_output_token_max) {
+                return error.MacroExpansionTokenLimit;
+            }
+        }
+        try out.appendSlice(alloc, text);
+    }
+};
 
 fn templateRepetitionCount(
     elements: []const TemplateElement,
     bindings: *const Bindings,
+    path: CapturePath,
 ) !usize {
     var count: ?usize = null;
-    var found_repetition_binding = false;
     for (elements) |elem| {
         switch (elem) {
             .text => {},
             .metavar => |var_name| {
-                if (bindings.hasRep(var_name)) {
-                    const len = bindings.getRepLen(var_name);
+                if (bindings.repetitionCount(var_name, path)) |length| {
                     if (count) |existing| {
-                        if (existing != len) return error.InvalidMacroRepetition;
+                        if (existing != length) return error.InvalidMacroRepetition;
                     } else {
-                        count = len;
+                        count = length;
                     }
-                    found_repetition_binding = true;
-                } else if (bindings.getTop(var_name) == null) {
-                    return error.UnboundMacroRepetition;
                 }
             },
-            .repetition => {
-                // Matching nested repetitions is not supported by the flat
-                // binding store. Reject instead of guessing an index.
-                return error.InvalidMacroRepetition;
+            .repetition => |nested| {
+                const nested_count = try templateRepetitionCount(nested.elements, bindings, path);
+                if (count) |existing| {
+                    if (existing != nested_count) return error.InvalidMacroRepetition;
+                } else {
+                    count = nested_count;
+                }
             },
         }
     }
-    if (!found_repetition_binding) return error.UnboundMacroRepetition;
-    return count.?;
+    return count orelse error.UnboundMacroRepetition;
 }
 
 fn expandTemplateElements(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
+    budget: *OutputBudget,
     elements: []const TemplateElement,
     bindings: *const Bindings,
-    rep_idx: ?usize,
+    path: CapturePath,
 ) !void {
     for (elements) |elem| {
         switch (elem) {
-            .text => |t| {
-                try out.appendSlice(alloc, t);
-            },
+            .text => |text| try budget.append(alloc, out, text),
             .metavar => |var_name| {
-                if (rep_idx) |idx| {
-                    if (bindings.hasRep(var_name)) {
-                        const val = bindings.getRep(var_name, idx) orelse
-                            return error.UnboundMacroRepetition;
-                        try out.appendSlice(alloc, val);
-                    } else if (bindings.getTop(var_name)) |val| {
-                        try out.appendSlice(alloc, val);
-                    } else {
-                        return error.UnboundMacroVariable;
-                    }
-                } else if (bindings.getTop(var_name)) |val| {
-                    try out.appendSlice(alloc, val);
-                } else if (bindings.hasRep(var_name)) {
-                    return error.UnboundMacroRepetition;
-                } else {
-                    return error.UnboundMacroVariable;
-                }
+                const value = bindings.getCapture(var_name, path) orelse
+                    return if (bindings.hasRep(var_name))
+                        error.UnboundMacroRepetition
+                    else
+                        error.UnboundMacroVariable;
+                try budget.append(alloc, out, value);
             },
             .repetition => |rep| {
-                const count = try templateRepetitionCount(rep.elements, bindings);
-                if (rep.op == .one_or_more and count == 0) {
-                    return error.InvalidMacroRepetition;
-                }
-                if (rep.op == .zero_or_one and count > 1) {
-                    return error.InvalidMacroRepetition;
-                }
-                for (0..count) |idx| {
-                    if (idx > 0 and rep.separator != null) {
-                        try out.appendSlice(alloc, rep.separator.?);
-                        try out.appendSlice(alloc, "\n");
+                const count = try templateRepetitionCount(rep.elements, bindings, path);
+                if (rep.op == .one_or_more and count == 0) return error.InvalidMacroRepetition;
+                if (rep.op == .zero_or_one and count > 1) return error.InvalidMacroRepetition;
+                for (0..count) |index| {
+                    if (index > 0 and rep.separator != null) {
+                        try budget.append(alloc, out, rep.separator.?);
+                        try budget.append(alloc, out, "\n");
                     }
-                    try expandTemplateElements(alloc, out, rep.elements, bindings, idx);
+                    const child_path = try pathWithIndex(path, index);
+                    try expandTemplateElements(alloc, out, budget, rep.elements, bindings, child_path);
                 }
             },
         }
@@ -1226,22 +1549,31 @@ pub fn expandMacroRules(
 ) ![]const u8 {
     const trimmed_args = try getEnclosedContent(raw_args);
     if (def.rules.len == 0) return error.InvalidMacroDefinition;
+    var saw_fragment_mismatch = false;
     for (def.rules) |rule| {
         var bindings = Bindings.init(alloc);
         defer bindings.deinit();
 
-        if (try matchPattern(alloc, rule.matcher, trimmed_args, &bindings)) {
-            var out: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer out.deinit(alloc);
-            try expandTemplateElements(alloc, &out, rule.template, &bindings, null);
-            if (std.mem.trim(u8, out.items, " \t\r\n").len == 0) {
-                return error.EmptyMacroExpansion;
-            }
-            const expanded: []const u8 = try out.toOwnedSlice(alloc);
-            return expanded;
+        const matched = matchPattern(alloc, rule.matcher, trimmed_args, &bindings) catch |err| switch (err) {
+            error.FragmentMismatch => {
+                saw_fragment_mismatch = true;
+                continue;
+            },
+            else => return err,
+        };
+        if (!matched) continue;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(alloc);
+        var budget: OutputBudget = .{};
+        try expandTemplateElements(alloc, &out, &budget, rule.template, &bindings, .{});
+        if (std.mem.trim(u8, out.items, " \t\r\n").len == 0) {
+            return error.EmptyMacroExpansion;
         }
+        const expanded = try out.toOwnedSlice(alloc);
+        return expanded;
     }
-    return error.UnmatchedMacroRule;
+    return if (saw_fragment_mismatch) error.FragmentMismatch else error.UnmatchedMacroRule;
 }
 
 pub fn parseMacroRulesDefinition(alloc: std.mem.Allocator, raw_def: []const u8) !MacroDef {

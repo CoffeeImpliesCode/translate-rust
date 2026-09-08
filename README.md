@@ -23,7 +23,8 @@ Current positive end-to-end paths are:
 
 Current rejection coverage is:
 
-- The `fletcher` and `crc16` source fixtures reject macros outside the supported subset.
+- The `fletcher` fixture rejects the external `quickcheck!` macro with `ExternalMacroSourceUnavailable`.
+- The `crc16` fixture rejects the generated `tables.rs` include with `BuildScriptArtifactUnavailable`; build scripts are not executed.
 - The legacy wire corpus rejects `fnv`, `fletcher`, `hex`, `wyhash`, `adler`, `xxhash-rust`, and `seahash`.
 - It also rejects `crc16`, `atoi`, `leb128`, `itoa`, `siphasher`, `percent-encoding`, and `syn`.
 

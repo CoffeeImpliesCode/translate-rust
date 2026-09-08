@@ -260,9 +260,138 @@ test "expandMacroRules rejects unmatched invocations" {
     defer def.deinit(alloc);
 
     try std.testing.expectError(
-        error.UnmatchedMacroRule,
+        error.FragmentMismatch,
         expand.expandMacroRules(alloc, def, "(123)"),
     );
+}
+
+test "expandMacroRules rejects separators absent from matcher" {
+    const alloc = std.testing.allocator;
+    var def = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! literal { (a) => { struct A; }; }",
+    );
+    defer def.deinit(alloc);
+
+    try std.testing.expectError(
+        error.UnmatchedMacroRule,
+        expand.expandMacroRules(alloc, def, "(a,)"),
+    );
+    try std.testing.expectError(
+        error.UnmatchedMacroRule,
+        expand.expandMacroRules(alloc, def, "(a;)"),
+    );
+}
+
+test "expandMacroRules recursively matches nested repetitions" {
+    const alloc = std.testing.allocator;
+    var def = try expand.parseMacroRulesDefinition(alloc,
+        \\macro_rules! nested {
+        \\    ($($( $x:ident ),*);*) => { $( $( struct $x; )* )* };
+        \\}
+    );
+    defer def.deinit(alloc);
+
+    const expanded = try expand.expandMacroRules(alloc, def, "(a,b; c,d)");
+    defer alloc.free(expanded);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "struct a;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "struct b;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "struct c;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "struct d;") != null);
+}
+
+test "expandMacroRules rejects repetition depth overflow" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(alloc);
+    try raw.appendSlice(alloc, "macro_rules! deep { (");
+    for (0..expand.macro_repetition_depth_max + 1) |_| {
+        try raw.appendSlice(alloc, "$(");
+    }
+    try raw.appendSlice(alloc, "$x:ident");
+    for (0..expand.macro_repetition_depth_max + 1) |_| {
+        try raw.appendSlice(alloc, ")*");
+    }
+    try raw.appendSlice(alloc, ") => { $x }; }");
+
+    var def = try expand.parseMacroRulesDefinition(alloc, raw.items);
+    defer def.deinit(alloc);
+    try std.testing.expectError(
+        error.MacroRepetitionDepthExceeded,
+        expand.expandMacroRules(alloc, def, "(x)"),
+    );
+}
+
+test "expandMacroRules rejects expansion token overflow" {
+    const alloc = std.testing.allocator;
+    var def = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! many { ($($x:ident),*) => { $( $x ; )* }; }",
+    );
+    defer def.deinit(alloc);
+
+    var args: std.ArrayListUnmanaged(u8) = .empty;
+    defer args.deinit(alloc);
+    try args.append(alloc, '(');
+    for (0..expand.macro_output_token_max + 1) |index| {
+        if (index != 0) try args.appendSlice(alloc, ",");
+        try args.appendSlice(alloc, "x");
+    }
+    try args.append(alloc, ')');
+
+    try std.testing.expectError(
+        error.MacroExpansionTokenLimit,
+        expand.expandMacroRules(alloc, def, args.items),
+    );
+}
+
+test "expandMacroRules rejects fragment mismatches explicitly" {
+    const alloc = std.testing.allocator;
+    var ident_def = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! ident_only { ($value:ident) => { $value }; }",
+    );
+    defer ident_def.deinit(alloc);
+    try std.testing.expectError(
+        error.FragmentMismatch,
+        expand.expandMacroRules(alloc, ident_def, "(123)"),
+    );
+
+    var expr_def = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! expr_only { ($value:expr) => { $value }; }",
+    );
+    defer expr_def.deinit(alloc);
+    try std.testing.expectError(
+        error.FragmentMismatch,
+        expand.expandMacroRules(alloc, expr_def, "(???)"),
+    );
+}
+
+test "expandMacroRules accepts raw identifiers as ident fragments" {
+    const alloc = std.testing.allocator;
+    var def = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! raw_ident { ($value:ident) => { $value }; }",
+    );
+    defer def.deinit(alloc);
+
+    const expanded = try expand.expandMacroRules(alloc, def, "(r#type)");
+    defer alloc.free(expanded);
+    try std.testing.expectEqualStrings(" r#type ", expanded);
+}
+
+test "expandMacroRules matches literal identifiers at token boundaries" {
+    const alloc = std.testing.allocator;
+    var def = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! choose { (foo $tail:ident) => { struct Wrong; }; (foobar) => { struct Correct; }; }",
+    );
+    defer def.deinit(alloc);
+
+    const expanded = try expand.expandMacroRules(alloc, def, "(foobar)");
+    defer alloc.free(expanded);
+    try std.testing.expectEqualStrings(" struct Correct; ", expanded);
 }
 
 test "expandMacroRules rejects unbound template metavariables" {
@@ -571,7 +700,7 @@ test "expandMacroRules rejects unmatched args" {
     var def = try expand.parseMacroRulesDefinition(alloc, raw_def);
     defer def.deinit(alloc);
     try std.testing.expectError(
-        error.UnmatchedMacroRule,
+        error.FragmentMismatch,
         expand.expandMacroRules(alloc, def, "(a, 123)"),
     );
 }
@@ -786,14 +915,18 @@ test "cst rejects unresolved impl and macro paths" {
         "trait Display { fn value(); } impl Display for Missing { fn value() {} }",
         null,
     );
-    try expectCstError(error.UnknownMacro, "unknown_item_macro!(Value);", null);
     try expectCstError(
-        error.UnmatchedMacroRule,
+        error.ExternalMacroSourceUnavailable,
+        "unknown_item_macro!(Value);",
+        null,
+    );
+    try expectCstError(
+        error.FragmentMismatch,
         "macro_rules! make { ($name:ident) => { struct $name; }; } make!(123);",
         null,
     );
     try expectCstError(
-        error.UnknownMacro,
+        error.ExternalMacroSourceUnavailable,
         "module::unknown_item_macro!(Value);",
         null,
     );
