@@ -18,6 +18,8 @@ pub const MacroKind = enum {
     println,
     eprintln,
     format,
+    write,
+    writeln,
     custom,
 };
 
@@ -44,6 +46,8 @@ pub fn identifyMacro(name: []const u8) MacroKind {
     if (std.mem.eql(u8, ident, "println")) return .println;
     if (std.mem.eql(u8, ident, "eprintln")) return .eprintln;
     if (std.mem.eql(u8, ident, "format")) return .format;
+    if (std.mem.eql(u8, ident, "write")) return .write;
+    if (std.mem.eql(u8, ident, "writeln")) return .writeln;
     return .custom;
 }
 
@@ -58,24 +62,53 @@ pub fn isTestingAssert(kind: MacroKind) bool {
 /// Returns the index of the closing single quote for a char literal whose
 /// opening single quote is at `start`, or `null` if the literal is unterminated
 /// (e.g. a Rust lifetime like `'a` in an argument position). Handles escapes
-/// (`\'`, `'\n'`, `'\u{...}'`, ...) so an escaped quote is not treated as the
-/// terminator.
+/// (`\'`, `'\n'`, `'\x41'`, `'\u{...}'`, ...) so an escaped quote is not treated
+/// as the terminator.
 fn findCharEnd(s: []const u8, start: usize) ?usize {
+    if (start >= s.len or s[start] != '\'') return null;
     if (start + 2 >= s.len) return null;
     var i: usize = start + 1;
     if (s[i] == '\\') {
         i += 1;
-        if (i < s.len and s[i] == 'u') {
-            while (i < s.len and s[i] != '}') : (i += 1) {}
-            if (i >= s.len) return null;
-            i += 1;
-        } else if (i < s.len) {
-            i += 1;
+        if (i >= s.len) return null;
+        switch (s[i]) {
+            'u' => {
+                i += 1;
+                if (i >= s.len or s[i] != '{') return null;
+                i += 1;
+                const digits_start = i;
+                while (i < s.len and std.ascii.isHex(s[i])) : (i += 1) {}
+                if (i == digits_start or i >= s.len or s[i] != '}') return null;
+                i += 1;
+            },
+            'x' => {
+                i += 1;
+                if (i + 2 > s.len) return null;
+                if (!std.ascii.isHex(s[i]) or !std.ascii.isHex(s[i + 1])) return null;
+                i += 2;
+            },
+            else => i += 1,
         }
     } else {
         i += 1;
     }
     if (i < s.len and s[i] == '\'') return i;
+    return null;
+}
+
+fn findStringEnd(s: []const u8, start: usize) ?usize {
+    if (start >= s.len or s[start] != '"') return null;
+    var i = start + 1;
+    var escaped = false;
+    while (i < s.len) : (i += 1) {
+        if (escaped) {
+            escaped = false;
+        } else if (s[i] == '\\') {
+            escaped = true;
+        } else if (s[i] == '"') {
+            return i;
+        }
+    }
     return null;
 }
 
@@ -737,11 +770,14 @@ fn isLiteralFragment(value: []const u8) bool {
     {
         return tokenStreamIsValid(value);
     }
+    if (value.len >= 3 and value[0] == 'b' and value[1] == '\'') {
+        return tokenStreamIsValid(value);
+    }
+    const has_raw_prefix = value.len > 0 and
+        (value[0] == 'r' or (value.len > 1 and value[0] == 'b' and value[1] == 'r'));
     if (std.mem.startsWith(u8, value, "r\"") or
-        std.mem.startsWith(u8, value, "r#\"") or
         std.mem.startsWith(u8, value, "b\"") or
-        std.mem.startsWith(u8, value, "br\"") or
-        std.mem.startsWith(u8, value, "br#\""))
+        (has_raw_prefix and rawLiteralHasQuote(value)))
     {
         return tokenStreamIsValid(value);
     }
@@ -752,8 +788,95 @@ fn isLiteralFragment(value: []const u8) bool {
     return true;
 }
 
+fn rawLiteralHasQuote(value: []const u8) bool {
+    const prefix_len: usize = if (value[0] == 'r') 1 else 2;
+    if (value.len <= prefix_len) return false;
+    var marker = prefix_len;
+    while (marker < value.len and value[marker] == '#') : (marker += 1) {}
+    return marker < value.len and value[marker] == '"';
+}
+
+fn hasTopLevelComma(value: []const u8) bool {
+    var paren_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    var index: usize = 0;
+    while (index < value.len) {
+        if (value[index] == '/' and index + 1 < value.len) {
+            if (value[index + 1] == '/') {
+                index += 2;
+                while (index < value.len and value[index] != '\n') : (index += 1) {}
+                continue;
+            }
+            if (value[index + 1] == '*') {
+                const close = findBlockCommentEnd(value, index) orelse return false;
+                index = close + 1;
+                continue;
+            }
+        }
+        if (value[index] == 'r' or
+            (value[index] == 'b' and index + 1 < value.len and value[index + 1] == 'r'))
+        {
+            const prefix_len: usize = if (value[index] == 'r') 1 else 2;
+            var marker = index + prefix_len;
+            while (marker < value.len and value[marker] == '#') : (marker += 1) {}
+            if (marker < value.len and value[marker] == '"') {
+                const hash_count = marker - index - prefix_len;
+                const close = findRawStringEnd(value, marker + 1, hash_count) orelse return false;
+                index = close + 1;
+                continue;
+            }
+        }
+        if (value[index] == '"') {
+            index += 1;
+            var escaped = false;
+            while (index < value.len) : (index += 1) {
+                if (escaped) {
+                    escaped = false;
+                } else if (value[index] == '\\') {
+                    escaped = true;
+                } else if (value[index] == '"') {
+                    index += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (value[index] == '\'') {
+            if (findCharEnd(value, index)) |close| {
+                index = close + 1;
+                continue;
+            }
+            if (index + 1 < value.len and isIdentStart(value[index + 1])) {
+                index += 1;
+                continue;
+            }
+            return false;
+        }
+        switch (value[index]) {
+            '(' => paren_depth += 1,
+            ')' => {
+                if (paren_depth > 0) paren_depth -= 1;
+            },
+            '[' => bracket_depth += 1,
+            ']' => {
+                if (bracket_depth > 0) bracket_depth -= 1;
+            },
+            '{' => brace_depth += 1,
+            '}' => {
+                if (brace_depth > 0) brace_depth -= 1;
+            },
+            ',' => if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0) return true,
+            else => {},
+        }
+        index += 1;
+    }
+    return false;
+}
+
 fn isExpressionFragment(value: []const u8) bool {
     if (!tokenStreamIsValid(value)) return false;
+    if (std.mem.indexOfScalar(u8, value, ',') != null and hasTopLevelComma(value)) return false;
     if (std.mem.eql(u8, value, "???") or std.mem.indexOf(u8, value, "??") != null) return false;
     if (value[0] == ';' or value[0] == ',' or value[0] == '+') return false;
     const keywords = [_][]const u8{
@@ -1218,6 +1341,7 @@ fn scanUntilDelimited(
     next_elem: ?MatcherElement,
     sep: ?[]const u8,
     follow_tok: ?[]const u8,
+    stop_at_whitespace: bool,
 ) usize {
     var i = start;
     var paren_depth: usize = 0;
@@ -1274,7 +1398,7 @@ fn scanUntilDelimited(
             }
             if (sep) |s| {
                 if (tokenPrefixMatches(input_text, i, s)) return i;
-            } else if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            } else if (stop_at_whitespace and std.ascii.isWhitespace(c)) {
                 return i;
             }
             if (follow_tok) |ft| {
@@ -1327,6 +1451,10 @@ fn matchSequence(
                     next_elem,
                     separator,
                     follow_tok,
+                    if (next_elem) |next|
+                        next != .token
+                    else
+                        path.len > 0 and separator == null and follow_tok == null,
                 );
                 const value = std.mem.trim(u8, input_text[value_start..input_idx], " \t\r\n");
                 if (value.len == 0) return null;
@@ -1689,12 +1817,652 @@ pub fn parseMacroRulesDefinition(alloc: std.mem.Allocator, raw_def: []const u8) 
     };
 }
 
-pub const MacroTable = struct {
+/// Configuration used when evaluating `cfg` attributes during source macro
+/// expansion. The defaults match the frontend's disabled-feature behavior.
+pub const MacroSourceOptions = struct {
+    features: []const []const u8 = &.{},
+    target_pointer_width: ?u16 = null,
+    docsrs: bool = false,
+    include_tests: bool = false,
+    expansion_depth_max: usize = 64,
+};
+
+const SourceCfgState = enum {
+    none,
+    enabled,
+    disabled,
+};
+
+const SourceCfgAttribute = struct {
+    end: usize,
+    state: SourceCfgState,
+};
+
+const SourceAttributePrefix = struct {
+    end: usize,
+    disabled: bool,
+};
+
+const SourceMacroInvocation = struct {
+    name: []const u8,
+    end: usize,
+};
+
+const MacroScope = struct {
     alloc: std.mem.Allocator,
     macros: std.StringHashMapUnmanaged(MacroDef) = .empty,
 
+    fn init(alloc: std.mem.Allocator) MacroScope {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *MacroScope) void {
+        var values = self.macros.valueIterator();
+        while (values.next()) |definition| {
+            definition.deinit(self.alloc);
+        }
+        self.macros.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn register(self: *MacroScope, definition: MacroDef) !void {
+        if (self.macros.get(definition.name)) |old_definition| {
+            _ = self.macros.remove(definition.name);
+            var owned_old = old_definition;
+            owned_old.deinit(self.alloc);
+        }
+        try self.macros.put(self.alloc, definition.name, definition);
+    }
+
+    fn get(self: *const MacroScope, name: []const u8) ?MacroDef {
+        return self.macros.get(name);
+    }
+};
+
+const MacroScopeStack = struct {
+    alloc: std.mem.Allocator,
+    outer: *const MacroTable,
+    scopes: std.ArrayListUnmanaged(MacroScope) = .empty,
+
+    fn init(alloc: std.mem.Allocator, outer: *const MacroTable) MacroScopeStack {
+        return .{ .alloc = alloc, .outer = outer };
+    }
+
+    fn deinit(self: *MacroScopeStack) void {
+        while (self.scopes.items.len > 0) {
+            var scope = self.scopes.pop().?;
+            scope.deinit();
+        }
+        self.scopes.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn push(self: *MacroScopeStack) !void {
+        try self.scopes.append(self.alloc, MacroScope.init(self.alloc));
+    }
+
+    fn pop(self: *MacroScopeStack) void {
+        var scope = self.scopes.pop() orelse return;
+        scope.deinit();
+    }
+
+    fn register(self: *MacroScopeStack, definition: MacroDef) !void {
+        if (self.scopes.items.len == 0) return error.MacroScopeUnavailable;
+        try self.scopes.items[self.scopes.items.len - 1].register(definition);
+    }
+
+    fn get(self: *const MacroScopeStack, name: []const u8) ?MacroDef {
+        var index = self.scopes.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.scopes.items[index].get(name)) |definition| return definition;
+        }
+        return self.outer.get(name);
+    }
+};
+
+fn sourceCfgSkipWhitespace(input: []const u8, index: *usize) void {
+    while (index.* < input.len and
+        (input[index.*] == ' ' or input[index.*] == '\t' or
+            input[index.*] == '\r' or input[index.*] == '\n'))
+    {
+        index.* += 1;
+    }
+}
+
+fn sourceCfgIdentifier(input: []const u8, index: *usize) ?[]const u8 {
+    sourceCfgSkipWhitespace(input, index);
+    const start = index.*;
+    while (index.* < input.len and
+        (std.ascii.isAlphanumeric(input[index.*]) or input[index.*] == '_'))
+    {
+        index.* += 1;
+    }
+    if (index.* == start) return null;
+    return input[start..index.*];
+}
+
+fn sourceCfgString(input: []const u8, index: *usize) ![]const u8 {
+    sourceCfgSkipWhitespace(input, index);
+    if (index.* >= input.len or input[index.*] != '"') {
+        return error.UnsupportedCfgPredicate;
+    }
+    index.* += 1;
+    const start = index.*;
+    while (index.* < input.len and input[index.*] != '"') {
+        if (input[index.*] == '\\') return error.UnsupportedCfgPredicate;
+        index.* += 1;
+    }
+    if (index.* >= input.len) return error.UnsupportedCfgPredicate;
+    const result = input[start..index.*];
+    index.* += 1;
+    return result;
+}
+
+fn sourceCfgExpect(input: []const u8, index: *usize, expected: u8) !void {
+    sourceCfgSkipWhitespace(input, index);
+    if (index.* >= input.len or input[index.*] != expected) {
+        return error.UnsupportedCfgPredicate;
+    }
+    index.* += 1;
+}
+
+fn sourceCfgFeatureEnabled(options: MacroSourceOptions, feature: []const u8) bool {
+    for (options.features) |enabled| {
+        if (std.mem.eql(u8, enabled, feature)) return true;
+    }
+    return false;
+}
+
+fn sourceCfgTargetBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "unix") or
+        std.mem.eql(u8, name, "windows") or
+        std.mem.eql(u8, name, "target_os") or
+        std.mem.eql(u8, name, "target_arch") or
+        std.mem.eql(u8, name, "target_env") or
+        std.mem.eql(u8, name, "target_family") or
+        std.mem.eql(u8, name, "target_vendor") or
+        std.mem.eql(u8, name, "debug_assertions") or
+        std.mem.eql(u8, name, "panic") or
+        std.mem.eql(u8, name, "proc_macro") or
+        std.mem.eql(u8, name, "miri") or
+        std.mem.eql(u8, name, "sanitize");
+}
+
+fn sourceCfgPredicate(
+    input: []const u8,
+    index: *usize,
+    options: MacroSourceOptions,
+) !bool {
+    const name = sourceCfgIdentifier(input, index) orelse
+        return error.UnsupportedCfgPredicate;
+    if (std.mem.eql(u8, name, "feature")) {
+        try sourceCfgExpect(input, index, '=');
+        return sourceCfgFeatureEnabled(options, try sourceCfgString(input, index));
+    }
+    if (std.mem.eql(u8, name, "target_pointer_width")) {
+        try sourceCfgExpect(input, index, '=');
+        const target_text = try sourceCfgString(input, index);
+        const target_width = std.fmt.parseInt(u16, target_text, 10) catch
+            return error.UnsupportedCfgPredicate;
+        const configured_width = options.target_pointer_width orelse @as(u16, @bitSizeOf(usize));
+        return configured_width == target_width;
+    }
+    if (std.mem.eql(u8, name, "test")) return options.include_tests;
+    if (std.mem.eql(u8, name, "docsrs")) return options.docsrs;
+    if (std.mem.eql(u8, name, "not")) {
+        try sourceCfgExpect(input, index, '(');
+        const value = try sourceCfgPredicate(input, index, options);
+        try sourceCfgExpect(input, index, ')');
+        return !value;
+    }
+
+    const is_all = std.mem.eql(u8, name, "all");
+    const is_any = std.mem.eql(u8, name, "any");
+    if (!is_all and !is_any) {
+        if (sourceCfgTargetBuiltin(name)) return error.UnsupportedCfgPredicate;
+        sourceCfgSkipWhitespace(input, index);
+        if (index.* < input.len and
+            (input[index.*] == '=' or input[index.*] == '('))
+        {
+            return error.UnsupportedCfgPredicate;
+        }
+        return false;
+    }
+
+    try sourceCfgExpect(input, index, '(');
+    sourceCfgSkipWhitespace(input, index);
+    if (index.* < input.len and input[index.*] == ')') {
+        index.* += 1;
+        return is_all;
+    }
+
+    var value = is_all;
+    while (true) {
+        const operand = try sourceCfgPredicate(input, index, options);
+        value = if (is_all) value and operand else value or operand;
+        sourceCfgSkipWhitespace(input, index);
+        if (index.* >= input.len) return error.UnsupportedCfgPredicate;
+        if (input[index.*] == ')') {
+            index.* += 1;
+            return value;
+        }
+        if (input[index.*] != ',') return error.UnsupportedCfgPredicate;
+        index.* += 1;
+    }
+}
+
+fn sourceCfgPredicateText(input: []const u8, options: MacroSourceOptions) !bool {
+    var index: usize = 0;
+    const value = try sourceCfgPredicate(input, &index, options);
+    sourceCfgSkipWhitespace(input, &index);
+    if (index != input.len) return error.UnsupportedCfgPredicate;
+    return value;
+}
+
+fn sourceCfgAttributeAt(
+    source: []const u8,
+    start: usize,
+    end: usize,
+    options: MacroSourceOptions,
+) !?SourceCfgAttribute {
+    if (start >= end or source[start] != '#') return null;
+    const bracket = if (start + 1 < end and source[start + 1] == '[')
+        start + 1
+    else if (start + 2 < end and source[start + 1] == '!' and source[start + 2] == '[')
+        start + 2
+    else
+        return null;
+    const close = try findClosingDelimiterChecked(source, bracket);
+    if (close >= end) return error.MalformedMacroInvocation;
+
+    const attr_end = close + 1;
+    const body_start = bracket + 1;
+    const body = std.mem.trim(u8, source[body_start..close], " \t\r\n");
+    if (std.mem.startsWith(u8, body, "cfg(") and body.len >= 5 and body[body.len - 1] == ')') {
+        const enabled = try sourceCfgPredicateText(body[4 .. body.len - 1], options);
+        return .{ .end = attr_end, .state = if (enabled) .enabled else .disabled };
+    }
+    if (std.mem.startsWith(u8, body, "cfg_attr(") and
+        body.len >= 10 and body[body.len - 1] == ')')
+    {
+        const inner = body[9 .. body.len - 1];
+        var depth: usize = 0;
+        var in_string = false;
+        var escaped = false;
+        var separator: ?usize = null;
+        for (inner, 0..) |character, index| {
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (character == '\\') {
+                    escaped = true;
+                } else if (character == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (character == '"') {
+                in_string = true;
+            } else if (character == '(') {
+                depth += 1;
+            } else if (character == ')') {
+                if (depth == 0) return error.UnsupportedCfgPredicate;
+                depth -= 1;
+            } else if (character == ',' and depth == 0) {
+                separator = index;
+                break;
+            }
+        }
+        const split = separator orelse return error.UnsupportedCfgPredicate;
+        const condition = std.mem.trim(u8, inner[0..split], " \t\r\n");
+        const payload = std.mem.trim(u8, inner[split + 1 ..], " \t\r\n");
+        if (condition.len == 0 or payload.len == 0) return error.UnsupportedCfgPredicate;
+        if (!try sourceCfgPredicateText(condition, options)) {
+            return .{ .end = attr_end, .state = .none };
+        }
+        if (std.mem.startsWith(u8, payload, "cfg(") and
+            payload.len >= 5 and payload[payload.len - 1] == ')')
+        {
+            const enabled = try sourceCfgPredicateText(payload[4 .. payload.len - 1], options);
+            return .{ .end = attr_end, .state = if (enabled) .enabled else .disabled };
+        }
+    }
+    return .{ .end = attr_end, .state = .none };
+}
+
+fn sourceAttributePrefixAt(
+    source: []const u8,
+    start: usize,
+    end: usize,
+    options: MacroSourceOptions,
+) !?SourceAttributePrefix {
+    if (start >= end or source[start] != '#') return null;
+    var cursor = start;
+    var found = false;
+    var disabled = false;
+    while (cursor < end and source[cursor] == '#') {
+        const attribute = (try sourceCfgAttributeAt(source, cursor, end, options)) orelse break;
+        found = true;
+        if (attribute.state == .disabled) disabled = true;
+        const next = skipWhitespaceAndComments(source, attribute.end);
+        cursor = if (next > end) end else next;
+    }
+    if (!found) return null;
+    return .{ .end = cursor, .disabled = disabled };
+}
+
+fn sourceMacroDefinitionAt(source: []const u8, start: usize, end: usize) ?usize {
+    const keyword = "macro_rules!";
+    if (start + keyword.len > end or !std.mem.startsWith(u8, source[start..end], keyword)) {
+        return null;
+    }
+    if (start + keyword.len < end and isIdentChar(source[start + keyword.len])) return null;
+    var cursor = skipWhitespaceAndComments(source, start + keyword.len);
+    if (cursor >= end or !isIdentStart(source[cursor])) return null;
+    while (cursor < end and isIdentChar(source[cursor])) : (cursor += 1) {}
+    cursor = skipWhitespaceAndComments(source, cursor);
+    if (cursor >= end or
+        (source[cursor] != '(' and source[cursor] != '[' and source[cursor] != '{'))
+    {
+        return null;
+    }
+    const close = findClosingDelimiterChecked(source, cursor) catch return null;
+    if (close >= end) return null;
+    const next = skipWhitespaceAndComments(source, close + 1);
+    cursor = if (next > end) end else next;
+    if (cursor < end and source[cursor] == ';') cursor += 1;
+    return cursor;
+}
+
+fn sourceMacroNameEnd(source: []const u8, start: usize, end: usize) ?usize {
+    if (start >= end or !isIdentStart(source[start])) return null;
+    var cursor = start;
+    while (cursor < end and isIdentChar(source[cursor])) : (cursor += 1) {}
+    while (cursor + 2 < end and source[cursor] == ':' and source[cursor + 1] == ':') {
+        cursor = skipWhitespaceAndComments(source, cursor + 2);
+        if (cursor >= end or !isIdentStart(source[cursor])) return null;
+        while (cursor < end and isIdentChar(source[cursor])) : (cursor += 1) {}
+    }
+    return cursor;
+}
+
+fn sourceMacroInvocationAt(source: []const u8, start: usize, end: usize) ?SourceMacroInvocation {
+    const name_end = sourceMacroNameEnd(source, start, end) orelse return null;
+    var cursor = skipWhitespaceAndComments(source, name_end);
+    if (cursor >= end or source[cursor] != '!') return null;
+    cursor = skipWhitespaceAndComments(source, cursor + 1);
+    if (cursor >= end or
+        (source[cursor] != '(' and source[cursor] != '[' and source[cursor] != '{'))
+    {
+        return null;
+    }
+    const close = findClosingDelimiterChecked(source, cursor) catch return null;
+    if (close >= end) return null;
+    return .{ .name = source[start..name_end], .end = close + 1 };
+}
+
+fn sourceLiteralEnd(source: []const u8, start: usize, end: usize) !?usize {
+    if (start >= end) return null;
+    if (start + 1 < end and source[start] == '/' and source[start + 1] == '/') {
+        var cursor = start + 2;
+        while (cursor < end and source[cursor] != '\n') : (cursor += 1) {}
+        return cursor;
+    }
+    if (start + 1 < end and source[start] == '/' and source[start + 1] == '*') {
+        const close = findBlockCommentEnd(source, start) orelse return null;
+        return close + 1;
+    }
+    if (source[start] == '"') {
+        const close = findStringEnd(source, start) orelse
+            return error.MalformedMacroInvocation;
+        if (close >= end) return error.MalformedMacroInvocation;
+        return close + 1;
+    }
+    if (source[start] == '\'') {
+        const close = findCharEnd(source, start) orelse return null;
+        if (close >= end) return error.MalformedMacroInvocation;
+        return close + 1;
+    }
+    if (source[start] == 'r' or
+        (source[start] == 'b' and start + 1 < end and source[start + 1] == 'r'))
+    {
+        const prefix_len: usize = if (source[start] == 'r') 1 else 2;
+        var marker = start + prefix_len;
+        while (marker < end and source[marker] == '#') : (marker += 1) {}
+        if (marker < end and source[marker] == '"') {
+            const hash_count = marker - start - prefix_len;
+            const close = findRawStringEnd(source, marker + 1, hash_count) orelse
+                return error.MalformedMacroInvocation;
+            if (close >= end) return error.MalformedMacroInvocation;
+            return close + 1;
+        }
+    }
+    if (source[start] == 'b' and start + 1 < end) {
+        if (source[start + 1] == '"') {
+            const close = findStringEnd(source, start + 1) orelse
+                return error.MalformedMacroInvocation;
+            if (close >= end) return error.MalformedMacroInvocation;
+            return close + 1;
+        }
+        if (source[start + 1] == '\'') {
+            const close = findCharEnd(source, start + 1) orelse
+                return error.MalformedMacroInvocation;
+            if (close >= end) return error.MalformedMacroInvocation;
+            return close + 1;
+        }
+    }
+    return null;
+}
+
+fn expandSourceRange(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    start: usize,
+    end: usize,
+    stack: *MacroScopeStack,
+    options: MacroSourceOptions,
+    depth: usize,
+    output: *std.ArrayListUnmanaged(u8),
+) !void {
+    var cursor = start;
+    while (cursor < end) {
+        if (try sourceLiteralEnd(source, cursor, end)) |literal_end| {
+            if (literal_end > end) return error.MalformedMacroInvocation;
+            try output.appendSlice(alloc, source[cursor..literal_end]);
+            cursor = literal_end;
+            continue;
+        }
+
+        if (source[cursor] == '#') {
+            if (try sourceAttributePrefixAt(source, cursor, end, options)) |prefix| {
+                const target_start = prefix.end;
+                if (sourceMacroDefinitionAt(source, target_start, end)) |definition_end| {
+                    if (!prefix.disabled) {
+                        const raw_definition = source[target_start..definition_end];
+                        var definition = try parseMacroRulesDefinition(alloc, raw_definition);
+                        var definition_owned = true;
+                        errdefer if (definition_owned) definition.deinit(alloc);
+                        try stack.register(definition);
+                        definition_owned = false;
+                    }
+                    cursor = definition_end;
+                    continue;
+                }
+                if (sourceMacroInvocationAt(source, target_start, end)) |invocation| {
+                    if (prefix.disabled) {
+                        cursor = invocation.end;
+                        if (cursor < end and source[cursor] == ';') cursor += 1;
+                        continue;
+                    }
+                    if (stack.get(invocation.name)) |definition| {
+                        if (depth >= options.expansion_depth_max) {
+                            return error.MacroExpansionRecursionLimit;
+                        }
+                        const bang = std.mem.indexOfScalar(u8, source[target_start..invocation.end], '!') orelse
+                            return error.MalformedMacroInvocation;
+                        const token_start = target_start + bang + 1;
+                        const token_tree = std.mem.trim(
+                            u8,
+                            source[token_start..invocation.end],
+                            " \t\r\n",
+                        );
+                        const expanded = try expandMacroRules(alloc, definition, token_tree);
+                        defer alloc.free(expanded);
+                        try expandSourceRange(
+                            alloc,
+                            expanded,
+                            0,
+                            expanded.len,
+                            stack,
+                            options,
+                            depth + 1,
+                            output,
+                        );
+                        cursor = invocation.end;
+                        continue;
+                    }
+                }
+                try output.appendSlice(alloc, source[cursor..prefix.end]);
+                cursor = prefix.end;
+                continue;
+            }
+        }
+
+        if (sourceMacroDefinitionAt(source, cursor, end)) |definition_end| {
+            const raw_definition = source[cursor..definition_end];
+            var definition = try parseMacroRulesDefinition(alloc, raw_definition);
+            var definition_owned = true;
+            errdefer if (definition_owned) definition.deinit(alloc);
+            try stack.register(definition);
+            definition_owned = false;
+            cursor = definition_end;
+            continue;
+        }
+
+        if (sourceMacroInvocationAt(source, cursor, end)) |invocation| {
+            if (stack.get(invocation.name)) |definition| {
+                if (depth >= options.expansion_depth_max) {
+                    return error.MacroExpansionRecursionLimit;
+                }
+                const bang = std.mem.indexOfScalar(u8, source[cursor..invocation.end], '!') orelse
+                    return error.MalformedMacroInvocation;
+                const token_start = cursor + bang + 1;
+                const token_tree = std.mem.trim(
+                    u8,
+                    source[token_start..invocation.end],
+                    " \t\r\n",
+                );
+                const expanded = try expandMacroRules(alloc, definition, token_tree);
+                defer alloc.free(expanded);
+                try expandSourceRange(
+                    alloc,
+                    expanded,
+                    0,
+                    expanded.len,
+                    stack,
+                    options,
+                    depth + 1,
+                    output,
+                );
+                cursor = invocation.end;
+                continue;
+            }
+            if (identifyMacro(invocation.name) == .custom) {
+                try output.appendSlice(alloc, source[cursor..invocation.end]);
+                cursor = invocation.end;
+                continue;
+            }
+            const bang = std.mem.indexOfScalar(u8, source[cursor..invocation.end], '!') orelse
+                return error.MalformedMacroInvocation;
+            const token_start = cursor + bang + 1;
+            try output.appendSlice(alloc, source[cursor..token_start]);
+            try expandSourceRange(
+                alloc,
+                source,
+                token_start,
+                invocation.end,
+                stack,
+                options,
+                depth,
+                output,
+            );
+            cursor = invocation.end;
+            continue;
+        }
+
+        if (source[cursor] == '{') {
+            const close = try findClosingDelimiterChecked(source, cursor);
+            if (close >= end) return error.MalformedMacroInvocation;
+            try output.append(alloc, '{');
+            try stack.push();
+            expandSourceRange(
+                alloc,
+                source,
+                cursor + 1,
+                close,
+                stack,
+                options,
+                depth,
+                output,
+            ) catch |err| {
+                stack.pop();
+                return err;
+            };
+            stack.pop();
+            try output.append(alloc, '}');
+            cursor = close + 1;
+            continue;
+        }
+
+        try output.append(alloc, source[cursor]);
+        cursor += 1;
+    }
+}
+
+/// Expand in-source `macro_rules!` definitions and invocations with lexical
+/// scopes. Definitions are removed from the result, while unknown and built-in
+/// invocations remain unchanged for later frontend diagnostics or lowering.
+pub fn expandSourceMacros(
+    alloc: std.mem.Allocator,
+    outer: *const MacroTable,
+    source: []const u8,
+    options: MacroSourceOptions,
+) ![]const u8 {
+    var stack = MacroScopeStack.init(alloc, outer);
+    defer stack.deinit();
+    try stack.push();
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(alloc);
+    try expandSourceRange(alloc, source, 0, source.len, &stack, options, 0, &output);
+    return output.toOwnedSlice(alloc);
+}
+
+/// Maximum number of lexical tables visited by `MacroTable.get`.
+pub const macro_scope_depth_max: usize = 128;
+
+/// A lexical table of declarative macros.
+///
+/// Child tables borrow their parent. A child owns only definitions registered
+/// on that table; callers must keep every parent alive until its descendants
+/// are deinitialized.
+pub const MacroTable = struct {
+    alloc: std.mem.Allocator,
+    parent: ?*const MacroTable = null,
+    macros: std.StringHashMapUnmanaged(MacroDef) = .empty,
+
+    /// Create a root macro scope.
     pub fn init(alloc: std.mem.Allocator) MacroTable {
         return .{ .alloc = alloc };
+    }
+
+    /// Create a child scope that borrows `parent` for ancestor lookup.
+    pub fn initChild(parent: *const MacroTable) MacroTable {
+        return .{
+            .alloc = parent.alloc,
+            .parent = parent,
+        };
     }
 
     pub fn deinit(self: *MacroTable) void {
@@ -1707,6 +2475,11 @@ pub const MacroTable = struct {
     }
 
     pub fn register(self: *MacroTable, name: []const u8, def: MacroDef) !void {
+        if (self.macros.get(name)) |old_definition| {
+            _ = self.macros.remove(name);
+            var owned_old = old_definition;
+            owned_old.deinit(self.alloc);
+        }
         try self.macros.put(self.alloc, name, def);
     }
 
@@ -1716,7 +2489,16 @@ pub const MacroTable = struct {
             clean_name = clean_name[0 .. clean_name.len - 1];
         }
         if (std.mem.indexOf(u8, clean_name, "::") != null) return null;
-        return self.macros.get(clean_name);
+
+        var scope: ?*const MacroTable = self;
+        var depth: usize = 0;
+        while (scope) |current| {
+            if (current.macros.get(clean_name)) |definition| return definition;
+            depth += 1;
+            if (depth >= macro_scope_depth_max) return null;
+            scope = current.parent;
+        }
+        return null;
     }
 };
 
@@ -1734,6 +2516,10 @@ test "identifyMacro classifications" {
     try std.testing.expectEqual(MacroKind.println, identifyMacro("println!"));
     try std.testing.expectEqual(MacroKind.eprintln, identifyMacro("eprintln!"));
     try std.testing.expectEqual(MacroKind.format, identifyMacro("format!"));
+    try std.testing.expectEqual(MacroKind.write, identifyMacro("write!"));
+    try std.testing.expectEqual(MacroKind.writeln, identifyMacro("writeln!"));
+    try std.testing.expectEqual(MacroKind.write, identifyMacro("core::write!"));
+    try std.testing.expectEqual(MacroKind.writeln, identifyMacro("std::writeln!"));
     try std.testing.expectEqual(MacroKind.custom, identifyMacro("my_macro!"));
 }
 

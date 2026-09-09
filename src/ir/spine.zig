@@ -23,6 +23,7 @@ pub const EntityKind = enum {
     enum_,
     union_,
     fn_,
+    method_ref,
     const_,
     static_,
     trait_,

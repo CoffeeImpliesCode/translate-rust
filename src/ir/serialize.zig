@@ -16,7 +16,7 @@ const Json = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
 const Array = std.json.Array;
 
-pub const wire_format_version: u32 = 5;
+pub const wire_format_version: u32 = 6;
 
 pub const Bodies = bodies_mod.Bodies;
 pub const BodyKind = bodies_mod.BodyKind;
@@ -31,6 +31,8 @@ pub const FnBody = bodies_mod.FnBody;
 pub const StructBody = bodies_mod.StructBody;
 pub const StructMethod = bodies_mod.StructMethod;
 pub const TraitBody = bodies_mod.TraitBody;
+pub const TraitAssocConst = bodies_mod.TraitAssocConst;
+pub const ImplBody = bodies_mod.ImplBody;
 pub const EnumBody = bodies_mod.EnumBody;
 pub const TraitMethodSig = bodies_mod.TraitMethodSig;
 pub const TypeAliasBody = bodies_mod.TypeAliasBody;
@@ -49,9 +51,13 @@ fn getObj(v: Json) !ObjectMap {
 fn req(o: ObjectMap, key: []const u8) !Json {
     return o.get(key) orelse error.MissingField;
 }
-
 fn checkedU32(value: i128) !u32 {
     if (value < 0 or value > @as(i128, std.math.maxInt(u32))) return error.BadWireFormat;
+    return @intCast(value);
+}
+
+fn checkedU64(value: i128) !u64 {
+    if (value < 0 or value > @as(i128, std.math.maxInt(u64))) return error.BadWireFormat;
     return @intCast(value);
 }
 
@@ -59,6 +65,14 @@ fn reqU32(o: ObjectMap, key: []const u8) !u32 {
     const v = try req(o, key);
     return switch (v) {
         .integer => |i| try checkedU32(i),
+        else => error.BadWireFormat,
+    };
+}
+
+fn reqU64(o: ObjectMap, key: []const u8) !u64 {
+    const v = try req(o, key);
+    return switch (v) {
+        .integer => |i| try checkedU64(i),
         else => error.BadWireFormat,
     };
 }
@@ -191,6 +205,17 @@ fn decodeStringList(allocator: std.mem.Allocator, v: Json) ![]const []const u8 {
     }
     return list.toOwnedSlice(allocator);
 }
+fn decodeOptionalStringList(
+    allocator: std.mem.Allocator,
+    o: ObjectMap,
+    key: []const u8,
+) ![]const []const u8 {
+    const value = o.get(key) orelse return &.{};
+    return switch (value) {
+        .null => &.{},
+        else => try decodeStringList(allocator, value),
+    };
+}
 
 fn freeDecodedExternalNominal(
     allocator: std.mem.Allocator,
@@ -216,7 +241,7 @@ pub const RustIr = struct {
     graph: graph.CrateGraph,
     types: []const types.Type = &.{},
     bodies: bodies_mod.Bodies,
-    /// Owned records produced by frontend monomorphization. Canonical v5
+    /// Owned records produced by frontend monomorphization. Canonical v6
     /// always carries this table explicitly, including when it is empty.
     instantiations: []const types.Instantiation = &.{},
 
@@ -275,7 +300,153 @@ fn freeDecodedPathSegmentList(
     for (list.items) |segment| allocator.free(segment.name);
     list.deinit(allocator);
 }
+fn freeDecodedPath(allocator: std.mem.Allocator, path: types.Path) void {
+    for (path.segments) |segment| allocator.free(segment.name);
+    if (path.segments.len > 0) allocator.free(path.segments);
+}
 
+fn freeDecodedAssociatedTypeBinding(
+    allocator: std.mem.Allocator,
+    binding: types.AssociatedTypeBinding,
+) void {
+    allocator.free(binding.name);
+    freeDecodedType(allocator, binding.ty);
+}
+
+fn freeDecodedAssociatedTypeBindingSlice(
+    allocator: std.mem.Allocator,
+    bindings: []const types.AssociatedTypeBinding,
+) void {
+    for (bindings) |binding| freeDecodedAssociatedTypeBinding(allocator, binding);
+    if (bindings.len > 0) allocator.free(bindings);
+}
+
+fn freeDecodedAssociatedTypeBindingList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(types.AssociatedTypeBinding),
+) void {
+    for (list.items) |binding| freeDecodedAssociatedTypeBinding(allocator, binding);
+    list.deinit(allocator);
+}
+
+fn freeDecodedBound(allocator: std.mem.Allocator, bound: types.Bound) void {
+    freeDecodedPath(allocator, bound.path);
+    freeDecodedTypeSlice(allocator, bound.args);
+    freeDecodedAssociatedTypeBindingSlice(allocator, bound.associated_types);
+}
+
+fn freeDecodedBoundSlice(allocator: std.mem.Allocator, bounds: []const types.Bound) void {
+    for (bounds) |bound| freeDecodedBound(allocator, bound);
+    if (bounds.len > 0) allocator.free(bounds);
+}
+
+fn freeDecodedBoundList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(types.Bound),
+) void {
+    for (list.items) |bound| freeDecodedBound(allocator, bound);
+    list.deinit(allocator);
+}
+
+fn freeDecodedGenericParam(allocator: std.mem.Allocator, param: types.GenericParam) void {
+    switch (param) {
+        .type_ => |type_param| {
+            allocator.free(type_param.name);
+            freeDecodedBoundSlice(allocator, type_param.bounds);
+        },
+        .const_ => |const_param| {
+            allocator.free(const_param.name);
+            freeDecodedType(allocator, const_param.ty);
+        },
+        .lifetime => |lifetime| allocator.free(lifetime.name),
+    }
+}
+
+fn freeDecodedGenericParamSlice(
+    allocator: std.mem.Allocator,
+    params: []const types.GenericParam,
+) void {
+    for (params) |param| freeDecodedGenericParam(allocator, param);
+    if (params.len > 0) allocator.free(params);
+}
+
+fn freeDecodedGenericParamList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(types.GenericParam),
+) void {
+    for (list.items) |param| freeDecodedGenericParam(allocator, param);
+    list.deinit(allocator);
+}
+
+fn freeDecodedWhereClause(allocator: std.mem.Allocator, clause: types.WhereClause) void {
+    freeDecodedPath(allocator, clause.self_ty);
+    freeDecodedBoundSlice(allocator, clause.bounds);
+}
+
+fn freeDecodedWhereClauseList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(types.WhereClause),
+) void {
+    for (list.items) |clause| freeDecodedWhereClause(allocator, clause);
+    list.deinit(allocator);
+}
+
+fn freeDecodedWhereClauseSlice(
+    allocator: std.mem.Allocator,
+    clauses: []const types.WhereClause,
+) void {
+    for (clauses) |clause| freeDecodedWhereClause(allocator, clause);
+    if (clauses.len > 0) allocator.free(clauses);
+}
+
+fn freeDecodedGenerics(allocator: std.mem.Allocator, generics: types.Generics) void {
+    freeDecodedGenericParamSlice(allocator, generics.params);
+    freeDecodedWhereClauseSlice(allocator, generics.where_clauses);
+}
+
+fn freeDecodedAssocType(allocator: std.mem.Allocator, assoc_type: items.AssocType) void {
+    allocator.free(assoc_type.name);
+    if (assoc_type.generics) |generics| freeDecodedGenerics(allocator, generics);
+    freeDecodedBoundSlice(allocator, assoc_type.bounds);
+    if (assoc_type.default) |default| freeDecodedType(allocator, default);
+}
+
+fn freeDecodedAssocTypeList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(items.AssocType),
+) void {
+    for (list.items) |assoc_type| freeDecodedAssocType(allocator, assoc_type);
+    list.deinit(allocator);
+}
+
+fn freeDecodedAssocTypeSlice(allocator: std.mem.Allocator, values: []const items.AssocType) void {
+    for (values) |assoc_type| freeDecodedAssocType(allocator, assoc_type);
+    if (values.len > 0) allocator.free(values);
+}
+
+fn freeDecodedTraitAssocConst(
+    allocator: std.mem.Allocator,
+    assoc_const: TraitAssocConst,
+) void {
+    allocator.free(assoc_const.name);
+    freeDecodedType(allocator, assoc_const.ty);
+}
+
+fn freeDecodedTraitAssocConstList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(TraitAssocConst),
+) void {
+    for (list.items) |assoc_const| freeDecodedTraitAssocConst(allocator, assoc_const);
+    list.deinit(allocator);
+}
+
+fn freeDecodedTraitAssocConstSlice(
+    allocator: std.mem.Allocator,
+    values: []const TraitAssocConst,
+) void {
+    for (values) |assoc_const| freeDecodedTraitAssocConst(allocator, assoc_const);
+    if (values.len > 0) allocator.free(values);
+}
 fn freeDecodedVisibility(allocator: std.mem.Allocator, visibility: spine.Visibility) void {
     switch (visibility) {
         .in_path => |path| allocator.free(path),
@@ -354,13 +525,49 @@ fn freeDecodedFieldPatList(
     list.deinit(allocator);
 }
 
+fn freeDecodedField(allocator: std.mem.Allocator, field: items.Field) void {
+    allocator.free(field.name);
+    freeDecodedType(allocator, field.ty);
+    freeDecodedVisibility(allocator, field.visibility);
+}
+
+fn freeDecodedFieldList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(items.Field),
+) void {
+    for (list.items) |field| freeDecodedField(allocator, field);
+    list.deinit(allocator);
+}
+
+fn freeDecodedFields(allocator: std.mem.Allocator, fields: []const items.Field) void {
+    for (fields) |field| freeDecodedField(allocator, field);
+    if (fields.len > 0) allocator.free(fields);
+}
+fn freeDecodedVariantFields(allocator: std.mem.Allocator, fields: items.VariantFields) void {
+    switch (fields) {
+        .tuple => |values| freeDecodedTypeSlice(allocator, values),
+        .named => |values| freeDecodedFields(allocator, values),
+        .none => {},
+    }
+}
+
+fn freeDecodedVariant(allocator: std.mem.Allocator, variant: items.Variant) void {
+    allocator.free(variant.name);
+    freeDecodedVariantFields(allocator, variant.fields);
+}
+
+fn freeDecodedVariantList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(items.Variant)) void {
+    for (list.items) |variant| freeDecodedVariant(allocator, variant);
+    list.deinit(allocator);
+}
 fn freeDecodedParam(allocator: std.mem.Allocator, param: items.Param) void {
     allocator.free(param.name);
+    freeDecodedType(allocator, param.ty);
 }
 
 fn freeDecodedParams(allocator: std.mem.Allocator, params: []const items.Param) void {
     for (params) |param| freeDecodedParam(allocator, param);
-    allocator.free(params);
+    if (params.len > 0) allocator.free(params);
 }
 
 fn freeDecodedParamList(
@@ -468,6 +675,7 @@ fn decodeEntityKind(s: []const u8) !spine.EntityKind {
     if (std.mem.eql(u8, s, "enum_")) return .enum_;
     if (std.mem.eql(u8, s, "union_")) return .union_;
     if (std.mem.eql(u8, s, "fn_")) return .fn_;
+    if (std.mem.eql(u8, s, "method_ref")) return .method_ref;
     if (std.mem.eql(u8, s, "const_")) return .const_;
     if (std.mem.eql(u8, s, "static_")) return .static_;
     if (std.mem.eql(u8, s, "trait_")) return .trait_;
@@ -744,6 +952,256 @@ fn decodePathSegments(allocator: std.mem.Allocator, v: Json) ![]const types.Path
     }
     return list.toOwnedSlice(allocator);
 }
+fn decodePath(allocator: std.mem.Allocator, v: Json) !types.Path {
+    const o = try getObj(v);
+    return .{ .segments = try decodePathSegments(allocator, try req(o, "segments")) };
+}
+
+fn decodeAssociatedTypeBinding(
+    allocator: std.mem.Allocator,
+    v: Json,
+) !types.AssociatedTypeBinding {
+    const o = try getObj(v);
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
+    const ty = try decodeType(allocator, try req(o, "ty"));
+    errdefer freeDecodedType(allocator, ty);
+    return .{ .name = name, .ty = ty };
+}
+
+fn decodeAssociatedTypeBindings(
+    allocator: std.mem.Allocator,
+    v: Json,
+) ![]const types.AssociatedTypeBinding {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(types.AssociatedTypeBinding) = .empty;
+    errdefer freeDecodedAssociatedTypeBindingList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeAssociatedTypeBinding(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedAssociatedTypeBinding(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn decodeBound(allocator: std.mem.Allocator, v: Json) !types.Bound {
+    const o = try getObj(v);
+    const path = try decodePath(allocator, try req(o, "path"));
+    errdefer freeDecodedPath(allocator, path);
+    const args = try decodeTypeList(allocator, try req(o, "args"));
+    errdefer freeDecodedTypeSlice(allocator, args);
+    const associated_types = try decodeAssociatedTypeBindings(
+        allocator,
+        try req(o, "associated_types"),
+    );
+    errdefer freeDecodedAssociatedTypeBindingSlice(allocator, associated_types);
+    const optional = try reqBool(o, "optional");
+    return .{
+        .path = path,
+        .args = args,
+        .associated_types = associated_types,
+        .optional = optional,
+    };
+}
+
+fn decodeBounds(allocator: std.mem.Allocator, v: Json) ![]const types.Bound {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(types.Bound) = .empty;
+    errdefer freeDecodedBoundList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeBound(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedBound(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn decodeWhereClause(allocator: std.mem.Allocator, v: Json) !types.WhereClause {
+    const o = try getObj(v);
+    const self_ty = try decodePath(allocator, try req(o, "self_ty"));
+    errdefer freeDecodedPath(allocator, self_ty);
+    const bounds = try decodeBounds(allocator, try req(o, "bounds"));
+    return .{ .self_ty = self_ty, .bounds = bounds };
+}
+
+fn decodeWhereClauses(allocator: std.mem.Allocator, v: Json) ![]const types.WhereClause {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(types.WhereClause) = .empty;
+    errdefer freeDecodedWhereClauseList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeWhereClause(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedWhereClause(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn decodeGenericParam(allocator: std.mem.Allocator, v: Json) !types.GenericParam {
+    const o = try getObj(v);
+    const kind = try reqStr(o, "kind");
+    if (std.mem.eql(u8, kind, "type_")) {
+        const name = try allocator.dupe(u8, try reqStr(o, "name"));
+        errdefer allocator.free(name);
+        const bounds = try decodeBounds(allocator, try req(o, "bounds"));
+        errdefer freeDecodedBoundSlice(allocator, bounds);
+        return .{ .type_ = .{ .name = name, .bounds = bounds } };
+    }
+    if (std.mem.eql(u8, kind, "const_")) {
+        const name = try allocator.dupe(u8, try reqStr(o, "name"));
+        errdefer allocator.free(name);
+        const ty = try decodeType(allocator, try req(o, "ty"));
+        errdefer freeDecodedType(allocator, ty);
+        return .{ .const_ = .{ .name = name, .ty = ty } };
+    }
+    if (std.mem.eql(u8, kind, "lifetime")) {
+        return .{ .lifetime = .{ .name = try allocator.dupe(u8, try reqStr(o, "name")) } };
+    }
+    return error.BadWireFormat;
+}
+
+fn decodeGenericParams(allocator: std.mem.Allocator, v: Json) ![]const types.GenericParam {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(types.GenericParam) = .empty;
+    errdefer freeDecodedGenericParamList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeGenericParam(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedGenericParam(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn decodeGenerics(allocator: std.mem.Allocator, v: Json) !types.Generics {
+    const o = try getObj(v);
+    const params = try decodeGenericParams(allocator, try req(o, "params"));
+    errdefer freeDecodedGenericParamSlice(allocator, params);
+    const where_clauses = try decodeWhereClauses(allocator, try req(o, "where_clauses"));
+    return .{ .params = params, .where_clauses = where_clauses };
+}
+
+fn decodeOptionalGenerics(
+    allocator: std.mem.Allocator,
+    o: ObjectMap,
+    key: []const u8,
+) !?types.Generics {
+    const value = o.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        else => try decodeGenerics(allocator, value),
+    };
+}
+fn decodeOptionalPath(
+    allocator: std.mem.Allocator,
+    o: ObjectMap,
+    key: []const u8,
+) !?types.Path {
+    const value = o.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        else => try decodePath(allocator, value),
+    };
+}
+
+fn decodeOptionalType(
+    allocator: std.mem.Allocator,
+    o: ObjectMap,
+    key: []const u8,
+) !?types.Type {
+    const value = o.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        else => try decodeType(allocator, value),
+    };
+}
+
+fn decodeAssocType(allocator: std.mem.Allocator, v: Json) !items.AssocType {
+    const o = try getObj(v);
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
+    const generics = try decodeOptionalGenerics(allocator, o, "generics");
+    errdefer if (generics) |value| freeDecodedGenerics(allocator, value);
+    const bounds = try decodeBounds(allocator, try req(o, "bounds"));
+    errdefer freeDecodedBoundSlice(allocator, bounds);
+    const default = try decodeOptionalType(allocator, o, "default");
+    return .{ .name = name, .generics = generics, .bounds = bounds, .default = default };
+}
+
+fn decodeAssocTypes(allocator: std.mem.Allocator, v: Json) ![]const items.AssocType {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(items.AssocType) = .empty;
+    errdefer freeDecodedAssocTypeList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeAssocType(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedAssocType(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn decodeOptionalAssocTypes(allocator: std.mem.Allocator, o: ObjectMap) ![]const items.AssocType {
+    const value = o.get("assoc_types") orelse return &.{};
+    return decodeAssocTypes(allocator, value);
+}
+
+fn decodeTraitAssocConst(allocator: std.mem.Allocator, v: Json) !TraitAssocConst {
+    const o = try getObj(v);
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
+    const ty = try decodeType(allocator, try req(o, "ty"));
+    errdefer freeDecodedType(allocator, ty);
+    const default = try optU32(o, "default");
+    return .{ .name = name, .ty = ty, .default = default };
+}
+
+fn decodeTraitAssocConsts(allocator: std.mem.Allocator, v: Json) ![]const TraitAssocConst {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(TraitAssocConst) = .empty;
+    errdefer freeDecodedTraitAssocConstList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeTraitAssocConst(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedTraitAssocConst(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn decodeOptionalTraitAssocConsts(
+    allocator: std.mem.Allocator,
+    o: ObjectMap,
+) ![]const TraitAssocConst {
+    const value = o.get("assoc_consts") orelse return &.{};
+    return decodeTraitAssocConsts(allocator, value);
+}
 
 fn freeDecodedType(allocator: std.mem.Allocator, ty: types.Type) void {
     switch (ty) {
@@ -795,6 +1253,14 @@ fn freeDecodedType(allocator: std.mem.Allocator, ty: types.Type) void {
             freeDecodedType(allocator, boxed.*);
             allocator.destroy(@constCast(boxed));
         },
+        .@"opaque" => |opaque_ty| {
+            freeDecodedBoundSlice(allocator, opaque_ty.bounds);
+            if (opaque_ty.concrete) |concrete| {
+                freeDecodedType(allocator, concrete.*);
+                allocator.destroy(@constCast(concrete));
+            }
+        },
+        .dyn_trait => |bounds| freeDecodedBoundSlice(allocator, bounds),
         .unsupported => |unsupported| allocator.free(unsupported.message),
         .prim => {},
     }
@@ -813,14 +1279,22 @@ fn freeDecodedTypeList(
     list.deinit(allocator);
 }
 
-fn decodeTypeList(allocator: std.mem.Allocator, v: Json) anyerror![]const types.Type {
+const TypeDecodeError = std.mem.Allocator.Error || error{ BadWireFormat, MissingField, InvalidTypePath };
+
+fn decodeTypeList(allocator: std.mem.Allocator, v: Json) TypeDecodeError![]const types.Type {
     const arr = switch (v) {
         .array => |a| a,
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(types.Type) = .empty;
     errdefer freeDecodedTypeList(allocator, &list);
-    for (arr.items) |it| try list.append(allocator, try decodeType(allocator, it));
+    for (arr.items) |it| {
+        const value = try decodeType(allocator, it);
+        list.append(allocator, value) catch |err| {
+            freeDecodedType(allocator, value);
+            return err;
+        };
+    }
     return list.toOwnedSlice(allocator);
 }
 
@@ -849,10 +1323,20 @@ fn decodeInstantiations(
     };
     var list: std.ArrayListUnmanaged(types.Instantiation) = .empty;
     errdefer freeDecodedInstantiationList(allocator, &list);
-    for (arr.items) |item| try list.append(allocator, try decodeInstantiation(allocator, item));
+    for (arr.items) |item| {
+        const value = try decodeInstantiation(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedInstantiation(allocator, value);
+            return err;
+        };
+    }
     return list.toOwnedSlice(allocator);
 }
 
+fn freeDecodedInstantiation(allocator: std.mem.Allocator, instantiation: types.Instantiation) void {
+    freeDecodedTypeSlice(allocator, instantiation.args.params);
+    if (instantiation.zig_suffix.len > 0) allocator.free(instantiation.zig_suffix);
+}
 fn freeDecodedInstantiationList(
     allocator: std.mem.Allocator,
     list: *std.ArrayListUnmanaged(types.Instantiation),
@@ -918,7 +1402,7 @@ fn decodeExternalNominal(
     return .{ .path = path, .args = args };
 }
 
-fn decodeType(allocator: std.mem.Allocator, v: Json) !types.Type {
+fn decodeType(allocator: std.mem.Allocator, v: Json) TypeDecodeError!types.Type {
     const o = try getObj(v);
     const tag = try reqStr(o, "kind");
     const val = try req(o, "value");
@@ -933,60 +1417,80 @@ fn decodeType(allocator: std.mem.Allocator, v: Json) !types.Type {
     if (std.mem.eql(u8, tag, "external_nominal")) {
         return .{ .external_nominal = try decodeExternalNominal(allocator, val) };
     }
+    if (std.mem.eql(u8, tag, "opaque")) {
+        const p = try getObj(val);
+        const bounds = try decodeBounds(allocator, try req(p, "bounds"));
+        errdefer freeDecodedBoundSlice(allocator, bounds);
+        const concrete: ?*const types.Type = switch (try req(p, "concrete")) {
+            .null => null,
+            else => blk: {
+                const value = try decodeType(allocator, try req(p, "concrete"));
+                errdefer freeDecodedType(allocator, value);
+                const ptr = try allocator.create(types.Type);
+                ptr.* = value;
+                break :blk ptr;
+            },
+        };
+        return .{ .@"opaque" = .{ .bounds = bounds, .concrete = concrete } };
+    }
+    if (std.mem.eql(u8, tag, "dyn_trait")) {
+        const p = try getObj(val);
+        return .{ .dyn_trait = try decodeBounds(allocator, try req(p, "bounds")) };
+    }
     if (std.mem.eql(u8, tag, "slice")) {
         const p = try getObj(val);
+        const const_ = try reqBool(p, "const_");
+        const elem = try decodeType(allocator, try req(p, "elem"));
+        errdefer freeDecodedType(allocator, elem);
         const inner = try allocator.create(types.Slice);
-        inner.* = .{
-            .const_ = try reqBool(p, "const_"),
-            .elem = try decodeType(allocator, try req(p, "elem")),
-        };
+        inner.* = .{ .const_ = const_, .elem = elem };
         return .{ .slice = inner };
     }
     if (std.mem.eql(u8, tag, "reference")) {
         const p = try getObj(val);
+        const mut = try reqBool(p, "mut");
+        const pointee = try decodeType(allocator, try req(p, "pointee"));
+        errdefer freeDecodedType(allocator, pointee);
         const inner = try allocator.create(types.Ref);
-        inner.* = .{
-            .mut = try reqBool(p, "mut"),
-            .pointee = try decodeType(allocator, try req(p, "pointee")),
-        };
+        inner.* = .{ .mut = mut, .pointee = pointee };
         return .{ .reference = inner };
     }
     if (std.mem.eql(u8, tag, "raw_ptr")) {
         const p = try getObj(val);
+        const mut = try reqBool(p, "mut");
+        const pointee = try decodeType(allocator, try req(p, "pointee"));
+        errdefer freeDecodedType(allocator, pointee);
         const inner = try allocator.create(types.RawPtr);
-        inner.* = .{
-            .mut = try reqBool(p, "mut"),
-            .pointee = try decodeType(allocator, try req(p, "pointee")),
-        };
+        inner.* = .{ .mut = mut, .pointee = pointee };
         return .{ .raw_ptr = inner };
     }
     if (std.mem.eql(u8, tag, "array")) {
         const p = try getObj(val);
-        const inner = try allocator.create(types.Array);
         const len_o = try getObj(try req(p, "len"));
-        inner.* = .{
-            .elem = try decodeType(allocator, try req(p, "elem")),
-            .len = blk: {
-                const len_kind = try reqStr(len_o, "kind");
-                if (std.mem.eql(u8, len_kind, "literal")) {
-                    break :blk .{ .literal = try reqU32(len_o, "value") };
-                }
-                if (std.mem.eql(u8, len_kind, "generic")) {
-                    break :blk .{ .generic = try reqU32(len_o, "value") };
-                }
-                return error.BadWireFormat;
-            },
-        };
+        const len_kind = try reqStr(len_o, "kind");
+        const length: types.ArrayLen = if (std.mem.eql(u8, len_kind, "literal"))
+            .{ .literal = try reqU64(len_o, "value") }
+        else if (std.mem.eql(u8, len_kind, "generic"))
+            .{ .generic = try reqU32(len_o, "value") }
+        else if (std.mem.eql(u8, len_kind, "expression"))
+            .{ .expression = try reqU32(len_o, "value") }
+        else
+            return error.BadWireFormat;
+        const elem = try decodeType(allocator, try req(p, "elem"));
+        errdefer freeDecodedType(allocator, elem);
+        const inner = try allocator.create(types.Array);
+        inner.* = .{ .elem = elem, .len = length };
         return .{ .array = inner };
     }
     if (std.mem.eql(u8, tag, "tuple")) return .{ .tuple = try decodeTypeList(allocator, val) };
     if (std.mem.eql(u8, tag, "fn_ptr")) {
         const p = try getObj(val);
+        const params = try decodeTypeList(allocator, try req(p, "params"));
+        errdefer freeDecodedTypeSlice(allocator, params);
+        const ret = try decodeType(allocator, try req(p, "ret"));
+        errdefer freeDecodedType(allocator, ret);
         const inner = try allocator.create(types.FnPtr);
-        inner.* = .{
-            .params = try decodeTypeList(allocator, try req(p, "params")),
-            .ret = try decodeType(allocator, try req(p, "ret")),
-        };
+        inner.* = .{ .params = params, .ret = ret };
         return .{ .fn_ptr = inner };
     }
     if (std.mem.eql(u8, tag, "generic_inst")) {
@@ -998,23 +1502,28 @@ fn decodeType(allocator: std.mem.Allocator, v: Json) !types.Type {
         } };
     }
     if (std.mem.eql(u8, tag, "option")) {
+        const value = try decodeType(allocator, val);
+        errdefer freeDecodedType(allocator, value);
         const inner = try allocator.create(types.Type);
-        inner.* = try decodeType(allocator, val);
+        inner.* = value;
         return .{ .option = inner };
     }
     if (std.mem.eql(u8, tag, "result")) {
         const p = try getObj(val);
+        const ok = try decodeType(allocator, try req(p, "ok"));
+        errdefer freeDecodedType(allocator, ok);
+        const err_ty = try decodeType(allocator, try req(p, "err"));
+        errdefer freeDecodedType(allocator, err_ty);
+        const is_error_unionable = try reqBool(p, "is_error_unionable");
         const inner = try allocator.create(types.Result);
-        inner.* = .{
-            .ok = try decodeType(allocator, try req(p, "ok")),
-            .err = try decodeType(allocator, try req(p, "err")),
-            .is_error_unionable = try reqBool(p, "is_error_unionable"),
-        };
+        inner.* = .{ .ok = ok, .err = err_ty, .is_error_unionable = is_error_unionable };
         return .{ .result = inner };
     }
     if (std.mem.eql(u8, tag, "boxed")) {
+        const value = try decodeType(allocator, val);
+        errdefer freeDecodedType(allocator, value);
         const inner = try allocator.create(types.Type);
-        inner.* = try decodeType(allocator, val);
+        inner.* = value;
         return .{ .boxed = inner };
     }
     if (std.mem.eql(u8, tag, "unsupported")) {
@@ -1102,15 +1611,37 @@ fn decodeCallKind(v: Json) !exprs.CallKind {
     return error.BadWireFormat;
 }
 
-// ── Expressions ─────────────────────────────────────────────────────────────
+fn decodeCoreFunction(s: []const u8) !exprs.CoreFunction {
+    if (std.mem.eql(u8, s, "mem_size_of")) return .mem_size_of;
+    if (std.mem.eql(u8, s, "mem_transmute")) return .mem_transmute;
+    if (std.mem.eql(u8, s, "mem_size_of_val")) return .mem_size_of_val;
+    if (std.mem.eql(u8, s, "ptr_copy_nonoverlapping")) return .ptr_copy_nonoverlapping;
+    if (std.mem.eql(u8, s, "ptr_write_bytes")) return .ptr_write_bytes;
+    if (std.mem.eql(u8, s, "ptr_read_unaligned")) return .ptr_read_unaligned;
+    if (std.mem.eql(u8, s, "slice_from_raw_parts")) return .slice_from_raw_parts;
+    if (std.mem.eql(u8, s, "slice_from_raw_parts_mut")) return .slice_from_raw_parts_mut;
+    if (std.mem.eql(u8, s, "str_from_utf8")) return .str_from_utf8;
+    if (std.mem.eql(u8, s, "str_from_utf8_unchecked")) return .str_from_utf8_unchecked;
+    if (std.mem.eql(u8, s, "string_from_utf8")) return .string_from_utf8;
+    if (std.mem.eql(u8, s, "string_from_utf8_lossy")) return .string_from_utf8_lossy;
+    if (std.mem.eql(u8, s, "string_from_utf8_unchecked")) return .string_from_utf8_unchecked;
+    if (std.mem.eql(u8, s, "cmp_min")) return .cmp_min;
+    if (std.mem.eql(u8, s, "cmp_max")) return .cmp_max;
+    if (std.mem.eql(u8, s, "default_value")) return .default_value;
+    if (std.mem.eql(u8, s, "convert_from")) return .convert_from;
+    return error.BadWireFormat;
+}
 
-fn decodeBlockExpr(allocator: std.mem.Allocator, v: Json) !exprs.BlockExpr {
-    const o = try getObj(v);
-    const labelled = try reqOptStr(o, "labelled");
+fn decodeBlockExpr(allocator: std.mem.Allocator, value: Json) !exprs.BlockExpr {
+    const object = try getObj(value);
+    const statements = try decodeIdList(allocator, try req(object, "statements"));
+    errdefer allocator.free(statements);
+    const tail = try reqOptionalId(object, "tail");
+    const label = try reqOptStr(object, "labelled");
     return .{
-        .statements = try decodeIdList(allocator, try req(o, "statements")),
-        .tail = try reqOptionalId(o, "tail"),
-        .labelled = if (labelled) |s| try allocator.dupe(u8, s) else null,
+        .statements = statements,
+        .tail = tail,
+        .labelled = if (label) |name| try allocator.dupe(u8, name) else null,
     };
 }
 
@@ -1123,13 +1654,154 @@ fn decodeElseBranch(allocator: std.mem.Allocator, v: Json) !exprs.ElseBranch {
     return error.BadWireFormat;
 }
 
+fn decodeClosureTrait(s: []const u8) !exprs.ClosureTrait {
+    if (std.mem.eql(u8, s, "fn")) return .@"fn";
+    if (std.mem.eql(u8, s, "fn_mut")) return .fn_mut;
+    if (std.mem.eql(u8, s, "fn_once")) return .fn_once;
+    return error.BadWireFormat;
+}
+
+fn decodeCaptureMode(s: []const u8) !exprs.CaptureMode {
+    if (std.mem.eql(u8, s, "by_value")) return .by_value;
+    if (std.mem.eql(u8, s, "by_ref")) return .by_ref;
+    if (std.mem.eql(u8, s, "by_mut_ref")) return .by_mut_ref;
+    return error.BadWireFormat;
+}
+
+fn decodeIteratorTerminal(s: []const u8) !exprs.IteratorTerminal {
+    if (std.mem.eql(u8, s, "iterator")) return .iterator;
+    if (std.mem.eql(u8, s, "collect_vec")) return .collect_vec;
+    if (std.mem.eql(u8, s, "sum")) return .sum;
+    return error.BadWireFormat;
+}
+
+fn decodeClosure(allocator: std.mem.Allocator, value: Json) !exprs.ClosureExpr {
+    const object = try getObj(value);
+    const captures_value = try req(object, "captures");
+    const captures_array = switch (captures_value) {
+        .array => |array| array,
+        else => return error.BadWireFormat,
+    };
+    var captures: std.ArrayListUnmanaged(exprs.Capture) = .empty;
+    errdefer {
+        for (captures.items) |capture| allocator.free(capture.name);
+        captures.deinit(allocator);
+    }
+    for (captures_array.items) |capture_value| {
+        const capture_object = try getObj(capture_value);
+        const mode = try decodeCaptureMode(try reqStr(capture_object, "mode"));
+        const ty = try reqU32(capture_object, "ty");
+        var owned_name: ?[]u8 = try allocator.dupe(u8, try reqStr(capture_object, "name"));
+        errdefer if (owned_name) |name| allocator.free(name);
+        try captures.append(allocator, .{
+            .name = owned_name.?,
+            .mode = mode,
+            .ty = ty,
+        });
+        owned_name = null;
+    }
+    const capture_slice = try captures.toOwnedSlice(allocator);
+    errdefer {
+        for (capture_slice) |capture| allocator.free(capture.name);
+        if (capture_slice.len > 0) allocator.free(capture_slice);
+    }
+    const params = try decodeIdList(allocator, try req(object, "params"));
+    errdefer if (params.len > 0) allocator.free(params);
+    const return_ty = try reqOptionalId(object, "return_ty");
+    const body = try decodeBlockExpr(allocator, try req(object, "body"));
+    errdefer freeDecodedBlockExpr(allocator, body);
+    return .{
+        .captures = capture_slice,
+        .params = params,
+        .return_ty = return_ty,
+        .body = body,
+        .trait = try decodeClosureTrait(try reqStr(object, "trait")),
+    };
+}
+
+fn decodeIteratorAdapter(allocator: std.mem.Allocator, value: Json) !exprs.IteratorAdapter {
+    const object = try getObj(value);
+    const tag = try reqStr(object, "kind");
+    if (std.mem.eql(u8, tag, "map")) {
+        return .{ .map = .{ .closure = try decodeClosure(allocator, try req(object, "closure")) } };
+    }
+    if (std.mem.eql(u8, tag, "filter")) {
+        return .{ .filter = .{ .closure = try decodeClosure(allocator, try req(object, "closure")) } };
+    }
+    if (std.mem.eql(u8, tag, "flat_map")) {
+        return .{ .flat_map = try decodeClosure(allocator, try req(object, "closure")) };
+    }
+    if (std.mem.eql(u8, tag, "enumerate")) return .{ .enumerate = {} };
+    if (std.mem.eql(u8, tag, "zip")) {
+        return .{ .zip = .{ .other = try reqU32(object, "other") } };
+    }
+    if (std.mem.eql(u8, tag, "range_rev")) return .{ .range_rev = {} };
+    if (std.mem.eql(u8, tag, "other")) {
+        const reason = try allocator.dupe(u8, try reqStr(object, "reason"));
+        errdefer allocator.free(reason);
+        return .{ .other = .{
+            .reason = reason,
+            .suggested_version = try decodeUnsupportedVersion(
+                try reqStr(object, "suggested_version"),
+            ),
+        } };
+    }
+    return error.BadWireFormat;
+}
+
+fn decodeIteratorChain(allocator: std.mem.Allocator, value: Json) !exprs.IteratorChainExpr {
+    const object = try getObj(value);
+    const adapters_value = try req(object, "adapters");
+    const adapters_array = switch (adapters_value) {
+        .array => |array| array,
+        else => return error.BadWireFormat,
+    };
+    var adapters: std.ArrayListUnmanaged(exprs.IteratorAdapter) = .empty;
+    errdefer {
+        for (adapters.items) |adapter| freeDecodedIteratorAdapter(allocator, adapter);
+        adapters.deinit(allocator);
+    }
+    for (adapters_array.items) |adapter_value| {
+        const adapter = try decodeIteratorAdapter(allocator, adapter_value);
+        adapters.append(allocator, adapter) catch |err| {
+            freeDecodedIteratorAdapter(allocator, adapter);
+            return err;
+        };
+    }
+    const adapter_slice = try adapters.toOwnedSlice(allocator);
+    errdefer {
+        for (adapter_slice) |adapter| freeDecodedIteratorAdapter(allocator, adapter);
+        if (adapter_slice.len > 0) allocator.free(adapter_slice);
+    }
+    return .{
+        .source = try reqU32(object, "source"),
+        .adapters = adapter_slice,
+        .terminal = try decodeIteratorTerminal(try reqStr(object, "terminal")),
+    };
+}
+
+fn freeDecodedIteratorAdapter(allocator: std.mem.Allocator, adapter: exprs.IteratorAdapter) void {
+    switch (adapter) {
+        .map => |map| freeDecodedClosure(allocator, map.closure),
+        .filter => |filter| freeDecodedClosure(allocator, filter.closure),
+        .flat_map => |closure| freeDecodedClosure(allocator, closure),
+        .other => |unsupported| allocator.free(unsupported.reason),
+        .enumerate, .zip, .range_rev => {},
+    }
+}
+
 fn decodeIterKind(allocator: std.mem.Allocator, v: Json) !exprs.IterKind {
     const o = try getObj(v);
     const tag = try reqStr(o, "kind");
     if (std.mem.eql(u8, tag, "range")) return .{ .range = {} };
     if (std.mem.eql(u8, tag, "slice")) return .{ .slice = {} };
     if (std.mem.eql(u8, tag, "enumerate")) return .{ .enumerate = {} };
-    if (std.mem.eql(u8, tag, "multi")) return .{ .multi = try decodeIdList(allocator, try req(o, "value")) };
+    if (std.mem.eql(u8, tag, "multi")) {
+        return .{ .multi = try decodeIdList(allocator, try req(o, "value")) };
+    }
+    if (std.mem.eql(u8, tag, "adapter")) {
+        return .{ .adapter = try decodeIteratorChain(allocator, try req(o, "value")) };
+    }
     return error.BadWireFormat;
 }
 
@@ -1150,6 +1822,20 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             .elements = try decodeIdList(allocator, try req(p, "elements")),
             .repeat = repeat,
         } };
+    }
+    if (std.mem.eql(u8, tag, "range")) {
+        const p = try getObj(val);
+        return .{ .range = .{
+            .start = try reqU32(p, "start"),
+            .end = try reqOptionalId(p, "end"),
+            .inclusive = try reqBool(p, "inclusive"),
+        } };
+    }
+    if (std.mem.eql(u8, tag, "panic_")) {
+        const p = try getObj(val);
+        const message = try allocator.dupe(u8, try reqStr(p, "message"));
+        errdefer allocator.free(message);
+        return .{ .panic_ = .{ .message = message } };
     }
 
     if (std.mem.eql(u8, tag, "path")) {
@@ -1251,6 +1937,25 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             .args = try decodeIdList(allocator, try req(q, "args")),
         } };
     }
+    if (std.mem.eql(u8, tag, "core_call")) {
+        const q = try getObj(val);
+        const generic_args = try decodeTypeList(allocator, try req(q, "generic_args"));
+        errdefer freeDecodedTypeSlice(allocator, generic_args);
+        const args = try decodeIdList(allocator, try req(q, "args"));
+        errdefer if (args.len > 0) allocator.free(args);
+        return .{ .core_call = .{
+            .function = try decodeCoreFunction(try reqStr(q, "function")),
+            .generic_args = generic_args,
+            .args = args,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "core_function")) {
+        const q = try getObj(val);
+        return .{ .core_function = .{
+            .function = try decodeCoreFunction(try reqStr(q, "function")),
+            .generic_args = try decodeTypeList(allocator, try req(q, "generic_args")),
+        } };
+    }
     if (std.mem.eql(u8, tag, "method_call")) {
         const q = try getObj(val);
         return .{ .method_call = .{
@@ -1324,6 +2029,52 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             .variant = variant,
             .tuple_fields = tuple_fields,
             .named_fields = named_fields,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "external_variant")) {
+        const q = try getObj(val);
+        const owner = try decodeExternalNominal(allocator, try req(q, "owner"));
+        errdefer freeDecodedExternalNominal(allocator, owner);
+        const variant = try allocator.dupe(u8, try reqStr(q, "variant"));
+        errdefer allocator.free(variant);
+        const tuple_fields = try decodeIdList(allocator, try req(q, "tuple_fields"));
+        errdefer allocator.free(tuple_fields);
+        const named_arr = switch (try req(q, "named_fields")) {
+            .array => |a| a,
+            else => return error.BadWireFormat,
+        };
+        var named: std.ArrayListUnmanaged(exprs.FieldInit) = .empty;
+        errdefer freeDecodedFieldInitList(allocator, &named);
+        for (named_arr.items) |fv| {
+            const fo = try getObj(fv);
+            var field_name: ?[]u8 = try allocator.dupe(u8, try reqStr(fo, "field"));
+            errdefer if (field_name) |owned| allocator.free(owned);
+            const value = try reqU32(fo, "value");
+            const shorthand = try reqBool(fo, "shorthand");
+            try named.append(allocator, .{
+                .field = field_name.?,
+                .value = value,
+                .shorthand = shorthand,
+            });
+            field_name = null;
+        }
+        const named_fields = try named.toOwnedSlice(allocator);
+        errdefer freeDecodedFieldInits(allocator, named_fields);
+        return .{ .external_variant = .{
+            .owner = owner,
+            .variant = variant,
+            .tuple_fields = tuple_fields,
+            .named_fields = named_fields,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "format_write")) {
+        const q = try getObj(val);
+        const template = try allocator.dupe(u8, try reqStr(q, "template"));
+        errdefer allocator.free(template);
+        return .{ .format_write = .{
+            .writer = try reqU32(q, "writer"),
+            .template = template,
+            .args = try decodeIdList(allocator, try req(q, "args")),
         } };
     }
     if (std.mem.eql(u8, tag, "field")) {
@@ -1405,6 +2156,12 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
         const q = try getObj(val);
         return .{ .return_ = .{ .value = try reqOptionalId(q, "value") } };
     }
+    if (std.mem.eql(u8, tag, "closure")) {
+        return .{ .closure = try decodeClosure(allocator, val) };
+    }
+    if (std.mem.eql(u8, tag, "iterator_chain")) {
+        return .{ .iterator_chain = try decodeIteratorChain(allocator, val) };
+    }
     if (std.mem.eql(u8, tag, "unsupported")) {
         const q = try getObj(val);
         const reason = try allocator.dupe(u8, try reqStr(q, "reason"));
@@ -1466,6 +2223,41 @@ fn decodePatternKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !
         return .{ .path = .{
             .def = @intCast(try reqU32(p, "def")),
             .variant = if (variant) |s| try allocator.dupe(u8, s) else null,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "external_variant")) {
+        const p = try getObj(val);
+        const owner = try decodeExternalNominal(allocator, try req(p, "owner"));
+        errdefer freeDecodedExternalNominal(allocator, owner);
+        const variant = try allocator.dupe(u8, try reqStr(p, "variant"));
+        errdefer allocator.free(variant);
+        const fields_arr = switch (try req(p, "fields")) {
+            .array => |a| a,
+            else => return error.BadWireFormat,
+        };
+        var fields: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
+        errdefer freeDecodedFieldPatList(allocator, &fields);
+        for (fields_arr.items) |fv| {
+            const fo = try getObj(fv);
+            var field_name: ?[]u8 = try allocator.dupe(u8, try reqStr(fo, "field"));
+            errdefer if (field_name) |owned| allocator.free(owned);
+            const pat = try reqOptionalId(fo, "pat");
+            const shorthand = try reqBool(fo, "shorthand");
+            try fields.append(allocator, .{
+                .field = field_name.?,
+                .pat = pat,
+                .shorthand = shorthand,
+            });
+            field_name = null;
+        }
+        const field_values = try fields.toOwnedSlice(allocator);
+        errdefer freeDecodedFieldPats(allocator, field_values);
+        const rest = try reqBool(p, "rest");
+        return .{ .external_variant = .{
+            .owner = owner,
+            .variant = variant,
+            .fields = field_values,
+            .rest = rest,
         } };
     }
     if (std.mem.eql(u8, tag, "tuple")) {
@@ -1608,6 +2400,7 @@ fn decodeField(allocator: std.mem.Allocator, v: Json) !items.Field {
     const name = try allocator.dupe(u8, try reqStr(o, "name"));
     errdefer allocator.free(name);
     const ty = try decodeType(allocator, try req(o, "ty"));
+    errdefer freeDecodedType(allocator, ty);
     const visibility = try decodeVisibility(
         allocator,
         o.get("vis") orelse o.get("visibility") orelse return error.MissingField,
@@ -1620,11 +2413,13 @@ fn decodeField(allocator: std.mem.Allocator, v: Json) !items.Field {
         .span = try decodeSpan(try req(o, "span")),
     };
 }
+
 fn decodeParam(allocator: std.mem.Allocator, v: Json) !items.Param {
     const o = try getObj(v);
     const name = try allocator.dupe(u8, try reqStr(o, "name"));
     errdefer allocator.free(name);
     const ty = try decodeType(allocator, try req(o, "ty"));
+    errdefer freeDecodedType(allocator, ty);
     const span = try decodeSpan(try req(o, "span"));
     return .{
         .name = name,
@@ -1666,6 +2461,7 @@ fn decodeVariant(allocator: std.mem.Allocator, v: Json) !items.Variant {
         if (!try reqBool(fields_obj, "plain")) return error.BadWireFormat;
         break :blk .none;
     };
+    errdefer freeDecodedVariantFields(allocator, fields);
     const discriminant = switch (try req(o, "discriminant")) {
         .integer => |integer| integer,
         .string => |text| std.fmt.parseInt(i128, text, 10) catch return error.BadWireFormat,
@@ -1682,7 +2478,11 @@ fn decodeParams(allocator: std.mem.Allocator, v: Json) ![]const items.Param {
     var list: std.ArrayListUnmanaged(items.Param) = .empty;
     errdefer freeDecodedParamList(allocator, &list);
     for (arr.items) |item| {
-        try list.append(allocator, try decodeParam(allocator, item));
+        const value = try decodeParam(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedParam(allocator, value);
+            return err;
+        };
     }
     return list.toOwnedSlice(allocator);
 }
@@ -1693,9 +2493,13 @@ fn decodeFields(allocator: std.mem.Allocator, v: Json) ![]const items.Field {
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(items.Field) = .empty;
-    errdefer list.deinit(allocator);
+    errdefer freeDecodedFieldList(allocator, &list);
     for (arr.items) |item| {
-        try list.append(allocator, try decodeField(allocator, item));
+        const value = try decodeField(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedField(allocator, value);
+            return err;
+        };
     }
     return list.toOwnedSlice(allocator);
 }
@@ -1706,9 +2510,13 @@ fn decodeVariants(allocator: std.mem.Allocator, v: Json) ![]const items.Variant 
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(items.Variant) = .empty;
-    errdefer list.deinit(allocator);
+    errdefer freeDecodedVariantList(allocator, &list);
     for (arr.items) |item| {
-        try list.append(allocator, try decodeVariant(allocator, item));
+        const value = try decodeVariant(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedVariant(allocator, value);
+            return err;
+        };
     }
     return list.toOwnedSlice(allocator);
 }
@@ -1733,17 +2541,24 @@ fn decodeStructMethod(allocator: std.mem.Allocator, v: Json) !StructMethod {
     const params = try decodeParams(allocator, try req(o, "params"));
     errdefer freeDecodedParams(allocator, params);
     const ret = try decodeType(allocator, try req(o, "ret"));
+    errdefer freeDecodedType(allocator, ret);
     const generic_params = try decodeStringList(allocator, try req(o, "generic_params"));
     errdefer freeDecodedStringList(allocator, generic_params);
+    const generics = try decodeOptionalGenerics(allocator, o, "generics");
+    errdefer if (generics) |value| freeDecodedGenerics(allocator, value);
+    const body = try reqU32(o, "body");
+    const receiver = try decodeReceiverField(o, "receiver");
+    const is_allocating = try reqBool(o, "is_allocating");
     return .{
         .name = name,
         .visibility = visibility,
         .params = params,
         .ret = ret,
         .generic_params = generic_params,
-        .body = try reqU32(o, "body"),
-        .receiver = try decodeReceiverField(o, "receiver"),
-        .is_allocating = try reqBool(o, "is_allocating"),
+        .generics = generics,
+        .body = body,
+        .receiver = receiver,
+        .is_allocating = is_allocating,
     };
 }
 
@@ -1753,9 +2568,13 @@ fn decodeStructMethods(allocator: std.mem.Allocator, v: Json) ![]const StructMet
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(StructMethod) = .empty;
-    errdefer list.deinit(allocator);
+    errdefer freeDecodedStructMethodList(allocator, &list);
     for (arr.items) |item| {
-        try list.append(allocator, try decodeStructMethod(allocator, item));
+        const method = try decodeStructMethod(allocator, item);
+        list.append(allocator, method) catch |err| {
+            freeDecodedStructMethod(allocator, method);
+            return err;
+        };
     }
     return list.toOwnedSlice(allocator);
 }
@@ -1767,10 +2586,17 @@ fn decodeTraitMethod(allocator: std.mem.Allocator, v: Json) !TraitMethodSig {
     const params = try decodeParams(allocator, try req(o, "params"));
     errdefer freeDecodedParams(allocator, params);
     const ret = try decodeType(allocator, try req(o, "ret"));
+    errdefer freeDecodedType(allocator, ret);
+    const generic_params = try decodeOptionalStringList(allocator, o, "generic_params");
+    errdefer freeDecodedStringList(allocator, generic_params);
+    const generics = try decodeOptionalGenerics(allocator, o, "generics");
+    errdefer if (generics) |value| freeDecodedGenerics(allocator, value);
     return .{
         .name = name,
         .params = params,
         .ret = ret,
+        .generic_params = generic_params,
+        .generics = generics,
         .receiver = try decodeReceiver(try reqStr(o, "receiver")),
     };
 }
@@ -1781,9 +2607,13 @@ fn decodeTraitMethods(allocator: std.mem.Allocator, v: Json) ![]const TraitMetho
         else => return error.BadWireFormat,
     };
     var list: std.ArrayListUnmanaged(TraitMethodSig) = .empty;
-    errdefer list.deinit(allocator);
+    errdefer freeDecodedTraitMethodList(allocator, &list);
     for (arr.items) |item| {
-        try list.append(allocator, try decodeTraitMethod(allocator, item));
+        const method = try decodeTraitMethod(allocator, item);
+        list.append(allocator, method) catch |err| {
+            freeDecodedTraitMethod(allocator, method);
+            return err;
+        };
     }
     return list.toOwnedSlice(allocator);
 }
@@ -1794,17 +2624,28 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
     if (std.mem.eql(u8, kind_str, "none")) return .none;
     if (std.mem.eql(u8, kind_str, "const_")) {
         const co = try getObj(try req(o, "value"));
+        const ty = try decodeType(allocator, try req(co, "ty"));
+        errdefer freeDecodedType(allocator, ty);
         return .{ .const_ = .{
-            .ty = try decodeType(allocator, try req(co, "ty")),
+            .ty = ty,
             .init = try reqU32(co, "init"),
         } };
     }
     if (std.mem.eql(u8, kind_str, "fn_")) {
         const fo = try getObj(try req(o, "value"));
+        const params = try decodeParams(allocator, try req(fo, "params"));
+        errdefer freeDecodedParams(allocator, params);
+        const ret = try decodeType(allocator, try req(fo, "ret"));
+        errdefer freeDecodedType(allocator, ret);
+        const generic_params = try decodeStringList(allocator, try req(fo, "generic_params"));
+        errdefer freeDecodedStringList(allocator, generic_params);
+        const generics = try decodeOptionalGenerics(allocator, fo, "generics");
+        errdefer if (generics) |value| freeDecodedGenerics(allocator, value);
         return .{ .fn_ = .{
-            .params = try decodeParams(allocator, try req(fo, "params")),
-            .ret = try decodeType(allocator, try req(fo, "ret")),
-            .generic_params = try decodeStringList(allocator, try req(fo, "generic_params")),
+            .params = params,
+            .ret = ret,
+            .generic_params = generic_params,
+            .generics = generics,
             .body = try reqU32(fo, "body"),
             .is_allocating = try reqBool(fo, "is_allocating"),
         } };
@@ -1820,21 +2661,35 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
             .unit
         else
             return error.BadWireFormat;
+        const generic_params = try decodeStringList(allocator, try req(so, "generic_params"));
+        errdefer freeDecodedStringList(allocator, generic_params);
+        const trait_bounds = try decodeStringList(allocator, try req(so, "trait_bounds"));
+        errdefer freeDecodedStringList(allocator, trait_bounds);
+        const fields = try decodeFields(allocator, try req(so, "fields"));
+        errdefer freeDecodedFields(allocator, fields);
+        const methods = try decodeStructMethods(allocator, try req(so, "methods"));
+        errdefer freeDecodedStructMethods(allocator, methods);
+        const has_dynamic_resources = try reqBool(so, "has_dynamic_resources");
         return .{ .struct_ = .{
-            .generic_params = try decodeStringList(allocator, try req(so, "generic_params")),
-            .trait_bounds = try decodeStringList(allocator, try req(so, "trait_bounds")),
+            .generic_params = generic_params,
+            .trait_bounds = trait_bounds,
             .layout = layout,
-            .fields = try decodeFields(allocator, try req(so, "fields")),
-            .methods = try decodeStructMethods(allocator, try req(so, "methods")),
-            .has_dynamic_resources = try reqBool(so, "has_dynamic_resources"),
+            .fields = fields,
+            .methods = methods,
+            .has_dynamic_resources = has_dynamic_resources,
         } };
     }
     if (std.mem.eql(u8, kind_str, "enum_")) {
         const eo = try getObj(try req(o, "value"));
         const repr_value = try req(eo, "repr_int");
+        const generic_params = try decodeStringList(allocator, try req(eo, "generic_params"));
+        errdefer freeDecodedStringList(allocator, generic_params);
+        const variants = try decodeVariants(allocator, try req(eo, "variants"));
+        errdefer freeDecodedBodyVariants(allocator, variants);
         return .{ .enum_ = .{
             .kind = try decodeEnumKind(try reqStr(eo, "kind")),
-            .variants = try decodeVariants(allocator, try req(eo, "variants")),
+            .generic_params = generic_params,
+            .variants = variants,
             .repr_int = switch (repr_value) {
                 .string => |name| try decodeIntRepr(name),
                 .null => null,
@@ -1847,13 +2702,52 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
         const to = try getObj(try req(o, "value"));
         const name = try allocator.dupe(u8, try reqStr(to, "name"));
         errdefer allocator.free(name);
+        const generic_params = try decodeOptionalStringList(allocator, to, "generic_params");
+        errdefer freeDecodedStringList(allocator, generic_params);
+        const generics = try decodeOptionalGenerics(allocator, to, "generics");
+        errdefer if (generics) |value| freeDecodedGenerics(allocator, value);
         const supertraits = try decodeStringList(allocator, try req(to, "supertraits"));
         errdefer freeDecodedStringList(allocator, supertraits);
         const methods = try decodeTraitMethods(allocator, try req(to, "methods"));
+        errdefer freeDecodedTraitMethods(allocator, methods);
+        const assoc_types = try decodeOptionalAssocTypes(allocator, to);
+        errdefer freeDecodedAssocTypeSlice(allocator, assoc_types);
+        const assoc_consts = try decodeOptionalTraitAssocConsts(allocator, to);
+        errdefer freeDecodedTraitAssocConstSlice(allocator, assoc_consts);
         return .{ .trait_ = .{
             .name = name,
+            .generic_params = generic_params,
+            .generics = generics,
             .supertraits = supertraits,
             .methods = methods,
+            .assoc_types = assoc_types,
+            .assoc_consts = assoc_consts,
+        } };
+    }
+    if (std.mem.eql(u8, kind_str, "impl_")) {
+        const io = try getObj(try req(o, "value"));
+        const self_ty = try decodeType(allocator, try req(io, "self_ty"));
+        errdefer freeDecodedType(allocator, self_ty);
+        const trait_path = try decodeOptionalPath(allocator, io, "trait_path");
+        errdefer if (trait_path) |path| freeDecodedPath(allocator, path);
+        const trait_args = try decodeTypeList(allocator, try req(io, "trait_args"));
+        errdefer freeDecodedTypeSlice(allocator, trait_args);
+        const trait_associated_types = try decodeAssociatedTypeBindings(
+            allocator,
+            try req(io, "trait_associated_types"),
+        );
+        errdefer freeDecodedAssociatedTypeBindingSlice(allocator, trait_associated_types);
+        const generics = try decodeOptionalGenerics(allocator, io, "generics");
+        errdefer if (generics) |value| freeDecodedGenerics(allocator, value);
+        const assoc_items = try decodeIdList(allocator, try req(io, "assoc_items"));
+        errdefer if (assoc_items.len > 0) allocator.free(assoc_items);
+        return .{ .impl_ = .{
+            .self_ty = self_ty,
+            .trait_path = trait_path,
+            .trait_args = trait_args,
+            .trait_associated_types = trait_associated_types,
+            .generics = generics,
+            .assoc_items = assoc_items,
         } };
     }
     if (std.mem.eql(u8, kind_str, "type_alias")) {
@@ -1894,23 +2788,46 @@ fn freeDecodedBodyVariants(allocator: std.mem.Allocator, variants: []const items
     if (variants.len > 0) allocator.free(variants);
 }
 
+fn freeDecodedStructMethod(allocator: std.mem.Allocator, method: StructMethod) void {
+    allocator.free(method.name);
+    freeDecodedVisibility(allocator, method.visibility);
+    freeDecodedBodyParams(allocator, method.params);
+    freeDecodedType(allocator, method.ret);
+    freeDecodedStringList(allocator, method.generic_params);
+    if (method.generics) |generics| freeDecodedGenerics(allocator, generics);
+}
+
+fn freeDecodedStructMethodList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(StructMethod),
+) void {
+    for (list.items) |method| freeDecodedStructMethod(allocator, method);
+    list.deinit(allocator);
+}
+
 fn freeDecodedStructMethods(allocator: std.mem.Allocator, methods: []const StructMethod) void {
-    for (methods) |method| {
-        allocator.free(method.name);
-        freeDecodedVisibility(allocator, method.visibility);
-        freeDecodedBodyParams(allocator, method.params);
-        freeDecodedType(allocator, method.ret);
-        freeDecodedStringList(allocator, method.generic_params);
-    }
+    for (methods) |method| freeDecodedStructMethod(allocator, method);
     if (methods.len > 0) allocator.free(methods);
 }
 
+fn freeDecodedTraitMethod(allocator: std.mem.Allocator, method: TraitMethodSig) void {
+    allocator.free(method.name);
+    freeDecodedBodyParams(allocator, method.params);
+    freeDecodedType(allocator, method.ret);
+    freeDecodedStringList(allocator, method.generic_params);
+    if (method.generics) |generics| freeDecodedGenerics(allocator, generics);
+}
+
+fn freeDecodedTraitMethodList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(TraitMethodSig),
+) void {
+    for (list.items) |method| freeDecodedTraitMethod(allocator, method);
+    list.deinit(allocator);
+}
+
 fn freeDecodedTraitMethods(allocator: std.mem.Allocator, methods: []const TraitMethodSig) void {
-    for (methods) |method| {
-        allocator.free(method.name);
-        freeDecodedBodyParams(allocator, method.params);
-        freeDecodedType(allocator, method.ret);
-    }
+    for (methods) |method| freeDecodedTraitMethod(allocator, method);
     if (methods.len > 0) allocator.free(methods);
 }
 
@@ -1963,15 +2880,7 @@ fn freeDecodedIteratorChain(
     allocator: std.mem.Allocator,
     chain: exprs.IteratorChainExpr,
 ) void {
-    for (chain.adapters) |adapter| {
-        switch (adapter) {
-            .map => |map| freeDecodedClosure(allocator, map.closure),
-            .filter => |filter| freeDecodedClosure(allocator, filter.closure),
-            .flat_map => |closure| freeDecodedClosure(allocator, closure),
-            .enumerate, .zip, .range_rev => {},
-            .other => |unsupported| allocator.free(unsupported.reason),
-        }
-    }
+    for (chain.adapters) |adapter| freeDecodedIteratorAdapter(allocator, adapter);
     if (chain.adapters.len > 0) allocator.free(chain.adapters);
 }
 
@@ -1985,6 +2894,7 @@ fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void 
             if (vec_lit.elements.len > 0) allocator.free(vec_lit.elements);
         },
         .range => {},
+        .panic_ => |panic_expr| allocator.free(panic_expr.message),
         .path => |path| freeDecodedTypeSlice(allocator, path.generic_args),
         .block => |block| freeDecodedBlockExpr(allocator, block),
         .unit => {},
@@ -2017,6 +2927,11 @@ fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void 
         .call => |call| {
             if (call.args.len > 0) allocator.free(call.args);
         },
+        .core_call => |call| {
+            freeDecodedTypeSlice(allocator, call.generic_args);
+            if (call.args.len > 0) allocator.free(call.args);
+        },
+        .core_function => |function| freeDecodedTypeSlice(allocator, function.generic_args),
         .method_call => |method_call| {
             if (method_call.args.len > 0) allocator.free(method_call.args);
         },
@@ -2025,6 +2940,16 @@ fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void 
             allocator.free(enum_variant.variant);
             if (enum_variant.tuple_fields.len > 0) allocator.free(enum_variant.tuple_fields);
             freeDecodedFieldInits(allocator, enum_variant.named_fields);
+        },
+        .external_variant => |variant| {
+            freeDecodedExternalNominal(allocator, variant.owner);
+            allocator.free(variant.variant);
+            if (variant.tuple_fields.len > 0) allocator.free(variant.tuple_fields);
+            freeDecodedFieldInits(allocator, variant.named_fields);
+        },
+        .format_write => |format_write| {
+            allocator.free(format_write.template);
+            if (format_write.args.len > 0) allocator.free(format_write.args);
         },
         .field => |field| allocator.free(field.field),
         .index => {},
@@ -2038,6 +2963,14 @@ fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void 
 
 fn freeDecodedExpr(allocator: std.mem.Allocator, expr: exprs.Expr) void {
     freeDecodedExprKind(allocator, expr.kind);
+}
+
+fn freeDecodedExprList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.Expr),
+) void {
+    for (list.items) |value| freeDecodedExpr(allocator, value);
+    list.deinit(allocator);
 }
 
 fn freeDecodedExprs(allocator: std.mem.Allocator, values: []const exprs.Expr) void {
@@ -2060,6 +2993,11 @@ fn freeDecodedPatternKind(allocator: std.mem.Allocator, kind: exprs.PatternKind)
             if (slice.elements.len > 0) allocator.free(slice.elements);
         },
         .struct_pat => |struct_pat| freeDecodedFieldPats(allocator, struct_pat.fields),
+        .external_variant => |variant| {
+            freeDecodedExternalNominal(allocator, variant.owner);
+            allocator.free(variant.variant);
+            freeDecodedFieldPats(allocator, variant.fields);
+        },
         .reference => {},
         .@"or" => |or_pat| {
             if (or_pat.alternatives.len > 0) allocator.free(or_pat.alternatives);
@@ -2073,6 +3011,13 @@ fn freeDecodedPattern(allocator: std.mem.Allocator, pattern: exprs.Pattern) void
     freeDecodedPatternKind(allocator, pattern.kind);
 }
 
+fn freeDecodedPatternList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.Pattern),
+) void {
+    for (list.items) |value| freeDecodedPattern(allocator, value);
+    list.deinit(allocator);
+}
 fn freeDecodedPatterns(allocator: std.mem.Allocator, values: []const exprs.Pattern) void {
     for (values) |value| freeDecodedPattern(allocator, value);
     if (values.len > 0) allocator.free(values);
@@ -2083,6 +3028,13 @@ fn freeDecodedStatement(allocator: std.mem.Allocator, statement: exprs.Statement
         .let, .expr, .item => {},
         .let_else => |let_else| freeDecodedBlockExpr(allocator, let_else.else_block),
     }
+}
+fn freeDecodedStatementList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.Statement),
+) void {
+    for (list.items) |value| freeDecodedStatement(allocator, value);
+    list.deinit(allocator);
 }
 
 fn freeDecodedStatements(
@@ -2109,6 +3061,7 @@ fn freeDecodedBodyKind(allocator: std.mem.Allocator, body: BodyKind) void {
             freeDecodedBodyParams(allocator, fn_body.params);
             freeDecodedType(allocator, fn_body.ret);
             freeDecodedStringList(allocator, fn_body.generic_params);
+            if (fn_body.generics) |generics| freeDecodedGenerics(allocator, generics);
         },
         .struct_ => |struct_body| {
             freeDecodedStringList(allocator, struct_body.generic_params);
@@ -2116,11 +3069,26 @@ fn freeDecodedBodyKind(allocator: std.mem.Allocator, body: BodyKind) void {
             freeDecodedBodyFields(allocator, struct_body.fields);
             freeDecodedStructMethods(allocator, struct_body.methods);
         },
-        .enum_ => |enum_body| freeDecodedBodyVariants(allocator, enum_body.variants),
+        .enum_ => |enum_body| {
+            freeDecodedStringList(allocator, enum_body.generic_params);
+            freeDecodedBodyVariants(allocator, enum_body.variants);
+        },
         .trait_ => |trait_body| {
             allocator.free(trait_body.name);
+            freeDecodedStringList(allocator, trait_body.generic_params);
+            if (trait_body.generics) |generics| freeDecodedGenerics(allocator, generics);
             freeDecodedStringList(allocator, trait_body.supertraits);
             freeDecodedTraitMethods(allocator, trait_body.methods);
+            freeDecodedAssocTypeSlice(allocator, trait_body.assoc_types);
+            freeDecodedTraitAssocConstSlice(allocator, trait_body.assoc_consts);
+        },
+        .impl_ => |impl_body| {
+            freeDecodedType(allocator, impl_body.self_ty);
+            if (impl_body.trait_path) |path| freeDecodedPath(allocator, path);
+            freeDecodedTypeSlice(allocator, impl_body.trait_args);
+            freeDecodedAssociatedTypeBindingSlice(allocator, impl_body.trait_associated_types);
+            if (impl_body.generics) |generics| freeDecodedGenerics(allocator, generics);
+            if (impl_body.assoc_items.len > 0) allocator.free(impl_body.assoc_items);
         },
         .type_alias => |alias_body| freeDecodedType(allocator, alias_body.target),
     }
@@ -2161,6 +3129,11 @@ fn bodyKindMatchesEntity(entity_kind: spine.EntityKind, body_kind: BodyKind) boo
             .trait_ => true,
             else => false,
         },
+        .impl_ => switch (body_kind) {
+            .impl_ => true,
+            else => false,
+        },
+        .method_ref => false,
         else => false,
     };
 }
@@ -2193,30 +3166,48 @@ fn decodeBodies(
         else => return error.BadWireFormat,
     };
     var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
-    errdefer exprs_list.deinit(allocator);
-    for (exprs_arr.items) |ev| try exprs_list.append(allocator, try decodeExpr(allocator, ev));
+    errdefer freeDecodedExprList(allocator, &exprs_list);
+    for (exprs_arr.items) |ev| {
+        const value = try decodeExpr(allocator, ev);
+        exprs_list.append(allocator, value) catch |err| {
+            freeDecodedExpr(allocator, value);
+            return err;
+        };
+    }
     const decoded_exprs = try exprs_list.toOwnedSlice(allocator);
-    errdefer allocator.free(decoded_exprs);
+    errdefer freeDecodedExprs(allocator, decoded_exprs);
 
     const stmts_arr = switch (try req(o, "stmts")) {
         .array => |a| a,
         else => return error.BadWireFormat,
     };
     var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
-    errdefer stmts_list.deinit(allocator);
-    for (stmts_arr.items) |sv| try stmts_list.append(allocator, try decodeStatement(allocator, sv));
+    errdefer freeDecodedStatementList(allocator, &stmts_list);
+    for (stmts_arr.items) |sv| {
+        const value = try decodeStatement(allocator, sv);
+        stmts_list.append(allocator, value) catch |err| {
+            freeDecodedStatement(allocator, value);
+            return err;
+        };
+    }
     const decoded_stmts = try stmts_list.toOwnedSlice(allocator);
-    errdefer allocator.free(decoded_stmts);
+    errdefer freeDecodedStatements(allocator, decoded_stmts);
 
     const pats_arr = switch (try req(o, "pats")) {
         .array => |a| a,
         else => return error.BadWireFormat,
     };
     var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
-    errdefer pats_list.deinit(allocator);
-    for (pats_arr.items) |pv| try pats_list.append(allocator, try decodePattern(allocator, pv));
+    errdefer freeDecodedPatternList(allocator, &pats_list);
+    for (pats_arr.items) |pv| {
+        const value = try decodePattern(allocator, pv);
+        pats_list.append(allocator, value) catch |err| {
+            freeDecodedPattern(allocator, value);
+            return err;
+        };
+    }
     const decoded_pats = try pats_list.toOwnedSlice(allocator);
-    errdefer allocator.free(decoded_pats);
+    errdefer freeDecodedPatterns(allocator, decoded_pats);
 
     const types_arr = switch (try req(o, "types")) {
         .array => |a| a,
@@ -2224,7 +3215,13 @@ fn decodeBodies(
     };
     var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
     errdefer freeDecodedTypeList(allocator, &types_list);
-    for (types_arr.items) |tv| try types_list.append(allocator, try decodeType(allocator, tv));
+    for (types_arr.items) |tv| {
+        const value = try decodeType(allocator, tv);
+        types_list.append(allocator, value) catch |err| {
+            freeDecodedType(allocator, value);
+            return err;
+        };
+    }
     const decoded_types = try types_list.toOwnedSlice(allocator);
     errdefer freeDecodedTypeSlice(allocator, decoded_types);
 
@@ -2275,6 +3272,19 @@ pub fn emptyBodies() Bodies {
     };
 }
 
+fn orderDenseIds(comptime T: type, values: []T) bool {
+    var swaps_remaining = values.len;
+    for (values, 0..) |*value, index| {
+        while (value.id != index and swaps_remaining > 0) : (swaps_remaining -= 1) {
+            const target: usize = value.id;
+            if (target >= values.len or values[target].id == target) return false;
+            std.mem.swap(T, value, &values[target]);
+        }
+        if (value.id != index) return false;
+    }
+    return true;
+}
+
 fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGraph {
     var g = graph.CrateGraph.init(allocator);
     errdefer g.deinit();
@@ -2308,10 +3318,7 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
             const e = try decodeEntity(allocator, ev);
             var entity_transferred = false;
             errdefer if (!entity_transferred) freeDecodedEntity(allocator, e);
-            if (@as(usize, e.id) != g.symbol_table.entities.items.len) {
-                return error.InvalidEntityId;
-            }
-            _ = try g.symbol_table.add(e);
+            try g.symbol_table.entities.append(allocator, e);
             entity_transferred = true;
         }
         const modules_arr = switch (try req(c, "modules")) {
@@ -2322,8 +3329,7 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
             const m = try decodeModule(allocator, mv);
             var module_transferred = false;
             errdefer if (!module_transferred) freeDecodedModule(allocator, m);
-            if (@as(usize, m.id) != g.modules.items.len) return error.InvalidModuleId;
-            _ = try g.addModule(m);
+            try g.modules.append(allocator, m);
             module_transferred = true;
         }
         const uses_arr = switch (try req(c, "uses")) {
@@ -2350,6 +3356,9 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
         name_transferred = true;
         deps_transferred = true;
     }
+    // Wire records are grouped by crate, not by their global dense IDs.
+    if (!orderDenseIds(spine.Entity, g.symbol_table.entities.items)) return error.InvalidEntityId;
+    if (!orderDenseIds(graph.Module, g.modules.items)) return error.InvalidModuleId;
     try g.validateTopology();
     return g;
 }
@@ -2433,6 +3442,7 @@ fn entityKindTag(k: spine.EntityKind) []const u8 {
         .enum_ => "enum_",
         .union_ => "union_",
         .fn_ => "fn_",
+        .method_ref => "method_ref",
         .const_ => "const_",
         .static_ => "static_",
         .trait_ => "trait_",
@@ -2535,7 +3545,17 @@ fn crateMembers(
     errdefer allocator.free(member);
     @memset(member, false);
     for (g.symbol_table.entities.items) |entity| {
-        if (g.entityBelongsToRoot(entity.id, root)) member[entity.id] = true;
+        member[entity.id] = g.entityBelongsToRoot(entity.id, root);
+        if (!member[entity.id] and root == g.crates.items[0].root) {
+            // Preserve auxiliary external namespaces once, in the first crate record.
+            member[entity.id] = true;
+            for (g.crates.items[1..]) |other_crate| {
+                if (g.entityBelongsToRoot(entity.id, other_crate.root)) {
+                    member[entity.id] = false;
+                    break;
+                }
+            }
+        }
     }
     for (g.modules.items) |module_row| {
         const module_entity_id = g.moduleEntityId(&module_row) orelse
@@ -2607,10 +3627,16 @@ fn encodeIdList(allocator: std.mem.Allocator, ids: []const exprs.NodeId) !Json {
     return .{ .array = arr };
 }
 
-fn encodeTypeList(allocator: std.mem.Allocator, tys: []const types.Type) anyerror!Json {
+fn encodeTypeList(allocator: std.mem.Allocator, tys: []const types.Type) std.mem.Allocator.Error!Json {
     var arr = Array.init(allocator);
     for (tys) |t| try arr.append(try encodeType(allocator, t));
     return .{ .array = arr };
+}
+fn encodeExternalNominal(allocator: std.mem.Allocator, external: types.ExternalNominal) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "path", try encodeStringList(allocator, external.path));
+    try o.put(allocator, "args", try encodeTypeList(allocator, external.args));
+    return .{ .object = o };
 }
 
 fn encodeInstantiation(
@@ -2739,7 +3765,171 @@ fn encodeCorruptType(allocator: std.mem.Allocator) !Json {
     return .{ .object = o };
 }
 
-fn encodeType(allocator: std.mem.Allocator, ty: types.Type) !Json {
+fn encodePath(allocator: std.mem.Allocator, path: types.Path) !Json {
+    var o = ObjectMap.empty;
+    var segments = Array.init(allocator);
+    for (path.segments) |segment| {
+        var so = ObjectMap.empty;
+        try so.put(allocator, "name", .{ .string = segment.name });
+        try so.put(
+            allocator,
+            "id",
+            if (segment.id) |id| mkInt(id) else .{ .null = {} },
+        );
+        try segments.append(.{ .object = so });
+    }
+    try o.put(allocator, "segments", .{ .array = segments });
+    return .{ .object = o };
+}
+
+fn encodeAssociatedTypeBinding(
+    allocator: std.mem.Allocator,
+    binding: types.AssociatedTypeBinding,
+) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "name", .{ .string = binding.name });
+    try o.put(allocator, "ty", try encodeType(allocator, binding.ty));
+    return .{ .object = o };
+}
+
+fn encodeAssociatedTypeBindings(
+    allocator: std.mem.Allocator,
+    bindings: []const types.AssociatedTypeBinding,
+) !Json {
+    var arr = Array.init(allocator);
+    for (bindings) |binding| {
+        try arr.append(try encodeAssociatedTypeBinding(allocator, binding));
+    }
+    return .{ .array = arr };
+}
+
+fn encodeBound(allocator: std.mem.Allocator, bound: types.Bound) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "path", try encodePath(allocator, bound.path));
+    try o.put(allocator, "args", try encodeTypeList(allocator, bound.args));
+    try o.put(
+        allocator,
+        "associated_types",
+        try encodeAssociatedTypeBindings(allocator, bound.associated_types),
+    );
+    try o.put(allocator, "optional", .{ .bool = bound.optional });
+    return .{ .object = o };
+}
+
+fn encodeBounds(allocator: std.mem.Allocator, bounds: []const types.Bound) !Json {
+    var arr = Array.init(allocator);
+    for (bounds) |bound| try arr.append(try encodeBound(allocator, bound));
+    return .{ .array = arr };
+}
+
+fn encodeGenericParam(allocator: std.mem.Allocator, param: types.GenericParam) !Json {
+    var o = ObjectMap.empty;
+    switch (param) {
+        .type_ => |type_param| {
+            try o.put(allocator, "kind", .{ .string = "type_" });
+            try o.put(allocator, "name", .{ .string = type_param.name });
+            try o.put(allocator, "bounds", try encodeBounds(allocator, type_param.bounds));
+        },
+        .const_ => |const_param| {
+            try o.put(allocator, "kind", .{ .string = "const_" });
+            try o.put(allocator, "name", .{ .string = const_param.name });
+            try o.put(allocator, "ty", try encodeType(allocator, const_param.ty));
+        },
+        .lifetime => |lifetime| {
+            try o.put(allocator, "kind", .{ .string = "lifetime" });
+            try o.put(allocator, "name", .{ .string = lifetime.name });
+        },
+    }
+    return .{ .object = o };
+}
+
+fn encodeGenericParams(
+    allocator: std.mem.Allocator,
+    params: []const types.GenericParam,
+) !Json {
+    var arr = Array.init(allocator);
+    for (params) |param| try arr.append(try encodeGenericParam(allocator, param));
+    return .{ .array = arr };
+}
+
+fn encodeWhereClause(allocator: std.mem.Allocator, clause: types.WhereClause) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "self_ty", try encodePath(allocator, clause.self_ty));
+    try o.put(allocator, "bounds", try encodeBounds(allocator, clause.bounds));
+    return .{ .object = o };
+}
+
+fn encodeWhereClauses(
+    allocator: std.mem.Allocator,
+    clauses: []const types.WhereClause,
+) !Json {
+    var arr = Array.init(allocator);
+    for (clauses) |clause| try arr.append(try encodeWhereClause(allocator, clause));
+    return .{ .array = arr };
+}
+
+fn encodeGenerics(allocator: std.mem.Allocator, generics: types.Generics) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "params", try encodeGenericParams(allocator, generics.params));
+    try o.put(
+        allocator,
+        "where_clauses",
+        try encodeWhereClauses(allocator, generics.where_clauses),
+    );
+    return .{ .object = o };
+}
+
+fn encodeAssocType(allocator: std.mem.Allocator, assoc_type: items.AssocType) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "name", .{ .string = assoc_type.name });
+    try o.put(
+        allocator,
+        "generics",
+        if (assoc_type.generics) |generics|
+            try encodeGenerics(allocator, generics)
+        else
+            .{ .null = {} },
+    );
+    try o.put(allocator, "bounds", try encodeBounds(allocator, assoc_type.bounds));
+    try o.put(
+        allocator,
+        "default",
+        if (assoc_type.default) |default|
+            try encodeType(allocator, default)
+        else
+            .{ .null = {} },
+    );
+    return .{ .object = o };
+}
+
+fn encodeAssocTypes(allocator: std.mem.Allocator, values: []const items.AssocType) !Json {
+    var arr = Array.init(allocator);
+    for (values) |value| try arr.append(try encodeAssocType(allocator, value));
+    return .{ .array = arr };
+}
+
+fn encodeTraitAssocConst(allocator: std.mem.Allocator, value: TraitAssocConst) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "name", .{ .string = value.name });
+    try o.put(allocator, "ty", try encodeType(allocator, value.ty));
+    try o.put(
+        allocator,
+        "default",
+        if (value.default) |default| mkInt(default) else .{ .null = {} },
+    );
+    return .{ .object = o };
+}
+
+fn encodeTraitAssocConsts(
+    allocator: std.mem.Allocator,
+    values: []const TraitAssocConst,
+) !Json {
+    var arr = Array.init(allocator);
+    for (values) |value| try arr.append(try encodeTraitAssocConst(allocator, value));
+    return .{ .array = arr };
+}
+
+fn encodeType(allocator: std.mem.Allocator, ty: types.Type) std.mem.Allocator.Error!Json {
     if (!hasValidTypeTag(ty)) return encodeCorruptType(allocator);
     var o = ObjectMap.empty;
     switch (ty) {
@@ -2800,6 +3990,10 @@ fn encodeType(allocator: std.mem.Allocator, ty: types.Type) !Json {
                     try lo.put(allocator, "kind", .{ .string = "generic" });
                     try lo.put(allocator, "value", mkInt(n));
                 },
+                .expression => |expression| {
+                    try lo.put(allocator, "kind", .{ .string = "expression" });
+                    try lo.put(allocator, "value", mkInt(expression));
+                },
             }
             var vo = ObjectMap.empty;
             try vo.put(allocator, "elem", try encodeType(allocator, a.elem));
@@ -2842,6 +4036,26 @@ fn encodeType(allocator: std.mem.Allocator, ty: types.Type) !Json {
             try o.put(allocator, "kind", .{ .string = "boxed" });
             try o.put(allocator, "value", try encodeType(allocator, b.*));
         },
+        .@"opaque" => |opaque_ty| {
+            try o.put(allocator, "kind", .{ .string = "opaque" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "bounds", try encodeBounds(allocator, opaque_ty.bounds));
+            try vo.put(
+                allocator,
+                "concrete",
+                if (opaque_ty.concrete) |concrete|
+                    try encodeType(allocator, concrete.*)
+                else
+                    .{ .null = {} },
+            );
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .dyn_trait => |bounds| {
+            try o.put(allocator, "kind", .{ .string = "dyn_trait" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "bounds", try encodeBounds(allocator, bounds));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
         .unsupported => |u| {
             try o.put(allocator, "kind", .{ .string = "unsupported" });
             var vo = ObjectMap.empty;
@@ -2878,6 +4092,70 @@ fn encodeElseBranch(allocator: std.mem.Allocator, eb: exprs.ElseBranch) !Json {
     return .{ .object = o };
 }
 
+fn encodeClosure(allocator: std.mem.Allocator, closure: exprs.ClosureExpr) !Json {
+    var o = ObjectMap.empty;
+    var captures = Array.init(allocator);
+    for (closure.captures) |capture| {
+        var capture_object = ObjectMap.empty;
+        try capture_object.put(allocator, "name", .{ .string = capture.name });
+        try capture_object.put(allocator, "mode", .{ .string = @tagName(capture.mode) });
+        try capture_object.put(allocator, "ty", mkInt(capture.ty));
+        try captures.append(.{ .object = capture_object });
+    }
+    try o.put(allocator, "captures", .{ .array = captures });
+    try o.put(allocator, "params", try encodeIdList(allocator, closure.params));
+    try o.put(allocator, "return_ty", encodeOptId(closure.return_ty));
+    try o.put(allocator, "body", try encodeBlockExpr(allocator, closure.body));
+    try o.put(allocator, "trait", .{ .string = @tagName(closure.trait) });
+    return .{ .object = o };
+}
+
+fn encodeIteratorAdapter(allocator: std.mem.Allocator, adapter: exprs.IteratorAdapter) !Json {
+    var o = ObjectMap.empty;
+    switch (adapter) {
+        .map => |map| {
+            try o.put(allocator, "kind", .{ .string = "map" });
+            try o.put(allocator, "closure", try encodeClosure(allocator, map.closure));
+        },
+        .filter => |filter| {
+            try o.put(allocator, "kind", .{ .string = "filter" });
+            try o.put(allocator, "closure", try encodeClosure(allocator, filter.closure));
+        },
+        .flat_map => |closure| {
+            try o.put(allocator, "kind", .{ .string = "flat_map" });
+            try o.put(allocator, "closure", try encodeClosure(allocator, closure));
+        },
+        .enumerate => try o.put(allocator, "kind", .{ .string = "enumerate" }),
+        .zip => |zip| {
+            try o.put(allocator, "kind", .{ .string = "zip" });
+            try o.put(allocator, "other", mkInt(zip.other));
+        },
+        .range_rev => try o.put(allocator, "kind", .{ .string = "range_rev" }),
+        .other => |unsupported| {
+            try o.put(allocator, "kind", .{ .string = "other" });
+            try o.put(allocator, "reason", .{ .string = unsupported.reason });
+            try o.put(
+                allocator,
+                "suggested_version",
+                .{ .string = @tagName(unsupported.suggested_version) },
+            );
+        },
+    }
+    return .{ .object = o };
+}
+
+fn encodeIteratorChain(allocator: std.mem.Allocator, chain: exprs.IteratorChainExpr) !Json {
+    var o = ObjectMap.empty;
+    var adapters = Array.init(allocator);
+    for (chain.adapters) |adapter| {
+        try adapters.append(try encodeIteratorAdapter(allocator, adapter));
+    }
+    try o.put(allocator, "source", mkInt(chain.source));
+    try o.put(allocator, "adapters", .{ .array = adapters });
+    try o.put(allocator, "terminal", .{ .string = @tagName(chain.terminal) });
+    return .{ .object = o };
+}
+
 fn encodeIterKind(allocator: std.mem.Allocator, ik: exprs.IterKind) !Json {
     var o = ObjectMap.empty;
     switch (ik) {
@@ -2888,7 +4166,10 @@ fn encodeIterKind(allocator: std.mem.Allocator, ik: exprs.IterKind) !Json {
             try o.put(allocator, "kind", .{ .string = "multi" });
             try o.put(allocator, "value", try encodeIdList(allocator, ids));
         },
-        .adapter => return error.UnsupportedWireVariant,
+        .adapter => |chain| {
+            try o.put(allocator, "kind", .{ .string = "adapter" });
+            try o.put(allocator, "value", try encodeIteratorChain(allocator, chain));
+        },
     }
     return .{ .object = o };
 }
@@ -2912,6 +4193,20 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             var vo = ObjectMap.empty;
             try vo.put(allocator, "elements", try encodeIdList(allocator, v.elements));
             try vo.put(allocator, "repeat", if (v.repeat) |r| mkInt(r) else .{ .null = {} });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .range => |v| {
+            try o.put(allocator, "kind", .{ .string = "range" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "start", mkInt(v.start));
+            try vo.put(allocator, "end", encodeOptId(v.end));
+            try vo.put(allocator, "inclusive", .{ .bool = v.inclusive });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .panic_ => |v| {
+            try o.put(allocator, "kind", .{ .string = "panic_" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "message", .{ .string = v.message });
             try o.put(allocator, "value", .{ .object = vo });
         },
         .path => |p| {
@@ -3020,6 +4315,21 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try vo.put(allocator, "args", try encodeIdList(allocator, v.args));
             try o.put(allocator, "value", .{ .object = vo });
         },
+        .core_call => |v| {
+            try o.put(allocator, "kind", .{ .string = "core_call" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "function", .{ .string = @tagName(v.function) });
+            try vo.put(allocator, "generic_args", try encodeTypeList(allocator, v.generic_args));
+            try vo.put(allocator, "args", try encodeIdList(allocator, v.args));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .core_function => |v| {
+            try o.put(allocator, "kind", .{ .string = "core_function" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "function", .{ .string = @tagName(v.function) });
+            try vo.put(allocator, "generic_args", try encodeTypeList(allocator, v.generic_args));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
         .method_call => |v| {
             try o.put(allocator, "kind", .{ .string = "method_call" });
             var vo = ObjectMap.empty;
@@ -3060,6 +4370,31 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
                 try named.append(.{ .object = fo });
             }
             try vo.put(allocator, "named_fields", .{ .array = named });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .external_variant => |v| {
+            try o.put(allocator, "kind", .{ .string = "external_variant" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "owner", try encodeExternalNominal(allocator, v.owner));
+            try vo.put(allocator, "variant", .{ .string = v.variant });
+            try vo.put(allocator, "tuple_fields", try encodeIdList(allocator, v.tuple_fields));
+            var named = Array.init(allocator);
+            for (v.named_fields) |f| {
+                var fo = ObjectMap.empty;
+                try fo.put(allocator, "field", .{ .string = f.field });
+                try fo.put(allocator, "value", mkInt(f.value));
+                try fo.put(allocator, "shorthand", .{ .bool = f.shorthand });
+                try named.append(.{ .object = fo });
+            }
+            try vo.put(allocator, "named_fields", .{ .array = named });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .format_write => |v| {
+            try o.put(allocator, "kind", .{ .string = "format_write" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "writer", mkInt(v.writer));
+            try vo.put(allocator, "template", .{ .string = v.template });
+            try vo.put(allocator, "args", try encodeIdList(allocator, v.args));
             try o.put(allocator, "value", .{ .object = vo });
         },
         .field => |v| {
@@ -3145,7 +4480,14 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             );
             try o.put(allocator, "value", .{ .object = vo });
         },
-        .range, .closure, .iterator_chain => return error.UnsupportedWireVariant,
+        .closure => |closure| {
+            try o.put(allocator, "kind", .{ .string = "closure" });
+            try o.put(allocator, "value", try encodeClosure(allocator, closure));
+        },
+        .iterator_chain => |chain| {
+            try o.put(allocator, "kind", .{ .string = "iterator_chain" });
+            try o.put(allocator, "value", try encodeIteratorChain(allocator, chain));
+        },
     }
     return .{ .object = o };
 }
@@ -3200,6 +4542,23 @@ fn encodePatternKind(allocator: std.mem.Allocator, kind: exprs.PatternKind) !Jso
             var vo = ObjectMap.empty;
             try vo.put(allocator, "def", mkInt(p.def));
             try vo.put(allocator, "variant", encodeOptStr(p.variant));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .external_variant => |t| {
+            try o.put(allocator, "kind", .{ .string = "external_variant" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "owner", try encodeExternalNominal(allocator, t.owner));
+            try vo.put(allocator, "variant", .{ .string = t.variant });
+            var fields = Array.init(allocator);
+            for (t.fields) |f| {
+                var fo = ObjectMap.empty;
+                try fo.put(allocator, "field", .{ .string = f.field });
+                try fo.put(allocator, "pat", encodeOptId(f.pat));
+                try fo.put(allocator, "shorthand", .{ .bool = f.shorthand });
+                try fields.append(.{ .object = fo });
+            }
+            try vo.put(allocator, "fields", .{ .array = fields });
+            try vo.put(allocator, "rest", .{ .bool = t.rest });
             try o.put(allocator, "value", .{ .object = vo });
         },
         .tuple => |t| {
@@ -3381,6 +4740,14 @@ fn encodeStructMethod(allocator: std.mem.Allocator, method: StructMethod) !Json 
     try o.put(allocator, "params", .{ .array = params });
     try o.put(allocator, "ret", try encodeType(allocator, method.ret));
     try o.put(allocator, "generic_params", try encodeStringList(allocator, method.generic_params));
+    try o.put(
+        allocator,
+        "generics",
+        if (method.generics) |generics|
+            try encodeGenerics(allocator, generics)
+        else
+            .{ .null = {} },
+    );
     try o.put(allocator, "body", mkInt(method.body));
     try o.put(allocator, "receiver", if (method.receiver) |receiver|
         .{ .string = @tagName(receiver) }
@@ -3403,6 +4770,15 @@ fn encodeTraitMethod(allocator: std.mem.Allocator, method: TraitMethodSig) !Json
     for (method.params) |param| try params.append(try encodeParam(allocator, param));
     try o.put(allocator, "params", .{ .array = params });
     try o.put(allocator, "ret", try encodeType(allocator, method.ret));
+    try o.put(allocator, "generic_params", try encodeStringList(allocator, method.generic_params));
+    try o.put(
+        allocator,
+        "generics",
+        if (method.generics) |generics|
+            try encodeGenerics(allocator, generics)
+        else
+            .{ .null = {} },
+    );
     try o.put(allocator, "receiver", .{ .string = @tagName(method.receiver) });
     return .{ .object = o };
 }
@@ -3440,6 +4816,14 @@ fn encodeBodyKind(allocator: std.mem.Allocator, bk: BodyKind) !Json {
             try vo.put(allocator, "params", .{ .array = params });
             try vo.put(allocator, "ret", try encodeType(allocator, fb.ret));
             try vo.put(allocator, "generic_params", try encodeStringList(allocator, fb.generic_params));
+            try vo.put(
+                allocator,
+                "generics",
+                if (fb.generics) |generics|
+                    try encodeGenerics(allocator, generics)
+                else
+                    .{ .null = {} },
+            );
             try vo.put(allocator, "body", mkInt(fb.body));
             try vo.put(allocator, "is_allocating", .{ .bool = fb.is_allocating });
             try o.put(allocator, "value", .{ .object = vo });
@@ -3459,6 +4843,7 @@ fn encodeBodyKind(allocator: std.mem.Allocator, bk: BodyKind) !Json {
             try o.put(allocator, "kind", .{ .string = "enum_" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "kind", .{ .string = @tagName(eb.kind) });
+            try vo.put(allocator, "generic_params", try encodeStringList(allocator, eb.generic_params));
             try vo.put(allocator, "variants", try encodeVariants(allocator, eb.variants));
             try vo.put(allocator, "repr_int", if (eb.repr_int) |repr|
                 .{ .string = @tagName(repr) }
@@ -3471,8 +4856,52 @@ fn encodeBodyKind(allocator: std.mem.Allocator, bk: BodyKind) !Json {
             try o.put(allocator, "kind", .{ .string = "trait_" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "name", .{ .string = tb.name });
+            try vo.put(allocator, "generic_params", try encodeStringList(allocator, tb.generic_params));
+            try vo.put(
+                allocator,
+                "generics",
+                if (tb.generics) |generics|
+                    try encodeGenerics(allocator, generics)
+                else
+                    .{ .null = {} },
+            );
             try vo.put(allocator, "supertraits", try encodeStringList(allocator, tb.supertraits));
+            try vo.put(allocator, "assoc_types", try encodeAssocTypes(allocator, tb.assoc_types));
+            try vo.put(
+                allocator,
+                "assoc_consts",
+                try encodeTraitAssocConsts(allocator, tb.assoc_consts),
+            );
             try vo.put(allocator, "methods", try encodeTraitMethods(allocator, tb.methods));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .impl_ => |impl_body| {
+            try o.put(allocator, "kind", .{ .string = "impl_" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "self_ty", try encodeType(allocator, impl_body.self_ty));
+            try vo.put(
+                allocator,
+                "trait_path",
+                if (impl_body.trait_path) |path|
+                    try encodePath(allocator, path)
+                else
+                    .{ .null = {} },
+            );
+            try vo.put(allocator, "trait_args", try encodeTypeList(allocator, impl_body.trait_args));
+            try vo.put(
+                allocator,
+                "trait_associated_types",
+                try encodeAssociatedTypeBindings(allocator, impl_body.trait_associated_types),
+            );
+            try vo.put(
+                allocator,
+                "generics",
+                if (impl_body.generics) |generics|
+                    try encodeGenerics(allocator, generics)
+                else
+                    .{ .null = {} },
+            );
+            try vo.put(allocator, "assoc_items", try encodeIdList(allocator, impl_body.assoc_items));
             try o.put(allocator, "value", .{ .object = vo });
         },
         .type_alias => |ab| {
@@ -3522,11 +4951,45 @@ fn encodeBodies(
 
     return .{ .object = o };
 }
-fn isExternalRoot(path: []const []const u8) bool {
+const NominalEnvironment = struct {
+    allocator: std.mem.Allocator,
+    entities: []const spine.Entity,
+    bodies: *const Bodies,
+    crates: []const graph.Crate,
+};
+
+fn normalizedNameEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_char, right_char| {
+        const normalized_left = if (left_char == '-') '_' else left_char;
+        const normalized_right = if (right_char == '-') '_' else right_char;
+        if (normalized_left != normalized_right) return false;
+    }
+    return true;
+}
+
+fn isExternalRootName(environment: NominalEnvironment, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "alloc") or
+        std.mem.eql(u8, name, "core") or
+        std.mem.eql(u8, name, "std"))
+    {
+        return true;
+    }
+    for (environment.crates) |crate| {
+        for (crate.deps) |dependency| {
+            if (normalizedNameEqual(dependency.local_alias, name) or
+                normalizedNameEqual(dependency.extern_name, name))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn isExternalRoot(environment: NominalEnvironment, path: []const []const u8) bool {
     if (path.len == 0) return false;
-    return std.mem.eql(u8, path[0], "alloc") or
-        std.mem.eql(u8, path[0], "core") or
-        std.mem.eql(u8, path[0], "std");
+    return isExternalRootName(environment, path[0]);
 }
 
 fn genericNameKnown(names: []const []const u8, name: []const u8) bool {
@@ -3535,24 +4998,258 @@ fn genericNameKnown(names: []const []const u8, name: []const u8) bool {
     }
     return false;
 }
+const NominalContext = struct {
+    names: []const []const u8,
+    params: []const types.GenericParam = &.{},
+    outer_names: []const []const u8 = &.{},
+    outer_params: []const types.GenericParam = &.{},
+    implicit_self: bool = false,
+    self_entity: ?spine.EntityId = null,
+};
+const NominalContextSeen = struct {
+    expressions: []bool,
+    statements: []bool,
+    patterns: []bool,
+    body_types: []bool,
+    root_types: []bool,
+    paired_types: []bool,
+    root_type_values: []const types.Type,
+};
+fn nominalTraitAssocConstDeclaration(
+    environment: NominalEnvironment,
+    id: spine.EntityId,
+) bool {
+    const entity_value = environment.entities[id];
+    if (entity_value.kind != .const_) return false;
+    const parent_id = entity_value.parent orelse return false;
+    if (@as(usize, parent_id) >= environment.entities.len) return false;
+    if (environment.entities[parent_id].kind != .trait_) return false;
+    if (@as(usize, parent_id) >= environment.bodies.bodies.len) return false;
+    const trait_body = switch (environment.bodies.bodies[parent_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.assoc_consts) |assoc_const| {
+        if (std.mem.eql(u8, assoc_const.name, entity_value.name)) return true;
+    }
+    return false;
+}
+
+fn nominalOwnerContext(
+    environment: NominalEnvironment,
+    owner: spine.EntityId,
+) !NominalContext {
+    const entities = environment.entities;
+    if (@as(usize, owner) >= entities.len) return error.InvalidEntityReference;
+    var parent_id = entities[owner].parent orelse return .{ .names = &.{} };
+    var depth: usize = 0;
+    while (depth < entities.len) : (depth += 1) {
+        if (@as(usize, parent_id) >= entities.len) return error.InvalidParent;
+        const parent = entities[parent_id];
+        switch (parent.kind) {
+            .impl_ => {
+                if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
+                    return error.InvalidBodyTable;
+                }
+                const impl_body = switch (environment.bodies.bodies[parent_id]) {
+                    .impl_ => |body| body,
+                    else => return error.BodyKindMismatch,
+                };
+                return .{
+                    .names = &.{},
+                    .params = if (impl_body.generics) |generics| generics.params else &.{},
+                    .implicit_self = true,
+                    .self_entity = nominalConcreteSelfEntity(environment, impl_body.self_ty),
+                };
+            },
+            .struct_, .union_ => {
+                if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
+                    return error.InvalidBodyTable;
+                }
+                const struct_body = switch (environment.bodies.bodies[parent_id]) {
+                    .struct_ => |body| body,
+                    else => return error.BodyKindMismatch,
+                };
+                return .{
+                    .names = struct_body.generic_params,
+                    .implicit_self = true,
+                    .self_entity = parent.id,
+                };
+            },
+            .trait_ => {
+                if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
+                    return error.InvalidBodyTable;
+                }
+                return switch (environment.bodies.bodies[parent_id]) {
+                    .trait_ => |body| .{
+                        .names = body.generic_params,
+                        .params = if (body.generics) |generics| generics.params else &.{},
+                        .implicit_self = true,
+                    },
+                    .none => .{ .names = &.{}, .implicit_self = true },
+                    else => error.BodyKindMismatch,
+                };
+            },
+            .fn_, .module, .crate_ => return .{ .names = &.{} },
+            else => return error.InvalidParent,
+        }
+        parent_id = parent.parent orelse return .{ .names = &.{} };
+    }
+    return error.InvalidParent;
+}
+fn nominalGenericCountForEntity(
+    environment: NominalEnvironment,
+    id: spine.EntityId,
+) ?usize {
+    if (@as(usize, id) >= environment.bodies.bodies.len) return null;
+    if (nominalTraitAssocConstDeclaration(environment, id)) return 1;
+    return switch (environment.bodies.bodies[id]) {
+        .fn_ => |body| body.generic_params.len,
+        .struct_ => |body| body.generic_params.len,
+        .enum_ => |body| body.generic_params.len,
+        else => null,
+    };
+}
+
+fn nominalParamNameKnown(params: []const types.GenericParam, name: []const u8) bool {
+    for (params) |param| {
+        const candidate = switch (param) {
+            .type_ => |value| value.name,
+            .const_ => |value| value.name,
+            .lifetime => |value| value.name,
+        };
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+fn nominalNameKnown(context: NominalContext, name: []const u8) bool {
+    return (context.implicit_self and std.mem.eql(u8, name, "Self")) or
+        genericNameKnown(context.names, name) or
+        nominalParamNameKnown(context.params, name) or
+        genericNameKnown(context.outer_names, name) or
+        nominalParamNameKnown(context.outer_params, name);
+}
+fn nominalConcreteSelfEntity(environment: NominalEnvironment, ty: types.Type) ?spine.EntityId {
+    const candidate: ?spine.EntityId = switch (ty) {
+        .path => |path| if (path.segments.len == 0)
+            null
+        else
+            path.segments[path.segments.len - 1].id,
+        .generic_inst => |generic_inst| generic_inst.decl,
+        .reference => |reference| nominalConcreteSelfEntity(environment, reference.pointee),
+        .raw_ptr => |raw_ptr| nominalConcreteSelfEntity(environment, raw_ptr.pointee),
+        .boxed => |boxed| nominalConcreteSelfEntity(environment, boxed.*),
+        else => null,
+    };
+    if (candidate) |id| {
+        if (@as(usize, id) >= environment.entities.len) return null;
+        return switch (environment.entities[id].kind) {
+            .struct_, .union_, .enum_ => id,
+            else => null,
+        };
+    }
+    return null;
+}
+
+fn validateNominalImplicitSelfPath(
+    environment: NominalEnvironment,
+    path: types.Path,
+    context: NominalContext,
+) !bool {
+    if (path.segments.len == 0) return false;
+    const first = path.segments[0];
+    if (!std.mem.eql(u8, first.name, "Self")) return false;
+    if (!context.implicit_self) return false;
+    if (first.id) |id| {
+        const expected = context.self_entity orelse return error.InvalidTypePath;
+        if (id != expected or @as(usize, id) >= environment.entities.len) {
+            return error.InvalidTypePath;
+        }
+        switch (environment.entities[id].kind) {
+            .struct_, .union_, .enum_ => {},
+            else => return error.InvalidTypePath,
+        }
+    }
+    if (path.segments.len == 1) return true;
+    if (path.segments.len != 3) return error.InvalidTypePath;
+    const trait_segment = path.segments[1];
+    const assoc_segment = path.segments[2];
+    const trait_id = trait_segment.id orelse return error.UnresolvedTypePath;
+    if (@as(usize, trait_id) >= environment.entities.len or
+        environment.entities[trait_id].kind != .trait_ or
+        !std.mem.eql(u8, environment.entities[trait_id].name, trait_segment.name) or
+        assoc_segment.id != null or trait_segment.name.len == 0 or
+        assoc_segment.name.len == 0)
+    {
+        return error.InvalidTypePath;
+    }
+    const trait_body = if (@as(usize, trait_id) < environment.bodies.bodies.len) blk: {
+        break :blk switch (environment.bodies.bodies[trait_id]) {
+            .trait_ => |body| body,
+            else => return error.InvalidTypePath,
+        };
+    } else return error.InvalidEntityReference;
+    for (trait_body.assoc_types) |assoc_type| {
+        if (std.mem.eql(u8, assoc_type.name, assoc_segment.name)) return true;
+    }
+    return error.UnresolvedTypePath;
+}
 
 fn validateNominalType(
-    entities: []const spine.Entity,
+    environment: NominalEnvironment,
     ty: types.Type,
     generic_names: []const []const u8,
 ) !void {
+    return validateNominalTypeContext(environment, ty, .{ .names = generic_names });
+}
+
+fn validateNominalTypeContext(
+    environment: NominalEnvironment,
+    ty: types.Type,
+    context: NominalContext,
+) error{
+    InvalidTypePath,
+    InvalidEntityReference,
+    InvalidExprRef,
+    InvalidTypeTraversal,
+    UnresolvedTypePath,
+    UnsupportedExternalNominalType,
+    IncompleteGenericMetadata,
+}!void {
+    return validateNominalTypeContextDepth(environment, ty, context, 0);
+}
+
+fn validateNominalTypeContextDepth(
+    environment: NominalEnvironment,
+    ty: types.Type,
+    context: NominalContext,
+    depth: usize,
+) error{
+    InvalidTypePath,
+    InvalidEntityReference,
+    InvalidExprRef,
+    InvalidTypeTraversal,
+    UnresolvedTypePath,
+    UnsupportedExternalNominalType,
+    IncompleteGenericMetadata,
+}!void {
+    if (depth >= types.traversal_depth_max) return error.InvalidTypeTraversal;
     switch (ty) {
         .path => |path| {
             if (path.segments.len == 0) return error.InvalidTypePath;
+            if (try validateNominalImplicitSelfPath(environment, path, context)) return;
             var generic_root = false;
             for (path.segments, 0..) |segment, index| {
                 if (segment.name.len == 0) return error.InvalidTypePath;
                 if (segment.id) |id| {
-                    if (@as(usize, id) >= entities.len) return error.InvalidEntityReference;
-                    if (!std.mem.eql(u8, entities[id].name, segment.name)) {
+                    if (@as(usize, id) >= environment.entities.len) {
+                        return error.InvalidEntityReference;
+                    }
+                    if (!std.mem.eql(u8, environment.entities[id].name, segment.name)) {
                         return error.InvalidTypePath;
                     }
-                } else if (index == 0 and genericNameKnown(generic_names, segment.name)) {
+                } else if (index == 0 and nominalNameKnown(context, segment.name)) {
                     generic_root = true;
                 } else if (!generic_root) {
                     return error.UnresolvedTypePath;
@@ -3560,120 +5257,1035 @@ fn validateNominalType(
             }
         },
         .external_nominal => |external| {
-            if (!isExternalRoot(external.path)) {
+            if (!isExternalRoot(environment, external.path)) {
                 return error.UnsupportedExternalNominalType;
             }
             for (external.path) |segment| {
                 if (segment.len == 0) return error.InvalidTypePath;
             }
             for (external.args) |arg| {
-                try validateNominalType(entities, arg, generic_names);
+                try validateNominalTypeContextDepth(environment, arg, context, depth + 1);
             }
         },
-        .reference => |reference| try validateNominalType(entities, reference.pointee, generic_names),
-        .raw_ptr => |raw_ptr| try validateNominalType(entities, raw_ptr.pointee, generic_names),
-        .slice => |slice| try validateNominalType(entities, slice.elem, generic_names),
-        .array => |array| try validateNominalType(entities, array.elem, generic_names),
+        .reference => |reference| {
+            try validateNominalTypeContextDepth(environment, reference.pointee, context, depth + 1);
+        },
+        .raw_ptr => |raw_ptr| {
+            try validateNominalTypeContextDepth(environment, raw_ptr.pointee, context, depth + 1);
+        },
+        .slice => |slice| {
+            try validateNominalTypeContextDepth(environment, slice.elem, context, depth + 1);
+        },
+        .array => |array| {
+            try validateNominalTypeContextDepth(environment, array.elem, context, depth + 1);
+            switch (array.len) {
+                .literal => {},
+                .generic => |index| {
+                    if (@as(usize, index) >= context.names.len and
+                        @as(usize, index) >= context.params.len)
+                    {
+                        return error.IncompleteGenericMetadata;
+                    }
+                },
+                .expression => |expression| {
+                    if (@as(usize, expression) >= environment.bodies.exprs.len) {
+                        return error.InvalidExprRef;
+                    }
+                },
+            }
+        },
         .tuple => |tuple| for (tuple) |item| {
-            try validateNominalType(entities, item, generic_names);
+            try validateNominalTypeContextDepth(environment, item, context, depth + 1);
         },
         .fn_ptr => |fn_ptr| {
             for (fn_ptr.params) |param| {
-                try validateNominalType(entities, param, generic_names);
+                try validateNominalTypeContextDepth(environment, param, context, depth + 1);
             }
-            try validateNominalType(entities, fn_ptr.ret, generic_names);
+            try validateNominalTypeContextDepth(environment, fn_ptr.ret, context, depth + 1);
         },
         .generic_inst => |generic_inst| {
-            if (@as(usize, generic_inst.decl) >= entities.len) {
+            if (@as(usize, generic_inst.decl) >= environment.entities.len) {
                 return error.InvalidEntityReference;
             }
             for (generic_inst.args.params) |param| {
-                try validateNominalType(entities, param, generic_names);
+                try validateNominalTypeContextDepth(environment, param, context, depth + 1);
             }
         },
-        .option => |option| try validateNominalType(entities, option.*, generic_names),
-        .result => |result| {
-            try validateNominalType(entities, result.ok, generic_names);
-            try validateNominalType(entities, result.err, generic_names);
+        .option => |option| {
+            try validateNominalTypeContextDepth(environment, option.*, context, depth + 1);
         },
-        .boxed => |boxed| try validateNominalType(entities, boxed.*, generic_names),
+        .result => |result| {
+            try validateNominalTypeContextDepth(environment, result.ok, context, depth + 1);
+            try validateNominalTypeContextDepth(environment, result.err, context, depth + 1);
+        },
+        .boxed => |boxed| {
+            try validateNominalTypeContextDepth(environment, boxed.*, context, depth + 1);
+        },
+        .@"opaque" => |opaque_ty| {
+            for (opaque_ty.bounds) |bound| {
+                try validateNominalBoundContextDepth(environment, bound, context, depth + 1);
+            }
+            if (opaque_ty.concrete) |concrete| {
+                try validateNominalTypeContextDepth(environment, concrete.*, context, depth + 1);
+            }
+        },
+        .dyn_trait => |bounds| {
+            for (bounds) |bound| {
+                try validateNominalBoundContextDepth(environment, bound, context, depth + 1);
+            }
+        },
         .prim, .unsupported => {},
     }
 }
 
-fn validateNominalParams(
-    entities: []const spine.Entity,
-    params: []const items.Param,
-    generic_names: []const []const u8,
-) !void {
-    for (params) |param| try validateNominalType(entities, param.ty, generic_names);
-}
-
 fn validateNominalFields(
-    entities: []const spine.Entity,
+    environment: NominalEnvironment,
     fields: []const items.Field,
     generic_names: []const []const u8,
 ) !void {
-    for (fields) |field| try validateNominalType(entities, field.ty, generic_names);
+    for (fields) |field| try validateNominalType(environment, field.ty, generic_names);
+}
+fn validateNominalPath(
+    environment: NominalEnvironment,
+    path: types.Path,
+    generic_names: []const []const u8,
+) !void {
+    return validateNominalPathContext(environment, path, .{ .names = generic_names });
+}
+
+fn validateNominalPathContext(
+    environment: NominalEnvironment,
+    path: types.Path,
+    context: NominalContext,
+) !void {
+    if (path.segments.len == 0) return error.InvalidTypePath;
+    if (try validateNominalImplicitSelfPath(environment, path, context)) return;
+    var generic_root = false;
+    for (path.segments, 0..) |segment, index| {
+        if (segment.name.len == 0) return error.InvalidTypePath;
+        if (segment.id) |id| {
+            if (@as(usize, id) >= environment.entities.len) return error.InvalidEntityReference;
+            if (!std.mem.eql(u8, environment.entities[id].name, segment.name)) {
+                return error.InvalidTypePath;
+            }
+        } else if (index == 0 and nominalNameKnown(context, segment.name)) {
+            generic_root = true;
+        } else if (!generic_root) {
+            return error.UnresolvedTypePath;
+        }
+    }
+}
+
+fn validateNominalTraitPath(
+    environment: NominalEnvironment,
+    path: types.Path,
+    generic_names: []const []const u8,
+) !void {
+    return validateNominalTraitPathContext(environment, path, .{ .names = generic_names });
+}
+
+fn validateNominalTraitPathContext(
+    environment: NominalEnvironment,
+    path: types.Path,
+    context: NominalContext,
+) !void {
+    if (path.segments.len == 0) return error.InvalidTypePath;
+    var all_ids_null = true;
+    for (path.segments) |segment| {
+        if (segment.name.len == 0) return error.InvalidTypePath;
+        if (segment.id != null) all_ids_null = false;
+    }
+    if (all_ids_null and isExternalRootName(environment, path.segments[0].name)) return;
+
+    const terminal = path.segments[path.segments.len - 1];
+    const terminal_id = terminal.id orelse return error.UnresolvedTypePath;
+    if (@as(usize, terminal_id) >= environment.entities.len) return error.InvalidEntityReference;
+    if (environment.entities[terminal_id].kind != .trait_) return error.InvalidTypePath;
+    for (path.segments, 0..) |segment, index| {
+        if (segment.id) |id| {
+            if (@as(usize, id) >= environment.entities.len) return error.InvalidEntityReference;
+            if (!std.mem.eql(u8, environment.entities[id].name, segment.name)) {
+                return error.InvalidTypePath;
+            }
+            if (index + 1 < path.segments.len and
+                environment.entities[id].kind != .module and
+                environment.entities[id].kind != .extern_crate)
+            {
+                return error.InvalidTypePath;
+            }
+        } else if (index == 0 and nominalNameKnown(context, segment.name)) {
+            continue;
+        }
+    }
+}
+
+fn validateNominalAssociatedTypeBindings(
+    environment: NominalEnvironment,
+    bindings: []const types.AssociatedTypeBinding,
+    context: NominalContext,
+) !void {
+    return validateNominalAssociatedTypeBindingsDepth(environment, bindings, context, 0);
+}
+
+fn validateNominalAssociatedTypeBindingsDepth(
+    environment: NominalEnvironment,
+    bindings: []const types.AssociatedTypeBinding,
+    context: NominalContext,
+    depth: usize,
+) !void {
+    if (depth >= types.traversal_depth_max) return error.InvalidTypeTraversal;
+    for (bindings, 0..) |binding, index| {
+        if (binding.name.len == 0) return error.IncompleteGenericMetadata;
+        for (bindings[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, binding.name)) {
+                return error.IncompleteGenericMetadata;
+            }
+        }
+        try validateNominalTypeContextDepth(environment, binding.ty, context, depth + 1);
+    }
+}
+
+fn validateNominalBoundContext(
+    environment: NominalEnvironment,
+    bound: types.Bound,
+    context: NominalContext,
+) !void {
+    return validateNominalBoundContextDepth(environment, bound, context, 0);
+}
+
+fn validateNominalBoundContextDepth(
+    environment: NominalEnvironment,
+    bound: types.Bound,
+    context: NominalContext,
+    depth: usize,
+) !void {
+    if (depth >= types.traversal_depth_max) return error.InvalidTypeTraversal;
+    try validateNominalTraitPathContext(environment, bound.path, context);
+    for (bound.args) |arg| {
+        try validateNominalTypeContextDepth(environment, arg, context, depth + 1);
+    }
+    try validateNominalAssociatedTypeBindingsDepth(
+        environment,
+        bound.associated_types,
+        context,
+        depth + 1,
+    );
+}
+
+fn validateNominalBounds(
+    environment: NominalEnvironment,
+    bounds: []const types.Bound,
+    generic_names: []const []const u8,
+) !void {
+    return validateNominalBoundsContext(environment, bounds, .{ .names = generic_names });
+}
+
+fn validateNominalBoundsContext(
+    environment: NominalEnvironment,
+    bounds: []const types.Bound,
+    context: NominalContext,
+) !void {
+    for (bounds) |bound| try validateNominalBoundContext(environment, bound, context);
+}
+
+fn validateNominalGenerics(
+    environment: NominalEnvironment,
+    generics: types.Generics,
+    generic_names: []const []const u8,
+) !void {
+    return validateNominalGenericsContext(environment, generics, .{ .names = generic_names });
+}
+
+fn validateNominalGenericsContext(
+    environment: NominalEnvironment,
+    generics: types.Generics,
+    outer: NominalContext,
+) !void {
+    const context: NominalContext = .{
+        .names = &.{},
+        .params = generics.params,
+        .outer_names = outer.names,
+        .outer_params = outer.params,
+        .implicit_self = outer.implicit_self,
+        .self_entity = outer.self_entity,
+    };
+    for (generics.params, 0..) |param, index| {
+        const name = switch (param) {
+            .type_ => |value| value.name,
+            .const_ => |value| value.name,
+            .lifetime => |value| value.name,
+        };
+        if (name.len == 0) return error.IncompleteGenericMetadata;
+        for (generics.params[0..index]) |prior| {
+            const prior_name = switch (prior) {
+                .type_ => |value| value.name,
+                .const_ => |value| value.name,
+                .lifetime => |value| value.name,
+            };
+            if (std.mem.eql(u8, name, prior_name)) return error.IncompleteGenericMetadata;
+        }
+        switch (param) {
+            .type_ => |value| try validateNominalBoundsContext(environment, value.bounds, context),
+            .const_ => |value| try validateNominalTypeContext(environment, value.ty, context),
+            .lifetime => {},
+        }
+    }
+    for (generics.where_clauses) |clause| {
+        try validateNominalPathContext(environment, clause.self_ty, context);
+        try validateNominalBoundsContext(environment, clause.bounds, context);
+    }
 }
 
 fn validateNominalBody(
-    entities: []const spine.Entity,
+    environment: NominalEnvironment,
+    owner: spine.EntityId,
     body: BodyKind,
 ) !void {
+    const entities = environment.entities;
     switch (body) {
         .none => {},
-        .const_ => |const_body| try validateNominalType(entities, const_body.ty, &.{}),
+        .const_ => |const_body| {
+            const context = try nominalOwnerContext(environment, owner);
+            try validateNominalTypeContext(environment, const_body.ty, context);
+        },
         .fn_ => |fn_body| {
-            try validateNominalParams(entities, fn_body.params, fn_body.generic_params);
-            try validateNominalType(entities, fn_body.ret, fn_body.generic_params);
+            const outer = try nominalOwnerContext(environment, owner);
+            const params: []const types.GenericParam = if (fn_body.generics) |generics|
+                generics.params
+            else
+                &.{};
+            const context: NominalContext = .{
+                .names = fn_body.generic_params,
+                .params = params,
+                .outer_names = outer.names,
+                .outer_params = outer.params,
+                .implicit_self = outer.implicit_self,
+                .self_entity = outer.self_entity,
+            };
+            for (fn_body.params) |param| {
+                try validateNominalTypeContext(environment, param.ty, context);
+            }
+            try validateNominalTypeContext(environment, fn_body.ret, context);
+            if (fn_body.generics) |generics| {
+                try validateNominalGenericsContext(environment, generics, outer);
+            }
         },
         .struct_ => |struct_body| {
-            try validateNominalFields(entities, struct_body.fields, struct_body.generic_params);
+            const struct_scope: NominalContext = .{
+                .names = struct_body.generic_params,
+                .implicit_self = true,
+                .self_entity = owner,
+            };
+            for (struct_body.fields) |field| {
+                try validateNominalTypeContext(environment, field.ty, struct_scope);
+            }
             for (struct_body.methods) |method| {
-                try validateNominalParams(entities, method.params, method.generic_params);
-                try validateNominalType(entities, method.ret, method.generic_params);
+                const method_params: []const types.GenericParam = if (method.generics) |generics|
+                    generics.params
+                else
+                    &.{};
+                const method_scope: NominalContext = .{
+                    .names = method.generic_params,
+                    .params = method_params,
+                    .outer_names = struct_scope.names,
+                    .outer_params = struct_scope.params,
+                    .implicit_self = true,
+                    .self_entity = owner,
+                };
+                for (method.params) |param| {
+                    try validateNominalTypeContext(environment, param.ty, method_scope);
+                }
+                try validateNominalTypeContext(environment, method.ret, method_scope);
+                if (method.generics) |generics| {
+                    try validateNominalGenericsContext(environment, generics, struct_scope);
+                }
             }
         },
         .enum_ => |enum_body| {
+            for (enum_body.generic_params, 0..) |name, index| {
+                if (name.len == 0) return error.IncompleteGenericMetadata;
+                for (enum_body.generic_params[0..index]) |prior| {
+                    if (std.mem.eql(u8, prior, name)) return error.IncompleteGenericMetadata;
+                }
+            }
+            const enum_scope: NominalContext = .{
+                .names = enum_body.generic_params,
+                .implicit_self = true,
+                .self_entity = owner,
+            };
             for (enum_body.variants) |variant| {
                 switch (variant.fields) {
                     .none => {},
                     .tuple => |fields| for (fields) |field| {
-                        try validateNominalType(entities, field, &.{});
+                        try validateNominalTypeContext(environment, field, enum_scope);
                     },
-                    .named => |fields| try validateNominalFields(entities, fields, &.{}),
+                    .named => |fields| for (fields) |field| {
+                        if (field.name.len == 0) return error.IncompleteGenericMetadata;
+                        try validateNominalTypeContext(environment, field.ty, enum_scope);
+                    },
                 }
             }
         },
         .trait_ => |trait_body| {
+            const trait_params: []const types.GenericParam = if (trait_body.generics) |generics|
+                generics.params
+            else
+                &.{};
+            const trait_scope: NominalContext = .{
+                .names = trait_body.generic_params,
+                .params = trait_params,
+                .implicit_self = true,
+            };
+            if (trait_body.generics) |generics| {
+                try validateNominalGenericsContext(environment, generics, trait_scope);
+            }
             for (trait_body.methods) |method| {
-                try validateNominalParams(entities, method.params, &.{});
-                try validateNominalType(entities, method.ret, &.{});
+                const method_params: []const types.GenericParam = if (method.generics) |generics|
+                    generics.params
+                else
+                    &.{};
+                const method_scope: NominalContext = .{
+                    .names = method.generic_params,
+                    .params = method_params,
+                    .outer_names = trait_scope.names,
+                    .implicit_self = true,
+                    .outer_params = trait_scope.params,
+                };
+                for (method.params) |param| {
+                    try validateNominalTypeContext(environment, param.ty, method_scope);
+                }
+                try validateNominalTypeContext(environment, method.ret, method_scope);
+                if (method.generics) |generics| {
+                    try validateNominalGenericsContext(environment, generics, trait_scope);
+                }
+            }
+            for (trait_body.assoc_types) |assoc_type| {
+                const assoc_scope: NominalContext = if (assoc_type.generics) |generics| .{
+                    .names = &.{},
+                    .params = generics.params,
+                    .outer_names = trait_scope.names,
+                    .outer_params = trait_scope.params,
+                    .implicit_self = true,
+                } else trait_scope;
+                if (assoc_type.generics) |generics| {
+                    try validateNominalGenericsContext(environment, generics, trait_scope);
+                }
+                try validateNominalBoundsContext(environment, assoc_type.bounds, assoc_scope);
+                if (assoc_type.default) |default| {
+                    try validateNominalTypeContext(environment, default, assoc_scope);
+                }
+            }
+            for (trait_body.assoc_consts) |assoc_const| {
+                try validateNominalTypeContext(environment, assoc_const.ty, trait_scope);
             }
         },
-        .type_alias => |alias_body| try validateNominalType(entities, alias_body.target, &.{}),
+        .impl_ => |impl_body| {
+            const impl_params: []const types.GenericParam = if (impl_body.generics) |generics|
+                generics.params
+            else
+                &.{};
+            const impl_context: NominalContext = .{
+                .names = &.{},
+                .params = impl_params,
+                .implicit_self = true,
+                .self_entity = nominalConcreteSelfEntity(environment, impl_body.self_ty),
+            };
+            try validateNominalTypeContext(environment, impl_body.self_ty, impl_context);
+            if (impl_body.trait_path) |path| {
+                try validateNominalTraitPathContext(environment, path, impl_context);
+                for (impl_body.trait_args) |arg| {
+                    try validateNominalTypeContext(environment, arg, impl_context);
+                }
+                try validateNominalAssociatedTypeBindings(
+                    environment,
+                    impl_body.trait_associated_types,
+                    impl_context,
+                );
+            } else if (impl_body.trait_args.len != 0 or
+                impl_body.trait_associated_types.len != 0)
+            {
+                return error.InvalidTypePath;
+            }
+            if (impl_body.generics) |generics| {
+                try validateNominalGenerics(environment, generics, &.{});
+            }
+            for (impl_body.assoc_items) |assoc_id| {
+                if (@as(usize, assoc_id) >= entities.len) return error.InvalidEntityReference;
+                const assoc = entities[assoc_id];
+                if (assoc.parent == null or assoc.parent.? != owner) {
+                    return error.InvalidEntityReference;
+                }
+                switch (assoc.kind) {
+                    .fn_, .const_, .static_, .type_alias => {},
+                    else => return error.InvalidEntityReference,
+                }
+            }
+        },
+        .type_alias => |alias_body| try validateNominalType(environment, alias_body.target, &.{}),
+    }
+}
+
+const NominalCoreCallArity = struct {
+    generic_count: usize,
+    value_count: usize,
+};
+
+fn nominalCoreCallArity(function: exprs.CoreFunction) NominalCoreCallArity {
+    return switch (function) {
+        .mem_size_of => .{ .generic_count = 1, .value_count = 0 },
+        .mem_transmute => .{ .generic_count = 2, .value_count = 1 },
+        .mem_size_of_val => .{ .generic_count = 1, .value_count = 1 },
+        .ptr_copy_nonoverlapping => .{ .generic_count = 1, .value_count = 3 },
+        .ptr_write_bytes => .{ .generic_count = 1, .value_count = 3 },
+        .ptr_read_unaligned => .{ .generic_count = 1, .value_count = 1 },
+        .slice_from_raw_parts => .{ .generic_count = 1, .value_count = 2 },
+        .slice_from_raw_parts_mut => .{ .generic_count = 1, .value_count = 2 },
+        .str_from_utf8 => .{ .generic_count = 0, .value_count = 1 },
+        .str_from_utf8_unchecked => .{ .generic_count = 0, .value_count = 1 },
+        .string_from_utf8 => .{ .generic_count = 0, .value_count = 1 },
+        .string_from_utf8_lossy => .{ .generic_count = 0, .value_count = 1 },
+        .string_from_utf8_unchecked => .{ .generic_count = 0, .value_count = 1 },
+        .cmp_min => .{ .generic_count = 1, .value_count = 2 },
+        .cmp_max => .{ .generic_count = 1, .value_count = 2 },
+        .default_value => .{ .generic_count = 1, .value_count = 0 },
+        .convert_from => .{ .generic_count = 1, .value_count = 1 },
+    };
+}
+
+fn validateNominalCoreFunction(
+    environment: NominalEnvironment,
+    function: exprs.CoreFunctionValue,
+    context: NominalContext,
+) !void {
+    const arity = nominalCoreCallArity(function.function);
+    if (function.generic_args.len != arity.generic_count) {
+        return error.InvalidCoreFunctionArity;
+    }
+    for (function.generic_args) |argument| {
+        try validateNominalTypeContext(environment, argument, context);
+    }
+}
+
+fn validateNominalCoreCall(
+    environment: NominalEnvironment,
+    call: exprs.CoreCall,
+    context: NominalContext,
+) !void {
+    const arity = nominalCoreCallArity(call.function);
+    if (call.generic_args.len != arity.generic_count or
+        call.args.len != arity.value_count)
+    {
+        return error.InvalidCoreCallArity;
+    }
+    for (call.generic_args) |argument| {
+        try validateNominalTypeContext(environment, argument, context);
+    }
+    for (call.args) |argument| {
+        if (@as(usize, argument) >= environment.bodies.exprs.len) {
+            return error.InvalidExprRef;
+        }
+    }
+}
+
+fn validateNominalExternalOwner(
+    environment: NominalEnvironment,
+    owner: types.ExternalNominal,
+    context: NominalContext,
+) !void {
+    if (!isExternalRoot(environment, owner.path)) return error.UnsupportedExternalNominalType;
+    for (owner.path) |segment| {
+        if (segment.len == 0) return error.InvalidTypePath;
+    }
+    for (owner.args) |argument| {
+        try validateNominalTypeContext(environment, argument, context);
+    }
+}
+
+fn validateNominalExternalVariant(
+    environment: NominalEnvironment,
+    variant: exprs.ExternalVariant,
+    context: NominalContext,
+) !void {
+    try validateNominalExternalOwner(environment, variant.owner, context);
+    if (!std.mem.eql(u8, variant.variant, "Owned") and
+        !std.mem.eql(u8, variant.variant, "Borrowed"))
+    {
+        return error.InvalidExternalVariant;
+    }
+    for (variant.tuple_fields) |field| {
+        if (@as(usize, field) >= environment.bodies.exprs.len) return error.InvalidExprRef;
+    }
+    for (variant.named_fields) |field| {
+        if (field.field.len == 0) return error.IncompleteGenericMetadata;
+        if (@as(usize, field.value) >= environment.bodies.exprs.len) return error.InvalidExprRef;
+    }
+    if (variant.owner.path.len < 3 or
+        !std.mem.eql(u8, variant.owner.path[variant.owner.path.len - 2], "borrow") or
+        !std.mem.eql(u8, variant.owner.path[variant.owner.path.len - 1], "Cow"))
+    {
+        return error.InvalidExternalVariant;
+    }
+}
+
+fn validateNominalExternalVariantPattern(
+    environment: NominalEnvironment,
+    variant: exprs.ExternalVariantPattern,
+    context: NominalContext,
+) !void {
+    try validateNominalExternalOwner(environment, variant.owner, context);
+    if (!std.mem.eql(u8, variant.variant, "Owned") and
+        !std.mem.eql(u8, variant.variant, "Borrowed"))
+    {
+        return error.InvalidExternalVariant;
+    }
+    for (variant.fields) |field| {
+        if (field.field.len == 0) return error.IncompleteGenericMetadata;
+        if (field.pat) |pattern| {
+            if (@as(usize, pattern) >= environment.bodies.pats.len) return error.InvalidPatternRef;
+        }
+    }
+    if (variant.owner.path.len < 3 or
+        !std.mem.eql(u8, variant.owner.path[variant.owner.path.len - 2], "borrow") or
+        !std.mem.eql(u8, variant.owner.path[variant.owner.path.len - 1], "Cow"))
+    {
+        return error.InvalidExternalVariant;
+    }
+}
+
+fn markNominalBodyTypeSeen(context_seen: *NominalContextSeen, index: usize) void {
+    context_seen.body_types[index] = true;
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        context_seen.root_types[index] = true;
+    }
+}
+
+fn markNominalRootTypeSeen(context_seen: *NominalContextSeen, index: usize) void {
+    context_seen.root_types[index] = true;
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        context_seen.body_types[index] = true;
+    }
+}
+
+fn validateNominalContextualTypeRef(
+    environment: NominalEnvironment,
+    id: exprs.TypeId,
+    context: NominalContext,
+    context_seen: *NominalContextSeen,
+) !void {
+    const index = @as(usize, id);
+    if (index >= environment.bodies.types.len) return error.InvalidTypeRef;
+    markNominalBodyTypeSeen(context_seen, index);
+    try validateNominalTypeContext(environment, environment.bodies.types[index], context);
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        try validateNominalTypeContext(environment, context_seen.root_type_values[index], context);
+    }
+}
+
+fn validateNominalContextualRootType(
+    environment: NominalEnvironment,
+    root_types: []const types.Type,
+    id: exprs.TypeId,
+    context: NominalContext,
+    context_seen: *NominalContextSeen,
+) !void {
+    const index = @as(usize, id);
+    if (index >= root_types.len) return error.InvalidTypeRef;
+    markNominalRootTypeSeen(context_seen, index);
+    try validateNominalTypeContext(environment, root_types[index], context);
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        try validateNominalTypeContext(environment, environment.bodies.types[index], context);
+    }
+}
+
+fn validateNominalContextualClosure(
+    environment: NominalEnvironment,
+    closure: exprs.ClosureExpr,
+    context: NominalContext,
+    context_seen: *NominalContextSeen,
+) !void {
+    for (closure.captures) |capture| {
+        try validateNominalContextualTypeRef(environment, capture.ty, context, context_seen);
+    }
+    if (closure.return_ty) |return_ty| {
+        try validateNominalContextualTypeRef(environment, return_ty, context, context_seen);
+    }
+}
+
+fn validateNominalContextualExpr(
+    environment: NominalEnvironment,
+    root_types: []const types.Type,
+    expression: exprs.Expr,
+    context: NominalContext,
+    context_seen: *NominalContextSeen,
+) !void {
+    if (expression.ty) |type_id| {
+        try validateNominalContextualTypeRef(environment, type_id, context, context_seen);
+    }
+    switch (expression.kind) {
+        .path => |path| {
+            if (path.generic_args.len > 0) {
+                const generic_count = nominalGenericCountForEntity(environment, path.def) orelse
+                    return error.IncompleteGenericMetadata;
+                if (generic_count == 0 or path.generic_args.len != generic_count) {
+                    return error.IncompleteGenericMetadata;
+                }
+            }
+            for (path.generic_args) |argument| {
+                try validateNominalTypeContext(environment, argument, context);
+            }
+        },
+        .core_call => |call| try validateNominalCoreCall(environment, call, context),
+        .core_function => |function| try validateNominalCoreFunction(environment, function, context),
+        .external_variant => |variant| {
+            try validateNominalExternalVariant(environment, variant, context);
+        },
+        .cast => |cast| {
+            try validateNominalTypeContext(environment, cast.source_type, context);
+            if (@as(usize, cast.target) < root_types.len) {
+                try validateNominalContextualRootType(
+                    environment,
+                    root_types,
+                    cast.target,
+                    context,
+                    context_seen,
+                );
+            } else {
+                try validateNominalContextualTypeRef(environment, cast.target, context, context_seen);
+            }
+        },
+        .closure => |closure| try validateNominalContextualClosure(
+            environment,
+            closure,
+            context,
+            context_seen,
+        ),
+        .iterator_chain => |chain| {
+            switch (chain.terminal) {
+                .iterator, .collect_vec, .sum => {},
+            }
+            for (chain.adapters) |adapter| switch (adapter) {
+                .map => |map| try validateNominalContextualClosure(
+                    environment,
+                    map.closure,
+                    context,
+                    context_seen,
+                ),
+                .filter => |filter| try validateNominalContextualClosure(
+                    environment,
+                    filter.closure,
+                    context,
+                    context_seen,
+                ),
+                .flat_map => |closure| try validateNominalContextualClosure(
+                    environment,
+                    closure,
+                    context,
+                    context_seen,
+                ),
+                .enumerate, .zip, .range_rev, .other => {},
+            };
+        },
+        else => {},
+    }
+}
+
+fn validateNominalContextualNode(
+    environment: NominalEnvironment,
+    root_types: []const types.Type,
+    node: exprs.ReachableNode,
+    context: NominalContext,
+    context_seen: *NominalContextSeen,
+) !void {
+    switch (node) {
+        .expression => |id| {
+            const index = @as(usize, id);
+            context_seen.expressions[index] = true;
+            try validateNominalContextualExpr(
+                environment,
+                root_types,
+                environment.bodies.exprs[index],
+                context,
+                context_seen,
+            );
+        },
+        .statement => |id| {
+            const index = @as(usize, id);
+            const statement = environment.bodies.stmts[index];
+            context_seen.statements[index] = true;
+            if (statement.ty) |type_id| {
+                try validateNominalContextualTypeRef(environment, type_id, context, context_seen);
+            }
+            switch (statement.kind) {
+                .let => |let_statement| {
+                    if (let_statement.ty) |type_id| {
+                        try validateNominalContextualTypeRef(
+                            environment,
+                            type_id,
+                            context,
+                            context_seen,
+                        );
+                    }
+                },
+                else => {},
+            }
+        },
+        .pattern => |id| {
+            const index = @as(usize, id);
+            const pattern = environment.bodies.pats[index];
+            context_seen.patterns[index] = true;
+            if (pattern.ty) |type_id| {
+                try validateNominalContextualTypeRef(environment, type_id, context, context_seen);
+            }
+            switch (pattern.kind) {
+                .external_variant => |variant| {
+                    try validateNominalExternalVariantPattern(environment, variant, context);
+                },
+                else => {},
+            }
+        },
+    }
+}
+
+fn validateNominalCoreCallsInRoot(
+    environment: NominalEnvironment,
+    root_types: []const types.Type,
+    root: exprs.NodeId,
+    context: NominalContext,
+    walker: *exprs.NodeWalker,
+    context_seen: *NominalContextSeen,
+) !void {
+    try walker.reset(root);
+    while (try walker.next()) |node| {
+        try validateNominalContextualNode(
+            environment,
+            root_types,
+            node,
+            context,
+            context_seen,
+        );
+    }
+}
+
+fn validateNominalCoreCallsInBody(
+    environment: NominalEnvironment,
+    root_types: []const types.Type,
+    owner: spine.EntityId,
+    body: BodyKind,
+    walker: *exprs.NodeWalker,
+    context_seen: *NominalContextSeen,
+) !void {
+    switch (body) {
+        .none, .enum_, .impl_, .type_alias => {},
+        .const_ => |const_body| {
+            try validateNominalCoreCallsInRoot(
+                environment,
+                root_types,
+                const_body.init,
+                try nominalOwnerContext(environment, owner),
+                walker,
+                context_seen,
+            );
+        },
+        .fn_ => |fn_body| {
+            const outer = try nominalOwnerContext(environment, owner);
+            const params: []const types.GenericParam = if (fn_body.generics) |generics|
+                generics.params
+            else
+                &.{};
+            const context: NominalContext = .{
+                .names = fn_body.generic_params,
+                .params = params,
+                .outer_names = outer.names,
+                .outer_params = outer.params,
+                .implicit_self = outer.implicit_self,
+                .self_entity = outer.self_entity,
+            };
+            try validateNominalCoreCallsInRoot(
+                environment,
+                root_types,
+                fn_body.body,
+                context,
+                walker,
+                context_seen,
+            );
+        },
+        .struct_ => |struct_body| {
+            const struct_scope: NominalContext = .{
+                .names = struct_body.generic_params,
+                .implicit_self = true,
+                .self_entity = owner,
+            };
+            for (struct_body.methods) |method| {
+                const method_params: []const types.GenericParam = if (method.generics) |generics|
+                    generics.params
+                else
+                    &.{};
+                const method_scope: NominalContext = .{
+                    .names = method.generic_params,
+                    .params = method_params,
+                    .outer_names = struct_scope.names,
+                    .outer_params = struct_scope.params,
+                    .implicit_self = true,
+                    .self_entity = owner,
+                };
+                try validateNominalCoreCallsInRoot(
+                    environment,
+                    root_types,
+                    method.body,
+                    method_scope,
+                    walker,
+                    context_seen,
+                );
+            }
+        },
+        .trait_ => |trait_body| {
+            const trait_params: []const types.GenericParam = if (trait_body.generics) |generics|
+                generics.params
+            else
+                &.{};
+            const trait_scope: NominalContext = .{
+                .names = trait_body.generic_params,
+                .params = trait_params,
+                .implicit_self = true,
+            };
+            for (trait_body.assoc_consts) |assoc_const| {
+                if (assoc_const.default) |default| {
+                    try validateNominalCoreCallsInRoot(
+                        environment,
+                        root_types,
+                        default,
+                        trait_scope,
+                        walker,
+                        context_seen,
+                    );
+                }
+            }
+        },
     }
 }
 
 fn validateNominalTables(
-    entities: []const spine.Entity,
+    environment: NominalEnvironment,
     root_types: []const types.Type,
-    body_data: *const Bodies,
     instantiations: []const types.Instantiation,
 ) !void {
-    for (root_types) |ty| try validateNominalType(entities, ty, &.{});
-    for (body_data.types) |ty| try validateNominalType(entities, ty, &.{});
-    for (body_data.exprs) |expr| {
-        switch (expr.kind) {
-            .path => |path| for (path.generic_args) |arg| {
-                try validateNominalType(entities, arg, &.{});
-            },
-            else => {},
+    const entities = environment.entities;
+    const body_data = environment.bodies;
+    if (body_data.bodies.len != entities.len) return error.InvalidBodyTable;
+
+    var context_seen: NominalContextSeen = .{
+        .expressions = &.{},
+        .statements = &.{},
+        .patterns = &.{},
+        .body_types = &.{},
+        .root_types = &.{},
+        .root_type_values = root_types,
+        .paired_types = &.{},
+    };
+    defer {
+        environment.allocator.free(context_seen.expressions);
+        environment.allocator.free(context_seen.statements);
+        environment.allocator.free(context_seen.patterns);
+        environment.allocator.free(context_seen.body_types);
+        environment.allocator.free(context_seen.root_types);
+        environment.allocator.free(context_seen.paired_types);
+    }
+    context_seen.expressions = environment.allocator.alloc(bool, body_data.exprs.len) catch
+        return error.OutOfMemory;
+    context_seen.statements = environment.allocator.alloc(bool, body_data.stmts.len) catch
+        return error.OutOfMemory;
+    context_seen.patterns = environment.allocator.alloc(bool, body_data.pats.len) catch
+        return error.OutOfMemory;
+    context_seen.body_types = environment.allocator.alloc(bool, body_data.types.len) catch
+        return error.OutOfMemory;
+    context_seen.root_types = environment.allocator.alloc(bool, root_types.len) catch
+        return error.OutOfMemory;
+    const paired_count = @min(root_types.len, body_data.types.len);
+    context_seen.paired_types = environment.allocator.alloc(bool, paired_count) catch
+        return error.OutOfMemory;
+    for (context_seen.paired_types, 0..) |*paired, index| {
+        paired.* = types.deepEqual(root_types[index], body_data.types[index]);
+    }
+    @memset(context_seen.expressions, false);
+    @memset(context_seen.statements, false);
+    @memset(context_seen.patterns, false);
+    @memset(context_seen.body_types, false);
+    @memset(context_seen.root_types, false);
+
+    var walker = exprs.NodeWalker.init(
+        environment.allocator,
+        body_data.exprs,
+        body_data.stmts,
+        body_data.pats,
+        body_data.types,
+    ) catch return error.OutOfMemory;
+    defer walker.deinit();
+    for (body_data.bodies, 0..) |body, index| {
+        const owner: spine.EntityId = @intCast(index);
+        const body_is_none = switch (body) {
+            .none => true,
+            else => false,
+        };
+        if ((entities[index].kind == .const_ or entities[index].kind == .static_) and
+            body_is_none and
+            !nominalTraitAssocConstDeclaration(environment, owner))
+        {
+            return error.BodyKindMismatch;
+        }
+        try validateNominalBody(environment, owner, body);
+        try validateNominalCoreCallsInBody(
+            environment,
+            root_types,
+            owner,
+            body,
+            &walker,
+            &context_seen,
+        );
+    }
+    for (body_data.exprs, 0..) |_, index| {
+        if (!context_seen.expressions[index]) {
+            try validateNominalCoreCallsInRoot(
+                environment,
+                root_types,
+                @intCast(index),
+                .{ .names = &.{} },
+                &walker,
+                &context_seen,
+            );
         }
     }
-    if (body_data.bodies.len != entities.len) return error.InvalidBodyTable;
-    for (body_data.bodies) |body| try validateNominalBody(entities, body);
+    for (body_data.pats, 0..) |_, index| {
+        if (!context_seen.patterns[index]) {
+            try validateNominalContextualNode(
+                environment,
+                root_types,
+                .{ .pattern = @intCast(index) },
+                .{ .names = &.{} },
+                &context_seen,
+            );
+        }
+    }
+    for (body_data.stmts, 0..) |_, index| {
+        if (!context_seen.statements[index]) {
+            try validateNominalContextualNode(
+                environment,
+                root_types,
+                .{ .statement = @intCast(index) },
+                .{ .names = &.{} },
+                &context_seen,
+            );
+        }
+    }
+    for (root_types, 0..) |ty, index| {
+        if (!context_seen.root_types[index]) {
+            try validateNominalType(environment, ty, &.{});
+        }
+    }
+    for (body_data.types, 0..) |ty, index| {
+        if (!context_seen.body_types[index]) {
+            try validateNominalType(environment, ty, &.{});
+        }
+    }
     for (instantiations, 0..) |instantiation, index| {
         if (@as(usize, instantiation.generic_id) >= entities.len) {
             return error.InvalidEntityReference;
@@ -3682,6 +6294,7 @@ fn validateNominalTables(
         const generic_count = switch (body_data.bodies[instantiation.generic_id]) {
             .fn_ => |body| body.generic_params.len,
             .struct_ => |body| body.generic_params.len,
+            .enum_ => |body| body.generic_params.len,
             else => return error.IncompleteGenericMetadata,
         };
         if (generic_count == 0 or instantiation.args.params.len != generic_count) {
@@ -3695,7 +6308,7 @@ fn validateNominalTables(
             }
         }
         for (instantiation.args.params) |param| {
-            try validateNominalType(entities, param, &.{});
+            try validateNominalType(environment, param, &.{});
         }
     }
 }
@@ -3721,9 +6334,13 @@ pub fn encode(allocator: std.mem.Allocator, ir_data: *const RustIr) ![]const u8 
         );
     }
     try validateNominalTables(
-        ir_data.graph.symbol_table.entities.items,
+        .{
+            .allocator = allocator,
+            .entities = ir_data.graph.symbol_table.entities.items,
+            .bodies = &ir_data.bodies,
+            .crates = ir_data.graph.crates.items,
+        },
         ir_data.types,
-        &ir_data.bodies,
         ir_data.instantiations,
     );
 
@@ -3762,11 +6379,13 @@ pub fn encode(allocator: std.mem.Allocator, ir_data: *const RustIr) ![]const u8 
     return std.json.Stringify.valueAlloc(allocator, root_val, .{});
 }
 
-/// Decode a canonical v5 JSON string into a `RustIr` instance.
+/// Decode a canonical v6 JSON string into a `RustIr` instance.
 /// Allocations made during decoding use `allocator`.
 pub fn decode(allocator: std.mem.Allocator, json_bytes: []const u8) !RustIr {
-    var parsed = std.json.parseFromSlice(Json, allocator, json_bytes, .{}) catch
-        return error.InvalidJson;
+    var parsed = std.json.parseFromSlice(Json, allocator, json_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
     defer parsed.deinit();
 
     const root_map = getObj(parsed.value) catch return error.BadWireFormat;
@@ -3796,9 +6415,13 @@ pub fn decode(allocator: std.mem.Allocator, json_bytes: []const u8) !RustIr {
     );
     errdefer freeDecodedBodies(allocator, b);
     try validateNominalTables(
-        g.symbol_table.entities.items,
+        .{
+            .allocator = allocator,
+            .entities = g.symbol_table.entities.items,
+            .bodies = &b,
+            .crates = g.crates.items,
+        },
         ir_types,
-        &b,
         instantiations,
     );
 

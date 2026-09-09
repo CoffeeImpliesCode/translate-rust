@@ -21,7 +21,7 @@ const valid_crates_json =
     "\"items\":[],\"attributes\":[]}],\"uses\":[]}]";
 
 const canonical_empty_payload =
-    "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+    "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
     "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
     ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[]," ++
     "\"pats\":[],\"types\":[],\"bodies\":[{\"owner\":0,\"body\":{\"kind\":\"none\"}}]}}";
@@ -42,7 +42,7 @@ const tampered_cast_exprs_json =
     "\"ty\":1,\"kind\":\"cast\",\"value\":{\"operand\":0,\"source_type\":{\"kind\":\"prim\"," ++
     "\"value\":\"u32\"},\"target\":1,\"conversion\":\"primitive_from\"}}]";
 const tampered_cast_payload =
-    "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+    "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
     "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
     ",\"types\":[{\"kind\":\"prim\",\"value\":\"u32\"},{\"kind\":\"prim\",\"value\":\"u8\"}]," ++
     "\"instantiations\":[],\"bodies\":{\"exprs\":" ++ tampered_cast_exprs_json ++
@@ -64,7 +64,7 @@ const valid_dependency_crates_json =
     "\"items\":[],\"attributes\":[]}],\"uses\":[]}]";
 
 const canonical_dependency_payload =
-    "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+    "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
     "\"sidecar\":null,\"toolchain\":null," ++ valid_dependency_crates_json ++
     ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[]," ++
     "\"pats\":[],\"types\":[],\"bodies\":[{\"owner\":0,\"body\":{\"kind\":\"none\"}}]}}";
@@ -285,6 +285,294 @@ fn initTestGraph(
     });
     return crate_graph;
 }
+
+fn initCoreCallIr(allocator: std.mem.Allocator) !serialize.RustIr {
+    const crate_graph = try initTestGraph(allocator, "core_call_fixture", &.{.fn_});
+    const expression_table = try allocator.dupe(exprs.Expr, &.{
+        .{
+            .id = 0,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 1,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .core_call = .{
+                .function = .mem_size_of,
+                .generic_args = &.{.{ .prim = .u8 }},
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .core_call = .{
+                .function = .default_value,
+                .generic_args = &.{.{ .prim = .u16 }},
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 3,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .core_call = .{
+                .function = .convert_from,
+                .generic_args = &.{.{ .prim = .u32 }},
+                .args = &.{1},
+            } },
+        },
+        .{
+            .id = 4,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .core_call = .{
+                .function = .string_from_utf8,
+                .generic_args = &.{},
+                .args = &.{1},
+            } },
+        },
+        .{
+            .id = 5,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .core_call = .{
+                .function = .string_from_utf8_lossy,
+                .generic_args = &.{},
+                .args = &.{1},
+            } },
+        },
+        .{
+            .id = 6,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .core_call = .{
+                .function = .string_from_utf8_unchecked,
+                .generic_args = &.{},
+                .args = &.{1},
+            } },
+        },
+    });
+    const body_table = try allocator.alloc(bodies.BodyKind, 2);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } };
+    return .{
+        .crate_name = "core_call_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &.{},
+        .instantiations = &.{},
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = body_table,
+        },
+    };
+}
+
+fn initSemanticNodesIr(allocator: std.mem.Allocator) !serialize.RustIr {
+    const crate_graph = try initTestGraph(allocator, "semantic_nodes_fixture", &.{.fn_});
+    const owner: types.ExternalNominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{.{ .prim = .u8 }},
+    };
+    const array_type = try allocator.create(types.Array);
+    array_type.* = .{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .expression = 1 },
+    };
+    const expression_table = try allocator.dupe(exprs.Expr, &.{
+        .{
+            .id = 0,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 1,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .unit = {} },
+        },
+        .{
+            .id = 2,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .core_function = .{
+                .function = .mem_transmute,
+                .generic_args = &.{ .{ .prim = .u8 }, .{ .prim = .u16 } },
+            } },
+        },
+        .{
+            .id = 3,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .external_variant = .{
+                .owner = owner,
+                .variant = "Owned",
+                .tuple_fields = &.{1},
+                .named_fields = &.{.{
+                    .field = "value",
+                    .value = 1,
+                    .shorthand = false,
+                }},
+            } },
+        },
+    });
+    const pattern_table = try allocator.dupe(exprs.Pattern, &.{
+        .{
+            .id = 0,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .external_variant = .{
+                .owner = owner,
+                .variant = "Borrowed",
+                .fields = &.{.{
+                    .field = "value",
+                    .pat = null,
+                    .shorthand = false,
+                }},
+                .rest = false,
+            } },
+        },
+    });
+    const body_table = try allocator.alloc(bodies.BodyKind, 2);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } };
+    return .{
+        .crate_name = "semantic_nodes_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &.{},
+        .instantiations = &.{},
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = pattern_table,
+            .types = &.{.{ .array = array_type }},
+            .bodies = body_table,
+        },
+    };
+}
+
+test "semantic variants and array expression lengths round-trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var ir = try initSemanticNodesIr(allocator);
+
+    const encoded = try serialize.encode(allocator, &ir);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"core_function\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"function\":\"mem_transmute\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"external_variant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"expression\",\"value\":1") != null);
+
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    const function = switch (decoded.bodies.exprs[2].kind) {
+        .core_function => |value| value,
+        else => return error.ExpectedCoreFunctionExpression,
+    };
+    try std.testing.expectEqual(exprs.CoreFunction.mem_transmute, function.function);
+    try std.testing.expectEqual(@as(usize, 2), function.generic_args.len);
+    const variant = switch (decoded.bodies.exprs[3].kind) {
+        .external_variant => |value| value,
+        else => return error.ExpectedExternalVariantExpression,
+    };
+    try std.testing.expectEqualStrings("alloc", variant.owner.path[0]);
+    try std.testing.expectEqualStrings("Owned", variant.variant);
+    const pattern = switch (decoded.bodies.pats[0].kind) {
+        .external_variant => |value| value,
+        else => return error.ExpectedExternalVariantPattern,
+    };
+    try std.testing.expectEqualStrings("Borrowed", pattern.variant);
+    switch (decoded.bodies.types[0]) {
+        .array => |array| switch (array.len) {
+            .expression => |expression| try std.testing.expectEqual(@as(u32, 1), expression),
+            else => return error.ExpectedExpressionArrayLength,
+        },
+        else => return error.ExpectedArrayType,
+    }
+}
+
+test "core calls round-trip with canonical wire tags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var ir = try initCoreCallIr(allocator);
+
+    const encoded = try serialize.encode(allocator, &ir);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"core_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"function\":\"mem_size_of\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"function\":\"default_value\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"function\":\"convert_from\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"function\":\"string_from_utf8\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"function\":\"string_from_utf8_lossy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"function\":\"string_from_utf8_unchecked\"") != null);
+
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    const call = switch (decoded.bodies.exprs[1].kind) {
+        .core_call => |value| value,
+        else => return error.ExpectedCoreCallExpression,
+    };
+    try std.testing.expectEqual(exprs.CoreFunction.mem_size_of, call.function);
+    try std.testing.expectEqual(@as(usize, 1), call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 0), call.args.len);
+    const default_call = switch (decoded.bodies.exprs[2].kind) {
+        .core_call => |value| value,
+        else => return error.ExpectedDefaultValueCall,
+    };
+    try std.testing.expectEqual(exprs.CoreFunction.default_value, default_call.function);
+    try std.testing.expectEqual(@as(usize, 1), default_call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 0), default_call.args.len);
+    const convert_call = switch (decoded.bodies.exprs[3].kind) {
+        .core_call => |value| value,
+        else => return error.ExpectedConvertFromCall,
+    };
+    try std.testing.expectEqual(exprs.CoreFunction.convert_from, convert_call.function);
+    try std.testing.expectEqual(@as(usize, 1), convert_call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 1), convert_call.args.len);
+    const string_functions = [_]exprs.CoreFunction{
+        .string_from_utf8,
+        .string_from_utf8_lossy,
+        .string_from_utf8_unchecked,
+    };
+    for (string_functions, 0..) |expected, offset| {
+        const index = offset + 4;
+        const string_call = switch (decoded.bodies.exprs[index].kind) {
+            .core_call => |value| value,
+            else => return error.ExpectedStringCoreCall,
+        };
+        try std.testing.expectEqual(expected, string_call.function);
+        try std.testing.expectEqual(@as(usize, 0), string_call.generic_args.len);
+        try std.testing.expectEqual(@as(usize, 1), string_call.args.len);
+    }
+
+    const reencoded = try serialize.encode(allocator, &decoded);
+    try std.testing.expectEqualStrings(encoded, reencoded);
+}
 fn expectCanonicalDependencyMissingField(field: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -352,6 +640,11 @@ fn expectCanonicalDependencyFeatureElementWrongType() !void {
     );
 }
 
+test "serialize: allocation exhaustion is not invalid JSON" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, serialize.decode(failing.allocator(), canonical_empty_payload));
+}
+
 test "serialize: two crate roots roundtrip with non-zero allocator memory" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -400,8 +693,32 @@ test "serialize: two crate roots roundtrip with non-zero allocator memory" {
             .is_translated = true,
         });
     }
+    const child_id = try crate_graph.symbol_table.add(.{
+        .id = 2,
+        .kind = .module,
+        .name = try allocator.dupe(u8, "child"),
+        .span = span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    crate_graph.modules.items[0].items = try allocator.dupe(spine.EntityId, &.{child_id});
+    const child_module_id = try crate_graph.addModule(.{
+        .id = child_id,
+        .kind = .@"inline",
+        .name = try allocator.dupe(u8, "child"),
+        .parent = 0,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
 
-    const body_kinds = [_]bodies.BodyKind{ .none, .none };
+    const body_kinds = [_]bodies.BodyKind{ .none, .none, .none };
     const ir: serialize.RustIr = .{
         .crate_name = "alpha",
         .graph = crate_graph,
@@ -419,20 +736,23 @@ test "serialize: two crate roots roundtrip with non-zero allocator memory" {
     var encode_fba = std.heap.FixedBufferAllocator.init(&encode_memory);
     const encoded = try serialize.encode(encode_fba.allocator(), &ir);
 
-    var decode_memory: [64 * 1024]u8 = undefined;
+    var decode_memory: [128 * 1024]u8 = undefined;
     @memset(&decode_memory, 1);
     var decode_fba = std.heap.FixedBufferAllocator.init(&decode_memory);
     var decoded = try serialize.decode(decode_fba.allocator(), encoded);
     defer decoded.graph.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), decoded.graph.crates.items.len);
-    try std.testing.expectEqual(@as(usize, 2), decoded.graph.symbol_table.entities.items.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.graph.symbol_table.entities.items.len);
     try std.testing.expectEqual(@as(usize, 0), decoded.graph.crates.items[0].deps.len);
     try std.testing.expectEqual(@as(usize, 0), decoded.graph.crates.items[1].deps.len);
     try std.testing.expectEqual(@as(spine.EntityId, 0), decoded.graph.crates.items[0].root);
     try std.testing.expectEqual(@as(spine.EntityId, 1), decoded.graph.crates.items[1].root);
     try std.testing.expectEqualStrings("alpha", decoded.graph.symbol_table.entities.items[0].name);
     try std.testing.expectEqualStrings("beta", decoded.graph.symbol_table.entities.items[1].name);
+    try std.testing.expectEqualStrings("child", decoded.graph.symbol_table.get(child_id).?.name);
+    try std.testing.expectEqual(@as(?spine.EntityId, 0), decoded.graph.modules.items[child_module_id].parent);
+    try std.testing.expectEqualSlices(spine.EntityId, &.{child_id}, decoded.graph.modules.items[0].items);
 }
 
 test "serialize: instantiation cleanup preserves borrowed nested arguments" {
@@ -483,7 +803,7 @@ test "serialize: canonical dependency metadata encodes all states and order" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(
-        @as(i128, 5),
+        @as(i128, 6),
         parsed.value.object.get("format_version").?.integer,
     );
     const crates = parsed.value.object.get("crates").?.array.items;
@@ -739,7 +1059,7 @@ test "serialize: RustIr roundtrip with entities, types, and bodies" {
     try std.testing.expectEqual(@as(exprs.TypeId, 2), decoded_primitive_from.target);
 }
 
-test "serialize: canonical v5 cast conversion tags decode" {
+test "serialize: canonical cast conversion tags decode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -778,7 +1098,7 @@ test "serialize: cast target root mismatch is rejected before lowering" {
         root.validateForTranslation(&decoded),
     );
 }
-test "serialize: canonical v5 cast conversion is required" {
+test "serialize: canonical cast conversion is required" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -789,7 +1109,7 @@ test "serialize: canonical v5 cast conversion is required" {
     );
 }
 
-test "serialize: canonical v5 cast conversion rejects malformed tags" {
+test "serialize: canonical cast conversion rejects malformed tags" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -811,6 +1131,121 @@ test "serialize: canonical v5 cast conversion rejects malformed tags" {
         error.BadWireFormat,
         serialize.decode(allocator, wrong_type),
     );
+}
+
+test "serialize: range bounds and panic preserve wire payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const span: spine.Span = .{
+        .start_line = 3,
+        .start_col = 5,
+        .end_line = 3,
+        .end_col = 18,
+    };
+    const table_types = [_]types.Type{
+        .{ .prim = .usize },
+        .{ .prim = .never },
+    };
+    const expressions = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "4",
+                .value = 4,
+                .base = .dec,
+                .ty_suffix = "usize",
+            } } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "8",
+                .value = 8,
+                .base = .dec,
+                .ty_suffix = "usize",
+            } } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .range = .{
+                .start = 0,
+                .end = null,
+                .inclusive = false,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .range = .{
+                .start = 0,
+                .end = 1,
+                .inclusive = true,
+            } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .panic_ = .{ .message = "unreachable branch" } },
+        },
+    };
+    const sample_ir: serialize.RustIr = .{
+        .crate_name = "range_panic",
+        .edition = "2021",
+        .graph = try initTestGraph(allocator, "range_panic", &.{}),
+        .types = &table_types,
+        .bodies = .{
+            .exprs = &expressions,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &table_types,
+            .bodies = &.{.none},
+        },
+    };
+
+    const encoded = try serialize.encode(allocator, &sample_ir);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"kind\":\"range\",\"value\":{\"start\":0,\"end\":null,\"inclusive\":false}",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"kind\":\"range\",\"value\":{\"start\":0,\"end\":1,\"inclusive\":true}",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"kind\":\"panic_\",\"value\":{\"message\":\"unreachable branch\"}",
+    ) != null);
+
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    const open_range = switch (decoded.bodies.exprs[2].kind) {
+        .range => |range| range,
+        else => return error.ExpectedRangeExpression,
+    };
+    try std.testing.expectEqual(@as(?exprs.NodeId, null), open_range.end);
+    const bounded_range = switch (decoded.bodies.exprs[3].kind) {
+        .range => |range| range,
+        else => return error.ExpectedRangeExpression,
+    };
+    try std.testing.expectEqual(@as(?exprs.NodeId, 1), bounded_range.end);
+    try std.testing.expect(bounded_range.inclusive);
+    const panic_expr = switch (decoded.bodies.exprs[4].kind) {
+        .panic_ => |panic_value| panic_value,
+        else => return error.ExpectedPanicExpression,
+    };
+    try std.testing.expectEqualStrings("unreachable branch", panic_expr.message);
 }
 
 test "serialize: explicit Vec literal preserves wire payload and roundtrips" {
@@ -1033,11 +1468,9 @@ test "serialize: explicit unsupported diagnostics preserve tagged metadata" {
     try std.testing.expectEqual(type_span, decoded_type.span);
 }
 
-test "serialize: decoder frees an owned literal field when a later field is invalid" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+test "serialize: decoder frees owned data on malformed literal" {
     const malformed =
-        "{\"format_version\":5,\"crate_name\":\"malformed\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"malformed\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[{\"id\":0," ++
         "\"span\":{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":4}," ++
@@ -1047,7 +1480,7 @@ test "serialize: decoder frees an owned literal field when a later field is inva
 
     try std.testing.expectError(
         error.BadWireFormat,
-        serialize.decode(arena.allocator(), malformed),
+        serialize.decode(std.testing.allocator, malformed),
     );
 }
 
@@ -1269,6 +1702,7 @@ test "serialize: every entity kind tag roundtrips exactly" {
         .enum_,
         .union_,
         .fn_,
+        .method_ref,
         .const_,
         .static_,
         .trait_,
@@ -1287,6 +1721,7 @@ test "serialize: every entity kind tag roundtrips exactly" {
         "enum_",
         "union_",
         "fn_",
+        "method_ref",
         "const_",
         "static_",
         "trait_",
@@ -1319,7 +1754,10 @@ test "serialize: every entity kind tag roundtrips exactly" {
             .name = try allocator.dupe(u8, "entity"),
             .span = span,
             .visibility = .public,
-            .parent = if (index == 0) null else 0,
+            .parent = if (index == 0) null else if (kind == .method_ref)
+                @intCast(index - 1)
+            else
+                0,
             .resolved = null,
             .renamed_to = null,
             .attributes = &.{},
@@ -1336,8 +1774,13 @@ test "serialize: every entity kind tag roundtrips exactly" {
         }
     }
 
-    const entity_items = try allocator.alloc(spine.EntityId, entity_kinds.len - 1);
-    for (entity_items, 0..) |*item_id, index| item_id.* = @intCast(index + 1);
+    const entity_items = try allocator.alloc(spine.EntityId, entity_kinds.len - 2);
+    var module_item_index: usize = 0;
+    for (entity_kinds, 0..) |kind, index| {
+        if (index == 0 or kind == .method_ref) continue;
+        entity_items[module_item_index] = @intCast(index);
+        module_item_index += 1;
+    }
     _ = try crate_graph.addModule(.{
         .id = 0,
         .kind = .root,
@@ -1360,13 +1803,26 @@ test "serialize: every entity kind tag roundtrips exactly" {
     });
 
     const body_kinds = try allocator.alloc(bodies.BodyKind, entity_kinds.len);
-    for (body_kinds) |*body| body.* = .none;
+    for (body_kinds, entity_kinds) |*body, kind| {
+        body.* = switch (kind) {
+            .const_, .static_ => .{ .const_ = .{
+                .ty = .{ .prim = .unit },
+                .init = 0,
+            } },
+            else => .none,
+        };
+    }
     const sample_ir: serialize.RustIr = .{
         .crate_name = "entity_kinds",
         .edition = "2021",
         .graph = crate_graph,
         .bodies = .{
-            .exprs = &.{},
+            .exprs = &.{.{
+                .id = 0,
+                .span = span,
+                .ty = null,
+                .kind = .unit,
+            }},
             .stmts = &.{},
             .pats = &.{},
             .types = &.{},
@@ -1400,7 +1856,7 @@ test "serialize: partial body data is rejected" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"partial\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"partial\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[],\"pats\":[]," ++
         "\"types\":[],\"bodies\":[{\"owner\":0,\"body\":{\"kind\":\"struct_\"}}]}}";
@@ -1413,7 +1869,7 @@ test "serialize: absent supported body metadata is rejected" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"partial\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"partial\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[],\"pats\":[]," ++
         "\"types\":[],\"bodies\":[{\"owner\":0,\"body\":{\"kind\":\"fn_\",\"value\":{\"params\":[]," ++
@@ -1429,7 +1885,7 @@ test "serialize: absent nullable node field is rejected" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"partial\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"partial\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[{\"id\":0," ++
         "\"span\":{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":1}," ++
@@ -1441,7 +1897,7 @@ test "serialize: absent nullable node field is rejected" {
     );
 }
 
-test "serialize: canonical v5 requires every root field" {
+test "serialize: canonical wire requires every root field" {
     const fields = [_][]const u8{
         "format_version",
         "crate_name",
@@ -1478,7 +1934,7 @@ test "serialize: v4 translation input is rejected after dependency metadata sche
 
 test "serialize: canonical body owner must name a real entity" {
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[]," ++
         "\"pats\":[],\"types\":[],\"bodies\":[{\"owner\":1,\"body\":{\"kind\":\"none\"}}]}}";
@@ -1490,7 +1946,7 @@ test "serialize: canonical body owner must name a real entity" {
 
 test "serialize: canonical body kind must match its owner" {
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[]," ++
         "\"pats\":[],\"types\":[],\"bodies\":[{\"owner\":0,\"body\":{\"kind\":\"fn_\"," ++
@@ -1504,7 +1960,7 @@ test "serialize: canonical body kind must match its owner" {
 
 test "serialize: canonical nominal paths require graph bindings" {
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[{\"kind\":\"path\",\"value\":{\"segments\":[{\"name\":\"Missing\"," ++
         "\"id\":null}]}}],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[]," ++
@@ -1517,7 +1973,7 @@ test "serialize: canonical nominal paths require graph bindings" {
 
 test "serialize: nominal failure frees every decoded body table" {
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[{\"kind\":\"path\",\"value\":{\"segments\":[{\"name\":\"Missing\"," ++
         "\"id\":null}]}}],\"instantiations\":[],\"bodies\":{\"exprs\":[{\"id\":0," ++
@@ -1540,7 +1996,7 @@ test "serialize: canonical primitive paths and alloc external nominal roundtrip"
     defer arena.deinit();
     const allocator = arena.allocator();
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[{\"kind\":\"prim\",\"value\":\"i32\"},{\"kind\":\"path\",\"value\":{\"segments\":[{\"name\":\"fixture\",\"id\":0}]}},{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"alloc\",\"vec\",\"Vec\"]," ++
         "\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"}]}}]," ++
@@ -1593,7 +2049,7 @@ test "serialize: canonical primitive paths and alloc external nominal roundtrip"
 
 test "serialize: canonical external nominal rejects unknown root" {
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"unknown\"," ++
         "\"vec\",\"Vec\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"}]}}]," ++
@@ -1607,7 +2063,7 @@ test "serialize: canonical external nominal rejects unknown root" {
 
 test "serialize: canonical instantiation metadata is complete" {
     const payload =
-        "{\"format_version\":5,\"crate_name\":\"fixture\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[{\"generic_id\":0,\"args\":{\"params\":[]}}]," ++
         "\"bodies\":{\"exprs\":[],\"stmts\":[],\"pats\":[],\"types\":[]," ++
@@ -1623,7 +2079,7 @@ test "serialize: unknown wire tags and negative repeats are rejected" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const unknown_length =
-        "{\"format_version\":5,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[{\"kind\":\"array\",\"value\":{\"elem\":{\"kind\":\"prim\"," ++
         "\"value\":\"u8\"},\"len\":{\"kind\":\"unknown\",\"value\":1}}}]," ++
@@ -1635,7 +2091,7 @@ test "serialize: unknown wire tags and negative repeats are rejected" {
     );
 
     const negative_repeat =
-        "{\"format_version\":5,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"instantiations\":[],\"types\":[],\"bodies\":{\"exprs\":[{\"id\":0," ++
         "\"span\":{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":1}," ++
@@ -1647,7 +2103,7 @@ test "serialize: unknown wire tags and negative repeats are rejected" {
     );
 
     const unknown_reason =
-        "{\"format_version\":5,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[{\"kind\":\"unsupported\",\"value\":{\"reason\":\"unknown_reason\"," ++
         "\"message\":\"bad\",\"span\":{\"start_line\":1,\"start_col\":1," ++
@@ -1658,7 +2114,7 @@ test "serialize: unknown wire tags and negative repeats are rejected" {
         serialize.decode(allocator, unknown_reason),
     );
     const incomplete_expr_unsupported =
-        "{\"format_version\":5,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[{\"id\":0," ++
         "\"span\":{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":1}," ++
@@ -1670,7 +2126,7 @@ test "serialize: unknown wire tags and negative repeats are rejected" {
     );
 
     const incomplete_pattern_unsupported =
-        "{\"format_version\":5,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
         "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
         ",\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[],\"pats\":[{\"id\":0," ++
         "\"span\":{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":1}," ++
@@ -1682,7 +2138,7 @@ test "serialize: unknown wire tags and negative repeats are rejected" {
     );
 }
 
-test "serialize: rich v3 bodies preserve all supported metadata" {
+test "serialize: rich bodies preserve all supported metadata" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1760,7 +2216,20 @@ test "serialize: rich v3 bodies preserve all supported metadata" {
         ),
         .types = &root_types,
         .bodies = .{
-            .exprs = &.{},
+            .exprs = &.{
+                .{ .id = 0, .span = span, .ty = 0, .kind = .{ .literal = .{ .int = .{
+                    .text = "7",
+                    .value = 7,
+                    .base = .dec,
+                    .ty_suffix = "i32",
+                } } } },
+                .{ .id = 1, .span = span, .ty = 0, .kind = .{ .literal = .{ .int = .{
+                    .text = "8",
+                    .value = 8,
+                    .base = .dec,
+                    .ty_suffix = "i32",
+                } } } },
+            },
             .stmts = &.{},
             .pats = &.{},
             .types = &root_types,
@@ -1820,4 +2289,795 @@ test "serialize: rich v3 bodies preserve all supported metadata" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "serialize: trait impl and generic metadata roundtrip" {
+    // This fixture keeps associated items as child entities.
+    // It exercises every new metadata field through encode, decode, and validation.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 8,
+    };
+
+    var crate_graph = try initTestGraph(
+        allocator,
+        "metadata",
+        &.{ .trait_, .struct_, .impl_, .fn_, .const_, .type_alias, .fn_ },
+    );
+    crate_graph.modules.items[0].items = try allocator.dupe(
+        spine.EntityId,
+        &.{ 1, 2, 3, 7 },
+    );
+    for ([_]spine.EntityId{ 4, 5, 6 }) |child_id| {
+        crate_graph.symbol_table.entities.items[child_id].parent = 3;
+    }
+
+    const trait_path: types.Path = .{
+        .segments = &.{.{ .name = "item_1", .id = 1 }},
+    };
+    const self_path: types.Path = .{
+        .segments = &.{.{ .name = "item_2", .id = 2 }},
+    };
+    const external_trait_path: types.Path = .{
+        .segments = &.{
+            .{ .name = "std", .id = null },
+            .{ .name = "hash", .id = null },
+            .{ .name = "Hasher", .id = null },
+        },
+    };
+    const method_generic_path: types.Path = .{
+        .segments = &.{.{ .name = "U", .id = null }},
+    };
+    const function_generic_path: types.Path = .{
+        .segments = &.{.{ .name = "V", .id = null }},
+    };
+    const trait_generic_path: types.Path = .{
+        .segments = &.{.{ .name = "T", .id = null }},
+    };
+    const trait_method_generic_path: types.Path = .{
+        .segments = &.{.{ .name = "M", .id = null }},
+    };
+    const trait_bound: types.Bound = .{
+        .path = trait_path,
+        .args = &.{.{ .prim = .u8 }},
+        .associated_types = &.{.{
+            .name = "Output",
+            .ty = .{ .prim = .u8 },
+        }},
+        .optional = true,
+    };
+    const external_trait_bound: types.Bound = .{ .path = external_trait_path };
+    const trait_generics: types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "T",
+            .bounds = &.{trait_bound},
+        } }},
+        .where_clauses = &.{},
+    };
+    const trait_method_generics: types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "M",
+            .bounds = &.{trait_bound},
+        } }},
+        .where_clauses = &.{},
+    };
+    const impl_generics: types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "T",
+            .bounds = &.{ trait_bound, external_trait_bound },
+        } }},
+        .where_clauses = &.{},
+    };
+    const method_generics: types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "U",
+            .bounds = &.{trait_bound},
+        } }},
+        .where_clauses = &.{.{
+            .self_ty = method_generic_path,
+            .bounds = &.{trait_bound},
+        }},
+    };
+    const function_generics: types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "V",
+            .bounds = &.{trait_bound},
+        } }},
+        .where_clauses = &.{.{
+            .self_ty = function_generic_path,
+            .bounds = &.{trait_bound},
+        }},
+    };
+
+    const method_param: items.Param = .{
+        .name = "value",
+        .ty = .{ .path = method_generic_path },
+        .span = span,
+    };
+    const method: bodies.StructMethod = .{
+        .name = "convert",
+        .params = &.{method_param},
+        .ret = .{ .path = method_generic_path },
+        .generic_params = &.{"U"},
+        .generics = method_generics,
+        .body = 1,
+        .receiver = .ref_,
+    };
+    const function_param: items.Param = .{
+        .name = "value",
+        .ty = .{ .path = function_generic_path },
+        .span = span,
+    };
+    const trait_method_param: items.Param = .{
+        .name = "value",
+        .ty = .{ .path = trait_method_generic_path },
+        .span = span,
+    };
+    const trait_method: bodies.TraitMethodSig = .{
+        .name = "collect",
+        .params = &.{trait_method_param},
+        .ret = .{ .path = trait_generic_path },
+        .generic_params = &.{"M"},
+        .generics = trait_method_generics,
+        .receiver = .ref_,
+    };
+    const type_rows = [_]types.Type{.{ .prim = .u64 }};
+    const expression_rows = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "7u64",
+                .value = 7,
+                .base = .dec,
+                .ty_suffix = "u64",
+            } } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 0,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 0,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 0,
+                .labelled = null,
+            } },
+        },
+    };
+    const body_rows = [_]bodies.BodyKind{
+        .none,
+        .{ .trait_ = .{
+            .name = "item_1",
+            .generic_params = &.{"T"},
+            .generics = trait_generics,
+            .methods = &.{trait_method},
+            .assoc_types = &.{.{
+                .name = "Output",
+                .generics = null,
+                .bounds = &.{trait_bound},
+                .default = .{ .path = self_path },
+            }},
+            .assoc_consts = &.{.{
+                .name = "LIMIT",
+                .ty = .{ .prim = .u64 },
+                .default = 0,
+            }},
+        } },
+        .{ .struct_ = .{
+            .layout = .unit,
+            .methods = &.{method},
+        } },
+        .{ .impl_ = .{
+            .self_ty = .{ .path = self_path },
+            .trait_path = trait_path,
+            .trait_args = &.{.{ .path = self_path }},
+            .trait_associated_types = &.{.{
+                .name = "InputType",
+                .ty = .{ .prim = .u8 },
+            }},
+            .generics = impl_generics,
+            .assoc_items = &.{ 4, 5, 6 },
+        } },
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .u64 },
+            .body = 2,
+        } },
+        .{ .const_ = .{
+            .ty = .{ .prim = .u64 },
+            .init = 0,
+        } },
+        .{ .type_alias = .{
+            .target = .{ .path = self_path },
+        } },
+        .{ .fn_ = .{
+            .params = &.{function_param},
+            .ret = .{ .path = function_generic_path },
+            .generic_params = &.{"V"},
+            .generics = function_generics,
+            .body = 3,
+        } },
+    };
+    var fixture_ir: serialize.RustIr = .{
+        .crate_name = "metadata",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &type_rows,
+        .bodies = .{
+            .exprs = &expression_rows,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &type_rows,
+            .bodies = &body_rows,
+        },
+    };
+    defer fixture_ir.graph.deinit();
+    try root.validateForTranslation(&fixture_ir);
+    const encoded = try serialize.encode(allocator, &fixture_ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+
+    const decoded_trait = decoded.bodies.bodies[1].trait_;
+    try std.testing.expectEqual(@as(usize, 1), decoded_trait.generic_params.len);
+    try std.testing.expectEqualStrings("T", decoded_trait.generic_params[0]);
+    const decoded_trait_generics = decoded_trait.generics orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), decoded_trait_generics.params.len);
+    switch (decoded_trait_generics.params[0]) {
+        .type_ => |param| {
+            try std.testing.expectEqualStrings("T", param.name);
+            try std.testing.expectEqual(@as(usize, 1), param.bounds.len);
+            const bound = param.bounds[0];
+            try std.testing.expect(bound.optional);
+            try std.testing.expectEqual(@as(usize, 1), bound.args.len);
+            switch (bound.args[0]) {
+                .prim => |primitive| try std.testing.expectEqual(types.Prim.u8, primitive),
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expectEqual(@as(usize, 1), bound.associated_types.len);
+            try std.testing.expectEqualStrings("Output", bound.associated_types[0].name);
+            switch (bound.associated_types[0].ty) {
+                .prim => |primitive| try std.testing.expectEqual(types.Prim.u8, primitive),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded_trait.methods.len);
+    const decoded_trait_method = decoded_trait.methods[0];
+    try std.testing.expectEqualStrings("M", decoded_trait_method.generic_params[0]);
+    const decoded_trait_method_generics = decoded_trait_method.generics orelse
+        return error.TestUnexpectedResult;
+    switch (decoded_trait_method_generics.params[0]) {
+        .type_ => |param| try std.testing.expectEqualStrings("M", param.name),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (decoded_trait_method.ret) {
+        .path => |path| try std.testing.expectEqualStrings("T", path.segments[0].name),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded_trait.assoc_types.len);
+    try std.testing.expectEqualStrings("Output", decoded_trait.assoc_types[0].name);
+    try std.testing.expect(decoded_trait.assoc_types[0].generics == null);
+    try std.testing.expectEqual(@as(usize, 1), decoded_trait.assoc_types[0].bounds.len);
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, 1),
+        decoded_trait.assoc_types[0].bounds[0].path.segments[0].id,
+    );
+    const assoc_default = decoded_trait.assoc_types[0].default orelse
+        return error.TestUnexpectedResult;
+    switch (assoc_default) {
+        .path => |path| {
+            try std.testing.expectEqualStrings("item_2", path.segments[0].name);
+            try std.testing.expectEqual(@as(?spine.EntityId, 2), path.segments[0].id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded_trait.assoc_consts.len);
+    try std.testing.expectEqualStrings("LIMIT", decoded_trait.assoc_consts[0].name);
+    try std.testing.expectEqual(
+        @as(?exprs.NodeId, 0),
+        decoded_trait.assoc_consts[0].default,
+    );
+
+    const decoded_impl = decoded.bodies.bodies[3].impl_;
+    switch (decoded_impl.self_ty) {
+        .path => |path| {
+            try std.testing.expectEqualStrings("item_2", path.segments[0].name);
+            try std.testing.expectEqual(@as(?spine.EntityId, 2), path.segments[0].id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const decoded_trait_path = decoded_impl.trait_path orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(
+        "item_1",
+        decoded_trait_path.segments[0].name,
+    );
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, 1),
+        decoded_trait_path.segments[0].id,
+    );
+    try std.testing.expectEqual(@as(usize, 1), decoded_impl.trait_args.len);
+    switch (decoded_impl.trait_args[0]) {
+        .path => |path| {
+            try std.testing.expectEqualStrings("item_2", path.segments[0].name);
+            try std.testing.expectEqual(@as(?spine.EntityId, 2), path.segments[0].id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded_impl.trait_associated_types.len);
+    try std.testing.expectEqualStrings(
+        "InputType",
+        decoded_impl.trait_associated_types[0].name,
+    );
+    switch (decoded_impl.trait_associated_types[0].ty) {
+        .prim => |primitive| try std.testing.expectEqual(types.Prim.u8, primitive),
+        else => return error.TestUnexpectedResult,
+    }
+    const decoded_impl_generics = decoded_impl.generics orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), decoded_impl_generics.params.len);
+    switch (decoded_impl_generics.params[0]) {
+        .type_ => |param| {
+            try std.testing.expectEqualStrings("T", param.name);
+            try std.testing.expectEqual(
+                @as(?spine.EntityId, 1),
+                param.bounds[0].path.segments[0].id,
+            );
+            try std.testing.expectEqual(@as(usize, 2), param.bounds.len);
+            try std.testing.expectEqualStrings(
+                "std",
+                param.bounds[1].path.segments[0].name,
+            );
+            try std.testing.expectEqualStrings(
+                "Hasher",
+                param.bounds[1].path.segments[2].name,
+            );
+            try std.testing.expect(param.bounds[1].path.segments[2].id == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 0), decoded_impl_generics.where_clauses.len);
+    try std.testing.expectEqualSlices(
+        spine.EntityId,
+        &.{ 4, 5, 6 },
+        decoded_impl.assoc_items,
+    );
+    for (decoded_impl.assoc_items) |child_id| {
+        try std.testing.expectEqual(
+            @as(?spine.EntityId, 3),
+            decoded.graph.symbol_table.entities.items[child_id].parent,
+        );
+    }
+
+    const decoded_method = decoded.bodies.bodies[2].struct_.methods[0];
+    const decoded_method_generics = decoded_method.generics orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("U", decoded_method.generic_params[0]);
+    switch (decoded_method_generics.params[0]) {
+        .type_ => |param| {
+            try std.testing.expectEqualStrings("U", param.name);
+            try std.testing.expectEqual(
+                @as(?spine.EntityId, 1),
+                param.bounds[0].path.segments[0].id,
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings(
+        "U",
+        decoded_method_generics.where_clauses[0].self_ty.segments[0].name,
+    );
+    try std.testing.expect(
+        decoded_method_generics.where_clauses[0].self_ty.segments[0].id == null,
+    );
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, 1),
+        decoded_method_generics.where_clauses[0].bounds[0].path.segments[0].id,
+    );
+
+    const decoded_function = decoded.bodies.bodies[7].fn_;
+    const decoded_function_generics = decoded_function.generics orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("V", decoded_function.generic_params[0]);
+    switch (decoded_function.params[0].ty) {
+        .path => |path| {
+            try std.testing.expectEqualStrings("V", path.segments[0].name);
+            try std.testing.expect(path.segments[0].id == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (decoded_function_generics.params[0]) {
+        .type_ => |param| {
+            try std.testing.expectEqualStrings("V", param.name);
+            try std.testing.expectEqual(
+                @as(?spine.EntityId, 1),
+                param.bounds[0].path.segments[0].id,
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings(
+        "V",
+        decoded_function_generics.where_clauses[0].self_ty.segments[0].name,
+    );
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, 1),
+        decoded_function_generics.where_clauses[0].bounds[0].path.segments[0].id,
+    );
+    try std.testing.expectEqual(@as(exprs.NodeId, 0), decoded.bodies.bodies[5].const_.init);
+    switch (decoded.bodies.bodies[6].type_alias.target) {
+        .path => |path| {
+            try std.testing.expectEqualStrings("item_2", path.segments[0].name);
+            try std.testing.expectEqual(@as(?spine.EntityId, 2), path.segments[0].id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_body_rows = body_rows;
+    var malformed_ir = fixture_ir;
+    malformed_ir.bodies.bodies = &malformed_body_rows;
+    malformed_body_rows[3].impl_.assoc_items = &.{7};
+    try std.testing.expectError(
+        error.InvalidEntityReference,
+        root.validateForTranslation(&malformed_ir),
+    );
+    malformed_body_rows[3].impl_.assoc_items = &.{ 4, 4 };
+    try std.testing.expectError(
+        error.InvalidEntityReference,
+        root.validateForTranslation(&malformed_ir),
+    );
+}
+
+test "serialize: bound Self keeps its concrete identity and abstract projection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 8,
+    };
+
+    var crate_graph = try initTestGraph(
+        allocator,
+        "self_identity",
+        &.{ .struct_, .struct_, .trait_ },
+    );
+    defer crate_graph.deinit();
+
+    const concrete_self_path: types.Path = .{
+        .segments = &.{.{ .name = "Self", .id = 1 }},
+    };
+    const concrete_self_param: items.Param = .{
+        .name = "other",
+        .ty = .{ .path = concrete_self_path },
+        .span = span,
+    };
+    const concrete_method: bodies.StructMethod = .{
+        .name = "combine",
+        .params = &.{concrete_self_param},
+        .ret = .{ .path = concrete_self_path },
+        .body = 0,
+        .receiver = .ref_,
+    };
+    const abstract_projection: types.Path = .{
+        .segments = &.{
+            .{ .name = "Self", .id = null },
+            .{ .name = "item_3", .id = 3 },
+            .{ .name = "Output", .id = null },
+        },
+    };
+    const expression_rows = [_]exprs.Expr{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{},
+            .tail = null,
+            .labelled = null,
+        } },
+    }};
+    const body_rows = [_]bodies.BodyKind{
+        .none,
+        .{ .struct_ = .{
+            .layout = .unit,
+            .methods = &.{concrete_method},
+        } },
+        .{ .struct_ = .{ .layout = .unit } },
+        .{ .trait_ = .{
+            .name = "item_3",
+            .assoc_types = &.{.{
+                .name = "Output",
+                .generics = null,
+                .bounds = &.{},
+                .default = .{ .path = abstract_projection },
+            }},
+        } },
+    };
+    const fixture_ir: serialize.RustIr = .{
+        .crate_name = "self_identity",
+        .graph = crate_graph,
+        .bodies = .{
+            .exprs = &expression_rows,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = &body_rows,
+        },
+    };
+
+    try root.validateForTranslation(&fixture_ir);
+    const encoded = try serialize.encode(allocator, &fixture_ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+
+    const decoded_self = decoded.bodies.bodies[1].struct_.methods[0].ret.path.segments[0];
+    try std.testing.expectEqualStrings("Self", decoded_self.name);
+    try std.testing.expectEqual(@as(?spine.EntityId, 1), decoded_self.id);
+    const decoded_default = decoded.bodies.bodies[3].trait_.assoc_types[0].default orelse
+        return error.TestUnexpectedResult;
+    const decoded_projection = switch (decoded_default) {
+        .path => |path| path.segments,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("Self", decoded_projection[0].name);
+    try std.testing.expectEqual(@as(?spine.EntityId, null), decoded_projection[0].id);
+    try std.testing.expectEqual(@as(?spine.EntityId, 3), decoded_projection[1].id);
+
+    const wrong_self_path: types.Path = .{
+        .segments = &.{.{ .name = "Self", .id = 2 }},
+    };
+    const wrong_self_param: items.Param = .{
+        .name = "other",
+        .ty = .{ .path = wrong_self_path },
+        .span = span,
+    };
+    var wrong_method = concrete_method;
+    wrong_method.params = &.{wrong_self_param};
+    wrong_method.ret = .{ .path = wrong_self_path };
+    var wrong_body_rows = body_rows;
+    wrong_body_rows[1].struct_.methods = &.{wrong_method};
+    var wrong_ir = fixture_ir;
+    wrong_ir.bodies.bodies = &wrong_body_rows;
+    try std.testing.expectError(error.InvalidTypePath, root.validateForTranslation(&wrong_ir));
+
+    const invalid_self_path: types.Path = .{
+        .segments = &.{.{ .name = "Self", .id = 99 }},
+    };
+    var invalid_method = concrete_method;
+    invalid_method.ret = .{ .path = invalid_self_path };
+    var invalid_body_rows = body_rows;
+    invalid_body_rows[1].struct_.methods = &.{invalid_method};
+    var invalid_ir = fixture_ir;
+    invalid_ir.bodies.bodies = &invalid_body_rows;
+    try std.testing.expectError(error.InvalidTypePath, root.validateForTranslation(&invalid_ir));
+}
+
+test "serialize: declared dependency trait validates while unknown root fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 8,
+    };
+
+    var crate_graph = try initTestGraph(allocator, "dependency_bound", &.{.fn_});
+    defer crate_graph.deinit();
+    const dependencies = try allocator.alloc(graph.CrateDep, 1);
+    dependencies[0] = .{
+        .extern_name = try allocator.dupe(u8, "num-traits"),
+        .local_alias = try allocator.dupe(u8, "num-traits"),
+        .id = 1,
+    };
+    crate_graph.crates.items[0].deps = dependencies;
+
+    const dependency_trait_path: types.Path = .{
+        .segments = &.{
+            .{ .name = "num_traits", .id = null },
+            .{ .name = "Bounded", .id = null },
+        },
+    };
+    const dependency_bound: types.Bound = .{ .path = dependency_trait_path };
+    const function_generics: types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "T",
+            .bounds = &.{dependency_bound},
+        } }},
+        .where_clauses = &.{},
+    };
+    const expression_rows = [_]exprs.Expr{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{},
+            .tail = null,
+            .labelled = null,
+        } },
+    }};
+    const body_rows = [_]bodies.BodyKind{
+        .none,
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .generic_params = &.{"T"},
+            .generics = function_generics,
+            .body = 0,
+        } },
+    };
+    const fixture_ir: serialize.RustIr = .{
+        .crate_name = "dependency_bound",
+        .graph = crate_graph,
+        .bodies = .{
+            .exprs = &expression_rows,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = &body_rows,
+        },
+    };
+
+    try root.validateForTranslation(&fixture_ir);
+    const encoded = try serialize.encode(allocator, &fixture_ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+    try std.testing.expectEqualStrings(
+        "num-traits",
+        decoded.graph.crates.items[0].deps[0].extern_name,
+    );
+    const decoded_bound = decoded.bodies.bodies[1].fn_.generics.?.params[0].type_.bounds[0];
+    try std.testing.expectEqualStrings("num_traits", decoded_bound.path.segments[0].name);
+    try std.testing.expectEqual(@as(?spine.EntityId, null), decoded_bound.path.segments[0].id);
+
+    const unknown_trait_path: types.Path = .{
+        .segments = &.{
+            .{ .name = "unknown_dependency", .id = null },
+            .{ .name = "Bounded", .id = null },
+        },
+    };
+    const unknown_bound: types.Bound = .{ .path = unknown_trait_path };
+    const unknown_generics: types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "T",
+            .bounds = &.{unknown_bound},
+        } }},
+        .where_clauses = &.{},
+    };
+    var unknown_function = body_rows[1].fn_;
+    unknown_function.generics = unknown_generics;
+    var unknown_body_rows = body_rows;
+    unknown_body_rows[1] = .{ .fn_ = unknown_function };
+    var unknown_ir = fixture_ir;
+    unknown_ir.bodies.bodies = &unknown_body_rows;
+    try std.testing.expectError(error.UnresolvedTypePath, root.validateForTranslation(&unknown_ir));
+}
+
+test "serialize: format write preserves template and references" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 8,
+    };
+
+    var crate_graph = try initTestGraph(allocator, "format_write", &.{.fn_});
+    defer crate_graph.deinit();
+    const expression_rows = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .unit,
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .unit,
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .format_write = .{
+                .writer = 1,
+                .template = "value={}\n",
+                .args = &.{2},
+            } },
+        },
+    };
+    const body_rows = [_]bodies.BodyKind{
+        .none,
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 0,
+        } },
+    };
+    const fixture_ir: serialize.RustIr = .{
+        .crate_name = "format_write",
+        .graph = crate_graph,
+        .bodies = .{
+            .exprs = &expression_rows,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = &body_rows,
+        },
+    };
+
+    try root.validateForTranslation(&fixture_ir);
+    const encoded = try serialize.encode(allocator, &fixture_ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+
+    const decoded_format = switch (decoded.bodies.exprs[3].kind) {
+        .format_write => |format_write| format_write,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(exprs.NodeId, 1), decoded_format.writer);
+    try std.testing.expectEqualStrings("value={}\n", decoded_format.template);
+    try std.testing.expectEqualSlices(exprs.NodeId, &.{2}, decoded_format.args);
+
+    var malformed_expr_rows = expression_rows;
+    malformed_expr_rows[3].kind = .{ .format_write = .{
+        .writer = 99,
+        .template = "value={}\n",
+        .args = &.{2},
+    } };
+    var malformed_ir = fixture_ir;
+    malformed_ir.bodies.exprs = &malformed_expr_rows;
+    try std.testing.expectError(
+        error.InvalidExprRef,
+        root.validateForTranslation(&malformed_ir),
+    );
 }

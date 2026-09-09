@@ -28,11 +28,13 @@ pub const StdMethod = enum {
     option_unwrap,
     option_unwrap_or,
     option_map,
+    option_and_then,
     option_as_ref,
     option_take,
 
     result_is_ok,
     result_is_err,
+    result_ok,
     result_unwrap,
     result_unwrap_or,
     result_map,
@@ -45,6 +47,12 @@ pub const StdMethod = enum {
     slice_as_slice,
     slice_iter,
     slice_iter_mut,
+    slice_split_at,
+    slice_split_first,
+    slice_chunks_exact,
+    slice_chunks,
+    slice_copy_from_slice,
+    chunks_exact_remainder,
 
     num_wrapping_add,
     num_wrapping_sub,
@@ -55,6 +63,18 @@ pub const StdMethod = enum {
     num_count_ones,
     num_leading_zeros,
     num_trailing_zeros,
+    num_rotate_left,
+    num_rotate_right,
+    num_to_le,
+    num_to_be,
+    num_swap_bytes,
+    num_checked_add,
+    num_checked_sub,
+    num_checked_mul,
+    char_to_digit,
+    byte_is_ascii,
+    range_contains,
+    format_write_str,
 
     default,
     clone,
@@ -212,6 +232,13 @@ pub fn lookupStdMethod(
             .reference => |r| cur_t = r.pointee,
             .raw_ptr => |ptr| cur_t = ptr.pointee,
             .boxed => |b| cur_t = b.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    cur_t = concrete.*;
+                } else {
+                    break;
+                }
+            },
             else => break,
         }
     }
@@ -223,12 +250,14 @@ pub fn lookupStdMethod(
             if (std.mem.eql(u8, method_name, "unwrap")) return .option_unwrap;
             if (std.mem.eql(u8, method_name, "unwrap_or")) return .option_unwrap_or;
             if (std.mem.eql(u8, method_name, "map")) return .option_map;
+            if (std.mem.eql(u8, method_name, "and_then")) return .option_and_then;
             if (std.mem.eql(u8, method_name, "as_ref")) return .option_as_ref;
             if (std.mem.eql(u8, method_name, "take")) return .option_take;
         },
         .result => {
             if (std.mem.eql(u8, method_name, "is_ok")) return .result_is_ok;
             if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
+            if (std.mem.eql(u8, method_name, "ok")) return .result_ok;
             if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
             if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
             if (std.mem.eql(u8, method_name, "map")) return .result_map;
@@ -242,8 +271,64 @@ pub fn lookupStdMethod(
             if (std.mem.eql(u8, method_name, "as_slice")) return .slice_as_slice;
             if (std.mem.eql(u8, method_name, "iter")) return .slice_iter;
             if (std.mem.eql(u8, method_name, "iter_mut")) return .slice_iter_mut;
+            if (std.mem.eql(u8, method_name, "split_at")) return .slice_split_at;
+            if (std.mem.eql(u8, method_name, "chunks_exact")) return .slice_chunks_exact;
+            if (std.mem.eql(u8, method_name, "split_first")) return .slice_split_first;
+            if (std.mem.eql(u8, method_name, "chunks")) return .slice_chunks;
+            if (std.mem.eql(u8, method_name, "copy_from_slice")) return .slice_copy_from_slice;
+        },
+        .external_nominal => |external| {
+            const is_option = external.path.len == 3 and
+                (std.mem.eql(u8, external.path[0], "core") or
+                    std.mem.eql(u8, external.path[0], "std")) and
+                std.mem.eql(u8, external.path[1], "option") and
+                std.mem.eql(u8, external.path[2], "Option");
+            const is_result = external.path.len == 3 and
+                (std.mem.eql(u8, external.path[0], "core") or
+                    std.mem.eql(u8, external.path[0], "std")) and
+                std.mem.eql(u8, external.path[1], "result") and
+                std.mem.eql(u8, external.path[2], "Result");
+            if (is_option) {
+                if (std.mem.eql(u8, method_name, "is_some")) return .option_is_some;
+                if (std.mem.eql(u8, method_name, "is_none")) return .option_is_none;
+                if (std.mem.eql(u8, method_name, "unwrap")) return .option_unwrap;
+                if (std.mem.eql(u8, method_name, "unwrap_or")) return .option_unwrap_or;
+                if (std.mem.eql(u8, method_name, "map")) return .option_map;
+                if (std.mem.eql(u8, method_name, "and_then")) return .option_and_then;
+                if (std.mem.eql(u8, method_name, "as_ref")) return .option_as_ref;
+                if (std.mem.eql(u8, method_name, "take")) return .option_take;
+            }
+            if (is_result) {
+                if (std.mem.eql(u8, method_name, "is_ok")) return .result_is_ok;
+                if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
+                if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
+                if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
+                if (std.mem.eql(u8, method_name, "map")) return .result_map;
+                if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
+                if (std.mem.eql(u8, method_name, "as_ref")) return .result_as_ref;
+            }
+            if (external.path.len == 3 and
+                (std.mem.eql(u8, external.path[0], "core") or std.mem.eql(u8, external.path[0], "std")))
+            {
+                if (std.mem.eql(u8, external.path[1], "fmt") and
+                    std.mem.eql(u8, external.path[2], "Formatter") and
+                    std.mem.eql(u8, method_name, "write_str")) return .format_write_str;
+                if (std.mem.eql(u8, external.path[1], "ops") and
+                    (std.mem.eql(u8, external.path[2], "Range") or std.mem.eql(u8, external.path[2], "RangeInclusive")) and
+                    std.mem.eql(u8, method_name, "contains")) return .range_contains;
+            }
+            if (external.path.len == 3 and
+                std.mem.eql(u8, external.path[0], "core") and
+                std.mem.eql(u8, external.path[1], "slice") and
+                std.mem.eql(u8, external.path[2], "ChunksExact") and
+                external.args.len == 1 and
+                std.mem.eql(u8, method_name, "remainder"))
+            {
+                return .chunks_exact_remainder;
+            }
         },
         .prim => |p| {
+            if (p == .u8 and std.mem.eql(u8, method_name, "is_ascii")) return .byte_is_ascii;
             switch (p) {
                 .u8, .u16, .u32, .u64, .u128, .usize, .i8, .i16, .i32, .i64, .i128, .isize => {
                     if (std.mem.eql(u8, method_name, "wrapping_add")) return .num_wrapping_add;
@@ -255,6 +340,17 @@ pub fn lookupStdMethod(
                     if (std.mem.eql(u8, method_name, "count_ones")) return .num_count_ones;
                     if (std.mem.eql(u8, method_name, "leading_zeros")) return .num_leading_zeros;
                     if (std.mem.eql(u8, method_name, "trailing_zeros")) return .num_trailing_zeros;
+                    if (std.mem.eql(u8, method_name, "rotate_left")) return .num_rotate_left;
+                    if (std.mem.eql(u8, method_name, "rotate_right")) return .num_rotate_right;
+                    if (std.mem.eql(u8, method_name, "to_le")) return .num_to_le;
+                    if (std.mem.eql(u8, method_name, "to_be")) return .num_to_be;
+                    if (std.mem.eql(u8, method_name, "swap_bytes")) return .num_swap_bytes;
+                    if (std.mem.eql(u8, method_name, "checked_add")) return .num_checked_add;
+                    if (std.mem.eql(u8, method_name, "checked_sub")) return .num_checked_sub;
+                    if (std.mem.eql(u8, method_name, "checked_mul")) return .num_checked_mul;
+                },
+                .char => {
+                    if (std.mem.eql(u8, method_name, "to_digit")) return .char_to_digit;
                 },
                 else => {},
             }
@@ -267,6 +363,114 @@ pub fn lookupStdMethod(
 
     return null;
 }
+/// Return whether `t` is one of the public iterator carriers whose methods
+/// remain ordinary runtime-backed calls. These methods are intentionally not
+/// `StdMethod` entries: the Zig backend lowers their receiver and method name
+/// directly instead of routing them through `lowerUnsupportedStdMethod`.
+fn isRuntimeIteratorMethod(t: types.Type, method_name: []const u8) bool {
+    var current = t;
+    while (true) {
+        switch (current) {
+            .reference => |reference| current = reference.pointee,
+            .raw_ptr => |raw_ptr| current = raw_ptr.pointee,
+            .boxed => |boxed| current = boxed.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    current = concrete.*;
+                } else {
+                    return false;
+                }
+            },
+            else => break,
+        }
+    }
+
+    const external = switch (current) {
+        .external_nominal => |value| value,
+        else => return false,
+    };
+    if (external.path.len != 3) return false;
+    if (!std.mem.eql(u8, external.path[0], "core") and
+        !std.mem.eql(u8, external.path[0], "std"))
+    {
+        return false;
+    }
+
+    const is_slice_iter = std.mem.eql(u8, external.path[1], "slice") and
+        (std.mem.eql(u8, external.path[2], "Iter") or
+            std.mem.eql(u8, external.path[2], "IterMut"));
+    const is_iterator_adapter = std.mem.eql(u8, external.path[1], "iter") and
+        (std.mem.eql(u8, external.path[2], "StepBy") or
+            std.mem.eql(u8, external.path[2], "Skip") or
+            std.mem.eql(u8, external.path[2], "Zip") or
+            std.mem.eql(u8, external.path[2], "Enumerate") or
+            std.mem.eql(u8, external.path[2], "Rev"));
+    const is_range = std.mem.eql(u8, external.path[1], "ops") and
+        std.mem.eql(u8, external.path[2], "Range");
+    const valid_shape = if (is_slice_iter)
+        external.args.len == 1
+    else if (is_iterator_adapter)
+        if (std.mem.eql(u8, external.path[2], "Zip"))
+            external.args.len == 2
+        else
+            external.args.len == 1
+    else if (is_range)
+        external.args.len == 1
+    else
+        false;
+    if (!valid_shape) return false;
+
+    return std.mem.eql(u8, method_name, "next") or
+        std.mem.eql(u8, method_name, "next_back") or
+        std.mem.eql(u8, method_name, "nth") or
+        std.mem.eql(u8, method_name, "nth_back") or
+        std.mem.eql(u8, method_name, "count") or
+        std.mem.eql(u8, method_name, "last") or
+        std.mem.eql(u8, method_name, "len") or
+        std.mem.eql(u8, method_name, "is_empty") or
+        std.mem.eql(u8, method_name, "size_hint") or
+        std.mem.eql(u8, method_name, "as_slice") or
+        std.mem.eql(u8, method_name, "as_mut_slice") or
+        std.mem.eql(u8, method_name, "step_by") or
+        std.mem.eql(u8, method_name, "chain") or
+        std.mem.eql(u8, method_name, "zip") or
+        std.mem.eql(u8, method_name, "map") or
+        std.mem.eql(u8, method_name, "filter") or
+        std.mem.eql(u8, method_name, "filter_map") or
+        std.mem.eql(u8, method_name, "enumerate") or
+        std.mem.eql(u8, method_name, "peekable") or
+        std.mem.eql(u8, method_name, "skip_while") or
+        std.mem.eql(u8, method_name, "take_while") or
+        std.mem.eql(u8, method_name, "skip") or
+        std.mem.eql(u8, method_name, "take") or
+        std.mem.eql(u8, method_name, "scan") or
+        std.mem.eql(u8, method_name, "flat_map") or
+        std.mem.eql(u8, method_name, "fuse") or
+        std.mem.eql(u8, method_name, "inspect") or
+        std.mem.eql(u8, method_name, "by_ref") or
+        std.mem.eql(u8, method_name, "collect") or
+        std.mem.eql(u8, method_name, "fold") or
+        std.mem.eql(u8, method_name, "all") or
+        std.mem.eql(u8, method_name, "any") or
+        std.mem.eql(u8, method_name, "find") or
+        std.mem.eql(u8, method_name, "position") or
+        std.mem.eql(u8, method_name, "rposition") or
+        std.mem.eql(u8, method_name, "max") or
+        std.mem.eql(u8, method_name, "min") or
+        std.mem.eql(u8, method_name, "rev") or
+        std.mem.eql(u8, method_name, "clone") or
+        std.mem.eql(u8, method_name, "cloned") or
+        std.mem.eql(u8, method_name, "copied");
+}
+
+fn boundTypeName(bounds: []const types.Bound) ?[]const u8 {
+    for (bounds) |bound| {
+        if (bound.path.segments.len == 0) continue;
+        const last = bound.path.segments[bound.path.segments.len - 1];
+        if (last.name.len > 0) return last.name;
+    }
+    return null;
+}
 
 /// Helper to get a type's simple name from `types.Type` / symbol table.
 pub fn getTypeName(g: *const graph.CrateGraph, t: types.Type) ?[]const u8 {
@@ -274,10 +478,14 @@ pub fn getTypeName(g: *const graph.CrateGraph, t: types.Type) ?[]const u8 {
         .path => |p| {
             if (p.segments.len > 0) {
                 const last = p.segments[p.segments.len - 1];
-                if (last.name.len > 0) return last.name;
+                // A bound path segment is authoritative. In particular,
+                // `Self` keeps its source spelling after CST binding, while
+                // its EntityId identifies the concrete receiver declaration.
+                // Prefer that declaration name for method dispatch.
                 if (last.id) |id| {
                     if (g.symbol_table.get(id)) |ent| return ent.name;
                 }
+                if (last.name.len > 0) return last.name;
             }
             return null;
         },
@@ -293,6 +501,11 @@ pub fn getTypeName(g: *const graph.CrateGraph, t: types.Type) ?[]const u8 {
         .reference => |r| return getTypeName(g, r.pointee),
         .raw_ptr => |ptr| return getTypeName(g, ptr.pointee),
         .boxed => |b| return getTypeName(g, b.*),
+        .@"opaque" => |opaque_type| return if (opaque_type.concrete) |concrete|
+            getTypeName(g, concrete.*)
+        else
+            null,
+        .dyn_trait => |bounds| return boundTypeName(bounds),
         .option => return "Option",
         .result => return "Result",
         .slice => return "slice",
@@ -351,6 +564,9 @@ const LocalInitializerFinder = struct {
             .slice => |slice| {
                 for (slice.elements) |element| self.visitPattern(element, init, depth + 1);
                 if (slice.rest) |rest| self.visitPattern(rest, init, depth + 1);
+            },
+            .external_variant => |variant| for (variant.fields) |field| {
+                if (field.pat) |field_pattern| self.visitPattern(field_pattern, init, depth + 1);
             },
             .struct_pat => |struct_pat| for (struct_pat.fields) |field| {
                 if (field.pat) |field_pattern| {
@@ -511,6 +727,10 @@ const LocalInitializerFinder = struct {
                 for (variant.tuple_fields) |field| self.visitExpr(field, depth + 1);
                 for (variant.named_fields) |field| self.visitExpr(field.value, depth + 1);
             },
+            .external_variant => |variant| {
+                for (variant.tuple_fields) |field| self.visitExpr(field, depth + 1);
+                for (variant.named_fields) |field| self.visitExpr(field.value, depth + 1);
+            },
             .field => |field| self.visitExpr(field.base, depth + 1),
             .index => |index| {
                 self.visitExpr(index.base, depth + 1);
@@ -532,11 +752,19 @@ const LocalInitializerFinder = struct {
             .vec_lit => |vec| for (vec.elements) |element| self.visitExpr(element, depth + 1),
             .range => |range| {
                 self.visitExpr(range.start, depth + 1);
-                self.visitExpr(range.end, depth + 1);
+                if (range.end) |end| self.visitExpr(end, depth + 1);
             },
             .closure => |closure| self.visitClosure(closure, depth + 1),
             .iterator_chain => |chain| self.visitIteratorChain(chain, depth + 1),
-            .literal, .unit, .path, .continue_, .unsupported => {},
+            .core_function => {},
+            .core_call => |call| {
+                for (call.args) |arg| self.visitExpr(arg, depth + 1);
+            },
+            .format_write => |format| {
+                self.visitExpr(format.writer, depth + 1);
+                for (format.args) |arg| self.visitExpr(arg, depth + 1);
+            },
+            .literal, .unit, .path, .continue_, .panic_, .unsupported => {},
         }
     }
 };
@@ -815,6 +1043,34 @@ fn operandTypeResolved(
     };
 }
 
+fn isScalarOperandType(t: types.Type) bool {
+    var current = t;
+    for (0..128) |_| {
+        if (current != .reference) return current == .prim;
+        current = current.reference.pointee;
+    }
+    return false;
+}
+
+fn isRuntimeMemoryMethod(t: types.Type, name: []const u8) bool {
+    var current = t;
+    for (0..128) |_| {
+        if (current != .reference) break;
+        current = current.reference.pointee;
+    }
+    return switch (current) {
+        .raw_ptr => std.mem.eql(u8, name, "add") or
+            std.mem.eql(u8, name, "sub") or
+            std.mem.eql(u8, name, "offset") or
+            std.mem.eql(u8, name, "read_unaligned"),
+        .slice, .array => std.mem.eql(u8, name, "as_ptr") or
+            std.mem.eql(u8, name, "as_mut_ptr") or
+            std.mem.eql(u8, name, "get_unchecked") or
+            std.mem.eql(u8, name, "get_unchecked_mut"),
+        else => false,
+    };
+}
+
 fn operandIsPrimitive(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
@@ -824,17 +1080,14 @@ fn operandIsPrimitive(
     const operand = b.exprs[node];
     if (operand.ty) |type_id| {
         if (type_id >= b.types.len) return false;
-        return b.types[type_id] == .prim;
+        return isScalarOperandType(b.types[type_id]);
     }
     return switch (operand.kind) {
         .literal => |literal| switch (literal) {
             .int, .float, .character, .boolean => true,
             .string, .byte_array => false,
         },
-        .path => |path| switch (pathDeclaredType(g, b, path) orelse return false) {
-            .prim => true,
-            else => false,
-        },
+        .path => |path| isScalarOperandType(pathDeclaredType(g, b, path) orelse return false),
         .binary => |binary| operandIsPrimitive(g, b, binary.lhs) and operandIsPrimitive(g, b, binary.rhs),
         .cast => true,
         else => false,
@@ -882,13 +1135,217 @@ fn isRetainedIteratorProjection(
     return false;
 }
 
+fn isRuntimeIoMethod(g: *const graph.CrateGraph, b: *const bodies.Bodies, method_id: exprs.DefId, receiver: types.Type, name: []const u8) bool {
+    const trait_name: []const u8 = if (std.mem.eql(u8, name, "read_exact"))
+        "Read"
+    else if (std.mem.eql(u8, name, "write_all"))
+        "Write"
+    else
+        return false;
+    const method = g.symbol_table.get(method_id) orelse return false;
+    const owner = method.parent orelse return false;
+    return bodies.genericBound(g, b, owner, receiver, &.{ "std", "io", trait_name }) != null;
+}
+
+fn isBoundStandardMethod(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    expression: exprs.Expr,
+    receiver: types.Type,
+    name: []const u8,
+) bool {
+    const method = g.symbol_table.get(expression.kind.method_call.method) orelse return false;
+    const owner = method.parent orelse return false;
+    if (std.mem.eql(u8, name, "as_ref")) {
+        return bodies.genericBound(g, b, owner, receiver, &.{ "core", "convert", "AsRef" }) != null;
+    }
+    if (std.mem.eql(u8, name, "try_into")) {
+        if (bodies.genericBound(g, b, owner, receiver, &.{ "core", "convert", "TryInto" }) != null) return true;
+        return switch (receiver) {
+            .prim => |primitive| switch (primitive) {
+                .i8,
+                .i16,
+                .i32,
+                .i64,
+                .i128,
+                .isize,
+                .u8,
+                .u16,
+                .u32,
+                .u64,
+                .u128,
+                .usize,
+                => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+    if (std.mem.eql(u8, name, "into")) {
+        if (bodies.genericBound(g, b, owner, receiver, &.{ "core", "convert", "Into" }) != null) return true;
+        const result_id = expression.ty orelse return false;
+        if (result_id >= b.types.len) return false;
+        return bodies.genericBound(g, b, owner, b.types[result_id], &.{ "core", "convert", "From" }) != null;
+    }
+    return false;
+}
+
+fn associatedSelfType(declared: types.Type, actual: types.Type, depth: usize) ?types.Type {
+    if (depth >= 128) return null;
+    if (declared == .path and declared.path.segments.len == 1 and
+        std.mem.eql(u8, declared.path.segments[0].name, "Self")) return actual;
+    if (std.meta.activeTag(declared) != std.meta.activeTag(actual)) return null;
+    return switch (declared) {
+        .result => |result| associatedSelfType(result.ok, actual.result.ok, depth + 1) orelse
+            associatedSelfType(result.err, actual.result.err, depth + 1),
+        .option => |value| associatedSelfType(value.*, actual.option.*, depth + 1),
+        .reference => |value| associatedSelfType(value.pointee, actual.reference.pointee, depth + 1),
+        .raw_ptr => |value| associatedSelfType(value.pointee, actual.raw_ptr.pointee, depth + 1),
+        .boxed => |value| associatedSelfType(value.*, actual.boxed.*, depth + 1),
+        .slice => |value| associatedSelfType(value.elem, actual.slice.elem, depth + 1),
+        .array => |value| associatedSelfType(value.elem, actual.array.elem, depth + 1),
+        else => null,
+    };
+}
+
+fn resolveAssociatedTraitCall(g: *const graph.CrateGraph, b: *const bodies.Bodies, expression: *exprs.Expr) bool {
+    const call = expression.kind.call;
+    if (call.call_kind != .associated) return false;
+    const method = g.symbol_table.get(call.call_kind.associated) orelse return false;
+    if (method.kind != .method_ref) return false;
+    const trait_id = method.parent orelse return false;
+    const trait_entity = g.symbol_table.get(trait_id) orelse return false;
+    if (trait_entity.kind != .trait_ or trait_id >= b.bodies.len) return false;
+    const trait_body = switch (b.bodies[trait_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    const result_id = expression.ty orelse return false;
+    if (result_id >= b.types.len) return false;
+    for (trait_body.methods) |signature| {
+        if (!std.mem.eql(u8, signature.name, method.name)) continue;
+        const receiver = associatedSelfType(signature.ret, b.types[result_id], 0) orelse return false;
+        const name = getTypeName(g, receiver) orelse return false;
+        const implementation = lookupTraitMethod(g, trait_entity.name, name, method.name) orelse return false;
+        expression.kind.call.call_kind = .{ .associated = implementation };
+        return true;
+    }
+    return false;
+}
+
+fn operatorOperandType(g: *const graph.CrateGraph, b: *const bodies.Bodies, node: exprs.NodeId) ?types.Type {
+    if (node >= b.exprs.len) return null;
+    const expression = b.exprs[node];
+    if (expression.ty) |id| return if (id < b.types.len) b.types[id] else null;
+    return if (expression.kind == .path) pathDeclaredType(g, b, expression.kind.path) else null;
+}
+
+fn expressionOwner(g: *const graph.CrateGraph, b: *const bodies.Bodies, node: exprs.NodeId, depth: usize) ?spine.EntityId {
+    if (depth >= 128 or node >= b.exprs.len) return null;
+    return switch (b.exprs[node].kind) {
+        .path => |path| blk: {
+            const entity = g.symbol_table.get(path.def) orelse break :blk null;
+            const parent = entity.parent orelse break :blk null;
+            const owner = g.symbol_table.get(parent) orelse break :blk null;
+            break :blk if (owner.kind == .fn_ or owner.kind == .impl_) parent else null;
+        },
+        .field => |field| expressionOwner(g, b, field.base, depth + 1),
+        .index => |index| expressionOwner(g, b, index.base, depth + 1),
+        .unary => |unary| expressionOwner(g, b, unary.operand, depth + 1),
+        .cast => |cast| expressionOwner(g, b, cast.operand, depth + 1),
+        .binary => |binary| expressionOwner(g, b, binary.lhs, depth + 1) orelse
+            expressionOwner(g, b, binary.rhs, depth + 1),
+        .call => |call| switch (call.call_kind) {
+            .free, .associated, .constructor => |id| id,
+        },
+        .method_call => |method| expressionOwner(g, b, method.receiver, depth + 1),
+        else => null,
+    };
+}
+
+fn boundOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, lhs: exprs.NodeId, rhs: exprs.NodeId, module: []const u8, name: []const u8) bool {
+    const receiver = operatorOperandType(g, b, lhs) orelse return false;
+    const owner = expressionOwner(g, b, lhs, 0) orelse expressionOwner(g, b, rhs, 0) orelse return false;
+    return bodies.genericBound(g, b, owner, receiver, &.{ "core", module, name }) != null;
+}
+
+fn builtInEqualityType(ty: types.Type) bool {
+    var current = ty;
+    for (0..128) |_| {
+        if (current == .reference) {
+            current = current.reference.pointee;
+            continue;
+        }
+        return current == .slice or current == .array or current == .option or current == .raw_ptr;
+    }
+    return false;
+}
+
+fn supportsBinaryOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, binary: exprs.BinaryExpr) bool {
+    const operation: [3][]const u8 = switch (binary.op) {
+        .add => .{ "ops", "Add", "add" },
+        .sub => .{ "ops", "Sub", "sub" },
+        .mul => .{ "ops", "Mul", "mul" },
+        .div => .{ "ops", "Div", "div" },
+        .rem => .{ "ops", "Rem", "rem" },
+        .bit_and => .{ "ops", "BitAnd", "bitand" },
+        .bit_or => .{ "ops", "BitOr", "bitor" },
+        .bit_xor => .{ "ops", "BitXor", "bitxor" },
+        .shl => .{ "ops", "Shl", "shl" },
+        .shr => .{ "ops", "Shr", "shr" },
+        .eq, .ne => .{ "cmp", "PartialEq", "eq" },
+        .lt, .le, .gt, .ge => .{ "cmp", "PartialOrd", @tagName(binary.op) },
+        .boolean_and, .boolean_or => return false,
+    };
+    if (binary.op == .eq or binary.op == .ne) {
+        if (operatorOperandType(g, b, binary.lhs)) |ty| {
+            if (builtInEqualityType(ty)) return true;
+        }
+    }
+    if (boundOperator(g, b, binary.lhs, binary.rhs, operation[0], operation[1])) return true;
+    const receiver = receiverNominalName(g, b, binary.lhs) orelse return false;
+    return lookupTraitMethod(g, operation[1], receiver, operation[2]) != null;
+}
+
+fn resolveAssignmentOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, expression: *exprs.Expr) std.mem.Allocator.Error!bool {
+    const assignment = expression.kind.assign;
+    if (assignment.op == .plain or operandIsPrimitive(g, b, assignment.target)) return false;
+    const operation: [2][]const u8 = switch (assignment.op) {
+        .plain => return false,
+        .add => .{ "AddAssign", "add_assign" },
+        .sub => .{ "SubAssign", "sub_assign" },
+        .mul => .{ "MulAssign", "mul_assign" },
+        .div => .{ "DivAssign", "div_assign" },
+        .rem => .{ "RemAssign", "rem_assign" },
+        .bit_and => .{ "BitAndAssign", "bitand_assign" },
+        .bit_or => .{ "BitOrAssign", "bitor_assign" },
+        .bit_xor => .{ "BitXorAssign", "bitxor_assign" },
+        .shl => .{ "ShlAssign", "shl_assign" },
+        .shr => .{ "ShrAssign", "shr_assign" },
+    };
+    const receiver_name = receiverNominalName(g, b, assignment.target) orelse return false;
+    const method = lookupTraitMethod(g, operation[0], receiver_name, operation[1]) orelse
+        return boundOperator(g, b, assignment.target, assignment.value, "ops", operation[0]);
+    const args = try g.allocator.dupe(exprs.NodeId, &.{assignment.value});
+    expression.kind = .{ .method_call = .{
+        .receiver = assignment.target,
+        .receiver_mode = .mutable,
+        .method = method,
+        .args = args,
+    } };
+    return true;
+}
+
 /// Resolve all method calls in `b.exprs` using the crate graph and types table.
 pub fn resolveMethods(
     g: *const graph.CrateGraph,
     b: *bodies.Bodies,
-) ResolutionStats {
+) std.mem.Allocator.Error!ResolutionStats {
     var stats: ResolutionStats = .{};
     for (@constCast(b.exprs)) |*e| {
+        if (e.kind == .call and resolveAssociatedTraitCall(g, b, e)) {
+            stats.trait_resolved += 1;
+        }
         if (e.kind == .method_call) {
             const mc = &e.kind.method_call;
             const method_ent = g.symbol_table.get(mc.method);
@@ -953,10 +1410,18 @@ pub fn resolveMethods(
                 }
             }
 
-            // Keep the standard-library table as the final method fallback.
+            // Keep standard methods and canonical iterator calls dispatchable.
+            // Iterator methods stay ordinary calls because their runtime
+            // implementation is selected by the backend from the external
+            // iterator carrier and method name.
             if (!resolved) {
                 if (receiver_ty) |ty| {
-                    if (lookupStdMethod(ty, method_name) != null) {
+                    if (lookupStdMethod(ty, method_name) != null or
+                        isRuntimeIteratorMethod(ty, method_name) or
+                        isRuntimeMemoryMethod(ty, method_name) or
+                        isBoundStandardMethod(g, b, e.*, ty, method_name) or
+                        isRuntimeIoMethod(g, b, mc.method, ty, method_name))
+                    {
                         stats.std_resolved += 1;
                         resolved = true;
                     }
@@ -971,12 +1436,21 @@ pub fn resolveMethods(
                 replaceWithUnsupported(e, reason);
                 stats.unsupported_methods += 1;
             }
+        } else if (e.kind == .assign) {
+            if (try resolveAssignmentOperator(g, b, e)) {
+                stats.trait_resolved += 1;
+            } else if (e.kind.assign.op != .plain and !operandIsPrimitive(g, b, e.kind.assign.target)) {
+                replaceWithUnsupported(e, reason_operator_requires_primitives);
+                stats.unsupported_operators += 1;
+            }
         } else if (e.kind == .binary) {
             const binary = e.kind.binary;
             if (!operandTypeResolved(g, b, binary.lhs) or !operandTypeResolved(g, b, binary.rhs)) {
                 replaceWithUnsupported(e, reason_operator_operands_unresolved);
                 stats.unsupported_operators += 1;
-            } else if (!operandIsPrimitive(g, b, binary.lhs) or !operandIsPrimitive(g, b, binary.rhs)) {
+            } else if ((!operandIsPrimitive(g, b, binary.lhs) or !operandIsPrimitive(g, b, binary.rhs)) and
+                !supportsBinaryOperator(g, b, binary))
+            {
                 replaceWithUnsupported(e, reason_operator_requires_primitives);
                 stats.unsupported_operators += 1;
             }
@@ -1135,16 +1609,54 @@ test "lookupStdMethod coverage" {
     const slice_ty: types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
     try std.testing.expectEqual(StdMethod.slice_len, lookupStdMethod(slice_ty, "len"));
     try std.testing.expectEqual(StdMethod.slice_iter_mut, lookupStdMethod(slice_ty, "iter_mut"));
+    try std.testing.expectEqual(StdMethod.slice_split_at, lookupStdMethod(slice_ty, "split_at"));
+    try std.testing.expectEqual(StdMethod.slice_chunks_exact, lookupStdMethod(slice_ty, "chunks_exact"));
 
     const ref_slice: types.Type = .{ .reference = &.{ .mut = false, .pointee = slice_ty } };
     try std.testing.expectEqual(StdMethod.slice_is_empty, lookupStdMethod(ref_slice, "is_empty"));
 
+    const chunks_ty: types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "slice", "ChunksExact" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    try std.testing.expectEqual(
+        StdMethod.chunks_exact_remainder,
+        lookupStdMethod(chunks_ty, "remainder"),
+    );
     const prim_ty: types.Type = .{ .prim = .u64 };
     try std.testing.expectEqual(StdMethod.num_wrapping_add, lookupStdMethod(prim_ty, "wrapping_add"));
     try std.testing.expectEqual(StdMethod.num_count_ones, lookupStdMethod(prim_ty, "count_ones"));
 
     try std.testing.expectEqual(StdMethod.clone, lookupStdMethod(prim_ty, "clone"));
     try std.testing.expectEqual(StdMethod.default, lookupStdMethod(prim_ty, "default"));
+}
+
+test "canonical iterator methods remain runtime dispatchable" {
+    const iter: types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "slice", "Iter" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    const iter_ref: types.Type = .{ .reference = &.{ .mut = false, .pointee = iter } };
+    const step_by: types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "iter", "StepBy" },
+        .args = &.{iter},
+    } };
+    const zip: types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "iter", "Zip" },
+        .args = &.{ iter, iter },
+    } };
+    const malformed: types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "slice", "Iter" },
+        .args = &.{},
+    } };
+
+    try std.testing.expect(isRuntimeIteratorMethod(iter_ref, "next"));
+    try std.testing.expect(isRuntimeIteratorMethod(iter, "next_back"));
+    try std.testing.expect(isRuntimeIteratorMethod(iter, "as_slice"));
+    try std.testing.expect(isRuntimeIteratorMethod(step_by, "size_hint"));
+    try std.testing.expect(isRuntimeIteratorMethod(zip, "nth"));
+    try std.testing.expect(!isRuntimeIteratorMethod(malformed, "next"));
+    try std.testing.expect(!isRuntimeIteratorMethod(iter, "not_an_iterator_method"));
 }
 
 test "resolveMethods keeps local iterator projections dispatchable" {
@@ -1241,7 +1753,7 @@ test "resolveMethods keeps local iterator projections dispatchable" {
         .bodies = &.{},
     };
 
-    const stats = resolveMethods(&g, &b);
+    const stats = try resolveMethods(&g, &b);
 
     try std.testing.expectEqual(@as(usize, 2), stats.inherent_resolved);
     try std.testing.expectEqual(@as(usize, 0), stats.unsupported_methods);
@@ -1287,7 +1799,7 @@ test "resolveMethods uses typed slice standard iteration" {
         .bodies = &.{},
     };
 
-    const stats = resolveMethods(&g, &b);
+    const stats = try resolveMethods(&g, &b);
 
     try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);
     try std.testing.expectEqual(@as(usize, 0), stats.unsupported_methods);
@@ -1345,7 +1857,7 @@ test "resolveMethods preserves cloned projection on typed slice iterator" {
         .bodies = &.{},
     };
 
-    const stats = resolveMethods(&g, &b);
+    const stats = try resolveMethods(&g, &b);
 
     try std.testing.expectEqual(@as(usize, 2), stats.std_resolved);
     try std.testing.expectEqual(@as(usize, 0), stats.unsupported_methods);
@@ -1403,7 +1915,7 @@ test "resolveMethods rejects unknown iterator projection" {
         .bodies = &.{},
     };
 
-    const stats = resolveMethods(&g, &b);
+    const stats = try resolveMethods(&g, &b);
 
     try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);
     try std.testing.expectEqual(@as(usize, 1), stats.unsupported_methods);
@@ -1512,7 +2024,7 @@ test "resolveMethods pass updates method_call entity id and gathers stats" {
         .bodies = &.{},
     };
 
-    const stats = resolveMethods(&g, &b);
+    const stats = try resolveMethods(&g, &b);
 
     try std.testing.expectEqual(@as(usize, 1), stats.inherent_resolved);
     try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);

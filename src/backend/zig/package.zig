@@ -879,7 +879,7 @@ pub fn promoteWithHooks(
             },
         }
         if (fingerprint_patched) {
-            std.debug.print("[DEBUG-generated-build]\n{s}\n", .{build_result.stderr});
+            std.debug.print("generated package build failed:\n{s}\n", .{build_result.stderr});
             releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(
                 io,

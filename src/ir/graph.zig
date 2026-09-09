@@ -410,6 +410,14 @@ pub const CrateGraph = struct {
             } else if (entity.kind != .module and entity.kind != .crate_) {
                 return error.MissingModuleItem;
             }
+            if (entity.kind == .method_ref) {
+                const parent_id = entity.parent orelse return error.MissingModuleItem;
+                const parent_kind = self.symbol_table.entities.items[parent_id].kind;
+                if (parent_kind != .fn_ and parent_kind != .trait_) {
+                    return error.InvalidParent;
+                }
+                if (entity.resolved != null) return error.InvalidResolvedEntity;
+            }
             if (entity.resolved) |resolved_id| {
                 if (@as(usize, resolved_id) >= self.symbol_table.entities.items.len) {
                     return error.InvalidResolvedEntity;

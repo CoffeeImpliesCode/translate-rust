@@ -27,6 +27,7 @@ const bodies = ir.bodies;
 const types = ir.types;
 const spine = ir.spine;
 const items = ir.items;
+const resolve_methods = @import("resolve_methods.zig");
 /// Unannotated literal class for defaulting unconstrained variables.
 pub const Class = enum {
     none,
@@ -55,6 +56,11 @@ pub const Edge = union(enum) {
 };
 
 /// Collection of generated pins, edges, literal classes, and instantiations.
+pub const DerivedPin = struct {
+    node: exprs.NodeId,
+    ty: types.Type,
+};
+
 pub const Gen = struct {
     pub const Self = Gen;
 
@@ -63,6 +69,10 @@ pub const Gen = struct {
     classes: std.AutoHashMapUnmanaged(exprs.NodeId, Class) = .empty,
     instantiations: std.AutoHashMapUnmanaged(exprs.NodeId, types.Instantiation) = .empty,
     invalid_casts: std.ArrayListUnmanaged(exprs.NodeId) = .empty,
+    derived_types: std.ArrayListUnmanaged(types.Type) = .empty,
+    derived_pins: std.ArrayListUnmanaged(DerivedPin) = .empty,
+    derived_pattern_pins: std.ArrayListUnmanaged(DerivedPin) = .empty,
+    derived_error: bool = false,
 
     pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
         self.pins.deinit(alloc);
@@ -70,6 +80,9 @@ pub const Gen = struct {
         self.classes.deinit(alloc);
         deinitInstantiationMap(alloc, &self.instantiations);
         self.invalid_casts.deinit(alloc);
+        self.derived_types.deinit(alloc);
+        self.derived_pins.deinit(alloc);
+        self.derived_pattern_pins.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -204,6 +217,20 @@ pub fn substType(
             bx_ptr.* = sub_inner;
             return .{ .boxed = bx_ptr };
         },
+        .@"opaque" => |opaque_type| {
+            const sub_bounds = try substBoundSlice(alloc, opaque_type.bounds, param_names, args);
+            const sub_concrete = if (opaque_type.concrete) |concrete| blk: {
+                const concrete_ptr = try alloc.create(types.Type);
+                concrete_ptr.* = try substType(alloc, concrete.*, param_names, args);
+                break :blk @as(?*const types.Type, concrete_ptr);
+            } else null;
+            const opaque_copy = types.Opaque{
+                .bounds = sub_bounds,
+                .concrete = sub_concrete,
+            };
+            return .{ .@"opaque" = opaque_copy };
+        },
+        .dyn_trait => |bounds| return .{ .dyn_trait = try substBoundSlice(alloc, bounds, param_names, args) },
         .external_nominal => |external| {
             var changed = false;
             const sub_args = try alloc.alloc(types.Type, external.args.len);
@@ -243,6 +270,7 @@ pub fn substType(
                 sub_params[i] = try substType(alloc, param, param_names, args);
                 if (!typeEqual(sub_params[i], param)) changed = true;
             }
+
             const sub_ret = try substType(alloc, fp.ret, param_names, args);
             if (!typeEqual(sub_ret, fp.ret)) changed = true;
             if (!changed) {
@@ -255,6 +283,106 @@ pub fn substType(
         },
         .unsupported => return t,
     }
+}
+fn substTypeSlice(
+    alloc: std.mem.Allocator,
+    source: []const types.Type,
+    param_names: []const []const u8,
+    args: []const types.Type,
+) std.mem.Allocator.Error![]const types.Type {
+    if (source.len == 0) return &.{};
+    const substituted = try alloc.alloc(types.Type, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (source[0..initialized], substituted[0..initialized]) |original, replacement| {
+            freeSubstitutedType(alloc, original, replacement, param_names, args);
+        }
+        alloc.free(substituted);
+    }
+    for (source, 0..) |original, index| {
+        substituted[index] = try substType(alloc, original, param_names, args);
+        initialized += 1;
+    }
+    return substituted;
+}
+
+fn substBoundSlice(
+    alloc: std.mem.Allocator,
+    source: []const types.Bound,
+    param_names: []const []const u8,
+    args: []const types.Type,
+) std.mem.Allocator.Error![]const types.Bound {
+    if (source.len == 0) return &.{};
+    const substituted = try alloc.alloc(types.Bound, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeSubstitutedBounds(alloc, source[0..initialized], substituted[0..initialized], param_names, args);
+        alloc.free(substituted);
+    }
+    for (source, 0..) |original, index| {
+        const bound_args = try substTypeSlice(alloc, original.args, param_names, args);
+        const associated_types = try alloc.alloc(types.AssociatedTypeBinding, original.associated_types.len);
+        var associated_initialized: usize = 0;
+        errdefer {
+            for (
+                original.associated_types[0..associated_initialized],
+                associated_types[0..associated_initialized],
+            ) |original_binding, replacement_binding| {
+                freeSubstitutedType(
+                    alloc,
+                    original_binding.ty,
+                    replacement_binding.ty,
+                    param_names,
+                    args,
+                );
+            }
+            if (associated_types.len > 0) alloc.free(associated_types);
+        }
+        for (original.associated_types, 0..) |binding, binding_index| {
+            associated_types[binding_index] = .{
+                .name = binding.name,
+                .ty = try substType(alloc, binding.ty, param_names, args),
+            };
+            associated_initialized += 1;
+        }
+        substituted[index] = .{
+            .path = original.path,
+            .args = bound_args,
+            .associated_types = if (associated_types.len > 0) associated_types else &.{},
+            .optional = original.optional,
+        };
+        initialized += 1;
+    }
+    return substituted;
+}
+
+fn matchBoundSlice(
+    expected: []const types.Bound,
+    actual: []const types.Bound,
+    param_names: []const []const u8,
+    inferred_args: []?types.Type,
+) bool {
+    if (expected.len != actual.len) return false;
+    for (expected, actual) |expected_bound, actual_bound| {
+        if (expected_bound.optional != actual_bound.optional) return false;
+        if (expected_bound.path.segments.len != actual_bound.path.segments.len) return false;
+        for (expected_bound.path.segments, actual_bound.path.segments) |expected_segment, actual_segment| {
+            if (!std.mem.eql(u8, expected_segment.name, actual_segment.name)) return false;
+        }
+        if (expected_bound.args.len != actual_bound.args.len) return false;
+        for (expected_bound.args, actual_bound.args) |expected_arg, actual_arg| {
+            if (!matchGenericType(expected_arg, actual_arg, param_names, inferred_args)) return false;
+        }
+        if (expected_bound.associated_types.len != actual_bound.associated_types.len) return false;
+        for (expected_bound.associated_types, actual_bound.associated_types) |
+            expected_binding,
+            actual_binding,
+        | {
+            if (!std.mem.eql(u8, expected_binding.name, actual_binding.name)) return false;
+            if (!matchGenericType(expected_binding.ty, actual_binding.ty, param_names, inferred_args)) return false;
+        }
+    }
+    return true;
 }
 
 /// Match one generic signature type against one concrete argument type.
@@ -346,6 +474,16 @@ fn matchGenericType(
             return matchGenericType(res.err, other.err, param_names, inferred_args);
         },
         .boxed => |boxed| matchGenericType(boxed.*, actual_ty.boxed.*, param_names, inferred_args),
+        .@"opaque" => |opaque_type| {
+            const actual_opaque = actual_ty.@"opaque";
+            if (!matchBoundSlice(opaque_type.bounds, actual_opaque.bounds, param_names, inferred_args)) return false;
+            if (opaque_type.concrete) |expected_concrete| {
+                const actual_concrete = actual_opaque.concrete orelse return false;
+                if (!matchGenericType(expected_concrete.*, actual_concrete.*, param_names, inferred_args)) return false;
+            }
+            return true;
+        },
+        .dyn_trait => |bounds| matchBoundSlice(bounds, actual_ty.dyn_trait, param_names, inferred_args),
         .unsupported => |unsupported| {
             const other = actual_ty.unsupported;
             return unsupported.reason == other.reason and
@@ -365,7 +503,14 @@ const Ctx = struct {
     /// field entity. This keeps a path argument's type available before the
     /// unification result has been applied to the expression table.
     local_types: std.AutoHashMapUnmanaged(exprs.DefId, types.Type) = .empty,
+    known_nodes: std.AutoHashMapUnmanaged(exprs.NodeId, types.Type) = .empty,
+    /// Return types expected by enclosing expression tails.  Abstract
+    /// associated calls need this context before a concrete impl is selected.
+    expected_types: std.AutoHashMapUnmanaged(exprs.NodeId, types.Type) = .empty,
     current_fn: ?exprs.DefId = null,
+    type_expression_depth: usize = 0,
+    /// Innermost value-producing loop, for constraining `break value`.
+    loop_result: ?exprs.NodeId = null,
     local_defs: []exprs.DefId = &.{},
     local_claimed: []bool = &.{},
     fn boolId(self: *Ctx) ?exprs.TypeId {
@@ -397,21 +542,21 @@ const Ctx = struct {
         for (cg.symbol_table.entities.items) |entity| {
             if (entity.kind == .field and entity.parent == fn_id) count += 1;
         }
-        if (count == 0) return;
+        if (count > 0) {
+            self.local_defs = try self.alloc.alloc(exprs.DefId, count);
+            errdefer {
+                self.alloc.free(self.local_defs);
+                self.local_defs = &.{};
+            }
+            self.local_claimed = try self.alloc.alloc(bool, count);
+            for (self.local_claimed) |*claimed| claimed.* = false;
 
-        self.local_defs = try self.alloc.alloc(exprs.DefId, count);
-        errdefer {
-            self.alloc.free(self.local_defs);
-            self.local_defs = &.{};
-        }
-        self.local_claimed = try self.alloc.alloc(bool, count);
-        for (self.local_claimed) |*claimed| claimed.* = false;
-
-        var index: usize = 0;
-        for (cg.symbol_table.entities.items) |entity| {
-            if (entity.kind == .field and entity.parent == fn_id) {
-                self.local_defs[index] = entity.id;
-                index += 1;
+            var index: usize = 0;
+            for (cg.symbol_table.entities.items) |entity| {
+                if (entity.kind == .field and entity.parent == fn_id) {
+                    self.local_defs[index] = entity.id;
+                    index += 1;
+                }
             }
         }
         for (params) |param| {
@@ -419,8 +564,44 @@ const Ctx = struct {
                 try self.local_types.put(self.alloc, def, param.ty);
             }
         }
+        if (currentImplSelfType(self)) |self_ty| {
+            if (self.claimLocal("self")) |def| {
+                try self.local_types.put(self.alloc, def, self_ty);
+            }
+        }
+    }
+    fn deinit(self: *Ctx) void {
+        self.clearLocals();
+        self.local_types.deinit(self.alloc);
+        self.known_nodes.deinit(self.alloc);
+        self.expected_types.deinit(self.alloc);
+        self.def_map.deinit(self.alloc);
+        self.* = undefined;
     }
 
+    fn recordDerivedType(self: *Ctx, node: exprs.NodeId, ty: types.Type) void {
+        if (ty == .unsupported) return;
+        if (findTypeIndex(self.b, ty) != null) return;
+        var found = false;
+        for (self.g.derived_types.items) |known| {
+            if (typeEqual(known, ty)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            self.g.derived_types.append(self.alloc, ty) catch {
+                self.g.derived_error = true;
+                return;
+            };
+        }
+        for (self.g.derived_pins.items) |pin| {
+            if (pin.node == node and typeEqual(pin.ty, ty)) return;
+        }
+        self.g.derived_pins.append(self.alloc, .{ .node = node, .ty = ty }) catch {
+            self.g.derived_error = true;
+        };
+    }
     fn claimLocal(self: *Ctx, name: []const u8) ?exprs.DefId {
         const cg = self.cg orelse return null;
         for (self.local_defs, 0..) |def, index| {
@@ -431,13 +612,6 @@ const Ctx = struct {
             return def;
         }
         return null;
-    }
-
-    fn deinit(self: *Ctx) void {
-        self.clearLocals();
-        self.local_types.deinit(self.alloc);
-        self.def_map.deinit(self.alloc);
-        self.* = undefined;
     }
 };
 
@@ -453,7 +627,7 @@ pub fn primTypeId(b: *const bodies.Bodies, prim: types.Prim) ?exprs.TypeId {
 /// Structural equality check for types to resolve TypeId in `b.types` and to
 /// validate repeated generic bindings. Qualifiers are part of the identity:
 /// `&[T]` and `&mut [T]` must never unify.
-fn typeEqual(a: types.Type, b: types.Type) bool {
+pub fn typeEqual(a: types.Type, b: types.Type) bool {
     const a_tag = std.meta.activeTag(a);
     const b_tag = std.meta.activeTag(b);
     if (a_tag != b_tag) return false;
@@ -521,12 +695,118 @@ fn typeEqual(a: types.Type, b: types.Type) bool {
                 typeEqual(res.ok, other.ok) and typeEqual(res.err, other.err);
         },
         .boxed => |boxed| typeEqual(boxed.*, b.boxed.*),
+        .@"opaque" => |opaque_type| {
+            const other = b.@"opaque";
+            if (!boundsEqual(opaque_type.bounds, other.bounds)) return false;
+            const concrete = opaque_type.concrete orelse return other.concrete == null;
+            const other_concrete = other.concrete orelse return false;
+            return typeEqual(concrete.*, other_concrete.*);
+        },
+        .dyn_trait => |bounds| boundsEqual(bounds, b.dyn_trait),
         .unsupported => |unsupported| {
             const other = b.unsupported;
             return unsupported.reason == other.reason and
                 std.mem.eql(u8, unsupported.message, other.message);
         },
     };
+}
+
+fn boundsEqual(left: []const types.Bound, right: []const types.Bound) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_bound, right_bound| {
+        if (left_bound.optional != right_bound.optional) return false;
+        if (left_bound.path.segments.len != right_bound.path.segments.len) return false;
+        for (left_bound.path.segments, right_bound.path.segments) |left_segment, right_segment| {
+            if (!std.mem.eql(u8, left_segment.name, right_segment.name)) return false;
+        }
+        if (left_bound.args.len != right_bound.args.len) return false;
+        for (left_bound.args, right_bound.args) |left_arg, right_arg| {
+            if (!typeEqual(left_arg, right_arg)) return false;
+        }
+        if (left_bound.associated_types.len != right_bound.associated_types.len) return false;
+        for (left_bound.associated_types, right_bound.associated_types) |
+            left_binding,
+            right_binding,
+        | {
+            if (!std.mem.eql(u8, left_binding.name, right_binding.name)) return false;
+            if (!typeEqual(left_binding.ty, right_binding.ty)) return false;
+        }
+    }
+    return true;
+}
+/// Return whether a derived type is safe to add to the global type table.
+/// Generic parameters and associated projections retain unresolved path
+/// segments and are valid only in their declaration's generic context.
+fn isConcreteDerivedType(t: types.Type) bool {
+    return switch (t) {
+        .prim => true,
+        .path => |path| blk: {
+            if (path.segments.len == 0) break :blk false;
+            break :blk path.segments[path.segments.len - 1].id != null;
+        },
+        .external_nominal => |external| blk: {
+            if (external.path.len == 0) break :blk false;
+            for (external.args) |arg| {
+                if (!isConcreteDerivedType(arg)) break :blk false;
+            }
+            break :blk true;
+        },
+        .reference => |reference| isConcreteDerivedType(reference.pointee),
+        .raw_ptr => |raw_ptr| isConcreteDerivedType(raw_ptr.pointee),
+        .slice => |slice| isConcreteDerivedType(slice.elem),
+        .array => |array| blk: {
+            switch (array.len) {
+                .literal, .expression => {},
+                .generic => break :blk false,
+            }
+            break :blk isConcreteDerivedType(array.elem);
+        },
+        .tuple => |tuple| blk: {
+            for (tuple) |element| {
+                if (!isConcreteDerivedType(element)) break :blk false;
+            }
+            break :blk true;
+        },
+        .fn_ptr => |fn_ptr| blk: {
+            for (fn_ptr.params) |param| {
+                if (!isConcreteDerivedType(param)) break :blk false;
+            }
+            break :blk isConcreteDerivedType(fn_ptr.ret);
+        },
+        .generic_inst => |generic| blk: {
+            if (generic.decl == std.math.maxInt(spine.EntityId)) break :blk false;
+            for (generic.args.params) |arg| {
+                if (!isConcreteDerivedType(arg)) break :blk false;
+            }
+            break :blk true;
+        },
+        .option => |inner| isConcreteDerivedType(inner.*),
+        .result => |result| isConcreteDerivedType(result.ok) and
+            isConcreteDerivedType(result.err),
+        .boxed => |inner| isConcreteDerivedType(inner.*),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete|
+            isConcreteDerivedType(concrete.*)
+        else
+            false,
+        .dyn_trait => |bounds| concreteBounds(bounds),
+        .unsupported => false,
+    };
+}
+
+pub fn isConcreteType(t: types.Type) bool {
+    return isConcreteDerivedType(t);
+}
+
+fn concreteBounds(bounds: []const types.Bound) bool {
+    for (bounds) |bound| {
+        for (bound.args) |arg| {
+            if (!isConcreteDerivedType(arg)) return false;
+        }
+        for (bound.associated_types) |binding| {
+            if (!isConcreteDerivedType(binding.ty)) return false;
+        }
+    }
+    return true;
 }
 
 /// Find the TypeId corresponding to target type in `b.types`.
@@ -536,6 +816,42 @@ pub fn findTypeIndex(b: *const bodies.Bodies, target: types.Type) ?exprs.TypeId 
         if (typeEqual(t, target)) return @intCast(i);
     }
     return null;
+}
+pub fn findTypeIndexInSlice(type_list: []const types.Type, target: types.Type) ?exprs.TypeId {
+    for (type_list, 0..) |candidate, index| {
+        if (typeEqual(candidate, target)) return @intCast(index);
+    }
+    return null;
+}
+
+/// Intern all concrete types discovered while generating constraints, then
+/// convert their deferred expression pins to final TypeIds.
+pub fn materializeDerivedTypes(
+    alloc: std.mem.Allocator,
+    type_list: *std.ArrayListUnmanaged(types.Type),
+    patterns: []exprs.Pattern,
+    g: *Gen,
+) !void {
+    if (g.derived_error) return error.OutOfMemory;
+    for (g.derived_types.items) |derived| {
+        if (findTypeIndexInSlice(type_list.items, derived) == null) {
+            try type_list.append(alloc, derived);
+        }
+    }
+    for (g.derived_pins.items) |derived_pin| {
+        const type_id = findTypeIndexInSlice(type_list.items, derived_pin.ty) orelse
+            return error.MissingDerivedType;
+        try g.pins.append(alloc, .{ .node = derived_pin.node, .ty = type_id });
+    }
+    for (g.derived_pattern_pins.items) |pin| {
+        if (pin.node >= patterns.len) return error.InvalidPatternRef;
+        const type_id = findTypeIndexInSlice(type_list.items, pin.ty) orelse blk: {
+            const id: exprs.TypeId = @intCast(type_list.items.len);
+            try type_list.append(alloc, pin.ty);
+            break :blk id;
+        };
+        patterns[pin.node].ty = type_id;
+    }
 }
 
 /// Locate the TypeId of a slice with the given primitive element type.
@@ -643,7 +959,7 @@ fn walkLiteral(ctx: *Ctx, node: exprs.NodeId, lit: exprs.Literal) std.mem.Alloca
         .int => |il| {
             if (il.ty_suffix) |s| {
                 if (intSuffixPrim(s)) |p| {
-                    if (primTypeId(ctx.b, p)) |tid| try addPin(ctx, node, tid);
+                    try pinKnownType(ctx, node, .{ .prim = p });
                 }
             } else {
                 try setClass(ctx, node, .integer);
@@ -651,16 +967,14 @@ fn walkLiteral(ctx: *Ctx, node: exprs.NodeId, lit: exprs.Literal) std.mem.Alloca
         },
         .float => |fl| {
             if (endsWithCi(fl.text, "f32")) {
-                if (primTypeId(ctx.b, .f32)) |tid| try addPin(ctx, node, tid);
+                try pinKnownType(ctx, node, .{ .prim = .f32 });
             } else if (endsWithCi(fl.text, "f64")) {
-                if (primTypeId(ctx.b, .f64)) |tid| try addPin(ctx, node, tid);
+                try pinKnownType(ctx, node, .{ .prim = .f64 });
             } else {
                 try setClass(ctx, node, .float);
             }
         },
-        .boolean => {
-            if (ctx.boolId()) |tid| try addPin(ctx, node, tid);
-        },
+        .boolean => try pinKnownType(ctx, node, .{ .prim = .bool }),
         .character, .string, .byte_array => {},
     }
 }
@@ -674,6 +988,13 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
     if (ctx.b.exprs[node].ty) |type_id| {
         try addPin(ctx, node, type_id);
     }
+    const lhs_known = getKnownType(ctx, bin.lhs);
+    const rhs_known = getKnownType(ctx, bin.rhs);
+    if (lhs_known != null and rhs_known != null) {
+        if (knownBinaryType(ctx, bin)) |known| {
+            try pinKnownType(ctx, node, known);
+        }
+    }
     switch (bin.op) {
         .add,
         .sub,
@@ -684,8 +1005,20 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
         .bit_or,
         .bit_xor,
         => {
-            try addEq(ctx, bin.lhs, node);
-            try addEq(ctx, bin.rhs, node);
+            if (getKnownType(ctx, bin.lhs)) |lhs_ty| {
+                if (lhs_ty != .reference) {
+                    try addEq(ctx, bin.lhs, node);
+                }
+            } else {
+                try addEq(ctx, bin.lhs, node);
+            }
+            if (getKnownType(ctx, bin.rhs)) |rhs_ty| {
+                if (rhs_ty != .reference) {
+                    try addEq(ctx, bin.rhs, node);
+                }
+            } else {
+                try addEq(ctx, bin.rhs, node);
+            }
         },
         .eq,
         .ne,
@@ -695,17 +1028,15 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
         .ge,
         => {
             try addEq(ctx, bin.lhs, bin.rhs);
-            if (ctx.boolId()) |bid| try addPin(ctx, node, bid);
+            try pinKnownType(ctx, node, .{ .prim = .bool });
         },
         .shl, .shr => {
             try addEq(ctx, bin.lhs, node);
         },
         .boolean_and, .boolean_or => {
-            if (ctx.boolId()) |bid| {
-                try addPin(ctx, bin.lhs, bid);
-                try addPin(ctx, bin.rhs, bid);
-                try addPin(ctx, node, bid);
-            }
+            try pinKnownType(ctx, bin.lhs, .{ .prim = .bool });
+            try pinKnownType(ctx, bin.rhs, .{ .prim = .bool });
+            try pinKnownType(ctx, node, .{ .prim = .bool });
         },
     }
 }
@@ -714,7 +1045,7 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
 fn walkIf(ctx: *Ctx, node: exprs.NodeId, ie: exprs.IfExpr, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
     std.debug.assert(node < ctx.b.exprs.len);
     std.debug.assert(ie.cond < ctx.b.exprs.len);
-    if (ctx.boolId()) |bid| try addPin(ctx, ie.cond, bid);
+    try pinKnownType(ctx, ie.cond, .{ .prim = .bool });
     try walkExpr(ctx, ie.cond, fn_body);
     try walkBlock(ctx, ie.then_, fn_body, null);
     if (ie.then_.tail) |tt| {
@@ -733,6 +1064,7 @@ fn walkIf(ctx: *Ctx, node: exprs.NodeId, ie: exprs.IfExpr, fn_body: exprs.NodeId
             try addEq(ctx, node, n);
         },
     }
+    if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
 }
 
 /// Walk a `match` expression: unify the body expressions of all arms with match node.
@@ -740,8 +1072,9 @@ fn walkMatch(ctx: *Ctx, node: exprs.NodeId, m: exprs.MatchExpr, fn_body: exprs.N
     std.debug.assert(node < ctx.b.exprs.len);
     std.debug.assert(m.scrutinee < ctx.b.exprs.len);
     try walkExpr(ctx, m.scrutinee, fn_body);
+    const scrutinee_ty = getKnownType(ctx, m.scrutinee);
     for (m.arms) |arm| {
-        for (arm.patterns) |pattern| try bindMatchPattern(ctx, pattern);
+        for (arm.patterns) |pattern| try bindMatchPatternKnownType(ctx, pattern, scrutinee_ty);
         if (arm.guard) |guard| try walkExpr(ctx, guard, fn_body);
         try addEq(ctx, node, arm.body);
         try walkExpr(ctx, arm.body, fn_body);
@@ -751,6 +1084,109 @@ fn walkMatch(ctx: *Ctx, node: exprs.NodeId, m: exprs.MatchExpr, fn_body: exprs.N
 /// Claim local entities in a pattern in lowering order. `let` bindings map
 /// their resolved EntityId to the initializer; other patterns only reserve the
 /// entity so later shadowed bindings keep their distinct ids.
+fn variantPayloadType(
+    ctx: *Ctx,
+    pattern: exprs.PatternKind,
+    known_ty: ?types.Type,
+) ?types.Type {
+    const struct_pat = switch (pattern) {
+        .struct_pat => |value| value,
+        else => return known_ty,
+    };
+    const variant_name = if (ctx.cg) |cg|
+        if (cg.symbol_table.get(struct_pat.def)) |entity| entity.name else ""
+    else
+        "";
+    if (known_ty) |ty| {
+        if (std.mem.eql(u8, variant_name, "Some")) return optionPayloadType(ty);
+        if (std.mem.eql(u8, variant_name, "Ok")) return resultPayloadType(ty, false);
+        if (std.mem.eql(u8, variant_name, "Err")) return resultPayloadType(ty, true);
+        if (externalCowPayloadType(ctx, ty, variant_name)) |payload| return payload;
+        for (struct_pat.fields) |field| {
+            if (field.field.len == 0) continue;
+            if (fieldTypeForBase(ctx, ty, field.field)) |field_ty| return field_ty;
+        }
+    }
+    return null;
+}
+fn externalCowPayloadType(ctx: *Ctx, ty: types.Type, variant_name: []const u8) ?types.Type {
+    var base = ty;
+    var depth: usize = 0;
+    while (depth < 128) : (depth += 1) {
+        switch (base) {
+            .reference => |reference| base = reference.pointee,
+            .boxed => |boxed| base = boxed.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    base = concrete.*;
+                } else {
+                    break;
+                }
+            },
+            else => break,
+        }
+    }
+    const external = switch (base) {
+        .external_nominal => |value| value,
+        else => return null,
+    };
+    if (external.path.len != 3 or external.args.len != 1) return null;
+    if ((!std.mem.eql(u8, external.path[0], "alloc") and
+        !std.mem.eql(u8, external.path[0], "std")) or
+        !std.mem.eql(u8, external.path[1], "borrow") or
+        !std.mem.eql(u8, external.path[2], "Cow"))
+    {
+        return null;
+    }
+    const borrowed = std.mem.eql(u8, variant_name, "Borrowed");
+    const owned = std.mem.eql(u8, variant_name, "Owned");
+    if (!borrowed and !owned) return null;
+    const payload = external.args[0];
+    if (borrowed) return makeReferenceType(ctx, payload, false);
+    if (types.isStr(payload)) {
+        return makeExternalNominalType(ctx, &.{ "alloc", "string", "String" }, &.{});
+    }
+    const element = switch (payload) {
+        .slice => |slice| slice.elem,
+        else => return payload,
+    };
+    return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{element});
+}
+
+fn externalVariantFieldType(
+    ctx: *Ctx,
+    variant: exprs.ExternalVariantPattern,
+    known_ty: ?types.Type,
+    field_name: []const u8,
+) ?types.Type {
+    const payload_ty = externalCowPayloadType(
+        ctx,
+        known_ty orelse .{ .external_nominal = variant.owner },
+        variant.variant,
+    ) orelse return null;
+    if (std.mem.eql(u8, field_name, "0")) return payload_ty;
+    return null;
+}
+
+fn bindExternalVariantPattern(
+    ctx: *Ctx,
+    pattern: exprs.ExternalVariantPattern,
+    init: ?exprs.NodeId,
+    known_ty: ?types.Type,
+) std.mem.Allocator.Error!void {
+    for (pattern.fields) |field| {
+        const field_ty = externalVariantFieldType(ctx, pattern, known_ty, field.field);
+        if (field.pat) |field_pattern| {
+            try bindPattern(ctx, field_pattern, init, field_ty);
+        } else if (field.shorthand) {
+            if (ctx.claimLocal(field.field)) |def| {
+                if (init) |init_node| try ctx.def_map.put(ctx.alloc, def, init_node);
+                if (field_ty) |ty| try ctx.local_types.put(ctx.alloc, def, ty);
+            }
+        }
+    }
+}
+
 fn bindPattern(
     ctx: *Ctx,
     pattern_id: exprs.NodeId,
@@ -758,6 +1194,16 @@ fn bindPattern(
     known_ty: ?types.Type,
 ) std.mem.Allocator.Error!void {
     if (pattern_id >= ctx.b.pats.len) return;
+    const pattern_type: ?types.Type = if (known_ty) |ty| switch (ctx.b.pats[pattern_id].kind) {
+        .binding => |binding| if (binding.mode == .value)
+            ty
+        else
+            makeReferenceType(ctx, ty, binding.mode == .mut_ref) orelse return error.OutOfMemory,
+        else => ty,
+    } else null;
+    if (pattern_type) |ty| {
+        try ctx.g.derived_pattern_pins.append(ctx.alloc, .{ .node = pattern_id, .ty = ty });
+    }
     switch (ctx.b.pats[pattern_id].kind) {
         .binding => |binding| {
             const def_id = ctx.claimLocal(binding.name) orelse blk: {
@@ -766,7 +1212,7 @@ fn bindPattern(
             };
             if (def_id) |def| {
                 if (init) |init_node| try ctx.def_map.put(ctx.alloc, def, init_node);
-                if (known_ty) |ty| try ctx.local_types.put(ctx.alloc, def, ty);
+                if (pattern_type) |ty| try ctx.local_types.put(ctx.alloc, def, ty);
             }
         },
         .tuple => |tuple| {
@@ -775,7 +1221,9 @@ fn bindPattern(
                     .tuple => |elements| if (index < elements.len) elements[index] else null,
                     else => null,
                 } else null;
-                try bindPattern(ctx, element, init, element_ty);
+                // A destructured binding owns its tuple element type; it must
+                // not be equated with the whole tuple initializer.
+                try bindPattern(ctx, element, null, element_ty);
             }
         },
         .slice => |slice| {
@@ -793,22 +1241,35 @@ fn bindPattern(
             if (slice.rest) |rest| try bindPattern(ctx, rest, init, known_ty);
         },
         .struct_pat => |struct_pat| {
+            const payload_ty = variantPayloadType(ctx, .{ .struct_pat = struct_pat }, known_ty);
             for (struct_pat.fields) |field| {
+                const field_ty = if (payload_ty != null and field.field.len > 0 and
+                    std.mem.eql(u8, field.field, "0"))
+                    payload_ty
+                else if (known_ty) |ty|
+                    fieldTypeForBase(ctx, ty, field.field)
+                else
+                    null;
                 if (field.pat) |field_pattern| {
-                    try bindPattern(ctx, field_pattern, init, null);
+                    try bindPattern(ctx, field_pattern, init, field_ty);
                 } else if (field.shorthand) {
                     const def_id = ctx.claimLocal(field.field);
                     if (init) |init_node| {
-                        if (def_id) |def| try ctx.def_map.put(ctx.alloc, def, init_node);
+                        if (def_id) |def| {
+                            try ctx.def_map.put(ctx.alloc, def, init_node);
+                            if (field_ty) |ty| try ctx.local_types.put(ctx.alloc, def, ty);
+                        }
+                    } else if (def_id) |def| {
+                        if (field_ty) |ty| try ctx.local_types.put(ctx.alloc, def, ty);
                     }
                 }
             }
         },
+        .external_variant => |external_variant| {
+            try bindExternalVariantPattern(ctx, external_variant, init, known_ty);
+        },
         .reference => |reference| {
-            const inner_ty = if (known_ty) |ty| switch (ty) {
-                .reference => |matched| matched.pointee,
-                else => ty,
-            } else null;
+            const inner_ty = if (known_ty) |ty| dereferencedType(ty) orelse ty else null;
             try bindPattern(ctx, reference.inner, init, inner_ty);
         },
         .@"or" => |or_pattern| {
@@ -868,6 +1329,15 @@ fn bindMatchPattern(ctx: *Ctx, pattern_id: exprs.NodeId) std.mem.Allocator.Error
                 }
             }
         },
+        .external_variant => |external_variant| {
+            for (external_variant.fields) |field| {
+                if (field.pat) |field_pattern| {
+                    try bindMatchPattern(ctx, field_pattern);
+                } else if (field.shorthand) {
+                    _ = ctx.claimLocal(field.field);
+                }
+            }
+        },
         .tuple => |tuple| for (tuple.elements) |element| try bindMatchPattern(ctx, element),
         .reference => |reference| try bindMatchPattern(ctx, reference.inner),
         .@"or" => |or_pattern| for (or_pattern.alternatives) |alternative| try bindMatchPattern(ctx, alternative),
@@ -883,6 +1353,30 @@ fn bindMatchPatternType(ctx: *Ctx, pattern_id: exprs.NodeId, ty: ?types.Type) st
                 if (ty) |known| try ctx.local_types.put(ctx.alloc, def, known);
             }
         },
+        .external_variant => |external_variant| {
+            try bindExternalVariantPattern(ctx, external_variant, null, ty);
+        },
+        else => try bindMatchPattern(ctx, pattern_id),
+    }
+}
+
+fn bindMatchPatternKnownType(
+    ctx: *Ctx,
+    pattern_id: exprs.NodeId,
+    known_ty: ?types.Type,
+) std.mem.Allocator.Error!void {
+    if (pattern_id >= ctx.b.pats.len) return;
+    switch (ctx.b.pats[pattern_id].kind) {
+        .binding, .tuple, .slice, .reference, .@"or", .external_variant => {
+            try bindPattern(ctx, pattern_id, null, known_ty);
+        },
+        .struct_pat => {
+            if (variantPayloadType(ctx, ctx.b.pats[pattern_id].kind, known_ty) != null) {
+                try bindPattern(ctx, pattern_id, null, known_ty);
+            } else {
+                try bindMatchPattern(ctx, pattern_id);
+            }
+        },
         else => try bindMatchPattern(ctx, pattern_id),
     }
 }
@@ -896,7 +1390,7 @@ fn walkStmt(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             if (ls.init) |init| {
                 if (ls.ty) |ty| try addPin(ctx, init, ty);
                 try walkExpr(ctx, init, fn_body);
-                const known_ty = getKnownType(ctx, init);
+                const known_ty = annotatedOrKnownType(ctx, ls.ty, init);
                 try bindPattern(ctx, ls.pattern, init, known_ty);
             } else {
                 try bindPattern(ctx, ls.pattern, null, null);
@@ -904,7 +1398,7 @@ fn walkStmt(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         },
         .let_else => |le| {
             try walkExpr(ctx, le.init, fn_body);
-            const known_ty = getKnownType(ctx, le.init);
+            const known_ty = annotatedOrKnownType(ctx, null, le.init);
             try bindPattern(ctx, le.pattern, le.init, known_ty);
             try walkBlock(ctx, le.else_block, fn_body, null);
         },
@@ -923,9 +1417,20 @@ fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?
     }
 }
 
-fn walkClosure(ctx: *Ctx, closure: exprs.ClosureExpr, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
-    for (closure.params) |param| try bindPattern(ctx, param, null, null);
+fn walkClosureTyped(
+    ctx: *Ctx,
+    closure: exprs.ClosureExpr,
+    fn_body: exprs.NodeId,
+    param_ty: ?types.Type,
+) std.mem.Allocator.Error!void {
+    for (closure.params, 0..) |param, index| {
+        try bindPattern(ctx, param, null, if (index == 0) param_ty else null);
+    }
     try walkBlock(ctx, closure.body, fn_body, null);
+}
+
+fn walkClosure(ctx: *Ctx, closure: exprs.ClosureExpr, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
+    try walkClosureTyped(ctx, closure, fn_body, null);
 }
 
 fn walkIteratorChain(
@@ -934,13 +1439,58 @@ fn walkIteratorChain(
     fn_body: exprs.NodeId,
 ) std.mem.Allocator.Error!void {
     try walkExpr(ctx, chain.source, fn_body);
+    var current_ty = iteratorSourceItemType(ctx, chain.source);
     for (chain.adapters) |adapter| {
         switch (adapter) {
-            .map => |map| try walkClosure(ctx, map.closure, fn_body),
-            .filter => |filter| try walkClosure(ctx, filter.closure, fn_body),
-            .flat_map => |closure| try walkClosure(ctx, closure, fn_body),
-            .enumerate, .range_rev, .other => {},
-            .zip => |zip| try walkExpr(ctx, zip.other, fn_body),
+            .map => |map| {
+                if (current_ty) |input_ty| {
+                    try walkClosureTyped(ctx, map.closure, fn_body, input_ty);
+                } else {
+                    try walkClosure(ctx, map.closure, fn_body);
+                }
+                current_ty = closureValueReturnType(ctx, map.closure);
+            },
+            .filter => |filter| {
+                if (current_ty) |input_ty| {
+                    const predicate_input = makeReferenceType(ctx, input_ty, false);
+                    if (predicate_input) |typed_input| {
+                        try walkClosureTyped(ctx, filter.closure, fn_body, typed_input);
+                    } else {
+                        try walkClosure(ctx, filter.closure, fn_body);
+                    }
+                } else {
+                    try walkClosure(ctx, filter.closure, fn_body);
+                }
+            },
+            .flat_map => |closure| {
+                try walkClosureTyped(ctx, closure, fn_body, current_ty);
+                current_ty = if (closureValueReturnType(ctx, closure)) |returned|
+                    iteratorItemType(ctx, returned)
+                else
+                    null;
+            },
+            .enumerate => {
+                if (current_ty) |input_ty| {
+                    const tuple = try ctx.alloc.alloc(types.Type, 2);
+                    tuple[0] = .{ .prim = .usize };
+                    tuple[1] = input_ty;
+                    current_ty = .{ .tuple = tuple };
+                }
+            },
+            .zip => |zip| {
+                try walkExpr(ctx, zip.other, fn_body);
+                if (current_ty) |input_ty| {
+                    if (iteratorSourceItemType(ctx, zip.other)) |other_ty| {
+                        const tuple = try ctx.alloc.alloc(types.Type, 2);
+                        tuple[0] = input_ty;
+                        tuple[1] = other_ty;
+                        current_ty = .{ .tuple = tuple };
+                    } else {
+                        current_ty = null;
+                    }
+                }
+            },
+            .range_rev, .other => {},
         }
     }
 }
@@ -949,6 +1499,9 @@ fn walkIteratorChain(
 /// Duplicates the args slice so the recorded value remains valid after the
 /// caller's temporary storage is freed.
 fn addInstantiation(ctx: *Ctx, node: exprs.NodeId, inst: types.Instantiation) std.mem.Allocator.Error!void {
+    for (inst.args.params) |arg| {
+        if (!isConcreteDerivedType(arg)) return;
+    }
     const owned = try ctx.alloc.dupe(types.Type, inst.args.params);
     errdefer ctx.alloc.free(owned);
     const gop = try ctx.g.instantiations.getOrPut(ctx.alloc, node);
@@ -963,7 +1516,6 @@ fn addInstantiation(ctx: *Ctx, node: exprs.NodeId, inst: types.Instantiation) st
     };
 }
 
-/// Free every recorded value's duplicated args slice, then the map itself.
 fn deinitInstantiationMap(
     alloc: std.mem.Allocator,
     map: *std.AutoHashMapUnmanaged(exprs.NodeId, types.Instantiation),
@@ -1040,6 +1592,25 @@ fn collectTypeParamNamesFromType(
             try collectTypeParamNamesFromType(alloc, b, buf, res.err);
         },
         .boxed => |bx| try collectTypeParamNamesFromType(alloc, b, buf, bx.*),
+        .@"opaque" => |opaque_type| {
+            for (opaque_type.bounds) |bound| {
+                for (bound.args) |arg| try collectTypeParamNamesFromType(alloc, b, buf, arg);
+                for (bound.associated_types) |binding| {
+                    try collectTypeParamNamesFromType(alloc, b, buf, binding.ty);
+                }
+            }
+            if (opaque_type.concrete) |concrete| {
+                try collectTypeParamNamesFromType(alloc, b, buf, concrete.*);
+            }
+        },
+        .dyn_trait => |bounds| {
+            for (bounds) |bound| {
+                for (bound.args) |arg| try collectTypeParamNamesFromType(alloc, b, buf, arg);
+                for (bound.associated_types) |binding| {
+                    try collectTypeParamNamesFromType(alloc, b, buf, binding.ty);
+                }
+            }
+        },
         .unsupported => {},
     }
 }
@@ -1102,9 +1673,33 @@ fn isIntegerType(ty: types.Type) bool {
 fn isLenReceiverType(ty: types.Type) bool {
     return switch (ty) {
         .slice, .array => true,
-        .reference => |reference| switch (reference.pointee) {
-            .slice, .array => true,
-            else => false,
+        .reference => |reference| isLenReceiverType(reference.pointee),
+        .boxed => |boxed| isLenReceiverType(boxed.*),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete| isLenReceiverType(concrete.*) else false,
+        .external_nominal => |external| blk: {
+            if (external.path.len < 2) break :blk false;
+            const root = std.mem.eql(u8, external.path[0], "alloc") or
+                std.mem.eql(u8, external.path[0], "std");
+            if (!root) break :blk false;
+            if (external.path.len == 3 and
+                std.mem.eql(u8, external.path[1], "vec") and
+                std.mem.eql(u8, external.path[2], "Vec"))
+            {
+                break :blk external.args.len == 1;
+            }
+            if (external.path.len == 3 and
+                std.mem.eql(u8, external.path[1], "string") and
+                std.mem.eql(u8, external.path[2], "String"))
+            {
+                break :blk external.args.len == 0;
+            }
+            if (external.path.len == 3 and
+                std.mem.eql(u8, external.path[1], "borrow") and
+                std.mem.eql(u8, external.path[2], "Cow"))
+            {
+                break :blk external.args.len == 1;
+            }
+            break :blk false;
         },
         else => false,
     };
@@ -1114,17 +1709,1377 @@ fn indexedElementType(ty: types.Type) ?types.Type {
         .array => |array| array.elem,
         .slice => |slice| slice.elem,
         .reference => |reference| indexedElementType(reference.pointee),
+        .boxed => |boxed| indexedElementType(boxed.*),
+        .external_nominal => |external| if (external.path.len == 3 and
+            (std.mem.eql(u8, external.path[0], "alloc") or
+                std.mem.eql(u8, external.path[0], "std")) and
+            std.mem.eql(u8, external.path[1], "vec") and
+            std.mem.eql(u8, external.path[2], "Vec") and
+            external.args.len == 1)
+            external.args[0]
+        else
+            null,
+        else => null,
+    };
+}
+fn sliceElementForMethod(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .slice => |slice| slice.elem,
+        .array => |array| array.elem,
+        .reference => |reference| sliceElementForMethod(reference.pointee),
+        .boxed => |boxed| sliceElementForMethod(boxed.*),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete| sliceElementForMethod(concrete.*) else null,
+        .external_nominal => |external| blk: {
+            if (external.path.len != 3 or external.args.len > 1) break :blk null;
+            const root = std.mem.eql(u8, external.path[0], "alloc") or
+                std.mem.eql(u8, external.path[0], "std");
+            if (!root) break :blk null;
+            if (std.mem.eql(u8, external.path[1], "vec") and
+                std.mem.eql(u8, external.path[2], "Vec") and
+                external.args.len == 1)
+            {
+                break :blk external.args[0];
+            }
+            if (std.mem.eql(u8, external.path[1], "string") and
+                std.mem.eql(u8, external.path[2], "String") and
+                external.args.len == 0)
+            {
+                break :blk types.Type{ .prim = .u8 };
+            }
+            if (std.mem.eql(u8, external.path[1], "borrow") and
+                std.mem.eql(u8, external.path[2], "Cow") and
+                external.args.len == 1)
+            {
+                break :blk switch (external.args[0]) {
+                    .slice => |slice| slice.elem,
+                    else => external.args[0],
+                };
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+fn sliceIteratorElementType(ty: types.Type) ?types.Type {
+    var current = ty;
+    while (true) {
+        switch (current) {
+            .reference => |reference| current = reference.pointee,
+            .boxed => |boxed| current = boxed.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    current = concrete.*;
+                } else {
+                    return null;
+                }
+            },
+            else => break,
+        }
+    }
+    return switch (current) {
+        .external_nominal => |external| if (external.path.len == 3 and
+            (std.mem.eql(u8, external.path[0], "core") or
+                std.mem.eql(u8, external.path[0], "std")) and
+            std.mem.eql(u8, external.path[1], "slice") and
+            (std.mem.eql(u8, external.path[2], "Iter") or
+                std.mem.eql(u8, external.path[2], "IterMut")) and
+            external.args.len == 1)
+            external.args[0]
+        else
+            null,
         else => null,
     };
 }
 
+fn scalarOperandType(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .reference => |reference| scalarOperandType(reference.pointee),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete|
+            scalarOperandType(concrete.*)
+        else
+            null,
+        .boxed => |boxed| scalarOperandType(boxed.*),
+        .prim => |primitive| if (isScalarCastType(.{ .prim = primitive }))
+            ty
+        else
+            null,
+        else => null,
+    };
+}
+
+fn dereferencedType(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .reference => |reference| reference.pointee,
+        .raw_ptr => |raw_ptr| raw_ptr.pointee,
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete| dereferencedType(concrete.*) else null,
+        .boxed => |boxed| dereferencedType(boxed.*),
+        else => null,
+    };
+}
+fn dereferencedValueType(ctx: *Ctx, ty: types.Type) ?types.Type {
+    if (dereferencedType(ty)) |pointee| return pointee;
+    const external = switch (ty) {
+        .external_nominal => |value| value,
+        else => return null,
+    };
+    if (external.path.len != 3 or external.args.len != 1) return null;
+    if ((!std.mem.eql(u8, external.path[0], "alloc") and
+        !std.mem.eql(u8, external.path[0], "std")) or
+        !std.mem.eql(u8, external.path[1], "vec") or
+        !std.mem.eql(u8, external.path[2], "Vec"))
+    {
+        return null;
+    }
+    const slice = ctx.alloc.create(types.Slice) catch return null;
+    slice.* = .{ .const_ = true, .elem = external.args[0] };
+    return .{ .slice = slice };
+}
+
+fn optionPayloadType(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .reference => |reference| optionPayloadType(reference.pointee),
+        .boxed => |boxed| optionPayloadType(boxed.*),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete|
+            optionPayloadType(concrete.*)
+        else
+            null,
+        .option => |inner| inner.*,
+        .external_nominal => |external| if (external.path.len == 3 and
+            (std.mem.eql(u8, external.path[0], "core") or
+                std.mem.eql(u8, external.path[0], "std")) and
+            std.mem.eql(u8, external.path[1], "option") and
+            std.mem.eql(u8, external.path[2], "Option") and
+            external.args.len == 1)
+            external.args[0]
+        else
+            null,
+        else => null,
+    };
+}
+
+fn resultPayloadType(ty: types.Type, error_payload: bool) ?types.Type {
+    return switch (ty) {
+        .reference => |reference| resultPayloadType(reference.pointee, error_payload),
+        .boxed => |boxed| resultPayloadType(boxed.*, error_payload),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete|
+            resultPayloadType(concrete.*, error_payload)
+        else
+            null,
+        .result => |result| if (error_payload) result.err else result.ok,
+        .external_nominal => |external| if (external.path.len == 3 and
+            (std.mem.eql(u8, external.path[0], "core") or
+                std.mem.eql(u8, external.path[0], "std")) and
+            std.mem.eql(u8, external.path[1], "result") and
+            std.mem.eql(u8, external.path[2], "Result") and
+            external.args.len == 2)
+            external.args[if (error_payload) 1 else 0]
+        else
+            null,
+        else => null,
+    };
+}
+
+fn unwrapTryType(ty: types.Type) ?types.Type {
+    if (optionPayloadType(ty)) |payload| return payload;
+    return resultPayloadType(ty, false);
+}
+fn makeRawPtrType(ctx: *Ctx, elem: types.Type, mutable: bool) ?types.Type {
+    const pointer = ctx.alloc.create(types.RawPtr) catch return null;
+    pointer.* = .{ .mut = mutable, .pointee = elem };
+    return .{ .raw_ptr = pointer };
+}
+
+fn makeReferenceType(ctx: *Ctx, elem: types.Type, mutable: bool) ?types.Type {
+    if (types.isStr(elem)) return makeSliceType(ctx, .{ .prim = .u8 }, mutable);
+    const reference = ctx.alloc.create(types.Ref) catch return null;
+    reference.* = .{ .mut = mutable, .pointee = elem };
+    return .{ .reference = reference };
+}
+/// Return the nominal definition represented by a value type.
+///
+/// Field lookup follows the resolved type identity. It never guesses a
+/// declaration from a field or type spelling alone.
+fn nominalDefForField(ty: types.Type) ?exprs.DefId {
+    return switch (ty) {
+        .path => |path| if (path.segments.len == 0)
+            null
+        else
+            path.segments[path.segments.len - 1].id,
+        .generic_inst => |instance| instance.decl,
+        .reference => |reference| nominalDefForField(reference.pointee),
+        .raw_ptr => |raw_ptr| nominalDefForField(raw_ptr.pointee),
+        else => null,
+    };
+}
+
+/// Resolve a method receiver's `Self` path to its containing impl type.
+///
+/// A function can be nested below modules or other graph entities, so the
+/// immediate parent is not necessarily the impl body. Walk the entity chain
+/// while keeping the body table and graph in lockstep.
+fn currentImplSelfType(ctx: *const Ctx) ?types.Type {
+    var current = ctx.current_fn;
+    const cg = ctx.cg orelse return null;
+    var remaining = cg.symbol_table.entities.items.len;
+    while (current) |entity_id| {
+        if (remaining == 0) return null;
+        remaining -= 1;
+        if (entity_id < ctx.b.bodies.len) {
+            switch (ctx.b.bodies[entity_id]) {
+                .impl_ => |impl_body| return impl_body.self_ty,
+                else => {},
+            }
+        }
+        const entity = cg.symbol_table.get(entity_id) orelse return null;
+        current = entity.parent;
+    }
+    return null;
+}
+
+/// Resolve a field's declared type from its receiver type.
+fn fieldTypeForBase(ctx: *Ctx, base_ty: types.Type, field_name: []const u8) ?types.Type {
+    switch (base_ty) {
+        .tuple => |tuple| {
+            const index = std.fmt.parseInt(usize, field_name, 10) catch return null;
+            if (index < tuple.len) return tuple[index];
+            return null;
+        },
+        .reference => |reference| return fieldTypeForBase(ctx, reference.pointee, field_name),
+        .raw_ptr => |raw_ptr| return fieldTypeForBase(ctx, raw_ptr.pointee, field_name),
+        .path => |path| {
+            if (path.segments.len == 1 and
+                std.mem.eql(u8, path.segments[0].name, "Self"))
+            {
+                const self_ty = currentImplSelfType(ctx) orelse return null;
+                if (self_ty == .path and self_ty.path.segments.len == 1 and
+                    std.mem.eql(u8, self_ty.path.segments[0].name, "Self"))
+                {
+                    return null;
+                }
+                return fieldTypeForBase(ctx, self_ty, field_name);
+            }
+        },
+        .external_nominal => |external| {
+            if (external.path.len == 3 and external.args.len == 1 and
+                (std.mem.eql(u8, external.path[0], "core") or
+                    std.mem.eql(u8, external.path[0], "std")) and
+                std.mem.eql(u8, external.path[1], "ops") and
+                std.mem.eql(u8, external.path[2], "Range") and
+                (std.mem.eql(u8, field_name, "start") or
+                    std.mem.eql(u8, field_name, "end")))
+            {
+                return external.args[0];
+            }
+        },
+        else => {},
+    }
+
+    const def = nominalDefForField(base_ty) orelse return null;
+    if (def >= ctx.b.bodies.len) return null;
+    const field_ty = switch (ctx.b.bodies[def]) {
+        .struct_ => |struct_body| blk: {
+            for (struct_body.fields) |field| {
+                if (std.mem.eql(u8, field.name, field_name)) break :blk field.ty;
+            }
+            break :blk null;
+        },
+        else => null,
+    } orelse return null;
+
+    return switch (base_ty) {
+        .generic_inst => |instance| blk: {
+            const param_names = getGenericParamNames(ctx, def) catch break :blk field_ty;
+            defer ctx.alloc.free(param_names);
+            break :blk substType(
+                ctx.alloc,
+                field_ty,
+                param_names,
+                instance.args.params,
+            ) catch field_ty;
+        },
+        else => field_ty,
+    };
+}
+
+fn annotatedOrKnownType(
+    ctx: *Ctx,
+    annotation: ?exprs.TypeId,
+    init: exprs.NodeId,
+) ?types.Type {
+    if (annotation) |type_id| {
+        if (type_id < ctx.b.types.len) return ctx.b.types[type_id];
+    }
+    return getKnownType(ctx, init);
+}
+
+fn makeSliceType(ctx: *Ctx, elem: types.Type, mutable: bool) ?types.Type {
+    const slice = ctx.alloc.create(types.Slice) catch return null;
+    slice.* = .{ .const_ = !mutable, .elem = elem };
+    return .{ .slice = slice };
+}
+
+fn chunksExactElement(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .external_nominal => |external| blk: {
+            if (external.path.len != 3 or external.args.len != 1) break :blk null;
+            if (!std.mem.eql(u8, external.path[0], "core") or
+                !std.mem.eql(u8, external.path[1], "slice") or
+                !std.mem.eql(u8, external.path[2], "ChunksExact"))
+            {
+                break :blk null;
+            }
+            break :blk external.args[0];
+        },
+        else => null,
+    };
+}
+
+fn chunksExactType(ctx: *Ctx, elem: types.Type) ?types.Type {
+    const args = ctx.alloc.alloc(types.Type, 1) catch return null;
+    args[0] = elem;
+    return .{ .external_nominal = .{
+        .path = &.{ "core", "slice", "ChunksExact" },
+        .args = args,
+    } };
+}
+fn makeOptionType(ctx: *Ctx, inner: types.Type) ?types.Type {
+    const ptr = ctx.alloc.create(types.Type) catch return null;
+    ptr.* = inner;
+    return .{ .option = ptr };
+}
+
+fn makeExternalNominalType(
+    ctx: *Ctx,
+    path: []const []const u8,
+    args: []const types.Type,
+) ?types.Type {
+    const owned_args: []const types.Type = if (args.len == 0)
+        &.{}
+    else
+        (ctx.alloc.dupe(types.Type, args) catch return null);
+
+    const owned_path: []const []const u8 = if (path.len == 0) &.{} else blk: {
+        const copied_path = ctx.alloc.alloc([]const u8, path.len) catch {
+            if (args.len > 0) ctx.alloc.free(owned_args);
+            return null;
+        };
+        var copied_count: usize = 0;
+        for (path, 0..) |segment, index| {
+            copied_path[index] = ctx.alloc.dupe(u8, segment) catch {
+                while (copied_count > 0) {
+                    copied_count -= 1;
+                    ctx.alloc.free(copied_path[copied_count]);
+                }
+                ctx.alloc.free(copied_path);
+                if (args.len > 0) ctx.alloc.free(owned_args);
+                return null;
+            };
+            copied_count += 1;
+        }
+        break :blk copied_path;
+    };
+    return .{ .external_nominal = .{ .path = owned_path, .args = owned_args } };
+}
+
+fn externalNominalBase(ty: types.Type) ?types.ExternalNominal {
+    var base = ty;
+    while (true) {
+        switch (base) {
+            .reference => |reference| base = reference.pointee,
+            .boxed => |boxed| base = boxed.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    base = concrete.*;
+                } else {
+                    return null;
+                }
+            },
+            else => break,
+        }
+    }
+    return switch (base) {
+        .external_nominal => |external| external,
+        else => null,
+    };
+}
+
+fn knownAllocMethodType(
+    ctx: *Ctx,
+    receiver_ty: types.Type,
+    method_name: []const u8,
+) ?types.Type {
+    const external = externalNominalBase(receiver_ty);
+    if (external) |value| {
+        const is_vec = value.path.len == 3 and
+            (std.mem.eql(u8, value.path[0], "alloc") or
+                std.mem.eql(u8, value.path[0], "std")) and
+            std.mem.eql(u8, value.path[1], "vec") and
+            std.mem.eql(u8, value.path[2], "Vec") and
+            value.args.len == 1;
+        const is_string = value.path.len == 3 and
+            (std.mem.eql(u8, value.path[0], "alloc") or
+                std.mem.eql(u8, value.path[0], "std")) and
+            std.mem.eql(u8, value.path[1], "string") and
+            std.mem.eql(u8, value.path[2], "String") and
+            value.args.len == 0;
+        const is_cow = value.path.len == 3 and
+            (std.mem.eql(u8, value.path[0], "alloc") or
+                std.mem.eql(u8, value.path[0], "std")) and
+            std.mem.eql(u8, value.path[1], "borrow") and
+            std.mem.eql(u8, value.path[2], "Cow") and
+            value.args.len == 1;
+
+        if (is_vec) {
+            const element = value.args[0];
+            if (std.mem.eql(u8, method_name, "as_ref") or
+                std.mem.eql(u8, method_name, "as_slice"))
+            {
+                return makeSliceType(ctx, element, false);
+            }
+            if (std.mem.eql(u8, method_name, "as_mut_slice")) {
+                return makeSliceType(ctx, element, true);
+            }
+            if (std.mem.eql(u8, method_name, "to_vec") or
+                std.mem.eql(u8, method_name, "to_owned"))
+            {
+                return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{element});
+            }
+            if (std.mem.eql(u8, method_name, "push") or
+                std.mem.eql(u8, method_name, "extend") or
+                std.mem.eql(u8, method_name, "clear") or
+                std.mem.eql(u8, method_name, "reserve") or
+                std.mem.eql(u8, method_name, "reserve_exact") or
+                std.mem.eql(u8, method_name, "truncate") or
+                std.mem.eql(u8, method_name, "resize") or
+                std.mem.eql(u8, method_name, "shrink_to_fit"))
+            {
+                return .{ .prim = .unit };
+            }
+        }
+        if (is_string) {
+            if (std.mem.eql(u8, method_name, "as_ref") or
+                std.mem.eql(u8, method_name, "as_bytes") or
+                std.mem.eql(u8, method_name, "as_str"))
+            {
+                return makeSliceType(ctx, .{ .prim = .u8 }, false);
+            }
+            if (std.mem.eql(u8, method_name, "into_bytes")) {
+                return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{.{ .prim = .u8 }});
+            }
+            if (std.mem.eql(u8, method_name, "to_owned") or
+                std.mem.eql(u8, method_name, "clone"))
+            {
+                return makeExternalNominalType(ctx, &.{ "alloc", "string", "String" }, &.{});
+            }
+            if (std.mem.eql(u8, method_name, "push") or
+                std.mem.eql(u8, method_name, "push_str") or
+                std.mem.eql(u8, method_name, "clear") or
+                std.mem.eql(u8, method_name, "reserve") or
+                std.mem.eql(u8, method_name, "truncate"))
+            {
+                return .{ .prim = .unit };
+            }
+        }
+        if (is_cow) {
+            const payload = value.args[0];
+            if (std.mem.eql(u8, method_name, "as_ref") or
+                std.mem.eql(u8, method_name, "borrow"))
+            {
+                if (types.isStr(payload)) return makeReferenceType(ctx, payload, false);
+                return switch (payload) {
+                    .slice => |slice| makeSliceType(ctx, slice.elem, false),
+                    else => payload,
+                };
+            }
+            if (std.mem.eql(u8, method_name, "into_owned") or
+                std.mem.eql(u8, method_name, "to_owned"))
+            {
+                if (types.isStr(payload)) {
+                    return makeExternalNominalType(
+                        ctx,
+                        &.{ "alloc", "string", "String" },
+                        &.{},
+                    );
+                }
+                return switch (payload) {
+                    .slice => |slice| makeExternalNominalType(
+                        ctx,
+                        &.{ "alloc", "vec", "Vec" },
+                        &.{slice.elem},
+                    ),
+                    else => payload,
+                };
+            }
+        }
+    }
+
+    if (std.mem.eql(u8, method_name, "to_vec") or
+        std.mem.eql(u8, method_name, "to_owned"))
+    {
+        if (sliceElementForMethod(receiver_ty)) |element| {
+            return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{element});
+        }
+    }
+    if (std.mem.eql(u8, method_name, "as_slice") or
+        std.mem.eql(u8, method_name, "as_mut_slice"))
+    {
+        if (sliceElementForMethod(receiver_ty)) |element| {
+            return makeSliceType(ctx, element, std.mem.eql(u8, method_name, "as_mut_slice"));
+        }
+    }
+    return null;
+}
+
+fn publicIteratorPath(external: types.ExternalNominal, module: []const u8, name: []const u8) bool {
+    if (external.path.len != 3) return false;
+    if (!std.mem.eql(u8, external.path[0], "core") and
+        !std.mem.eql(u8, external.path[0], "std"))
+    {
+        return false;
+    }
+    return std.mem.eql(u8, external.path[1], module) and
+        std.mem.eql(u8, external.path[2], name);
+}
+fn closureValueReturnType(ctx: *Ctx, closure: exprs.ClosureExpr) ?types.Type {
+    if (closure.body.tail) |tail| {
+        if (getKnownType(ctx, tail)) |known| return known;
+    }
+    if (closure.return_ty) |type_id| {
+        if (type_id < ctx.b.types.len) return ctx.b.types[type_id];
+    }
+    if (closure.body.tail != null) return null;
+    return .{ .prim = .unit };
+}
+
+fn iteratorSourceItemType(ctx: *Ctx, source: exprs.NodeId) ?types.Type {
+    if (source >= ctx.b.exprs.len) return null;
+    const source_ty = getKnownType(ctx, source) orelse return null;
+    return switch (source_ty) {
+        .slice => |slice| slice.elem,
+        .array => |array| array.elem,
+        .reference => |reference| switch (reference.pointee) {
+            .slice => |slice| slice.elem,
+            .array => |array| array.elem,
+            else => iteratorItemType(ctx, source_ty),
+        },
+        else => iteratorItemType(ctx, source_ty),
+    };
+}
+
+fn iteratorChainElementType(ctx: *Ctx, chain: exprs.IteratorChainExpr) ?types.Type {
+    var current = iteratorSourceItemType(ctx, chain.source) orelse return null;
+    for (chain.adapters) |adapter| {
+        current = switch (adapter) {
+            .map => |map| closureValueReturnType(ctx, map.closure) orelse return null,
+            .filter => current,
+            .flat_map => |closure| blk: {
+                const returned = closureValueReturnType(ctx, closure) orelse return null;
+                break :blk iteratorItemType(ctx, returned) orelse return null;
+            },
+            .enumerate => blk: {
+                const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+                tuple[0] = .{ .prim = .usize };
+                tuple[1] = current;
+                break :blk .{ .tuple = tuple };
+            },
+            .zip => |zip| blk: {
+                const other_item = iteratorSourceItemType(ctx, zip.other) orelse return null;
+                const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+                tuple[0] = current;
+                tuple[1] = other_item;
+                break :blk .{ .tuple = tuple };
+            },
+            .range_rev => current,
+            .other => return null,
+        };
+    }
+    return current;
+}
+
+fn iteratorItemType(ctx: *Ctx, ty: types.Type) ?types.Type {
+    var base = ty;
+    while (true) {
+        switch (base) {
+            .reference => |reference| base = reference.pointee,
+            .raw_ptr => |raw_ptr| base = raw_ptr.pointee,
+            .boxed => |boxed| base = boxed.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    base = concrete.*;
+                } else {
+                    return null;
+                }
+            },
+            else => break,
+        }
+    }
+    switch (base) {
+        .external_nominal => |external| {
+            if (publicIteratorPath(external, "ops", "Range") and external.args.len == 1) {
+                return external.args[0];
+            }
+            if (publicIteratorPath(external, "slice", "Iter") and external.args.len == 1) {
+                return makeReferenceType(ctx, external.args[0], false);
+            }
+            if (publicIteratorPath(external, "slice", "IterMut") and external.args.len == 1) {
+                return makeReferenceType(ctx, external.args[0], true);
+            }
+            if ((publicIteratorPath(external, "iter", "StepBy") or
+                publicIteratorPath(external, "iter", "Skip") or
+                publicIteratorPath(external, "iter", "Rev")) and
+                external.args.len == 1)
+            {
+                return iteratorItemType(ctx, external.args[0]);
+            }
+            if (publicIteratorPath(external, "iter", "Enumerate") and external.args.len == 1) {
+                const element = iteratorItemType(ctx, external.args[0]) orelse return null;
+                const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+                tuple[0] = .{ .prim = .usize };
+                tuple[1] = element;
+                return .{ .tuple = tuple };
+            }
+            if (publicIteratorPath(external, "iter", "Zip") and external.args.len == 2) {
+                const left = iteratorItemType(ctx, external.args[0]) orelse return null;
+                const right = iteratorItemType(ctx, external.args[1]) orelse return null;
+                const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+                tuple[0] = left;
+                tuple[1] = right;
+                return .{ .tuple = tuple };
+            }
+        },
+        .slice => |slice| return makeReferenceType(ctx, slice.elem, false),
+        .array => |array| return array.elem,
+        else => {},
+    }
+    return null;
+}
+
+fn knownIteratorMethodType(
+    ctx: *Ctx,
+    method_name: []const u8,
+    receiver: types.Type,
+    args: []const exprs.NodeId,
+) ?types.Type {
+    if (std.mem.eql(u8, method_name, "iter") or std.mem.eql(u8, method_name, "iter_mut")) {
+        const element = sliceElementForMethod(receiver) orelse return null;
+        return makeExternalNominalType(
+            ctx,
+            if (std.mem.eql(u8, method_name, "iter"))
+                &.{ "core", "slice", "Iter" }
+            else
+                &.{ "core", "slice", "IterMut" },
+            &.{element},
+        );
+    }
+    if (std.mem.eql(u8, method_name, "step_by") or
+        std.mem.eql(u8, method_name, "skip") or
+        std.mem.eql(u8, method_name, "rev") or
+        std.mem.eql(u8, method_name, "enumerate"))
+    {
+        const type_name = if (std.mem.eql(u8, method_name, "step_by"))
+            "StepBy"
+        else if (std.mem.eql(u8, method_name, "skip"))
+            "Skip"
+        else if (std.mem.eql(u8, method_name, "rev"))
+            "Rev"
+        else
+            "Enumerate";
+        return makeExternalNominalType(ctx, &.{ "core", "iter", type_name }, &.{receiver});
+    }
+    if (std.mem.eql(u8, method_name, "zip")) {
+        if (args.len == 0) return null;
+        const other = getKnownType(ctx, args[0]) orelse return null;
+        return makeExternalNominalType(ctx, &.{ "core", "iter", "Zip" }, &.{ receiver, other });
+    }
+
+    return null;
+}
+fn knownIteratorChainType(ctx: *Ctx, chain: exprs.IteratorChainExpr) ?types.Type {
+    if (chain.terminal == .sum) return iteratorChainElementType(ctx, chain);
+    if (chain.terminal == .collect_vec) {
+        const element = iteratorChainElementType(ctx, chain) orelse return null;
+        return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{element});
+    }
+    if (chain.terminal != .iterator) return null;
+    var current = getKnownType(ctx, chain.source) orelse return null;
+    for (chain.adapters) |adapter| {
+        current = switch (adapter) {
+            .map => |map| closureValueReturnType(ctx, map.closure) orelse return null,
+            .filter => current,
+            .flat_map => |closure| blk: {
+                const returned = closureValueReturnType(ctx, closure) orelse return null;
+                break :blk makeExternalNominalType(
+                    ctx,
+                    &.{ "core", "iter", "FlatMap" },
+                    &.{ current, returned },
+                ) orelse return null;
+            },
+            .enumerate => makeExternalNominalType(
+                ctx,
+                &.{ "core", "iter", "Enumerate" },
+                &.{current},
+            ) orelse return null,
+            .zip => |zip| blk: {
+                const other = getKnownType(ctx, zip.other) orelse return null;
+                break :blk makeExternalNominalType(
+                    ctx,
+                    &.{ "core", "iter", "Zip" },
+                    &.{ current, other },
+                ) orelse return null;
+            },
+            .range_rev => makeExternalNominalType(
+                ctx,
+                &.{ "core", "iter", "Rev" },
+                &.{current},
+            ) orelse return null,
+            .other => return null,
+        };
+    }
+    return current;
+}
+
+fn makeOptionLike(ctx: *Ctx, carrier: types.Type, payload: types.Type) ?types.Type {
+    return switch (carrier) {
+        .external_nominal => |external| if (external.path.len == 3 and
+            (std.mem.eql(u8, external.path[0], "core") or
+                std.mem.eql(u8, external.path[0], "std")) and
+            std.mem.eql(u8, external.path[1], "option") and
+            std.mem.eql(u8, external.path[2], "Option"))
+            makeExternalNominalType(ctx, external.path, &.{payload})
+        else
+            makeOptionType(ctx, payload),
+        else => makeOptionType(ctx, payload),
+    };
+}
+
+fn makeResultLike(
+    ctx: *Ctx,
+    carrier: types.Type,
+    ok: types.Type,
+    err: types.Type,
+) ?types.Type {
+    return switch (carrier) {
+        .external_nominal => |external| makeExternalNominalType(ctx, external.path, &.{ ok, err }),
+        .result => blk: {
+            const result = ctx.alloc.create(types.Result) catch break :blk null;
+            result.* = .{ .ok = ok, .err = err, .is_error_unionable = carrier.result.is_error_unionable };
+            break :blk .{ .result = result };
+        },
+        else => null,
+    };
+}
+
+fn closureReturnType(ctx: *Ctx, closure_node: exprs.NodeId) ?types.Type {
+    if (closure_node >= ctx.b.exprs.len) return null;
+    const closure = switch (ctx.b.exprs[closure_node].kind) {
+        .closure => |value| value,
+        else => return null,
+    };
+    const tail = closure.body.tail orelse return .{ .prim = .unit };
+    return getKnownType(ctx, tail);
+}
+
+fn methodClosureInputType(method_name: []const u8, receiver_ty: types.Type) ?types.Type {
+    if (std.mem.eql(u8, method_name, "map") or
+        std.mem.eql(u8, method_name, "and_then"))
+    {
+        if (optionPayloadType(receiver_ty)) |payload| return payload;
+        if (std.mem.eql(u8, method_name, "map")) {
+            return resultPayloadType(receiver_ty, false);
+        }
+        return null;
+    }
+    if (std.mem.eql(u8, method_name, "map_err")) {
+        return resultPayloadType(receiver_ty, true);
+    }
+    return null;
+}
+
+fn isCharType(ty: types.Type) bool {
+    var base = ty;
+    while (true) {
+        switch (base) {
+            .reference => |r| base = r.pointee,
+            .raw_ptr => |r| base = r.pointee,
+            .boxed => |b| base = b.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    base = concrete.*;
+                } else {
+                    break;
+                }
+            },
+            else => break,
+        }
+    }
+    return switch (base) {
+        .prim => |p| p == .char,
+        else => false,
+    };
+}
+
+fn canonicalReceiverName(ctx: *const Ctx, ty: types.Type) ?[]const u8 {
+    var base = ty;
+    while (true) {
+        switch (base) {
+            .reference => |reference| base = reference.pointee,
+            .raw_ptr => |raw_ptr| base = raw_ptr.pointee,
+            .boxed => |boxed| base = boxed.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    base = concrete.*;
+                } else {
+                    break;
+                }
+            },
+            else => break,
+        }
+    }
+
+    const cg = ctx.cg orelse return null;
+    return switch (base) {
+        .path => |path| blk: {
+            if (path.segments.len == 0) break :blk null;
+            const terminal = path.segments[path.segments.len - 1];
+            const def = terminal.id orelse break :blk null;
+            const entity = cg.symbol_table.get(def) orelse break :blk null;
+            break :blk entity.name;
+        },
+        .generic_inst => |instance| blk: {
+            const entity = cg.symbol_table.get(instance.decl) orelse break :blk null;
+            break :blk entity.name;
+        },
+        .external_nominal => |external| if (external.path.len > 0)
+            external.path[external.path.len - 1]
+        else
+            null,
+        else => null,
+    };
+}
+
+fn callDefinition(call: exprs.Call) exprs.DefId {
+    return switch (call.call_kind) {
+        .free => |id| id,
+        .associated => |id| id,
+        .constructor => |id| id,
+    };
+}
+
+fn nominalTypeForDefinition(ctx: *Ctx, node: exprs.NodeId, def: exprs.DefId) ?types.Type {
+    if (node < ctx.b.exprs.len) {
+        if (ctx.b.exprs[node].ty) |type_id| {
+            if (type_id < ctx.b.types.len) {
+                switch (ctx.b.types[type_id]) {
+                    .generic_inst => |instance| if (instance.decl == def) return ctx.b.types[type_id],
+                    else => {},
+                }
+            }
+        }
+    }
+    for (ctx.b.types) |candidate| {
+        switch (candidate) {
+            .path => |path| {
+                if (path.segments.len == 0) continue;
+                if (path.segments[path.segments.len - 1].id == def) return candidate;
+            },
+            .generic_inst => |instance| if (instance.decl == def) return candidate,
+            else => {},
+        }
+    }
+    if (ctx.cg) |cg| {
+        if (cg.symbol_table.get(def)) |entity| {
+            if (entity.name.len == 0) return null;
+            // Nested type storage shares the materialized IR's allocator lifetime.
+            const segments = ctx.alloc.alloc(types.PathSegment, 1) catch {
+                ctx.g.derived_error = true;
+                return null;
+            };
+            segments[0] = .{ .name = entity.name, .id = def };
+            return .{ .path = .{ .segments = segments } };
+        }
+    }
+    return null;
+}
+
+fn callGenericArguments(ctx: *Ctx, node: exprs.NodeId, def: exprs.DefId) ?[]const types.Type {
+    if (explicitArgsForNode(ctx, node)) |args| {
+        if (if (node < ctx.b.exprs.len) ctx.b.exprs[node].ty else null) |type_id| {
+            if (type_id < ctx.b.types.len) switch (ctx.b.types[type_id]) {
+                .generic_inst => |instance| if (instance.decl == def) return args.params,
+                else => {},
+            };
+        }
+    }
+    if (ctx.g.instantiations.get(node)) |inst| {
+        if (inst.generic_id == def) return inst.args.params;
+    }
+    return null;
+}
+
+fn traitAssociatedReturnType(ctx: *Ctx, def: exprs.DefId) ?types.Type {
+    const cg = ctx.cg orelse return null;
+    const entity = cg.symbol_table.get(def) orelse return null;
+    const parent = entity.parent orelse return null;
+    if (parent >= ctx.b.bodies.len) return null;
+    const trait_body = switch (ctx.b.bodies[parent]) {
+        .trait_ => |body| body,
+        else => return null,
+    };
+    for (trait_body.methods) |method| {
+        if (std.mem.eql(u8, method.name, entity.name)) return method.ret;
+    }
+    return null;
+}
+
+fn knownCallReturnType(ctx: *Ctx, node: exprs.NodeId, call: exprs.Call) ?types.Type {
+    const def = callDefinition(call);
+    if (ctx.def_map.get(def)) |initializer| {
+        if (initializer < ctx.b.exprs.len and ctx.b.exprs[initializer].kind == .closure) {
+            return closureValueReturnType(ctx, ctx.b.exprs[initializer].kind.closure);
+        }
+    }
+    var return_type: ?types.Type = null;
+    if (def < ctx.b.bodies.len) {
+        return_type = switch (ctx.b.bodies[def]) {
+            .fn_ => |function| function.ret,
+            else => null,
+        };
+    }
+    if (return_type == null) return_type = traitAssociatedReturnType(ctx, def);
+
+    if (return_type) |declared| {
+        if (!isConcreteDerivedType(declared)) {
+            if (ctx.expected_types.get(node)) |expected| return expected;
+        }
+        if (callGenericArguments(ctx, node, def)) |generic_args| {
+            const names = getGenericParamNames(ctx, def) catch null;
+            if (names) |param_names| {
+                defer ctx.alloc.free(param_names);
+                const substituted = substType(
+                    ctx.alloc,
+                    declared,
+                    param_names,
+                    generic_args,
+                ) catch null;
+                if (substituted) |resolved| {
+                    if (isConcreteDerivedType(resolved)) return resolved;
+                }
+            }
+        }
+        if (isConcreteDerivedType(declared)) return declared;
+    }
+
+    if (call.call_kind == .constructor and
+        def < ctx.b.bodies.len and ctx.b.bodies[def] == .struct_)
+    {
+        return nominalTypeForDefinition(ctx, node, def);
+    }
+    return ctx.expected_types.get(node);
+}
+
+fn knownDeclaredMethodReturnType(
+    ctx: *Ctx,
+    receiver_ty: types.Type,
+    method_name: []const u8,
+) ?types.Type {
+    const cg = ctx.cg orelse return null;
+    const type_name = canonicalReceiverName(ctx, receiver_ty) orelse return null;
+    const method_def = resolve_methods.lookupInherentMethod(cg, type_name, method_name) orelse
+        return null;
+    if (method_def >= ctx.b.bodies.len) return null;
+
+    var return_type = switch (ctx.b.bodies[method_def]) {
+        .fn_ => |fn_body| fn_body.ret,
+        else => return null,
+    };
+
+    var base = receiver_ty;
+    while (true) {
+        switch (base) {
+            .reference => |reference| base = reference.pointee,
+            .raw_ptr => |raw_ptr| base = raw_ptr.pointee,
+            .boxed => |boxed| base = boxed.*,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    base = concrete.*;
+                } else {
+                    break;
+                }
+            },
+            else => break,
+        }
+    }
+    const generic_args = switch (base) {
+        .generic_inst => |instance| instance.args.params,
+        else => &[_]types.Type{},
+    };
+    if (generic_args.len == 0) return return_type;
+
+    const method_entity = cg.symbol_table.get(method_def) orelse return return_type;
+    const impl_id = method_entity.parent orelse return return_type;
+    if (impl_id >= ctx.b.bodies.len) return return_type;
+    const impl_body = switch (ctx.b.bodies[impl_id]) {
+        .impl_ => |body| body,
+        else => return return_type,
+    };
+    const generics = impl_body.generics orelse return return_type;
+    var type_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer type_names.deinit(ctx.alloc);
+    for (generics.params) |param| {
+        switch (param) {
+            .type_ => |type_param| type_names.append(ctx.alloc, type_param.name) catch return return_type,
+            else => {},
+        }
+    }
+    return_type = substType(ctx.alloc, return_type, type_names.items, generic_args) catch return_type;
+    return return_type;
+}
+/// Infer the standard I/O result only when the receiver's generic parameter
+/// carries the corresponding non-optional trait bound.
+fn knownIoMethodResultType(
+    ctx: *Ctx,
+    receiver_ty: types.Type,
+    method_name: []const u8,
+) ?types.Type {
+    const trait_path: []const []const u8 = if (std.mem.eql(u8, method_name, "read_exact"))
+        &.{ "std", "io", "Read" }
+    else if (std.mem.eql(u8, method_name, "write_all"))
+        &.{ "std", "io", "Write" }
+    else
+        return null;
+    const cg = ctx.cg orelse return null;
+    const owner = ctx.current_fn orelse return null;
+    if (bodies.genericBound(cg, ctx.b, owner, receiver_ty, trait_path) == null) return null;
+    const result = ctx.alloc.create(types.Result) catch {
+        ctx.g.derived_error = true;
+        return null;
+    };
+    result.* = .{
+        .ok = .{ .prim = .unit },
+        .err = .{ .external_nominal = .{
+            .path = &.{ "std", "io", "Error" },
+        } },
+        .is_error_unionable = false,
+    };
+    return .{ .result = result };
+}
+
+fn genericMethodOwner(ctx: *const Ctx, method_def: exprs.DefId) ?exprs.DefId {
+    if (ctx.cg) |cg| {
+        if (cg.symbol_table.get(method_def)) |entity| {
+            if (entity.kind == .method_ref) return entity.parent;
+        }
+    }
+    return ctx.current_fn;
+}
+
+fn knownBoundMethodReturnType(
+    ctx: *Ctx,
+    receiver_ty: types.Type,
+    method_name: []const u8,
+    method_def: exprs.DefId,
+) ?types.Type {
+    const cg = ctx.cg orelse return null;
+    const owner = genericMethodOwner(ctx, method_def) orelse return null;
+    const trait_path: []const []const u8 =
+        if (std.mem.eql(u8, method_name, "as_ref"))
+            &.{ "core", "convert", "AsRef" }
+        else if (std.mem.eql(u8, method_name, "as_mut"))
+            &.{ "core", "convert", "AsMut" }
+        else if (std.mem.eql(u8, method_name, "borrow"))
+            &.{ "core", "borrow", "Borrow" }
+        else if (std.mem.eql(u8, method_name, "borrow_mut"))
+            &.{ "core", "borrow", "BorrowMut" }
+        else if (std.mem.eql(u8, method_name, "into"))
+            &.{ "core", "convert", "Into" }
+        else if (std.mem.eql(u8, method_name, "try_into"))
+            &.{ "core", "convert", "TryInto" }
+        else
+            return null;
+    const bound = bodies.genericBound(cg, ctx.b, owner, receiver_ty, trait_path) orelse return null;
+    if (bound.args.len == 0) return null;
+    const target = substType(ctx.alloc, bound.args[0], &.{"Self"}, &.{receiver_ty}) catch {
+        ctx.g.derived_error = true;
+        return null;
+    };
+    if (std.mem.eql(u8, method_name, "into")) return target;
+    if (std.mem.eql(u8, method_name, "as_ref") or
+        std.mem.eql(u8, method_name, "as_mut") or
+        std.mem.eql(u8, method_name, "borrow") or
+        std.mem.eql(u8, method_name, "borrow_mut"))
+    {
+        return makeReferenceType(
+            ctx,
+            target,
+            std.mem.eql(u8, method_name, "as_mut") or
+                std.mem.eql(u8, method_name, "borrow_mut"),
+        );
+    }
+    var error_type: types.Type = undefined;
+    var has_error_binding = false;
+    for (bound.associated_types) |binding| {
+        if (std.mem.eql(u8, binding.name, "Error")) {
+            error_type = binding.ty;
+            has_error_binding = true;
+            break;
+        }
+    }
+    if (!has_error_binding) {
+        error_type = makeExternalNominalType(
+            ctx,
+            &.{ "core", "convert", "TryInto", "Error" },
+            &.{ receiver_ty, target },
+        ) orelse return null;
+    }
+    const result = ctx.alloc.create(types.Result) catch {
+        ctx.g.derived_error = true;
+        return null;
+    };
+    result.* = .{ .ok = target, .err = error_type, .is_error_unionable = false };
+    return .{ .result = result };
+}
+
+fn knownCoreFunctionType(ctx: *Ctx, function: exprs.CoreFunctionValue) ?types.Type {
+    switch (function.function) {
+        .default_value, .convert_from => {
+            if (function.generic_args.len != 1) return null;
+            return function.generic_args[0];
+        },
+        .mem_transmute => {
+            if (function.generic_args.len != 2) return null;
+            const params = ctx.alloc.dupe(types.Type, &.{function.generic_args[0]}) catch {
+                ctx.g.derived_error = true;
+                return null;
+            };
+            const fn_ptr = ctx.alloc.create(types.FnPtr) catch {
+                ctx.alloc.free(params);
+                ctx.g.derived_error = true;
+                return null;
+            };
+            fn_ptr.* = .{
+                .params = params,
+                .ret = function.generic_args[1],
+            };
+            return .{ .fn_ptr = fn_ptr };
+        },
+        else => return null,
+    }
+}
+
+fn coreTypeArgument(ctx: *Ctx, call: exprs.CoreCall) ?types.Type {
+    if (call.generic_args.len == 1) return call.generic_args[0];
+    if (call.generic_args.len != 0 or call.args.len == 0) return null;
+    const first = getKnownType(ctx, call.args[0]);
+    if (call.function == .cmp_min or call.function == .cmp_max) {
+        if (first) |known| return known;
+        return if (call.args.len == 2) getKnownType(ctx, call.args[1]) else null;
+    }
+    const known = first orelse return null;
+    return switch (call.function) {
+        .mem_size_of_val => switch (known) {
+            .reference => |reference| reference.pointee,
+            .slice, .array => known,
+            else => null,
+        },
+        .ptr_copy_nonoverlapping,
+        .ptr_write_bytes,
+        .ptr_read_unaligned,
+        .slice_from_raw_parts,
+        .slice_from_raw_parts_mut,
+        => switch (known) {
+            .raw_ptr => |pointer| pointer.pointee,
+            .reference => |reference| reference.pointee,
+            else => null,
+        },
+        else => null,
+    };
+}
+fn knownCoreCallType(ctx: *Ctx, call: exprs.CoreCall) ?types.Type {
+    switch (call.function) {
+        .default_value, .convert_from => {
+            if (call.generic_args.len != 1) return null;
+            return call.generic_args[0];
+        },
+        .mem_size_of => return .{ .prim = .usize },
+        .mem_transmute => {
+            if (call.generic_args.len != 2) return null;
+            return call.generic_args[1];
+        },
+        .mem_size_of_val => return .{ .prim = .usize },
+        .ptr_copy_nonoverlapping, .ptr_write_bytes => return .{ .prim = .unit },
+        .ptr_read_unaligned, .cmp_min, .cmp_max => return coreTypeArgument(ctx, call),
+        .slice_from_raw_parts, .slice_from_raw_parts_mut => {
+            const element = coreTypeArgument(ctx, call) orelse return null;
+            const slice = ctx.alloc.create(types.Slice) catch {
+                ctx.g.derived_error = true;
+                return null;
+            };
+            slice.* = .{
+                .const_ = call.function == .slice_from_raw_parts,
+                .elem = element,
+            };
+            return .{ .slice = slice };
+        },
+        .str_from_utf8, .str_from_utf8_unchecked => {
+            const string: types.Type = .{ .slice = &.{
+                .const_ = true,
+                .elem = .{ .prim = .u8 },
+            } };
+            if (call.function == .str_from_utf8_unchecked) return string;
+            const result = ctx.alloc.create(types.Result) catch {
+                ctx.g.derived_error = true;
+                return null;
+            };
+            result.* = .{
+                .ok = string,
+                .err = .{ .external_nominal = .{ .path = &.{ "core", "str", "Utf8Error" } } },
+                .is_error_unionable = false,
+            };
+            return .{ .result = result };
+        },
+        .string_from_utf8 => {
+            const string = makeExternalNominalType(
+                ctx,
+                &.{ "alloc", "string", "String" },
+                &.{},
+            ) orelse return null;
+            const error_type = makeExternalNominalType(
+                ctx,
+                &.{ "alloc", "string", "FromUtf8Error" },
+                &.{},
+            ) orelse return null;
+            return makeExternalNominalType(
+                ctx,
+                &.{ "core", "result", "Result" },
+                &.{ string, error_type },
+            );
+        },
+        .string_from_utf8_lossy => {
+            return makeExternalNominalType(
+                ctx,
+                &.{ "alloc", "borrow", "Cow" },
+                &.{types.str_type},
+            );
+        },
+        .string_from_utf8_unchecked => {
+            return makeExternalNominalType(ctx, &.{ "alloc", "string", "String" }, &.{});
+        },
+    }
+}
+
+fn walkTypeExpressions(ctx: *Ctx, ty: types.Type, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
+    if (ctx.type_expression_depth >= types.traversal_depth_max) return;
+    ctx.type_expression_depth += 1;
+    defer ctx.type_expression_depth -= 1;
+    switch (ty) {
+        .array => |array| {
+            if (array.len == .expression) try walkExpr(ctx, array.len.expression, fn_body);
+            try walkTypeExpressions(ctx, array.elem, fn_body);
+        },
+        .reference => |reference| try walkTypeExpressions(ctx, reference.pointee, fn_body),
+        .raw_ptr => |pointer| try walkTypeExpressions(ctx, pointer.pointee, fn_body),
+        .slice => |slice| try walkTypeExpressions(ctx, slice.elem, fn_body),
+        .tuple => |elements| for (elements) |element| try walkTypeExpressions(ctx, element, fn_body),
+        .external_nominal => |external| for (external.args) |argument| try walkTypeExpressions(ctx, argument, fn_body),
+        .generic_inst => |instance| for (instance.args.params) |argument| try walkTypeExpressions(ctx, argument, fn_body),
+        .fn_ptr => |function| {
+            for (function.params) |parameter| try walkTypeExpressions(ctx, parameter, fn_body);
+            try walkTypeExpressions(ctx, function.ret, fn_body);
+        },
+        .option => |value| try walkTypeExpressions(ctx, value.*, fn_body),
+        .result => |result| {
+            try walkTypeExpressions(ctx, result.ok, fn_body);
+            try walkTypeExpressions(ctx, result.err, fn_body);
+        },
+        .boxed => |value| try walkTypeExpressions(ctx, value.*, fn_body),
+        .@"opaque" => |value| if (value.concrete) |concrete| try walkTypeExpressions(ctx, concrete.*, fn_body),
+        .path => |path| {
+            if (path.segments.len == 0) return;
+            const def = path.segments[path.segments.len - 1].id orelse return;
+            if (def >= ctx.b.bodies.len) return;
+            switch (ctx.b.bodies[def]) {
+                .const_ => |constant| try walkExpr(ctx, constant.init, fn_body),
+                else => {},
+            }
+        },
+        .prim, .dyn_trait, .unsupported => {},
+    }
+}
+
+fn walkCoreCall(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
+    const call = &@constCast(ctx.b.exprs)[node].kind.core_call;
+    for (call.generic_args) |argument| try walkTypeExpressions(ctx, argument, fn_body);
+    for (call.args) |arg| try walkExpr(ctx, arg, fn_body);
+    if (call.generic_args.len == 0) {
+        if (coreTypeArgument(ctx, call.*)) |argument| {
+            call.generic_args = try ctx.alloc.dupe(types.Type, &.{argument});
+        }
+    }
+    if (getKnownType(ctx, node)) |result| try pinKnownType(ctx, node, result);
+    switch (call.function) {
+        .cmp_min, .cmp_max => if (coreTypeArgument(ctx, call.*)) |argument| {
+            for (call.args) |arg| try constrainExpectedType(ctx, arg, argument);
+        },
+        .ptr_copy_nonoverlapping, .ptr_write_bytes => {
+            if (call.args.len != 3) return;
+            try constrainExpectedType(ctx, call.args[2], .{ .prim = .usize });
+            if (call.function == .ptr_write_bytes) {
+                try constrainExpectedType(ctx, call.args[1], .{ .prim = .u8 });
+            }
+        },
+        .slice_from_raw_parts, .slice_from_raw_parts_mut => {
+            if (call.args.len != 2) return;
+            try constrainExpectedType(ctx, call.args[1], .{ .prim = .usize });
+        },
+        else => {},
+    }
+}
 /// Derive a concrete Type for an argument expression node where possible.
 fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
     if (node >= ctx.b.exprs.len) return null;
+    if (ctx.known_nodes.get(node)) |known| return known;
     const e = ctx.b.exprs[node];
     switch (e.kind) {
+        .core_call => |call| {
+            const known = knownCoreCallType(ctx, call) orelse return null;
+            ctx.known_nodes.put(ctx.alloc, node, known) catch {
+                ctx.g.derived_error = true;
+                return null;
+            };
+            return known;
+        },
+        .core_function => |function| {
+            const known = knownCoreFunctionType(ctx, function) orelse return null;
+            ctx.known_nodes.put(ctx.alloc, node, known) catch {
+                ctx.g.derived_error = true;
+                return null;
+            };
+            return known;
+        },
+        .external_variant => |variant| {
+            if (variant.owner.args.len == 0) return null;
+            const known: types.Type = .{ .external_nominal = variant.owner };
+            ctx.known_nodes.put(ctx.alloc, node, known) catch {
+                ctx.g.derived_error = true;
+                return null;
+            };
+            return known;
+        },
         .path => |p| {
-            if (ctx.local_types.get(p.def)) |local_ty| return local_ty;
+            if (ctx.local_types.get(p.def)) |local_ty| {
+                if (local_ty == .path and local_ty.path.segments.len == 1 and
+                    std.mem.eql(u8, local_ty.path.segments[0].name, "Self"))
+                {
+                    if (currentImplSelfType(ctx)) |self_ty| return self_ty;
+                }
+                return local_ty;
+            }
+            if (p.def < ctx.b.bodies.len) {
+                switch (ctx.b.bodies[p.def]) {
+                    .const_ => |constant| return constant.ty,
+                    else => {},
+                }
+            }
             if (p.generic_args.len > 0) {
                 return .{ .generic_inst = .{
                     .decl = p.def,
@@ -1140,13 +3095,272 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                 }
             }
         },
+        .call => |call| {
+            if (knownCallReturnType(ctx, node, call)) |known| {
+                ctx.known_nodes.put(ctx.alloc, node, known) catch {
+                    ctx.g.derived_error = true;
+                    return null;
+                };
+                return known;
+            }
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
+            }
+        },
+        .if_else => |if_expr| {
+            const then_ty = if (if_expr.then_.tail) |tail|
+                getKnownType(ctx, tail)
+            else
+                null;
+            const else_ty: ?types.Type = switch (if_expr.@"else") {
+                .block => |block| if (block.tail) |tail| getKnownType(ctx, tail) else null,
+                .chain => |chain| getKnownType(ctx, chain),
+                .none => null,
+            };
+            if (then_ty) |known_then| {
+                if (else_ty) |known_else| {
+                    if (typeEqual(known_then, known_else)) return known_then;
+                    return null;
+                }
+                return known_then;
+            }
+            return else_ty;
+        },
         .method_call => |method| {
             if (getMethodName(ctx, method.method)) |method_name| {
+                if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                    if (knownAllocMethodType(ctx, receiver_ty, method_name)) |alloc_result| {
+                        return alloc_result;
+                    }
+                    if (knownBoundMethodReturnType(
+                        ctx,
+                        receiver_ty,
+                        method_name,
+                        method.method,
+                    )) |bound_result| {
+                        return bound_result;
+                    }
+                    if (knownIoMethodResultType(ctx, receiver_ty, method_name)) |io_result| {
+                        ctx.known_nodes.put(ctx.alloc, node, io_result) catch {
+                            ctx.g.derived_error = true;
+                            return null;
+                        };
+                        return io_result;
+                    }
+                    if (knownIteratorMethodType(ctx, method_name, receiver_ty, method.args)) |iterator_ty| {
+                        return iterator_ty;
+                    }
+                    if (std.mem.eql(u8, method_name, "ok")) {
+                        if (resultPayloadType(receiver_ty, false)) |ok_payload| {
+                            return makeOptionLike(ctx, receiver_ty, ok_payload);
+                        }
+                    }
+                    if (std.mem.eql(u8, method_name, "take")) {
+                        if (optionPayloadType(receiver_ty)) |payload| {
+                            return makeOptionLike(ctx, receiver_ty, payload);
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, method_name, "as_ref")) {
+                    if (getKnownType(ctx, method.receiver)) |option_ty| {
+                        if (optionPayloadType(option_ty)) |payload| {
+                            if (makeReferenceType(ctx, payload, false)) |reference| {
+                                return makeOptionLike(ctx, option_ty, reference);
+                            }
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, method_name, "read_exact") or
+                    std.mem.eql(u8, method_name, "write_all"))
+                {
+                    return null;
+                }
+                if (std.mem.eql(u8, method_name, "map") or
+                    std.mem.eql(u8, method_name, "map_err") or
+                    std.mem.eql(u8, method_name, "and_then"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (std.mem.eql(u8, method_name, "map") or
+                            std.mem.eql(u8, method_name, "and_then"))
+                        {
+                            if (optionPayloadType(receiver_ty)) |_| {
+                                if (method.args.len > 0) {
+                                    if (closureReturnType(ctx, method.args[0])) |mapped| {
+                                        if (std.mem.eql(u8, method_name, "and_then")) return mapped;
+                                        return makeOptionLike(ctx, receiver_ty, mapped);
+                                    }
+                                }
+                            } else if (std.mem.eql(u8, method_name, "map")) {
+                                if (resultPayloadType(receiver_ty, false)) |ok| {
+                                    if (method.args.len > 0) {
+                                        if (closureReturnType(ctx, method.args[0])) |mapped| {
+                                            if (resultPayloadType(receiver_ty, true)) |err| {
+                                                return makeResultLike(ctx, receiver_ty, mapped, err);
+                                            }
+                                        }
+                                    }
+                                    _ = ok;
+                                }
+                            }
+                        } else if (resultPayloadType(receiver_ty, true)) |_| {
+                            if (method.args.len > 0) {
+                                if (closureReturnType(ctx, method.args[0])) |mapped| {
+                                    if (resultPayloadType(receiver_ty, false)) |ok| {
+                                        return makeResultLike(ctx, receiver_ty, ok, mapped);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "clone") or
+                    std.mem.eql(u8, method_name, "by_ref"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| return receiver_ty;
+                } else if (std.mem.eql(u8, method_name, "wrapping_add") or
+                    std.mem.eql(u8, method_name, "wrapping_sub") or
+                    std.mem.eql(u8, method_name, "wrapping_mul") or
+                    std.mem.eql(u8, method_name, "saturating_add") or
+                    std.mem.eql(u8, method_name, "saturating_sub") or
+                    std.mem.eql(u8, method_name, "saturating_mul") or
+                    std.mem.eql(u8, method_name, "bitxor") or
+                    std.mem.eql(u8, method_name, "bitor") or
+                    std.mem.eql(u8, method_name, "bitand"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (scalarOperandType(receiver_ty)) |scalar| return scalar;
+                    }
+                }
                 if (std.mem.eql(u8, method_name, "len")) {
                     if (getKnownType(ctx, method.receiver)) |receiver_ty| {
-                        if (isLenReceiverType(receiver_ty)) {
+                        if (isLenReceiverType(receiver_ty) or
+                            iteratorItemType(ctx, receiver_ty) != null)
+                        {
                             return .{ .prim = .usize };
                         }
+                    }
+                } else if (std.mem.eql(u8, method_name, "count")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (iteratorItemType(ctx, receiver_ty) != null) {
+                            return .{ .prim = .usize };
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "size_hint")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (iteratorItemType(ctx, receiver_ty) != null) {
+                            const upper = makeOptionType(ctx, .{ .prim = .usize }) orelse return null;
+                            const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+                            tuple[0] = .{ .prim = .usize };
+                            tuple[1] = upper;
+                            return .{ .tuple = tuple };
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "split_at")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (sliceElementForMethod(receiver_ty)) |element| {
+                            if (makeSliceType(ctx, element, false)) |slice_type| {
+                                const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+                                tuple[0] = slice_type;
+                                tuple[1] = slice_type;
+                                return .{ .tuple = tuple };
+                            }
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "chunks_exact")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (sliceElementForMethod(receiver_ty)) |element| {
+                            return chunksExactType(ctx, element);
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "remainder")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (chunksExactElement(receiver_ty)) |element| {
+                            return makeSliceType(ctx, element, false);
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "as_slice") or
+                    std.mem.eql(u8, method_name, "as_mut_slice"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (sliceIteratorElementType(receiver_ty)) |element| {
+                            return makeSliceType(
+                                ctx,
+                                element,
+                                std.mem.eql(u8, method_name, "as_mut_slice"),
+                            );
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "as_ptr") or
+                    std.mem.eql(u8, method_name, "as_mut_ptr"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (sliceElementForMethod(receiver_ty)) |element| {
+                            return makeRawPtrType(
+                                ctx,
+                                element,
+                                std.mem.eql(u8, method_name, "as_mut_ptr"),
+                            );
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "get_unchecked") or
+                    std.mem.eql(u8, method_name, "get_unchecked_mut"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (sliceElementForMethod(receiver_ty)) |element| {
+                            return makeReferenceType(
+                                ctx,
+                                element,
+                                std.mem.eql(u8, method_name, "get_unchecked_mut"),
+                            );
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "read") or
+                    std.mem.eql(u8, method_name, "read_unaligned") or
+                    std.mem.eql(u8, method_name, "read_volatile"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (dereferencedType(receiver_ty)) |pointee| return pointee;
+                    }
+                } else if (std.mem.eql(u8, method_name, "to_le") or
+                    std.mem.eql(u8, method_name, "to_be") or
+                    std.mem.eql(u8, method_name, "from_le") or
+                    std.mem.eql(u8, method_name, "from_be") or
+                    std.mem.eql(u8, method_name, "swap_bytes"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |recv_ty| {
+                        if (isIntegerType(recv_ty)) return recv_ty;
+                    }
+                } else if (std.mem.eql(u8, method_name, "offset") or
+                    std.mem.eql(u8, method_name, "wrapping_offset") or
+                    std.mem.eql(u8, method_name, "add") or
+                    std.mem.eql(u8, method_name, "sub") or
+                    std.mem.eql(u8, method_name, "wrapping_add") or
+                    std.mem.eql(u8, method_name, "wrapping_sub"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |recv_ty| {
+                        if (recv_ty == .raw_ptr) return recv_ty;
+                    }
+                } else if (std.mem.eql(u8, method_name, "next") or
+                    std.mem.eql(u8, method_name, "next_back") or
+                    std.mem.eql(u8, method_name, "nth") or
+                    std.mem.eql(u8, method_name, "nth_back") or
+                    std.mem.eql(u8, method_name, "last"))
+                {
+                    if (getKnownType(ctx, method.receiver)) |recv_ty| {
+                        if (iteratorItemType(ctx, recv_ty)) |item| {
+                            return makeOptionLike(ctx, recv_ty, item) orelse
+                                makeOptionType(ctx, item);
+                        }
+                    }
+                } else if (std.mem.eql(u8, method_name, "to_digit")) {
+                    if (getKnownType(ctx, method.receiver)) |recv_ty| {
+                        if (isCharType(recv_ty)) {
+                            return makeOptionType(ctx, .{ .prim = .u32 });
+                        }
+                    }
+                }
+                if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                    if (knownDeclaredMethodReturnType(ctx, receiver_ty, method_name)) |return_type| {
+                        return return_type;
                     }
                 }
             }
@@ -1154,8 +3368,10 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                 if (tid < ctx.b.types.len) return ctx.b.types[tid];
             }
         },
-        .binary => |binary| {
-            if (knownBinaryType(ctx, binary)) |known| return known;
+        .field => |field| {
+            if (getKnownType(ctx, field.base)) |base_ty| {
+                if (fieldTypeForBase(ctx, base_ty, field.field)) |field_ty| return field_ty;
+            }
             if (e.ty) |tid| {
                 if (tid < ctx.b.types.len) return ctx.b.types[tid];
             }
@@ -1169,35 +3385,84 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
             }
             return null;
         },
-        .unary => |unary| return switch (unary.op) {
-            .deref => if (getKnownType(ctx, unary.operand)) |operand_ty| switch (operand_ty) {
-                .reference => |reference| reference.pointee,
-                .raw_ptr => |raw_ptr| raw_ptr.pointee,
-                else => null,
-            } else null,
-            .negate, .bit_not => getKnownType(ctx, unary.operand),
-            .logical_not => @as(?types.Type, .{ .prim = .bool }),
-            .ref => null,
+        .binary => |binary| {
+            if (knownBinaryType(ctx, binary)) |known| return known;
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
+            }
         },
-        .cast => |cast| return if (cast.target < ctx.b.types.len) ctx.b.types[cast.target] else null,
+        .unary => |unary| return switch (unary.op) {
+            .deref => if (getKnownType(ctx, unary.operand)) |operand_ty|
+                dereferencedValueType(ctx, operand_ty)
+            else
+                null,
+            .negate, .bit_not => getKnownType(ctx, unary.operand),
+            .logical_not => if (getKnownType(ctx, unary.operand)) |op_ty| blk: {
+                if (isIntegerType(op_ty)) break :blk op_ty;
+                break :blk types.Type{ .prim = .bool };
+            } else types.Type{ .prim = .bool },
+            .ref => |mode| if (getKnownType(ctx, unary.operand)) |pointee|
+                makeReferenceType(ctx, pointee, mode == .mutable)
+            else
+                null,
+        },
+        .iterator_chain => |chain| return knownIteratorChainType(ctx, chain),
+        .range => |range| {
+            const start_ty = getKnownType(ctx, range.start);
+            const end_ty = if (range.end) |end| getKnownType(ctx, end) else null;
+            const element_ty: types.Type = if (start_ty) |start| blk: {
+                if (end_ty) |end| {
+                    if (!typeEqual(start, end)) return null;
+                }
+                break :blk start;
+            } else end_ty orelse return null;
+            return makeExternalNominalType(
+                ctx,
+                &.{ "core", "ops", "Range" },
+                &.{element_ty},
+            );
+        },
+        .cast => |cast| {
+            if (cast.target >= ctx.b.types.len) return null;
+            const target = ctx.b.types[cast.target];
+            if (isInferPlaceholderType(target)) return null;
+            return target;
+        },
         .literal => |lit| switch (lit) {
             .int => |il| {
                 if (il.ty_suffix) |s| {
                     if (intSuffixPrim(s)) |p| return .{ .prim = p };
                 }
-                return .{ .prim = .i32 };
+                return null;
             },
             .float => |fl| return .{ .prim = floatSuffixPrim(fl.text) },
             .boolean => return .{ .prim = .bool },
             .character => return .{ .prim = .char },
             .string => {},
-            .byte_array => return .{
-                .array = &.{
-                    .len = .{ .literal = @intCast(lit.byte_array.items.len) },
+            .byte_array => |bytes| {
+                const array = ctx.alloc.create(types.Array) catch {
+                    ctx.g.derived_error = true;
+                    return null;
+                };
+                array.* = .{
+                    .len = .{ .literal = @intCast(bytes.items.len) },
                     .elem = .{ .prim = .u8 },
-                },
+                };
+                const known: types.Type = .{ .array = array };
+                ctx.known_nodes.put(ctx.alloc, node, known) catch {
+                    ctx.g.derived_error = true;
+                    return null;
+                };
+                return known;
             },
         },
+        .try_ => |t| {
+            if (getKnownType(ctx, t.inner)) |inner_ty| {
+                return unwrapTryType(inner_ty);
+            }
+            return null;
+        },
+        .break_, .continue_ => return .{ .prim = .never },
         else => {
             if (e.ty) |tid| {
                 if (tid < ctx.b.types.len) return ctx.b.types[tid];
@@ -1206,9 +3471,12 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
     }
     return null;
 }
+
 fn knownBinaryType(ctx: *Ctx, binary: exprs.BinaryExpr) ?types.Type {
-    const lhs = getKnownType(ctx, binary.lhs) orelse return null;
-    const rhs = getKnownType(ctx, binary.rhs) orelse return null;
+    const lhs = getKnownType(ctx, binary.lhs);
+    const rhs = getKnownType(ctx, binary.rhs);
+    const lhs_scalar = if (lhs) |value| scalarOperandType(value) else null;
+    const rhs_scalar = if (rhs) |value| scalarOperandType(value) else null;
     return switch (binary.op) {
         .add,
         .sub,
@@ -1218,11 +3486,31 @@ fn knownBinaryType(ctx: *Ctx, binary: exprs.BinaryExpr) ?types.Type {
         .bit_and,
         .bit_or,
         .bit_xor,
-        => if (isScalarCastType(lhs) and isScalarCastType(rhs) and typeEqual(lhs, rhs)) lhs else null,
-        .shl, .shr => if (isScalarCastType(lhs) and isIntegerType(rhs)) lhs else null,
+        => blk: {
+            if (lhs_scalar) |left| {
+                if (rhs_scalar) |right| {
+                    if (typeEqual(left, right)) break :blk left;
+                    break :blk null;
+                }
+                break :blk left;
+            }
+            if (rhs_scalar) |right| break :blk right;
+            break :blk null;
+        },
+        .shl, .shr => blk: {
+            if (lhs_scalar) |left| {
+                if (rhs_scalar) |right| {
+                    if (isIntegerType(right)) break :blk left;
+                    break :blk null;
+                }
+                break :blk left;
+            }
+            break :blk null;
+        },
         else => null,
     };
 }
+
 fn isScalarCastType(ty: types.Type) bool {
     return switch (ty) {
         .prim => |primitive| switch (primitive) {
@@ -1275,8 +3563,130 @@ fn unsignedPrimitiveWidth(primitive: types.Prim) ?u16 {
         .u64 => 64,
         .u128 => 128,
         .usize => 64,
+        .char => 32,
         else => null,
     };
+}
+
+fn isIntegerPrimitive(primitive: types.Prim) bool {
+    return switch (primitive) {
+        .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => true,
+        .f32, .f64, .bool, .char, .unit, .never => false,
+    };
+}
+
+fn isBoolType(ty: types.Type) bool {
+    return switch (ty) {
+        .prim => |primitive| primitive == .bool,
+        else => false,
+    };
+}
+
+fn isThinRawPointer(raw_ptr: *const types.RawPtr) bool {
+    return switch (raw_ptr.pointee) {
+        .slice => false,
+        else => true,
+    };
+}
+
+fn isInferPlaceholderType(ty: types.Type) bool {
+    return switch (ty) {
+        .external_nominal => |external| external.path.len > 0 and
+            std.mem.eql(u8, external.path[external.path.len - 1], "_"),
+        .path => |path| path.segments.len > 0 and
+            std.mem.eql(u8, path.segments[path.segments.len - 1].name, "_"),
+        else => false,
+    };
+}
+fn resolveWildcardRawPointerTarget(
+    ctx: *Ctx,
+    source: types.Type,
+    target: types.Type,
+) ?types.Type {
+    const target_raw = switch (target) {
+        .raw_ptr => |raw| raw,
+        else => return null,
+    };
+    if (!isInferPlaceholderType(target_raw.pointee)) return null;
+    const source_pointee: types.Type = switch (source) {
+        .reference => |reference| reference.pointee,
+        .raw_ptr => |raw| raw.pointee,
+        else => return null,
+    };
+    const resolved = ctx.alloc.create(types.RawPtr) catch {
+        ctx.g.derived_error = true;
+        return null;
+    };
+    resolved.* = .{
+        .mut = target_raw.mut,
+        .pointee = source_pointee,
+    };
+    return .{ .raw_ptr = resolved };
+}
+
+fn resolveWildcardRawPointerSource(
+    ctx: *Ctx,
+    source: types.Type,
+    target: types.Type,
+) ?types.Type {
+    const source_raw = switch (source) {
+        .raw_ptr => |raw| raw,
+        else => return null,
+    };
+    const target_raw = switch (target) {
+        .raw_ptr => |raw| raw,
+        else => return null,
+    };
+    if (!isInferPlaceholderType(source_raw.pointee) or
+        isInferPlaceholderType(target_raw.pointee))
+    {
+        return null;
+    }
+    const resolved = ctx.alloc.create(types.RawPtr) catch {
+        ctx.g.derived_error = true;
+        return null;
+    };
+    resolved.* = .{
+        .mut = source_raw.mut,
+        .pointee = target_raw.pointee,
+    };
+    return .{ .raw_ptr = resolved };
+}
+
+fn referenceToRawPointerCompatible(source_ref: *const types.Ref, target_raw: *const types.RawPtr) bool {
+    if (target_raw.mut and !source_ref.mut) return false;
+    if (typeEqual(source_ref.pointee, target_raw.pointee)) return true;
+    switch (source_ref.pointee) {
+        .array => |arr| {
+            if (typeEqual(arr.elem, target_raw.pointee)) return true;
+            if (target_raw.pointee == .slice and typeEqual(arr.elem, target_raw.pointee.slice.elem)) {
+                return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+fn referenceArrayToSliceCompatible(
+    source_ref: *const types.Ref,
+    target_slice: *const types.Slice,
+) bool {
+    if (!target_slice.const_ and !source_ref.mut) return false;
+    const source_array = switch (source_ref.pointee) {
+        .array => |array| array,
+        else => return false,
+    };
+    return typeEqual(source_array.elem, target_slice.elem);
+}
+
+fn rawPointeesCastCompatible(
+    source_ptr: *const types.RawPtr,
+    target_ptr: *const types.RawPtr,
+) bool {
+    const source_is_fat = (source_ptr.pointee == .slice);
+    const target_is_fat = (target_ptr.pointee == .slice);
+    if (target_is_fat and !source_is_fat) return false;
+    return true;
 }
 
 fn isValidPrimitiveFrom(source: types.Type, target: types.Type) bool {
@@ -1292,59 +3702,98 @@ fn isValidPrimitiveFrom(source: types.Type, target: types.Type) bool {
     const target_width = unsignedPrimitiveWidth(target_primitive) orelse return false;
     return source_width <= target_width;
 }
-
 fn isValidCast(
     kind: exprs.ConversionKind,
     source_type: types.Type,
     target: types.Type,
     operand_type: ?types.Type,
 ) bool {
-    const known_source = operand_type orelse return false;
-    if (!typeEqual(source_type, known_source)) return false;
+    const effective_source = if (operand_type) |known| blk: {
+        if (std.meta.activeTag(source_type) != .unsupported and
+            !isInferPlaceholderType(source_type) and
+            !typeEqual(source_type, known))
+        {
+            return false;
+        }
+        break :blk known;
+    } else blk: {
+        if (std.meta.activeTag(source_type) == .unsupported) return false;
+        break :blk source_type;
+    };
     return switch (kind) {
         .as_ => switch (target) {
-            .prim => isScalarCastType(source_type) and isScalarCastType(target),
-            .raw_ptr => |target_pointer| switch (source_type) {
-                .raw_ptr => |source_pointer| pointerPointeesCompatible(
-                    source_pointer.pointee,
-                    target_pointer.pointee,
-                ),
+            .prim => |target_prim| blk: {
+                if (isScalarCastType(target)) {
+                    if (isScalarCastType(effective_source) or isBoolType(effective_source)) break :blk true;
+                    if (effective_source == .raw_ptr and isThinRawPointer(effective_source.raw_ptr) and isIntegerPrimitive(target_prim)) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .raw_ptr => |target_ptr| switch (effective_source) {
+                .raw_ptr => |source_ptr| rawPointeesCastCompatible(source_ptr, target_ptr),
+                .reference => |source_ref| referenceToRawPointerCompatible(source_ref, target_ptr),
+                .prim => |source_prim| isIntegerPrimitive(source_prim) and isThinRawPointer(target_ptr),
                 else => false,
             },
+            .slice => |target_slice| switch (effective_source) {
+                .reference => |source_ref| referenceArrayToSliceCompatible(source_ref, target_slice),
+                else => false,
+            },
+            .reference => false,
             else => false,
         },
-        .primitive_from => isValidPrimitiveFrom(source_type, target),
+        .primitive_from => isValidPrimitiveFrom(effective_source, target),
     };
+}
+
+fn loopCarrierElementType(ctx: *Ctx, iterable: exprs.NodeId) ?types.Type {
+    if (iterable >= ctx.b.exprs.len) return null;
+    const iterable_ty = getKnownType(ctx, iterable) orelse return null;
+    if (chunksExactElement(iterable_ty)) |element| {
+        return makeSliceType(ctx, element, false);
+    }
+    switch (iterable_ty) {
+        .external_nominal => return iteratorItemType(ctx, iterable_ty),
+        .reference => |reference| switch (reference.pointee) {
+            .array => |array| return makeReferenceType(ctx, array.elem, reference.mut),
+            else => {},
+        },
+        .slice => |slice| return makeReferenceType(ctx, slice.elem, !slice.const_),
+        .array => |array| return array.elem,
+        else => {},
+    }
+    return iteratorItemType(ctx, iterable_ty);
 }
 
 fn loopElementType(ctx: *Ctx, iterable: exprs.NodeId, iter_kind: exprs.IterKind) ?types.Type {
     if (iterable >= ctx.b.exprs.len) return null;
-    const iterable_source = switch (ctx.b.exprs[iterable].kind) {
-        .method_call => |method| method.receiver,
-        else => iterable,
-    };
-    const iterable_ty = getKnownType(ctx, iterable_source) orelse return null;
-    const element = switch (iterable_ty) {
-        .slice => |slice| slice.elem,
-        .array => |array| array.elem,
-        .reference => |reference| switch (reference.pointee) {
-            .slice => |slice| slice.elem,
-            .array => |array| array.elem,
-            else => return null,
-        },
-        else => return null,
-    };
-    if (switch (iterable_ty) {
-        .array => true,
-        else => false,
-    }) return element;
     switch (iter_kind) {
-        .slice => {
-            const reference = ctx.alloc.create(types.Ref) catch return null;
-            reference.* = .{ .mut = false, .pointee = element };
-            return .{ .reference = reference };
+        .range => {
+            const range_ty = getKnownType(ctx, iterable) orelse return null;
+            return iteratorItemType(ctx, range_ty) orelse range_ty;
         },
-        else => return element,
+        .slice => return loopCarrierElementType(ctx, iterable),
+        .enumerate => {
+            const element = loopCarrierElementType(ctx, iterable) orelse return null;
+            const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+            tuple[0] = .{ .prim = .usize };
+            tuple[1] = element;
+            return .{ .tuple = tuple };
+        },
+        .multi => |carriers| {
+            if (carriers.len == 0) return null;
+            const tuple = ctx.alloc.alloc(types.Type, carriers.len) catch return null;
+            for (carriers, 0..) |carrier, index| {
+                tuple[index] = loopCarrierElementType(ctx, carrier) orelse return null;
+            }
+            return .{ .tuple = tuple };
+        },
+        .adapter => |chain| {
+            const iterator_ty = knownIteratorChainType(ctx, chain) orelse return null;
+            return iteratorItemType(ctx, iterator_ty);
+        },
     }
 }
 
@@ -1361,6 +3810,20 @@ fn explicitArgsForNode(ctx: *Ctx, node: exprs.NodeId) ?types.GenericArgs {
         else => null,
     };
 }
+/// Recover the declared return type for a call in an enclosing block tail.
+/// This supplies the expected type for abstract associated calls whose
+/// declaration still contains `Self` or an associated projection.
+fn expectedTypeForTail(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    fn_body: exprs.NodeId,
+) ?types.Type {
+    if (fn_body >= ctx.b.exprs.len) return null;
+    const body_expr = ctx.b.exprs[fn_body];
+    if (body_expr.kind != .block or body_expr.kind.block.tail != node) return null;
+    return findFnReturnType(ctx.b, fn_body);
+}
+
 /// Recover the expected generic result for a tail call. This is deliberately
 /// limited to the enclosing block tail: using a function's return type for an
 /// arbitrary nested call would bind unrelated call sites to the same record.
@@ -1370,14 +3833,9 @@ fn expectedGenericTypeForTail(
     fn_body: exprs.NodeId,
     def: exprs.DefId,
 ) ?types.Type {
-    if (fn_body >= ctx.b.exprs.len) return null;
-    const body_expr = ctx.b.exprs[fn_body];
-    if (body_expr.kind != .block) return null;
-    if (body_expr.kind.block.tail != node) return null;
-    const type_id = findFnRetTypeId(ctx.b, fn_body) orelse return null;
-    if (type_id >= ctx.b.types.len) return null;
-    return switch (ctx.b.types[type_id]) {
-        .generic_inst => |inst| if (inst.decl == def) ctx.b.types[type_id] else null,
+    const expected = expectedTypeForTail(ctx, node, fn_body) orelse return null;
+    return switch (expected) {
+        .generic_inst => |inst| if (inst.decl == def) expected else null,
         else => null,
     };
 }
@@ -1400,7 +3858,91 @@ fn explicitArgsMatchSignature(
             defer ctx.alloc.free(names);
             return names.len == args.len;
         },
-        .enum_, .trait_ => return false,
+        .enum_, .trait_, .impl_ => return false,
+    }
+}
+
+fn constrainExpectedType(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    expected: types.Type,
+) std.mem.Allocator.Error!void {
+    if (node >= ctx.b.exprs.len) return;
+    if (getKnownType(ctx, node)) |known| {
+        if (known == .prim and known.prim == .never) return;
+    }
+    var target = expected;
+    if (ctx.b.exprs[node].kind == .array and expected == .slice) {
+        const literal = ctx.b.exprs[node].kind.array;
+        const array = try ctx.alloc.create(types.Array);
+        array.* = .{
+            .elem = expected.slice.elem,
+            .len = .{ .literal = literal.repeat orelse @intCast(literal.elements.len) },
+        };
+        target = .{ .array = array };
+    }
+    try pinKnownType(ctx, node, target);
+    switch (ctx.b.exprs[node].kind) {
+        .array => |array| switch (target) {
+            .array => |array_type| {
+                for (array.elements) |element| {
+                    try constrainExpectedType(ctx, element, array_type.elem);
+                }
+            },
+            .tuple => |elements| {
+                if (array.repeat != null or array.elements.len != elements.len) return;
+                for (array.elements, elements) |element, element_type| {
+                    try constrainExpectedType(ctx, element, element_type);
+                }
+            },
+            else => {},
+        },
+        .unary => |unary| {
+            if (unary.op == .ref) {
+                switch (target) {
+                    .reference => |reference| try constrainExpectedType(ctx, unary.operand, reference.pointee),
+                    .slice => {
+                        if (unary.operand < ctx.b.exprs.len and ctx.b.exprs[unary.operand].kind == .array) {
+                            try constrainExpectedType(ctx, unary.operand, target);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn constrainConcreteArguments(
+    ctx: *Ctx,
+    definition: bodies.BodyKind,
+    args: []const exprs.NodeId,
+    fields: []const exprs.FieldInit,
+) std.mem.Allocator.Error!void {
+    switch (definition) {
+        .fn_ => |function| {
+            if (args.len != function.params.len) return;
+            for (args, function.params) |arg, param| {
+                try constrainExpectedType(ctx, arg, param.ty);
+            }
+        },
+        .struct_ => |structure| {
+            if (fields.len != 0) {
+                for (fields) |field| {
+                    for (structure.fields) |declared| {
+                        if (!std.mem.eql(u8, field.field, declared.name)) continue;
+                        try constrainExpectedType(ctx, field.value, declared.ty);
+                        break;
+                    }
+                }
+            } else if (args.len == structure.fields.len) {
+                for (args, structure.fields) |arg, field| {
+                    try constrainExpectedType(ctx, arg, field.ty);
+                }
+            }
+        },
+        else => {},
     }
 }
 
@@ -1408,15 +3950,15 @@ fn explicitArgsMatchSignature(
 /// callee is generic, unify argument types with instantiated parameter types.
 fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
     for (c.args) |a| try walkExpr(ctx, a, fn_body);
-    const def = switch (c.call_kind) {
-        .free => |d| d,
-        .associated => |d| d,
-        .constructor => |d| d,
-    };
-    const expected_type = expectedGenericTypeForTail(ctx, node, fn_body, def);
+    const def = callDefinition(c);
+    const expected_type = expectedTypeForTail(ctx, node, fn_body);
+    if (expected_type) |expected| {
+        try ctx.expected_types.put(ctx.alloc, node, expected);
+    }
+    const expected_generic = expectedGenericTypeForTail(ctx, node, fn_body, def);
     const explicit: ?types.GenericArgs = if (explicitArgsForNode(ctx, node)) |args|
         args
-    else if (expected_type) |expected|
+    else if (expected_generic) |expected|
         switch (expected) {
             .generic_inst => |inst| inst.args,
             else => null,
@@ -1431,11 +3973,7 @@ fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeI
         c.args,
         &.{},
     );
-    if (expected_type) |expected| {
-        if (findTypeIndex(ctx.b, expected)) |type_id| {
-            try addPin(ctx, node, type_id);
-        }
-    }
+    if (expected_type) |expected| try pinKnownType(ctx, node, expected);
 }
 
 /// Walk a struct literal: recurse into field values and, when the struct is
@@ -1473,19 +4011,16 @@ fn instantiateGenericDef(
     var ret_ty: ?types.Type = null;
     switch (ctx.b.bodies[def]) {
         .fn_ => |fb| ret_ty = fb.ret,
-        .struct_ => {},
+        .struct_ => if (caller_names.len == 0) {
+            ret_ty = nominalTypeForDefinition(ctx, node, def);
+        },
         else => return,
     }
 
-    // Non-generic functions still carry useful concrete nominal return types.
-    // Preserve those types on call nodes so a following local binding can
-    // propagate the constructor result through its resolved EntityId.
+    // Preserve concrete constructor types through local bindings.
     if (caller_names.len == 0) {
-        if (ret_ty) |return_ty| {
-            if (findTypeIndex(ctx.b, return_ty)) |return_type_id| {
-                try addPin(ctx, node, return_type_id);
-            }
-        }
+        try constrainConcreteArguments(ctx, ctx.b.bodies[def], args, fields);
+        if (ret_ty) |return_ty| try pinKnownType(ctx, node, return_ty);
         return;
     }
     const param_names = caller_names;
@@ -1613,6 +4148,39 @@ fn substitutedTypeId(
     return found;
 }
 
+fn freeSubstitutedBounds(
+    alloc: std.mem.Allocator,
+    original: []const types.Bound,
+    substituted: []const types.Bound,
+    param_names: []const []const u8,
+    args: []const types.Type,
+) void {
+    if (original.len != substituted.len) return;
+    for (original, substituted) |original_bound, substituted_bound| {
+        if (original_bound.args.len == substituted_bound.args.len) {
+            for (original_bound.args, substituted_bound.args) |original_arg, substituted_arg| {
+                freeSubstitutedType(alloc, original_arg, substituted_arg, param_names, args);
+            }
+        }
+        if (substituted_bound.args.len > 0) alloc.free(substituted_bound.args);
+        if (original_bound.associated_types.len == substituted_bound.associated_types.len) {
+            for (original_bound.associated_types, substituted_bound.associated_types) |
+                original_binding,
+                substituted_binding,
+            | {
+                freeSubstitutedType(
+                    alloc,
+                    original_binding.ty,
+                    substituted_binding.ty,
+                    param_names,
+                    args,
+                );
+            }
+        }
+        if (substituted_bound.associated_types.len > 0) alloc.free(substituted_bound.associated_types);
+    }
+}
+
 /// Release only nodes allocated by `substType`; source and argument types stay borrowed.
 fn freeSubstitutedType(
     alloc: std.mem.Allocator,
@@ -1703,8 +4271,35 @@ fn freeSubstitutedType(
                 .boxed => |value| value,
                 else => return,
             };
-            freeSubstitutedType(alloc, boxed.*, sub_boxed.*, param_names, args);
             if (!typeEqual(sub_boxed.*, boxed.*)) alloc.destroy(sub_boxed);
+        },
+        .@"opaque" => |opaque_type| {
+            const sub_opaque = switch (substituted) {
+                .@"opaque" => |value| value,
+                else => return,
+            };
+            freeSubstitutedBounds(alloc, opaque_type.bounds, sub_opaque.bounds, param_names, args);
+            if (sub_opaque.bounds.len > 0) alloc.free(sub_opaque.bounds);
+            if (sub_opaque.concrete) |sub_concrete| {
+                if (opaque_type.concrete) |original_concrete| {
+                    freeSubstitutedType(
+                        alloc,
+                        original_concrete.*,
+                        sub_concrete.*,
+                        param_names,
+                        args,
+                    );
+                }
+                alloc.destroy(sub_concrete);
+            }
+        },
+        .dyn_trait => |bounds| {
+            const sub_bounds = switch (substituted) {
+                .dyn_trait => |value| value,
+                else => return,
+            };
+            freeSubstitutedBounds(alloc, bounds, sub_bounds, param_names, args);
+            if (sub_bounds.len > 0) alloc.free(sub_bounds);
         },
         .fn_ptr => |fn_ptr| {
             const sub_fn_ptr = switch (substituted) {
@@ -1768,6 +4363,20 @@ fn freeSubstitutedType(
         .prim, .path, .unsupported => {},
     }
 }
+fn pinKnownType(ctx: *Ctx, node: exprs.NodeId, known: types.Type) std.mem.Allocator.Error!void {
+    const entry = try ctx.known_nodes.getOrPut(ctx.alloc, node);
+    if (!entry.found_existing or
+        (entry.value_ptr.* == .generic_inst and known != .generic_inst) or
+        (isInferPlaceholderType(entry.value_ptr.*) and !isInferPlaceholderType(known)))
+    {
+        entry.value_ptr.* = known;
+    }
+    if (findTypeIndex(ctx.b, known)) |type_id| {
+        try addPin(ctx, node, type_id);
+    } else {
+        ctx.recordDerivedType(node, known);
+    }
+}
 
 fn typeContainsParam(t: types.Type, param_names: []const []const u8) bool {
     switch (t) {
@@ -1811,7 +4420,26 @@ fn typeContainsParam(t: types.Type, param_names: []const []const u8) bool {
             return typeContainsParam(res.ok, param_names) or typeContainsParam(res.err, param_names);
         },
         .boxed => |bx| return typeContainsParam(bx.*, param_names),
+        .@"opaque" => |opaque_type| {
+            if (opaque_type.concrete) |concrete| {
+                if (typeContainsParam(concrete.*, param_names)) return true;
+            }
+            return boundsContainParam(opaque_type.bounds, param_names);
+        },
+        .dyn_trait => |bounds| return boundsContainParam(bounds, param_names),
     }
+}
+
+fn boundsContainParam(bounds: []const types.Bound, param_names: []const []const u8) bool {
+    for (bounds) |bound| {
+        for (bound.args) |arg| {
+            if (typeContainsParam(arg, param_names)) return true;
+        }
+        for (bound.associated_types) |binding| {
+            if (typeContainsParam(binding.ty, param_names)) return true;
+        }
+    }
+    return false;
 }
 
 /// Walk a path expression: link occurrences with the same def_id.
@@ -1825,6 +4453,8 @@ fn walkPath(ctx: *Ctx, node: exprs.NodeId, p: exprs.PathExpr) std.mem.Allocator.
     if (ctx.local_types.get(p.def)) |local_ty| {
         if (findTypeIndex(ctx.b, local_ty)) |type_id| {
             try addPin(ctx, node, type_id);
+        } else {
+            ctx.recordDerivedType(node, local_ty);
         }
     }
 }
@@ -1843,6 +4473,28 @@ fn parseAssertionCondition(reason: []const u8, expr_count: usize) ?exprs.NodeId 
     const condition = std.fmt.parseInt(exprs.NodeId, suffix, 10) catch return null;
     if (condition >= expr_count) return null;
     return condition;
+}
+
+fn constrainCompoundAssignment(
+    ctx: *Ctx,
+    target: exprs.NodeId,
+    value: exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    const target_ty = getKnownType(ctx, target);
+    const value_ty = getKnownType(ctx, value);
+    if (target_ty) |known_target| {
+        if (value_ty) |known_value| {
+            if (typeEqual(known_target, known_value)) {
+                try addEq(ctx, target, value);
+            }
+        } else {
+            try constrainExpectedType(ctx, value, known_target);
+        }
+    } else if (value_ty) |known_value| {
+        try constrainExpectedType(ctx, target, known_value);
+    } else {
+        try addEq(ctx, target, value);
+    }
 }
 
 /// Recursively walk an expression node in the graph.
@@ -1864,11 +4516,14 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
                 });
             }
         },
-        .block => |blk| try walkBlock(ctx, blk, fn_body, node),
+        .block => {
+            try walkBlock(ctx, e.kind.block, fn_body, node);
+            if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
+        },
         .if_else => |ie| try walkIf(ctx, node, ie, fn_body),
         .if_let => |il| {
             try walkExpr(ctx, il.scrutinee, fn_body);
-            try bindPattern(ctx, il.pattern, null, null);
+            try bindPattern(ctx, il.pattern, null, getKnownType(ctx, il.scrutinee));
             try walkBlock(ctx, il.then_, fn_body, null);
             switch (il.@"else") {
                 .none => {},
@@ -1877,30 +4532,49 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             }
         },
         .match => |m| try walkMatch(ctx, node, m, fn_body),
-        .loop_ => |l| try walkBlock(ctx, l.body, fn_body, null),
+        .loop_ => |l| {
+            const previous_loop = ctx.loop_result;
+            ctx.loop_result = node;
+            defer ctx.loop_result = previous_loop;
+            try walkBlock(ctx, l.body, fn_body, null);
+        },
         .while_ => |w| {
-            if (w.capture) |capture| try bindPattern(ctx, capture, null, null);
-            if (ctx.boolId()) |bid| try addPin(ctx, w.cond, bid);
+            if (w.capture == null) try pinKnownType(ctx, w.cond, .{ .prim = .bool });
             try walkExpr(ctx, w.cond, fn_body);
+            if (w.capture) |capture| {
+                try bindPattern(ctx, capture, null, getKnownType(ctx, w.cond));
+            }
             try walkBlock(ctx, w.body, fn_body, null);
         },
         .for_ => |f| {
             try walkExpr(ctx, f.iterable, fn_body);
+            switch (f.iter_kind) {
+                .range, .slice, .enumerate => {},
+                .multi => |ids| for (ids) |id| {
+                    if (id != f.iterable) try walkExpr(ctx, id, fn_body);
+                },
+                .adapter => |chain| try walkIteratorChain(ctx, chain, fn_body),
+            }
             const element_ty = loopElementType(ctx, f.iterable, f.iter_kind);
             try bindPattern(ctx, f.pattern, null, element_ty);
             try walkBlock(ctx, f.body, fn_body, null);
-            switch (f.iter_kind) {
-                .range, .slice, .enumerate => {},
-                .multi => |ids| for (ids) |id| try walkExpr(ctx, id, fn_body),
-                .adapter => |chain| try walkIteratorChain(ctx, chain, fn_body),
-            }
         },
         .break_ => |br| {
-            if (br.value) |v| try walkExpr(ctx, v, fn_body);
+            if (br.value) |v| {
+                try walkExpr(ctx, v, fn_body);
+                if (ctx.loop_result) |loop| try addEq(ctx, loop, v);
+            }
+            try pinKnownType(ctx, node, .{ .prim = .never });
         },
-        .continue_ => {},
+        .continue_ => try pinKnownType(ctx, node, .{ .prim = .never }),
         .call => |c| {
             try handleCall(ctx, node, c, fn_body);
+            if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
+        },
+        .core_call => try walkCoreCall(ctx, node, fn_body),
+        .core_function => |function| {
+            for (function.generic_args) |argument| try walkTypeExpressions(ctx, argument, fn_body);
+            if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
         },
         .method_call => |m| {
             try walkMethodCall(ctx, node, m, fn_body);
@@ -1912,14 +4586,27 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             for (ev.tuple_fields) |f| try walkExpr(ctx, f, fn_body);
             for (ev.named_fields) |f| try walkExpr(ctx, f.value, fn_body);
         },
+        .external_variant => |variant| {
+            for (variant.tuple_fields) |field| try walkExpr(ctx, field, fn_body);
+            for (variant.named_fields) |field| try walkExpr(ctx, field.value, fn_body);
+            if (expectedTypeForTail(ctx, node, fn_body)) |expected| {
+                try constrainExpectedType(ctx, node, expected);
+            } else if (getKnownType(ctx, node)) |known| {
+                try pinKnownType(ctx, node, known);
+            }
+        },
         .field => |f| {
             try walkExpr(ctx, f.base, fn_body);
+            if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
         },
         .index => |ix| {
             try walkExpr(ctx, ix.base, fn_body);
             try walkExpr(ctx, ix.index, fn_body);
+            if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
         },
         .cast => |cast| {
+            if (cast.target < ctx.b.types.len) try walkTypeExpressions(ctx, ctx.b.types[cast.target], fn_body);
+            try walkTypeExpressions(ctx, cast.source_type, fn_body);
             try walkExpr(ctx, cast.operand, fn_body);
             const source = getKnownType(ctx, cast.operand);
             var source_type = cast.source_type;
@@ -1935,8 +4622,35 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             if (cast.target >= ctx.b.types.len) {
                 try ctx.g.invalid_casts.append(ctx.alloc, node);
             } else {
-                const target = ctx.b.types[cast.target];
-                if (!isValidCast(cast.kind, source_type, target, source)) {
+                var target = ctx.b.types[cast.target];
+                var source_for_target = source orelse source_type;
+                if (resolveWildcardRawPointerSource(ctx, source_type, target)) |resolved| {
+                    source_for_target = resolved;
+                    source_type = resolved;
+                    @constCast(ctx.b.exprs)[node].kind.cast.source_type = resolved;
+                } else if (resolveWildcardRawPointerSource(ctx, source_for_target, target)) |resolved| {
+                    source_for_target = resolved;
+                    source_type = resolved;
+                    @constCast(ctx.b.exprs)[node].kind.cast.source_type = resolved;
+                }
+                if (resolveWildcardRawPointerTarget(ctx, source_for_target, target)) |resolved| {
+                    @constCast(ctx.b.types)[cast.target] = resolved;
+                    target = resolved;
+                }
+                if (isInferPlaceholderType(target)) {
+                    // Infer an `as _` destination from surrounding constraints
+                    // during solving; never reuse the source type as a target.
+                } else if (source == null and
+                    std.meta.activeTag(source_type) == .unsupported)
+                {
+                    // Keep casts whose operand type depends on an earlier
+                    // projection/local binding for the solved-type pass below.
+                } else if (!isValidCast(
+                    cast.kind,
+                    source_type,
+                    target,
+                    if (source != null) source_for_target else null,
+                )) {
                     try ctx.g.invalid_casts.append(ctx.alloc, node);
                 } else {
                     try addPin(ctx, node, cast.target);
@@ -1949,28 +4663,50 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             switch (u.op) {
                 .negate, .bit_not => try addEq(ctx, u.operand, node),
                 .logical_not => {
-                    if (ctx.boolId()) |bid| {
-                        try addPin(ctx, u.operand, bid);
-                        try addPin(ctx, node, bid);
+                    if (getKnownType(ctx, u.operand)) |op_ty| {
+                        if (isIntegerType(op_ty)) {
+                            try addEq(ctx, u.operand, node);
+                        } else {
+                            try pinKnownType(ctx, u.operand, .{ .prim = .bool });
+                            try pinKnownType(ctx, node, .{ .prim = .bool });
+                        }
+                    } else {
+                        try addEq(ctx, u.operand, node);
                     }
                 },
                 .deref => {
                     if (getKnownType(ctx, node)) |known| {
                         if (findTypeIndex(ctx.b, known)) |type_id| {
                             try addPin(ctx, node, type_id);
+                        } else {
+                            ctx.recordDerivedType(node, known);
                         }
                     }
                 },
-                .ref => {},
+                .ref => if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known),
             }
         },
         .assign => |a| {
             try walkExpr(ctx, a.target, fn_body);
             try walkExpr(ctx, a.value, fn_body);
-            try addEq(ctx, a.target, a.value);
-            try addEq(ctx, node, a.target);
+            switch (a.op) {
+                .plain => try addEq(ctx, a.target, a.value),
+                .add, .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => try constrainCompoundAssignment(ctx, a.target, a.value),
+            }
+            try pinKnownType(ctx, node, .{ .prim = .unit });
         },
-        .try_ => |t| try walkExpr(ctx, t.inner, fn_body),
+        .try_ => |t| {
+            try walkExpr(ctx, t.inner, fn_body);
+            if (getKnownType(ctx, t.inner)) |inner_ty| {
+                if (unwrapTryType(inner_ty)) |unwrapped_ty| {
+                    if (findTypeIndex(ctx.b, unwrapped_ty)) |tid| {
+                        try addPin(ctx, node, tid);
+                    } else {
+                        ctx.recordDerivedType(node, unwrapped_ty);
+                    }
+                }
+            }
+        },
         .return_ => |r| {
             if (r.value) |v| {
                 try walkExpr(ctx, v, fn_body);
@@ -1979,7 +4715,20 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             }
         },
         .closure => |closure| try walkClosure(ctx, closure, fn_body),
-        .iterator_chain => |chain| try walkIteratorChain(ctx, chain, fn_body),
+        .iterator_chain => |chain| {
+            try walkIteratorChain(ctx, chain, fn_body);
+            if (getKnownType(ctx, node)) |known| {
+                if (findTypeIndex(ctx.b, known)) |type_id| {
+                    try addPin(ctx, node, type_id);
+                } else {
+                    ctx.recordDerivedType(node, known);
+                }
+            }
+        },
+        .format_write => |format| {
+            try walkExpr(ctx, format.writer, fn_body);
+            for (format.args) |arg| try walkExpr(ctx, arg, fn_body);
+        },
         .unsupported => |unsupported| {
             if (parseAssertionCondition(unsupported.reason, ctx.b.exprs.len)) |condition| {
                 if (condition != node) try walkExpr(ctx, condition, fn_body);
@@ -1989,10 +4738,15 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .vec_lit => |vec| for (vec.elements) |el| try walkExpr(ctx, el, fn_body),
         .range => |range| {
             try walkExpr(ctx, range.start, fn_body);
-            try walkExpr(ctx, range.end, fn_body);
-            try addEq(ctx, node, range.start);
-            try addEq(ctx, node, range.end);
+            if (range.end) |end| {
+                try walkExpr(ctx, end, fn_body);
+                try addEq(ctx, range.start, end);
+            }
+            if (getKnownType(ctx, node)) |known| {
+                try pinKnownType(ctx, node, known);
+            }
         },
+        .panic_ => try pinKnownType(ctx, node, .{ .prim = .never }),
     }
 }
 
@@ -2017,26 +4771,155 @@ fn getMethodName(ctx: *Ctx, def: exprs.DefId) ?[]const u8 {
 }
 
 fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
+    const m_name = getMethodName(ctx, m.method) orelse {
+        try walkExpr(ctx, m.receiver, fn_body);
+        for (m.args) |a| try walkExpr(ctx, a, fn_body);
+        return;
+    };
     try walkExpr(ctx, m.receiver, fn_body);
-    for (m.args) |a| try walkExpr(ctx, a, fn_body);
-
-    const m_name = getMethodName(ctx, m.method) orelse return;
-
-    // .len() -> usize when the receiver has a slice/array shape.
-    if (std.mem.eql(u8, m_name, "len")) {
-        if (getKnownType(ctx, m.receiver)) |receiver_ty| {
-            if (isLenReceiverType(receiver_ty)) {
-                if (primTypeId(ctx.b, .usize)) |uid| {
-                    try addPin(ctx, node, uid);
+    const receiver_ty = getKnownType(ctx, m.receiver);
+    for (m.args) |a| {
+        if (receiver_ty) |known_receiver| {
+            if (methodClosureInputType(m_name, known_receiver)) |input_ty| {
+                if (a < ctx.b.exprs.len and ctx.b.exprs[a].kind == .closure) {
+                    try walkClosureTyped(ctx, ctx.b.exprs[a].kind.closure, fn_body, input_ty);
+                    continue;
+                }
+            }
+        }
+        try walkExpr(ctx, a, fn_body);
+    }
+    if (std.mem.eql(u8, m_name, "ok")) {
+        if (receiver_ty) |known_receiver| {
+            if (resultPayloadType(known_receiver, false)) |ok_payload| {
+                if (makeOptionLike(ctx, known_receiver, ok_payload)) |option_result| {
+                    try pinKnownType(ctx, node, option_result);
                 }
             }
         }
         return;
     }
+    if (receiver_ty) |known_receiver| {
+        if (knownAllocMethodType(ctx, known_receiver, m_name)) |alloc_result| {
+            try pinKnownType(ctx, node, alloc_result);
+            return;
+        }
+        if (knownBoundMethodReturnType(ctx, known_receiver, m_name, m.method)) |bound_result| {
+            try pinKnownType(ctx, node, bound_result);
+            return;
+        }
+        if ((std.mem.eql(u8, m_name, "as_ref") or std.mem.eql(u8, m_name, "take")) and
+            optionPayloadType(known_receiver) != null)
+        {
+            if (getKnownType(ctx, node)) |option_result| {
+                try pinKnownType(ctx, node, option_result);
+                return;
+            }
+        }
+    }
+    if (receiver_ty) |known_receiver| {
+        if (knownIoMethodResultType(ctx, known_receiver, m_name)) |io_result| {
+            try pinKnownType(ctx, node, io_result);
+            return;
+        }
+    }
+    if (receiver_ty) |known_receiver| {
+        if (knownIteratorMethodType(ctx, m_name, known_receiver, m.args)) |iterator_ty| {
+            try pinKnownType(ctx, node, iterator_ty);
+            return;
+        }
+    }
 
-    // .clone() on copy/cloneable types -> infer return type as self type
-    if (std.mem.eql(u8, m_name, "clone")) {
+    // .len() -> usize for slices, arrays, and canonical iterators.
+    if (std.mem.eql(u8, m_name, "len")) {
+        if (receiver_ty) |known_receiver| {
+            if (isLenReceiverType(known_receiver) or
+                iteratorItemType(ctx, known_receiver) != null)
+            {
+                try pinKnownType(ctx, node, .{ .prim = .usize });
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, m_name, "map") or
+        std.mem.eql(u8, m_name, "map_err") or
+        std.mem.eql(u8, m_name, "and_then"))
+    {
+        if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
+        return;
+    }
+    if (std.mem.eql(u8, m_name, "as_ptr") or
+        std.mem.eql(u8, m_name, "as_mut_ptr") or
+        std.mem.eql(u8, m_name, "get_unchecked") or
+        std.mem.eql(u8, m_name, "get_unchecked_mut"))
+    {
+        if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "split_at") or
+        std.mem.eql(u8, m_name, "chunks_exact") or
+        std.mem.eql(u8, m_name, "remainder"))
+    {
+        if (getKnownType(ctx, node)) |known| {
+            if (findTypeIndex(ctx.b, known)) |type_id| {
+                try addPin(ctx, node, type_id);
+            } else {
+                ctx.recordDerivedType(node, known);
+            }
+        }
+        return;
+    }
+
+    // .clone()/.by_ref() -> infer return type as self type.
+    if (std.mem.eql(u8, m_name, "clone") or std.mem.eql(u8, m_name, "by_ref")) {
         try addEq(ctx, m.receiver, node);
+        return;
+    }
+    if (std.mem.eql(u8, m_name, "to_le") or
+        std.mem.eql(u8, m_name, "to_be") or
+        std.mem.eql(u8, m_name, "from_le") or
+        std.mem.eql(u8, m_name, "from_be") or
+        std.mem.eql(u8, m_name, "swap_bytes"))
+    {
+        try addEq(ctx, m.receiver, node);
+        return;
+    }
+
+    if (std.mem.eql(u8, m_name, "offset") or
+        std.mem.eql(u8, m_name, "wrapping_offset") or
+        std.mem.eql(u8, m_name, "add") or
+        std.mem.eql(u8, m_name, "sub") or
+        std.mem.eql(u8, m_name, "wrapping_add") or
+        std.mem.eql(u8, m_name, "wrapping_sub"))
+    {
+        if (getKnownType(ctx, m.receiver)) |recv_ty| {
+            if (recv_ty == .raw_ptr) {
+                try addEq(ctx, m.receiver, node);
+                return;
+            }
+        }
+    }
+
+    if (std.mem.eql(u8, m_name, "read") or
+        std.mem.eql(u8, m_name, "read_unaligned") or
+        std.mem.eql(u8, m_name, "read_volatile") or
+        std.mem.eql(u8, m_name, "next") or
+        std.mem.eql(u8, m_name, "next_back") or
+        std.mem.eql(u8, m_name, "nth") or
+        std.mem.eql(u8, m_name, "nth_back") or
+        std.mem.eql(u8, m_name, "last") or
+        std.mem.eql(u8, m_name, "count") or
+        std.mem.eql(u8, m_name, "size_hint") or
+        std.mem.eql(u8, m_name, "to_digit"))
+    {
+        if (getKnownType(ctx, node)) |known| {
+            if (findTypeIndex(ctx.b, known)) |type_id| {
+                try addPin(ctx, node, type_id);
+            } else {
+                ctx.recordDerivedType(node, known);
+            }
+        }
         return;
     }
 
@@ -2044,9 +4927,25 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
     if (std.mem.eql(u8, m_name, "as_ref") or
         std.mem.eql(u8, m_name, "as_bytes") or
         std.mem.eql(u8, m_name, "borrow") or
-        std.mem.eql(u8, m_name, "as_slice"))
+        std.mem.eql(u8, m_name, "as_slice") or
+        std.mem.eql(u8, m_name, "as_mut_slice"))
     {
         if (getKnownType(ctx, m.receiver)) |recv_ty| {
+            if (std.mem.eql(u8, m_name, "as_slice") or
+                std.mem.eql(u8, m_name, "as_mut_slice"))
+            {
+                if (sliceIteratorElementType(recv_ty)) |element| {
+                    if (makeSliceType(
+                        ctx,
+                        element,
+                        std.mem.eql(u8, m_name, "as_mut_slice"),
+                    )) |slice_type| {
+                        try pinKnownType(ctx, node, slice_type);
+                        return;
+                    }
+                }
+            }
+
             const elem_ty: ?types.Type = switch (recv_ty) {
                 .slice => |s| s.elem,
                 .array => |arr| arr.elem,
@@ -2130,6 +5029,11 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
         try addEq(ctx, m.receiver, node);
         return;
     }
+    if (receiver_ty) |known_receiver| {
+        if (knownDeclaredMethodReturnType(ctx, known_receiver, m_name)) |return_type| {
+            try pinKnownType(ctx, node, return_type);
+        }
+    }
 }
 
 /// Walk the lossless code model of every `.fn_` body in `b` and generate
@@ -2165,10 +5069,10 @@ pub fn genWithGraph(alloc: std.mem.Allocator, b: *const bodies.Bodies, cg: ?*con
                     }
                 }
             },
-            .none, .const_, .struct_, .enum_, .trait_, .type_alias => {},
+            .none, .const_, .struct_, .enum_, .trait_, .impl_, .type_alias => {},
         }
     }
-
+    if (g.derived_error) return error.OutOfMemory;
     return g;
 }
 
@@ -2189,11 +5093,21 @@ fn findRoot(parent: []exprs.NodeId, i: exprs.NodeId) exprs.NodeId {
     return root;
 }
 
+fn isNeverTypeId(type_list: []const types.Type, type_id: ?exprs.TypeId) bool {
+    const id = type_id orelse return false;
+    if (id >= type_list.len) return false;
+    return switch (type_list[id]) {
+        .prim => |primitive| primitive == .never,
+        else => false,
+    };
+}
+
 fn unionNodes(
     parent: []exprs.NodeId,
     rank: []u8,
     concrete: []?exprs.TypeId,
     classes: []Class,
+    type_list: []const types.Type,
     a: exprs.NodeId,
     b: exprs.NodeId,
 ) void {
@@ -2202,7 +5116,13 @@ fn unionNodes(
     const root_b = findRoot(parent, b);
     if (root_a == root_b) return;
 
-    const merged_concrete = concrete[root_a] orelse concrete[root_b];
+    // `never` is the bottom type. It participates in an equality edge as a
+    // diverging operand, but must not erase a reachable type from the other
+    // operand. Keep the per-node bottom marker for the result pass below.
+    const merged_concrete = if (isNeverTypeId(type_list, concrete[root_a]))
+        concrete[root_b] orelse concrete[root_a]
+    else
+        concrete[root_a] orelse concrete[root_b];
     const merged_class: Class = if (classes[root_a] != .none) classes[root_a] else classes[root_b];
 
     if (rank[root_a] < rank[root_b]) {
@@ -2221,19 +5141,116 @@ fn unionNodes(
     }
 }
 
-fn findFnRetTypeId(b: *const bodies.Bodies, body_node: exprs.NodeId) ?exprs.TypeId {
-    std.debug.assert(b.bodies.len >= 0);
+fn findFnReturnType(b: *const bodies.Bodies, body_node: exprs.NodeId) ?types.Type {
     for (b.bodies) |bk| {
         switch (bk) {
             .fn_ => |fb| {
                 if (fb.body == body_node) {
-                    return findTypeIndex(b, fb.ret);
+                    return fb.ret;
                 }
             },
             else => {},
         }
     }
     return null;
+}
+
+fn findFnRetTypeId(b: *const bodies.Bodies, body_node: exprs.NodeId) ?exprs.TypeId {
+    const result = findFnReturnType(b, body_node) orelse return null;
+    return findTypeIndex(b, result);
+}
+fn resolvedTypeAt(
+    b: *const bodies.Bodies,
+    result_types: []const ?exprs.TypeId,
+    node: exprs.NodeId,
+) ?types.Type {
+    if (node < result_types.len) {
+        if (result_types[node]) |type_id| {
+            if (type_id < b.types.len) return b.types[type_id];
+        }
+    }
+    if (node < b.exprs.len) {
+        if (b.exprs[node].ty) |type_id| {
+            if (type_id < b.types.len) return b.types[type_id];
+        }
+    }
+    return null;
+}
+
+fn corePointerPointee(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .raw_ptr => |pointer| pointer.pointee,
+        .reference => |reference| reference.pointee,
+        else => null,
+    };
+}
+
+/// Resolve an omitted core generic from solved operand/result types. This
+/// deliberately has no primitive fallback: an omitted argument is valid only
+/// when the surrounding constraints provide a real type.
+fn coreTypeArgumentFromSolved(
+    b: *const bodies.Bodies,
+    result_types: []const ?exprs.TypeId,
+    node: exprs.NodeId,
+    call: exprs.CoreCall,
+) ?types.Type {
+    if (call.generic_args.len != 0) return null;
+    const result_ty = resolvedTypeAt(b, result_types, node);
+    switch (call.function) {
+        .default_value, .convert_from => return result_ty,
+        .cmp_min, .cmp_max => {
+            if (result_ty) |known| return known;
+            if (call.args.len > 0) {
+                if (resolvedTypeAt(b, result_types, call.args[0])) |known| return known;
+            }
+            if (call.args.len > 1) return resolvedTypeAt(b, result_types, call.args[1]);
+            return null;
+        },
+        .mem_size_of_val => {
+            if (call.args.len == 0) return null;
+            const argument = resolvedTypeAt(b, result_types, call.args[0]) orelse return null;
+            return switch (argument) {
+                .reference => |reference| reference.pointee,
+                .slice, .array => argument,
+                else => null,
+            };
+        },
+        .ptr_copy_nonoverlapping, .ptr_write_bytes => {
+            if (call.args.len == 0) return null;
+            const argument = resolvedTypeAt(b, result_types, call.args[0]) orelse return null;
+            return corePointerPointee(argument);
+        },
+        .ptr_read_unaligned => {
+            if (result_ty) |known| return known;
+            if (call.args.len == 0) return null;
+            const argument = resolvedTypeAt(b, result_types, call.args[0]) orelse return null;
+            return corePointerPointee(argument);
+        },
+        .slice_from_raw_parts, .slice_from_raw_parts_mut => {
+            if (result_ty) |known| {
+                if (known == .slice) return known.slice.elem;
+            }
+            if (call.args.len == 0) return null;
+            const argument = resolvedTypeAt(b, result_types, call.args[0]) orelse return null;
+            return corePointerPointee(argument);
+        },
+        else => return null,
+    }
+}
+
+fn finalizeCoreCallTypeArguments(
+    alloc: std.mem.Allocator,
+    b: *const bodies.Bodies,
+    result_types: []const ?exprs.TypeId,
+) !void {
+    for (b.exprs, 0..) |expression, node| {
+        if (expression.kind != .core_call) continue;
+        const call = &@constCast(b.exprs)[node].kind.core_call;
+        if (call.generic_args.len != 0) continue;
+        if (coreTypeArgumentFromSolved(b, result_types, @intCast(node), call.*)) |argument| {
+            call.generic_args = try alloc.dupe(types.Type, &.{argument});
+        }
+    }
 }
 
 /// Run unification solver on pre-computed constraint Gen over `b`.
@@ -2260,6 +5277,8 @@ pub fn solveWithGen(
     defer alloc.free(rank);
     const concrete = try alloc.alloc(?exprs.TypeId, num_exprs);
     defer alloc.free(concrete);
+    const bottom = try alloc.alloc(bool, num_exprs);
+    defer alloc.free(bottom);
     const classes = try alloc.alloc(Class, num_exprs);
     defer alloc.free(classes);
 
@@ -2267,6 +5286,7 @@ pub fn solveWithGen(
         parent[i] = @intCast(i);
         rank[i] = 0;
         concrete[i] = b.exprs[i].ty;
+        bottom[i] = isNeverTypeId(b.types, concrete[i]);
         classes[i] = .none;
     }
 
@@ -2281,6 +5301,7 @@ pub fn solveWithGen(
     for (g.pins.items) |p| {
         if (p.node < num_exprs) {
             concrete[p.node] = p.ty;
+            if (isNeverTypeId(b.types, p.ty)) bottom[p.node] = true;
         }
     }
 
@@ -2288,7 +5309,15 @@ pub fn solveWithGen(
     for (g.edges.items) |e| {
         switch (e) {
             .eq => |eq_edge| {
-                unionNodes(parent, rank, concrete, classes, eq_edge.a, eq_edge.b);
+                unionNodes(
+                    parent,
+                    rank,
+                    concrete,
+                    classes,
+                    b.types,
+                    eq_edge.a,
+                    eq_edge.b,
+                );
             },
             .ret => {},
         }
@@ -2347,11 +5376,85 @@ pub fn solveWithGen(
     // Assemble Inferred result array.
     const result_types = try alloc.alloc(?exprs.TypeId, num_exprs);
     errdefer alloc.free(result_types);
+    const never_type_id = primTypeId(b, .never);
     for (0..num_exprs) |i| {
         const root = findRoot(parent, @intCast(i));
-        result_types[i] = concrete[root];
+        result_types[i] = if (bottom[i]) never_type_id orelse concrete[root] else concrete[root];
     }
 
+    // Core generic arguments may become knowable only after unification has
+    // applied a return-type or assignment constraint.
+    try finalizeCoreCallTypeArguments(alloc, b, result_types);
+
+    for (b.exprs, 0..) |expression, node| {
+        const cast = switch (expression.kind) {
+            .cast => |value| value,
+            else => continue,
+        };
+        if (cast.target >= b.types.len) {
+            return error.InvalidCast;
+        }
+        const target_is_placeholder = isInferPlaceholderType(b.types[cast.target]);
+        if (std.meta.activeTag(cast.source_type) != .unsupported and !target_is_placeholder) {
+            continue;
+        }
+
+        const source_type_id: ?exprs.TypeId = if (std.meta.activeTag(cast.source_type) == .unsupported)
+            if (cast.operand < result_types.len) result_types[cast.operand] else null
+        else
+            findTypeIndex(b, cast.source_type);
+        const resolved_source_id = source_type_id orelse blk: {
+            if (cast.operand < b.exprs.len) {
+                const operand_type = b.exprs[cast.operand].ty orelse return error.InvalidCast;
+                break :blk operand_type;
+            }
+            return error.InvalidCast;
+        };
+
+        const resolved_target_id: ?exprs.TypeId = if (!target_is_placeholder)
+            cast.target
+        else blk: {
+            const candidate = if (node < result_types.len)
+                result_types[node]
+            else
+                null;
+            if (candidate) |candidate_id| {
+                if (candidate_id < b.types.len and
+                    !isInferPlaceholderType(b.types[candidate_id]) and
+                    isConcreteDerivedType(b.types[candidate_id]))
+                {
+                    break :blk candidate_id;
+                }
+            }
+            if (node < b.exprs.len) {
+                if (b.exprs[node].ty) |candidate_id| {
+                    if (candidate_id < b.types.len and
+                        !isInferPlaceholderType(b.types[candidate_id]) and
+                        isConcreteDerivedType(b.types[candidate_id]))
+                    {
+                        break :blk candidate_id;
+                    }
+                }
+            }
+            break :blk null;
+        };
+        const final_target_id = resolved_target_id orelse return error.InvalidCast;
+        if (resolved_source_id >= b.types.len or final_target_id >= b.types.len) {
+            return error.InvalidCast;
+        }
+        const source_type = if (std.meta.activeTag(cast.source_type) == .unsupported)
+            b.types[resolved_source_id]
+        else
+            cast.source_type;
+        const target_type = b.types[final_target_id];
+        if (target_is_placeholder) {
+            @constCast(b.types)[cast.target] = target_type;
+        }
+        @constCast(b.exprs)[node].kind.cast.source_type = source_type;
+        if (!isValidCast(cast.kind, source_type, target_type, source_type)) {
+            return error.InvalidCast;
+        }
+    }
     return .{
         .types = result_types,
         .instantiations = try cloneInstantiationMap(alloc, g.instantiations),
@@ -3449,4 +6552,279 @@ test "source analysis infers binary and length cast sources" {
         types.Type{ .prim = .usize },
         types_store[inferred.getType(10).?],
     );
+}
+
+test "array reference casts unsize without strengthening mutability" {
+    const array: types.Array = .{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .literal = 4 },
+    };
+    const shared_source: types.Ref = .{ .mut = false, .pointee = .{ .array = &array } };
+    const mutable_source: types.Ref = .{ .mut = true, .pointee = .{ .array = &array } };
+    const shared_target: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const mutable_target: types.Slice = .{ .const_ = false, .elem = .{ .prim = .u8 } };
+    const nested_shared_target: types.Ref = .{
+        .mut = false,
+        .pointee = .{ .slice = &shared_target },
+    };
+
+    try std.testing.expect(isValidCast(
+        .as_,
+        .{ .reference = &mutable_source },
+        .{ .slice = &shared_target },
+        .{ .reference = &mutable_source },
+    ));
+    try std.testing.expect(isValidCast(
+        .as_,
+        .{ .reference = &mutable_source },
+        .{ .slice = &mutable_target },
+        .{ .reference = &mutable_source },
+    ));
+    try std.testing.expect(!isValidCast(
+        .as_,
+        .{ .reference = &shared_source },
+        .{ .slice = &mutable_target },
+        .{ .reference = &shared_source },
+    ));
+    try std.testing.expect(!isValidCast(
+        .as_,
+        .{ .reference = &shared_source },
+        .{ .reference = &nested_shared_target },
+        .{ .reference = &shared_source },
+    ));
+}
+
+test "assignment expression has unit type" {
+    const types_store = [_]types.Type{
+        .{ .prim = .i32 },
+        .{ .prim = .unit },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = test_span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 10, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = test_span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 11, .generic_args = &.{} } },
+        },
+        .{
+            .id = 2,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .assign = .{ .target = 0, .op = .plain, .value = 1, .overflow = .checked } },
+        },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+    var generated: Gen = .{};
+    defer generated.deinit(std.testing.allocator);
+    var ctx: Ctx = .{
+        .alloc = std.testing.allocator,
+        .b = &b,
+        .g = &generated,
+    };
+    defer ctx.deinit();
+
+    try walkExpr(&ctx, 2, 2);
+    try std.testing.expectEqual(types_store[1], getKnownType(&ctx, 2).?);
+    var saw_unit_pin = false;
+    for (generated.pins.items) |pin| {
+        if (pin.node == 2 and pin.ty == 1) saw_unit_pin = true;
+    }
+    try std.testing.expect(saw_unit_pin);
+    for (generated.edges.items) |edge| {
+        if (edge == .eq) try std.testing.expect(edge.eq.a != 2 and edge.eq.b != 2);
+    }
+}
+
+test "solver finalizes omitted pointer core generic from solved types" {
+    var raw_pointer: types.RawPtr = .{ .mut = false, .pointee = .{ .prim = .u64 } };
+    const types_store = [_]types.Type{
+        .{ .raw_ptr = &raw_pointer },
+        .{ .prim = .u64 },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = test_span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 10, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = test_span,
+            .ty = 1,
+            .kind = .{ .core_call = .{
+                .function = .ptr_read_unaligned,
+                .generic_args = &.{},
+                .args = &.{0},
+            } },
+        },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+    var solved = [_]?exprs.TypeId{ 0, 1 };
+    try std.testing.expectEqual(
+        types_store[1],
+        coreTypeArgumentFromSolved(&b, &solved, 1, exprs_store[1].kind.core_call).?,
+    );
+    try finalizeCoreCallTypeArguments(std.testing.allocator, &b, &solved);
+    defer std.testing.allocator.free(exprs_store[1].kind.core_call.generic_args);
+    try std.testing.expectEqual(@as(usize, 1), exprs_store[1].kind.core_call.generic_args.len);
+    try std.testing.expectEqual(
+        types_store[1],
+        exprs_store[1].kind.core_call.generic_args[0],
+    );
+}
+
+test "core transmute function item exposes source and result types" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var exprs_store = [_]exprs.Expr{.{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .core_function = .{
+            .function = .mem_transmute,
+            .generic_args = &.{ .{ .prim = .u32 }, .{ .prim = .u64 } },
+        } },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var generated: Gen = .{};
+    defer generated.deinit(alloc);
+    var ctx: Ctx = .{ .alloc = alloc, .b = &b, .g = &generated };
+    defer ctx.deinit();
+    try walkExpr(&ctx, 0, 0);
+    const known = getKnownType(&ctx, 0).?;
+    try std.testing.expect(known == .fn_ptr);
+    try std.testing.expectEqual(@as(usize, 1), known.fn_ptr.params.len);
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, known.fn_ptr.params[0]);
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, known.fn_ptr.ret);
+}
+
+test "external Cow variant derives owned payload type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const slice = try alloc.create(types.Slice);
+    slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const owner: types.ExternalNominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{.{ .slice = slice }},
+    };
+    const pattern: exprs.ExternalVariantPattern = .{
+        .owner = owner,
+        .variant = "Owned",
+        .fields = &.{.{
+            .field = "0",
+            .pat = null,
+            .shorthand = true,
+        }},
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var generated: Gen = .{};
+    defer generated.deinit(alloc);
+    var ctx: Ctx = .{ .alloc = alloc, .b = &b, .g = &generated };
+    defer ctx.deinit();
+    const payload = externalVariantFieldType(&ctx, pattern, null, "0").?;
+    try std.testing.expect(payload == .external_nominal);
+    try std.testing.expectEqualStrings("Vec", payload.external_nominal.path[2]);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, payload.external_nominal.args[0]);
+}
+
+test "I/O method result requires matching generic bound" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var graph_store = graph.CrateGraph.init(alloc);
+    defer graph_store.deinit();
+    const owner_id = try graph_store.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "read"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const bound: types.Bound = .{ .path = .{
+        .segments = &.{
+            .{ .name = "std", .id = null },
+            .{ .name = "io", .id = null },
+            .{ .name = "Read", .id = null },
+        },
+    } };
+    const generic_param: types.GenericParam = .{ .type_ = .{
+        .name = "R",
+        .bounds = &.{bound},
+    } };
+    const generics: types.Generics = .{
+        .params = &.{generic_param},
+        .where_clauses = &.{},
+    };
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .generics = generics,
+            .body = 0,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &bodies_store,
+    };
+    const receiver: types.Type = .{ .path = .{
+        .segments = &.{.{ .name = "R", .id = null }},
+    } };
+    var generated: Gen = .{};
+    defer generated.deinit(alloc);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .b = &b,
+        .g = &generated,
+        .cg = &graph_store,
+        .current_fn = owner_id,
+    };
+    defer ctx.deinit();
+    const result = knownIoMethodResultType(&ctx, receiver, "read_exact").?;
+    try std.testing.expect(result == .result);
+    try std.testing.expectEqual(types.Type{ .prim = .unit }, result.result.ok);
+    try std.testing.expectEqual(types.Type{
+        .external_nominal = .{ .path = &.{ "std", "io", "Error" } },
+    }, result.result.err);
+    try std.testing.expect(knownIoMethodResultType(&ctx, receiver, "write_all") == null);
 }

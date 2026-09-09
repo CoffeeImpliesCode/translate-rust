@@ -130,8 +130,7 @@ pub const Ctx = struct {
     declaration_owner: ?spine.EntityId = null,
     /// Declarations collected before the current module is lowered.
     const_environment: ?*const ConstEnvironment = null,
-    /// In-crate `macro_rules!` definitions registered during CST extraction.
-    /// Shared by the root module and every submodule so an item-level macro invocation can be expanded regardless of which file defined it.
+    /// Current module's macro definitions, with borrowed ancestor scopes.
     macro_table: ?*exp.MacroTable = null,
     /// Impl blocks wait here until all lexical declarations and imports exist.
     pending_impls: ?*std.ArrayListUnmanaged(PendingImpl) = null,
@@ -406,9 +405,15 @@ const TypeMapError = std.mem.Allocator.Error || error{
 /// The declaration environment is evaluated independently of source order.
 fn mapArrayLen(e: *Ctx, node: ts.Node) TypeMapError!types.ArrayLen {
     const value = constIntegerValue(e, node) orelse return error.InvalidType;
-    if (value < 0 or value > @as(i128, std.math.maxInt(u32))) {
-        return error.InvalidType;
-    }
+    if (value < 0) return error.InvalidType;
+    const max_len: i128 = if (e.cfg.target_pointer_width) |width| switch (width) {
+        8 => @as(i128, std.math.maxInt(u8)),
+        16 => @as(i128, std.math.maxInt(u16)),
+        32 => @as(i128, std.math.maxInt(u32)),
+        64 => @as(i128, std.math.maxInt(u64)),
+        else => return error.InvalidType,
+    } else @as(i128, std.math.maxInt(usize));
+    if (value > max_len) return error.InvalidType;
     return .{ .literal = @intCast(value) };
 }
 
@@ -424,11 +429,7 @@ fn mapType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
     }
     if (std.mem.eql(u8, kind, "primitive_type")) {
         const nm = text(e, node);
-        if (std.mem.eql(u8, nm, "str")) {
-            const s = try e.alloc.create(types.Slice);
-            s.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
-            return .{ .slice = s };
-        }
+        if (std.mem.eql(u8, nm, "str")) return types.str_type;
         if (mapPrim(nm)) |p| return .{ .prim = p };
         return unsupportedTy();
     }
@@ -507,6 +508,24 @@ fn mapType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         raw.* = .{ .mut = mut, .pointee = elem };
         return .{ .raw_ptr = raw };
     }
+    if (std.mem.eql(u8, kind, "abstract_type")) {
+        const trait_node = node.childByFieldName("trait") orelse return error.InvalidType;
+        const bounds = try collectTraitTypeBounds(e, trait_node);
+        if (bounds.len == 0) return error.InvalidType;
+        return .{ .@"opaque" = .{ .bounds = bounds } };
+    }
+    if (std.mem.eql(u8, kind, "dynamic_type")) {
+        const trait_node = node.childByFieldName("trait") orelse return error.InvalidType;
+        const bounds = try collectTraitTypeBounds(e, trait_node);
+        if (bounds.len == 0) return error.InvalidType;
+        return .{ .dyn_trait = bounds };
+    }
+    if (std.mem.eql(u8, kind, "bounded_type")) {
+        const bounds = try collectTraitTypeBounds(e, node);
+        if (bounds.len == 0) return error.InvalidType;
+        return .{ .dyn_trait = bounds };
+    }
+    if (std.mem.eql(u8, kind, "type_binding")) return error.InvalidType;
     if (std.mem.eql(u8, kind, "generic_type") or
         std.mem.eql(u8, kind, "type_identifier") or
         std.mem.eql(u8, kind, "identifier") or
@@ -568,6 +587,128 @@ fn freeExternalPath(e: *const Ctx, path: []const []const u8) void {
     for (path) |segment| e.alloc.free(segment);
     if (path.len > 0) e.alloc.free(path);
 }
+fn freePathSegments(e: *const Ctx, path: []const types.PathSegment) void {
+    for (path) |segment| e.alloc.free(segment.name);
+    if (path.len > 0) e.alloc.free(path);
+}
+
+fn isKnownExternalCrate(g: *const graph.CrateGraph, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "core") or
+        std.mem.eql(u8, name, "std") or
+        std.mem.eql(u8, name, "alloc"))
+        return true;
+    for (g.crates.items) |crate_info| {
+        for (crate_info.deps) |dep| {
+            if (std.mem.eql(u8, dep.local_alias, name) or
+                std.mem.eql(u8, dep.extern_name, name))
+                return true;
+            if (dep.local_alias.len == name.len) {
+                var match = true;
+                for (dep.local_alias, name) |a, b| {
+                    const norm_a = if (a == '-') '_' else a;
+                    const norm_b = if (b == '-') '_' else b;
+                    if (norm_a != norm_b) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return true;
+            }
+            if (dep.extern_name.len == name.len) {
+                var match = true;
+                for (dep.extern_name, name) |a, b| {
+                    const norm_a = if (a == '-') '_' else a;
+                    const norm_b = if (b == '-') '_' else b;
+                    if (norm_a != norm_b) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return true;
+            }
+        }
+    }
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.kind == .extern_crate) {
+            if (std.mem.eql(u8, entity.name, name)) return true;
+            if (entity.renamed_to) |renamed| {
+                if (std.mem.eql(u8, renamed, name)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn preludeExternalPath(name: []const u8) ?[]const []const u8 {
+    if (std.mem.eql(u8, name, "String")) return &.{ "alloc", "string", "String" };
+    if (std.mem.eql(u8, name, "Vec")) return &.{ "alloc", "vec", "Vec" };
+    if (std.mem.eql(u8, name, "From")) return &.{ "core", "convert", "From" };
+    if (std.mem.eql(u8, name, "Into")) return &.{ "core", "convert", "Into" };
+    if (std.mem.eql(u8, name, "TryFrom")) return &.{ "core", "convert", "TryFrom" };
+    if (std.mem.eql(u8, name, "TryInto")) return &.{ "core", "convert", "TryInto" };
+    if (std.mem.eql(u8, name, "AsRef")) return &.{ "core", "convert", "AsRef" };
+    if (std.mem.eql(u8, name, "AsMut")) return &.{ "core", "convert", "AsMut" };
+    if (std.mem.eql(u8, name, "Default")) return &.{ "core", "default", "Default" };
+    if (std.mem.eql(u8, name, "Clone")) return &.{ "core", "clone", "Clone" };
+    if (std.mem.eql(u8, name, "Copy")) return &.{ "core", "marker", "Copy" };
+    if (std.mem.eql(u8, name, "Send")) return &.{ "core", "marker", "Send" };
+    if (std.mem.eql(u8, name, "Sync")) return &.{ "core", "marker", "Sync" };
+    if (std.mem.eql(u8, name, "Sized")) return &.{ "core", "marker", "Sized" };
+    if (std.mem.eql(u8, name, "Unpin")) return &.{ "core", "marker", "Unpin" };
+    if (std.mem.eql(u8, name, "Fn")) return &.{ "core", "ops", "Fn" };
+    if (std.mem.eql(u8, name, "FnMut")) return &.{ "core", "ops", "FnMut" };
+    if (std.mem.eql(u8, name, "FnOnce")) return &.{ "core", "ops", "FnOnce" };
+    if (std.mem.eql(u8, name, "Drop")) return &.{ "core", "ops", "Drop" };
+    if (std.mem.eql(u8, name, "Iterator")) return &.{ "core", "iter", "Iterator" };
+    if (std.mem.eql(u8, name, "IntoIterator")) return &.{ "core", "iter", "IntoIterator" };
+    if (std.mem.eql(u8, name, "DoubleEndedIterator")) return &.{ "core", "iter", "DoubleEndedIterator" };
+    if (std.mem.eql(u8, name, "ExactSizeIterator")) return &.{ "core", "iter", "ExactSizeIterator" };
+    if (std.mem.eql(u8, name, "Extend")) return &.{ "core", "iter", "Extend" };
+    if (std.mem.eql(u8, name, "Debug")) return &.{ "core", "fmt", "Debug" };
+    if (std.mem.eql(u8, name, "Display")) return &.{ "core", "fmt", "Display" };
+    if (std.mem.eql(u8, name, "Hash")) return &.{ "core", "hash", "Hash" };
+    if (std.mem.eql(u8, name, "Hasher")) return &.{ "core", "hash", "Hasher" };
+    if (std.mem.eql(u8, name, "PartialEq")) return &.{ "core", "cmp", "PartialEq" };
+    if (std.mem.eql(u8, name, "Eq")) return &.{ "core", "cmp", "Eq" };
+    if (std.mem.eql(u8, name, "PartialOrd")) return &.{ "core", "cmp", "PartialOrd" };
+    if (std.mem.eql(u8, name, "Ord")) return &.{ "core", "cmp", "Ord" };
+    if (std.mem.eql(u8, name, "Add")) return &.{ "core", "ops", "Add" };
+    if (std.mem.eql(u8, name, "Sub")) return &.{ "core", "ops", "Sub" };
+    if (std.mem.eql(u8, name, "Mul")) return &.{ "core", "ops", "Mul" };
+    if (std.mem.eql(u8, name, "Div")) return &.{ "core", "ops", "Div" };
+    if (std.mem.eql(u8, name, "Rem")) return &.{ "core", "ops", "Rem" };
+    if (std.mem.eql(u8, name, "Not")) return &.{ "core", "ops", "Not" };
+    if (std.mem.eql(u8, name, "BitAnd")) return &.{ "core", "ops", "BitAnd" };
+    if (std.mem.eql(u8, name, "BitOr")) return &.{ "core", "ops", "BitOr" };
+    if (std.mem.eql(u8, name, "BitXor")) return &.{ "core", "ops", "BitXor" };
+    if (std.mem.eql(u8, name, "Shl")) return &.{ "core", "ops", "Shl" };
+    if (std.mem.eql(u8, name, "Shr")) return &.{ "core", "ops", "Shr" };
+    if (std.mem.eql(u8, name, "Neg")) return &.{ "core", "ops", "Neg" };
+    if (std.mem.eql(u8, name, "AddAssign")) return &.{ "core", "ops", "AddAssign" };
+    if (std.mem.eql(u8, name, "SubAssign")) return &.{ "core", "ops", "SubAssign" };
+    if (std.mem.eql(u8, name, "MulAssign")) return &.{ "core", "ops", "MulAssign" };
+    if (std.mem.eql(u8, name, "DivAssign")) return &.{ "core", "ops", "DivAssign" };
+    if (std.mem.eql(u8, name, "RemAssign")) return &.{ "core", "ops", "RemAssign" };
+    if (std.mem.eql(u8, name, "BitAndAssign")) return &.{ "core", "ops", "BitAndAssign" };
+    if (std.mem.eql(u8, name, "BitOrAssign")) return &.{ "core", "ops", "BitOrAssign" };
+    if (std.mem.eql(u8, name, "BitXorAssign")) return &.{ "core", "ops", "BitXorAssign" };
+    if (std.mem.eql(u8, name, "ShlAssign")) return &.{ "core", "ops", "ShlAssign" };
+    if (std.mem.eql(u8, name, "ShrAssign")) return &.{ "core", "ops", "ShrAssign" };
+    if (std.mem.eql(u8, name, "Index")) return &.{ "core", "ops", "Index" };
+    if (std.mem.eql(u8, name, "IndexMut")) return &.{ "core", "ops", "IndexMut" };
+    if (std.mem.eql(u8, name, "Deref")) return &.{ "core", "ops", "Deref" };
+    if (std.mem.eql(u8, name, "DerefMut")) return &.{ "core", "ops", "DerefMut" };
+    return null;
+}
+
+fn preludePathSegments(allocator: std.mem.Allocator, name: []const u8) !?[]const types.PathSegment {
+    const external = preludeExternalPath(name) orelse return null;
+    const segments = try allocator.alloc(types.PathSegment, external.len);
+    for (external, 0..) |seg_name, i| {
+        segments[i] = .{ .name = try allocator.dupe(u8, seg_name), .id = null };
+    }
+    return segments;
+}
 
 fn externalUsePath(e: *const Ctx, name: []const u8) !?[]const []const u8 {
     const owner_id = e.declaration_owner orelse return null;
@@ -605,18 +746,13 @@ fn makePendingGeneric(
     args: []const types.Type,
     path_segments: []const types.PathSegment,
 ) TypeMapError!types.Type {
-    const pending = e.pending_generics orelse {
-        e.alloc.free(path_segments);
-        return error.UnresolvedNominalType;
-    };
+    var source_owned = true;
+    defer if (source_owned) freePathSegments(e, path_segments);
+    const pending = e.pending_generics orelse return error.UnresolvedNominalType;
     if (pending.items.len >= @as(usize, unresolved_generic_decl_id)) {
-        e.alloc.free(path_segments);
         return error.UnresolvedNominalType;
     }
-    const owner_id = e.declaration_owner orelse {
-        e.alloc.free(path_segments);
-        return error.UnresolvedNominalType;
-    };
+    const owner_id = e.declaration_owner orelse return error.UnresolvedNominalType;
     const owned_path = try e.alloc.alloc(types.PathSegment, path_segments.len);
     var copied: usize = 0;
     errdefer {
@@ -630,7 +766,6 @@ fn makePendingGeneric(
         };
         copied += 1;
     }
-    e.alloc.free(path_segments);
     const placeholder: spine.EntityId = unresolved_generic_decl_id -
         @as(spine.EntityId, @intCast(pending.items.len));
     try pending.append(e.alloc, .{
@@ -638,6 +773,8 @@ fn makePendingGeneric(
         .owner_id = owner_id,
         .path = owned_path,
     });
+    freePathSegments(e, path_segments);
+    source_owned = false;
     return .{ .generic_inst = .{
         .decl = placeholder,
         .args = .{ .params = args },
@@ -649,14 +786,24 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
     var arg_nodes: [8]ts.Node = undefined;
     var arg_count: usize = 0;
     var segs: std.ArrayListUnmanaged(types.PathSegment) = .empty;
-    defer segs.deinit(e.alloc);
+    var segs_owned = true;
+    defer {
+        if (segs_owned) {
+            for (segs.items) |segment| e.alloc.free(segment.name);
+        }
+        segs.deinit(e.alloc);
+    }
 
     const kind = node.kind();
     if (std.mem.eql(u8, kind, "type_identifier") or std.mem.eql(u8, kind, "identifier")) {
         name = text(e, node);
     } else if (std.mem.eql(u8, kind, "scoped_type_identifier")) {
         const sub = try mapScopedSegments(e, node);
-        try segs.appendSlice(e.alloc, sub);
+        segs.appendSlice(e.alloc, sub) catch |err| {
+            freePathSegments(e, sub);
+            return err;
+        };
+        e.alloc.free(sub);
     } else {
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
@@ -665,7 +812,11 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
                 name = text(e, c);
             } else if (std.mem.eql(u8, k, "scoped_type_identifier")) {
                 const sub = try mapScopedSegments(e, c);
-                try segs.appendSlice(e.alloc, sub);
+                segs.appendSlice(e.alloc, sub) catch |err| {
+                    freePathSegments(e, sub);
+                    return err;
+                };
+                e.alloc.free(sub);
             } else if (std.mem.eql(u8, k, "type_arguments") or
                 std.mem.eql(u8, k, "generic_type"))
             {
@@ -712,20 +863,42 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         return .{ .boxed = inner };
     }
     const had_scoped_segments = segs.items.len > 0;
-    if (segs.items.len > 0 and
-        (std.mem.eql(u8, segs.items[0].name, "core") or
-            std.mem.eql(u8, segs.items[0].name, "std") or
-            std.mem.eql(u8, segs.items[0].name, "alloc")))
-    {
+    if (segs.items.len > 0 and isKnownExternalCrate(e.g, segs.items[0].name)) {
         const external_path = try e.alloc.alloc([]const u8, segs.items.len);
         for (segs.items, 0..) |segment, index| {
             if (segment.name.len == 0) return error.InvalidType;
-            external_path[index] = segment.name;
+            external_path[index] = try e.alloc.dupe(u8, segment.name);
         }
         return .{ .external_nominal = .{
             .path = external_path,
             .args = args,
         } };
+    }
+    if (segs.items.len > 0) {
+        // A scoped type can begin with an unscoped external-use alias:
+        // `io::Error` after `use std::io;`. Resolve the alias first, then
+        // append the remaining nominal segments without erasing them.
+        if (try externalUsePath(e, segs.items[0].name)) |alias_path| {
+            if (segs.items.len == 1) {
+                return .{ .external_nominal = .{ .path = alias_path, .args = args } };
+            }
+            const combined = try e.alloc.alloc([]const u8, alias_path.len + segs.items.len - 1);
+            var copied: usize = 0;
+            errdefer {
+                for (combined[0..copied]) |segment| e.alloc.free(segment);
+                e.alloc.free(combined);
+            }
+            for (alias_path, 0..) |segment, index| {
+                combined[index] = try e.alloc.dupe(u8, segment);
+                copied += 1;
+            }
+            for (segs.items[1..], 0..) |segment, index| {
+                combined[alias_path.len + index] = try e.alloc.dupe(u8, segment.name);
+                copied += 1;
+            }
+            freeExternalPath(e, alias_path);
+            return .{ .external_nominal = .{ .path = combined, .args = args } };
+        }
     }
     if (!had_scoped_segments) {
         if (try externalUsePath(e, nm)) |external_path| {
@@ -736,34 +909,67 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         }
     }
 
+    const prelude_visible = blk: {
+        const owner_id = e.declaration_owner orelse break :blk true;
+        const module_id = owningModule(e.g, owner_id) orelse break :blk true;
+        break :blk resolveModuleItem(e.g, module_id, nm) == null;
+    };
+    if (!had_scoped_segments and prelude_visible and
+        (std.mem.eql(u8, nm, "String") or std.mem.eql(u8, nm, "Vec")))
+    {
+        const prelude_path = preludeExternalPath(nm).?;
+        const external_path = try e.alloc.alloc([]const u8, prelude_path.len);
+        var copied: usize = 0;
+        errdefer {
+            for (external_path[0..copied]) |segment| e.alloc.free(segment);
+            e.alloc.free(external_path);
+        }
+        for (prelude_path, 0..) |segment, index| {
+            external_path[index] = try e.alloc.dupe(u8, segment);
+            copied += 1;
+        }
+        return .{ .external_nominal = .{
+            .path = external_path,
+            .args = args,
+        } };
+    }
     if (args.len > 0) {
         if (segs.items.len == 0 or
             !std.mem.eql(u8, segs.items[segs.items.len - 1].name, nm))
         {
-            try segs.append(e.alloc, .{ .name = nm, .id = null });
+            try segs.append(e.alloc, .{
+                .name = try e.alloc.dupe(u8, nm),
+                .id = null,
+            });
         }
         const path_segments = try segs.toOwnedSlice(e.alloc);
-        const owner_id = e.declaration_owner orelse {
-            e.alloc.free(path_segments);
-            return error.UnresolvedNominalType;
-        };
+        segs_owned = false;
+        var path_owned = true;
+        defer if (path_owned) freePathSegments(e, path_segments);
+        const owner_id = e.declaration_owner orelse return error.UnresolvedNominalType;
         var path: types.Path = .{ .segments = path_segments };
         bindPath(e.g, e.bodies_list.items, owner_id, &.{}, &path) catch |err| switch (err) {
-            error.UnresolvedNominalType => return makePendingGeneric(e, args, path_segments),
-            else => {
-                e.alloc.free(path_segments);
-                return err;
+            error.UnresolvedNominalType => {
+                if (!had_scoped_segments) {
+                    if (preludeExternalPath(nm)) |prelude_path| {
+                        const ext_path = try e.alloc.alloc([]const u8, prelude_path.len);
+                        for (prelude_path, 0..) |seg, i| {
+                            ext_path[i] = try e.alloc.dupe(u8, seg);
+                        }
+                        return .{ .external_nominal = .{
+                            .path = ext_path,
+                            .args = args,
+                        } };
+                    }
+                }
+                path_owned = false;
+                return makePendingGeneric(e, args, path_segments);
             },
+            else => return err,
         };
-        if (path.segments.len == 0) {
-            e.alloc.free(path_segments);
+        if (path.segments.len == 0) return error.UnresolvedNominalType;
+        const base_def = path.segments[path.segments.len - 1].id orelse
             return error.UnresolvedNominalType;
-        }
-        const base_def = path.segments[path.segments.len - 1].id orelse {
-            e.alloc.free(path_segments);
-            return error.UnresolvedNominalType;
-        };
-        e.alloc.free(path_segments);
         return .{
             .generic_inst = .{
                 .decl = base_def,
@@ -772,17 +978,22 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         };
     }
     if (segs.items.len == 0 or !std.mem.eql(u8, segs.items[segs.items.len - 1].name, nm)) {
-        try segs.append(e.alloc, .{ .name = nm, .id = null });
+        try segs.append(e.alloc, .{
+            .name = try e.alloc.dupe(u8, nm),
+            .id = null,
+        });
     }
-    const path_segments: []const types.PathSegment = try segs.toOwnedSlice(e.alloc);
-    return .{ .path = .{ .segments = path_segments } };
+    const plain_segments = try segs.toOwnedSlice(e.alloc);
+    segs_owned = false;
+    return .{ .path = .{ .segments = plain_segments } };
 }
 
-/// Preserve every segment of a scoped type path. The binder resolves only the
-/// terminal nominal entity; `crate`/`self`/`super` remain lexical prefixes.
-fn mapScopedSegments(e: *Ctx, node: ts.Node) ![]const types.PathSegment {
+fn mapScopedSegments(e: *Ctx, node: ts.Node) TypeMapError![]const types.PathSegment {
     var segs: std.ArrayListUnmanaged(types.PathSegment) = .empty;
-    errdefer segs.deinit(e.alloc);
+    errdefer {
+        for (segs.items) |segment| e.alloc.free(segment.name);
+        segs.deinit(e.alloc);
+    }
     var source = std.mem.trim(u8, text(e, node), " \t\r\n");
     if (std.mem.startsWith(u8, source, "::")) source = source[2..];
     if (source.len == 0) return error.InvalidType;
@@ -790,7 +1001,27 @@ fn mapScopedSegments(e: *Ctx, node: ts.Node) ![]const types.PathSegment {
     while (path_parts.next()) |part| {
         const name = std.mem.trim(u8, part, " \t\r\n");
         if (name.len == 0) return error.InvalidType;
-        try segs.append(e.alloc, .{ .name = name, .id = null });
+        if (name.len >= 2 and name[0] == '<' and name[name.len - 1] == '>') {
+            const inner = std.mem.trim(u8, name[1 .. name.len - 1], " \t\r\n");
+            if (std.mem.indexOf(u8, inner, " as ")) |as_index| {
+                const generic_name = std.mem.trim(u8, inner[0..as_index], " \t\r\n");
+                const trait_name = std.mem.trim(u8, inner[as_index + 4 ..], " \t\r\n");
+                if (generic_name.len == 0 or trait_name.len == 0) return error.InvalidType;
+                try segs.append(e.alloc, .{
+                    .name = try e.alloc.dupe(u8, generic_name),
+                    .id = null,
+                });
+                try segs.append(e.alloc, .{
+                    .name = try e.alloc.dupe(u8, trait_name),
+                    .id = null,
+                });
+                continue;
+            }
+        }
+        try segs.append(e.alloc, .{
+            .name = try e.alloc.dupe(u8, name),
+            .id = null,
+        });
     }
     return segs.toOwnedSlice(e.alloc);
 }
@@ -798,6 +1029,7 @@ fn mapScopedSegments(e: *Ctx, node: ts.Node) ![]const types.PathSegment {
 pub const DeclarationTypeError = error{
     UnresolvedNominalType,
     InvalidNominalType,
+    OutOfMemory,
 };
 
 fn rootModuleEntity(g: *const graph.CrateGraph) ?spine.EntityId {
@@ -883,15 +1115,74 @@ fn resolveModuleItem(
 }
 
 fn bodyHasGenericParam(body: bodies.BodyKind, name: []const u8) bool {
-    const params: []const []const u8 = switch (body) {
-        .fn_ => |fn_body| fn_body.generic_params,
-        .struct_ => |struct_body| struct_body.generic_params,
-        else => &.{},
-    };
-    for (params) |param| {
-        if (std.mem.eql(u8, param, name)) return true;
+    switch (body) {
+        .fn_ => |fn_body| {
+            for (fn_body.generic_params) |param| {
+                if (std.mem.eql(u8, param, name)) return true;
+            }
+        },
+        .struct_ => |struct_body| {
+            for (struct_body.generic_params) |param| {
+                if (std.mem.eql(u8, param, name)) return true;
+            }
+        },
+        .trait_ => |trait_body| {
+            for (trait_body.generic_params) |param| {
+                if (std.mem.eql(u8, param, name)) return true;
+            }
+        },
+        .impl_ => |impl_body| {
+            if (impl_body.generics) |generics| {
+                for (generics.params) |param| {
+                    const param_name = switch (param) {
+                        .type_ => |value| value.name,
+                        .const_ => |value| value.name,
+                        .lifetime => |value| value.name,
+                    };
+                    if (std.mem.eql(u8, param_name, name)) return true;
+                }
+            }
+        },
+        else => {},
     }
     return false;
+}
+
+fn genericParamBounds(
+    generics: ?types.Generics,
+    name: []const u8,
+) ?[]const types.Bound {
+    const value = generics orelse return null;
+    for (value.params) |param| {
+        switch (param) {
+            .type_ => |type_param| {
+                if (std.mem.eql(u8, type_param.name, name)) {
+                    if (type_param.bounds.len > 0) return type_param.bounds;
+                }
+            },
+            else => {},
+        }
+    }
+    for (value.where_clauses) |clause| {
+        if (clause.self_ty.segments.len == 1 and
+            std.mem.eql(u8, clause.self_ty.segments[0].name, name))
+        {
+            if (clause.bounds.len > 0) return clause.bounds;
+        }
+    }
+    return null;
+}
+
+fn bodyGenericParamBounds(
+    body: bodies.BodyKind,
+    name: []const u8,
+) ?[]const types.Bound {
+    return switch (body) {
+        .fn_ => |fn_body| genericParamBounds(fn_body.generics, name),
+        .impl_ => |impl_body| genericParamBounds(impl_body.generics, name),
+        .trait_ => |trait_body| genericParamBounds(trait_body.generics, name),
+        else => null,
+    };
 }
 
 fn activeGenericParam(
@@ -916,6 +1207,102 @@ fn activeGenericParam(
     }
     return false;
 }
+fn genericBoundsFor(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    name: []const u8,
+) ?[]const types.Bound {
+    // An extra list belongs to the innermost method scope. An equal name in
+    // an enclosing body is shadowed even when that method has no bound.
+    for (extra_generic_params) |param| {
+        if (std.mem.eql(u8, param, name)) return &.{};
+    }
+
+    var current: ?spine.EntityId = owner_id;
+    var depth: usize = 0;
+    while (current) |entity_id| : (depth += 1) {
+        if (depth >= g.symbol_table.entities.items.len) return null;
+        const entity = g.symbol_table.get(entity_id) orelse return null;
+        if (entity_id < bodies_list.len) {
+            if (bodyGenericParamBounds(bodies_list[entity_id], name)) |bounds| {
+                return bounds;
+            }
+            if (entity.kind == .struct_) {
+                for (g.symbol_table.entities.items) |candidate| {
+                    if (candidate.kind == .impl_ and candidate.parent == entity_id) {
+                        if (candidate.id < bodies_list.len) {
+                            if (bodyGenericParamBounds(bodies_list[candidate.id], name)) |bounds| {
+                                return bounds;
+                            }
+                        }
+                    }
+                }
+            }
+            if (bodyHasGenericParam(bodies_list[entity_id], name)) return &.{};
+        }
+        current = entity.parent;
+    }
+    return null;
+}
+
+fn traitHasAssociatedMember(
+    bodies_list: []const bodies.BodyKind,
+    trait_id: spine.EntityId,
+    name: []const u8,
+) bool {
+    if (trait_id >= bodies_list.len) return false;
+    const trait_body = switch (bodies_list[trait_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.assoc_types) |assoc| {
+        if (std.mem.eql(u8, assoc.name, name)) return true;
+    }
+    for (trait_body.assoc_consts) |assoc| {
+        if (std.mem.eql(u8, assoc.name, name)) return true;
+    }
+    return false;
+}
+
+fn genericBoundTrait(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    generic_name: []const u8,
+    trait_name: ?[]const u8,
+    associated_name: ?[]const u8,
+) ?spine.EntityId {
+    const bounds = genericBoundsFor(
+        g,
+        bodies_list,
+        owner_id,
+        extra_generic_params,
+        generic_name,
+    ) orelse return null;
+    for (bounds) |bound| {
+        if (bound.path.segments.len == 0) continue;
+        const terminal = bound.path.segments[bound.path.segments.len - 1];
+        if (trait_name) |expected| {
+            if (!std.mem.eql(u8, terminal.name, expected)) continue;
+        }
+        var trait_id = terminal.id;
+        if (trait_id == null) {
+            const module_id = owningModule(g, owner_id) orelse continue;
+            trait_id = resolveModuleItem(g, module_id, terminal.name);
+        }
+        const resolved_id = trait_id orelse continue;
+        const entity = g.symbol_table.get(resolved_id) orelse continue;
+        if (entity.kind != .trait_) continue;
+        if (associated_name) |assoc| {
+            if (!traitHasAssociatedMember(bodies_list, resolved_id, assoc)) continue;
+        }
+        return resolved_id;
+    }
+    return null;
+}
 
 fn selfTypeEntity(g: *const graph.CrateGraph, owner_id: spine.EntityId) ?spine.EntityId {
     var current: ?spine.EntityId = owner_id;
@@ -925,11 +1312,216 @@ fn selfTypeEntity(g: *const graph.CrateGraph, owner_id: spine.EntityId) ?spine.E
         const entity = g.symbol_table.get(entity_id) orelse return null;
         switch (entity.kind) {
             .struct_, .enum_, .union_ => return entity.id,
-            .module => return null,
+            .trait_, .module => return null,
             else => current = entity.parent,
         }
     }
     return null;
+}
+
+fn containingTrait(g: *const graph.CrateGraph, owner_id: spine.EntityId) ?spine.EntityId {
+    var current: ?spine.EntityId = owner_id;
+    var depth: usize = 0;
+    while (current) |entity_id| : (depth += 1) {
+        if (depth >= g.symbol_table.entities.items.len) return null;
+        const entity = g.symbol_table.get(entity_id) orelse return null;
+        if (entity.kind == .trait_) return entity.id;
+        if (entity.kind == .module) return null;
+        current = entity.parent;
+    }
+    return null;
+}
+
+fn containingImpl(g: *const graph.CrateGraph, owner_id: spine.EntityId) ?spine.EntityId {
+    var current: ?spine.EntityId = owner_id;
+    var depth: usize = 0;
+    while (current) |entity_id| : (depth += 1) {
+        if (depth >= g.symbol_table.entities.items.len) return null;
+        const entity = g.symbol_table.get(entity_id) orelse return null;
+        if (entity.kind == .impl_) return entity.id;
+        current = entity.parent;
+    }
+    return null;
+}
+fn implSelfType(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+) ?types.Type {
+    const impl_id = containingImpl(g, owner_id) orelse return null;
+    if (impl_id >= bodies_list.len) return null;
+    const self_ty = switch (bodies_list[impl_id]) {
+        .impl_ => |impl_body| impl_body.self_ty,
+        else => return null,
+    };
+    return switch (self_ty) {
+        .path => |path| blk: {
+            if (path.segments.len == 0) break :blk null;
+            if (path.segments.len == 1 and
+                std.mem.eql(u8, path.segments[0].name, "Self"))
+            {
+                break :blk null;
+            }
+            const terminal = path.segments[path.segments.len - 1];
+            if (terminal.id == null and
+                !activeGenericParam(g, bodies_list, impl_id, &.{}, terminal.name))
+            {
+                break :blk null;
+            }
+            break :blk self_ty;
+        },
+        .generic_inst => |generic_inst| if (generic_inst.decl == unresolved_generic_decl_id)
+            null
+        else
+            self_ty,
+        else => self_ty,
+    };
+}
+
+fn associatedEntity(
+    g: *const graph.CrateGraph,
+    parent_id: spine.EntityId,
+    name: []const u8,
+) ?spine.EntityId {
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.parent != parent_id or !std.mem.eql(u8, entity.name, name)) continue;
+        return switch (entity.kind) {
+            .const_, .type_alias => entity.id,
+            else => null,
+        };
+    }
+    return null;
+}
+
+fn owningImplForStructMethod(
+    g: *const graph.CrateGraph,
+    struct_id: spine.EntityId,
+    method_name: []const u8,
+) ?spine.EntityId {
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .fn_ or !std.mem.eql(u8, entity.name, method_name)) continue;
+        const impl_id = entity.parent orelse continue;
+        const impl = g.symbol_table.get(impl_id) orelse continue;
+        if (impl.kind == .impl_ and impl.parent == struct_id) return impl_id;
+    }
+    return null;
+}
+
+fn associatedAliasTarget(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    name: []const u8,
+) ?types.Type {
+    const impl_id = containingImpl(g, owner_id) orelse return null;
+    const alias_id = associatedEntity(g, impl_id, name) orelse return null;
+    if (alias_id >= bodies_list.len) return null;
+    return switch (bodies_list[alias_id]) {
+        .type_alias => |alias| alias.target,
+        else => null,
+    };
+}
+fn bindProjectionPath(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    path: *types.Path,
+) DeclarationTypeError!void {
+    if (path.segments.len == 0) return;
+    const first = path.segments[0].name;
+    if (std.mem.eql(u8, first, "Self")) {
+        const self_id = selfTypeEntity(g, owner_id);
+        if (self_id) |id| @constCast(path.segments)[0].id = id;
+        if (path.segments.len == 2) {
+            if (containingImpl(g, owner_id)) |impl_id| {
+                const terminal = path.segments[path.segments.len - 1].name;
+                if (associatedEntity(g, impl_id, terminal)) |assoc_id| {
+                    @constCast(path.segments)[path.segments.len - 1].id = assoc_id;
+                }
+            }
+            if (self_id) |id| {
+                const terminal = path.segments[path.segments.len - 1].name;
+                if (associatedEntity(g, id, terminal)) |assoc_id| {
+                    @constCast(path.segments)[path.segments.len - 1].id = assoc_id;
+                }
+            }
+        }
+        if (self_id == null and path.segments.len == 2) {
+            if (containingTrait(g, owner_id)) |trait_id| {
+                const associated_name = path.segments[1].name;
+                if (traitHasAssociatedMember(bodies_list, trait_id, associated_name)) {
+                    const old_segments = path.segments;
+                    const expanded = try g.allocator.alloc(types.PathSegment, 3);
+                    expanded[0] = old_segments[0];
+                    const trait = g.symbol_table.get(trait_id) orelse return;
+                    expanded[1] = .{ .name = trait.name, .id = trait_id };
+                    expanded[2] = old_segments[1];
+                    path.segments = expanded;
+                    g.allocator.free(old_segments);
+                }
+            }
+        }
+        if (path.segments.len > 2) {
+            const module_id = owningModule(g, owner_id) orelse return;
+            if (resolveModuleItem(g, module_id, path.segments[1].name)) |trait_id| {
+                if (g.symbol_table.get(trait_id)) |trait| {
+                    if (trait.kind == .trait_) {
+                        @constCast(path.segments)[1].id = trait_id;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if (!activeGenericParam(g, bodies_list, owner_id, extra_generic_params, first)) return;
+
+    if (path.segments.len > 2) {
+        const terminal = path.segments[path.segments.len - 1].name;
+        var trait_id = genericBoundTrait(
+            g,
+            bodies_list,
+            owner_id,
+            extra_generic_params,
+            first,
+            path.segments[1].name,
+            terminal,
+        );
+        if (trait_id == null) {
+            const module_id = owningModule(g, owner_id) orelse return;
+            if (resolveModuleItem(g, module_id, path.segments[1].name)) |resolved_id| {
+                if (g.symbol_table.get(resolved_id)) |trait| {
+                    if (trait.kind == .trait_) trait_id = resolved_id;
+                }
+            }
+        }
+        if (trait_id) |id| @constCast(path.segments)[1].id = id;
+        return;
+    }
+
+    // Rust also permits the shorthand `T::Assoc`. Canonicalize it to the
+    // three-segment projection expected by the backend without replacing the
+    // generic receiver with a bound trait or concrete type.
+    if (path.segments.len == 2) {
+        const associated_name = path.segments[1].name;
+        const trait_id = genericBoundTrait(
+            g,
+            bodies_list,
+            owner_id,
+            extra_generic_params,
+            first,
+            null,
+            associated_name,
+        ) orelse return;
+        const trait = g.symbol_table.get(trait_id) orelse return;
+        const old_segments = path.segments;
+        const expanded = try g.allocator.alloc(types.PathSegment, 3);
+        expanded[0] = old_segments[0];
+        expanded[1] = .{ .name = trait.name, .id = trait_id };
+        expanded[2] = old_segments[1];
+        path.segments = expanded;
+        g.allocator.free(old_segments);
+    }
 }
 
 fn bindPath(
@@ -940,24 +1532,31 @@ fn bindPath(
     path: *types.Path,
 ) DeclarationTypeError!void {
     if (path.segments.len == 0) return error.UnresolvedNominalType;
-    var current = owningModule(g, owner_id) orelse return error.UnresolvedNominalType;
     var index: usize = 0;
     const first_name = path.segments[0].name;
 
     if (std.mem.eql(u8, first_name, "Self")) {
-        if (path.segments.len != 1) return error.UnresolvedNominalType;
-        const self_id = selfTypeEntity(g, owner_id) orelse return error.UnresolvedNominalType;
-        @constCast(path.segments)[0].id = self_id;
+        if (path.segments.len == 1) {
+            const self_id = selfTypeEntity(g, owner_id);
+            if (self_id) |id| {
+                @constCast(path.segments)[0].id = id;
+                return;
+            }
+            if (containingImpl(g, owner_id)) |_| return;
+            if (containingTrait(g, owner_id)) |_| return;
+            return error.UnresolvedNominalType;
+        }
+        try bindProjectionPath(g, bodies_list, owner_id, extra_generic_params, path);
         return;
     }
-    if (path.segments.len == 1 and
-        activeGenericParam(g, bodies_list, owner_id, extra_generic_params, first_name))
-    {
-        // Type parameters are lexical names, not graph entities. They remain
-        // null-id paths only while their declaration scope is active.
+    if (activeGenericParam(g, bodies_list, owner_id, extra_generic_params, first_name)) {
         @constCast(path.segments)[0].id = null;
+        if (path.segments.len > 1) {
+            try bindProjectionPath(g, bodies_list, owner_id, extra_generic_params, path);
+        }
         return;
     }
+    var current = owningModule(g, owner_id) orelse return error.UnresolvedNominalType;
     if (std.mem.eql(u8, first_name, "crate")) {
         current = rootModuleEntity(g) orelse return error.UnresolvedNominalType;
         index = 1;
@@ -1028,13 +1627,50 @@ fn bindType(
     ty: *types.Type,
 ) DeclarationTypeError!void {
     switch (ty.*) {
-        .path => |*path| try bindPath(
-            g,
-            bodies_list,
-            owner_id,
-            extra_generic_params,
-            path,
-        ),
+        .path => |*path| {
+            if (path.segments.len == 2 and
+                std.mem.eql(u8, path.segments[0].name, "Self"))
+            {
+                if (associatedAliasTarget(g, bodies_list, owner_id, path.segments[path.segments.len - 1].name)) |target| {
+                    ty.* = target;
+                    try bindType(
+                        g,
+                        bodies_list,
+                        owner_id,
+                        extra_generic_params,
+                        pending,
+                        ty,
+                    );
+                    return;
+                }
+            }
+            if (path.segments.len == 1 and std.mem.eql(u8, path.segments[0].name, "Self")) {
+                if (implSelfType(g, bodies_list, owner_id)) |self_ty| {
+                    ty.* = self_ty;
+                    try bindType(
+                        g,
+                        bodies_list,
+                        owner_id,
+                        extra_generic_params,
+                        pending,
+                        ty,
+                    );
+                    return;
+                }
+            }
+            if (bindPath(g, bodies_list, owner_id, extra_generic_params, path)) {} else |err| switch (err) {
+                error.UnresolvedNominalType => {
+                    if (path.segments.len == 1) {
+                        if (preludePathSegments(g.allocator, path.segments[0].name) catch null) |prelude_segs| {
+                            path.segments = prelude_segs;
+                            return;
+                        }
+                    }
+                    return err;
+                },
+                else => return err,
+            }
+        },
         .reference => |reference| {
             const mutable_reference = @constCast(reference);
             try bindType(
@@ -1086,10 +1722,7 @@ fn bindType(
         },
         .external_nominal => |external| {
             if (external.path.len == 0) return error.InvalidNominalType;
-            if (!std.mem.eql(u8, external.path[0], "core") and
-                !std.mem.eql(u8, external.path[0], "std") and
-                !std.mem.eql(u8, external.path[0], "alloc"))
-            {
+            if (!isKnownExternalCrate(g, external.path[0])) {
                 return error.UnresolvedNominalType;
             }
             for (external.path) |segment| {
@@ -1161,7 +1794,83 @@ fn bindType(
             const mutable_inner = @constCast(inner);
             try bindType(g, bodies_list, owner_id, extra_generic_params, pending, mutable_inner);
         },
+        .@"opaque" => |*opaque_type| {
+            for (@constCast(opaque_type.bounds)) |*bound| {
+                try bindBound(
+                    g,
+                    bodies_list,
+                    owner_id,
+                    extra_generic_params,
+                    pending,
+                    bound,
+                );
+            }
+            if (opaque_type.concrete) |concrete| {
+                try bindType(
+                    g,
+                    bodies_list,
+                    owner_id,
+                    extra_generic_params,
+                    pending,
+                    @constCast(concrete),
+                );
+            }
+        },
+        .dyn_trait => |bounds| {
+            for (@constCast(bounds)) |*bound| {
+                try bindBound(
+                    g,
+                    bodies_list,
+                    owner_id,
+                    extra_generic_params,
+                    pending,
+                    bound,
+                );
+            }
+        },
         .prim, .unsupported => {},
+    }
+}
+
+fn bindBound(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    pending: []const PendingGenericApplication,
+    bound: *types.Bound,
+) DeclarationTypeError!void {
+    if (bindPath(
+        g,
+        bodies_list,
+        owner_id,
+        extra_generic_params,
+        &bound.path,
+    )) {} else |err| switch (err) {
+        error.UnresolvedNominalType => {
+            if (bound.path.segments.len == 1) {
+                if (preludePathSegments(
+                    g.allocator,
+                    bound.path.segments[0].name,
+                ) catch null) |prelude_segs| {
+                    bound.path.segments = prelude_segs;
+                }
+            }
+        },
+        else => return err,
+    }
+    for (@constCast(bound.args)) |*arg| {
+        try bindType(g, bodies_list, owner_id, extra_generic_params, pending, arg);
+    }
+    for (@constCast(bound.associated_types)) |*associated_type| {
+        try bindType(
+            g,
+            bodies_list,
+            owner_id,
+            extra_generic_params,
+            pending,
+            &associated_type.ty,
+        );
     }
 }
 
@@ -1190,6 +1899,62 @@ fn bindFields(
         try bindType(g, bodies_list, owner_id, extra_generic_params, pending, &field.ty);
     }
 }
+fn bindGenerics(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    pending: []const PendingGenericApplication,
+    generics: *types.Generics,
+) DeclarationTypeError!void {
+    for (@constCast(generics.params)) |*param| {
+        switch (param.*) {
+            .type_ => |*type_param| {
+                for (@constCast(type_param.bounds)) |*bound| {
+                    try bindBound(
+                        g,
+                        bodies_list,
+                        owner_id,
+                        extra_generic_params,
+                        pending,
+                        bound,
+                    );
+                }
+            },
+            .const_ => |*const_param| try bindType(
+                g,
+                bodies_list,
+                owner_id,
+                extra_generic_params,
+                pending,
+                &const_param.ty,
+            ),
+            .lifetime => {},
+        }
+    }
+    for (@constCast(generics.where_clauses)) |*clause| {
+        bindPath(
+            g,
+            bodies_list,
+            owner_id,
+            extra_generic_params,
+            &clause.self_ty,
+        ) catch |err| switch (err) {
+            error.UnresolvedNominalType => {},
+            else => return err,
+        };
+        for (@constCast(clause.bounds)) |*bound| {
+            try bindBound(
+                g,
+                bodies_list,
+                owner_id,
+                extra_generic_params,
+                pending,
+                bound,
+            );
+        }
+    }
+}
 
 /// Bind every declaration-owned nominal type path after the complete CST graph
 /// exists. Body lowering must run only after this pass succeeds.
@@ -1210,6 +1975,16 @@ pub fn bindDeclarationTypes(
                 &constant.ty,
             ),
             .fn_ => |*function| {
+                if (function.generics) |*generics| {
+                    try bindGenerics(
+                        g,
+                        body_slice,
+                        @intCast(owner_id),
+                        &.{},
+                        pending,
+                        generics,
+                    );
+                }
                 try bindParams(
                     g,
                     body_slice,
@@ -1237,10 +2012,25 @@ pub fn bindDeclarationTypes(
                     structure.fields,
                 );
                 for (@constCast(structure.methods)) |*method| {
+                    const method_owner_id: spine.EntityId = owningImplForStructMethod(
+                        g,
+                        @intCast(owner_id),
+                        method.name,
+                    ) orelse @intCast(owner_id);
+                    if (method.generics) |*generics| {
+                        try bindGenerics(
+                            g,
+                            body_slice,
+                            method_owner_id,
+                            method.generic_params,
+                            pending,
+                            generics,
+                        );
+                    }
                     try bindParams(
                         g,
                         body_slice,
-                        @intCast(owner_id),
+                        method_owner_id,
                         method.generic_params,
                         pending,
                         method.params,
@@ -1248,7 +2038,7 @@ pub fn bindDeclarationTypes(
                     try bindType(
                         g,
                         body_slice,
-                        @intCast(owner_id),
+                        method_owner_id,
                         method.generic_params,
                         pending,
                         &method.ret,
@@ -1283,12 +2073,32 @@ pub fn bindDeclarationTypes(
                 }
             },
             .trait_ => |*trait_body| {
-                for (@constCast(trait_body.methods)) |*method| {
-                    try bindParams(
+                if (trait_body.generics) |*generics| {
+                    try bindGenerics(
                         g,
                         body_slice,
                         @intCast(owner_id),
                         &.{},
+                        pending,
+                        generics,
+                    );
+                }
+                for (@constCast(trait_body.methods)) |*method| {
+                    if (method.generics) |*generics| {
+                        try bindGenerics(
+                            g,
+                            body_slice,
+                            @intCast(owner_id),
+                            method.generic_params,
+                            pending,
+                            generics,
+                        );
+                    }
+                    try bindParams(
+                        g,
+                        body_slice,
+                        @intCast(owner_id),
+                        method.generic_params,
                         pending,
                         method.params,
                     );
@@ -1296,10 +2106,79 @@ pub fn bindDeclarationTypes(
                         g,
                         body_slice,
                         @intCast(owner_id),
-                        &.{},
+                        method.generic_params,
                         pending,
                         &method.ret,
                     );
+                }
+                for (@constCast(trait_body.assoc_types)) |*assoc| {
+                    if (assoc.default) |*default| {
+                        try bindType(
+                            g,
+                            body_slice,
+                            @intCast(owner_id),
+                            &.{},
+                            pending,
+                            default,
+                        );
+                    }
+                }
+                for (@constCast(trait_body.assoc_consts)) |*assoc| {
+                    try bindType(
+                        g,
+                        body_slice,
+                        @intCast(owner_id),
+                        &.{},
+                        pending,
+                        &assoc.ty,
+                    );
+                }
+            },
+            .impl_ => |*impl_body| {
+                if (impl_body.generics) |*generics| {
+                    try bindGenerics(
+                        g,
+                        body_slice,
+                        @intCast(owner_id),
+                        &.{},
+                        pending,
+                        generics,
+                    );
+                }
+                bindType(
+                    g,
+                    body_slice,
+                    @intCast(owner_id),
+                    &.{},
+                    pending,
+                    &impl_body.self_ty,
+                ) catch |err| switch (err) {
+                    error.UnresolvedNominalType, error.InvalidNominalType => {},
+                    else => return err,
+                };
+                if (impl_body.trait_path) |*trait_path| {
+                    if (bindPath(
+                        g,
+                        body_slice,
+                        @intCast(owner_id),
+                        &.{},
+                        trait_path,
+                    )) {} else |err| switch (err) {
+                        error.UnresolvedNominalType => {
+                            if (trait_path.segments.len == 1) {
+                                if (preludePathSegments(g.allocator, trait_path.segments[0].name) catch null) |prelude_segs| {
+                                    trait_path.segments = prelude_segs;
+                                }
+                            }
+                        },
+                        else => return err,
+                    }
+                    for (@constCast(impl_body.trait_args)) |*arg| {
+                        try bindType(g, body_slice, @intCast(owner_id), &.{}, pending, arg);
+                    }
+                    for (@constCast(impl_body.trait_associated_types)) |*assoc| {
+                        try bindType(g, body_slice, @intCast(owner_id), &.{}, pending, &assoc.ty);
+                    }
                 }
             },
             .type_alias => |*alias| try bindType(
@@ -1344,6 +2223,259 @@ fn collectFunctionGenericParams(e: *Ctx, item: ts.Node) ![]const []const u8 {
         }
     }
     return params.toOwnedSlice(e.alloc);
+}
+
+fn boundPathFromType(e: *Ctx, ty: types.Type) ?types.Path {
+    return switch (ty) {
+        .path => |path| path,
+        .external_nominal => |external| blk: {
+            var copied = e.alloc.alloc(types.PathSegment, external.path.len) catch break :blk null;
+            for (external.path, 0..) |name, index| {
+                copied[index] = .{ .name = name, .id = null };
+            }
+            break :blk .{ .segments = copied };
+        },
+        else => null,
+    };
+}
+
+fn parseTraitBound(e: *Ctx, node: ts.Node) !?types.Bound {
+    var actual_node = node;
+    var optional = false;
+    if (std.mem.eql(u8, node.kind(), "removed_trait_bound")) {
+        optional = true;
+        var i: u32 = 0;
+        var found: ?ts.Node = null;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            found = child;
+            break;
+        }
+        actual_node = found orelse return null;
+    }
+    if (std.mem.eql(u8, actual_node.kind(), "lifetime")) return null;
+
+    var args_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer args_list.deinit(e.alloc);
+    var assoc_list: std.ArrayListUnmanaged(types.AssociatedTypeBinding) = .empty;
+    errdefer assoc_list.deinit(e.alloc);
+
+    var trait_node = actual_node;
+    if (std.mem.eql(u8, actual_node.kind(), "generic_type")) {
+        trait_node = actual_node.childByFieldName("type") orelse return error.InvalidType;
+        const args_node = actual_node.childByFieldName("type_arguments") orelse
+            return error.InvalidType;
+        var i: u32 = 0;
+        while (args_node.namedChild(i)) |arg_child| : (i += 1) {
+            const arg_kind = arg_child.kind();
+            if (std.mem.eql(u8, arg_kind, "lifetime")) continue;
+            if (std.mem.eql(u8, arg_kind, "type_binding")) {
+                if (arg_child.childByFieldName("type_arguments") != null) {
+                    return error.InvalidType;
+                }
+                const binding_name = arg_child.childByFieldName("name") orelse
+                    return error.InvalidType;
+                const binding_type = arg_child.childByFieldName("type") orelse
+                    return error.InvalidType;
+                try assoc_list.append(e.alloc, .{
+                    .name = try e.alloc.dupe(u8, text(e, binding_name)),
+                    .ty = try mapType(e, binding_type),
+                });
+            } else {
+                const arg_ty = try mapType(e, arg_child);
+                try args_list.append(e.alloc, arg_ty);
+            }
+        }
+    }
+
+    const mapped_trait = try mapType(e, trait_node);
+    var bound_path: types.Path = boundPathFromType(e, mapped_trait) orelse blk: {
+        const segs = try mapScopedSegments(e, trait_node);
+        break :blk .{ .segments = segs };
+    };
+    if (bound_path.segments.len == 1) {
+        if (preludePathSegments(e.alloc, bound_path.segments[0].name) catch null) |prelude_segs| {
+            bound_path.segments = prelude_segs;
+        }
+    }
+
+    return .{
+        .path = bound_path,
+        .args = try args_list.toOwnedSlice(e.alloc),
+        .associated_types = try assoc_list.toOwnedSlice(e.alloc),
+        .optional = optional,
+    };
+}
+
+fn appendTraitTypeBounds(
+    e: *Ctx,
+    node: ts.Node,
+    bounds: *std.ArrayListUnmanaged(types.Bound),
+) !void {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "lifetime")) return;
+    if (std.mem.eql(u8, kind, "bounded_type") or
+        std.mem.eql(u8, kind, "trait_bounds") or
+        std.mem.eql(u8, kind, "type_bound"))
+    {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            try appendTraitTypeBounds(e, child, bounds);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, kind, "dynamic_type")) {
+        const trait_node = node.childByFieldName("trait") orelse return error.InvalidType;
+        try appendTraitTypeBounds(e, trait_node, bounds);
+        return;
+    }
+    if (std.mem.eql(u8, kind, "higher_ranked_trait_bound") or
+        std.mem.eql(u8, kind, "use_bounds"))
+    {
+        return error.InvalidType;
+    }
+    const bound = (try parseTraitBound(e, node)) orelse return error.InvalidType;
+    try bounds.append(e.alloc, bound);
+}
+
+fn collectTraitTypeBounds(e: *Ctx, node: ts.Node) ![]const types.Bound {
+    var bounds: std.ArrayListUnmanaged(types.Bound) = .empty;
+    errdefer bounds.deinit(e.alloc);
+    try appendTraitTypeBounds(e, node, &bounds);
+    return bounds.toOwnedSlice(e.alloc);
+}
+
+fn collectGenericBounds(e: *Ctx, node: ts.Node) ![]const types.Bound {
+    if (std.mem.eql(u8, node.kind(), "trait_bounds")) {
+        return collectTraitTypeBounds(e, node);
+    }
+    var bounds: std.ArrayListUnmanaged(types.Bound) = .empty;
+    errdefer bounds.deinit(e.alloc);
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        const kind = child.kind();
+        if (std.mem.eql(u8, kind, "trait_bounds") or
+            std.mem.eql(u8, kind, "type_bound"))
+        {
+            try appendTraitTypeBounds(e, child, &bounds);
+        }
+    }
+    return bounds.toOwnedSlice(e.alloc);
+}
+
+fn collectWhereClause(
+    e: *Ctx,
+    where_node: ts.Node,
+    where_clauses: *std.ArrayListUnmanaged(types.WhereClause),
+) !void {
+    var i: u32 = 0;
+    while (where_node.namedChild(i)) |predicate| : (i += 1) {
+        if (!std.mem.eql(u8, predicate.kind(), "where_predicate")) continue;
+        const left_node = predicate.childByFieldName("left") orelse
+            (if (predicate.namedChildCount() > 0) predicate.namedChild(0) else null) orelse continue;
+        if (std.mem.eql(u8, left_node.kind(), "lifetime")) continue;
+        const left_type = try mapType(e, left_node);
+        const self_path = boundPathFromType(e, left_type) orelse return error.InvalidType;
+        const bounds_node = predicate.childByFieldName("bounds") orelse blk: {
+            var j: u32 = 0;
+            while (predicate.namedChild(j)) |c| : (j += 1) {
+                if (std.mem.eql(u8, c.kind(), "trait_bounds")) break :blk c;
+            }
+            break :blk null;
+        };
+        const clause_bounds = if (bounds_node) |bn|
+            try collectGenericBounds(e, bn)
+        else
+            &[_]types.Bound{};
+        try where_clauses.append(e.alloc, .{
+            .self_ty = self_path,
+            .bounds = clause_bounds,
+        });
+    }
+}
+
+fn collectGenericsWithSelfBounds(
+    e: *Ctx,
+    item: ts.Node,
+    self_bounds: []const types.Bound,
+) !?types.Generics {
+    var params: std.ArrayListUnmanaged(types.GenericParam) = .empty;
+    errdefer params.deinit(e.alloc);
+    var where_clauses: std.ArrayListUnmanaged(types.WhereClause) = .empty;
+    errdefer where_clauses.deinit(e.alloc);
+    var found = false;
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        const ck = child.kind();
+        if (std.mem.eql(u8, ck, "type_parameters")) {
+            var j: u32 = 0;
+            while (child.namedChild(j)) |parameter| : (j += 1) {
+                const kind = parameter.kind();
+                if (std.mem.eql(u8, kind, "type_parameter")) {
+                    var name: []const u8 = "";
+                    var k: u32 = 0;
+                    while (parameter.namedChild(k)) |part| : (k += 1) {
+                        if (std.mem.eql(u8, part.kind(), "type_identifier")) {
+                            name = text(e, part);
+                            break;
+                        }
+                    }
+                    if (name.len == 0) continue;
+                    try params.append(e.alloc, .{ .type_ = .{
+                        .name = try e.alloc.dupe(u8, name),
+                        .bounds = try collectGenericBounds(e, parameter),
+                    } });
+                    found = true;
+                } else if (std.mem.eql(u8, kind, "const_parameter")) {
+                    var name: []const u8 = "";
+                    var ty_node: ?ts.Node = parameter.childByFieldName("type");
+                    var k: u32 = 0;
+                    while (parameter.namedChild(k)) |part| : (k += 1) {
+                        if (std.mem.eql(u8, part.kind(), "identifier")) name = text(e, part);
+                        if (ty_node == null and std.mem.eql(u8, part.kind(), "type")) ty_node = part;
+                    }
+                    if (name.len == 0 or ty_node == null) continue;
+                    try params.append(e.alloc, .{ .const_ = .{
+                        .name = try e.alloc.dupe(u8, name),
+                        .ty = try mapType(e, ty_node.?),
+                    } });
+                    found = true;
+                } else if (std.mem.eql(u8, kind, "lifetime_parameter")) {
+                    try params.append(e.alloc, .{ .lifetime = .{
+                        .name = try e.alloc.dupe(u8, text(e, parameter)),
+                    } });
+                    found = true;
+                }
+            }
+        } else if (std.mem.eql(u8, ck, "where_clause")) {
+            try collectWhereClause(e, child, &where_clauses);
+            found = true;
+        }
+    }
+    if (self_bounds.len > 0) {
+        const self_segments = try e.alloc.alloc(types.PathSegment, 1);
+        self_segments[0] = .{
+            .name = try e.alloc.dupe(u8, "Self"),
+            .id = null,
+        };
+        try where_clauses.append(e.alloc, .{
+            .self_ty = .{ .segments = self_segments },
+            .bounds = self_bounds,
+        });
+        found = true;
+    }
+    if (!found) {
+        params.deinit(e.alloc);
+        where_clauses.deinit(e.alloc);
+        return null;
+    }
+    return .{
+        .params = try params.toOwnedSlice(e.alloc),
+        .where_clauses = try where_clauses.toOwnedSlice(e.alloc),
+    };
+}
+
+fn collectGenerics(e: *Ctx, item: ts.Node) !?types.Generics {
+    return collectGenericsWithSelfBounds(e, item, &.{});
 }
 
 // ── item lowering ────────────────────────────────────────────────────────────
@@ -1392,7 +2524,12 @@ fn mapFields(e: *Ctx, node: ts.Node) ![]const items.Field {
                 std.mem.eql(u8, k, "type_identifier") or
                 std.mem.eql(u8, k, "scoped_type_identifier") or
                 std.mem.eql(u8, k, "reference_type") or
-                std.mem.eql(u8, k, "array_type"))
+                std.mem.eql(u8, k, "array_type") or
+                std.mem.eql(u8, k, "tuple_type") or
+                std.mem.eql(u8, k, "unit_type") or
+                std.mem.eql(u8, k, "abstract_type") or
+                std.mem.eql(u8, k, "dynamic_type") or
+                std.mem.eql(u8, k, "bounded_type"))
             {
                 fty = try mapType(e, cc);
             }
@@ -1556,59 +2693,172 @@ fn unionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
 }
 
 /// Map a `parameters` node into `items.Param` entries. Handles `self_parameter`
-/// and `parameter` nodes, extracting the bound name from an `identifier` or a
-/// `pattern` (including `mut` / destructured patterns).
+/// and `parameter` nodes, preserving source bindings through a synthetic outer
+/// name for nontrivial patterns.
+fn isParameterPatternKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "pattern") or
+        std.mem.eql(u8, kind, "mut_pattern") or
+        std.mem.eql(u8, kind, "tuple_pattern") or
+        std.mem.eql(u8, kind, "struct_pattern") or
+        std.mem.eql(u8, kind, "tuple_struct_pattern") or
+        std.mem.eql(u8, kind, "reference_pattern") or
+        std.mem.eql(u8, kind, "wildcard_pattern") or
+        std.mem.eql(u8, kind, "or_pattern") or
+        std.mem.eql(u8, kind, "slice_pattern") or
+        std.mem.eql(u8, kind, "literal_pattern") or
+        std.mem.eql(u8, kind, "scoped_identifier") or
+        std.mem.eql(u8, kind, "char_literal");
+}
+
+fn parameterPatternNode(node: ts.Node) ?ts.Node {
+    if (std.mem.eql(u8, node.kind(), "self_parameter")) return null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "identifier") or
+            isParameterPatternKind(child.kind()))
+        {
+            return child;
+        }
+    }
+    return null;
+}
+
+fn plainParameterName(e: *const Ctx, node: ts.Node) ?[]const u8 {
+    if (std.mem.eql(u8, node.kind(), "identifier")) return text(e, node);
+    if (!std.mem.eql(u8, node.kind(), "pattern") or node.namedChildCount() != 1) return null;
+    return plainParameterName(e, node.namedChild(0).?);
+}
+
+fn collectParameterPatternNames(
+    e: *const Ctx,
+    node: ts.Node,
+    pattern_names: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    if (std.mem.eql(u8, node.kind(), "identifier")) {
+        try pattern_names.append(e.alloc, text(e, node));
+    }
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        try collectParameterPatternNames(e, child, pattern_names);
+    }
+}
+
+fn syntheticParameterName(
+    e: *Ctx,
+    ordinal: usize,
+    source_names: []const []const u8,
+) ![]const u8 {
+    var candidate = try std.fmt.allocPrint(e.alloc, "__r2z_param_{d}", .{ordinal});
+    while (true) {
+        var collision = false;
+        for (source_names) |source_name| {
+            if (std.mem.eql(u8, candidate, source_name)) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision) return candidate;
+        const extended = try std.fmt.allocPrint(e.alloc, "{s}_", .{candidate});
+        e.alloc.free(candidate);
+        candidate = extended;
+    }
+}
+
+fn selfParameterType(e: *Ctx, node: ts.Node) !types.Type {
+    var borrowed = false;
+    var mutable = false;
+    var i: u32 = 0;
+    while (node.child(i)) |child| : (i += 1) {
+        const kind = child.kind();
+        if (std.mem.eql(u8, kind, "&")) borrowed = true;
+        if (std.mem.eql(u8, kind, "mutable_specifier")) mutable = true;
+    }
+
+    const segments = try e.alloc.alloc(types.PathSegment, 1);
+    errdefer e.alloc.free(segments);
+    segments[0] = .{ .name = "Self", .id = null };
+    const self_type: types.Type = .{ .path = .{ .segments = segments } };
+    if (!borrowed) return self_type;
+
+    const reference = try e.alloc.create(types.Ref);
+    reference.* = .{ .mut = mutable, .pointee = self_type };
+    return .{ .reference = reference };
+}
+
 fn mapParams(e: *Ctx, params_node: ?ts.Node) ![]const items.Param {
     var params: std.ArrayListUnmanaged(items.Param) = .empty;
     errdefer params.deinit(e.alloc);
+    var source_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer source_names.deinit(e.alloc);
+
     if (params_node) |pn| {
         var j: u32 = 0;
+        while (pn.namedChild(j)) |p| : (j += 1) {
+            if (!std.mem.eql(u8, p.kind(), "parameter")) continue;
+            if (parameterPatternNode(p)) |pattern| {
+                try collectParameterPatternNames(e, pattern, &source_names);
+            }
+        }
+
+        var nonself_ordinal: usize = 0;
+        j = 0;
         while (pn.namedChild(j)) |p| : (j += 1) {
             const pk = p.kind();
             if (!std.mem.eql(u8, pk, "parameter") and !std.mem.eql(u8, pk, "self_parameter")) continue;
             var pname: ?[]const u8 = null;
             var pty: ?types.Type = null;
-            if (std.mem.eql(u8, pk, "self_parameter")) {
+            var is_self = std.mem.eql(u8, pk, "self_parameter");
+            if (is_self) {
                 pname = "self";
-                const r = try e.alloc.create(types.Ref);
-                r.* = .{ .mut = false, .pointee = .{ .prim = .unit } };
-                pty = .{ .reference = r };
+                pty = try selfParameterType(e, p);
             }
             var k: u32 = 0;
             while (p.namedChild(k)) |c| : (k += 1) {
                 const kk = c.kind();
                 if (std.mem.eql(u8, kk, "identifier")) {
                     if (pname == null) pname = text(e, c);
-                } else if (std.mem.eql(u8, kk, "pattern") or
-                    std.mem.eql(u8, kk, "mut_pattern") or
-                    std.mem.eql(u8, kk, "reference_pattern"))
-                {
-                    if (pname == null) {
-                        var m: u32 = 0;
-                        while (c.namedChild(m)) |cc| : (m += 1) {
-                            if (std.mem.eql(u8, cc.kind(), "identifier")) {
-                                pname = text(e, cc);
-                                break;
-                            }
-                        }
-                    }
+                } else if (std.mem.eql(u8, kk, "self")) {
+                    pname = "self";
+                    is_self = true;
                 } else if (std.mem.eql(u8, kk, "type") or
                     std.mem.eql(u8, kk, "primitive_type") or
                     std.mem.eql(u8, kk, "reference_type") or
+                    std.mem.eql(u8, kk, "pointer_type") or
                     std.mem.eql(u8, kk, "generic_type") or
                     std.mem.eql(u8, kk, "type_identifier") or
                     std.mem.eql(u8, kk, "scoped_type_identifier") or
                     std.mem.eql(u8, kk, "array_type") or
                     std.mem.eql(u8, kk, "slice_type") or
                     std.mem.eql(u8, kk, "tuple_type") or
-                    std.mem.eql(u8, kk, "unit_type"))
+                    std.mem.eql(u8, kk, "unit_type") or
+                    std.mem.eql(u8, kk, "abstract_type") or
+                    std.mem.eql(u8, kk, "dynamic_type") or
+                    std.mem.eql(u8, kk, "bounded_type"))
                 {
                     pty = try mapType(e, c);
                 }
             }
+            var synthetic_name = false;
+            if (!is_self) {
+                const pattern = parameterPatternNode(p);
+                if (pattern) |pattern_node| {
+                    pname = plainParameterName(e, pattern_node);
+                    if (pname == null) {
+                        pname = try syntheticParameterName(e, nonself_ordinal, source_names.items);
+                        synthetic_name = true;
+                    }
+                } else if (pname == null) {
+                    pname = try syntheticParameterName(e, nonself_ordinal, source_names.items);
+                    synthetic_name = true;
+                }
+                nonself_ordinal += 1;
+            }
             const param_name = pname orelse return error.MalformedParameter;
             const param_ty = pty orelse return error.MalformedParameter;
-            const name_copy = try e.alloc.dupe(u8, param_name);
+            const name_copy = if (synthetic_name)
+                param_name
+            else
+                try e.alloc.dupe(u8, param_name);
             errdefer e.alloc.free(name_copy);
             try params.append(e.alloc, .{
                 .name = name_copy,
@@ -1621,6 +2871,98 @@ fn mapParams(e: *Ctx, params_node: ?ts.Node) ![]const items.Param {
     return mapped_params;
 }
 
+fn traitAssocType(e: *Ctx, item: ts.Node) !items.AssocType {
+    var name: []const u8 = "";
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "type_identifier")) {
+            name = text(e, child);
+            break;
+        }
+    }
+    if (name.len == 0) return error.MalformedItemName;
+    var default_node = item.childByFieldName("type");
+    if (default_node == null and std.mem.indexOfScalar(u8, text(e, item), '=') != null) {
+        var child_index: u32 = 0;
+        while (item.namedChild(child_index)) |child| : (child_index += 1) {
+            const kind = child.kind();
+            if (std.mem.eql(u8, kind, "type") or
+                std.mem.eql(u8, kind, "primitive_type") or
+                std.mem.eql(u8, kind, "generic_type") or
+                std.mem.eql(u8, kind, "type_identifier") or
+                std.mem.eql(u8, kind, "scoped_type_identifier") or
+                std.mem.eql(u8, kind, "reference_type") or
+                std.mem.eql(u8, kind, "array_type") or
+                std.mem.eql(u8, kind, "slice_type") or
+                std.mem.eql(u8, kind, "tuple_type") or
+                std.mem.eql(u8, kind, "unit_type") or
+                std.mem.eql(u8, kind, "abstract_type") or
+                std.mem.eql(u8, kind, "dynamic_type") or
+                std.mem.eql(u8, kind, "bounded_type"))
+            {
+                default_node = child;
+            }
+        }
+    }
+    const default_type = if (default_node) |node|
+        try mapType(e, node)
+    else
+        null;
+    return .{
+        .name = try e.alloc.dupe(u8, name),
+        .generics = null,
+        .bounds = try collectGenericBounds(e, item),
+        .default = default_type,
+    };
+}
+
+fn traitAssocConst(e: *Ctx, item: ts.Node) !bodies.TraitAssocConst {
+    var name: []const u8 = "";
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "identifier")) {
+            name = text(e, child);
+            break;
+        }
+    }
+    if (name.len == 0) return error.MalformedItemName;
+    var type_node = item.childByFieldName("type");
+    if (type_node == null) {
+        var saw_name = false;
+        var child_index: u32 = 0;
+        while (item.namedChild(child_index)) |child| : (child_index += 1) {
+            const kind = child.kind();
+            if (std.mem.eql(u8, kind, "identifier") and !saw_name) {
+                saw_name = true;
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "type") or
+                std.mem.eql(u8, kind, "primitive_type") or
+                std.mem.eql(u8, kind, "generic_type") or
+                std.mem.eql(u8, kind, "type_identifier") or
+                std.mem.eql(u8, kind, "scoped_type_identifier") or
+                std.mem.eql(u8, kind, "reference_type") or
+                std.mem.eql(u8, kind, "array_type") or
+                std.mem.eql(u8, kind, "slice_type") or
+                std.mem.eql(u8, kind, "tuple_type") or
+                std.mem.eql(u8, kind, "unit_type") or
+                std.mem.eql(u8, kind, "abstract_type") or
+                std.mem.eql(u8, kind, "dynamic_type") or
+                std.mem.eql(u8, kind, "bounded_type"))
+            {
+                type_node = child;
+                break;
+            }
+        }
+    }
+    const type_node_value = type_node orelse return error.MalformedConstType;
+    return .{
+        .name = try e.alloc.dupe(u8, name),
+        .ty = try mapType(e, type_node_value),
+        .default = null,
+    };
+}
+
 fn traitItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     var name: []const u8 = "";
     var decls: ?ts.Node = null;
@@ -1631,52 +2973,93 @@ fn traitItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     }
     const eid = try nominalEntity(e, .trait_, name, parent, item);
     e.declaration_owner = eid;
+    const trait_generic_params = try collectFunctionGenericParams(e, item);
     var methods: std.ArrayListUnmanaged(bodies.TraitMethodSig) = .empty;
-    errdefer methods.deinit(e.alloc);
+    var assoc_types: std.ArrayListUnmanaged(items.AssocType) = .empty;
+    var assoc_consts: std.ArrayListUnmanaged(bodies.TraitAssocConst) = .empty;
+    var supertraits: std.ArrayListUnmanaged([]const u8) = .empty;
+    var supertrait_bounds: std.ArrayListUnmanaged(types.Bound) = .empty;
+    errdefer {
+        methods.deinit(e.alloc);
+        assoc_types.deinit(e.alloc);
+        assoc_consts.deinit(e.alloc);
+        supertraits.deinit(e.alloc);
+        supertrait_bounds.deinit(e.alloc);
+    }
+    var s: u32 = 0;
+    while (item.namedChild(s)) |child| : (s += 1) {
+        const ck = child.kind();
+        if (std.mem.eql(u8, ck, "trait_bounds")) {
+            try appendTraitTypeBounds(e, child, &supertrait_bounds);
+            var b: u32 = 0;
+            while (child.namedChild(b)) |bound| : (b += 1) {
+                if (std.mem.eql(u8, bound.kind(), "lifetime")) continue;
+                try supertraits.append(e.alloc, try e.alloc.dupe(u8, text(e, bound)));
+            }
+        } else if (std.mem.eql(u8, ck, "type_bound")) {
+            try appendTraitTypeBounds(e, child, &supertrait_bounds);
+            try supertraits.append(e.alloc, try e.alloc.dupe(u8, text(e, child)));
+        }
+    }
+    const typed_supertraits = try supertrait_bounds.toOwnedSlice(e.alloc);
+    const trait_generics = try collectGenericsWithSelfBounds(e, item, typed_supertraits);
     if (decls) |dl| {
         var j: u32 = 0;
         while (dl.namedChild(j)) |m| : (j += 1) {
-            if (!std.mem.eql(u8, m.kind(), "function_signature_item")) continue;
-            var mname: []const u8 = "";
-            var mparams_node: ?ts.Node = null;
-            var k: u32 = 0;
-            while (m.namedChild(k)) |c| : (k += 1) {
-                const kk = c.kind();
-                if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
-                if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
-            }
-            if (mname.len == 0) return error.MalformedItemName;
-            const mret = try mapReturnType(e, m);
-            const mparams = try mapParams(e, mparams_node);
-            var receiver: items.Receiver = .ref_;
-            var params = mparams;
-            if (mparams.len > 0 and std.mem.eql(u8, mparams[0].name, "self")) {
-                if (mparams[0].ty == .reference) {
-                    if (mparams[0].ty.reference.*.mut) {
-                        receiver = .mut_ref;
-                    } else {
-                        receiver = .ref_;
-                    }
-                } else {
-                    receiver = .owned;
+            if (std.mem.eql(u8, m.kind(), "function_signature_item")) {
+                var mname: []const u8 = "";
+                var mparams_node: ?ts.Node = null;
+                var k: u32 = 0;
+                while (m.namedChild(k)) |c| : (k += 1) {
+                    const kk = c.kind();
+                    if (std.mem.eql(u8, kk, "identifier")) mname = text(e, c);
+                    if (std.mem.eql(u8, kk, "parameters")) mparams_node = c;
                 }
-                params = mparams[1..];
+                if (mname.len == 0) return error.MalformedItemName;
+                const method_generic_params = try collectFunctionGenericParams(e, m);
+                const method_generics = try collectGenerics(e, m);
+                const mret = try mapReturnType(e, m);
+                const mparams = try mapParams(e, mparams_node);
+                var receiver: items.Receiver = .ref_;
+                var params = mparams;
+                if (mparams.len > 0 and std.mem.eql(u8, mparams[0].name, "self")) {
+                    if (mparams[0].ty == .reference) {
+                        receiver = if (mparams[0].ty.reference.*.mut) .mut_ref else .ref_;
+                    } else {
+                        receiver = .owned;
+                    }
+                    params = mparams[1..];
+                }
+                try methods.append(e.alloc, .{
+                    .name = try e.alloc.dupe(u8, mname),
+                    .params = params,
+                    .ret = mret,
+                    .generic_params = method_generic_params,
+                    .generics = method_generics,
+                    .receiver = receiver,
+                });
+            } else if (std.mem.eql(u8, m.kind(), "type_item") or
+                std.mem.eql(u8, m.kind(), "associated_type"))
+            {
+                try assoc_types.append(e.alloc, try traitAssocType(e, m));
+            } else if (std.mem.eql(u8, m.kind(), "const_item")) {
+                try assoc_consts.append(e.alloc, try traitAssocConst(e, m));
             }
-            try methods.append(e.alloc, .{
-                .name = try e.alloc.dupe(u8, mname),
-                .params = params,
-                .ret = mret,
-                .receiver = receiver,
-            });
         }
     }
     const trait_name: []const u8 = try e.alloc.dupe(u8, name);
-    errdefer e.alloc.free(trait_name);
     const trait_methods: []const bodies.TraitMethodSig = try methods.toOwnedSlice(e.alloc);
+    const trait_assoc_types: []const items.AssocType = try assoc_types.toOwnedSlice(e.alloc);
+    const trait_assoc_consts: []const bodies.TraitAssocConst = try assoc_consts.toOwnedSlice(e.alloc);
+    const trait_supertraits = try supertraits.toOwnedSlice(e.alloc);
     e.bodies_list.items[eid] = .{ .trait_ = .{
         .name = trait_name,
-        .supertraits = &.{},
+        .generic_params = trait_generic_params,
+        .generics = trait_generics,
+        .supertraits = trait_supertraits,
         .methods = trait_methods,
+        .assoc_types = trait_assoc_types,
+        .assoc_consts = trait_assoc_consts,
     } };
 }
 
@@ -1711,7 +3094,10 @@ fn typeAliasItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
             std.mem.eql(u8, k, "array_type") or
             std.mem.eql(u8, k, "slice_type") or
             std.mem.eql(u8, k, "tuple_type") or
-            std.mem.eql(u8, k, "unit_type"))
+            std.mem.eql(u8, k, "unit_type") or
+            std.mem.eql(u8, k, "abstract_type") or
+            std.mem.eql(u8, k, "dynamic_type") or
+            std.mem.eql(u8, k, "bounded_type"))
         {
             target = try mapType(e, c);
         }
@@ -1763,6 +3149,204 @@ fn arrayElemTy(ty: types.Type) ?types.Type {
         .slice => |s| s.elem,
         else => null,
     };
+}
+fn setConstExprType(e: *Ctx, id: exprs.NodeId, ty: types.Type) !void {
+    const type_id = try appendType(e, ty);
+    e.exprs_list.items[id].ty = type_id;
+}
+
+fn constExprType(e: *const Ctx, id: exprs.NodeId) ?types.Type {
+    if (id >= e.exprs_list.items.len) return null;
+    const type_id = e.exprs_list.items[id].ty orelse return null;
+    if (type_id >= e.types_list.items.len) return null;
+    return e.types_list.items[type_id];
+}
+
+fn nominalDefFromType(ty: types.Type) ?spine.EntityId {
+    return switch (ty) {
+        .path => |path| if (path.segments.len == 0)
+            null
+        else
+            path.segments[path.segments.len - 1].id,
+        .reference => |reference| nominalDefFromType(reference.pointee),
+        .raw_ptr => |raw_ptr| nominalDefFromType(raw_ptr.pointee),
+        else => null,
+    };
+}
+
+fn constEntityByName(e: *const Ctx, name: []const u8) ?spine.EntityId {
+    const owner = e.declaration_owner orelse return null;
+    const module_id = owningModule(e.g, owner) orelse return null;
+    for (e.g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .const_ or entity.parent != module_id) continue;
+        if (std.mem.eql(u8, entity.name, name)) return entity.id;
+    }
+    return null;
+}
+
+fn constBodyType(e: *const Ctx, id: spine.EntityId) ?types.Type {
+    if (id >= e.bodies_list.items.len) return null;
+    return switch (e.bodies_list.items[id]) {
+        .const_ => |body| body.ty,
+        else => null,
+    };
+}
+fn bindConstTypeForOwner(
+    e: *Ctx,
+    owner: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    ty: *types.Type,
+) ConstLowerError!void {
+    const pending = if (e.pending_generics) |applications|
+        applications.items
+    else
+        &[_]PendingGenericApplication{};
+    bindType(
+        e.g,
+        e.bodies_list.items,
+        owner,
+        extra_generic_params,
+        pending,
+        ty,
+    ) catch return error.UnsupportedConstInitializer;
+}
+
+fn bindConstType(e: *Ctx, ty: *types.Type) ConstLowerError!void {
+    const owner = e.declaration_owner orelse return error.UnsupportedConstInitializer;
+    try bindConstTypeForOwner(e, owner, &.{}, ty);
+}
+
+fn constMethodEntity(
+    e: *const Ctx,
+    target: spine.EntityId,
+    name: []const u8,
+) ?spine.EntityId {
+    for (e.g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .fn_ or !std.mem.eql(u8, entity.name, name)) continue;
+        const impl_id = entity.parent orelse continue;
+        const impl = e.g.symbol_table.get(impl_id) orelse continue;
+        if (impl.kind != .impl_ or impl.parent != target) continue;
+        // Trait methods are not inherent const methods.
+        if (std.mem.indexOf(u8, impl.name, " for ") != null) continue;
+        return entity.id;
+    }
+    return null;
+}
+
+fn constMethodReceiver(
+    e: *const Ctx,
+    target: spine.EntityId,
+    method_name: []const u8,
+) exprs.ReceiverMode {
+    if (target >= e.bodies_list.items.len) return .value;
+    const body = switch (e.bodies_list.items[target]) {
+        .struct_ => |value| value,
+        else => return .value,
+    };
+    for (body.methods) |method| {
+        if (!std.mem.eql(u8, method.name, method_name)) continue;
+        return switch (method.receiver orelse .owned) {
+            .owned => .value,
+            .ref_ => .shared,
+            .mut_ref => .mutable,
+        };
+    }
+    return .value;
+}
+
+fn isConstFunction(e: *const Ctx, id: spine.EntityId) bool {
+    const origins = e.function_origins orelse return false;
+    const origin = origins.get(id) orelse return false;
+    const fn_index = std.mem.indexOf(u8, origin.source, "fn") orelse return false;
+    const prefix = origin.source[0..fn_index];
+    return std.mem.indexOf(u8, prefix, "const") != null;
+}
+
+const ConstMethodParts = struct {
+    receiver: ts.Node,
+    method: ts.Node,
+    arguments: ts.Node,
+};
+
+fn constMethodParts(_: *const Ctx, node: ts.Node) ?ConstMethodParts {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "method_call_expression")) {
+        return .{
+            .receiver = node.childByFieldName("receiver") orelse return null,
+            .method = node.childByFieldName("method") orelse return null,
+            .arguments = node.childByFieldName("arguments") orelse return null,
+        };
+    }
+    if (!std.mem.eql(u8, kind, "call_expression")) return null;
+    const callee = node.namedChild(0) orelse return null;
+    if (!std.mem.eql(u8, callee.kind(), "field_expression")) return null;
+    const arguments = blk: {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            if (std.mem.eql(u8, child.kind(), "arguments")) break :blk child;
+        }
+        break :blk null;
+    } orelse return null;
+    return .{
+        .receiver = callee.namedChild(0) orelse return null,
+        .method = callee.namedChild(1) orelse return null,
+        .arguments = arguments,
+    };
+}
+
+fn lowerConstArray(
+    e: *Ctx,
+    node: ts.Node,
+    expected: ?types.Type,
+    depth: usize,
+) ConstLowerError!exprs.NodeId {
+    const elem_type = if (expected) |ty| arrayElemTy(ty) else null;
+    if (node.childByFieldName("length")) |len_node| {
+        var elem: ?ts.Node = node.childByFieldName("element");
+        if (elem == null) {
+            var i: u32 = 0;
+            while (node.namedChild(i)) |c| : (i += 1) {
+                if (c.eql(len_node)) continue;
+                elem = c;
+                break;
+            }
+        }
+        const en = elem orelse return error.InvalidConstArray;
+        const elem_id = try lowerConstInit(e, en, elem_type, depth + 1);
+        if (!std.mem.eql(u8, len_node.kind(), "integer_literal")) return error.InvalidConstArray;
+        const parsed_len = parseConstIntText(text(e, len_node)) orelse
+            return error.InvalidConstArray;
+        if (parsed_len.value < 0) return error.InvalidConstArray;
+        const len = std.math.cast(usize, parsed_len.value) orelse
+            return error.InvalidConstArray;
+        var elems: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+        defer elems.deinit(e.alloc);
+        try elems.append(e.alloc, elem_id);
+        const elements: []const exprs.NodeId = try elems.toOwnedSlice(e.alloc);
+        errdefer e.alloc.free(elements);
+        const id: exprs.NodeId = try appendExpr(e, .{ .array = .{
+            .elements = elements,
+            .repeat = len,
+        } });
+        if (elem_type) |ty| try setConstExprType(e, id, ty);
+        return id;
+    }
+
+    var elements: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer elements.deinit(e.alloc);
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        if (isComment(c)) continue;
+        try elements.append(e.alloc, try lowerConstInit(e, c, elem_type, depth + 1));
+    }
+    const owned_elements: []const exprs.NodeId = try elements.toOwnedSlice(e.alloc);
+    errdefer e.alloc.free(owned_elements);
+    const id: exprs.NodeId = try appendExpr(e, .{ .array = .{
+        .elements = owned_elements,
+        .repeat = null,
+    } });
+    if (elem_type) |ty| try setConstExprType(e, id, ty);
+    return id;
 }
 
 fn hexDigit(value: u8) ?u8 {
@@ -1889,49 +3473,6 @@ const ConstLowerError = std.mem.Allocator.Error || error{
     UnsupportedConstInitializer,
 };
 
-fn lowerConstArray(e: *Ctx, node: ts.Node) ConstLowerError!exprs.NodeId {
-    if (node.childByFieldName("length")) |len_node| {
-        var elem: ?ts.Node = node.childByFieldName("element");
-        if (elem == null) {
-            var i: u32 = 0;
-            while (node.namedChild(i)) |c| : (i += 1) {
-                if (c.eql(len_node)) continue;
-                elem = c;
-                break;
-            }
-        }
-        const en = elem orelse return error.InvalidConstArray;
-        const elem_id = try lowerConstInit(e, en);
-        if (!std.mem.eql(u8, len_node.kind(), "integer_literal")) return error.InvalidConstArray;
-        const len = std.fmt.parseInt(usize, text(e, len_node), 10) catch return error.InvalidConstArray;
-        var elems: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
-        defer elems.deinit(e.alloc);
-        try elems.append(e.alloc, elem_id);
-        const elements: []const exprs.NodeId = try elems.toOwnedSlice(e.alloc);
-        errdefer e.alloc.free(elements);
-        const id: exprs.NodeId = try appendExpr(e, .{ .array = .{
-            .elements = elements,
-            .repeat = len,
-        } });
-        return id;
-    }
-
-    var elements: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
-    defer elements.deinit(e.alloc);
-    var i: u32 = 0;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        if (isComment(c)) continue;
-        try elements.append(e.alloc, try lowerConstInit(e, c));
-    }
-    const owned_elements: []const exprs.NodeId = try elements.toOwnedSlice(e.alloc);
-    errdefer e.alloc.free(owned_elements);
-    const id: exprs.NodeId = try appendExpr(e, .{ .array = .{
-        .elements = owned_elements,
-        .repeat = null,
-    } });
-    return id;
-}
-
 /// Parsed integer text, with the Rust-only suffix separated from the digits.
 const ParsedConstInt = struct {
     value: i128,
@@ -1951,7 +3492,9 @@ fn parseConstIntText(raw: []const u8) ?ParsedConstInt {
         8
     else
         10;
-    const digits = if (base != 10) body[2..] else body;
+    const untrimmed_digits = if (base != 10) body[2..] else body;
+    const digits = std.mem.trimEnd(u8, untrimmed_digits, "_");
+    if (digits.len == 0) return null;
     const value = std.fmt.parseInt(i128, digits, base) catch return null;
     return .{
         .value = value,
@@ -1960,7 +3503,6 @@ fn parseConstIntText(raw: []const u8) ?ParsedConstInt {
         .suffix = raw[body.len..],
     };
 }
-
 fn constOperator(e: *const Ctx, left: ts.Node, right: ts.Node) []const u8 {
     const start = left.endByte();
     const end = right.startByte();
@@ -1981,7 +3523,10 @@ fn isConstTypeNodeKind(kind: []const u8) bool {
         std.mem.eql(u8, kind, "array_type") or
         std.mem.eql(u8, kind, "slice_type") or
         std.mem.eql(u8, kind, "tuple_type") or
-        std.mem.eql(u8, kind, "unit_type");
+        std.mem.eql(u8, kind, "unit_type") or
+        std.mem.eql(u8, kind, "abstract_type") or
+        std.mem.eql(u8, kind, "dynamic_type") or
+        std.mem.eql(u8, kind, "bounded_type");
 }
 
 fn constInitializerNode(e: *const Ctx, item: ts.Node) ?ts.Node {
@@ -2217,6 +3762,28 @@ fn integerCastTarget(e: *const Ctx, node: ts.Node) ?IntegerCastTarget {
     return .{ .bits = bits, .signed = signed };
 }
 
+fn integerTargetForPrimitive(
+    e: *const Ctx,
+    primitive: types.Prim,
+) ?IntegerCastTarget {
+    const signed = switch (primitive) {
+        .i8, .i16, .i32, .i64, .i128, .isize => true,
+        .u8, .u16, .u32, .u64, .u128, .usize => false,
+        else => return null,
+    };
+    const bits: u16 = switch (primitive) {
+        .i8, .u8 => 8,
+        .i16, .u16 => 16,
+        .i32, .u32 => 32,
+        .i64, .u64 => 64,
+        .i128, .u128 => 128,
+        .isize, .usize => e.cfg.target_pointer_width orelse @as(u16, @bitSizeOf(usize)),
+        else => return null,
+    };
+    if (bits == 0 or bits > 128 or bits % 8 != 0) return null;
+    return .{ .bits = bits, .signed = signed };
+}
+
 fn checkedIntegerCastValue(value: i128, target: IntegerCastTarget) ?i128 {
     const mask: u128 = if (target.bits == 128) blk: {
         break :blk std.math.maxInt(u128);
@@ -2282,7 +3849,16 @@ fn constIntegerValueAt(e: *const Ctx, node: ts.Node, depth: usize) ?i128 {
         const op = std.mem.trim(u8, raw[0..op_len], " \t\r\n");
         if (std.mem.eql(u8, op, "-")) return checkedNeg(value);
         if (std.mem.eql(u8, op, "+")) return value;
-        if (std.mem.eql(u8, op, "!")) return ~value;
+        if (std.mem.eql(u8, op, "!")) {
+            if (parseConstIntText(text(e, operand))) |parsed| {
+                if (mapPrim(parsed.suffix)) |primitive| {
+                    if (integerTargetForPrimitive(e, primitive)) |target| {
+                        return checkedIntegerCastValue(~value, target);
+                    }
+                }
+            }
+            return ~value;
+        }
         return null;
     }
     if (std.mem.eql(u8, kind, "binary_expression")) {
@@ -2311,38 +3887,254 @@ fn constIntegerValue(e: *const Ctx, node: ts.Node) ?i128 {
     return constIntegerValueAt(e, node, 0);
 }
 
-fn lowerConstIntegerValue(e: *Ctx, value: i128) ConstLowerError!exprs.NodeId {
+fn lowerConstIntegerValue(
+    e: *Ctx,
+    value: i128,
+    expected: ?types.Type,
+) ConstLowerError!exprs.NodeId {
     const number = try std.fmt.allocPrint(e.alloc, "{d}", .{value});
     errdefer e.alloc.free(number);
-    return appendExpr(e, .{ .literal = .{ .int = .{
+    const id = try appendExpr(e, .{ .literal = .{ .int = .{
         .text = number,
         .value = value,
         .base = .dec,
         .ty_suffix = null,
     } } });
+    if (expected) |ty| try setConstExprType(e, id, ty);
+    return id;
+}
+
+fn lowerConstPath(
+    e: *Ctx,
+    node: ts.Node,
+    expected: ?types.Type,
+) ConstLowerError!exprs.NodeId {
+    const raw_name = std.mem.trim(u8, text(e, node), " \t\r\n:");
+    // A leaf-only lookup cannot resolve `module::CONST` safely. Reject scoped
+    // constants until this path is lowered through canonical module IDs.
+    if (std.mem.indexOf(u8, raw_name, "::") != null) {
+        return error.UnsupportedConstInitializer;
+    }
+    const def = constEntityByName(e, raw_name) orelse
+        return error.UnsupportedConstInitializer;
+    const ty = constBodyType(e, def) orelse return error.UnsupportedConstInitializer;
+    const id = try appendExpr(e, .{ .path = .{
+        .def = def,
+        .generic_args = &.{},
+    } });
+    try setConstExprType(e, id, expected orelse ty);
+    return id;
+}
+
+fn lowerConstStruct(
+    e: *Ctx,
+    node: ts.Node,
+    expected: ?types.Type,
+    depth: usize,
+) ConstLowerError!exprs.NodeId {
+    var name_node: ?ts.Node = null;
+    var fields_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "field_initializer_list")) {
+            fields_node = child;
+        } else if (name_node == null and !isComment(child)) {
+            name_node = child;
+        }
+    }
+    const type_name = name_node orelse return error.UnsupportedConstInitializer;
+    var mapped = mapNamedType(e, type_name) catch
+        return error.UnsupportedConstInitializer;
+    try bindConstType(e, &mapped);
+    const def = nominalDefFromType(mapped) orelse
+        return error.UnsupportedConstInitializer;
+    if (def >= e.bodies_list.items.len) return error.UnsupportedConstInitializer;
+    const struct_body = switch (e.bodies_list.items[def]) {
+        .struct_ => |body| body,
+        else => return error.UnsupportedConstInitializer,
+    };
+
+    var fields: std.ArrayListUnmanaged(exprs.FieldInit) = .empty;
+    defer fields.deinit(e.alloc);
+    if (fields_node) |list| {
+        var j: u32 = 0;
+        while (list.namedChild(j)) |field_node| : (j += 1) {
+            const field_kind = field_node.kind();
+            if (std.mem.eql(u8, field_kind, "base_field_initializer")) {
+                return error.UnsupportedConstInitializer;
+            }
+            var field_name: []const u8 = "";
+            var value_node: ?ts.Node = null;
+            if (std.mem.eql(u8, field_kind, "shorthand_field_initializer")) {
+                field_name = text(e, field_node);
+            } else if (std.mem.eql(u8, field_kind, "field_initializer")) {
+                var k: u32 = 0;
+                while (field_node.namedChild(k)) |child| : (k += 1) {
+                    const child_kind = child.kind();
+                    if (std.mem.eql(u8, child_kind, "field_identifier") or
+                        std.mem.eql(u8, child_kind, "identifier"))
+                    {
+                        if (field_name.len == 0) {
+                            field_name = text(e, child);
+                        } else {
+                            value_node = child;
+                        }
+                    } else if (!isComment(child) and value_node == null) {
+                        value_node = child;
+                    }
+                }
+            } else {
+                continue;
+            }
+            if (field_name.len == 0) return error.UnsupportedConstInitializer;
+            var field_type: ?types.Type = null;
+            for (struct_body.fields) |field| {
+                if (std.mem.eql(u8, field.name, field_name)) {
+                    field_type = field.ty;
+                    break;
+                }
+            }
+            var field_ty = field_type orelse return error.UnsupportedConstInitializer;
+            try bindConstTypeForOwner(e, def, struct_body.generic_params, &field_ty);
+            const value_id = if (value_node) |value|
+                try lowerConstInit(e, value, field_ty, depth + 1)
+            else blk: {
+                const path_def = constEntityByName(e, field_name) orelse
+                    return error.UnsupportedConstInitializer;
+                const path_ty = constBodyType(e, path_def) orelse
+                    return error.UnsupportedConstInitializer;
+                const path_id = try appendExpr(e, .{ .path = .{
+                    .def = path_def,
+                    .generic_args = &.{},
+                } });
+                try setConstExprType(e, path_id, path_ty);
+                break :blk path_id;
+            };
+            try fields.append(e.alloc, .{
+                .field = try e.alloc.dupe(u8, field_name),
+                .value = value_id,
+                .shorthand = value_node == null,
+            });
+        }
+    }
+    const owned_fields = try fields.toOwnedSlice(e.alloc);
+    errdefer e.alloc.free(owned_fields);
+    const id = try appendExpr(e, .{ .struct_lit = .{
+        .def = def,
+        .fields = owned_fields,
+        .base = null,
+    } });
+    try setConstExprType(e, id, expected orelse mapped);
+    return id;
+}
+
+fn lowerConstMethodCall(
+    e: *Ctx,
+    node: ts.Node,
+    expected: ?types.Type,
+    depth: usize,
+) ConstLowerError!exprs.NodeId {
+    if (depth >= max_const_eval_depth) return error.UnsupportedConstInitializer;
+    const parts = constMethodParts(e, node) orelse
+        return error.UnsupportedConstInitializer;
+    const method_name = text(e, parts.method);
+    if (method_name.len == 0) return error.UnsupportedConstInitializer;
+    const receiver_id = try lowerConstInit(e, parts.receiver, null, depth + 1);
+    const receiver_ty = constExprType(e, receiver_id) orelse
+        return error.UnsupportedConstInitializer;
+    const target = nominalDefFromType(receiver_ty) orelse
+        return error.UnsupportedConstInitializer;
+    const method_id = constMethodEntity(e, target, method_name) orelse
+        return error.UnsupportedConstInitializer;
+    if (!isConstFunction(e, method_id)) return error.UnsupportedConstInitializer;
+    const method_body = switch (e.bodies_list.items[method_id]) {
+        .fn_ => |body| body,
+        else => return error.UnsupportedConstInitializer,
+    };
+    var method_ret = method_body.ret;
+    try bindConstTypeForOwner(e, method_id, &.{}, &method_ret);
+    const params = if (method_body.params.len > 0 and
+        std.mem.eql(u8, method_body.params[0].name, "self"))
+        method_body.params[1..]
+    else
+        method_body.params;
+    var args: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer args.deinit(e.alloc);
+    var arg_index: usize = 0;
+    var i: u32 = 0;
+    while (parts.arguments.namedChild(i)) |arg| : (i += 1) {
+        if (arg_index >= params.len) return error.UnsupportedConstInitializer;
+        try args.append(
+            e.alloc,
+            try lowerConstInit(e, arg, params[arg_index].ty, depth + 1),
+        );
+        arg_index += 1;
+    }
+    if (arg_index != params.len) return error.UnsupportedConstInitializer;
+    const owned_args = try args.toOwnedSlice(e.alloc);
+    errdefer e.alloc.free(owned_args);
+    const id = try appendExpr(e, .{ .method_call = .{
+        .receiver = receiver_id,
+        .receiver_mode = constMethodReceiver(e, target, method_name),
+        .method = method_id,
+        .args = owned_args,
+    } });
+    try setConstExprType(e, id, expected orelse method_ret);
+    return id;
 }
 
 /// Lower a const initializer expression into the expr table.
-fn lowerConstInit(e: *Ctx, node: ts.Node) ConstLowerError!exprs.NodeId {
+fn lowerConstInit(
+    e: *Ctx,
+    node: ts.Node,
+    expected: ?types.Type,
+    depth: usize,
+) ConstLowerError!exprs.NodeId {
+    if (depth >= max_const_eval_depth) return error.UnsupportedConstInitializer;
     const kind = node.kind();
     if (std.mem.eql(u8, kind, "type_cast_expression")) {
         const value = try constIntegerCastValueAt(e, node, 0);
-        return lowerConstIntegerValue(e, value orelse return error.UnsupportedConstInitializer);
+        return lowerConstIntegerValue(
+            e,
+            value orelse return error.UnsupportedConstInitializer,
+            expected,
+        );
     }
     if (std.mem.eql(u8, kind, "expression") or
         std.mem.eql(u8, kind, "parenthesized_expression") or
-        std.mem.eql(u8, kind, "reference_expression") or
         std.mem.eql(u8, kind, "unsafe_expression"))
     {
         if (node.namedChildCount() > 0) {
-            const id: exprs.NodeId = try lowerConstInit(e, node.namedChild(0).?);
-            return id;
+            return lowerConstInit(e, node.namedChild(0).?, expected, depth + 1);
         }
         return error.UnsupportedConstInitializer;
     }
-    if (std.mem.eql(u8, kind, "array_expression")) {
-        const id: exprs.NodeId = try lowerConstArray(e, node);
+    if (std.mem.eql(u8, kind, "reference_expression")) {
+        const operand = node.namedChild(0) orelse return error.UnsupportedConstInitializer;
+        const operand_expected = if (expected) |ty| switch (ty) {
+            .reference => |reference| reference.pointee,
+            else => null,
+        } else null;
+        const operand_id = try lowerConstInit(e, operand, operand_expected, depth + 1);
+        const mode: exprs.ReceiverMode = if (std.mem.startsWith(u8, text(e, node), "&mut"))
+            .mutable
+        else
+            .shared;
+        const id = try appendExpr(e, .{ .unary = .{
+            .op = .{ .ref = mode },
+            .operand = operand_id,
+        } });
+        if (expected) |ty| try setConstExprType(e, id, ty);
         return id;
+    }
+    if (std.mem.eql(u8, kind, "array_expression")) {
+        return lowerConstArray(e, node, expected, depth);
+    }
+    if (std.mem.eql(u8, kind, "struct_expression")) {
+        return lowerConstStruct(e, node, expected, depth);
+    }
+    if (constMethodParts(e, node) != null) {
+        return lowerConstMethodCall(e, node, expected, depth);
     }
     if (std.mem.eql(u8, kind, "integer_literal")) {
         const t = text(e, node);
@@ -2354,50 +4146,75 @@ fn lowerConstInit(e: *Ctx, node: ts.Node) ConstLowerError!exprs.NodeId {
         errdefer if (suffix) |s| e.alloc.free(s);
         const text_copy = try e.alloc.dupe(u8, parsed.body);
         errdefer e.alloc.free(text_copy);
-        const id: exprs.NodeId = try appendExpr(e, .{ .literal = .{ .int = .{
+        const id = try appendExpr(e, .{ .literal = .{ .int = .{
             .text = text_copy,
             .value = parsed.value,
             .base = if (parsed.base == 16) .hex else if (parsed.base == 2) .bin else if (parsed.base == 8) .oct else .dec,
             .ty_suffix = suffix,
         } } });
+        if (expected) |ty| try setConstExprType(e, id, ty);
         return id;
     }
     if (std.mem.eql(u8, kind, "identifier") or
         std.mem.eql(u8, kind, "type_identifier") or
-        std.mem.eql(u8, kind, "call_expression") or
+        std.mem.eql(u8, kind, "scoped_identifier"))
+    {
+        if (constIntegerValue(e, node)) |value| {
+            return lowerConstIntegerValue(e, value, expected);
+        }
+        return lowerConstPath(e, node, expected);
+    }
+    if (std.mem.eql(u8, kind, "call_expression") or
         std.mem.eql(u8, kind, "binary_expression") or
         std.mem.eql(u8, kind, "unary_expression"))
     {
-        const value = constIntegerValue(e, node) orelse return error.UnsupportedConstInitializer;
-        return lowerConstIntegerValue(e, value);
+        const value = constIntegerValue(e, node) orelse
+            return error.UnsupportedConstInitializer;
+        return lowerConstIntegerValue(e, value, expected);
     }
     if (std.mem.eql(u8, kind, "float_literal")) {
         const t = text(e, node);
         const text_copy = try e.alloc.dupe(u8, t);
         errdefer e.alloc.free(text_copy);
         const value = std.fmt.parseFloat(f64, t) catch return error.InvalidLiteral;
-        const id: exprs.NodeId = try appendExpr(e, .{ .literal = .{ .float = .{
+        const id = try appendExpr(e, .{ .literal = .{ .float = .{
             .text = text_copy,
             .value = value,
         } } });
+        if (expected) |ty| try setConstExprType(e, id, ty);
         return id;
     }
-    if (std.mem.eql(u8, kind, "char_literal") or std.mem.eql(u8, kind, "byte_literal")) {
+    if (std.mem.eql(u8, kind, "byte_literal") or std.mem.eql(u8, kind, "char_literal")) {
         const t = text(e, node);
-        const is_byte = std.mem.eql(u8, kind, "byte_literal") or std.mem.startsWith(u8, t, "b");
         if (try decodeRustByteLiteral(e.alloc, t)) |bytes| {
-            errdefer e.alloc.free(bytes);
-            const id: exprs.NodeId = try appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
+            defer e.alloc.free(bytes);
+            if (bytes.len != 1) return error.InvalidLiteral;
+            const number = try std.fmt.allocPrint(e.alloc, "{d}", .{bytes[0]});
+            errdefer e.alloc.free(number);
+            const suffix = try e.alloc.dupe(u8, "u8");
+            errdefer e.alloc.free(suffix);
+            const id = try appendExpr(e, .{ .literal = .{ .int = .{
+                .text = number,
+                .value = bytes[0],
+                .base = .dec,
+                .ty_suffix = suffix,
+            } } });
+            if (expected) |ty| try setConstExprType(e, id, ty);
             return id;
         }
-        if (is_byte) return error.UnsupportedConstInitializer;
-        if (t.len < 3 or t[0] != '\'' or t[t.len - 1] != '\'') return error.InvalidLiteral;
+        if (std.mem.eql(u8, kind, "byte_literal") or std.mem.startsWith(u8, t, "b")) {
+            return error.InvalidLiteral;
+        }
+        if (t.len < 3 or t[0] != '\'' or t[t.len - 1] != '\'') {
+            return error.InvalidLiteral;
+        }
         const text_copy = try e.alloc.dupe(u8, t);
         errdefer e.alloc.free(text_copy);
-        const id: exprs.NodeId = try appendExpr(e, .{ .literal = .{ .character = .{
+        const id = try appendExpr(e, .{ .literal = .{ .character = .{
             .text = text_copy,
             .value = t[1],
         } } });
+        if (expected) |ty| try setConstExprType(e, id, ty);
         return id;
     }
     if (std.mem.eql(u8, kind, "boolean_literal")) {
@@ -2405,14 +4222,18 @@ fn lowerConstInit(e: *Ctx, node: ts.Node) ConstLowerError!exprs.NodeId {
         if (!std.mem.eql(u8, value, "true") and !std.mem.eql(u8, value, "false")) {
             return error.InvalidLiteral;
         }
-        const id: exprs.NodeId = try appendExpr(e, .{ .literal = .{ .boolean = std.mem.eql(u8, value, "true") } });
+        const id = try appendExpr(e, .{ .literal = .{
+            .boolean = std.mem.eql(u8, value, "true"),
+        } });
+        if (expected) |ty| try setConstExprType(e, id, ty);
         return id;
     }
     if (std.mem.eql(u8, kind, "string_literal") or
         std.mem.eql(u8, kind, "byte_string_literal") or
         std.mem.eql(u8, kind, "raw_string_literal"))
     {
-        const id: exprs.NodeId = try lowerConstString(e, node);
+        const id = try lowerConstString(e, node);
+        if (expected) |ty| try setConstExprType(e, id, ty);
         return id;
     }
     return error.UnsupportedConstInitializer;
@@ -2444,7 +4265,10 @@ fn constItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
             std.mem.eql(u8, k, "pointer_type") or
             std.mem.eql(u8, k, "slice_type") or
             std.mem.eql(u8, k, "tuple_type") or
-            std.mem.eql(u8, k, "unit_type"))
+            std.mem.eql(u8, k, "unit_type") or
+            std.mem.eql(u8, k, "abstract_type") or
+            std.mem.eql(u8, k, "dynamic_type") or
+            std.mem.eql(u8, k, "bounded_type"))
         {
             type_node = c;
             continue;
@@ -2456,8 +4280,9 @@ fn constItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     const initializer = init_node orelse return error.UnsupportedConstInitializer;
     const eid = try addEntity(e, .const_, name, parent, item);
     e.declaration_owner = eid;
-    const const_ty = try mapType(e, type_node orelse return error.MalformedConstType);
-    const init_id = try lowerConstInit(e, initializer);
+    var const_ty = try mapType(e, type_node orelse return error.MalformedConstType);
+    try bindConstType(e, &const_ty);
+    const init_id = try lowerConstInit(e, initializer, const_ty, 0);
     e.bodies_list.items[eid] = .{ .const_ = .{ .ty = const_ty, .init = init_id } };
 
     if (arrayElemTy(const_ty)) |elem| {
@@ -2495,19 +4320,30 @@ fn functionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId, is_trait_sig: b
     const eid = try addEntity(e, .fn_, name, parent, item);
     if (e.function_origins) |origins| {
         const lexical_mod = lexicalModuleForParent(e.g, parent);
-        const fn_src = try e.alloc.dupe(u8, text(e, item));
+        const fn_src = if (e.macro_table) |table|
+            try exp.expandSourceMacros(e.alloc, table, text(e, item), .{
+                .features = e.cfg.features,
+                .target_pointer_width = e.cfg.target_pointer_width,
+                .docsrs = e.cfg.docsrs,
+                .include_tests = e.include_tests,
+            })
+        else
+            try e.alloc.dupe(u8, text(e, item));
+        errdefer e.alloc.free(fn_src);
         try origins.put(e.alloc, eid, .{
             .lexical_module = lexical_mod,
             .source = fn_src,
         });
     }
     e.declaration_owner = eid;
-    const ret = try mapReturnType(e, item);
+    const generics = try collectGenerics(e, item);
     const params = try mapParams(e, params_node);
+    const ret = try mapReturnType(e, item);
     e.bodies_list.items[eid] = .{ .fn_ = .{
         .params = params,
         .ret = ret,
         .generic_params = generic_params,
+        .generics = generics,
         .body = 0,
     } };
 }
@@ -2546,10 +4382,7 @@ fn provisionalExternalUsePath(
     }
     var parts = std.mem.splitSequence(u8, source, "::");
     const first = parts.next() orelse return null;
-    if (!std.mem.eql(u8, first, "core") and
-        !std.mem.eql(u8, first, "std") and
-        !std.mem.eql(u8, first, "alloc"))
-        return null;
+    if (!isKnownExternalCrate(e.g, first)) return null;
     if (parent) |module_id| {
         if (resolveModuleItem(e.g, module_id, first)) |root_id| {
             const root_entity = e.g.symbol_table.get(root_id) orelse return null;
@@ -2745,8 +4578,44 @@ fn implTargetEntity(
         else => null,
     };
 }
+fn isNonEntityImplTarget(self_ty: types.Type, generics: ?types.Generics) bool {
+    return switch (self_ty) {
+        .prim,
+        .reference,
+        .raw_ptr,
+        .slice,
+        .array,
+        .tuple,
+        .fn_ptr,
+        .external_nominal,
+        .option,
+        .result,
+        .boxed,
+        .@"opaque",
+        .dyn_trait,
+        => true,
+        .path => |path| blk: {
+            if (path.segments.len != 1 or path.segments[0].id != null) break :blk false;
+            const generic_parameters = generics orelse break :blk false;
+            for (generic_parameters.params) |parameter| {
+                const name = switch (parameter) {
+                    .type_ => |type_parameter| type_parameter.name,
+                    else => continue,
+                };
+                if (std.mem.eql(u8, name, path.segments[0].name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .generic_inst, .unsupported => false,
+    };
+}
 
-fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
+fn implItem(
+    e: *Ctx,
+    item: ts.Node,
+    mod_id: spine.EntityId,
+    item_ids: *std.ArrayListUnmanaged(spine.EntityId),
+) !void {
     var self_ty_name: []const u8 = "";
     var trait_name: ?[]const u8 = null;
     var decl_list: ?ts.Node = null;
@@ -2767,11 +4636,26 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
     var i: u32 = 0;
     while (item.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
+        if (std.mem.eql(u8, k, "where_clause") or
+            std.mem.eql(u8, k, "type_parameters") or
+            std.mem.eql(u8, k, "generic_parameters"))
+        {
+            continue;
+        }
         if (std.mem.eql(u8, k, "type_identifier") or
             std.mem.eql(u8, k, "generic_type") or
             std.mem.eql(u8, k, "primitive_type") or
             std.mem.eql(u8, k, "scoped_type_identifier") or
-            std.mem.eql(u8, k, "type_path"))
+            std.mem.eql(u8, k, "type_path") or
+            std.mem.eql(u8, k, "array_type") or
+            std.mem.eql(u8, k, "slice_type") or
+            std.mem.eql(u8, k, "reference_type") or
+            std.mem.eql(u8, k, "pointer_type") or
+            std.mem.eql(u8, k, "tuple_type") or
+            std.mem.eql(u8, k, "unit_type") or
+            std.mem.eql(u8, k, "abstract_type") or
+            std.mem.eql(u8, k, "dynamic_type") or
+            std.mem.eql(u8, k, "bounded_type"))
         {
             const type_name = text(e, c);
             if (first_named_type == null) first_named_type = type_name;
@@ -2812,30 +4696,68 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
         target_path = target_path[0..idx];
     }
     target_path = std.mem.trim(u8, target_path, " \t\r\n");
-    var target_name = target_path;
-    if (std.mem.lastIndexOf(u8, target_name, "::")) |idx| {
-        target_name = target_name[idx + 2 ..];
-    }
-    target_name = std.mem.trim(u8, target_name, " \t\r\n");
 
-    const primitive_target = mapPrim(target_name) != null;
-    const target_id = if (primitive_target)
-        null
-    else
-        implTargetEntity(e, mod_id, target_path);
-    if (target_id == null and !primitive_target and e.pending_impls == null) {
-        return error.UnresolvedImplTarget;
-    }
+    const target_id = implTargetEntity(e, mod_id, target_path);
+    const force_pending_target = std.mem.eql(u8, target_path, "super") or
+        std.mem.startsWith(u8, target_path, "super::");
 
     const name = if (trait_name) |tr|
         try std.fmt.allocPrint(e.alloc, "{s} for {s}", .{ tr, self_ty_name })
     else
         try e.alloc.dupe(u8, self_ty_name);
+    // Associated declarations always retain the impl entity as their parent.
+    const impl_id = try addEntity(
+        e,
+        .impl_,
+        name,
+        if (force_pending_target) mod_id else target_id orelse mod_id,
+        item,
+    );
+    e.declaration_owner = impl_id;
+    const self_type_node = item.childByFieldName("type") orelse return error.MalformedImpl;
+    const impl_self_ty = try mapType(e, self_type_node);
+    const impl_generics = try collectGenerics(e, item);
+    const non_entity_target = isNonEntityImplTarget(impl_self_ty, impl_generics);
+    const pending_target = (target_id == null and !non_entity_target) or force_pending_target;
+    if (pending_target and e.pending_impls == null) return error.UnresolvedImplTarget;
+    const direct_target_id: ?spine.EntityId = if (pending_target) null else target_id;
 
-    // Both inherent impls (`impl Type { ... }`) and trait impls
-    // (`impl Trait for Type { ... }`) parent their methods to the resolved
-    // target struct, allowing the backend to hoist the methods there.
-    const impl_id = try addEntity(e, .impl_, name, target_id orelse mod_id, item);
+    var impl_trait_path: ?types.Path = null;
+    var impl_trait_args: []const types.Type = &.{};
+    var impl_trait_assoc: []const types.AssociatedTypeBinding = &.{};
+    if (item.childByFieldName("trait")) |trait_node| {
+        if (try parseTraitBound(e, trait_node)) |tb| {
+            impl_trait_path = tb.path;
+            impl_trait_args = tb.args;
+            impl_trait_assoc = tb.associated_types;
+        } else {
+            const mapped_trait = try mapType(e, trait_node);
+            impl_trait_path = boundPathFromType(e, mapped_trait);
+            if (impl_trait_path == null) {
+                impl_trait_path = .{ .segments = try mapScopedSegments(e, trait_node) };
+            }
+            if (impl_trait_path) |*tp| {
+                if (tp.segments.len == 1) {
+                    if (preludePathSegments(e.alloc, tp.segments[0].name) catch null) |prelude_segs| {
+                        tp.segments = prelude_segs;
+                    }
+                }
+            }
+        }
+    }
+    // Publish the impl receiver before lowering associated constants. Their
+    // initializer types can contain `Self`, which must see the concrete
+    // receiver while constItem appends expression type entries.
+    e.bodies_list.items[impl_id] = .{ .impl_ = .{
+        .self_ty = impl_self_ty,
+        .trait_path = impl_trait_path,
+        .trait_args = impl_trait_args,
+        .trait_associated_types = impl_trait_assoc,
+        .generics = impl_generics,
+        .assoc_items = &.{},
+    } };
+    var assoc_ids: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    errdefer assoc_ids.deinit(e.alloc);
     var pending_methods: std.ArrayListUnmanaged(PendingImplMethod) = .empty;
     if (decl_list) |dl| {
         var j: u32 = 0;
@@ -2847,8 +4769,9 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                 // The method is also registered on the target's StructBody
                 // below; the backend dedups the two paths by method name.
                 try functionItem(e, child, impl_id, false);
+                try assoc_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
 
-                if (target_id) |tid| {
+                if (direct_target_id) |tid| {
                     if (tid < e.bodies_list.items.len) {
                         switch (e.bodies_list.items[tid]) {
                             .struct_ => |*sb| {
@@ -2884,7 +4807,9 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                                         }
                                     }
                                 }
-                                if (receiver == null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
+                                if (receiver == null and all_params.len > 0 and
+                                    std.mem.eql(u8, all_params[0].name, "self"))
+                                {
                                     if (all_params[0].ty == .reference) {
                                         if (all_params[0].ty.reference.*.mut) {
                                             receiver = .mut_ref;
@@ -2895,7 +4820,9 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                                         receiver = .owned;
                                     }
                                 }
-                                if (receiver != null and all_params.len > 0 and std.mem.eql(u8, all_params[0].name, "self")) {
+                                if (receiver != null and all_params.len > 0 and
+                                    std.mem.eql(u8, all_params[0].name, "self"))
+                                {
                                     method_params = all_params[1..];
                                 }
 
@@ -2915,6 +4842,7 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                                         .params = method_params,
                                         .ret = mret,
                                         .generic_params = generic_params,
+                                        .generics = try collectGenerics(e, child),
                                         .body = 0,
                                         .receiver = receiver,
                                         .is_allocating = false,
@@ -2930,7 +4858,7 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                         }
                     }
                 }
-                if (target_id == null and !primitive_target) {
+                if (pending_target) {
                     var receiver: ?items.Receiver = null;
                     var parameter_node: ?ts.Node = null;
                     var k: u32 = 0;
@@ -2963,12 +4891,25 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
                 }
             } else if (std.mem.eql(u8, child.kind(), "const_item")) {
                 try constItem(e, child, impl_id);
-            } else if (std.mem.eql(u8, child.kind(), "type_item")) {
+                try assoc_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
+            } else if (std.mem.eql(u8, child.kind(), "type_item") or
+                std.mem.eql(u8, child.kind(), "associated_type"))
+            {
                 try typeAliasItem(e, child, impl_id);
+                try assoc_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
             }
         }
     }
-    if (target_id == null and !primitive_target) {
+    const assoc_items: []const spine.EntityId = try assoc_ids.toOwnedSlice(e.alloc);
+    e.bodies_list.items[impl_id] = .{ .impl_ = .{
+        .self_ty = impl_self_ty,
+        .trait_path = impl_trait_path,
+        .trait_args = impl_trait_args,
+        .trait_associated_types = impl_trait_assoc,
+        .generics = impl_generics,
+        .assoc_items = assoc_items,
+    } };
+    if (pending_target) {
         const pending = e.pending_impls orelse return error.UnresolvedImplTarget;
         const path_copy = try e.alloc.dupe(u8, target_path);
         const methods = try pending_methods.toOwnedSlice(e.alloc);
@@ -2980,9 +4921,8 @@ fn implItem(e: *Ctx, item: ts.Node, mod_id: spine.EntityId) !spine.EntityId {
         });
     } else {
         pending_methods.deinit(e.alloc);
+        if (target_id == null) try item_ids.append(e.alloc, impl_id);
     }
-
-    return impl_id;
 }
 fn finalizePendingImpls(
     e: *Ctx,
@@ -3040,12 +4980,14 @@ fn finalizePendingImpls(
                         .params = method_params,
                         .ret = function_body.ret,
                         .generic_params = function_body.generic_params,
+                        .generics = function_body.generics,
                         .body = 0,
                         .receiver = receiver,
                         .is_allocating = function_body.is_allocating,
                     };
                     const old_methods = structure.methods;
                     const new_methods = try e.alloc.alloc(bodies.StructMethod, old_methods.len + 1);
+
                     @memcpy(new_methods[0..old_methods.len], old_methods);
                     new_methods[old_methods.len] = new_method;
                     structure.methods = new_methods;
@@ -3137,6 +5079,21 @@ fn cfgFeatureEnabled(e: *const Ctx, feature: []const u8) bool {
     return false;
 }
 
+fn cfgBuiltinRequiresTarget(name: []const u8) bool {
+    return std.mem.eql(u8, name, "unix") or
+        std.mem.eql(u8, name, "windows") or
+        std.mem.eql(u8, name, "target_os") or
+        std.mem.eql(u8, name, "target_arch") or
+        std.mem.eql(u8, name, "target_env") or
+        std.mem.eql(u8, name, "target_family") or
+        std.mem.eql(u8, name, "target_vendor") or
+        std.mem.eql(u8, name, "debug_assertions") or
+        std.mem.eql(u8, name, "panic") or
+        std.mem.eql(u8, name, "proc_macro") or
+        std.mem.eql(u8, name, "miri") or
+        std.mem.eql(u8, name, "sanitize");
+}
+
 const CfgAttributeKind = enum {
     cfg,
     cfg_attr,
@@ -3206,8 +5163,7 @@ fn evaluateCfgPredicate(e: *const Ctx, input: []const u8, index: *usize) !bool {
         const target_text = try cfgString(input, index);
         const target_width = std.fmt.parseInt(u16, target_text, 10) catch
             return error.UnsupportedCfgPredicate;
-        const configured_width = e.cfg.target_pointer_width orelse
-            return error.UnsupportedCfgPredicate;
+        const configured_width = e.cfg.target_pointer_width orelse @as(u16, @bitSizeOf(usize));
         return configured_width == target_width;
     }
     if (std.mem.eql(u8, name, "test")) {
@@ -3224,7 +5180,16 @@ fn evaluateCfgPredicate(e: *const Ctx, input: []const u8, index: *usize) !bool {
     }
     const is_all = std.mem.eql(u8, name, "all");
     const is_any = std.mem.eql(u8, name, "any");
-    if (!is_all and !is_any) return error.UnsupportedCfgPredicate;
+    if (!is_all and !is_any) {
+        if (cfgBuiltinRequiresTarget(name)) return error.UnsupportedCfgPredicate;
+        cfgSkipWhitespace(input, index);
+        if (index.* < input.len and
+            (input[index.*] == '=' or input[index.*] == '('))
+        {
+            return error.UnsupportedCfgPredicate;
+        }
+        return false;
+    }
 
     try cfgExpect(input, index, '(');
     cfgSkipWhitespace(input, index);
@@ -3913,6 +5878,11 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
             const child_id = try addEntity(e, .module, mname, mod_id, item);
             const child_attributes = e.g.symbol_table.entities.items[child_id].attributes;
             const child_mod_idx = e.g.modules.items.len;
+            var child_macros = if (e.macro_table) |parent_macros|
+                exp.MacroTable.initChild(parent_macros)
+            else
+                exp.MacroTable.init(e.alloc);
+            defer child_macros.deinit();
             if (decls) |dl| {
                 _ = try e.g.addModule(.{
                     .id = child_id,
@@ -3926,7 +5896,10 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                     .items = &.{},
                     .attributes = try duplicateAttributes(e, child_attributes),
                 });
-                const child_items = try mapItemsInner(e, dl, child_id);
+                var sub_ctx = e.*;
+                sub_ctx.macro_table = &child_macros;
+                defer e.unsupported_macro = sub_ctx.unsupported_macro;
+                const child_items = try mapItemsInner(&sub_ctx, dl, child_id);
                 e.g.modules.items[child_mod_idx].items = child_items;
             } else {
                 const bdir = e.base_dir orelse return error.ModuleNotFound;
@@ -3991,7 +5964,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
                     .include_tests = e.include_tests,
                     .cfg = e.cfg,
                     .const_environment = e.const_environment,
-                    .macro_table = e.macro_table,
+                    .macro_table = &child_macros,
                     .pending_impls = e.pending_impls,
                     .pending_generics = e.pending_generics,
                     .function_origins = e.function_origins,
@@ -4041,7 +6014,7 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
             try functionItem(e, item2, mod_id, false);
             try item_ids.append(e.alloc, @intCast(e.bodies_list.items.len - 1));
         } else if (std.mem.eql(u8, k, "impl_item")) {
-            _ = try implItem(e, item2, mod_id);
+            try implItem(e, item2, mod_id, &item_ids);
         } else if (std.mem.eql(u8, k, "macro_definition")) {
             try registerMacroDefinition(e, item2);
         } else if (std.mem.eql(u8, k, "macro_invocation")) {
@@ -4141,8 +6114,8 @@ pub fn extractFile(ctx: *Ctx) !void {
         }
     }
     try names.resolveGraph(ctx.alloc, ctx.g);
-    if (owns_pending) try finalizePendingImpls(ctx, ctx.pending_impls.?);
     try bindDeclarationTypes(ctx.g, ctx.bodies_list, ctx.pending_generics.?.items);
+    if (owns_pending) try finalizePendingImpls(ctx, ctx.pending_impls.?);
 }
 
 test "cst lowers typed and cast integer constants as numeric literals" {
@@ -4348,7 +6321,7 @@ test "cst resolves forward const array lengths through primitive aliases" {
         else => return error.TestUnexpectedResult,
     };
     switch (array.len) {
-        .literal => |length| try std.testing.expectEqual(@as(u32, 4), length),
+        .literal => |length| try std.testing.expectEqual(@as(u64, 4), length),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -4600,11 +6573,16 @@ test "cst and ts_ext decode Rust byte string and byte character literals" {
     };
     try extractFile(&cst_ctx);
 
-    const expected = [_]struct { name: []const u8, bytes: []const u8 }{
-        .{ .name = "COOKED", .bytes = "line\n\x00\xff" },
-        .{ .name = "EMPTY", .bytes = "" },
-        .{ .name = "RAW", .bytes = "raw \\n text" },
-        .{ .name = "BYTE", .bytes = "\x41" },
+    const ExpectedKind = enum { byte_string, byte_character };
+    const expected = [_]struct {
+        name: []const u8,
+        bytes: []const u8,
+        kind: ExpectedKind,
+    }{
+        .{ .name = "COOKED", .bytes = "line\n\x00\xff", .kind = .byte_string },
+        .{ .name = "EMPTY", .bytes = "", .kind = .byte_string },
+        .{ .name = "RAW", .bytes = "raw \\n text", .kind = .byte_string },
+        .{ .name = "BYTE", .bytes = "\x41", .kind = .byte_character },
     };
     for (expected) |want| {
         var found: ?spine.EntityId = null;
@@ -4615,16 +6593,50 @@ test "cst and ts_ext decode Rust byte string and byte character literals" {
             }
         }
         const entity_id = found orelse return error.TestUnexpectedResult;
-        const init_id = switch (bodies_list.items[entity_id]) {
-            .const_ => |constant| constant.init,
+        const constant = switch (bodies_list.items[entity_id]) {
+            .const_ => |value| value,
             else => return error.TestUnexpectedResult,
         };
-        switch (exprs_list.items[init_id].kind) {
-            .literal => |literal| switch (literal) {
-                .byte_array => |byte_array| try std.testing.expectEqualSlices(u8, want.bytes, byte_array.items),
+        switch (want.kind) {
+            .byte_string => {
+                const slice = switch (constant.ty) {
+                    .slice => |value| value,
+                    else => return error.TestUnexpectedResult,
+                };
+                try std.testing.expect(slice.const_);
+                try std.testing.expectEqual(types.Type{ .prim = .u8 }, slice.elem);
+            },
+            .byte_character => {
+                try std.testing.expectEqual(types.Type{ .prim = .u8 }, constant.ty);
+            },
+        }
+        if (constant.init >= exprs_list.items.len) return error.TestUnexpectedResult;
+        const initializer = exprs_list.items[constant.init];
+        const initializer_type_id = initializer.ty orelse return error.TestUnexpectedResult;
+        if (initializer_type_id >= types_list.items.len) return error.TestUnexpectedResult;
+        try std.testing.expectEqual(constant.ty, types_list.items[initializer_type_id]);
+        const literal = switch (initializer.kind) {
+            .literal => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        switch (want.kind) {
+            .byte_string => switch (literal) {
+                .byte_array => |byte_array| {
+                    try std.testing.expectEqualSlices(u8, want.bytes, byte_array.items);
+                },
                 else => return error.TestUnexpectedResult,
             },
-            else => return error.TestUnexpectedResult,
+            .byte_character => switch (literal) {
+                .int => |byte| {
+                    try std.testing.expectEqual(@as(usize, 1), want.bytes.len);
+                    try std.testing.expectEqual(@as(i128, want.bytes[0]), byte.value);
+                    try std.testing.expectEqualStrings(
+                        "u8",
+                        byte.ty_suffix orelse return error.TestUnexpectedResult,
+                    );
+                },
+                else => return error.TestUnexpectedResult,
+            },
         }
     }
 
@@ -4658,8 +6670,14 @@ test "cst and ts_ext decode Rust byte string and byte character literals" {
     for (exprs_list.items[body_expr_start..]) |expression| {
         switch (expression.kind) {
             .literal => |literal| switch (literal) {
+                .int => |byte| {
+                    if (byte.value == 0x42 and
+                        std.mem.eql(u8, byte.ty_suffix orelse "", "u8"))
+                    {
+                        found_body_byte = true;
+                    }
+                },
                 .byte_array => |byte_array| {
-                    if (std.mem.eql(u8, byte_array.items, "\x42")) found_body_byte = true;
                     if (std.mem.eql(u8, byte_array.items, "raw \\n text")) found_body_raw = true;
                     if (std.mem.eql(u8, byte_array.items, "body\n")) found_body_string = true;
                 },
@@ -5292,7 +7310,7 @@ test "cst resolves core mem size_of through a use alias" {
         else => return error.TestUnexpectedResult,
     };
     switch (array.len) {
-        .literal => |length| try std.testing.expectEqual(@as(u32, 4), length),
+        .literal => |length| try std.testing.expectEqual(@as(u64, 4), length),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -5367,7 +7385,7 @@ test "cst retains outer const lengths in macro-expanded type aliases" {
         else => return error.TestUnexpectedResult,
     };
     switch (array.len) {
-        .literal => |length| try std.testing.expectEqual(@as(u32, 4), length),
+        .literal => |length| try std.testing.expectEqual(@as(u64, 4), length),
         else => return error.TestUnexpectedResult,
     }
 }

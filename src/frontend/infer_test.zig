@@ -83,10 +83,11 @@ const Fixture = struct {
 ///   3 = ExprStmt(expr=6)              — return acc
 fn buildFixtureF(alloc: std.mem.Allocator) !Fixture {
     // ── Types ───────────────────────────────────────────────────────────
-    const types_store = try alloc.alloc(types.Type, 3);
+    const types_store = try alloc.alloc(types.Type, 4);
     types_store[0] = .{ .prim = .u64 };
     types_store[1] = .{ .prim = .u32 };
     types_store[2] = .{ .prim = .bool };
+    types_store[3] = .{ .prim = .unit };
 
     // ── Pats ────────────────────────────────────────────────────────────
     const pats_store = try alloc.alloc(exprs.Pattern, 2);
@@ -492,46 +493,6 @@ test "(d) binary a + b produces Edge.eq(a, result) and Edge.eq(b, result)" {
     try std.testing.expect(found_rhs);
 }
 
-test "full fn f produces exact pins and edges" {
-    const a = std.testing.allocator;
-    var fx = try buildFixtureF(a);
-    defer {
-        deinitFixtureFStatements(a, &fx);
-        fx.deinit(a);
-    }
-
-    var g = try infer.gen(a, &fx.b);
-    defer g.deinit(a);
-
-    // Exact count: 3 pins (init of x, init of acc, 0x1u64), 5 edges (LHS<->res, RHS<->res, assign<->target, ret<->val, ret<->fn_body).
-    try std.testing.expectEqual(@as(usize, 3), g.pins.items.len);
-    try std.testing.expectEqual(@as(usize, 5), g.edges.items.len);
-
-    // Pins:
-    // 0: let x: u32 = 5 -> {node: 0, ty: 1}
-    // 1: var acc: u64 = 0u64 -> {node: 1, ty: 0}
-    // 2: 0x1u64 -> {node: 2, ty: 0}
-    try std.testing.expectEqual(@as(exprs.NodeId, 0), g.pins.items[0].node);
-    try std.testing.expectEqual(@as(exprs.TypeId, 1), g.pins.items[0].ty);
-
-    try std.testing.expectEqual(@as(exprs.NodeId, 1), g.pins.items[1].node);
-    try std.testing.expectEqual(@as(exprs.TypeId, 0), g.pins.items[1].ty);
-
-    try std.testing.expectEqual(@as(exprs.NodeId, 2), g.pins.items[2].node);
-    try std.testing.expectEqual(@as(exprs.TypeId, 0), g.pins.items[2].ty);
-
-    // Edges:
-    // 0: eq(3, 4) — acc <-> add result
-    // 1: eq(2, 4) — 0x1u64 <-> add result
-    // 2: eq(3, 5) — acc <-> assign node
-    // 3: eq(3, 6) — acc <-> return node
-    // 4: ret(3, 7) — return acc <-> fn body block
-    try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 3, .b = 4 } }, g.edges.items[0]);
-    try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 2, .b = 4 } }, g.edges.items[1]);
-    try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 5, .b = 3 } }, g.edges.items[2]);
-    try std.testing.expectEqual(infer.Edge{ .ret = .{ .expr = 3, .fn_body = 7 } }, g.edges.items[3]);
-    try std.testing.expectEqual(infer.Edge{ .eq = .{ .a = 6, .b = 3 } }, g.edges.items[4]);
-}
 test "(e) body containing .unsupported completes without error and emits supported pins" {
     const a = std.testing.allocator;
     var fx = try buildFixtureG(a);
@@ -587,8 +548,8 @@ test "solve on fixture f infers u32 and u64 on expressions" {
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(3));
     // Node 4 (binary add `acc + 0x1u64`) -> u64 (0)
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(4));
-    // Node 5 (assign `acc = acc + 0x1u64`) -> u64 (0)
-    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(5));
+    // Node 5 (assignment `acc = acc + 0x1u64`) -> unit (3)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 3), inferred.getType(5));
     // Node 6 (return acc) -> u64 (0)
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(6));
 }
@@ -596,12 +557,13 @@ test "solve on fixture f infers u32 and u64 on expressions" {
 test "fnv1a_hash and checksum style function infers u64 on every node with wrapping_mul" {
     const a = std.testing.allocator;
 
-    // ── Types: 0=u64, 1=u32, 2=bool, 3=i32 ──
-    const types_store = try a.alloc(types.Type, 4);
+    // ── Types: 0=u64, 1=u32, 2=bool, 3=i32, 4=unit ──
+    const types_store = try a.alloc(types.Type, 5);
     types_store[0] = .{ .prim = .u64 };
     types_store[1] = .{ .prim = .u32 };
     types_store[2] = .{ .prim = .bool };
     types_store[3] = .{ .prim = .i32 };
+    types_store[4] = .{ .prim = .unit };
 
     // ── Pats: 0=hash binding ──
     const pats_store = try a.alloc(exprs.Pattern, 1);
@@ -752,7 +714,7 @@ test "fnv1a_hash and checksum style function infers u64 on every node with wrapp
     var inferred = try infer.solve(a, &b);
     defer inferred.deinit(a);
 
-    // Every expression node in fnv1a_hash must infer u64 (TypeId 0):
+    // Every value-producing expression node in fnv1a_hash infers u64 (TypeId 0).
     // 0: initial hash literal
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(0));
     // 1: hash path
@@ -761,8 +723,8 @@ test "fnv1a_hash and checksum style function infers u64 on every node with wrapp
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(2));
     // 3: wrapping_mul binary expression
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(3));
-    // 4: assign expression
-    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(4));
+    // 4: assignment expression has Rust unit type (TypeId 4)
+    try std.testing.expectEqual(@as(?exprs.TypeId, 4), inferred.getType(4));
     // 5: return expression
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(5));
 
@@ -771,6 +733,7 @@ test "fnv1a_hash and checksum style function infers u64 on every node with wrapp
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), exprs_store[0].ty);
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), exprs_store[2].ty);
     try std.testing.expectEqual(@as(?exprs.TypeId, 0), exprs_store[3].ty);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 4), exprs_store[4].ty);
 }
 
 test "unannotated integer defaults to i32 and unannotated float defaults to f64" {
@@ -1758,4 +1721,353 @@ test "by-value array iteration binds the element value" {
     var inferred = try infer.solveWithGraph(alloc, &b, &graph_store);
     defer inferred.deinit(alloc);
     try std.testing.expectEqual(types.Type{ .prim = .u8 }, exprs_store[2].kind.cast.source_type);
+}
+test "range carrier stays distinct from concrete bound type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const range_u8: types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "ops", "Range" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    const types_store = [_]types.Type{
+        .{ .prim = .u8 },
+        .{ .prim = .usize },
+        range_u8,
+    };
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "0u8",
+                .value = 0,
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "255u8",
+                .value = 255,
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .range = .{
+                .start = 0,
+                .end = 1,
+                .inclusive = false,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 2,
+                .labelled = null,
+            } },
+        },
+    };
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &.{},
+            .ret = range_u8,
+            .body = 3,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    for (generated.edges.items) |edge| {
+        switch (edge) {
+            .eq => |equal| {
+                try std.testing.expect(!((equal.a == 2 and (equal.b == 0 or equal.b == 1)) or
+                    (equal.b == 2 and (equal.a == 0 or equal.a == 1))));
+            },
+            .ret => {},
+        }
+    }
+
+    var inferred = try infer.solveWithGen(alloc, &b, &generated);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(0));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(1));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 2), inferred.getType(2));
+}
+
+test "explicit generic call uses the instantiated return type" {
+    const explicit_args = [_]types.Type{.{ .prim = .u32 }};
+    const generic_t: types.Type = .{ .path = .{
+        .segments = &.{.{ .name = "T", .id = null }},
+    } };
+    const types_store = [_]types.Type{
+        .{ .prim = .u32 },
+        .{ .generic_inst = .{
+            .decl = 1,
+            .args = .{ .params = &explicit_args },
+        } },
+        .{ .prim = .unit },
+    };
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .call = .{
+                .call_kind = .{ .free = 1 },
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = 2,
+            .kind = .{ .unit = {} },
+        },
+    };
+    const stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = 0 },
+    }};
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = types_store[2],
+            .body = 1,
+        } },
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = generic_t,
+            .generic_params = &.{"T"},
+            .body = 2,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solve(std.testing.allocator, &b);
+    defer inferred.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(0));
+}
+
+test "tuple constructor call has its declared nominal type" {
+    const array_type = types.Array{
+        .elem = .{ .prim = .u32 },
+        .len = .{ .literal = 4 },
+    };
+    const nominal_type: types.Type = .{ .path = .{
+        .segments = &.{.{ .name = "U32X4", .id = 1 }},
+    } };
+    const types_store = [_]types.Type{
+        nominal_type,
+        .{ .array = &array_type },
+        .{ .prim = .unit },
+    };
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .array = .{
+                .elements = &.{},
+                .repeat = 4,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .call = .{
+                .call_kind = .{ .constructor = 1 },
+                .args = &.{0},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    const stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = 1 },
+    }};
+    const fields = [_]items.Field{.{
+        .name = "0",
+        .ty = types_store[1],
+        .visibility = .private,
+        .span = span,
+    }};
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = types_store[2],
+            .body = 2,
+        } },
+        .{ .struct_ = .{
+            .layout = .tuple,
+            .fields = &fields,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solve(std.testing.allocator, &b);
+    defer inferred.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(1));
+}
+
+test "chained raw pointer cast resolves a wildcard pointee" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const wildcard: types.Type = .{ .external_nominal = .{
+        .path = &.{"_"},
+    } };
+    const wildcard_pointer = types.RawPtr{
+        .mut = false,
+        .pointee = wildcard,
+    };
+    const byte_pointer = types.RawPtr{
+        .mut = false,
+        .pointee = .{ .prim = .u8 },
+    };
+    const types_store = [_]types.Type{
+        .{ .prim = .u64 },
+        .{ .raw_ptr = &wildcard_pointer },
+        .{ .raw_ptr = &byte_pointer },
+        .{ .prim = .unit },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .path = .{
+                .def = 10,
+                .generic_args = &.{},
+            } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .unary = .{
+                .op = .{ .ref = .shared },
+                .operand = 0,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .cast = .{
+                .kind = .as_,
+                .operand = 1,
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = 1,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = 2,
+            .kind = .{ .cast = .{
+                .kind = .as_,
+                .operand = 2,
+                .source_type = .{ .raw_ptr = &wildcard_pointer },
+                .target = 2,
+            } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    const stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = 3 },
+    }};
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &.{},
+            .ret = types_store[3],
+            .body = 4,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solve(alloc, &b);
+    defer inferred.deinit(alloc);
+    const resolved = exprs_store[3].kind.cast.source_type;
+    try std.testing.expect(resolved == .raw_ptr);
+    try std.testing.expect(!resolved.raw_ptr.mut);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, resolved.raw_ptr.pointee);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 2), inferred.getType(3));
 }

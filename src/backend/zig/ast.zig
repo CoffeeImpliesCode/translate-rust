@@ -36,7 +36,6 @@ pub const Import = struct {
     is_pub: bool = false,
 };
 
-/// Top-level or container declaration in Zig.
 pub const Decl = union(enum) {
     struct_decl: StructDecl,
     enum_decl: EnumDecl,
@@ -44,6 +43,7 @@ pub const Decl = union(enum) {
     fn_decl: FnDecl,
     const_decl: ConstDecl,
     var_decl: VarDecl,
+    trait_descriptor: TraitDescriptorDecl,
     comment: []const u8,
 };
 
@@ -127,6 +127,38 @@ pub const VarDecl = struct {
     init: Expr,
 };
 
+pub const ProjectedType = struct {
+    descriptor: []const u8,
+    receiver: *const Type,
+    member: []const u8,
+};
+
+pub const TraitDescriptorType = struct {
+    name: []const u8,
+    ty: Type,
+};
+
+pub const TraitDescriptorConst = struct {
+    name: []const u8,
+    value: Expr,
+};
+
+pub const TraitDescriptorMember = union(enum) {
+    type_: TraitDescriptorType,
+    const_: TraitDescriptorConst,
+};
+
+pub const TraitDescriptorCase = struct {
+    receiver: Type,
+    members: []const TraitDescriptorMember = &.{},
+};
+
+pub const TraitDescriptorDecl = struct {
+    name: []const u8,
+    is_pub: bool = true,
+    cases: []const TraitDescriptorCase = &.{},
+};
+
 /// Zig type representation.
 pub const Type = union(enum) {
     prim: Prim,
@@ -134,13 +166,21 @@ pub const Type = union(enum) {
     slice: Slice,
     opt: *const Type,
     err_union: ErrUnion,
+    projected: ProjectedType,
     named: []const u8,
     generic: GenericInst,
     array: Array,
+    array_expr: ArrayExpr,
     tuple: []const Type,
+    fn_ptr: FnPtr,
     anon_struct: AnonStruct,
     any_opaque,
     void_type,
+};
+
+pub const FnPtr = struct {
+    params: []const Type,
+    ret: *const Type,
 };
 
 pub const AnonStruct = struct {
@@ -179,6 +219,7 @@ pub const Ptr = struct {
     elem: *const Type,
     is_const: bool = false,
     is_allowzero: bool = false,
+    alignment: ?u32 = null,
     size: PtrSize = .one,
 };
 
@@ -202,6 +243,12 @@ pub const Array = struct {
     len: usize,
 };
 
+/// An expression-sized array type: `[<comptime expression>]T`.
+pub const ArrayExpr = struct {
+    elem: *const Type,
+    len: *const Expr,
+};
+
 /// Literal expressions.
 pub const Literal = union(enum) {
     int: i128,
@@ -217,6 +264,7 @@ pub const Literal = union(enum) {
 /// Zig expressions.
 pub const Expr = union(enum) {
     lit: Literal,
+    unit: void,
     ident: []const u8,
     field_access: FieldAccess,
     call: Call,
@@ -229,7 +277,9 @@ pub const Expr = union(enum) {
     array_init: ArrayInit,
     repeat: Repeat,
     multi_array: MultiArray,
+    tuple: []const Expr,
     builtin: BuiltinCall,
+    panic_: []const u8,
     unsupported: []const u8,
     if_expr: IfExpr,
     while_expr: WhileExpr,
@@ -264,8 +314,14 @@ pub const Match = struct {
     arms: []const MatchArm = &.{},
 };
 
+pub const Capture = struct {
+    name: []const u8,
+    by_ref: bool = false,
+};
+
 pub const MatchArm = struct {
     patterns: []const Pattern = &.{},
+    capture: ?Capture = null,
     body: Expr,
 };
 
@@ -393,7 +449,7 @@ pub const WhileExpr = struct {
 
 pub const ForExpr = struct {
     inputs: []const Expr = &.{},
-    captures: []const []const u8 = &.{},
+    captures: []const Capture = &.{},
     body: Block,
     else_body: ?*const Expr = null,
 };
@@ -469,6 +525,9 @@ pub const ValidationError = error{
     UnnamedMatchSelector,
     MissingTypedLiteralIdentity,
     UnsupportedTranslationNode,
+    DuplicateTraitDescriptorCase,
+    AmbiguousMatchCapture,
+    InvalidPointerAlignment,
     InvalidIdentifier,
 };
 
@@ -562,12 +621,24 @@ fn validateFilePath(path: []const u8) ValidationError!void {
 fn validateType(ty: Type) ValidationError!void {
     switch (ty) {
         .prim, .any_opaque, .void_type => {},
-        .ptr => |ptr| try validateType(ptr.elem.*),
+        .ptr => |ptr| {
+            if (ptr.alignment) |alignment| {
+                if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) {
+                    return error.InvalidPointerAlignment;
+                }
+            }
+            try validateType(ptr.elem.*);
+        },
         .slice => |slice| try validateType(slice.elem.*),
         .opt => |inner| try validateType(inner.*),
         .err_union => |err_union| {
-            if (err_union.err_set) |err_set| try validateName(err_set);
+            if (err_union.err_set) |err_set| try validateQualifiedName(err_set);
             try validateType(err_union.payload.*);
+        },
+        .projected => |projected| {
+            try validateQualifiedName(projected.descriptor);
+            try validateType(projected.receiver.*);
+            try validateName(projected.member);
         },
         .named => |name| try validateTypeName(name),
         .generic => |generic| {
@@ -575,7 +646,15 @@ fn validateType(ty: Type) ValidationError!void {
             for (generic.params) |param| try validateType(param);
         },
         .array => |array| try validateType(array.elem.*),
+        .array_expr => |array| {
+            try validateType(array.elem.*);
+            try validateExpr(array.len.*);
+        },
         .tuple => |tuple| for (tuple) |item| try validateType(item),
+        .fn_ptr => |function| {
+            for (function.params) |param| try validateType(param);
+            try validateType(function.ret.*);
+        },
         .anon_struct => |anon| {
             for (anon.fields) |field| {
                 try validateFieldName(field.name);
@@ -602,6 +681,7 @@ fn sameType(left: Type, right: Type) bool {
             const right_pointer = right.ptr;
             return left_pointer.is_const == right_pointer.is_const and
                 left_pointer.is_allowzero == right_pointer.is_allowzero and
+                left_pointer.alignment == right_pointer.alignment and
                 left_pointer.size == right_pointer.size and
                 sameType(left_pointer.elem.*, right_pointer.elem.*);
         },
@@ -620,6 +700,12 @@ fn sameType(left: Type, right: Type) bool {
             }
             return sameType(left_union.payload.*, right_union.payload.*);
         },
+        .projected => |left_projected| {
+            const right_projected = right.projected;
+            return std.mem.eql(u8, left_projected.descriptor, right_projected.descriptor) and
+                std.mem.eql(u8, left_projected.member, right_projected.member) and
+                sameType(left_projected.receiver.*, right_projected.receiver.*);
+        },
         .named => |left_name| std.mem.eql(u8, left_name, right.named),
         .generic => |left_generic| {
             const right_generic = right.generic;
@@ -631,7 +717,14 @@ fn sameType(left: Type, right: Type) bool {
             return left_array.len == right_array.len and
                 sameType(left_array.elem.*, right_array.elem.*);
         },
+        .array_expr => |left_array| {
+            const right_array = right.array_expr;
+            return sameType(left_array.elem.*, right_array.elem.*) and
+                sameExpr(left_array.len.*, right_array.len.*);
+        },
         .tuple => |left_tuple| sameTypeSlice(left_tuple, right.tuple),
+        .fn_ptr => |function| sameTypeSlice(function.params, right.fn_ptr.params) and
+            sameType(function.ret.*, right.fn_ptr.ret.*),
         .anon_struct => |left_struct| {
             const right_struct = right.anon_struct;
             if (left_struct.fields.len != right_struct.fields.len) return false;
@@ -647,6 +740,270 @@ fn sameType(left: Type, right: Type) bool {
         .any_opaque, .void_type => true,
     };
 }
+
+fn sameLiteral(left: Literal, right: Literal) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .int => |value| value == right.int,
+        .uint => |value| value == right.uint,
+        .float => |value| value == right.float,
+        .bool_lit => |value| value == right.bool_lit,
+        .char_lit => |value| value == right.char_lit,
+        .str => |value| std.mem.eql(u8, value, right.str),
+        .null_lit, .undefined_lit => true,
+    };
+}
+
+fn sameOptionalType(left: ?Type, right: ?Type) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return sameType(left.?, right.?);
+}
+
+fn sameOptionalExpr(left: ?*const Expr, right: ?*const Expr) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return sameExpr(left.?.*, right.?.*);
+}
+
+fn sameOptionalString(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn sameStringSlice(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_string, right_string| {
+        if (!std.mem.eql(u8, left_string, right_string)) return false;
+    }
+    return true;
+}
+
+fn sameOptionalStringSlice(
+    left: ?[]const []const u8,
+    right: ?[]const []const u8,
+) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return sameStringSlice(left.?, right.?);
+}
+
+fn sameExprSlice(left: []const Expr, right: []const Expr) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_expr, right_expr| {
+        if (!sameExpr(left_expr, right_expr)) return false;
+    }
+    return true;
+}
+
+fn samePatternSlice(left: []const Pattern, right: []const Pattern) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_pattern, right_pattern| {
+        if (!samePattern(left_pattern, right_pattern)) return false;
+    }
+    return true;
+}
+
+fn sameStructInitFieldSlice(
+    left: []const StructInitField,
+    right: []const StructInitField,
+) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_field, right_field| {
+        if (!std.mem.eql(u8, left_field.name, right_field.name)) return false;
+        if (!sameExpr(left_field.expr, right_field.expr)) return false;
+    }
+    return true;
+}
+
+fn sameStructPatternFieldSlice(
+    left: []const StructPatternField,
+    right: []const StructPatternField,
+) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_field, right_field| {
+        if (!std.mem.eql(u8, left_field.name, right_field.name)) return false;
+        if (!samePattern(left_field.pat, right_field.pat)) return false;
+    }
+    return true;
+}
+
+fn samePattern(left: Pattern, right: Pattern) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .wildcard => true,
+        .binding => |name| std.mem.eql(u8, name, right.binding),
+        .lit => |literal| sameLiteral(literal, right.lit),
+        .enum_literal => |name| std.mem.eql(u8, name, right.enum_literal),
+        .tuple => |patterns| samePatternSlice(patterns, right.tuple),
+        .struct_pat => |struct_pattern| {
+            const other = right.struct_pat;
+            return sameOptionalString(struct_pattern.name, other.name) and
+                sameStructPatternFieldSlice(struct_pattern.fields, other.fields);
+        },
+    };
+}
+
+fn sameCapture(left: Capture, right: Capture) bool {
+    return left.by_ref == right.by_ref and std.mem.eql(u8, left.name, right.name);
+}
+
+fn sameCaptureSlice(left: []const Capture, right: []const Capture) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_capture, right_capture| {
+        if (!sameCapture(left_capture, right_capture)) return false;
+    }
+    return true;
+}
+
+fn sameMatchArmSlice(left: []const MatchArm, right: []const MatchArm) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_arm, right_arm| {
+        if (!samePatternSlice(left_arm.patterns, right_arm.patterns)) return false;
+        if (left_arm.capture == null or right_arm.capture == null) {
+            if (left_arm.capture != null or right_arm.capture != null) return false;
+        } else if (!sameCapture(left_arm.capture.?, right_arm.capture.?)) {
+            return false;
+        }
+        if (!sameExpr(left_arm.body, right_arm.body)) return false;
+    }
+    return true;
+}
+
+fn sameStmt(left: Stmt, right: Stmt) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .let_stmt => |left_let| {
+            const right_let = right.let_stmt;
+            return std.mem.eql(u8, left_let.name, right_let.name) and
+                sameOptionalType(left_let.ty, right_let.ty) and
+                sameExpr(left_let.init, right_let.init) and
+                left_let.is_mut == right_let.is_mut;
+        },
+        .assign => |left_assign| {
+            const right_assign = right.assign;
+            return sameExpr(left_assign.target, right_assign.target) and
+                sameExpr(left_assign.val, right_assign.val) and
+                left_assign.op == right_assign.op;
+        },
+        .defer_stmt => |left_defer| {
+            const right_defer = right.defer_stmt;
+            return sameExpr(left_defer.expr, right_defer.expr) and
+                left_defer.is_errdefer == right_defer.is_errdefer;
+        },
+        .expr_stmt => |left_expr| sameExpr(left_expr.*, right.expr_stmt.*),
+    };
+}
+
+fn sameStmtSlice(left: []const Stmt, right: []const Stmt) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_stmt, right_stmt| {
+        if (!sameStmt(left_stmt, right_stmt)) return false;
+    }
+    return true;
+}
+
+fn sameBlock(left: Block, right: Block) bool {
+    return sameOptionalString(left.label, right.label) and
+        sameStmtSlice(left.stmts, right.stmts) and
+        sameOptionalExpr(left.expr, right.expr);
+}
+
+fn sameExpr(left: Expr, right: Expr) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .lit => |literal| sameLiteral(literal, right.lit),
+        .unit, .continue_expr => true,
+        .ident => |name| std.mem.eql(u8, name, right.ident),
+        .field_access => |field_access| {
+            const other = right.field_access;
+            return std.mem.eql(u8, field_access.field_name, other.field_name) and
+                sameExpr(field_access.target.*, other.target.*);
+        },
+        .call => |call| {
+            const other = right.call;
+            return sameExpr(call.callee.*, other.callee.*) and
+                sameTypeSlice(call.generic_args, other.generic_args) and
+                sameExprSlice(call.args, other.args);
+        },
+        .block => |block| sameBlock(block, right.block),
+        .match_expr => |match| {
+            const other = right.match_expr;
+            return sameExpr(match.target.*, other.target.*) and
+                sameMatchArmSlice(match.arms, other.arms);
+        },
+        .bin_op => |binary| {
+            const other = right.bin_op;
+            return binary.op == other.op and
+                sameExpr(binary.lhs.*, other.lhs.*) and
+                sameExpr(binary.rhs.*, other.rhs.*);
+        },
+        .unary_op => |unary| {
+            const other = right.unary_op;
+            return unary.op == other.op and sameExpr(unary.operand.*, other.operand.*);
+        },
+        .cast => |cast| {
+            const other = right.cast;
+            return sameType(cast.target, other.target) and
+                sameOptionalType(cast.source, other.source) and
+                sameExpr(cast.operand.*, other.operand.*);
+        },
+        .struct_init => |struct_init| {
+            const other = right.struct_init;
+            return sameOptionalType(struct_init.type_name, other.type_name) and
+                sameStructInitFieldSlice(struct_init.fields, other.fields);
+        },
+        .array_init => |array_init| {
+            const other = right.array_init;
+            return sameOptionalType(array_init.type_name, other.type_name) and
+                sameExprSlice(array_init.elements, other.elements);
+        },
+        .repeat => |repeat| {
+            const other = right.repeat;
+            return sameOptionalType(repeat.type_name, other.type_name) and
+                sameExpr(repeat.elem.*, other.elem.*) and repeat.len == other.len;
+        },
+        .multi_array => |multi_array| {
+            const other = right.multi_array;
+            return sameOptionalType(multi_array.type_name, other.type_name) and
+                sameExprSlice(multi_array.elements, other.elements);
+        },
+        .tuple => |elements| sameExprSlice(elements, right.tuple),
+        .builtin => |builtin| {
+            const other = right.builtin;
+            return std.mem.eql(u8, builtin.name, other.name) and
+                sameExprSlice(builtin.args, other.args);
+        },
+        .panic_ => |message| std.mem.eql(u8, message, right.panic_),
+        .unsupported => |message| std.mem.eql(u8, message, right.unsupported),
+        .if_expr => |if_expr| {
+            const other = right.if_expr;
+            return sameExpr(if_expr.cond.*, other.cond.*) and
+                sameExpr(if_expr.then_body.*, other.then_body.*) and
+                sameOptionalExpr(if_expr.else_body, other.else_body);
+        },
+        .while_expr => |while_expr| {
+            const other = right.while_expr;
+            return sameExpr(while_expr.cond.*, other.cond.*) and
+                sameOptionalExpr(while_expr.continue_expr, other.continue_expr) and
+                sameOptionalStringSlice(while_expr.captures, other.captures) and
+                sameBlock(while_expr.body, other.body) and
+                sameOptionalExpr(while_expr.else_body, other.else_body);
+        },
+        .for_expr => |for_expr| {
+            const other = right.for_expr;
+            return sameExprSlice(for_expr.inputs, other.inputs) and
+                sameCaptureSlice(for_expr.captures, other.captures) and
+                sameBlock(for_expr.body, other.body) and
+                sameOptionalExpr(for_expr.else_body, other.else_body);
+        },
+        .range => |range| {
+            const other = right.range;
+            return sameExpr(range.start.*, other.start.*) and
+                sameOptionalExpr(range.end, other.end);
+        },
+        .return_expr => |value| sameOptionalExpr(value, right.return_expr),
+        .break_expr => |value| sameOptionalExpr(value, right.break_expr),
+    };
+}
+
 const ScalarPointeeLayout = enum {
     byte_1,
     byte_2,
@@ -704,6 +1061,32 @@ fn validPointerCastShape(source: Ptr, target: Ptr, operand: Expr) bool {
         if (builtin.args.len != 1) return false;
     }
     return true;
+}
+
+fn patternContainsBinding(pattern: Pattern) bool {
+    return switch (pattern) {
+        .wildcard, .lit, .enum_literal => false,
+        .binding => true,
+        .tuple => |patterns| {
+            for (patterns) |child| {
+                if (patternContainsBinding(child)) return true;
+            }
+            return false;
+        },
+        .struct_pat => |struct_pattern| {
+            for (struct_pattern.fields) |field| {
+                if (patternContainsBinding(field.pat)) return true;
+            }
+            return false;
+        },
+    };
+}
+
+fn matchArmContainsBinding(arm: MatchArm) bool {
+    for (arm.patterns) |pattern| {
+        if (patternContainsBinding(pattern)) return true;
+    }
+    return false;
 }
 
 fn validateLiteral(_: Literal) ValidationError!void {}
@@ -771,6 +1154,10 @@ fn validateExpr(expr: Expr) ValidationError!void {
             for (match.arms) |arm| {
                 if (arm.patterns.len == 0) return error.UnnamedMatchSelector;
                 for (arm.patterns) |pattern| try validatePattern(pattern);
+                if (arm.capture) |capture| {
+                    try validateName(capture.name);
+                    if (matchArmContainsBinding(arm)) return error.AmbiguousMatchCapture;
+                }
                 try validateExpr(arm.body);
             }
         },
@@ -798,6 +1185,31 @@ fn validateExpr(expr: Expr) ValidationError!void {
                     try validateType(source);
                     try validateType(cast.target);
                 },
+                .slice => |target_slice| {
+                    const source = cast.source orelse return error.UnsupportedTranslationNode;
+                    const source_element = switch (source) {
+                        .ptr => |pointer| blk: {
+                            if (pointer.size != .one or (pointer.is_const and !target_slice.is_const))
+                                return error.UnsupportedTranslationNode;
+                            break :blk switch (pointer.elem.*) {
+                                .array => |array| array.elem,
+                                .array_expr => |array| array.elem,
+                                else => return error.UnsupportedTranslationNode,
+                            };
+                        },
+                        .slice => |slice| blk: {
+                            if (slice.is_const and !target_slice.is_const)
+                                return error.UnsupportedTranslationNode;
+                            break :blk slice.elem;
+                        },
+                        else => return error.UnsupportedTranslationNode,
+                    };
+                    if (!sameType(source_element.*, target_slice.elem.*))
+                        return error.UnsupportedTranslationNode;
+                    try validateType(source);
+                    try validateType(cast.target);
+                },
+                .opt => try validateType(cast.target),
                 else => return error.UnsupportedTranslationNode,
             }
             try validateExpr(cast.operand.*);
@@ -832,10 +1244,12 @@ fn validateExpr(expr: Expr) ValidationError!void {
             if (multi_array.type_name) |type_name| try validateType(type_name);
             for (multi_array.elements) |element| try validateExpr(element);
         },
+        .tuple => |elements| for (elements) |element| try validateExpr(element),
         .builtin => |builtin| {
             try validateQualifiedName(builtin.name);
             for (builtin.args) |arg| try validateExpr(arg);
         },
+        .unit, .panic_ => {},
         .unsupported => return error.UnsupportedTranslationNode,
         .if_expr => |if_expr| {
             try validateExpr(if_expr.cond.*);
@@ -854,7 +1268,7 @@ fn validateExpr(expr: Expr) ValidationError!void {
                 return error.EmptyTranslatedBody;
             }
             for (for_expr.inputs) |input| try validateExpr(input);
-            for (for_expr.captures) |capture| try validateName(capture);
+            for (for_expr.captures) |capture| try validateName(capture.name);
             try validateBlock(for_expr.body);
             if (for_expr.else_body) |else_body| try validateExpr(else_body.*);
         },
@@ -868,8 +1282,43 @@ fn validateExpr(expr: Expr) ValidationError!void {
     }
 }
 
+fn validateTraitDescriptor(descriptor: TraitDescriptorDecl) ValidationError!void {
+    try validateName(descriptor.name);
+    if (descriptor.cases.len == 0) return error.EmptyTranslatedContainer;
+    for (descriptor.cases, 0..) |case, case_index| {
+        try validateType(case.receiver);
+        if (case.members.len == 0) return error.EmptyTranslatedContainer;
+        for (descriptor.cases[0..case_index]) |prior| {
+            if (sameType(prior.receiver, case.receiver)) {
+                return error.DuplicateTraitDescriptorCase;
+            }
+        }
+        for (case.members, 0..) |member, member_index| {
+            const member_name = switch (member) {
+                .type_ => |value| value.name,
+                .const_ => |value| value.name,
+            };
+            try validateName(member_name);
+            for (case.members[0..member_index]) |prior| {
+                const prior_name = switch (prior) {
+                    .type_ => |value| value.name,
+                    .const_ => |value| value.name,
+                };
+                if (std.mem.eql(u8, prior_name, member_name)) {
+                    return error.InvalidIdentifier;
+                }
+            }
+            switch (member) {
+                .type_ => |value| try validateType(value.ty),
+                .const_ => |value| try validateExpr(value.value),
+            }
+        }
+    }
+}
+
 fn validateDecl(decl: Decl) ValidationError!void {
     switch (decl) {
+        .trait_descriptor => |descriptor| try validateTraitDescriptor(descriptor),
         .comment => {},
         .const_decl => |const_decl| {
             try validateName(const_decl.name);
@@ -1174,6 +1623,53 @@ test "ast validation: accepts numeric tuple fields and rejects invalid names" {
     );
 }
 
+test "ast validation: validates explicit captures and rejects ambiguous bindings" {
+    const valid_value_capture: Expr = .{ .match_expr = .{
+        .target = &Expr{ .ident = "input" },
+        .arms = &.{.{
+            .patterns = &.{.{ .enum_literal = "value" }},
+            .capture = .{ .name = "payload" },
+            .body = .{ .ident = "payload" },
+        }},
+    } };
+    try validateExpr(valid_value_capture);
+
+    const valid_pointer_capture: Expr = .{ .match_expr = .{
+        .target = &Expr{ .ident = "input" },
+        .arms = &.{.{
+            .patterns = &.{.{ .enum_literal = "value" }},
+            .capture = .{ .name = "payload", .by_ref = true },
+            .body = .{ .ident = "payload" },
+        }},
+    } };
+    try validateExpr(valid_pointer_capture);
+
+    for ([_][]const u8{ "", "0payload", "payload*" }) |name| {
+        const malformed: Expr = .{ .match_expr = .{
+            .target = &Expr{ .ident = "input" },
+            .arms = &.{.{
+                .patterns = &.{.{ .enum_literal = "value" }},
+                .capture = .{ .name = name },
+                .body = .{ .ident = "payload" },
+            }},
+        } };
+        try std.testing.expectError(error.InvalidIdentifier, validateExpr(malformed));
+    }
+
+    const ambiguous: Expr = .{ .match_expr = .{
+        .target = &Expr{ .ident = "input" },
+        .arms = &.{.{
+            .patterns = &.{
+                .{ .enum_literal = "value" },
+                .{ .binding = "legacy_payload" },
+            },
+            .capture = .{ .name = "payload" },
+            .body = .{ .ident = "payload" },
+        }},
+    } };
+    try std.testing.expectError(error.AmbiguousMatchCapture, validateExpr(ambiguous));
+}
+
 test "ast: instantiate AST DOM shapes" {
     const u8_ty: Type = .{ .prim = .u8 };
     const slice_ty: Type = .{ .slice = .{ .elem = &u8_ty, .is_const = true } };
@@ -1248,4 +1744,23 @@ test "ast: instantiate AST DOM shapes" {
     try std.testing.expectEqual(@as(usize, 1), pkg.files.len);
     try std.testing.expectEqualStrings("src/greeter.zig", pkg.files[0].path);
     try std.testing.expectEqual(@as(usize, 2), pkg.files[0].decls.len);
+}
+
+test "slice casts preserve borrowed element type and mutability" {
+    const byte: Type = .{ .prim = .u8 };
+    const word: Type = .{ .prim = .u16 };
+    const array: Type = .{ .array = .{ .elem = &byte, .len = 4 } };
+    const operand: Expr = .{ .ident = "buffer" };
+    var expression: Expr = .{ .cast = .{
+        .target = .{ .slice = .{ .elem = &byte, .is_const = false } },
+        .source = .{ .ptr = .{ .elem = &array, .size = .one, .is_const = false } },
+        .operand = &operand,
+    } };
+    try validateExpr(expression);
+    expression.cast.source.?.ptr.is_const = true;
+    try std.testing.expectError(error.UnsupportedTranslationNode, validateExpr(expression));
+    expression.cast.target.slice.is_const = true;
+    try validateExpr(expression);
+    expression.cast.target.slice.elem = &word;
+    try std.testing.expectError(error.UnsupportedTranslationNode, validateExpr(expression));
 }

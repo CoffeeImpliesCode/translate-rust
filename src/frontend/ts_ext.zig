@@ -47,8 +47,8 @@ pub const Ctx = struct {
 const Local = struct {
     name: []const u8,
     def: spine.EntityId,
+    ty: ?types.Type = null,
 };
-
 const Ext = struct {
     ctx: *Ctx,
     /// Enclosing fn entity id (for local parents).
@@ -127,9 +127,19 @@ fn isNominalEntityKind(kind: spine.EntityKind) bool {
 }
 
 fn bodyHasGenericParam(body: bodies.BodyKind, name: []const u8) bool {
+    if (body == .impl_) {
+        if (body.impl_.generics) |generics| {
+            for (generics.params) |param| {
+                if (param == .type_ and std.mem.eql(u8, param.type_.name, name)) return true;
+            }
+        }
+        return false;
+    }
     const params: []const []const u8 = switch (body) {
         .fn_ => |fn_body| fn_body.generic_params,
         .struct_ => |struct_body| struct_body.generic_params,
+        .enum_ => |enum_body| enum_body.generic_params,
+        .trait_ => |trait_body| trait_body.generic_params,
         else => &.{},
     };
     for (params) |param| {
@@ -466,14 +476,19 @@ fn resolveModulePath(
 ) ?spine.EntityId {
     if (segments.len == 0) return null;
     var current = start;
-    for (segments, 0..) |segment, index| {
-        const found = resolveModuleItem(e, current, segment) orelse return null;
-        if (index + 1 == segments.len) return found;
-        const ent = e.ctx.g.symbol_table.get(found) orelse return null;
-        if (ent.kind != .module) return null;
-        current = found;
+    for (segments) |segment| {
+        const owner = e.ctx.g.symbol_table.get(current) orelse return null;
+        current = if (owner.kind == .module)
+            resolveModuleItem(e, current, segment) orelse return null
+        else blk: {
+            const nominal = if (owner.kind == .type_alias)
+                resolveAliasNominalType(e, current) orelse return null
+            else
+                current;
+            break :blk resolveTypeMember(e, nominal, segment) orelse return null;
+        };
     }
-    return null;
+    return current;
 }
 
 /// Resolve a scoped path string to its terminal entity.
@@ -483,18 +498,24 @@ fn resolveScopedPathText(e: *const Ext, raw: []const u8) ?spine.EntityId {
     var it = std.mem.splitSequence(u8, raw, "::");
     while (it.next()) |segment| {
         if (segment.len == 0) continue;
+        if (count == segments.len) return null;
         segments[count] = segment;
         count += 1;
     }
     if (count == 0) return null;
     if (std.mem.eql(u8, segments[0], "Self")) {
         if (count == 1) return e.self_ty;
-        if (count == 2) {
-            if (e.self_ty) |type_id| {
-                if (resolveTypeMember(e, type_id, segments[1])) |member| return member;
+        var owner: ?spine.EntityId = e.fn_id;
+        while (owner) |id| {
+            const entity = e.ctx.g.symbol_table.get(id) orelse return null;
+            if (entity.kind == .impl_) {
+                if (resolveModulePath(e, id, segments[1..count])) |member| return member;
+                break;
             }
+            if (entity.kind == .module) break;
+            owner = entity.parent;
         }
-        return null;
+        return resolveModulePath(e, e.self_ty orelse return null, segments[1..count]);
     }
 
     const owner = owningModule(e, e.ctx.mod_id) orelse return null;
@@ -520,6 +541,37 @@ fn resolveScopedPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
     return resolveScopedPathText(e, text(e, node));
 }
 
+/// Resolve a nominal by lexical/module lookup, then by definition name.
+///
+/// The source extractor can see a re-exported enum before the names pass has
+/// attached its use target. The bounded graph walk above is preferred; this
+/// fallback keeps enum-variant patterns lossless in that intermediate state.
+fn resolveNominalName(e: *const Ext, name: []const u8) ?spine.EntityId {
+    const clean = std.mem.trim(u8, name, " \t\r\n");
+    if (clean.len == 0) return null;
+    if (resolveName(e, clean)) |candidate| {
+        if (e.ctx.g.symbol_table.get(candidate)) |entity| {
+            if (isNominalEntityKind(entity.kind)) return candidate;
+        }
+    }
+    for (e.ctx.g.symbol_table.entities.items) |entity| {
+        if (!isNominalEntityKind(entity.kind)) continue;
+        if (std.mem.eql(u8, entity.name, clean)) return entity.id;
+    }
+    return null;
+}
+
+fn resolvePatternOwner(e: *const Ext, raw: []const u8) ?spine.EntityId {
+    const clean = std.mem.trim(u8, raw, " \t\r\n");
+    if (clean.len == 0) return null;
+    if (resolveScopedPathText(e, clean)) |resolved| return resolved;
+    if (resolveNominalName(e, clean)) |resolved| return resolved;
+    if (std.mem.lastIndexOf(u8, clean, "::")) |separator| {
+        return resolveNominalName(e, clean[separator + 2 ..]);
+    }
+    return null;
+}
+
 /// Resolve an enum variant path against the enum body table.
 fn enumBodyHasVariant(e: *const Ext, enum_id: spine.EntityId, variant: []const u8) bool {
     if (@as(usize, enum_id) >= e.ctx.bodies_list.items.len) return false;
@@ -536,13 +588,13 @@ fn enumBodyHasVariant(e: *const Ext, enum_id: spine.EntityId, variant: []const u
 
 /// Resolve a pattern path, including an enum variant under its exact owner.
 fn resolvePatternPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
-    const raw = text(e, node);
+    const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
     const separator = std.mem.lastIndexOf(u8, raw, "::");
     if (separator) |index| {
-        const owner_path = raw[0..index];
-        const variant_name = raw[index + 2 ..];
+        const owner_path = std.mem.trim(u8, raw[0..index], " \t\r\n");
+        const variant_name = std.mem.trim(u8, raw[index + 2 ..], " \t\r\n");
         if (owner_path.len != 0 and variant_name.len != 0) {
-            if (resolveScopedPathText(e, owner_path)) |owner| {
+            if (resolvePatternOwner(e, owner_path)) |owner| {
                 if (e.ctx.g.symbol_table.get(owner)) |owner_entity| {
                     if (owner_entity.kind == .enum_) {
                         if (resolveVariant(e, owner, variant_name)) |variant| return variant;
@@ -552,7 +604,314 @@ fn resolvePatternPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
             }
         }
     }
-    return resolveScopedPath(e, node);
+    return resolveScopedPathText(e, raw) orelse resolveNominalName(e, raw);
+}
+
+const QualifiedAssociatedPath = struct {
+    receiver: ts.Node,
+    trait: ts.Node,
+    name: []const u8,
+};
+
+fn qualifiedAssociatedPath(e: *const Ext, node: ts.Node) ?QualifiedAssociatedPath {
+    if (!std.mem.eql(u8, node.kind(), "scoped_identifier") and
+        !std.mem.eql(u8, node.kind(), "scoped_type_identifier"))
+    {
+        return null;
+    }
+    const path = node.childByFieldName("path") orelse return null;
+    var qualified: ?ts.Node = null;
+    if (std.mem.eql(u8, path.kind(), "qualified_type")) {
+        qualified = path;
+    } else if (std.mem.eql(u8, path.kind(), "bracketed_type")) {
+        var i: u32 = 0;
+        while (path.namedChild(i)) |child| : (i += 1) {
+            if (std.mem.eql(u8, child.kind(), "qualified_type")) {
+                qualified = child;
+                break;
+            }
+        }
+    }
+    const qualified_node = qualified orelse return null;
+    return .{
+        .receiver = qualified_node.childByFieldName("type") orelse return null,
+        .trait = qualified_node.childByFieldName("alias") orelse
+            qualified_node.childByFieldName("trait") orelse return null,
+        .name = text(e, node.childByFieldName("name") orelse return null),
+    };
+}
+
+fn ensureTraitMethodRefEntity(
+    e: *Ext,
+    trait_id: spine.EntityId,
+    name: []const u8,
+) anyerror!?spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |entity| {
+        if (entity.kind == .method_ref and entity.parent == trait_id and
+            std.mem.eql(u8, entity.name, name))
+        {
+            return entity.id;
+        }
+    }
+    if (trait_id >= e.ctx.bodies_list.items.len) return null;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return null,
+    };
+    var declares_method = false;
+    for (trait_body.methods) |method| {
+        if (std.mem.eql(u8, method.name, name)) {
+            declares_method = true;
+            break;
+        }
+    }
+    if (!declares_method) return null;
+    const id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .method_ref,
+        .name = try e.ctx.alloc.dupe(u8, name),
+        .span = span_of,
+        .visibility = .public,
+        .parent = trait_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    return id;
+}
+
+fn traitMethodForPath(e: *Ext, node: ts.Node) anyerror!?spine.EntityId {
+    const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
+    const separator = std.mem.lastIndexOf(u8, raw, "::") orelse return null;
+    const owner_text = std.mem.trim(u8, raw[0..separator], " \t\r\n");
+    const method_name = std.mem.trim(u8, raw[separator + 2 ..], " \t\r\n");
+    if (owner_text.len == 0 or method_name.len == 0) return null;
+    const owner = resolvePatternOwner(e, owner_text) orelse return null;
+    const owner_entity = e.ctx.g.symbol_table.get(owner) orelse return null;
+    if (owner_entity.kind != .trait_) return null;
+    return ensureTraitMethodRefEntity(e, owner, method_name);
+}
+
+const StandardPreludeVariant = struct {
+    enum_id: spine.EntityId,
+    variant_id: spine.EntityId,
+    module_name: []const u8,
+    enum_name: []const u8,
+    variant_name: []const u8,
+};
+
+const standard_type_param_t: types.Type = .{ .path = .{
+    .segments = &.{.{ .name = "T", .id = null }},
+} };
+const standard_type_param_e: types.Type = .{ .path = .{
+    .segments = &.{.{ .name = "E", .id = null }},
+} };
+const standard_option_variants: []const items.Variant = &.{
+    .{ .name = "None", .fields = .{ .none = {} }, .discriminant = null },
+    .{ .name = "Some", .fields = .{ .tuple = &.{standard_type_param_t} }, .discriminant = null },
+};
+const standard_result_variants: []const items.Variant = &.{
+    .{ .name = "Ok", .fields = .{ .tuple = &.{standard_type_param_t} }, .discriminant = null },
+    .{ .name = "Err", .fields = .{ .tuple = &.{standard_type_param_e} }, .discriminant = null },
+};
+
+fn standardPreludeVariantName(name: []const u8) ?struct {
+    module_name: []const u8,
+    enum_name: []const u8,
+    variant_name: []const u8,
+} {
+    if (std.mem.eql(u8, name, "Some")) {
+        return .{ .module_name = "option", .enum_name = "Option", .variant_name = "Some" };
+    }
+    if (std.mem.eql(u8, name, "None")) {
+        return .{ .module_name = "option", .enum_name = "Option", .variant_name = "None" };
+    }
+    if (std.mem.eql(u8, name, "Ok")) {
+        return .{ .module_name = "result", .enum_name = "Result", .variant_name = "Ok" };
+    }
+    if (std.mem.eql(u8, name, "Err")) {
+        return .{ .module_name = "result", .enum_name = "Result", .variant_name = "Err" };
+    }
+    return null;
+}
+
+/// Lazily materialize the canonical prelude variant for a fully qualified
+/// path. Ordinary source resolution runs first at each call site, so a source
+/// declaration with the same spelling retains precedence.
+fn ensureStandardPreludePath(e: *Ext, raw: []const u8) anyerror!?StandardPreludeVariant {
+    const separator = std.mem.lastIndexOf(u8, raw, "::") orelse return null;
+    const owner = std.mem.trim(u8, raw[0..separator], " \t\r\n");
+    const variant = std.mem.trim(u8, raw[separator + 2 ..], " \t\r\n");
+    if (owner.len == 0 or variant.len == 0) return null;
+
+    const expected_owner =
+        (std.mem.eql(u8, owner, "core::option::Option") and
+            (std.mem.eql(u8, variant, "Some") or std.mem.eql(u8, variant, "None"))) or
+        (std.mem.eql(u8, owner, "core::result::Result") and
+            (std.mem.eql(u8, variant, "Ok") or std.mem.eql(u8, variant, "Err")));
+    if (!expected_owner) return null;
+    return ensureStandardPreludeVariant(e, variant);
+}
+
+fn moduleEntityForRow(e: *const Ext, row: graph.Module) ?spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .module) continue;
+        if (ent.parent != row.parent) continue;
+        if (!std.mem.eql(u8, ent.name, row.name)) continue;
+        return ent.id;
+    }
+    return null;
+}
+
+fn existingExternalModule(
+    e: *const Ext,
+    parent: ?spine.EntityId,
+    name: []const u8,
+) ?spine.EntityId {
+    for (e.ctx.g.modules.items) |row| {
+        if (!row.is_extern or row.parent != parent or
+            !std.mem.eql(u8, row.name, name)) continue;
+        if (moduleEntityForRow(e, row)) |module_id| return module_id;
+    }
+    return null;
+}
+
+fn appendGraphModuleItem(
+    e: *Ext,
+    module_id: spine.EntityId,
+    item_id: spine.EntityId,
+) !void {
+    const module_ent = e.ctx.g.symbol_table.get(module_id) orelse
+        return error.InvalidModuleEntity;
+    for (e.ctx.g.modules.items) |*row| {
+        if (moduleEntityForRow(e, row.*) != module_id) continue;
+        const old_items = row.items;
+        const new_items = try e.ctx.alloc.alloc(spine.EntityId, old_items.len + 1);
+        @memcpy(new_items[0..old_items.len], old_items);
+        new_items[old_items.len] = item_id;
+        if (old_items.len > 0) e.ctx.alloc.free(old_items);
+        row.items = new_items;
+        return;
+    }
+    _ = module_ent;
+    return error.InvalidModuleEntity;
+}
+
+fn ensureExternalModule(
+    e: *Ext,
+    parent: ?spine.EntityId,
+    name: []const u8,
+) !spine.EntityId {
+    if (existingExternalModule(e, parent, name)) |module_id| return module_id;
+    const owned_name = try e.ctx.alloc.dupe(u8, name);
+    errdefer e.ctx.alloc.free(owned_name);
+    const module_id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = owned_name,
+        .span = span_of,
+        .visibility = .public,
+        .parent = parent,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    const row_name = try e.ctx.alloc.dupe(u8, name);
+    errdefer e.ctx.alloc.free(row_name);
+    _ = try e.ctx.g.addModule(.{
+        .id = 0,
+        .kind = if (parent == null) .file else .@"inline",
+        .name = row_name,
+        .parent = parent,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = true,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    if (parent) |parent_id| try appendGraphModuleItem(e, parent_id, module_id);
+    return module_id;
+}
+
+fn appendStandardEnumEntity(
+    e: *Ext,
+    parent: spine.EntityId,
+    info: anytype,
+) !spine.EntityId {
+    const enum_id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .enum_,
+        .name = try e.ctx.alloc.dupe(u8, info.enum_name),
+        .span = span_of,
+        .visibility = .public,
+        .parent = parent,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    const variants: []const items.Variant = if (std.mem.eql(u8, info.enum_name, "Option"))
+        standard_option_variants
+    else
+        standard_result_variants;
+    e.ctx.bodies_list.items[enum_id] = .{ .enum_ = .{
+        .generic_params = if (std.mem.eql(u8, info.enum_name, "Option"))
+            &.{"T"}
+        else
+            &.{ "T", "E" },
+        .kind = .data,
+        .variants = variants,
+        .repr_int = null,
+        .non_exhaustive = false,
+    } };
+    try appendGraphModuleItem(e, parent, enum_id);
+    return enum_id;
+}
+
+fn ensureStandardPreludeVariant(
+    e: *Ext,
+    name: []const u8,
+) !?StandardPreludeVariant {
+    const info = standardPreludeVariantName(name) orelse return null;
+    const core_id = try ensureExternalModule(e, null, "core");
+    const module_id = try ensureExternalModule(e, core_id, info.module_name);
+    var enum_id: ?spine.EntityId = null;
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind == .enum_ and ent.parent == module_id and
+            std.mem.eql(u8, ent.name, info.enum_name))
+        {
+            enum_id = ent.id;
+            break;
+        }
+    }
+    const actual_enum = enum_id orelse try appendStandardEnumEntity(e, module_id, info);
+    const variant_id = if (resolveVariant(e, actual_enum, info.variant_name)) |existing|
+        existing
+    else blk: {
+        const id = try e.ctx.g.symbol_table.add(.{
+            .id = 0,
+            .kind = .variant,
+            .name = try e.ctx.alloc.dupe(u8, info.variant_name),
+            .span = span_of,
+            .visibility = .public,
+            .parent = actual_enum,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
+        try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+        break :blk id;
+    };
+    return .{
+        .enum_id = actual_enum,
+        .variant_id = variant_id,
+        .module_name = info.module_name,
+        .enum_name = info.enum_name,
+        .variant_name = info.variant_name,
+    };
 }
 
 /// Resolve an identifier: local scope first, then the current module scope.
@@ -590,6 +949,34 @@ fn pushLocal(e: *Ext, name: []const u8) anyerror!spine.EntityId {
     try e.ctx.bodies_list.append(e.ctx.alloc, .none);
     try e.locals.append(e.ctx.alloc, .{ .name = name, .def = id });
     return id;
+}
+
+/// Register a method reference without introducing a lexical binding.
+fn pushMethodRef(e: *Ext, name: []const u8) anyerror!spine.EntityId {
+    const id: spine.EntityId = @intCast(e.ctx.g.symbol_table.entities.items.len);
+    const duped = try e.ctx.alloc.dupe(u8, name);
+    _ = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .method_ref,
+        .name = duped,
+        .span = span_of,
+        .visibility = .public,
+        .parent = e.fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    return id;
+}
+
+fn setLocalType(e: *Ext, def: spine.EntityId, ty: types.Type) void {
+    for (e.locals.items) |*local| {
+        if (local.def == def) {
+            local.ty = ty;
+            return;
+        }
+    }
 }
 
 fn appendExpr(e: *Ext, kind: exprs.ExprKind) anyerror!exprs.NodeId {
@@ -636,6 +1023,23 @@ fn patternContainsUnsupported(e: *const Ext, pat_id: exprs.NodeId) bool {
             }
             break :blk false;
         },
+        .external_variant => |external| blk: {
+            for (external.fields) |field| {
+                if (field.pat) |field_id| {
+                    if (patternContainsUnsupported(e, field_id)) break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .range => |range| blk: {
+            if (range.lo) |lo| {
+                if (lo >= e.ctx.exprs.items.len or e.ctx.exprs.items[lo].kind == .unsupported) break :blk true;
+            }
+            if (range.hi) |hi| {
+                if (hi >= e.ctx.exprs.items.len or e.ctx.exprs.items[hi].kind == .unsupported) break :blk true;
+            }
+            break :blk false;
+        },
         .reference => |reference| patternContainsUnsupported(e, reference.inner),
         .@"or" => |or_pattern| blk: {
             for (or_pattern.alternatives) |alternative_id| {
@@ -647,7 +1051,12 @@ fn patternContainsUnsupported(e: *const Ext, pat_id: exprs.NodeId) bool {
     };
 }
 
-fn appendType(e: *Ext, t: types.Type) !exprs.TypeId {
+fn appendType(e: *Ext, t: types.Type) !?exprs.TypeId {
+    // Generic parameters and expression-valued array lengths are valid type
+    // table entries. Keep the concrete-return policy at its call sites instead
+    // of dropping otherwise valid cast, parameter, and local annotation types.
+    if (t == .unsupported) return null;
+    if (infer.findTypeIndexInSlice(e.ctx.types.items, t)) |existing| return existing;
     const id: exprs.TypeId = @intCast(e.ctx.types.items.len);
     try e.ctx.types.append(e.ctx.alloc, t);
     return id;
@@ -670,7 +1079,7 @@ fn isSliceTypeNode(node: ts.Node) bool {
 /// Lower a tree-sitter type node to a wire `types.Type`. Handles primitives,
 /// slices, arrays, references, named types (path / generic), and tuples.
 /// Unsupported syntax is explicit; unresolved nominal paths are typed errors.
-fn mapCstType(e: *const Ext, node: ts.Node) anyerror!types.Type {
+fn mapCstType(e: *Ext, node: ts.Node) anyerror!types.Type {
     const kind = node.kind();
     if (std.mem.eql(u8, kind, "type")) {
         if (node.namedChildCount() > 0) {
@@ -681,10 +1090,7 @@ fn mapCstType(e: *const Ext, node: ts.Node) anyerror!types.Type {
     }
     if (std.mem.eql(u8, kind, "primitive_type")) {
         const nm = text(e, node);
-        if (std.mem.eql(u8, nm, "str")) {
-            const slice_type = try cstSlice(e, .{ .prim = .u8 }, true);
-            return slice_type;
-        }
+        if (std.mem.eql(u8, nm, "str")) return types.str_type;
         const from = mapPrim(nm);
         if (from) |p| return .{ .prim = p };
         return unsupportedCstType();
@@ -756,16 +1162,25 @@ fn mapCstType(e: *const Ext, node: ts.Node) anyerror!types.Type {
             return slice_type;
         }
 
-        var len_lit: u32 = 0;
+        var len: types.ArrayLen = undefined;
         if (node.namedChild(1)) |len_node| {
             if (std.mem.eql(u8, len_node.kind(), "integer_literal")) {
-                len_lit = std.fmt.parseInt(u32, text(e, len_node), 10) catch
+                const len_lit = std.fmt.parseInt(u64, text(e, len_node), 10) catch
                     return error.InvalidType;
+                len = .{ .literal = len_lit };
+            } else {
+                const len_expr = try lowerExpr(e, len_node);
+                len = .{ .expression = @intCast(len_expr) };
             }
+        } else {
+            return error.InvalidType;
         }
         const a = try e.ctx.alloc.create(types.Array);
-        a.* = .{ .elem = elem, .len = .{ .literal = len_lit } };
+        a.* = .{ .elem = elem, .len = len };
         return .{ .array = a };
+    }
+    if (std.mem.eql(u8, kind, "qualified_type")) {
+        return mapCstQualifiedType(e, node);
     }
     if (std.mem.eql(u8, kind, "generic_type") or
         std.mem.eql(u8, kind, "type_identifier") or
@@ -788,6 +1203,39 @@ fn mapCstType(e: *const Ext, node: ts.Node) anyerror!types.Type {
     if (node.namedChildCount() > 0) return mapCstType(e, node.namedChild(0).?);
     return unsupportedCstType();
 }
+fn mapCstQualifiedType(e: *Ext, node: ts.Node) anyerror!types.Type {
+    const receiver_node = node.childByFieldName("type") orelse return error.UnresolvedNominalType;
+    const trait_node = node.childByFieldName("trait") orelse return error.UnresolvedNominalType;
+    const assoc_node = node.childByFieldName("path") orelse return error.UnresolvedNominalType;
+    const receiver = try mapCstType(e, receiver_node);
+    const receiver_path = switch (receiver) {
+        .path => |path| path,
+        else => return error.UnresolvedNominalType,
+    };
+    if (receiver_path.segments.len != 1) return error.UnresolvedNominalType;
+
+    const trait_def = resolvePatternPath(e, trait_node) orelse return error.UnresolvedNominalType;
+    const trait_raw = std.mem.trim(u8, text(e, trait_node), " \t\r\n");
+    const trait_name = if (std.mem.lastIndexOf(u8, trait_raw, "::")) |sep|
+        trait_raw[sep + 2 ..]
+    else
+        trait_raw;
+    const assoc_name = std.mem.trim(u8, text(e, assoc_node), " \t\r\n");
+    if (trait_name.len == 0 or assoc_name.len == 0) return error.UnresolvedNominalType;
+
+    const segments = try e.ctx.alloc.alloc(types.PathSegment, 3);
+    segments[0] = receiver_path.segments[0];
+    segments[1] = .{
+        .name = try e.ctx.alloc.dupe(u8, trait_name),
+        .id = trait_def,
+    };
+    segments[2] = .{
+        .name = try e.ctx.alloc.dupe(u8, assoc_name),
+        .id = null,
+    };
+    return .{ .path = .{ .segments = segments } };
+}
+
 fn cstSlice(e: *const Ext, elem: types.Type, const_: bool) !types.Type {
     const s = try e.ctx.alloc.create(types.Slice);
     s.* = .{ .const_ = const_, .elem = elem };
@@ -799,7 +1247,7 @@ fn unsupportedCstType() types.Type {
 }
 
 /// Map a named (path) type — possibly generic — to the wire model.
-fn mapCstNamedType(e: *const Ext, node: ts.Node) anyerror!types.Type {
+fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
     var name: ?[]const u8 = null;
     var arg_nodes: [8]ts.Node = undefined;
     var arg_count: usize = 0;
@@ -830,6 +1278,7 @@ fn mapCstNamedType(e: *const Ext, node: ts.Node) anyerror!types.Type {
             {
                 var j: u32 = 0;
                 while (c.namedChild(j)) |a| : (j += 1) {
+                    if (std.mem.eql(u8, a.kind(), "lifetime")) continue;
                     if (arg_count == arg_nodes.len) return error.TooManyTypeArguments;
                     arg_nodes[arg_count] = a;
                     arg_count += 1;
@@ -865,10 +1314,21 @@ fn mapCstNamedType(e: *const Ext, node: ts.Node) anyerror!types.Type {
         inner.* = args[0];
         return .{ .boxed = inner };
     }
+    if (segs.items.len == 0 and resolveName(e, nm) == null and
+        (std.mem.eql(u8, nm, "String") or std.mem.eql(u8, nm, "Vec")))
+    {
+        const prelude_path = if (std.mem.eql(u8, nm, "String")) "alloc::string::String" else "alloc::vec::Vec";
+        var external = (try externalNominalForPath(e, prelude_path)) orelse
+            return error.UnresolvedNominalType;
+        external.args = args;
+        return .{ .external_nominal = external };
+    }
 
     const had_scoped_segments = segs.items.len > 0;
-    if (segs.items.len == 0 or !std.mem.eql(u8, segs.items[segs.items.len - 1].name, nm)) {
-        try segs.append(e.ctx.alloc, .{ .name = nm, .id = null });
+    if (segs.items.len == 0 or
+        !std.mem.eql(u8, segs.items[segs.items.len - 1].name, nm))
+    {
+        try segs.append(e.ctx.alloc, .{ .name = try e.ctx.alloc.dupe(u8, nm), .id = null });
     }
     if (segs.items.len > 0 and
         (std.mem.eql(u8, segs.items[0].name, "core") or
@@ -878,7 +1338,7 @@ fn mapCstNamedType(e: *const Ext, node: ts.Node) anyerror!types.Type {
         const external_path = try e.ctx.alloc.alloc([]const u8, segs.items.len);
         for (segs.items, 0..) |segment, index| {
             if (segment.name.len == 0) return error.InvalidType;
-            external_path[index] = segment.name;
+            external_path[index] = try e.ctx.alloc.dupe(u8, segment.name);
         }
         return .{ .external_nominal = .{
             .path = external_path,
@@ -918,7 +1378,7 @@ fn mapCstScopedSegments(e: *const Ext, node: ts.Node) ![]const types.PathSegment
     while (path_parts.next()) |part| {
         const name = std.mem.trim(u8, part, " \t\r\n");
         if (name.len == 0) return error.UnresolvedNominalType;
-        try segs.append(e.ctx.alloc, .{ .name = name, .id = null });
+        try segs.append(e.ctx.alloc, .{ .name = try e.ctx.alloc.dupe(u8, name), .id = null });
     }
     return segs.toOwnedSlice(e.ctx.alloc);
 }
@@ -939,6 +1399,74 @@ fn externalUsePath(e: *const Ext, name: []const u8) !?[]const []const u8 {
         found = external.path;
     }
     return found;
+}
+
+fn externalNominalForPath(e: *const Ext, raw_path: []const u8) !?types.ExternalNominal {
+    var source = std.mem.trim(u8, raw_path, " \t\r\n");
+    if (std.mem.startsWith(u8, source, "::")) source = source[2..];
+    if (source.len == 0) return null;
+
+    var parts: [16][]const u8 = undefined;
+    var part_count: usize = 0;
+    var iterator = std.mem.splitSequence(u8, source, "::");
+    while (iterator.next()) |part| {
+        const name = std.mem.trim(u8, part, " \t\r\n");
+        if (name.len == 0 or part_count == parts.len) return null;
+        parts[part_count] = name;
+        part_count += 1;
+    }
+    if (part_count == 0) return null;
+
+    var prefix: []const []const u8 = &.{};
+    if (part_count > 1 and std.mem.eql(u8, parts[0], "String") and
+        resolveName(e, "String") == null)
+    {
+        prefix = &.{ "alloc", "string", "String" };
+    } else if (part_count == 1) {
+        prefix = (try externalUsePath(e, parts[0])) orelse return null;
+    } else if (!std.mem.eql(u8, parts[0], "core") and
+        !std.mem.eql(u8, parts[0], "std") and
+        !std.mem.eql(u8, parts[0], "alloc"))
+    {
+        prefix = (try externalUsePath(e, parts[0])) orelse return null;
+    }
+
+    const path_len = if (prefix.len > 0) prefix.len + part_count - 1 else part_count;
+    const owned_path = try e.ctx.alloc.alloc([]const u8, path_len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned_path[0..copied]) |segment| e.ctx.alloc.free(segment);
+        e.ctx.alloc.free(owned_path);
+    }
+    for (prefix) |segment| {
+        owned_path[copied] = try e.ctx.alloc.dupe(u8, segment);
+        copied += 1;
+    }
+    const source_start: usize = if (prefix.len > 0) 1 else 0;
+    for (parts[source_start..part_count]) |segment| {
+        owned_path[copied] = try e.ctx.alloc.dupe(u8, segment);
+        copied += 1;
+    }
+    return .{ .path = owned_path, .args = &.{} };
+}
+
+fn externalCowVariantForPath(
+    e: *const Ext,
+    owner_path: []const u8,
+    variant: []const u8,
+) !?types.ExternalNominal {
+    if (!std.mem.eql(u8, variant, "Owned") and
+        !std.mem.eql(u8, variant, "Borrowed")) return null;
+    const owner = (try externalNominalForPath(e, owner_path)) orelse return null;
+    if (owner.path.len < 3 or
+        !std.mem.eql(u8, owner.path[owner.path.len - 2], "borrow") or
+        !std.mem.eql(u8, owner.path[owner.path.len - 1], "Cow"))
+    {
+        for (owner.path) |segment| e.ctx.alloc.free(segment);
+        e.ctx.alloc.free(owner.path);
+        return null;
+    }
+    return owner;
 }
 
 fn mapPrim(nm: []const u8) ?types.Prim {
@@ -967,9 +1495,9 @@ fn mapPrim(nm: []const u8) ?types.Prim {
 /// Lower a `let_declaration`: registers the binding(s) locally via
 /// `lowerPattern` and appends a `let` statement.
 fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
-    var pat_node: ?ts.Node = null;
-    var type_node: ?ts.Node = null;
-    var init_node: ?ts.Node = null;
+    const pat_node = node.childByFieldName("pattern");
+    const type_node = node.childByFieldName("type");
+    const init_node = node.childByFieldName("value");
     var binding_mutable = false;
 
     var child_i: u32 = 0;
@@ -982,31 +1510,6 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
         }
     }
 
-    var i: u32 = 0;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        const k = c.kind();
-        if (pat_node == null and isPatternNode(c)) {
-            pat_node = c;
-        } else if (std.mem.eql(u8, k, "type") or
-            std.mem.eql(u8, k, "primitive_type") or
-            std.mem.eql(u8, k, "generic_type") or
-            std.mem.eql(u8, k, "reference_type") or
-            std.mem.eql(u8, k, "pointer_type") or
-            std.mem.eql(u8, k, "type_identifier") or
-            std.mem.eql(u8, k, "scoped_type_identifier") or
-            std.mem.eql(u8, k, "array_type") or
-            std.mem.eql(u8, k, "slice_type") or
-            std.mem.eql(u8, k, "tuple_type"))
-        {
-            type_node = c;
-        } else if (init_node == null and
-            !std.mem.eql(u8, k, "mutable_specifier") and
-            !std.mem.eql(u8, k, "let"))
-        {
-            init_node = c;
-        }
-    }
-    if (init_node == null) init_node = node.childByFieldName("value");
     var ann: ?exprs.TypeId = null;
     if (type_node) |tn| {
         const t = try mapCstType(e, tn);
@@ -1019,6 +1522,15 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
     var pat_id: exprs.NodeId = 0;
     if (pat_node) |pn| {
         pat_id = try lowerPattern(e, pn);
+        if (e.ctx.pats.items[pat_id].kind == .binding) {
+            const binding = e.ctx.pats.items[pat_id].kind.binding;
+            const def = resolveName(e, binding.name) orelse return error.MalformedCst;
+            if (ann) |type_id| {
+                setLocalType(e, def, e.ctx.types.items[type_id]);
+            } else if (init_id) |value| {
+                if (knownCastOperandType(e, value)) |ty| setLocalType(e, def, ty);
+            }
+        }
         if (binding_mutable) {
             switch (e.ctx.pats.items[pat_id].kind) {
                 .binding => |binding_value| {
@@ -1038,6 +1550,155 @@ fn lowerLet(e: *Ext, node: ts.Node) anyerror!void {
         .ty = ann,
     } });
 }
+/// Local const lowering is intentionally conservative. Keep only pure scalar
+/// expressions whose value is independent of all names; reject captures,
+/// forward references, calls, and aggregate values explicitly.
+fn isPureLocalConstExpr(e: *const Ext, node: exprs.NodeId) bool {
+    if (node >= e.ctx.exprs.items.len) return false;
+    return switch (e.ctx.exprs.items[node].kind) {
+        .literal => |literal| switch (literal) {
+            .int, .float, .boolean, .character => true,
+            else => false,
+        },
+        .binary => |binary| switch (binary.op) {
+            .add, .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => isPureLocalConstExpr(e, binary.lhs) and isPureLocalConstExpr(e, binary.rhs),
+            else => false,
+        },
+        .unary => |unary| switch (unary.op) {
+            .negate, .bit_not => isPureLocalConstExpr(e, unary.operand),
+            else => false,
+        },
+        .cast => |cast| isPureLocalConstExpr(e, cast.operand),
+        else => false,
+    };
+}
+
+/// Lower a block-local `const` as an immutable let binding. Lower the
+/// initializer before registering the name so a declaration cannot resolve
+/// itself when it shadows an outer binding.
+fn lowerConstItem(e: *Ext, node: ts.Node) anyerror!void {
+    var name: ?[]const u8 = null;
+    var type_node: ?ts.Node = null;
+    var init_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        const k = c.kind();
+        if (name == null and std.mem.eql(u8, k, "identifier")) {
+            name = text(e, c);
+            continue;
+        }
+        if (type_node == null and
+            (std.mem.eql(u8, k, "type") or
+                std.mem.eql(u8, k, "primitive_type") or
+                std.mem.eql(u8, k, "generic_type") or
+                std.mem.eql(u8, k, "reference_type") or
+                std.mem.eql(u8, k, "pointer_type") or
+                std.mem.eql(u8, k, "type_identifier") or
+                std.mem.eql(u8, k, "scoped_type_identifier") or
+                std.mem.eql(u8, k, "array_type") or
+                std.mem.eql(u8, k, "slice_type") or
+                std.mem.eql(u8, k, "tuple_type") or
+                std.mem.eql(u8, k, "unit_type")))
+        {
+            type_node = c;
+            continue;
+        }
+        if (init_node == null) init_node = c;
+    }
+    const binding_name = name orelse return error.MalformedCst;
+    const initializer = init_node orelse node.childByFieldName("value") orelse
+        return error.MalformedCst;
+
+    var ann: ?exprs.TypeId = null;
+    var local_ty: ?types.Type = null;
+    if (type_node) |tn| {
+        const t = try mapCstType(e, tn);
+        if (t != .unsupported) {
+            const type_id = try appendType(e, t);
+            ann = type_id;
+            local_ty = t;
+        }
+    }
+    var init_id = try lowerExpr(e, initializer);
+    if (!isPureLocalConstExpr(e, init_id)) {
+        init_id = try unsupported(e, "local const initializer is not a pure scalar");
+    }
+    const local_def = try pushLocal(e, binding_name);
+    if (local_ty) |ty| {
+        setLocalType(e, local_def, ty);
+    } else if (knownCastOperandType(e, init_id)) |ty| {
+        setLocalType(e, local_def, ty);
+    }
+    const pat_id = try appendPat(e, .{ .binding = .{
+        .name = try e.ctx.alloc.dupe(u8, binding_name),
+        .mode = .value,
+        .mutable = false,
+    } });
+    _ = try appendStmt(e, .{ .let = .{
+        .pattern = pat_id,
+        .init = init_id,
+        .ty = ann,
+    } });
+}
+
+/// Lower a function-local `static` with item identity preserved. The item is
+/// represented by a static entity and const body, while the enclosing block
+/// receives only an item statement and a lexical name binding. Its initializer
+/// is lowered before that binding is installed.
+fn lowerStaticItem(e: *Ext, node: ts.Node) anyerror!void {
+    var name_node: ?ts.Node = node.childByFieldName("name");
+    var type_node: ?ts.Node = node.childByFieldName("type");
+    var init_node: ?ts.Node = node.childByFieldName("value");
+
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        const kind = child.kind();
+        if (name_node == null and std.mem.eql(u8, kind, "identifier")) {
+            name_node = child;
+            continue;
+        }
+        if (type_node == null and
+            (isClosureTypeNode(kind) or std.mem.eql(u8, kind, "unit_type")))
+        {
+            type_node = child;
+            continue;
+        }
+        if (init_node == null and
+            (name_node == null or child.id != name_node.?.id) and
+            (type_node == null or child.id != type_node.?.id))
+        {
+            init_node = child;
+        }
+    }
+
+    const name = name_node orelse return error.MalformedCst;
+    const ty_node = type_node orelse return error.MalformedCst;
+    const initializer = init_node orelse return error.MalformedCst;
+    const static_ty = try mapCstType(e, ty_node);
+    if (static_ty == .unsupported) return error.UnsupportedStaticType;
+    const init_id = try lowerExpr(e, initializer);
+    const static_id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .static_,
+        .name = try e.ctx.alloc.dupe(u8, text(e, name)),
+        .span = span_of,
+        .visibility = .private,
+        .parent = e.fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .{ .const_ = .{
+        .ty = static_ty,
+        .init = init_id,
+    } });
+    try e.locals.append(e.ctx.alloc, .{
+        .name = text(e, name),
+        .def = static_id,
+        .ty = static_ty,
+    });
+    _ = try appendStmt(e, .{ .item = static_id });
+}
 
 fn isPatternNode(node: ts.Node) bool {
     const k = node.kind();
@@ -1048,12 +1709,117 @@ fn isPatternNode(node: ts.Node) bool {
         std.mem.eql(u8, k, "struct_pattern") or
         std.mem.eql(u8, k, "tuple_struct_pattern") or
         std.mem.eql(u8, k, "reference_pattern") or
+        std.mem.eql(u8, k, "ref_pattern") or
+        std.mem.eql(u8, k, "range_pattern") or
+        std.mem.eql(u8, k, "captured_pattern") or
         std.mem.eql(u8, k, "wildcard_pattern") or
+        std.mem.eql(u8, k, "_") or
         std.mem.eql(u8, k, "or_pattern") or
-        std.mem.eql(u8, k, "scoped_identifier") or
         std.mem.eql(u8, k, "slice_pattern") or
         std.mem.eql(u8, k, "literal_pattern") or
         std.mem.eql(u8, k, "char_literal");
+}
+
+const CstRange = struct {
+    left: ?ts.Node,
+    right: ?ts.Node,
+    inclusive: bool,
+};
+
+fn cstRange(e: *const Ext, node: ts.Node) CstRange {
+    const named_left = node.childByFieldName("left");
+    const named_right = node.childByFieldName("right");
+    const raw = text(e, node);
+    const inclusive = std.mem.indexOf(u8, raw, "..=") != null or
+        std.mem.indexOf(u8, raw, "...") != null;
+    // Rust's range_expression production has no fields in the vendored
+    // grammar. Prefer named bounds when a grammar revision provides them,
+    // then use the operator as the delimiter for the lossless fallback.
+    if (named_left != null or named_right != null) {
+        return .{ .left = named_left, .right = named_right, .inclusive = inclusive };
+    }
+    var left: ?ts.Node = null;
+    var right: ?ts.Node = null;
+    var after_operator = false;
+    var i: u32 = 0;
+    while (node.child(i)) |child| : (i += 1) {
+        if (!child.isNamed()) {
+            const child_text = text(e, child);
+            if (std.mem.eql(u8, child_text, "..") or
+                std.mem.eql(u8, child_text, "..=") or
+                std.mem.eql(u8, child_text, "..."))
+            {
+                after_operator = true;
+            }
+            continue;
+        }
+        if (isBlockTrivia(child)) continue;
+        if (after_operator) {
+            if (right == null) right = child;
+        } else if (left == null) {
+            left = child;
+        }
+    }
+    return .{ .left = left, .right = right, .inclusive = inclusive };
+}
+
+/// Peel a range node (`a..b`, `a..=b`, `a..`) into its iterator classification.
+/// Only `0..b` / `0..=b` are lowered (start must be the literal `0`); `..=b`
+/// lowers to the inclusive bound `b+1` which the backend emits as `0..(b+1)`.
+fn lowerRangeIter(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
+    const range = cstRange(e, node);
+    if (range.left) |left| {
+        const start = std.mem.trim(u8, text(e, left), " \t\r\n");
+        if (!std.mem.eql(u8, start, "0")) return unsupportedIter(e, "range start");
+    }
+    const right = range.right orelse return unsupportedIter(e, "range no end");
+    var end_eid = try lowerExpr(e, right);
+    if (range.inclusive) {
+        const one = try appendExpr(e, .{ .literal = .{ .int = .{
+            .text = "1",
+            .value = 1,
+            .base = .dec,
+            .ty_suffix = null,
+        } } });
+        end_eid = try appendExpr(e, .{ .binary = .{
+            .op = .add,
+            .overflow = .wrapping,
+            .lhs = end_eid,
+            .rhs = one,
+        } });
+    }
+    return .{ .kind = .{ .range = {} }, .eid = end_eid };
+}
+
+/// Lower a source range while retaining an absent end for open-ended slices.
+fn lowerRangeExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const range = cstRange(e, node);
+    const start_id = if (range.left) |start| blk: {
+        const lowered = try lowerExpr(e, start);
+        if (e.ctx.exprs.items[lowered].kind == .unsupported) {
+            return unsupported(e, "iterator range bound");
+        }
+        break :blk lowered;
+    } else try appendExpr(e, .{ .literal = .{ .int = .{
+        .text = "0",
+        .value = 0,
+        .base = .dec,
+        .ty_suffix = null,
+    } } });
+
+    var end_id: ?exprs.NodeId = null;
+    if (range.right) |end| {
+        const lowered = try lowerExpr(e, end);
+        if (e.ctx.exprs.items[lowered].kind == .unsupported) {
+            return unsupported(e, "iterator range bound");
+        }
+        end_id = lowered;
+    }
+    return appendExpr(e, .{ .range = .{
+        .start = start_id,
+        .end = end_id,
+        .inclusive = range.inclusive,
+    } });
 }
 
 /// Classification of a `for` iterable produced by `unwrapIterable`.
@@ -1089,80 +1855,6 @@ fn argumentsOf(node: ts.Node) ?ts.Node {
         if (std.mem.eql(u8, c.kind(), "arguments")) return c;
     }
     return null;
-}
-
-/// Peel a range node (`a..b`, `a..=b`, `a..`) into its iterator classification.
-/// Only `0..b` / `0..=b` are lowered (start must be the literal `0`); `..=b`
-/// lowers to the inclusive bound `b+1` which the backend emits as `0..(b+1)`.
-fn lowerRangeIter(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
-    var start_n: ?ts.Node = null;
-    var end_n: ?ts.Node = null;
-    var inclusive = false;
-    var saw_op = false;
-    var i: u32 = 0;
-    while (node.child(i)) |c| : (i += 1) {
-        const t = text(e, c);
-        if (std.mem.eql(u8, t, "..=")) {
-            saw_op = true;
-            inclusive = true;
-        } else if (std.mem.eql(u8, t, "..")) {
-            saw_op = true;
-        } else if (c.isNamed()) {
-            if (saw_op) end_n = c else start_n = c;
-        }
-    }
-    if (start_n) |sn| {
-        const st = std.mem.trim(u8, text(e, sn), " \t\r\n");
-        if (!std.mem.eql(u8, st, "0")) return unsupportedIter(e, "range start");
-    }
-    if (end_n == null) return unsupportedIter(e, "range no end");
-    var end_eid = try lowerExpr(e, end_n.?);
-    if (inclusive) {
-        const one = try appendExpr(e, .{ .literal = .{ .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null } } });
-        end_eid = try appendExpr(e, .{ .binary = .{ .op = .add, .overflow = .wrapping, .lhs = end_eid, .rhs = one } });
-    }
-    return .{ .kind = .{ .range = {} }, .eid = end_eid };
-}
-
-/// Lower a bounded source range without changing its endpoint semantics.
-fn lowerRangeExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
-    var start_node: ?ts.Node = null;
-    var end_node: ?ts.Node = null;
-    var inclusive = false;
-    var saw_operator = false;
-    var i: u32 = 0;
-    while (node.child(i)) |child| : (i += 1) {
-        const child_text = text(e, child);
-        if (std.mem.eql(u8, child_text, "..=")) {
-            saw_operator = true;
-            inclusive = true;
-        } else if (std.mem.eql(u8, child_text, "..")) {
-            saw_operator = true;
-        } else if (child.isNamed()) {
-            if (saw_operator) {
-                if (end_node != null) return unsupported(e, "range endpoint");
-                end_node = child;
-            } else {
-                if (start_node != null) return unsupported(e, "range start");
-                start_node = child;
-            }
-        }
-    }
-
-    const start = start_node orelse return unsupported(e, "bounded range start");
-    const end = end_node orelse return unsupported(e, "bounded range end");
-    const start_id = try lowerExpr(e, start);
-    const end_id = try lowerExpr(e, end);
-    if (e.ctx.exprs.items[start_id].kind == .unsupported or
-        e.ctx.exprs.items[end_id].kind == .unsupported)
-    {
-        return unsupported(e, "iterator range bound");
-    }
-    return appendExpr(e, .{ .range = .{
-        .start = start_id,
-        .end = end_id,
-        .inclusive = inclusive,
-    } });
 }
 
 fn peelParenthesized(node: ts.Node) ts.Node {
@@ -1202,6 +1894,9 @@ fn closurePatternNode(node: ts.Node) ?ts.Node {
 }
 
 fn localType(e: *const Ext, def: spine.EntityId) ?types.Type {
+    for (e.locals.items) |local| {
+        if (local.def == def) return local.ty;
+    }
     const entity = e.ctx.g.symbol_table.get(def) orelse return null;
     if (e.fn_id >= e.ctx.bodies_list.items.len) return null;
     return switch (e.ctx.bodies_list.items[e.fn_id]) {
@@ -1213,6 +1908,35 @@ fn localType(e: *const Ext, def: spine.EntityId) ?types.Type {
         },
         else => null,
     };
+}
+
+fn writesCapturedLocal(e: *const Ext, expression: exprs.Expr, definition: spine.EntityId) bool {
+    var target = switch (expression.kind) {
+        .assign => |assignment| assignment.target,
+        .unary => |unary| if (unary.op == .ref and unary.op.ref == .mutable)
+            unary.operand
+        else
+            return false,
+        .method_call => |call| if (call.receiver_mode == .mutable)
+            call.receiver
+        else
+            return false,
+        else => return false,
+    };
+    var depth: usize = 0;
+    while (target < e.ctx.exprs.items.len and depth < e.ctx.exprs.items.len) : (depth += 1) {
+        switch (e.ctx.exprs.items[target].kind) {
+            .path => |path| return path.def == definition,
+            .field => |field| target = field.base,
+            .index => |index| target = index.base,
+            .unary => |unary| {
+                if (unary.op != .deref) return false;
+                target = unary.operand;
+            },
+            else => return false,
+        }
+    }
+    return false;
 }
 
 fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
@@ -1233,13 +1957,18 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
         }
     }
     if (body_node == null) body_node = fallback_body;
+    var closure_return_ty: ?exprs.TypeId = null;
+    if (node.childByFieldName("return_type")) |return_node| {
+        const return_type = mapCstType(e, return_node) catch return null;
+        closure_return_ty = try appendType(e, return_type) orelse return null;
+    }
 
     var params: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
     defer params.deinit(e.ctx.alloc);
     if (parameters_node) |parameters| {
         // The wildcard in `|_|` is an anonymous grammar token, so it is not
-        // returned by `namedChild`. Walk all children to retain its parameter
-        // slot and to reject multiple wildcard parameters by arity.
+        // returned by `namedChild`. Walk all children to retain each
+        // parameter slot.
         var parameter_index: u32 = 0;
         while (parameters.child(parameter_index)) |parameter| : (parameter_index += 1) {
             if (isComment(parameter)) continue;
@@ -1255,11 +1984,14 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
                 error.MalformedCst => return null,
                 else => return err,
             };
+            if (parameter.childByFieldName("type")) |type_node| {
+                const parameter_type = mapCstType(e, type_node) catch return null;
+                setPatternLocalTypes(e, pattern_id, parameter_type);
+            }
             if (patternContainsUnsupported(e, pattern_id)) return null;
             try params.append(e.ctx.alloc, pattern_id);
         }
     }
-    if (params.items.len != 1) return null;
 
     const body = body_node orelse return null;
     if (isClosureTypeNode(body.kind())) return null;
@@ -1290,9 +2022,20 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
 
     var captures: std.ArrayListUnmanaged(exprs.Capture) = .empty;
     defer captures.deinit(e.ctx.alloc);
+    var capture_mode: exprs.CaptureMode = .by_ref;
+    var child_index: u32 = 0;
+    while (node.child(child_index)) |child| : (child_index += 1) {
+        if (std.mem.eql(u8, std.mem.trim(u8, text(e, child), " \t\r\n"), "move")) {
+            capture_mode = .by_value;
+            break;
+        }
+    }
+    var closure_trait: exprs.ClosureTrait = .@"fn";
     for (e.locals.items[0..outer_local_count]) |outer_local| {
         var referenced = false;
+        var mutated = false;
         for (e.ctx.exprs.items[body_expr_start..]) |expression| {
+            mutated = mutated or writesCapturedLocal(e, expression, outer_local.def);
             switch (expression.kind) {
                 .path => |path| {
                     if (path.def == outer_local.def) referenced = true;
@@ -1301,6 +2044,7 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
             }
         }
         if (!referenced) continue;
+        if (mutated) closure_trait = .fn_mut;
 
         const capture_entity = e.ctx.g.symbol_table.get(outer_local.def) orelse return null;
         const capture_type = localType(e, outer_local.def) orelse return null;
@@ -1308,10 +2052,10 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
             .unsupported => return null,
             else => {},
         }
-        const capture_type_id = try appendType(e, capture_type);
+        const capture_type_id = (try appendType(e, capture_type)) orelse return null;
         try captures.append(e.ctx.alloc, .{
             .name = capture_entity.name,
-            .mode = .by_ref,
+            .mode = if (mutated and capture_mode != .by_value) .by_mut_ref else capture_mode,
             .ty = capture_type_id,
         });
     }
@@ -1324,30 +2068,130 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
     return .{
         .captures = closure_captures,
         .params = closure_params,
-        .return_ty = null,
+        .return_ty = closure_return_ty,
         .body = body_block,
-        .trait = .@"fn",
+        .trait = closure_trait,
     };
+}
+
+fn discardClosureStorage(e: *Ext, closure: exprs.ClosureExpr) void {
+    if (closure.captures.len > 0) e.ctx.alloc.free(closure.captures);
+    if (closure.params.len > 0) e.ctx.alloc.free(closure.params);
+}
+
+fn discardIteratorAdapter(e: *Ext, adapter: exprs.IteratorAdapter) void {
+    switch (adapter) {
+        .map => |map| discardClosureStorage(e, map.closure),
+        .filter => |filter| discardClosureStorage(e, filter.closure),
+        .flat_map => |closure| discardClosureStorage(e, closure),
+        .enumerate, .range_rev, .other => {},
+        .zip => {},
+    }
+}
+
+fn discardIteratorAdapters(
+    e: *Ext,
+    adapters: *std.ArrayListUnmanaged(exprs.IteratorAdapter),
+) void {
+    for (adapters.items) |adapter| discardIteratorAdapter(e, adapter);
+    adapters.deinit(e.ctx.alloc);
+}
+
+fn iteratorArgumentsEmpty(arguments: ts.Node) bool {
+    var index: u32 = 0;
+    while (arguments.namedChild(index)) |argument| : (index += 1) {
+        if (!isComment(argument)) return false;
+    }
+    return true;
+}
+
+fn iteratorClosureArgument(arguments: ts.Node) ?ts.Node {
+    var closure: ?ts.Node = null;
+    var index: u32 = 0;
+    while (arguments.namedChild(index)) |argument| : (index += 1) {
+        if (isComment(argument)) continue;
+        if (closure != null) return null;
+        closure = argument;
+    }
+    return closure;
+}
+
+fn isSliceIteratorSourceType(ty: types.Type) bool {
+    return switch (ty) {
+        .slice, .array => true,
+        .reference => |reference| switch (reference.pointee) {
+            .slice, .array => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn isStandardIteratorSource(e: *Ext, node: ts.Node) bool {
+    var current = peelParenthesized(node);
+    while (std.mem.eql(u8, current.kind(), "reference_expression")) {
+        current = peelParenthesized(current.childByFieldName("value") orelse return false);
+    }
+    if (std.mem.eql(u8, current.kind(), "array_expression")) return true;
+    if (!std.mem.eql(u8, current.kind(), "identifier")) return false;
+    const definition = resolveName(e, text(e, current)) orelse return false;
+    const source_type = localType(e, definition) orelse return false;
+    return isSliceIteratorSourceType(source_type);
+}
+
+fn isSimpleIteratorSource(e: *Ext, node: ts.Node) bool {
+    const current = peelParenthesized(node);
+    if (std.mem.eql(u8, current.kind(), "range_expression")) return true;
+    if (isStandardIteratorSource(e, current)) return true;
+    if (!std.mem.eql(u8, current.kind(), "call_expression")) return false;
+
+    const method = methodNameOf(e, current) orelse return false;
+    const receiver = receiverOf(current) orelse return false;
+    const arguments = argumentsOf(current) orelse return false;
+    if (std.mem.eql(u8, method, "iter") or std.mem.eql(u8, method, "iter_mut")) {
+        return iteratorArgumentsEmpty(arguments) and isStandardIteratorSource(e, receiver);
+    }
+    if (!std.mem.eql(u8, method, "copied")) return false;
+    if (!iteratorArgumentsEmpty(arguments)) return false;
+    const iter_call = peelParenthesized(receiver);
+    if (!std.mem.eql(u8, iter_call.kind(), "call_expression")) return false;
+    const iter_method = methodNameOf(e, iter_call) orelse return false;
+    if (!std.mem.eql(u8, iter_method, "iter") and
+        !std.mem.eql(u8, iter_method, "iter_mut"))
+    {
+        return false;
+    }
+    const iter_arguments = argumentsOf(iter_call) orelse return false;
+    if (!iteratorArgumentsEmpty(iter_arguments)) return false;
+    const iter_receiver = receiverOf(iter_call) orelse return false;
+    return isStandardIteratorSource(e, iter_receiver);
+}
+
+fn iteratorSingleArgument(arguments: ts.Node) ?ts.Node {
+    var value: ?ts.Node = null;
+    var index: u32 = 0;
+    while (arguments.namedChild(index)) |argument| : (index += 1) {
+        if (isComment(argument)) continue;
+        if (value != null) return null;
+        value = argument;
+    }
+    return value;
 }
 
 fn isStandardIteratorChain(e: *Ext, node: ts.Node) bool {
     const current = peelParenthesized(node);
-    if (std.mem.eql(u8, current.kind(), "range_expression")) return true;
+    if (isSimpleIteratorSource(e, current)) return true;
     if (!std.mem.eql(u8, current.kind(), "call_expression")) return false;
     const method = methodNameOf(e, current) orelse return false;
-    if (!(std.mem.eql(u8, method, "iter") or
-        std.mem.eql(u8, method, "iter_mut") or
-        std.mem.eql(u8, method, "map") or
+    if (!(std.mem.eql(u8, method, "map") or
         std.mem.eql(u8, method, "filter") or
-        std.mem.eql(u8, method, "filter_map") or
         std.mem.eql(u8, method, "flat_map") or
-        std.mem.eql(u8, method, "cloned") or
-        std.mem.eql(u8, method, "copied") or
         std.mem.eql(u8, method, "enumerate") or
         std.mem.eql(u8, method, "zip") or
+        std.mem.eql(u8, method, "rev") or
+        std.mem.eql(u8, method, "cloned") or
         std.mem.eql(u8, method, "take") or
         std.mem.eql(u8, method, "skip") or
-        std.mem.eql(u8, method, "rev") or
         std.mem.eql(u8, method, "fuse")))
     {
         return false;
@@ -1356,65 +2200,149 @@ fn isStandardIteratorChain(e: *Ext, node: ts.Node) bool {
     return isStandardIteratorChain(e, receiver);
 }
 
-fn lowerIteratorCollection(
+fn lowerIteratorSource(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const current = peelParenthesized(node);
+    if (std.mem.eql(u8, current.kind(), "range_expression")) {
+        const source = try lowerRangeExpression(e, current);
+        if (e.ctx.exprs.items[source].kind != .range) return error.UnsupportedIteratorChain;
+        return source;
+    }
+    if (isStandardIteratorSource(e, current)) return lowerExpr(e, current);
+    if (!std.mem.eql(u8, current.kind(), "call_expression")) {
+        return error.UnsupportedIteratorChain;
+    }
+    const method = methodNameOf(e, current) orelse return error.UnsupportedIteratorChain;
+    const receiver = receiverOf(current) orelse return error.UnsupportedIteratorChain;
+    const arguments = argumentsOf(current) orelse return error.UnsupportedIteratorChain;
+    if (std.mem.eql(u8, method, "iter") or std.mem.eql(u8, method, "iter_mut")) {
+        if (!iteratorArgumentsEmpty(arguments) or !isStandardIteratorSource(e, receiver)) {
+            return error.UnsupportedIteratorChain;
+        }
+        return lowerExpr(e, current);
+    }
+    if (!std.mem.eql(u8, method, "copied") or !iteratorArgumentsEmpty(arguments)) {
+        return error.UnsupportedIteratorChain;
+    }
+    const iter_call = peelParenthesized(receiver);
+    if (!std.mem.eql(u8, iter_call.kind(), "call_expression")) {
+        return error.UnsupportedIteratorChain;
+    }
+    const iter_method = methodNameOf(e, iter_call) orelse return error.UnsupportedIteratorChain;
+    if (!std.mem.eql(u8, iter_method, "iter") and
+        !std.mem.eql(u8, iter_method, "iter_mut"))
+    {
+        return error.UnsupportedIteratorChain;
+    }
+    const iter_arguments = argumentsOf(iter_call) orelse return error.UnsupportedIteratorChain;
+    if (!iteratorArgumentsEmpty(iter_arguments)) return error.UnsupportedIteratorChain;
+    const iter_receiver = receiverOf(iter_call) orelse return error.UnsupportedIteratorChain;
+    if (!isStandardIteratorSource(e, iter_receiver)) return error.UnsupportedIteratorChain;
+    return lowerExpr(e, iter_receiver);
+}
+
+fn lowerIteratorChainParts(
     e: *Ext,
-    receiver: ts.Node,
-    collect_arguments: ts.Node,
-) anyerror!exprs.NodeId {
-    var collect_argument_index: u32 = 0;
-    while (collect_arguments.namedChild(collect_argument_index)) |argument| : (collect_argument_index += 1) {
-        if (!isComment(argument)) return unsupported(e, "iterator collect arguments");
+    node: ts.Node,
+    source: *exprs.NodeId,
+    adapters: *std.ArrayListUnmanaged(exprs.IteratorAdapter),
+) anyerror!void {
+    const current = peelParenthesized(node);
+    if (std.mem.eql(u8, current.kind(), "range_expression")) {
+        source.* = try lowerIteratorSource(e, current);
+        return;
     }
+    if (!std.mem.eql(u8, current.kind(), "call_expression")) {
+        return error.UnsupportedIteratorChain;
+    }
+    const method = methodNameOf(e, current) orelse return error.UnsupportedIteratorChain;
+    const receiver = receiverOf(current) orelse return error.UnsupportedIteratorChain;
+    const arguments = argumentsOf(current) orelse return error.UnsupportedIteratorChain;
 
-    const flat_map_call = peelParenthesized(receiver);
-    if (!std.mem.eql(u8, flat_map_call.kind(), "call_expression")) {
-        return unsupported(e, "iterator chain");
+    if (std.mem.eql(u8, method, "iter") or std.mem.eql(u8, method, "iter_mut") or
+        std.mem.eql(u8, method, "copied"))
+    {
+        source.* = try lowerIteratorSource(e, current);
+        return;
     }
-    const flat_map_callee = flat_map_call.namedChild(0) orelse
-        return unsupported(e, "iterator flat_map callee");
-    if (!std.mem.eql(u8, flat_map_callee.kind(), "field_expression")) {
-        return unsupported(e, "iterator flat_map callee");
+    if (std.mem.eql(u8, method, "enumerate")) {
+        if (!iteratorArgumentsEmpty(arguments)) return error.UnsupportedIteratorChain;
+        try lowerIteratorChainParts(e, receiver, source, adapters);
+        try adapters.append(e.ctx.alloc, .{ .enumerate = {} });
+        return;
     }
-    const flat_map_receiver = flat_map_callee.namedChild(0) orelse
-        return unsupported(e, "iterator flat_map receiver");
-    const flat_map_method = flat_map_callee.namedChild(1) orelse
-        return unsupported(e, "iterator flat_map method");
-    if (!std.mem.eql(u8, text(e, flat_map_method), "flat_map")) {
-        return unsupported(e, "iterator adapter");
+    if (std.mem.eql(u8, method, "zip")) {
+        const other_node = iteratorSingleArgument(arguments) orelse
+            return error.UnsupportedIteratorChain;
+        try lowerIteratorChainParts(e, receiver, source, adapters);
+        const other = try lowerIteratorSource(e, other_node);
+        try adapters.append(e.ctx.alloc, .{ .zip = .{ .other = other } });
+        return;
     }
-
-    const flat_map_arguments = argumentsOf(flat_map_call) orelse
-        return unsupported(e, "iterator flat_map arguments");
-    var closure_node: ?ts.Node = null;
-    var flat_map_argument_index: u32 = 0;
-    while (flat_map_arguments.namedChild(flat_map_argument_index)) |argument| : (flat_map_argument_index += 1) {
-        if (isComment(argument)) continue;
-        if (closure_node != null) return unsupported(e, "iterator flat_map arity");
-        closure_node = argument;
+    if (std.mem.eql(u8, method, "rev")) {
+        if (!iteratorArgumentsEmpty(arguments)) return error.UnsupportedIteratorChain;
+        const adapter_start = adapters.items.len;
+        try lowerIteratorChainParts(e, receiver, source, adapters);
+        if (adapters.items.len != adapter_start or
+            e.ctx.exprs.items[source.*].kind != .range)
+        {
+            return error.UnsupportedIteratorChain;
+        }
+        try adapters.append(e.ctx.alloc, .{ .range_rev = {} });
+        return;
     }
-    const closure_source = closure_node orelse return unsupported(e, "iterator flat_map closure");
+    if (!std.mem.eql(u8, method, "map") and !std.mem.eql(u8, method, "filter") and
+        !std.mem.eql(u8, method, "flat_map"))
+    {
+        return error.UnsupportedIteratorChain;
+    }
+    try lowerIteratorChainParts(e, receiver, source, adapters);
+    const closure_source = iteratorClosureArgument(arguments) orelse
+        return error.UnsupportedIteratorChain;
     if (!std.mem.eql(u8, closure_source.kind(), "closure_expression")) {
-        return unsupported(e, "iterator flat_map closure");
-    }
-
-    const source = peelParenthesized(flat_map_receiver);
-    if (!std.mem.eql(u8, source.kind(), "range_expression")) {
-        return unsupported(e, "iterator source");
-    }
-    const source_id = try lowerRangeExpression(e, source);
-    switch (e.ctx.exprs.items[source_id].kind) {
-        .range => {},
-        else => return unsupported(e, "iterator source range"),
+        return error.UnsupportedIteratorChain;
     }
     const closure = (try lowerClosureExpression(e, closure_source)) orelse
-        return unsupported(e, "iterator closure");
-    const adapters = try e.ctx.alloc.alloc(exprs.IteratorAdapter, 1);
-    adapters[0] = .{ .flat_map = closure };
-    return appendExpr(e, .{ .iterator_chain = .{
-        .source = source_id,
-        .adapters = adapters,
-        .terminal = .collect_vec,
-    } });
+        return error.UnsupportedIteratorChain;
+    errdefer discardClosureStorage(e, closure);
+    if (closure.params.len != 1) return error.UnsupportedIteratorChain;
+    try adapters.append(e.ctx.alloc, if (std.mem.eql(u8, method, "map"))
+        .{ .map = .{ .closure = closure } }
+    else if (std.mem.eql(u8, method, "filter"))
+        .{ .filter = .{ .closure = closure } }
+    else
+        .{ .flat_map = closure });
+}
+
+fn lowerIteratorChainData(
+    e: *Ext,
+    receiver: ts.Node,
+    terminal: exprs.IteratorTerminal,
+) anyerror!exprs.IteratorChainExpr {
+    var adapters: std.ArrayListUnmanaged(exprs.IteratorAdapter) = .empty;
+    errdefer discardIteratorAdapters(e, &adapters);
+    var source: exprs.NodeId = 0;
+    try lowerIteratorChainParts(e, receiver, &source, &adapters);
+    return .{
+        .source = source,
+        .adapters = try adapters.toOwnedSlice(e.ctx.alloc),
+        .terminal = terminal,
+    };
+}
+
+fn lowerIteratorExpression(
+    e: *Ext,
+    receiver: ts.Node,
+    terminal: exprs.IteratorTerminal,
+) anyerror!exprs.NodeId {
+    const chain = lowerIteratorChainData(e, receiver, terminal) catch |err| {
+        if (err == error.UnsupportedIteratorChain) return unsupported(e, "iterator chain");
+        return err;
+    };
+    errdefer {
+        for (chain.adapters) |adapter| discardIteratorAdapter(e, adapter);
+        e.ctx.alloc.free(chain.adapters);
+    }
+    return appendExpr(e, .{ .iterator_chain = chain });
 }
 
 /// The iterator equivalent of `unsupported`: a `.slice` iterable whose carrier
@@ -1431,48 +2359,68 @@ fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
     if (std.mem.eql(u8, k, "range_expression")) {
         return lowerRangeIter(e, node);
     }
+
     if (std.mem.eql(u8, k, "call_expression")) {
-        if (methodNameOf(e, node)) |mname| {
-            if (std.mem.eql(u8, mname, "enumerate")) {
-                const recv = receiverOf(node) orelse return unsupportedIter(e, "enumerate receiver");
+        const mname = methodNameOf(e, node);
+        if (mname) |name| {
+            if ((std.mem.eql(u8, name, "map") or std.mem.eql(u8, name, "filter") or
+                std.mem.eql(u8, name, "flat_map") or std.mem.eql(u8, name, "rev")) and
+                isStandardIteratorChain(e, node))
+            {
+                const chain = lowerIteratorChainData(e, node, .iterator) catch |err| {
+                    if (err == error.UnsupportedIteratorChain) return unsupportedIter(e, "iterator chain");
+                    return err;
+                };
+                return .{ .kind = .{ .adapter = chain }, .eid = chain.source };
+            }
+            if (std.mem.eql(u8, name, "enumerate")) {
+                const recv = receiverOf(node) orelse return error.MalformedCst;
                 const base = try unwrapIterable(e, recv);
                 return .{ .kind = .{ .enumerate = {} }, .eid = base.eid };
             }
-            if (std.mem.eql(u8, mname, "zip")) {
-                const recv = receiverOf(node) orelse return unsupportedIter(e, "zip receiver");
+            if (std.mem.eql(u8, name, "zip")) {
+                const recv = receiverOf(node) orelse return error.MalformedCst;
                 const base = try unwrapIterable(e, recv);
-                const arg = firstArg(e, argumentsOf(node)) orelse return unsupportedIter(e, "zip arg");
+                const arg = firstArg(e, argumentsOf(node)) orelse return error.MalformedCst;
                 const other = try lowerExpr(e, arg);
                 const ids = try e.ctx.alloc.alloc(exprs.NodeId, 2);
                 ids[0] = base.eid;
                 ids[1] = other;
                 return .{ .kind = .{ .multi = ids }, .eid = base.eid };
             }
-            if (std.mem.eql(u8, mname, "iter") or std.mem.eql(u8, mname, "iter_mut") or std.mem.eql(u8, mname, "as_ref") or std.mem.eql(u8, mname, "clone")) {
-                const recv = receiverOf(node) orelse return unsupportedIter(e, "iter receiver");
+            if (std.mem.eql(u8, name, "iter") or std.mem.eql(u8, name, "iter_mut")) {
+                // Keep the iterator call as the carrier. Inference uses the
+                // receiver to recover the element type and the method name to
+                // preserve shared versus mutable iteration semantics.
+                return .{ .kind = .{ .slice = {} }, .eid = try lowerExpr(e, node) };
+            }
+            if (std.mem.eql(u8, name, "as_ref") or std.mem.eql(u8, name, "clone")) {
+                const recv = receiverOf(node) orelse return error.MalformedCst;
                 return unwrapIterable(e, recv);
             }
         }
     }
+
     const eid = try lowerExpr(e, node);
     return .{ .kind = .{ .slice = {} }, .eid = eid };
 }
-
 /// Lower a `for_expression` to a wire `for_` expr, returning its expr id.
 fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const outer_local_count = e.locals.items.len;
+    defer e.locals.items.len = outer_local_count;
     // `for <pattern> in <iter> { <block> }`
-    var iter_node: ?ts.Node = null;
-    var body_node: ?ts.Node = null;
-    var pat_node: ?ts.Node = null;
+    var iter_node: ?ts.Node = node.childByFieldName("value");
+    var body_node: ?ts.Node = node.childByFieldName("body");
+    var pat_node: ?ts.Node = node.childByFieldName("pattern");
 
     var i: u32 = 0;
     while (node.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
-        if (isPatternNode(c)) {
-            if (pat_node == null) pat_node = c;
-        } else if (std.mem.eql(u8, k, "block")) {
+        if (pat_node == null and isPatternNode(c)) {
+            pat_node = c;
+        } else if (body_node == null and std.mem.eql(u8, k, "block")) {
             body_node = c;
-        } else if (iter_node == null) {
+        } else if (iter_node == null and !isPatternNode(c)) {
             iter_node = c;
         }
     }
@@ -1517,6 +2465,14 @@ fn isComment(node: ts.Node) bool {
     return std.mem.eql(u8, k, "line_comment") or std.mem.eql(u8, k, "block_comment");
 }
 
+fn isBlockTrivia(node: ts.Node) bool {
+    const k = node.kind();
+    return isComment(node) or
+        std.mem.eql(u8, k, "attribute_item") or
+        std.mem.eql(u8, k, "inner_attribute_item") or
+        std.mem.eql(u8, k, "empty_statement");
+}
+
 /// Return whether a CST statement has an explicit trailing semicolon.
 ///
 /// Tree-sitter may wrap a bare trailing control-flow expression (for example,
@@ -1533,32 +2489,44 @@ fn isSemicolonTerminated(e: *const Ext, node: ts.Node) bool {
 /// expression (no `;`) becomes the block tail; `;`-terminated statements and
 /// item-like children become statements.
 fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
+    const outer_local_count = e.locals.items.len;
+    defer e.locals.items.len = outer_local_count;
     var stmt_ids: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
     defer stmt_ids.deinit(e.ctx.alloc);
     var tail: ?exprs.NodeId = null;
 
-    // Find the last meaningful (non-comment) child so a bare trailing expr can
-    // be distinguished from a statement-position expr.
+    // Find the last value-bearing child so trivia cannot become the block tail.
     var last: ?ts.Node = null;
     {
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
-            if (isComment(c)) continue;
+            if (isBlockTrivia(c)) continue;
             last = c;
         }
     }
 
     var i: u32 = 0;
     while (node.namedChild(i)) |c| : (i += 1) {
-        if (isComment(c)) continue;
+        if (isBlockTrivia(c)) continue;
         const k = c.kind();
         const is_last = last != null and last.?.id == c.id;
 
-        if (std.mem.eql(u8, k, "let_declaration")) {
+        if (std.mem.eql(u8, k, "const_item")) {
+            try lowerConstItem(e, c);
+            try stmt_ids.append(e.ctx.alloc, @intCast(e.ctx.stmts.items.len - 1));
+        } else if (std.mem.eql(u8, k, "static_item")) {
+            try lowerStaticItem(e, c);
+            try stmt_ids.append(e.ctx.alloc, @intCast(e.ctx.stmts.items.len - 1));
+        } else if (std.mem.eql(u8, k, "let_declaration")) {
             try lowerLet(e, c);
             try stmt_ids.append(e.ctx.alloc, @intCast(e.ctx.stmts.items.len - 1));
-        } else if (std.mem.eql(u8, k, "expression_statement")) {
-            const sub = c.namedChild(0) orelse return error.MalformedCst;
+        } else if (std.mem.eql(u8, k, "expression_statement") or
+            std.mem.eql(u8, k, "macro_invocation"))
+        {
+            const sub = if (std.mem.eql(u8, k, "macro_invocation"))
+                c
+            else
+                c.namedChild(0) orelse return error.MalformedCst;
             const eid = try lowerExpr(e, sub);
             if (is_last and !isSemicolonTerminated(e, c)) {
                 // The grammar can wrap a bare final expression in an
@@ -1574,11 +2542,6 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
                 });
                 try stmt_ids.append(e.ctx.alloc, sid);
             }
-        } else if (std.mem.eql(u8, k, "macro_invocation")) {
-            const eid = try lowerMacroInvocation(e, c);
-            const sid: exprs.NodeId = @intCast(e.ctx.stmts.items.len);
-            try e.ctx.stmts.append(e.ctx.alloc, .{ .id = sid, .span = span_of, .ty = null, .kind = .{ .expr = eid } });
-            try stmt_ids.append(e.ctx.alloc, sid);
         } else if (std.mem.eql(u8, k, "for_expression")) {
             const eid = try lowerFor(e, c);
             const sid: exprs.NodeId = @intCast(e.ctx.stmts.items.len);
@@ -1616,6 +2579,49 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
     }
 
     return .{ .statements = try stmt_ids.toOwnedSlice(e.ctx.alloc), .tail = tail, .labelled = null };
+}
+
+fn controlBlock(node: ts.Node) ?ts.Node {
+    if (node.childByFieldName("body")) |body| return body;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "block")) return child;
+    }
+    return null;
+}
+
+fn controlLabel(e: *Ext, node: ts.Node) anyerror!?[]const u8 {
+    var label = node.childByFieldName("label");
+    if (label == null) {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            if (std.mem.eql(u8, child.kind(), "lifetime")) {
+                label = child;
+                break;
+            }
+        }
+    }
+    const raw = label orelse return null;
+    var name = std.mem.trim(u8, text(e, raw), " \t\r\n");
+    if (name.len > 0 and name[0] == '\'') name = name[1..];
+    if (name.len == 0) return null;
+    const owned_name = try e.ctx.alloc.dupe(u8, name);
+    return owned_name;
+}
+
+fn controlValue(e: *Ext, node: ts.Node) anyerror!?exprs.NodeId {
+    if (node.childByFieldName("value")) |value| {
+        const lowered = try lowerExpr(e, value);
+        return lowered;
+    }
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (!std.mem.eql(u8, child.kind(), "lifetime")) {
+            const lowered = try lowerExpr(e, child);
+            return lowered;
+        }
+    }
+    return null;
 }
 
 // ── expression lowering ─────────────────────────────────────────────────────
@@ -1667,36 +2673,143 @@ fn isScalarCastType(ty: types.Type) bool {
         else => false,
     };
 }
-
-fn isSupportedCastTarget(ty: types.Type) bool {
+fn isBoolType(ty: types.Type) bool {
     return switch (ty) {
-        .prim => isScalarCastType(ty),
-        .raw_ptr => true,
+        .prim => |primitive| primitive == .bool,
         else => false,
     };
 }
 
-fn knownCastCompatible(source: types.Type, target: types.Type) ?bool {
-    if (isScalarCastType(source)) return isScalarCastType(target);
-    return switch (source) {
-        .raw_ptr => |source_pointer| switch (target) {
-            .raw_ptr => |target_pointer| switch (source_pointer.pointee) {
-                .prim => |source_primitive| switch (target_pointer.pointee) {
-                    .prim => |target_primitive| blk: {
-                        const source_layout = scalarPointeeLayout(source_primitive) orelse
-                            break :blk null;
-                        const target_layout = scalarPointeeLayout(target_primitive) orelse
-                            break :blk null;
-                        break :blk if (source_layout == target_layout) true else null;
-                    },
-                    else => null,
-                },
-                else => null,
-            },
-            else => false,
+fn isIntegerType(ty: types.Type) bool {
+    return switch (ty) {
+        .prim => |primitive| switch (primitive) {
+            .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => true,
+            .f32, .f64, .bool, .char, .unit, .never => false,
         },
         else => false,
     };
+}
+fn isIntegerPrimitive(primitive: types.Prim) bool {
+    return switch (primitive) {
+        .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => true,
+        .f32, .f64, .bool, .char, .unit, .never => false,
+    };
+}
+
+fn isThinRawPointer(raw_ptr: *const types.RawPtr) bool {
+    return switch (raw_ptr.pointee) {
+        .slice => false,
+        else => true,
+    };
+}
+
+fn referenceToRawPointerCompatible(source_ref: *const types.Ref, target_raw: *const types.RawPtr) bool {
+    if (target_raw.mut and !source_ref.mut) return false;
+    if (infer.typeEqual(source_ref.pointee, target_raw.pointee)) return true;
+    switch (source_ref.pointee) {
+        .array => |arr| {
+            if (infer.typeEqual(arr.elem, target_raw.pointee)) return true;
+            if (target_raw.pointee == .slice and infer.typeEqual(arr.elem, target_raw.pointee.slice.elem)) {
+                return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn rawPointeesCastCompatible(source_pointee: types.Type, target_pointee: types.Type) bool {
+    const source_is_fat = (source_pointee == .slice);
+    const target_is_fat = (target_pointee == .slice);
+    if (target_is_fat and !source_is_fat) return false;
+    return true;
+}
+
+fn isSupportedCastTarget(ty: types.Type) bool {
+    return switch (ty) {
+        .prim => isScalarCastType(ty),
+        .raw_ptr, .slice => true,
+        else => false,
+    };
+}
+
+fn placeholderRawPointerTarget(
+    e: *const Ext,
+    node: ts.Node,
+    source: ?types.Type,
+) anyerror!?types.Type {
+    const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
+    const mutable = std.mem.startsWith(u8, raw, "*mut ");
+    const immutable = std.mem.startsWith(u8, raw, "*const ");
+    if ((!mutable and !immutable) or !std.mem.endsWith(u8, raw, "_")) return null;
+    var pointee: types.Type = undefined;
+    if (source) |source_type| {
+        pointee = switch (source_type) {
+            .reference => |reference| reference.pointee,
+            .raw_ptr => |raw_ptr| raw_ptr.pointee,
+            else => return null,
+        };
+    } else {
+        const wildcard_path = try e.ctx.alloc.alloc([]const u8, 1);
+        wildcard_path[0] = "_";
+        pointee = .{ .external_nominal = .{
+            .path = wildcard_path,
+            .args = &.{},
+        } };
+    }
+    const pointer = try e.ctx.alloc.create(types.RawPtr);
+    pointer.* = .{ .mut = mutable, .pointee = pointee };
+    return .{ .raw_ptr = pointer };
+}
+
+fn wildcardScalarTarget(e: *const Ext, node: ts.Node) anyerror!?types.Type {
+    if (!std.mem.eql(u8, std.mem.trim(u8, text(e, node), " \t\r\n"), "_")) return null;
+    const path = try e.ctx.alloc.alloc([]const u8, 1);
+    path[0] = "_";
+    return .{ .external_nominal = .{ .path = path, .args = &.{} } };
+}
+
+fn isWildcardRawPointerCst(e: *const Ext, node: ts.Node) bool {
+    if (!std.mem.eql(u8, node.kind(), "pointer_type")) return false;
+    const pointee = node.childByFieldName("type") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, text(e, pointee), " \t\r\n"), "_");
+}
+
+fn knownCastCompatible(source: types.Type, target: types.Type) ?bool {
+    if (isScalarCastType(target)) {
+        if (isScalarCastType(source) or isBoolType(source)) return true;
+        if (source == .raw_ptr) {
+            return isThinRawPointer(source.raw_ptr) and isIntegerPrimitive(target.prim);
+        }
+        return false;
+    }
+    if (target == .slice) {
+        const target_slice = target.slice;
+        return switch (source) {
+            .reference => |source_ref| {
+                if (!target_slice.const_ and !source_ref.mut) return false;
+                return switch (source_ref.pointee) {
+                    .array => |array| infer.typeEqual(array.elem, target_slice.elem),
+                    .slice => |slice| infer.typeEqual(slice.elem, target_slice.elem),
+                    else => false,
+                };
+            },
+            .slice => |source_slice| {
+                if (!target_slice.const_ and source_slice.const_) return false;
+                return infer.typeEqual(source_slice.elem, target_slice.elem);
+            },
+            else => false,
+        };
+    }
+    if (target == .raw_ptr) {
+        switch (source) {
+            .raw_ptr => |source_ptr| return rawPointeesCastCompatible(source_ptr.pointee, target.raw_ptr.pointee),
+            .reference => |source_ref| return referenceToRawPointerCompatible(source_ref, target.raw_ptr),
+            .prim => |source_prim| return isIntegerPrimitive(source_prim) and isThinRawPointer(target.raw_ptr),
+            else => return false,
+        }
+    }
+    return false;
 }
 fn indexedElementType(ty: types.Type) ?types.Type {
     return switch (ty) {
@@ -1707,6 +2820,94 @@ fn indexedElementType(ty: types.Type) ?types.Type {
     };
 }
 
+fn knownFieldType(e: *const Ext, field_id: spine.EntityId) ?types.Type {
+    const field_entity = e.ctx.g.symbol_table.get(field_id) orelse return null;
+    const parent = field_entity.parent orelse return null;
+    if (parent >= e.ctx.bodies_list.items.len) return null;
+    return switch (e.ctx.bodies_list.items[parent]) {
+        .struct_ => |struct_body| for (struct_body.fields) |field| {
+            if (std.mem.eql(u8, field.name, field_entity.name)) break field.ty;
+        } else null,
+        else => null,
+    };
+}
+
+fn activeGenericPathType(e: *const Ext, ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .path => |path| if (path.segments.len == 1 and
+            path.segments[0].id == null and
+            activeTypeParameter(e, path.segments[0].name))
+            activeGenericReceiver(e, path.segments[0].name) catch null
+        else
+            null,
+        else => null,
+    };
+}
+
+fn optionPayloadType(e: *const Ext, ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .option => |inner| activeGenericPathType(e, inner.*) orelse
+            if (isConcreteDeclaredReturnType(inner.*)) inner.* else null,
+        .result => |result| activeGenericPathType(e, result.ok) orelse
+            if (isConcreteDeclaredReturnType(result.ok)) result.ok else null,
+        else => null,
+    };
+}
+
+fn knownCallPayloadType(e: *const Ext, call: exprs.Call) ?types.Type {
+    const def = switch (call.call_kind) {
+        .free => |value| value,
+        .associated => |value| value,
+        .constructor => return null,
+    };
+    if (def >= e.ctx.bodies_list.items.len) return null;
+    const ret = switch (e.ctx.bodies_list.items[def]) {
+        .fn_ => |body| body.ret,
+        else => return null,
+    };
+    return optionPayloadType(e, ret);
+}
+
+fn knownPatternPayloadType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
+    if (node_id >= e.ctx.exprs.items.len) return null;
+    const expression = e.ctx.exprs.items[node_id];
+    if (expression.ty) |type_id| {
+        if (type_id < e.ctx.types.items.len) {
+            if (optionPayloadType(e, e.ctx.types.items[type_id])) |payload| return payload;
+        }
+    }
+    return switch (expression.kind) {
+        .call => |call| knownCallPayloadType(e, call),
+        else => null,
+    };
+}
+
+fn setPatternLocalTypes(e: *Ext, pattern_id: exprs.NodeId, ty: types.Type) void {
+    if (pattern_id >= e.ctx.pats.items.len) return;
+    switch (e.ctx.pats.items[pattern_id].kind) {
+        .binding => |binding| {
+            if (resolveName(e, binding.name)) |def| setLocalType(e, def, ty);
+        },
+        .tuple => |tuple| for (tuple.elements) |element| setPatternLocalTypes(e, element, ty),
+        .slice => |slice| {
+            for (slice.elements) |element| setPatternLocalTypes(e, element, ty);
+            if (slice.rest) |rest| setPatternLocalTypes(e, rest, ty);
+        },
+        .struct_pat => |structure| {
+            for (structure.fields) |field| {
+                if (field.pat) |field_pattern| setPatternLocalTypes(e, field_pattern, ty);
+            }
+        },
+        .external_variant => |variant| for (variant.fields) |field| {
+            if (field.pat) |field_pattern| setPatternLocalTypes(e, field_pattern, ty);
+        },
+        .reference => |reference| setPatternLocalTypes(e, reference.inner, ty),
+        .@"or" => |or_pattern| for (or_pattern.alternatives) |alternative|
+            setPatternLocalTypes(e, alternative, ty),
+        else => {},
+    }
+}
+
 fn knownCastOperandType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
     if (node_id >= e.ctx.exprs.items.len) return null;
     const expression = e.ctx.exprs.items[node_id];
@@ -1715,6 +2916,7 @@ fn knownCastOperandType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
     }
     return switch (expression.kind) {
         .path => |path| localType(e, path.def),
+        .field => |field| knownFieldType(e, field.resolved),
         .cast => |cast| if (cast.target < e.ctx.types.items.len)
             e.ctx.types.items[cast.target]
         else
@@ -1741,7 +2943,29 @@ fn knownCastOperandType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
             } else null,
             .negate, .bit_not => knownCastOperandType(e, unary.operand),
             .logical_not => .{ .prim = .bool },
-            .ref => null,
+            .ref => |mode| if (knownCastOperandType(e, unary.operand)) |pointee| blk: {
+                const ref_ptr = e.ctx.alloc.create(types.Ref) catch break :blk null;
+                ref_ptr.* = .{ .mut = (mode == .mutable), .pointee = pointee };
+                break :blk types.Type{ .reference = ref_ptr };
+            } else null,
+        },
+        .try_ => |t| if (knownCastOperandType(e, t.inner)) |inner_ty| switch (inner_ty) {
+            .option => |opt| opt.*,
+            .result => |res| res.ok,
+            else => null,
+        } else null,
+        .method_call => |method| blk: {
+            const method_name = if (e.ctx.g.symbol_table.get(method.method)) |ent| ent.name else break :blk null;
+            if (std.mem.eql(u8, method_name, "as_ptr") or std.mem.eql(u8, method_name, "as_mut_ptr")) {
+                if (knownCastOperandType(e, method.receiver)) |recv_ty| {
+                    if (indexedElementType(recv_ty)) |elem| {
+                        const ptr = e.ctx.alloc.create(types.RawPtr) catch break :blk null;
+                        ptr.* = .{ .mut = std.mem.eql(u8, method_name, "as_mut_ptr"), .pointee = elem };
+                        break :blk types.Type{ .raw_ptr = ptr };
+                    }
+                }
+            }
+            break :blk null;
         },
         else => null,
     };
@@ -1754,13 +2978,13 @@ fn pendingCastSourceType() types.Type {
         .span = span_of,
     } };
 }
-fn unsignedPrimitiveFromTarget(raw: []const u8) ?types.Prim {
+fn primitiveFromTarget(raw: []const u8) ?types.Prim {
     const suffix = "::from";
     if (!std.mem.endsWith(u8, raw, suffix)) return null;
     const base = raw[0 .. raw.len - suffix.len];
     const primitive = mapPrim(base) orelse return null;
     return switch (primitive) {
-        .u8, .u16, .u32, .u64, .u128, .usize => primitive,
+        .u8, .u16, .u32, .u64, .u128, .usize, .char => primitive,
         else => null,
     };
 }
@@ -1772,7 +2996,7 @@ fn appendPrimitiveFrom(
 ) anyerror!exprs.NodeId {
     defer e.ctx.alloc.free(args);
     if (args.len != 1) return unsupported(e, "primitive from call");
-    const target = try appendType(e, .{ .prim = target_primitive });
+    const target = (try appendType(e, .{ .prim = target_primitive })) orelse unreachable;
     const operand = args[0];
     const source_type = knownCastOperandType(e, operand) orelse pendingCastSourceType();
     const cast = try appendExpr(e, .{ .cast = .{
@@ -1784,21 +3008,105 @@ fn appendPrimitiveFrom(
     e.ctx.exprs.items[cast].ty = target;
     return cast;
 }
+fn primitiveTryFromTarget(raw: []const u8) ?types.Prim {
+    const suffix = "::try_from";
+    if (!std.mem.endsWith(u8, raw, suffix)) return null;
+    const base = raw[0 .. raw.len - suffix.len];
+    const primitive = mapPrim(base) orelse return null;
+    return switch (primitive) {
+        .i8,
+        .i16,
+        .i32,
+        .i64,
+        .i128,
+        .isize,
+        .u8,
+        .u16,
+        .u32,
+        .u64,
+        .u128,
+        .usize,
+        => primitive,
+        else => null,
+    };
+}
+
+fn appendPrimitiveTryFrom(
+    e: *Ext,
+    target_primitive: types.Prim,
+    args: []const exprs.NodeId,
+) anyerror!exprs.NodeId {
+    defer e.ctx.alloc.free(args);
+    if (args.len != 1) return unsupported(e, "primitive try_from call");
+
+    const result = try e.ctx.alloc.create(types.Result);
+    var result_owned = true;
+    const error_external =
+        (try externalNominalForPath(e, "core::num::TryFromIntError")) orelse
+        return error.UnresolvedNominalType;
+    var error_external_owned = true;
+    defer {
+        if (result_owned) e.ctx.alloc.destroy(result);
+        if (error_external_owned) {
+            for (error_external.path) |segment| e.ctx.alloc.free(segment);
+            e.ctx.alloc.free(error_external.path);
+        }
+    }
+    result.* = .{
+        .ok = .{ .prim = target_primitive },
+        .err = .{ .external_nominal = error_external },
+        .is_error_unionable = false,
+    };
+    const result_type: types.Type = .{ .result = result };
+    const result_id = if (infer.findTypeIndexInSlice(e.ctx.types.items, result_type)) |existing| blk: {
+        break :blk existing;
+    } else blk: {
+        const id = (try appendType(e, result_type)) orelse unreachable;
+        result_owned = false;
+        error_external_owned = false;
+        break :blk id;
+    };
+    const method = try pushMethodRef(e, "try_into");
+    const call = try appendExpr(e, .{ .method_call = .{
+        .receiver = args[0],
+        .receiver_mode = .value,
+        .method = method,
+        .args = &.{},
+    } });
+    e.ctx.exprs.items[call].ty = result_id;
+    return call;
+}
 
 fn lowerCast(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
-    const operand_node = node.childByFieldName("value") orelse node.namedChild(0) orelse
-        return error.MalformedCst;
-    const target_node = node.childByFieldName("type") orelse node.namedChild(1) orelse
-        return error.MalformedCst;
-    const target_type = mapCstType(e, target_node) catch return unsupported(e, "cast target type");
-    if (!isSupportedCastTarget(target_type)) return unsupported(e, "cast target type");
-    const target = try appendType(e, target_type);
-
+    const operand_node = node.childByFieldName("value") orelse return error.MalformedCst;
+    const target_node = node.childByFieldName("type") orelse return error.MalformedCst;
     const operand = try lowerExpr(e, operand_node);
     const known_source = knownCastOperandType(e, operand);
+    var target_type = mapCstType(e, target_node) catch blk: {
+        if (try placeholderRawPointerTarget(e, target_node, known_source)) |placeholder| {
+            break :blk placeholder;
+        }
+        if (try wildcardScalarTarget(e, target_node)) |placeholder| {
+            break :blk placeholder;
+        }
+        return unsupported(e, "cast target type");
+    };
+    if (isWildcardRawPointerCst(e, target_node)) {
+        if (try placeholderRawPointerTarget(e, target_node, known_source)) |placeholder| {
+            target_type = placeholder;
+        }
+    }
+    if (!isSupportedCastTarget(target_type)) {
+        return unsupported(e, "cast target type");
+    }
+    const target = (try appendType(e, target_type)) orelse {
+        return unsupported(e, "cast target type");
+    };
     if (known_source) |source_type| {
         if (knownCastCompatible(source_type, target_type)) |compatible| {
-            if (!compatible) return unsupported(e, "cast target type");
+            if (!compatible) {
+                return unsupported(e, "cast target type");
+            }
         }
     }
     const source_type = known_source orelse pendingCastSourceType();
@@ -1837,9 +3145,101 @@ fn lowerReferenceExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     } });
 }
 
+const PrimitiveAssociatedConstant = struct {
+    primitive: types.Prim,
+    value: i128,
+};
+
+fn primitiveAssociatedConstant(raw: []const u8) ?PrimitiveAssociatedConstant {
+    var segments: [4][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.splitSequence(u8, std.mem.trim(u8, raw, " \t\r\n"), "::");
+    while (it.next()) |segment| {
+        const trimmed = std.mem.trim(u8, segment, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (count == segments.len) return null;
+        segments[count] = trimmed;
+        count += 1;
+    }
+    if (count < 2) return null;
+    if (count > 2 and
+        !std.mem.eql(u8, segments[0], "std") and
+        !std.mem.eql(u8, segments[0], "core"))
+    {
+        return null;
+    }
+    const primitive = mapPrim(segments[count - 2]) orelse return null;
+    const is_max = std.mem.eql(u8, segments[count - 1], "MAX");
+    const is_min = std.mem.eql(u8, segments[count - 1], "MIN");
+    if (!is_max and !is_min) return null;
+    const value: i128 = switch (primitive) {
+        .i8 => if (is_max) std.math.maxInt(i8) else std.math.minInt(i8),
+        .i16 => if (is_max) std.math.maxInt(i16) else std.math.minInt(i16),
+        .i32 => if (is_max) std.math.maxInt(i32) else std.math.minInt(i32),
+        .i64 => if (is_max) std.math.maxInt(i64) else std.math.minInt(i64),
+        .i128 => if (is_max) std.math.maxInt(i128) else std.math.minInt(i128),
+        .u8 => if (is_max) std.math.maxInt(u8) else 0,
+        .u16 => if (is_max) std.math.maxInt(u16) else 0,
+        .u32 => if (is_max) std.math.maxInt(u32) else 0,
+        .u64 => if (is_max) std.math.maxInt(u64) else 0,
+        .usize => if (is_max) std.math.maxInt(usize) else 0,
+        .u128 => if (is_max) return null else 0,
+        else => return null,
+    };
+    return .{ .primitive = primitive, .value = value };
+}
+
+fn lowerPrimitiveAssociatedConstant(e: *Ext, constant: PrimitiveAssociatedConstant) anyerror!exprs.NodeId {
+    return appendExpr(e, .{ .literal = .{ .int = .{
+        .text = try std.fmt.allocPrint(e.ctx.alloc, "{d}{s}", .{
+            constant.value,
+            @tagName(constant.primitive),
+        }),
+        .value = constant.value,
+        .base = .dec,
+        .ty_suffix = @tagName(constant.primitive),
+    } } });
+}
+fn lowerPathValue(e: *Ext, def: spine.EntityId) anyerror!exprs.NodeId {
+    const entity = e.ctx.g.symbol_table.get(def) orelse return error.MalformedCst;
+    if (entity.kind == .variant) {
+        const owner = entity.parent orelse return error.MalformedCst;
+        if (owner < e.ctx.bodies_list.items.len) {
+            switch (e.ctx.bodies_list.items[owner]) {
+                .enum_ => |enum_body| for (enum_body.variants) |variant| {
+                    if (variant.fields == .none and std.mem.eql(u8, variant.name, entity.name)) {
+                        return appendExpr(e, .{ .enum_variant = .{
+                            .def = owner,
+                            .variant = try e.ctx.alloc.dupe(u8, entity.name),
+                            .tuple_fields = &.{},
+                            .named_fields = &.{},
+                        } });
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return appendExpr(e, .{ .path = .{ .def = def, .generic_args = &.{} } });
+}
+
 fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const kind = node.kind();
 
+    // Identifiers & paths.
+    if (std.mem.eql(u8, kind, "identifier")) {
+        const nm = text(e, node);
+        var def = resolveName(e, nm);
+        if (def == null) {
+            if (try ensureStandardPreludeVariant(e, nm)) |standard| {
+                def = standard.variant_id;
+            }
+        }
+        if (def) |resolved| {
+            return lowerPathValue(e, resolved);
+        }
+        return unsupported(e, "unresolved identifier");
+    }
     // `self` is a distinct tree-sitter node in field expressions, but it
     // resolves through the same local binding as an identifier.
     if (std.mem.eql(u8, kind, "self")) {
@@ -1876,20 +3276,52 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return appendExpr(e, .{ .unit = {} });
     }
 
-    // Identifiers & paths.
-    if (std.mem.eql(u8, kind, "identifier")) {
-        const nm = text(e, node);
-        if (resolveName(e, nm)) |def| {
-            return appendExpr(e, .{ .path = .{ .def = def, .generic_args = &.{} } });
+    if (std.mem.eql(u8, kind, "generic_function")) {
+        const function_node = node.childByFieldName("function") orelse
+            return error.MalformedCst;
+        const generic_args = try lowerGenericCallArgs(e, node);
+        if (try coreFunction(e, text(e, function_node))) |function| {
+            return appendExpr(e, .{ .core_function = .{
+                .function = function,
+                .generic_args = generic_args,
+            } });
         }
-        std.debug.print("unresolved identifier text={s}\n", .{nm});
-        return unsupported(e, "unresolved identifier");
+
+        var def: ?spine.EntityId = null;
+        if (std.mem.eql(u8, function_node.kind(), "identifier")) {
+            def = resolveName(e, text(e, function_node));
+        } else if (std.mem.eql(u8, function_node.kind(), "scoped_identifier") or
+            std.mem.eql(u8, function_node.kind(), "scoped_type_identifier"))
+        {
+            def = resolvePatternPath(e, function_node);
+        }
+        if (def) |resolved| {
+            return appendExpr(e, .{ .path = .{
+                .def = resolved,
+                .generic_args = generic_args,
+            } });
+        }
+        if (generic_args.len > 0) e.ctx.alloc.free(generic_args);
+        return unsupported(e, "unresolved generic function");
     }
+
     if (std.mem.eql(u8, kind, "scoped_identifier") or
         std.mem.eql(u8, kind, "scoped_type_identifier"))
     {
-        if (resolveScopedPath(e, node)) |def| {
-            return appendExpr(e, .{ .path = .{ .def = def, .generic_args = &.{} } });
+        if (try lowerQualifiedAssociatedConstPath(e, node)) |associated_const| {
+            return associated_const;
+        }
+        if (try lowerBoundAssociatedConstPath(e, text(e, node))) |associated_const| {
+            return associated_const;
+        }
+        if (primitiveAssociatedConstant(text(e, node))) |constant| {
+            return lowerPrimitiveAssociatedConstant(e, constant);
+        }
+        if (resolvePatternPath(e, node)) |def| {
+            return lowerPathValue(e, def);
+        }
+        if (try ensureStandardPreludePath(e, text(e, node))) |standard| {
+            return lowerPathValue(e, standard.variant_id);
         }
         return unsupported(e, "unresolved scoped path");
     }
@@ -1979,7 +3411,28 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     // Cast / block / for / if / return / unary / paren / reference.
     if (std.mem.eql(u8, kind, "type_cast_expression")) return lowerCast(e, node);
+    if (std.mem.eql(u8, kind, "unsafe_block")) {
+        const body = controlBlock(node) orelse return error.MalformedCst;
+        return appendExpr(e, .{ .block = try lowerBlock(e, body) });
+    }
+    if (std.mem.eql(u8, kind, "loop_expression")) {
+        const body_node = controlBlock(node) orelse return error.MalformedCst;
+        var body = try lowerBlock(e, body_node);
+        body.labelled = try controlLabel(e, node);
+        return appendExpr(e, .{ .loop_ = .{ .body = body } });
+    }
+    if (std.mem.eql(u8, kind, "break_expression")) {
+        return appendExpr(e, .{ .break_ = .{
+            .label = try controlLabel(e, node),
+            .value = try controlValue(e, node),
+        } });
+    }
+    if (std.mem.eql(u8, kind, "continue_expression")) {
+        return appendExpr(e, .{ .continue_ = .{ .label = try controlLabel(e, node) } });
+    }
     if (std.mem.eql(u8, kind, "while_expression")) {
+        const outer_local_count = e.locals.items.len;
+        defer e.locals.items.len = outer_local_count;
         var cond_node: ?ts.Node = null;
         var body_node: ?ts.Node = null;
         var i: u32 = 0;
@@ -1987,26 +3440,21 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             if (std.mem.eql(u8, c.kind(), "block")) body_node = c else if (cond_node == null) cond_node = c;
         }
         const cond = cond_node orelse return error.MalformedCst;
-        // `while let <pat> = <expr>` — the condition may be a `let_condition`
-        // (or wrap one inside a generic `condition` / `let_chain`).
-        var capture: ?exprs.NodeId = null;
-        var val_node: ?ts.Node = null;
-        if (std.mem.eql(u8, cond.kind(), "let_condition")) {
-            const pl = try lowerWhileLet(e, cond);
-            capture = pl.pattern;
-            val_node = pl.value;
-        } else if (std.mem.eql(u8, cond.kind(), "condition") and cond.namedChildCount() > 0) {
-            const inner = cond.namedChild(0).?;
-            if (std.mem.eql(u8, inner.kind(), "let_condition")) {
-                const pl = try lowerWhileLet(e, inner);
-                capture = pl.pattern;
-                val_node = pl.value;
-            }
-        }
-        const cond_expr = val_node orelse cond;
         const body = body_node orelse return error.MalformedCst;
+        var capture: ?exprs.NodeId = null;
+        var cond_id: exprs.NodeId = undefined;
+        if (try splitLetCondition(e, cond)) |let_cond| {
+            // Evaluate the scrutinee before introducing pattern bindings.
+            cond_id = try lowerExpr(e, let_cond.value);
+            capture = try lowerPattern(e, let_cond.pattern);
+            if (knownPatternPayloadType(e, cond_id)) |payload| {
+                setPatternLocalTypes(e, capture.?, payload);
+            }
+        } else {
+            cond_id = try lowerExpr(e, cond);
+        }
         return appendExpr(e, .{ .while_ = .{
-            .cond = try lowerExpr(e, cond_expr),
+            .cond = cond_id,
             .capture = capture,
             .body = try lowerBlock(e, body),
         } });
@@ -2040,7 +3488,12 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         const operator = opOf(e, node);
         const operand_id = try lowerExpr(e, operand.?);
         if (std.mem.eql(u8, operator, "!")) {
-            return appendExpr(e, .{ .unary = .{ .op = .logical_not, .operand = operand_id } });
+            const op_ty = knownCastOperandType(e, operand_id);
+            const op: exprs.UnaryOp = if (op_ty != null and isIntegerType(op_ty.?))
+                .bit_not
+            else
+                .logical_not;
+            return appendExpr(e, .{ .unary = .{ .op = op, .operand = operand_id } });
         }
         if (std.mem.eql(u8, operator, "-")) {
             return appendExpr(e, .{ .unary = .{ .op = .negate, .operand = operand_id } });
@@ -2055,6 +3508,9 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     if (std.mem.eql(u8, kind, "reference_expression")) {
         return lowerReferenceExpression(e, node);
     }
+    if (std.mem.eql(u8, kind, "array_expression")) {
+        return lowerArrayExpression(e, node);
+    }
     if (std.mem.eql(u8, kind, "tuple_expression")) {
         var elements: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
         defer elements.deinit(e.ctx.alloc);
@@ -2064,17 +3520,24 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             try elements.append(e.ctx.alloc, try lowerExpr(e, child));
         }
         if (elements.items.len == 0) return error.MalformedCst;
-        return appendExpr(e, .{ .array = .{
-            .elements = try elements.toOwnedSlice(e.ctx.alloc),
+        const owned_elements = try elements.toOwnedSlice(e.ctx.alloc);
+        const tuple_id = try appendExpr(e, .{ .array = .{
+            .elements = owned_elements,
             .repeat = null,
         } });
+        try attachKnownTupleType(e, tuple_id, owned_elements);
+        return tuple_id;
     }
     if (std.mem.eql(u8, kind, "parenthesized_expression")) {
         if (node.namedChildCount() > 0) return lowerExpr(e, node.namedChild(0).?);
         return error.MalformedCst;
     }
-
-    return unsupported(e, "expression");
+    if (std.mem.eql(u8, kind, "try_expression")) {
+        const inner_node = node.namedChild(0) orelse node.childByFieldName("expression") orelse return error.MalformedCst;
+        const inner_id = try lowerExpr(e, inner_node);
+        return appendExpr(e, .{ .try_ = .{ .inner = inner_id } });
+    }
+    return unsupported(e, kind);
 }
 
 fn lowerIntLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
@@ -2106,15 +3569,9 @@ fn parseIntLiteral(raw: []const u8) ?ParsedIntLiteral {
     var ty_suffix: ?[]const u8 = null;
     for (int_suffixes) |suffix| {
         if (body.len > suffix.len and std.mem.endsWith(u8, body, suffix)) {
-            const prefix = body[0 .. body.len - suffix.len];
-            if (prefix.len > 0) {
-                const last = prefix[prefix.len - 1];
-                if (std.ascii.isDigit(last) or last == '_') {
-                    body = prefix;
-                    ty_suffix = suffix;
-                    break;
-                }
-            }
+            body = body[0 .. body.len - suffix.len];
+            ty_suffix = suffix;
+            break;
         }
     }
 
@@ -2122,7 +3579,9 @@ fn parseIntLiteral(raw: []const u8) ?ParsedIntLiteral {
     if (body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X')) base = 16;
     if (body.len > 2 and body[0] == '0' and (body[1] == 'b' or body[1] == 'B')) base = 2;
     if (body.len > 2 and body[0] == '0' and (body[1] == 'o' or body[1] == 'O')) base = 8;
-    const digits = if (base == 10) body else body[2..];
+    const untrimmed_digits = if (base == 10) body else body[2..];
+    const digits = std.mem.trimEnd(u8, untrimmed_digits, "_");
+    if (digits.len == 0) return null;
     const value = std.fmt.parseInt(i128, digits, base) catch return null;
     return .{
         .body = body,
@@ -2130,6 +3589,15 @@ fn parseIntLiteral(raw: []const u8) ?ParsedIntLiteral {
         .base = base,
         .ty_suffix = ty_suffix,
     };
+}
+
+test "Rust integer suffixes preserve separated and hexadecimal values" {
+    const separated = parseIntLiteral("0_u8") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 0), separated.value);
+    try std.testing.expectEqualStrings("u8", separated.ty_suffix.?);
+    const hexadecimal = parseIntLiteral("0xffu8") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 255), hexadecimal.value);
+    try std.testing.expectEqualStrings("u8", hexadecimal.ty_suffix.?);
 }
 
 fn parseVecRepeatCount(raw: []const u8) ?usize {
@@ -2201,6 +3669,225 @@ fn parseVecRepeatCount(raw: []const u8) ?usize {
 
     if (!saw_digit or previous_separator) return null;
     return value;
+}
+
+fn checkedArrayLenBinary(op: exprs.BinaryOp, lhs: usize, rhs: usize) ?usize {
+    return switch (op) {
+        .add => std.math.add(usize, lhs, rhs) catch null,
+        .sub => std.math.sub(usize, lhs, rhs) catch null,
+        .mul => std.math.mul(usize, lhs, rhs) catch null,
+        .div => if (rhs == 0) null else lhs / rhs,
+        .rem => if (rhs == 0) null else lhs % rhs,
+        .bit_and => lhs & rhs,
+        .bit_or => lhs | rhs,
+        .bit_xor => lhs ^ rhs,
+        .shl => blk: {
+            if (rhs >= @bitSizeOf(usize)) break :blk null;
+            const shift: std.math.Log2Int(usize) = @intCast(rhs);
+            if (lhs > (@as(usize, std.math.maxInt(usize)) >> shift)) break :blk null;
+            break :blk lhs << shift;
+        },
+        .shr => blk: {
+            if (rhs >= @bitSizeOf(usize)) break :blk null;
+            break :blk lhs >> @as(std.math.Log2Int(usize), @intCast(rhs));
+        },
+        else => null,
+    };
+}
+
+fn constArrayLenFromExpr(e: *const Ext, node_id: exprs.NodeId, remaining: usize) ?usize {
+    if (remaining == 0 or node_id >= e.ctx.exprs.items.len) return null;
+    return switch (e.ctx.exprs.items[node_id].kind) {
+        .literal => |literal| switch (literal) {
+            .int => |integer| blk: {
+                if (integer.value < 0) break :blk null;
+                const max_usize: i128 = @intCast(std.math.maxInt(usize));
+                if (integer.value > max_usize) break :blk null;
+                break :blk @intCast(integer.value);
+            },
+            else => null,
+        },
+        .binary => |binary| blk: {
+            const lhs = constArrayLenFromExpr(e, binary.lhs, remaining - 1) orelse break :blk null;
+            const rhs = constArrayLenFromExpr(e, binary.rhs, remaining - 1) orelse break :blk null;
+            break :blk checkedArrayLenBinary(binary.op, lhs, rhs);
+        },
+        .cast => |cast| constArrayLenFromExpr(e, cast.operand, remaining - 1),
+        .path => |path| blk: {
+            if (path.def >= e.ctx.bodies_list.items.len) break :blk null;
+            const body = switch (e.ctx.bodies_list.items[path.def]) {
+                .const_ => |const_body| const_body,
+                else => break :blk null,
+            };
+            break :blk constArrayLenFromExpr(e, body.init, remaining - 1);
+        },
+        else => null,
+    };
+}
+
+fn constArrayLenFromCst(e: *const Ext, node: ts.Node, remaining: usize) ?usize {
+    if (remaining == 0) return null;
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "integer_literal")) {
+        return parseVecRepeatCount(text(e, node));
+    }
+    if (std.mem.eql(u8, kind, "parenthesized_expression")) {
+        const inner = node.namedChild(0) orelse return null;
+        return constArrayLenFromCst(e, inner, remaining - 1);
+    }
+    if (std.mem.eql(u8, kind, "type_cast_expression")) {
+        const operand = node.namedChild(0) orelse return null;
+        return constArrayLenFromCst(e, operand, remaining - 1);
+    }
+    if (std.mem.eql(u8, kind, "binary_expression")) {
+        const lhs_node = node.childByFieldName("left") orelse node.namedChild(0) orelse return null;
+        const rhs_node = node.childByFieldName("right") orelse
+            node.namedChild(if (node.namedChildCount() > 2) 2 else 1) orelse return null;
+        const op = mapBinaryOp(opOf(e, node)) orelse return null;
+        const lhs = constArrayLenFromCst(e, lhs_node, remaining - 1) orelse return null;
+        const rhs = constArrayLenFromCst(e, rhs_node, remaining - 1) orelse return null;
+        return checkedArrayLenBinary(op, lhs, rhs);
+    }
+    if (std.mem.eql(u8, kind, "identifier")) {
+        const def = resolveName(e, text(e, node)) orelse return null;
+        if (def >= e.ctx.bodies_list.items.len) return null;
+        const body = switch (e.ctx.bodies_list.items[def]) {
+            .const_ => |const_body| const_body,
+            else => return null,
+        };
+        return constArrayLenFromExpr(e, body.init, remaining - 1);
+    }
+    if (std.mem.eql(u8, kind, "scoped_identifier")) {
+        const def = resolveScopedPath(e, node) orelse return null;
+        if (def >= e.ctx.bodies_list.items.len) return null;
+        const body = switch (e.ctx.bodies_list.items[def]) {
+            .const_ => |const_body| const_body,
+            else => return null,
+        };
+        return constArrayLenFromExpr(e, body.init, remaining - 1);
+    }
+    return null;
+}
+
+fn sourceDeterminedExprType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
+    if (node_id >= e.ctx.exprs.items.len) return null;
+    const expression = e.ctx.exprs.items[node_id];
+    if (expression.ty) |type_id| {
+        if (type_id < e.ctx.types.items.len) return e.ctx.types.items[type_id];
+    }
+    switch (expression.kind) {
+        .literal => |literal| return switch (literal) {
+            .int => |integer| if (integer.ty_suffix != null)
+                knownCastOperandType(e, node_id)
+            else
+                null,
+            .float => |float| if (std.mem.endsWith(u8, float.text, "f32") or
+                std.mem.endsWith(u8, float.text, "f64"))
+                knownCastOperandType(e, node_id)
+            else
+                null,
+            .boolean => .{ .prim = .bool },
+            .character => .{ .prim = .char },
+            else => null,
+        },
+        else => return knownCastOperandType(e, node_id),
+    }
+}
+
+fn attachKnownArrayType(
+    e: *Ext,
+    array_id: exprs.NodeId,
+    elements: []const exprs.NodeId,
+    len: usize,
+) !void {
+    if (elements.len == 0) return;
+    const element_type = sourceDeterminedExprType(e, elements[0]) orelse return;
+    for (elements[1..]) |element| {
+        const candidate = sourceDeterminedExprType(e, element) orelse return;
+        if (!infer.typeEqual(element_type, candidate)) return;
+    }
+    const array_type = try e.ctx.alloc.create(types.Array);
+    errdefer e.ctx.alloc.destroy(array_type);
+    array_type.* = .{
+        .elem = element_type,
+        .len = .{ .literal = @intCast(len) },
+    };
+    const aggregate: types.Type = .{ .array = array_type };
+    if (!isConcreteDeclaredReturnType(aggregate)) return;
+    if (infer.findTypeIndexInSlice(e.ctx.types.items, aggregate)) |existing| {
+        e.ctx.alloc.destroy(array_type);
+        e.ctx.exprs.items[array_id].ty = existing;
+        return;
+    }
+    const type_id: exprs.TypeId = @intCast(e.ctx.types.items.len);
+    try e.ctx.types.append(e.ctx.alloc, aggregate);
+    e.ctx.exprs.items[array_id].ty = type_id;
+}
+
+fn attachKnownTupleType(
+    e: *Ext,
+    tuple_id: exprs.NodeId,
+    elements: []const exprs.NodeId,
+) !void {
+    if (elements.len == 0) return;
+    const tuple_types = try e.ctx.alloc.alloc(types.Type, elements.len);
+    errdefer e.ctx.alloc.free(tuple_types);
+    for (elements, 0..) |element, index| {
+        tuple_types[index] = sourceDeterminedExprType(e, element) orelse {
+            e.ctx.alloc.free(tuple_types);
+            return;
+        };
+    }
+    const aggregate: types.Type = .{ .tuple = tuple_types };
+    if (!isConcreteDeclaredReturnType(aggregate)) {
+        e.ctx.alloc.free(tuple_types);
+        return;
+    }
+    if (infer.findTypeIndexInSlice(e.ctx.types.items, aggregate)) |existing| {
+        e.ctx.alloc.free(tuple_types);
+        e.ctx.exprs.items[tuple_id].ty = existing;
+        return;
+    }
+    const type_id: exprs.TypeId = @intCast(e.ctx.types.items.len);
+    try e.ctx.types.append(e.ctx.alloc, aggregate);
+    e.ctx.exprs.items[tuple_id].ty = type_id;
+}
+
+fn lowerArrayExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    if (node.childByFieldName("length")) |length_node| {
+        const element_node = node.childByFieldName("element") orelse
+            node.childByFieldName("value") orelse
+            node.namedChild(0) orelse return error.MalformedCst;
+        const repeat = constArrayLenFromCst(
+            e,
+            length_node,
+            e.ctx.g.symbol_table.entities.items.len + e.ctx.exprs.items.len + 1,
+        ) orelse return unsupported(e, "array repeat count is not a source constant");
+        const element = try lowerExpr(e, element_node);
+        const elements = try e.ctx.alloc.alloc(exprs.NodeId, 1);
+        elements[0] = element;
+        const array_id = try appendExpr(e, .{ .array = .{
+            .elements = elements,
+            .repeat = repeat,
+        } });
+        try attachKnownArrayType(e, array_id, elements, repeat);
+        return array_id;
+    }
+
+    var elements: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer elements.deinit(e.ctx.alloc);
+    var index: u32 = 0;
+    while (node.namedChild(index)) |child| : (index += 1) {
+        if (isComment(child)) continue;
+        try elements.append(e.ctx.alloc, try lowerExpr(e, child));
+    }
+    const owned_elements = try elements.toOwnedSlice(e.ctx.alloc);
+    const array_id = try appendExpr(e, .{ .array = .{
+        .elements = owned_elements,
+        .repeat = null,
+    } });
+    try attachKnownArrayType(e, array_id, owned_elements, owned_elements.len);
+    return array_id;
 }
 
 fn hexDigit(value: u8) ?u8 {
@@ -2401,6 +4088,20 @@ fn lowerCharLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         std.mem.startsWith(u8, t, "b");
     const decoded = decodeRustByteLiteral(e.ctx.alloc, t) catch return unsupported(e, "invalid byte literal");
     if (decoded) |bytes| {
+        if (is_byte) {
+            if (bytes.len != 1) {
+                e.ctx.alloc.free(bytes);
+                return unsupported(e, "invalid byte literal");
+            }
+            const value = bytes[0];
+            e.ctx.alloc.free(bytes);
+            return appendExpr(e, .{ .literal = .{ .int = .{
+                .text = try std.fmt.allocPrint(e.ctx.alloc, "{d}u8", .{value}),
+                .value = value,
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } });
+        }
         return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
     }
     if (is_byte) return unsupported(e, "invalid byte literal");
@@ -2412,88 +4113,73 @@ fn lowerCharLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 }
 
 fn lowerStructExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
-    var name_node: ?ts.Node = null;
-    var fields_node: ?ts.Node = null;
-
-    var i: u32 = 0;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        const k = c.kind();
-        if (std.mem.eql(u8, k, "field_initializer_list")) {
-            fields_node = c;
-        } else if (name_node == null and !isComment(c)) {
-            name_node = c;
-        }
-    }
-
-    const n_node = name_node orelse return error.MalformedCst;
-    const raw_name = text(e, n_node);
-    const last_colon = std.mem.lastIndexOfScalar(u8, raw_name, ':');
-    var leaf_name = if (last_colon) |idx| raw_name[idx + 1 ..] else raw_name;
-    if (std.mem.indexOfScalar(u8, leaf_name, '<')) |lt_idx| {
-        leaf_name = leaf_name[0..lt_idx];
-    }
+    const name_node = node.childByFieldName("name") orelse return error.MalformedCst;
+    const fields_node = node.childByFieldName("body") orelse return error.MalformedCst;
+    const raw_name = std.mem.trim(u8, text(e, name_node), " \t\r\n");
+    var leaf_name = raw_name;
+    if (std.mem.lastIndexOfScalar(u8, leaf_name, ':')) |index| leaf_name = leaf_name[index + 1 ..];
+    if (std.mem.indexOfScalar(u8, leaf_name, '<')) |index| leaf_name = leaf_name[0..index];
     leaf_name = std.mem.trim(u8, leaf_name, " \t\r\n:");
-    const def = if (last_colon != null)
-        (resolveScopedPath(e, n_node) orelse return unsupported(e, "unresolved struct type"))
-    else
+    const def = resolvePatternPath(e, name_node) orelse
         (resolveName(e, leaf_name) orelse return unsupported(e, "unresolved struct type"));
 
     var fields: std.ArrayListUnmanaged(exprs.FieldInit) = .empty;
     defer fields.deinit(e.ctx.alloc);
-
     var base_id: ?exprs.NodeId = null;
-
-    if (fields_node) |fn_node| {
-        var j: u32 = 0;
-        while (fn_node.namedChild(j)) |c| : (j += 1) {
-            const k = c.kind();
-            if (std.mem.eql(u8, k, "field_initializer")) {
-                var fname_node: ?ts.Node = null;
-                var fval_node: ?ts.Node = null;
-                var m: u32 = 0;
-                while (c.namedChild(m)) |child| : (m += 1) {
-                    const ck = child.kind();
-                    if (std.mem.eql(u8, ck, "field_identifier") or std.mem.eql(u8, ck, "identifier")) {
-                        if (fname_node == null) fname_node = child else if (fval_node == null) fval_node = child;
-                    } else if (!isComment(child)) {
-                        if (fval_node == null) fval_node = child;
-                    }
+    var i: u32 = 0;
+    while (fields_node.namedChild(i)) |child| : (i += 1) {
+        const kind = child.kind();
+        if (std.mem.eql(u8, kind, "field_initializer")) {
+            const field_node = child.childByFieldName("field") orelse return error.MalformedCst;
+            const value_node = child.childByFieldName("value") orelse return error.MalformedCst;
+            try fields.append(e.ctx.alloc, .{
+                .field = try e.ctx.alloc.dupe(u8, text(e, field_node)),
+                .value = try lowerExpr(e, value_node),
+                .shorthand = false,
+            });
+        } else if (std.mem.eql(u8, kind, "shorthand_field_initializer")) {
+            var field_node: ?ts.Node = null;
+            var j: u32 = 0;
+            while (child.namedChild(j)) |field| : (j += 1) {
+                if (isBlockTrivia(field)) continue;
+                if (std.mem.eql(u8, field.kind(), "identifier")) {
+                    field_node = field;
+                    break;
                 }
-                const fnm = if (fname_node) |fnn| text(e, fnn) else return error.MalformedCst;
-                if (fnm.len == 0) return error.MalformedCst;
-                if (fval_node) |fvn| {
-                    const val_id = try lowerExpr(e, fvn);
-                    try fields.append(e.ctx.alloc, .{
-                        .field = try e.ctx.alloc.dupe(u8, fnm),
-                        .value = val_id,
-                        .shorthand = false,
-                    });
-                } else {
-                    // Shorthand `Point { x }` -> PathExpr(x)
-                    const var_def = resolveName(e, fnm) orelse return unsupported(e, "unresolved struct field");
-                    const val_id = try appendExpr(e, .{ .path = .{ .def = var_def, .generic_args = &.{} } });
-                    try fields.append(e.ctx.alloc, .{
-                        .field = try e.ctx.alloc.dupe(u8, fnm),
-                        .value = val_id,
-                        .shorthand = true,
-                    });
-                }
-            } else if (std.mem.eql(u8, k, "shorthand_field_initializer")) {
-                const fnm = text(e, c);
-                const var_def = resolveName(e, fnm) orelse return unsupported(e, "unresolved struct field");
-                const val_id = try appendExpr(e, .{ .path = .{ .def = var_def, .generic_args = &.{} } });
-                try fields.append(e.ctx.alloc, .{
-                    .field = try e.ctx.alloc.dupe(u8, fnm),
-                    .value = val_id,
-                    .shorthand = true,
-                });
-            } else if (std.mem.eql(u8, k, "base_field_initializer")) {
-                const bn = c.namedChild(0) orelse return error.MalformedCst;
-                base_id = try lowerExpr(e, bn);
             }
+            const field = field_node orelse return error.MalformedCst;
+            const field_name = text(e, field);
+            const value_def = resolveName(e, field_name) orelse
+                return unsupported(e, "unresolved struct field");
+            const value_id = try appendExpr(e, .{ .path = .{
+                .def = value_def,
+                .generic_args = &.{},
+            } });
+            try fields.append(e.ctx.alloc, .{
+                .field = try e.ctx.alloc.dupe(u8, field_name),
+                .value = value_id,
+                .shorthand = true,
+            });
+        } else if (std.mem.eql(u8, kind, "base_field_initializer")) {
+            const base_node = child.namedChild(0) orelse return error.MalformedCst;
+            base_id = try lowerExpr(e, base_node);
+        } else if (isBlockTrivia(child)) {
+            continue;
+        } else {
+            return error.MalformedCst;
         }
     }
 
+    const entity = e.ctx.g.symbol_table.get(def) orelse return error.MalformedCst;
+    if (entity.kind == .variant) {
+        if (base_id != null) return unsupported(e, "enum variant update expression");
+        return appendExpr(e, .{ .enum_variant = .{
+            .def = entity.parent orelse return error.MalformedCst,
+            .variant = try e.ctx.alloc.dupe(u8, entity.name),
+            .tuple_fields = &.{},
+            .named_fields = try fields.toOwnedSlice(e.ctx.alloc),
+        } });
+    }
     return appendExpr(e, .{ .struct_lit = .{
         .def = def,
         .fields = try fields.toOwnedSlice(e.ctx.alloc),
@@ -2502,53 +4188,64 @@ fn lowerStructExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 }
 
 fn lowerFieldPattern(e: *Ext, node: ts.Node) anyerror!exprs.FieldPat {
-    // `width` shorthand → `shorthand_field_identifier` child, pattern implied
-    // by name. `x: ax` → `field_identifier` x + pattern `ax`.
-    var fname: []const u8 = "";
-    var fpat_node: ?ts.Node = null;
-    var is_shorthand = false;
-
+    const field_node = node.childByFieldName("name") orelse return error.MalformedCst;
+    const field_name = text(e, field_node);
+    if (field_name.len == 0) return error.MalformedCst;
+    const pattern_node = node.childByFieldName("pattern");
+    var by_ref = false;
+    var mutable = false;
     var i: u32 = 0;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        const k = c.kind();
-        if (std.mem.eql(u8, k, "field_identifier")) {
-            fname = text(e, c);
-        } else if (std.mem.eql(u8, k, "shorthand_field_identifier")) {
-            fname = text(e, c);
-            is_shorthand = true;
-        } else if (std.mem.eql(u8, k, "identifier")) {
-            // `x: ax` — the nested pattern binding is an identifier.
-            fpat_node = c;
-        } else if (!isComment(c) and !std.mem.eql(u8, k, ":")) {
-            fpat_node = c;
+    while (node.child(i)) |child| : (i += 1) {
+        const child_text = std.mem.trim(u8, text(e, child), " \t\r\n");
+        if (std.mem.eql(u8, child_text, "ref")) by_ref = true;
+        if (std.mem.eql(u8, child.kind(), "mutable_specifier") or
+            std.mem.eql(u8, child_text, "mut"))
+        {
+            mutable = true;
         }
     }
-
-    if (fname.len == 0) return error.MalformedCst;
-
-    if (fpat_node) |fpn| {
-        const pid = try lowerPattern(e, fpn);
+    if (pattern_node) |nested| {
+        const pattern_id = try lowerPattern(e, nested);
+        if (by_ref or mutable) {
+            if (e.ctx.pats.items[pattern_id].kind == .binding) {
+                var binding = e.ctx.pats.items[pattern_id].kind.binding;
+                binding.mutable = binding.mutable or mutable;
+                binding.mode = if (mutable) .{ .mut_ref = {} } else .{ .shared_ref = {} };
+                e.ctx.pats.items[pattern_id].kind = .{ .binding = binding };
+            }
+        }
         return .{
-            .field = try e.ctx.alloc.dupe(u8, fname),
-            .pat = pid,
+            .field = try e.ctx.alloc.dupe(u8, field_name),
+            .pat = pattern_id,
             .shorthand = false,
         };
     }
-
-    // Shorthand `Point { width }` binds a local named `width`.
-    _ = try pushLocal(e, fname);
-    const pid = try appendPat(e, .{ .binding = .{
-        .name = try e.ctx.alloc.dupe(u8, fname),
-        .mode = .{ .value = {} },
-        .mutable = false,
+    _ = try pushLocal(e, field_name);
+    const pattern_id = try appendPat(e, .{ .binding = .{
+        .name = try e.ctx.alloc.dupe(u8, field_name),
+        .mode = if (mutable) .{ .mut_ref = {} } else if (by_ref) .{ .shared_ref = {} } else .{ .value = {} },
+        .mutable = mutable,
     } });
     return .{
-        .field = try e.ctx.alloc.dupe(u8, fname),
-        .pat = pid,
+        .field = try e.ctx.alloc.dupe(u8, field_name),
+        .pat = pattern_id,
         .shorthand = true,
     };
 }
 
+fn lowerPatternBound(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    if (std.mem.eql(u8, node.kind(), "literal_pattern")) {
+        const literal = node.namedChild(0) orelse return error.MalformedCst;
+        return lowerExpr(e, literal);
+    }
+    return lowerExpr(e, node);
+}
+
+fn patternRangeInclusive(e: *const Ext, node: ts.Node) bool {
+    const raw = text(e, node);
+    return std.mem.indexOf(u8, raw, "..=") != null or
+        std.mem.indexOf(u8, raw, "...") != null;
+}
 fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const kind = node.kind();
     if (std.mem.eql(u8, kind, "literal_pattern")) {
@@ -2566,6 +4263,7 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         var inner: ?ts.Node = null;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
+            if (isBlockTrivia(c)) continue;
             const k = c.kind();
             if (std.mem.eql(u8, k, "mutable_specifier")) {
                 mut = true;
@@ -2588,6 +4286,30 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return error.MalformedCst;
     }
 
+    if (std.mem.eql(u8, kind, "identifier")) {
+        const name = text(e, node);
+        if (resolveName(e, name)) |def| {
+            const entity = e.ctx.g.symbol_table.get(def) orelse return error.MalformedCst;
+            if (entity.kind == .variant or entity.kind == .const_) {
+                return appendPat(e, .{ .path = .{
+                    .def = def,
+                    .variant = try e.ctx.alloc.dupe(u8, name),
+                } });
+            }
+        } else if (try ensureStandardPreludeVariant(e, name)) |standard| {
+            return appendPat(e, .{ .path = .{
+                .def = standard.variant_id,
+                .variant = try e.ctx.alloc.dupe(u8, name),
+            } });
+        }
+        _ = try pushLocal(e, name);
+        return appendPat(e, .{ .binding = .{
+            .name = try e.ctx.alloc.dupe(u8, name),
+            .mode = .value,
+            .mutable = false,
+        } });
+    }
+
     if (std.mem.eql(u8, kind, "wildcard_pattern") or std.mem.eql(u8, kind, "_")) {
         return appendPat(e, .{ .wildcard = {} });
     }
@@ -2607,43 +4329,58 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         } });
     }
 
-    if (std.mem.eql(u8, kind, "identifier")) {
-        const nm = text(e, node);
-        if (resolveName(e, nm)) |def| {
-            if (e.ctx.g.symbol_table.get(def)) |ent| {
-                if (ent.kind == .variant or ent.kind == .const_) {
-                    return appendPat(e, .{ .path = .{ .def = def, .variant = null } });
-                }
-            }
-        }
-        _ = try pushLocal(e, nm);
-        return appendPat(e, .{ .binding = .{
-            .name = try e.ctx.alloc.dupe(u8, nm),
-            .mode = .{ .value = {} },
-            .mutable = false,
-        } });
-    }
-
     if (std.mem.eql(u8, kind, "scoped_identifier") or std.mem.eql(u8, kind, "path")) {
         const t = text(e, node);
         const last = std.mem.lastIndexOfScalar(u8, t, ':');
         const leaf = if (last) |idx| t[idx + 1 ..] else t;
-        const def: spine.EntityId = if (last != null)
-            (resolvePatternPath(e, node) orelse
-                return appendPat(e, .{ .unsupported = .{
-                    .reason = "unresolved pattern path",
-                    .suggested_version = .v3,
-                } }))
-        else
-            (resolveName(e, leaf) orelse
-                return appendPat(e, .{ .unsupported = .{
-                    .reason = "unresolved pattern path",
-                    .suggested_version = .v3,
-                } }));
+        var def_opt: ?spine.EntityId = null;
+        if (last != null) {
+            def_opt = resolvePatternPath(e, node);
+            if (def_opt == null) {
+                if (try ensureStandardPreludePath(e, t)) |standard|
+                    def_opt = standard.variant_id;
+            }
+        } else {
+            def_opt = resolveName(e, leaf);
+        }
+        const def = def_opt orelse return appendPat(e, .{ .unsupported = .{
+            .reason = "unresolved pattern path",
+            .suggested_version = .v3,
+        } });
         return appendPat(e, .{ .path = .{
             .def = def,
             .variant = try e.ctx.alloc.dupe(u8, leaf),
         } });
+    }
+
+    if (std.mem.eql(u8, kind, "range_pattern")) {
+        const left = node.childByFieldName("left");
+        const right = node.childByFieldName("right");
+        if (left == null and right == null) return error.MalformedCst;
+        var lower: ?exprs.NodeId = null;
+        if (left) |bound| lower = try lowerPatternBound(e, bound);
+        var upper: ?exprs.NodeId = null;
+        if (right) |bound| upper = try lowerPatternBound(e, bound);
+        return appendPat(e, .{ .range = .{
+            .lo = lower,
+            .hi = upper,
+            .inclusive = patternRangeInclusive(e, node),
+        } });
+    }
+
+    if (std.mem.eql(u8, kind, "ref_pattern")) {
+        const inner = firstNestedPatternChild(node) orelse return error.MalformedCst;
+        const pattern_id = try lowerPattern(e, inner);
+        if (e.ctx.pats.items[pattern_id].kind != .binding) {
+            return appendPat(e, .{ .unsupported = .{
+                .reason = "ref pattern",
+                .suggested_version = .v3,
+            } });
+        }
+        var binding = e.ctx.pats.items[pattern_id].kind.binding;
+        binding.mode = if (binding.mutable) .{ .mut_ref = {} } else .{ .shared_ref = {} };
+        e.ctx.pats.items[pattern_id].kind = .{ .binding = binding };
+        return pattern_id;
     }
     if (std.mem.eql(u8, kind, "slice_pattern")) {
         return appendPat(e, .{ .unsupported = .{
@@ -2660,7 +4397,7 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         while (node.namedChild(i)) |c| : (i += 1) {
             if (std.mem.eql(u8, c.kind(), "rest_pattern") or std.mem.eql(u8, c.kind(), "..")) {
                 has_rest = true;
-            } else if (!isComment(c)) {
+            } else if (!isBlockTrivia(c)) {
                 try elems.append(e.ctx.alloc, try lowerPattern(e, c));
             }
         }
@@ -2673,47 +4410,61 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     if (std.mem.eql(u8, kind, "match_pattern")) {
         // `match_pattern` wraps the real pattern. A bare `_` has no named
         // children → wildcard. Otherwise lower the first named child.
-        if (node.namedChildCount() == 0) {
-            if (std.mem.eql(u8, std.mem.trim(u8, text(e, node), " \t\r\n"), "_")) {
-                return appendPat(e, .{ .wildcard = {} });
-            }
-            return error.MalformedCst;
+        if (firstMatchPatternChild(node)) |inner| return lowerPattern(e, inner);
+        if (std.mem.eql(u8, std.mem.trim(u8, text(e, node), " \t\r\n"), "_")) {
+            return appendPat(e, .{ .wildcard = {} });
         }
-        return lowerPattern(e, node.namedChild(0).?);
+        return error.MalformedCst;
     }
 
     if (std.mem.eql(u8, kind, "tuple_struct_pattern")) {
-        var type_node: ?ts.Node = node.childByFieldName("type");
+        const type_node = node.childByFieldName("type") orelse return error.MalformedCst;
         var pat_nodes: std.ArrayListUnmanaged(ts.Node) = .empty;
         defer pat_nodes.deinit(e.ctx.alloc);
         var i: u32 = 0;
-        while (node.namedChild(i)) |c| : (i += 1) {
-            const k = c.kind();
-            if (type_node == null and
-                (std.mem.eql(u8, k, "scoped_identifier") or
-                    std.mem.eql(u8, k, "identifier") or
-                    std.mem.eql(u8, k, "type_identifier") or
-                    std.mem.eql(u8, k, "scoped_type_identifier") or
-                    std.mem.eql(u8, k, "path")))
-            {
-                type_node = c;
-                continue;
-            }
-            if (type_node) |tn| {
-                if (c.id == tn.id) continue;
-            }
-            if (!isComment(c) and !std.mem.eql(u8, k, "..")) {
-                // Field patterns are direct children (e.g. `r` in `Circle(r)`).
-                try pat_nodes.append(e.ctx.alloc, c);
+        while (node.namedChild(i)) |child| : (i += 1) {
+            if (child.id == type_node.id or isBlockTrivia(child)) continue;
+            try pat_nodes.append(e.ctx.alloc, child);
+        }
+
+        const raw_type = std.mem.trim(u8, text(e, type_node), " \t\r\n");
+        var leaf = raw_type;
+        if (std.mem.lastIndexOfScalar(u8, leaf, ':')) |index| leaf = leaf[index + 1 ..];
+        if (std.mem.indexOfScalar(u8, leaf, '<')) |index| leaf = leaf[0..index];
+        leaf = std.mem.trim(u8, leaf, " \t\r\n:");
+        const def_opt: ?spine.EntityId = blk: {
+            if (resolvePatternPath(e, type_node)) |resolved| break :blk resolved;
+            if (resolveName(e, leaf)) |resolved| break :blk resolved;
+            if (try ensureStandardPreludeVariant(e, leaf)) |standard| break :blk standard.variant_id;
+            break :blk null;
+        };
+        if (def_opt == null) {
+            if (std.mem.lastIndexOf(u8, raw_type, "::")) |last_sep| {
+                const owner_text = raw_type[0..last_sep];
+                const variant_name = std.mem.trim(u8, raw_type[last_sep + 2 ..], " \t\r\n");
+                if (variant_name.len > 0) {
+                    if (try externalCowVariantForPath(e, owner_text, variant_name)) |owner| {
+                        var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
+                        defer field_pats.deinit(e.ctx.alloc);
+                        for (pat_nodes.items, 0..) |pnode, field_index| {
+                            const pid = try lowerPattern(e, pnode);
+                            try field_pats.append(e.ctx.alloc, .{
+                                .field = try std.fmt.allocPrint(e.ctx.alloc, "{d}", .{field_index}),
+                                .pat = pid,
+                                .shorthand = true,
+                            });
+                        }
+                        return appendPat(e, .{ .external_variant = .{
+                            .owner = owner,
+                            .variant = try e.ctx.alloc.dupe(u8, variant_name),
+                            .fields = try field_pats.toOwnedSlice(e.ctx.alloc),
+                            .rest = false,
+                        } });
+                    }
+                }
             }
         }
-        const def_opt: ?spine.EntityId = if (type_node) |tn| blk: {
-            const raw_type = std.mem.trim(u8, text(e, tn), " \t\r\n");
-            if (raw_type.len == 0) break :blk null;
-            const last_colon = std.mem.lastIndexOfScalar(u8, raw_type, ':');
-            if (last_colon != null) break :blk resolvePatternPath(e, tn);
-            break :blk resolveName(e, raw_type);
-        } else null;
+
         const def = def_opt orelse return appendPat(e, .{ .unsupported = .{
             .reason = "unresolved tuple struct pattern",
             .suggested_version = .v3,
@@ -2737,56 +4488,54 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
 
     if (std.mem.eql(u8, kind, "struct_pattern")) {
-        var type_node: ?ts.Node = null;
-        var fields_list_node: ?ts.Node = null;
+        const type_node = node.childByFieldName("type") orelse return error.MalformedCst;
+        var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
+        defer field_pats.deinit(e.ctx.alloc);
+        var has_rest = false;
         var i: u32 = 0;
-        while (node.namedChild(i)) |c| : (i += 1) {
-            const k = c.kind();
-            if (type_node == null and (std.mem.eql(u8, k, "scoped_identifier") or std.mem.eql(u8, k, "identifier") or std.mem.eql(u8, k, "type_identifier") or std.mem.eql(u8, k, "scoped_type_identifier") or std.mem.eql(u8, k, "path"))) {
-                type_node = c;
-            } else if (std.mem.eql(u8, k, "field_pattern_list") or std.mem.eql(u8, k, "field_initializer_list")) {
-                fields_list_node = c;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            if (child.id == type_node.id or isBlockTrivia(child)) continue;
+            const child_kind = child.kind();
+            if (std.mem.eql(u8, child_kind, "field_pattern")) {
+                try field_pats.append(e.ctx.alloc, try lowerFieldPattern(e, child));
+            } else if (std.mem.eql(u8, child_kind, "remaining_field_pattern")) {
+                has_rest = true;
+            } else {
+                return error.MalformedCst;
             }
         }
-        const raw_type = if (type_node) |tn| text(e, tn) else "";
-        const last_colon = std.mem.lastIndexOfScalar(u8, raw_type, ':');
-        const leaf = if (last_colon) |idx| raw_type[idx + 1 ..] else raw_type;
-        const def_opt: ?spine.EntityId = if (last_colon != null) blk: {
-            if (type_node) |tn| break :blk resolvePatternPath(e, tn);
+
+        const raw_type = std.mem.trim(u8, text(e, type_node), " \t\r\n");
+        var leaf = raw_type;
+        if (std.mem.lastIndexOfScalar(u8, leaf, ':')) |index| leaf = leaf[index + 1 ..];
+        leaf = std.mem.trim(u8, leaf, " \t\r\n:");
+        const def_opt: ?spine.EntityId = blk: {
+            if (resolvePatternPath(e, type_node)) |resolved| break :blk resolved;
+            if (resolveName(e, leaf)) |resolved| break :blk resolved;
+            if (try ensureStandardPreludeVariant(e, leaf)) |standard| break :blk standard.variant_id;
             break :blk null;
-        } else resolveName(e, leaf);
+        };
+        if (def_opt == null) {
+            if (std.mem.lastIndexOf(u8, raw_type, "::")) |last_sep| {
+                const owner_text = raw_type[0..last_sep];
+                const variant_name = std.mem.trim(u8, raw_type[last_sep + 2 ..], " \t\r\n");
+                if (variant_name.len > 0) {
+                    if (try externalCowVariantForPath(e, owner_text, variant_name)) |owner| {
+                        return appendPat(e, .{ .external_variant = .{
+                            .owner = owner,
+                            .variant = try e.ctx.alloc.dupe(u8, variant_name),
+                            .fields = try field_pats.toOwnedSlice(e.ctx.alloc),
+                            .rest = has_rest,
+                        } });
+                    }
+                }
+            }
+        }
+
         const def = def_opt orelse return appendPat(e, .{ .unsupported = .{
             .reason = "unresolved struct pattern",
             .suggested_version = .v3,
         } });
-        var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
-        defer field_pats.deinit(e.ctx.alloc);
-        var has_rest = false;
-        if (fields_list_node == null) {
-            var j: u32 = 0;
-            while (node.namedChild(j)) |c| : (j += 1) {
-                if (type_node) |tn| {
-                    if (c.id == tn.id) continue;
-                }
-                const k = c.kind();
-                if (std.mem.eql(u8, k, "field_pattern")) {
-                    const fpat = try lowerFieldPattern(e, c);
-                    try field_pats.append(e.ctx.alloc, fpat);
-                } else if (std.mem.eql(u8, k, "remaining_field_pattern") or std.mem.eql(u8, k, "..")) {
-                    has_rest = true;
-                }
-            }
-        } else if (fields_list_node) |fln| {
-            var j: u32 = 0;
-            while (fln.namedChild(j)) |c| : (j += 1) {
-                const k = c.kind();
-                if (std.mem.eql(u8, k, "field_pattern")) {
-                    try field_pats.append(e.ctx.alloc, try lowerFieldPattern(e, c));
-                } else if (std.mem.eql(u8, k, "remaining_field_pattern") or std.mem.eql(u8, k, "..")) {
-                    has_rest = true;
-                }
-            }
-        }
         return appendPat(e, .{ .struct_pat = .{
             .def = def,
             .fields = try field_pats.toOwnedSlice(e.ctx.alloc),
@@ -2799,7 +4548,7 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         defer alts.deinit(e.ctx.alloc);
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
-            if (!isComment(c)) {
+            if (!isBlockTrivia(c)) {
                 try alts.append(e.ctx.alloc, try lowerPattern(e, c));
             }
         }
@@ -2808,7 +4557,7 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
 
     if (std.mem.eql(u8, kind, "reference_pattern")) {
-        if (node.namedChild(0)) |inner| {
+        if (firstNestedPatternChild(node)) |inner| {
             const pid = try lowerPattern(e, inner);
             return appendPat(e, .{ .reference = .{
                 .mode = .{ .value = {} },
@@ -2818,8 +4567,29 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return error.MalformedCst;
     }
 
-    if (std.mem.eql(u8, kind, "char_literal")) {
+    if (std.mem.eql(u8, kind, "char_literal") or std.mem.eql(u8, kind, "byte_literal")) {
         const raw = text(e, node);
+        if (std.mem.startsWith(u8, raw, "b")) {
+            const decoded = decodeRustByteLiteral(e.ctx.alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return appendPat(e, .{ .unsupported = .{
+                    .reason = "invalid byte pattern",
+                    .suggested_version = .v3,
+                } }),
+            };
+            const bytes = decoded orelse return error.MalformedCst;
+            defer e.ctx.alloc.free(bytes);
+            if (bytes.len != 1) return appendPat(e, .{ .unsupported = .{
+                .reason = "invalid byte pattern",
+                .suggested_version = .v3,
+            } });
+            return appendPat(e, .{ .literal = .{ .int = .{
+                .text = try std.fmt.allocPrint(e.ctx.alloc, "{d}u8", .{bytes[0]}),
+                .value = bytes[0],
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } });
+        }
         const value = decodeRustCharCodepoint(raw) orelse return appendPat(e, .{ .unsupported = .{
             .reason = "invalid char pattern",
             .suggested_version = .v3,
@@ -2880,79 +4650,75 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     } });
 }
 
-fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
-    var val_node: ?ts.Node = null;
-    var block_node: ?ts.Node = null;
-
+/// Return the semantic pattern child from a `match_pattern` wrapper.
+///
+/// Comments are extras and may occur before the grammar's `_pattern` child.
+/// Anonymous `_` must remain visible, so this scans raw children instead of
+/// using `namedChild`.
+fn firstMatchPatternChild(wrapper: ts.Node) ?ts.Node {
     var i: u32 = 0;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        const k = c.kind();
-        if (std.mem.eql(u8, k, "match_block")) {
-            block_node = c;
-        } else if (val_node == null and !isComment(c)) {
-            if (std.mem.eql(u8, k, "condition") or std.mem.eql(u8, k, "match_condition")) {
-                val_node = c.namedChild(0) orelse return error.MalformedCst;
-            } else {
-                val_node = c;
+    while (wrapper.child(i)) |child| : (i += 1) {
+        if (isBlockTrivia(child)) continue;
+        if (!child.isNamed() and std.mem.eql(u8, child.kind(), "if")) continue;
+        return child;
+    }
+    return null;
+}
+
+/// Return the semantic nested pattern from a ref/reference wrapper.
+///
+/// The `ref`, `&`, and `mut` tokens are anonymous grammar children. Skip
+/// those tokens and comments while retaining anonymous wildcard `_`.
+fn firstNestedPatternChild(wrapper: ts.Node) ?ts.Node {
+    var i: u32 = 0;
+    while (wrapper.child(i)) |child| : (i += 1) {
+        if (isBlockTrivia(child)) continue;
+        if (!child.isNamed()) {
+            const child_text = std.mem.trim(u8, child.kind(), " \t\r\n");
+            if (std.mem.eql(u8, child_text, "ref") or
+                std.mem.eql(u8, child_text, "mut") or
+                std.mem.eql(u8, child_text, "&"))
+            {
+                continue;
             }
         }
+        return child;
     }
+    return null;
+}
 
-    const scr_node = val_node orelse return error.MalformedCst;
+fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
+    const scr_node = node.childByFieldName("value") orelse return error.MalformedCst;
+    const block_node = node.childByFieldName("body") orelse return error.MalformedCst;
     const scrutinee_id = try lowerExpr(e, scr_node);
 
     var arms: std.ArrayListUnmanaged(exprs.MatchArm) = .empty;
     defer arms.deinit(e.ctx.alloc);
     var contains_unsupported_pattern = false;
 
-    const bn = block_node orelse return error.MalformedCst;
-    var j: u32 = 0;
-    while (bn.namedChild(j)) |c| : (j += 1) {
-        if (!std.mem.eql(u8, c.kind(), "match_arm")) {
-            if (isComment(c)) continue;
-            return error.MalformedCst;
-        }
+    var i: u32 = 0;
+    while (block_node.namedChild(i)) |arm_node| : (i += 1) {
+        if (isBlockTrivia(arm_node)) continue;
+        if (!std.mem.eql(u8, arm_node.kind(), "match_arm")) return error.MalformedCst;
+        const arm_local_count = e.locals.items.len;
+        defer e.locals.items.len = arm_local_count;
 
-        // `match_arm` = `match_pattern` + body-expr. The `match_pattern`
-        // node wraps the actual pattern; when a guard is present
-        // (`n if n > 5`) the guard expression is a sibling of the pattern
-        // inside `match_pattern`.
-        var match_pattern: ?ts.Node = null;
-        var body_node: ?ts.Node = null;
-
-        var m: u32 = 0;
-        while (c.namedChild(m)) |child| : (m += 1) {
-            if (std.mem.eql(u8, child.kind(), "match_pattern")) {
-                match_pattern = child;
-            } else if (body_node == null) {
-                body_node = child;
-            }
-        }
-
-        const mp = match_pattern orelse return error.MalformedCst;
-        const bn_arm = body_node orelse return error.MalformedCst;
-
-        // `match_arm` contains a pattern and, optionally, a guard.
-        var guard_node: ?ts.Node = null;
-        const pn = if (mp.namedChildCount() > 0) blk: {
-            if (mp.namedChildCount() > 1) guard_node = mp.namedChild(1);
-            break :blk mp.namedChild(0).?;
-        } else mp;
+        const pattern_wrapper = arm_node.childByFieldName("pattern") orelse return error.MalformedCst;
+        const body_node = arm_node.childByFieldName("value") orelse return error.MalformedCst;
+        const pattern_node = firstMatchPatternChild(pattern_wrapper) orelse return error.MalformedCst;
+        const guard_node = pattern_wrapper.childByFieldName("condition");
 
         var pat_ids: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
         defer pat_ids.deinit(e.ctx.alloc);
-
-        if (std.mem.eql(u8, pn.kind(), "or_pattern")) {
-            // Collapse `a | b | c` into one entry per alternative.
-            var k: u32 = 0;
-            while (pn.namedChild(k)) |alt| : (k += 1) {
-                if (!isComment(alt) and !std.mem.eql(u8, alt.kind(), "|")) {
-                    try pat_ids.append(e.ctx.alloc, try lowerPattern(e, alt));
-                }
+        if (std.mem.eql(u8, pattern_node.kind(), "or_pattern")) {
+            var j: u32 = 0;
+            while (pattern_node.namedChild(j)) |alternative| : (j += 1) {
+                if (isBlockTrivia(alternative)) continue;
+                try pat_ids.append(e.ctx.alloc, try lowerPattern(e, alternative));
             }
             if (pat_ids.items.len == 0) return error.MalformedCst;
         } else {
-            try pat_ids.append(e.ctx.alloc, try lowerPattern(e, pn));
+            try pat_ids.append(e.ctx.alloc, try lowerPattern(e, pattern_node));
         }
 
         for (pat_ids.items) |pat_id| {
@@ -2962,12 +4728,8 @@ fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
 
         var guard_id: ?exprs.NodeId = null;
-        if (guard_node) |gn| {
-            guard_id = try lowerExpr(e, gn);
-        }
-
-        const arm_body_id = try lowerExpr(e, bn_arm);
-
+        if (guard_node) |guard| guard_id = try lowerExpr(e, guard);
+        const arm_body_id = try lowerExpr(e, body_node);
         try arms.append(e.ctx.alloc, .{
             .patterns = try pat_ids.toOwnedSlice(e.ctx.alloc),
             .guard = guard_id,
@@ -2976,9 +4738,7 @@ fn lowerMatch(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
 
     if (arms.items.len == 0) return error.MalformedCst;
-    if (contains_unsupported_pattern) {
-        return unsupported(e, "unsupported match pattern");
-    }
+    if (contains_unsupported_pattern) return unsupported(e, "unsupported match pattern");
     return appendExpr(e, .{ .match = .{
         .scrutinee = scrutinee_id,
         .arms = try arms.toOwnedSlice(e.ctx.alloc),
@@ -3029,7 +4789,7 @@ fn isConcreteDeclaredReturnType(t: types.Type) bool {
         .array => |array| blk: {
             switch (array.len) {
                 .literal => {},
-                .generic => break :blk false,
+                .generic, .expression => break :blk false,
             }
             break :blk isConcreteDeclaredReturnType(array.elem);
         },
@@ -3055,8 +4815,25 @@ fn isConcreteDeclaredReturnType(t: types.Type) bool {
         .result => |result| isConcreteDeclaredReturnType(result.ok) and
             isConcreteDeclaredReturnType(result.err),
         .boxed => |inner| isConcreteDeclaredReturnType(inner.*),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete|
+            isConcreteDeclaredReturnType(concrete.*)
+        else
+            false,
+        .dyn_trait => |bounds| concreteDeclaredBounds(bounds),
         .unsupported => false,
     };
+}
+
+fn concreteDeclaredBounds(bounds: []const types.Bound) bool {
+    for (bounds) |bound| {
+        for (bound.args) |arg| {
+            if (!isConcreteDeclaredReturnType(arg)) return false;
+        }
+        for (bound.associated_types) |binding| {
+            if (!isConcreteDeclaredReturnType(binding.ty)) return false;
+        }
+    }
+    return true;
 }
 
 fn appendDeclaredCallReturnType(
@@ -3090,21 +4867,42 @@ fn appendGenericCall(
         .args = args,
     } });
     if (generic_args.len > 0) {
-        const owned_args = try e.ctx.alloc.dupe(types.Type, generic_args);
-        errdefer e.ctx.alloc.free(owned_args);
-        const type_id = try appendType(e, .{ .generic_inst = .{
-            .decl = switch (call_kind) {
-                .free => |def| def,
-                .associated => |def| def,
-                .constructor => |def| def,
-            },
-            .args = .{ .params = owned_args },
-        } });
-        e.ctx.exprs.items[id].ty = type_id;
+        const generic_decl: spine.EntityId = switch (call_kind) {
+            .free => |def| def,
+            .associated => |def| def,
+            .constructor => |def| def,
+        };
+        const generic_type: types.Type = .{ .generic_inst = .{
+            .decl = generic_decl,
+            .args = .{ .params = generic_args },
+        } };
+        if (isConcreteDeclaredReturnType(generic_type)) {
+            const owned_args = try e.ctx.alloc.dupe(types.Type, generic_args);
+            errdefer e.ctx.alloc.free(owned_args);
+            const type_id = (try appendType(e, .{ .generic_inst = .{
+                .decl = generic_decl,
+                .args = .{ .params = owned_args },
+            } })) orelse unreachable;
+            e.ctx.exprs.items[id].ty = type_id;
+        }
     } else {
         try appendDeclaredCallReturnType(e, call_kind, id);
     }
     return id;
+}
+
+fn isReferenceExpr(e: *const Ext, node_id: exprs.NodeId) bool {
+    if (node_id >= e.ctx.exprs.items.len) return false;
+    const expr = e.ctx.exprs.items[node_id];
+    if (expr.ty) |type_id| {
+        if (type_id < e.ctx.types.items.len) {
+            return e.ctx.types.items[type_id] == .reference;
+        }
+    }
+    return switch (expr.kind) {
+        .path => |p| if (localType(e, p.def)) |ty| ty == .reference else false,
+        else => false,
+    };
 }
 
 fn lowerMethodCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
@@ -3113,12 +4911,14 @@ fn lowerMethodCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const arguments = node.childByFieldName("arguments") orelse return error.MalformedCst;
     const method_name = text(e, method);
     if (method_name.len == 0) return error.MalformedCst;
-
     if (std.mem.eql(u8, method_name, "wrapping_mul") or
         std.mem.eql(u8, method_name, "wrapping_add") or
         std.mem.eql(u8, method_name, "wrapping_sub"))
     {
-        const lhs = try lowerExpr(e, receiver);
+        var lhs = try lowerExpr(e, receiver);
+        if (isReferenceExpr(e, lhs)) {
+            lhs = try appendExpr(e, .{ .unary = .{ .op = .deref, .operand = lhs } });
+        }
         const rhs = try lowerExpr(e, firstArg(e, arguments) orelse return error.MalformedCst);
         const op: exprs.BinaryOp = if (std.mem.eql(u8, method_name, "wrapping_mul"))
             .mul
@@ -3134,7 +4934,7 @@ fn lowerMethodCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         } });
     }
 
-    const method_def = try pushLocal(e, method_name);
+    const method_def = try pushMethodRef(e, method_name);
     const args = try lowerArgs(e, arguments);
     return appendExpr(e, .{ .method_call = .{
         .receiver = try lowerExpr(e, receiver),
@@ -3142,6 +4942,490 @@ fn lowerMethodCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         .method = method_def,
         .args = args,
     } });
+}
+
+fn stringCoreFunction(
+    e: *const Ext,
+    path_text: []const u8,
+) !?exprs.CoreFunction {
+    const path = if (std.mem.startsWith(u8, path_text, "::")) path_text[2..] else path_text;
+    const first_end = std.mem.indexOf(u8, path, "::") orelse path.len;
+    const first_name = path[0..first_end];
+    if (resolveName(e, first_name)) |def| {
+        const entity = e.ctx.g.symbol_table.get(def) orelse return null;
+        if (entity.kind != .use_) {
+            const module = moduleByEntity(e, def) orelse return null;
+            if (!module.is_extern) return null;
+        }
+    }
+    const external = (try externalNominalForPath(e, path_text)) orelse return null;
+    defer {
+        for (external.path) |segment| e.ctx.alloc.free(segment);
+        e.ctx.alloc.free(external.path);
+    }
+    if (external.path.len != 4 or
+        (!std.mem.eql(u8, external.path[0], "alloc") and
+            !std.mem.eql(u8, external.path[0], "std")) or
+        !std.mem.eql(u8, external.path[1], "string") or
+        !std.mem.eql(u8, external.path[2], "String"))
+    {
+        return null;
+    }
+    if (std.mem.eql(u8, external.path[3], "from_utf8")) return .string_from_utf8;
+    if (std.mem.eql(u8, external.path[3], "from_utf8_lossy")) return .string_from_utf8_lossy;
+    if (std.mem.eql(u8, external.path[3], "from_utf8_unchecked")) {
+        return .string_from_utf8_unchecked;
+    }
+    return null;
+}
+
+fn coreFunction(e: *const Ext, path_text: []const u8) !?exprs.CoreFunction {
+    if (try stringCoreFunction(e, path_text)) |function| return function;
+    const path = if (std.mem.startsWith(u8, path_text, "::")) path_text[2..] else path_text;
+    var source_parts: [3][]const u8 = undefined;
+    var source_count: usize = 0;
+    var parts = std.mem.splitSequence(u8, path, "::");
+    while (parts.next()) |part| {
+        if (part.len == 0 or source_count == source_parts.len) return null;
+        source_parts[source_count] = part;
+        source_count += 1;
+    }
+    if (source_count == 0) return null;
+    if (resolveName(e, source_parts[0])) |def| {
+        const entity = e.ctx.g.symbol_table.get(def) orelse return null;
+        if (entity.kind != .use_) {
+            const module = moduleByEntity(e, def) orelse return null;
+            if (!module.is_extern) return null;
+        }
+    }
+    var canonical: [3][]const u8 = undefined;
+    if (try externalUsePath(e, source_parts[0])) |prefix| {
+        if (prefix.len + source_count - 1 != canonical.len) return null;
+        @memcpy(canonical[0..prefix.len], prefix);
+        @memcpy(canonical[prefix.len..], source_parts[1..source_count]);
+    } else {
+        if (source_count != canonical.len) return null;
+        canonical = source_parts;
+    }
+    if (!std.mem.eql(u8, canonical[0], "core") and
+        !std.mem.eql(u8, canonical[0], "std")) return null;
+    const entries = [_]struct { namespace: []const u8, name: []const u8, function: exprs.CoreFunction }{
+        .{ .namespace = "mem", .name = "size_of", .function = .mem_size_of },
+        .{ .namespace = "mem", .name = "transmute", .function = .mem_transmute },
+        .{ .namespace = "mem", .name = "size_of_val", .function = .mem_size_of_val },
+        .{ .namespace = "ptr", .name = "copy_nonoverlapping", .function = .ptr_copy_nonoverlapping },
+        .{ .namespace = "ptr", .name = "write_bytes", .function = .ptr_write_bytes },
+        .{ .namespace = "ptr", .name = "read_unaligned", .function = .ptr_read_unaligned },
+        .{ .namespace = "slice", .name = "from_raw_parts", .function = .slice_from_raw_parts },
+        .{ .namespace = "slice", .name = "from_raw_parts_mut", .function = .slice_from_raw_parts_mut },
+        .{ .namespace = "str", .name = "from_utf8", .function = .str_from_utf8 },
+        .{ .namespace = "str", .name = "from_utf8_unchecked", .function = .str_from_utf8_unchecked },
+        .{ .namespace = "cmp", .name = "min", .function = .cmp_min },
+        .{ .namespace = "cmp", .name = "max", .function = .cmp_max },
+    };
+    for (entries) |entry| {
+        if (std.mem.eql(u8, canonical[1], entry.namespace) and
+            std.mem.eql(u8, canonical[2], entry.name)) return entry.function;
+    }
+    return null;
+}
+
+fn bodyView(e: *const Ext) bodies.Bodies {
+    return .{
+        .exprs = e.ctx.exprs.items,
+        .stmts = e.ctx.stmts.items,
+        .pats = e.ctx.pats.items,
+        .types = e.ctx.types.items,
+        .bodies = e.ctx.bodies_list.items,
+    };
+}
+
+fn genericBodyParams(view: *const bodies.Bodies, entity_id: spine.EntityId) ?types.Generics {
+    if (entity_id >= view.bodies.len) return null;
+    return switch (view.bodies[entity_id]) {
+        .fn_ => |function| function.generics,
+        .impl_ => |implementation| implementation.generics,
+        else => null,
+    };
+}
+
+fn boundTraitEntity(e: *const Ext, bound: types.Bound) ?spine.EntityId {
+    if (bound.path.segments.len == 0) return null;
+    const terminal = bound.path.segments[bound.path.segments.len - 1];
+    if (terminal.id) |id| {
+        if (e.ctx.g.symbol_table.get(id)) |entity| {
+            if (entity.kind == .trait_) return id;
+        }
+    }
+    const candidate = resolveName(e, terminal.name) orelse return null;
+    if (e.ctx.g.symbol_table.get(candidate)) |entity| {
+        if (entity.kind == .trait_) return candidate;
+    }
+    return null;
+}
+
+fn externalPathMatchesStandard(actual: []const []const u8, wanted: []const []const u8) bool {
+    if (actual.len != wanted.len) return false;
+    for (actual, wanted, 0..) |actual_part, wanted_part, index| {
+        if (index == 0 and std.mem.eql(u8, wanted_part, "core") and
+            std.mem.eql(u8, actual_part, "std"))
+        {
+            continue;
+        }
+        if (!std.mem.eql(u8, actual_part, wanted_part)) return false;
+    }
+    return true;
+}
+
+fn textNamesStandardTrait(
+    e: *const Ext,
+    raw_text: []const u8,
+    wanted: []const []const u8,
+) anyerror!bool {
+    if (wanted.len == 0) return false;
+    var raw = std.mem.trim(u8, raw_text, " \t\r\n");
+    if (std.mem.startsWith(u8, raw, "::")) raw = raw[2..];
+    if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| {
+        raw = std.mem.trim(u8, raw[0..generic_start], " \t\r\n");
+    }
+    const wanted_name = wanted[wanted.len - 1];
+    if (std.mem.indexOf(u8, raw, "::") != null) {
+        var parts: [4][]const u8 = undefined;
+        var count: usize = 0;
+        var iterator = std.mem.splitSequence(u8, raw, "::");
+        while (iterator.next()) |part| {
+            if (part.len == 0 or count == parts.len) return false;
+            parts[count] = part;
+            count += 1;
+        }
+        return externalPathMatchesStandard(parts[0..count], wanted);
+    }
+    if (!std.mem.eql(u8, raw, wanted_name)) return false;
+    if (try externalUsePath(e, raw)) |external| {
+        return externalPathMatchesStandard(external, wanted);
+    }
+    // An unqualified standard prelude trait is valid only when no lexical
+    // declaration shadows it.
+    return resolveName(e, raw) == null;
+}
+
+fn traitHasStandardSupertrait(
+    e: *const Ext,
+    trait_id: spine.EntityId,
+    wanted: []const []const u8,
+    depth: usize,
+) anyerror!bool {
+    if (depth >= e.ctx.g.symbol_table.entities.items.len or
+        trait_id >= e.ctx.bodies_list.items.len)
+    {
+        return false;
+    }
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.supertraits) |supertrait| {
+        if (try textNamesStandardTrait(e, supertrait, wanted)) return true;
+        var raw = std.mem.trim(u8, supertrait, " \t\r\n");
+        if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| raw = raw[0..generic_start];
+        const name = if (std.mem.lastIndexOf(u8, raw, "::")) |sep|
+            raw[sep + 2 ..]
+        else
+            raw;
+        const super_id = resolveName(e, name) orelse continue;
+        if (try traitHasStandardSupertrait(e, super_id, wanted, depth + 1)) return true;
+    }
+    return false;
+}
+
+fn genericHasStandardTraitBound(
+    e: *const Ext,
+    receiver: types.Type,
+    trait_path: []const []const u8,
+) anyerror!bool {
+    const view = bodyView(e);
+    if (bodies.genericBound(e.ctx.g, &view, e.fn_id, receiver, trait_path) != null) return true;
+    const receiver_name = switch (receiver) {
+        .path => |path| if (path.segments.len == 1) path.segments[0].name else return false,
+        else => return false,
+    };
+    var current: ?spine.EntityId = e.fn_id;
+    var remaining = e.ctx.g.symbol_table.entities.items.len;
+    while (current) |entity_id| {
+        if (remaining == 0) return false;
+        remaining -= 1;
+        if (genericBodyParams(&view, entity_id)) |generics| {
+            for (generics.params) |param| {
+                if (param != .type_ or !std.mem.eql(u8, param.type_.name, receiver_name)) continue;
+                for (param.type_.bounds) |bound| {
+                    if (bound.optional) continue;
+                    if (boundTraitEntity(e, bound)) |trait_id| {
+                        if (try traitHasStandardSupertrait(e, trait_id, trait_path, 0)) return true;
+                    }
+                }
+            }
+            for (generics.where_clauses) |clause| {
+                if (clause.self_ty.segments.len != 1 or
+                    !std.mem.eql(u8, clause.self_ty.segments[0].name, receiver_name))
+                {
+                    continue;
+                }
+                for (clause.bounds) |bound| {
+                    if (bound.optional) continue;
+                    if (boundTraitEntity(e, bound)) |trait_id| {
+                        if (try traitHasStandardSupertrait(e, trait_id, trait_path, 0)) return true;
+                    }
+                }
+            }
+        }
+        const entity = e.ctx.g.symbol_table.get(entity_id) orelse return false;
+        current = entity.parent;
+    }
+    return false;
+}
+
+fn activeGenericReceiver(e: *const Ext, name: []const u8) anyerror!?types.Type {
+    if (!activeTypeParameter(e, name)) return null;
+    const segments = try e.ctx.alloc.alloc(types.PathSegment, 1);
+    segments[0] = .{ .name = try e.ctx.alloc.dupe(u8, name), .id = null };
+    return .{ .path = .{ .segments = segments } };
+}
+
+fn traitDeclaresAssociatedConst(
+    e: *const Ext,
+    trait_id: spine.EntityId,
+    name: []const u8,
+) bool {
+    if (trait_id >= e.ctx.bodies_list.items.len) return false;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.assoc_consts) |assoc| {
+        if (std.mem.eql(u8, assoc.name, name)) return true;
+    }
+    return false;
+}
+
+fn declaringAssociatedConstTrait(
+    e: *const Ext,
+    trait_id: spine.EntityId,
+    name: []const u8,
+    depth: usize,
+) ?spine.EntityId {
+    if (depth >= e.ctx.g.symbol_table.entities.items.len) return null;
+    if (traitDeclaresAssociatedConst(e, trait_id, name)) return trait_id;
+    if (trait_id >= e.ctx.bodies_list.items.len) return null;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return null,
+    };
+    var found: ?spine.EntityId = null;
+    for (trait_body.supertraits) |supertrait| {
+        var raw = std.mem.trim(u8, supertrait, " \t\r\n");
+        if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| raw = raw[0..generic_start];
+        const super_name = if (std.mem.lastIndexOf(u8, raw, "::")) |separator|
+            raw[separator + 2 ..]
+        else
+            raw;
+        const super_id = resolveName(e, super_name) orelse continue;
+        const candidate = declaringAssociatedConstTrait(e, super_id, name, depth + 1) orelse continue;
+        if (found) |existing| {
+            if (existing != candidate) return null;
+        } else {
+            found = candidate;
+        }
+    }
+    return found;
+}
+
+fn mergeAssociatedConstTrait(
+    destination: *?spine.EntityId,
+    candidate: spine.EntityId,
+) bool {
+    if (destination.*) |existing| return existing == candidate;
+    destination.* = candidate;
+    return true;
+}
+
+fn boundAssociatedConstTrait(
+    e: *const Ext,
+    receiver_name: []const u8,
+    assoc_name: []const u8,
+) ?spine.EntityId {
+    const view = bodyView(e);
+    var found: ?spine.EntityId = null;
+    var current: ?spine.EntityId = e.fn_id;
+    var remaining = e.ctx.g.symbol_table.entities.items.len;
+    while (current) |entity_id| {
+        if (remaining == 0) return null;
+        remaining -= 1;
+        if (genericBodyParams(&view, entity_id)) |generics| {
+            for (generics.params) |param| {
+                if (param != .type_ or !std.mem.eql(u8, param.type_.name, receiver_name)) continue;
+                for (param.type_.bounds) |bound| {
+                    if (bound.optional) continue;
+                    const trait_id = boundTraitEntity(e, bound) orelse continue;
+                    const declaring = declaringAssociatedConstTrait(e, trait_id, assoc_name, 0) orelse continue;
+                    if (!mergeAssociatedConstTrait(&found, declaring)) return null;
+                }
+            }
+            for (generics.where_clauses) |clause| {
+                if (clause.self_ty.segments.len != 1 or
+                    !std.mem.eql(u8, clause.self_ty.segments[0].name, receiver_name))
+                {
+                    continue;
+                }
+                for (clause.bounds) |bound| {
+                    if (bound.optional) continue;
+                    const trait_id = boundTraitEntity(e, bound) orelse continue;
+                    const declaring = declaringAssociatedConstTrait(e, trait_id, assoc_name, 0) orelse continue;
+                    if (!mergeAssociatedConstTrait(&found, declaring)) return null;
+                }
+            }
+        }
+        const entity = e.ctx.g.symbol_table.get(entity_id) orelse return null;
+        current = entity.parent;
+    }
+    return found;
+}
+
+fn ensureTraitAssociatedConstEntity(
+    e: *Ext,
+    trait_id: spine.EntityId,
+    name: []const u8,
+) anyerror!?spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |entity| {
+        if (entity.kind == .const_ and entity.parent == trait_id and
+            std.mem.eql(u8, entity.name, name))
+        {
+            return entity.id;
+        }
+    }
+    if (!traitDeclaresAssociatedConst(e, trait_id, name)) return null;
+    const id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .const_,
+        .name = try e.ctx.alloc.dupe(u8, name),
+        .span = span_of,
+        .visibility = .public,
+        .parent = trait_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    return id;
+}
+
+fn lowerQualifiedAssociatedConstPath(
+    e: *Ext,
+    node: ts.Node,
+) anyerror!?exprs.NodeId {
+    const qualified = qualifiedAssociatedPath(e, node) orelse return null;
+    const receiver = mapCstType(e, qualified.receiver) catch return null;
+    const receiver_path = switch (receiver) {
+        .path => |path| path,
+        else => return null,
+    };
+    if (receiver_path.segments.len != 1) return null;
+    const trait_id = resolvePatternPath(e, qualified.trait) orelse return null;
+    const trait_entity = e.ctx.g.symbol_table.get(trait_id) orelse return null;
+    if (trait_entity.kind != .trait_) return null;
+    const declaring_trait = declaringAssociatedConstTrait(e, trait_id, qualified.name, 0) orelse
+        return null;
+    const const_id = (try ensureTraitAssociatedConstEntity(
+        e,
+        declaring_trait,
+        qualified.name,
+    )) orelse return null;
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 1);
+    generic_args[0] = receiver;
+    const result = try appendExpr(e, .{ .path = .{
+        .def = const_id,
+        .generic_args = generic_args,
+    } });
+    return result;
+}
+
+fn lowerBoundAssociatedConstPath(
+    e: *Ext,
+    raw_path: []const u8,
+) anyerror!?exprs.NodeId {
+    const separator = std.mem.indexOf(u8, raw_path, "::") orelse return null;
+    if (std.mem.lastIndexOf(u8, raw_path, "::").? != separator) return null;
+    const receiver_name = std.mem.trim(u8, raw_path[0..separator], " \t\r\n");
+    const assoc_name = std.mem.trim(u8, raw_path[separator + 2 ..], " \t\r\n");
+    const receiver = (try activeGenericReceiver(e, receiver_name)) orelse return null;
+    const trait_id = boundAssociatedConstTrait(e, receiver_name, assoc_name) orelse return null;
+    const const_id = (try ensureTraitAssociatedConstEntity(e, trait_id, assoc_name)) orelse return null;
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 1);
+    generic_args[0] = receiver;
+    const result = try appendExpr(e, .{ .path = .{
+        .def = const_id,
+        .generic_args = generic_args,
+    } });
+    return result;
+}
+
+fn lowerBoundCoreAssociatedCall(
+    e: *Ext,
+    raw_path: []const u8,
+    args: []const exprs.NodeId,
+    explicit_generic_args: []const types.Type,
+) anyerror!?exprs.NodeId {
+    if (explicit_generic_args.len != 0) return null;
+    const separator = std.mem.indexOf(u8, raw_path, "::") orelse return null;
+    const receiver_name = std.mem.trim(u8, raw_path[0..separator], " \t\r\n");
+    const method_name = std.mem.trim(u8, raw_path[separator + 2 ..], " \t\r\n");
+    if (receiver_name.len == 0 or method_name.len == 0) return null;
+
+    var receiver = try activeGenericReceiver(e, receiver_name);
+    if (receiver == null) {
+        if (std.mem.eql(u8, method_name, "from") and
+            std.mem.eql(u8, receiver_name, "String") and
+            resolveName(e, receiver_name) == null)
+        {
+            receiver = .{ .external_nominal = (try externalNominalForPath(e, "alloc::string::String")) orelse return null };
+        } else {
+            if (!std.mem.eql(u8, method_name, "default")) return null;
+            const primitive = mapPrim(receiver_name) orelse return null;
+            receiver = .{ .prim = primitive };
+        }
+    }
+    const function: exprs.CoreFunction = if (std.mem.eql(u8, method_name, "default")) blk: {
+        if (args.len != 0) return null;
+        if (!(try genericHasStandardTraitBound(e, receiver.?, &.{ "core", "default", "Default" })) and
+            receiver.? != .prim)
+        {
+            return null;
+        }
+        break :blk .default_value;
+    } else if (std.mem.eql(u8, method_name, "from")) blk: {
+        if (args.len != 1) return null;
+        const is_string_receiver = switch (receiver.?) {
+            .external_nominal => |external| external.path.len == 3 and
+                std.mem.eql(u8, external.path[0], "alloc") and
+                std.mem.eql(u8, external.path[1], "string") and
+                std.mem.eql(u8, external.path[2], "String"),
+            else => false,
+        };
+        if (!is_string_receiver and
+            !(try genericHasStandardTraitBound(e, receiver.?, &.{ "core", "convert", "From" })))
+        {
+            return null;
+        }
+        break :blk .convert_from;
+    } else return null;
+
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 1);
+    generic_args[0] = receiver.?;
+    const result = try appendExpr(e, .{ .core_call = .{
+        .function = function,
+        .generic_args = generic_args,
+        .args = args,
+    } });
+    return result;
 }
 
 fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
@@ -3179,11 +5463,18 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         const method = callee_base.namedChild(1) orelse return error.MalformedCst;
         const mname = text(e, method);
         if (mname.len == 0) return error.MalformedCst;
-        if (std.mem.eql(u8, mname, "collect") and isStandardIteratorChain(e, recv)) {
-            return lowerIteratorCollection(e, recv, call_args);
+        if ((std.mem.eql(u8, mname, "sum") or std.mem.eql(u8, mname, "collect")) and
+            isStandardIteratorChain(e, recv))
+        {
+            if (!iteratorArgumentsEmpty(call_args)) return unsupported(e, "iterator terminal arguments");
+            const terminal: exprs.IteratorTerminal = if (std.mem.eql(u8, mname, "sum"))
+                .sum
+            else
+                .collect_vec;
+            return lowerIteratorExpression(e, recv, terminal);
         }
         if (std.mem.eql(u8, mname, "flat_map") and isStandardIteratorChain(e, recv)) {
-            return unsupported(e, "iterator adapter");
+            return lowerIteratorExpression(e, node, .iterator);
         }
 
         // Rust `x.wrapping_mul(y)` → Zig `x *% y` (wrapping binary).
@@ -3191,7 +5482,10 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             std.mem.eql(u8, mname, "wrapping_add") or
             std.mem.eql(u8, mname, "wrapping_sub"))
         {
-            const lhs = try lowerExpr(e, recv);
+            var lhs = try lowerExpr(e, recv);
+            if (isReferenceExpr(e, lhs)) {
+                lhs = try appendExpr(e, .{ .unary = .{ .op = .deref, .operand = lhs } });
+            }
             const rhs = try lowerExpr(e, firstArg(e, call_args) orelse return error.MalformedCst);
             const op: exprs.BinaryOp = if (std.mem.eql(u8, mname, "wrapping_mul"))
                 .mul
@@ -3206,7 +5500,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 .rhs = rhs,
             } });
         }
-        const method_def = try pushLocal(e, mname);
+        const method_def = try pushMethodRef(e, mname);
         const args = try lowerArgs(e, call_args);
         return appendExpr(e, .{ .method_call = .{
             .receiver = try lowerExpr(e, recv),
@@ -3226,25 +5520,59 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
     }
     const args = try arg_list.toOwnedSlice(e.ctx.alloc);
+    if (std.mem.eql(u8, callee_base.kind(), "scoped_identifier") or
+        std.mem.eql(u8, callee_base.kind(), "scoped_type_identifier"))
+    {
+        if (try lowerBoundCoreAssociatedCall(e, text(e, callee_base), args, generic_args)) |core_call| {
+            return core_call;
+        }
+    }
+    if (try coreFunction(e, text(e, callee_base))) |function| {
+        return appendExpr(e, .{ .core_call = .{
+            .function = function,
+            .generic_args = try e.ctx.alloc.dupe(types.Type, generic_args),
+            .args = args,
+        } });
+    }
 
-    if (std.mem.eql(u8, callee_base.kind(), "scoped_identifier")) {
+    if (std.mem.eql(u8, callee_base.kind(), "scoped_identifier") or
+        std.mem.eql(u8, callee_base.kind(), "scoped_type_identifier"))
+    {
         // Struct::method(...) / Enum::Variant(...) / Self::method(...) /
         // Type::constructor(...). Split the scoped path at "::".
         const t = text(e, callee_base);
-        if (unsignedPrimitiveFromTarget(t)) |target_primitive| {
+        if (primitiveTryFromTarget(t)) |target_primitive| {
+            if (generic_args.len != 0) {
+                e.ctx.alloc.free(args);
+                return unsupported(e, "primitive try_from call");
+            }
+            return appendPrimitiveTryFrom(e, target_primitive, args);
+        }
+        if (primitiveFromTarget(t)) |target_primitive| {
             if (generic_args.len != 0) {
                 e.ctx.alloc.free(args);
                 return unsupported(e, "primitive from call");
             }
             return appendPrimitiveFrom(e, target_primitive, args);
         }
+        if (try traitMethodForPath(e, callee_base)) |method| {
+            return appendGenericCall(e, .{ .associated = method }, args, generic_args);
+        }
         // Resolve the complete path before interpreting the first segment as
         // a type name. A path-qualified function is free, but a type-qualified
         // function must continue through the associated lookup below. This
         // distinction matters when a resolver can see a method through an
         // alias or re-export.
-        if (resolveScopedPath(e, callee_base)) |path_def| {
+        if (resolvePatternPath(e, callee_base)) |path_def| {
             if (e.ctx.g.symbol_table.get(path_def)) |path_ent| {
+                if (path_ent.kind == .variant) {
+                    return appendExpr(e, .{ .enum_variant = .{
+                        .def = path_ent.parent orelse return error.MalformedCst,
+                        .variant = try e.ctx.alloc.dupe(u8, path_ent.name),
+                        .tuple_fields = args,
+                        .named_fields = &.{},
+                    } });
+                }
                 if (path_ent.kind == .fn_) {
                     const sep = std.mem.indexOf(u8, t, "::");
                     const base_name = if (sep) |idx| t[0..idx] else "";
@@ -3269,6 +5597,14 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 }
             }
         }
+        if (try ensureStandardPreludePath(e, t)) |standard| {
+            return appendExpr(e, .{ .enum_variant = .{
+                .def = standard.enum_id,
+                .variant = try e.ctx.alloc.dupe(u8, standard.variant_name),
+                .tuple_fields = args,
+                .named_fields = &.{},
+            } });
+        }
         const sep = std.mem.indexOf(u8, t, "::") orelse return unsupported(e, "unresolved call");
         const base_name = t[0..sep];
         const leaf = t[sep + 2 ..];
@@ -3280,7 +5616,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (std.mem.eql(u8, base_name, "Self")) {
             base_def = e.self_ty;
         } else {
-            base_def = resolveName(e, base_name);
+            base_def = resolveNominalName(e, base_name);
         }
 
         if (base_def) |bid| {
@@ -3291,7 +5627,10 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                         return unsupported(e, "unresolved associated call");
                 }
                 if (e.ctx.g.symbol_table.get(type_id)) |type_ent| {
-                    if (type_ent.kind == .enum_ and resolveVariant(e, type_id, leaf) != null) {
+                    if (type_ent.kind == .enum_ and
+                        (resolveVariant(e, type_id, leaf) != null or
+                            enumBodyHasVariant(e, type_id, leaf)))
+                    {
                         // Enum variant constructor: Shape::Circle(r)
                         return appendExpr(e, .{ .enum_variant = .{
                             .def = type_id,
@@ -3319,6 +5658,21 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 }
             }
         }
+        if (std.mem.lastIndexOf(u8, t, "::")) |last_sep| {
+            const owner_text = t[0..last_sep];
+            const variant_name = t[last_sep + 2 ..];
+            if (variant_name.len > 0) {
+                if (try externalCowVariantForPath(e, owner_text, variant_name)) |owner| {
+                    return appendExpr(e, .{ .external_variant = .{
+                        .owner = owner,
+                        .variant = try e.ctx.alloc.dupe(u8, variant_name),
+                        .tuple_fields = args,
+                        .named_fields = &.{},
+                    } });
+                }
+            }
+        }
+
         return unsupported(e, "unresolved call");
     }
 
@@ -3334,7 +5688,14 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             }
             return appendGenericCall(e, .{ .free = def }, args, generic_args);
         }
-        std.debug.print("unresolved call text={s}\n", .{text(e, node)});
+        if (try ensureStandardPreludeVariant(e, name)) |standard| {
+            return appendExpr(e, .{ .enum_variant = .{
+                .def = standard.enum_id,
+                .variant = try e.ctx.alloc.dupe(u8, standard.variant_name),
+                .tuple_fields = args,
+                .named_fields = &.{},
+            } });
+        }
         return unsupported(e, "unresolved call");
     }
 
@@ -3349,45 +5710,44 @@ fn firstArg(e: *Ext, args_node: ?ts.Node) ?ts.Node {
     return null;
 }
 
-/// Result of lowering a `let_condition`: the pattern id and the scrutinee
-/// expression node (lowered later with the rest of the condition).
-const WhileLetPat = struct {
-    pattern: exprs.NodeId,
-    value: ?ts.Node,
+/// A source `let_condition` split without lowering either side. The scrutinee
+/// must be lowered before the pattern so a binding cannot shadow a name used
+/// by that scrutinee.
+const LetCondition = struct {
+    pattern: ts.Node,
+    value: ts.Node,
 };
 
-/// Lower a `let_condition` (`while let <pat> = <expr>`).
-///
-/// The `let_condition` node has a pattern as its first named child followed by
-/// the scrutinee expression (the `value` field).
-fn lowerWhileLet(e: *Ext, node: ts.Node) anyerror!WhileLetPat {
-    const pat_node = node.namedChild(0) orelse return error.MalformedCst;
-    var val_node: ?ts.Node = null;
-    var i: u32 = 1;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        if (isComment(c) or std.mem.eql(u8, c.kind(), "=")) continue;
-        if (val_node == null) val_node = c;
-    }
-    const pat_id = try lowerPattern(e, pat_node);
-    // Register the pattern's bindings as locals so the loop body can resolve
-    // them (e.g. `byte` in `while let Some(byte) = ...`).
-    try registerPatternLocals(e, pat_node);
-    const value = val_node orelse return error.MalformedCst;
-    return .{ .pattern = pat_id, .value = value };
-}
-
-/// Register every binding identifier in a tree-sitter pattern as a local
-/// (mirrors how `let` / `for` register their pattern bindings).
-fn registerPatternLocals(e: *Ext, node: ts.Node) anyerror!void {
-    if (std.mem.eql(u8, node.kind(), "identifier")) {
-        const nm = text(e, node);
-        if (!std.mem.eql(u8, nm, "_")) _ = try pushLocal(e, nm);
-        return;
+fn findLetCondition(node: ts.Node) ?ts.Node {
+    if (std.mem.eql(u8, node.kind(), "let_condition")) return node;
+    if (!std.mem.eql(u8, node.kind(), "condition") and
+        !std.mem.eql(u8, node.kind(), "let_chain") and
+        !std.mem.eql(u8, node.kind(), "_let_chain"))
+    {
+        return null;
     }
     var i: u32 = 0;
-    while (node.namedChild(i)) |c| : (i += 1) {
-        try registerPatternLocals(e, c);
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (findLetCondition(child)) |let_node| return let_node;
     }
+    return null;
+}
+
+fn splitLetCondition(e: *const Ext, node: ts.Node) anyerror!?LetCondition {
+    const let_node = findLetCondition(node) orelse return null;
+    const pattern = let_node.childByFieldName("pattern") orelse
+        let_node.namedChild(0) orelse return error.MalformedCst;
+    var value: ?ts.Node = let_node.childByFieldName("value");
+    var i: u32 = 0;
+    while (let_node.namedChild(i)) |child| : (i += 1) {
+        if (child.id == pattern.id or isComment(child)) continue;
+        if (std.mem.eql(u8, text(e, child), "=")) continue;
+        if (value == null) value = child;
+    }
+    return .{
+        .pattern = pattern,
+        .value = value orelse return error.MalformedCst,
+    };
 }
 
 fn lowerArgs(e: *Ext, args_node: ?ts.Node) anyerror![]const exprs.NodeId {
@@ -3402,11 +5762,26 @@ fn lowerArgs(e: *Ext, args_node: ?ts.Node) anyerror![]const exprs.NodeId {
     return out.toOwnedSlice(e.ctx.alloc);
 }
 
+fn lowerElseBranch(e: *Ext, else_node: ?ts.Node) anyerror!exprs.ElseBranch {
+    var else_branch: exprs.ElseBranch = .{ .none = {} };
+    if (else_node) |en| {
+        const enk = en.kind();
+        if (std.mem.eql(u8, enk, "block")) {
+            else_branch = .{ .block = try lowerBlock(e, en) };
+        } else if (std.mem.eql(u8, enk, "if_expression")) {
+            else_branch = .{ .chain = try lowerIf(e, en) };
+        } else {
+            return error.MalformedCst;
+        }
+    }
+    return else_branch;
+}
+
 fn lowerIf(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
-    const cond_node = node.childByFieldName("condition");
-    const then_node = node.childByFieldName("consequence");
-    const cond_id = try lowerExpr(e, cond_node orelse return error.MalformedCst);
-    const then_blk = try lowerBlock(e, then_node orelse return error.MalformedCst);
+    const outer_local_count = e.locals.items.len;
+    defer e.locals.items.len = outer_local_count;
+    const cond_node = node.childByFieldName("condition") orelse return error.MalformedCst;
+    const then_node = node.childByFieldName("consequence") orelse return error.MalformedCst;
 
     var else_node = node.childByFieldName("alternative");
     if (else_node) |en| {
@@ -3414,21 +5789,35 @@ fn lowerIf(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             else_node = en.namedChild(0) orelse return error.MalformedCst;
         }
     }
-    var else_branch: exprs.ElseBranch = .{ .none = {} };
-    if (else_node) |en| {
-        // else may be an inline block or an `else if`.
-        const enk = en.kind();
-        if (std.mem.eql(u8, enk, "block")) {
-            const block = try lowerBlock(e, en);
-            else_branch = .{ .block = block };
-        } else if (std.mem.eql(u8, enk, "if_expression")) {
-            const chain = try lowerIf(e, en);
-            else_branch = .{ .chain = chain };
-        } else {
-            return error.MalformedCst;
+
+    if (try splitLetCondition(e, cond_node)) |let_cond| {
+        // The pattern bindings are visible only in the then branch. Lower the
+        // scrutinee while the outer scope is still active.
+        const scrutinee = try lowerExpr(e, let_cond.value);
+        const pattern = try lowerPattern(e, let_cond.pattern);
+        if (knownPatternPayloadType(e, scrutinee)) |payload| {
+            setPatternLocalTypes(e, pattern, payload);
         }
+        const then_blk = try lowerBlock(e, then_node);
+        e.locals.items.len = outer_local_count;
+        const else_branch = try lowerElseBranch(e, else_node);
+        return appendExpr(e, .{ .if_let = .{
+            .pattern = pattern,
+            .scrutinee = scrutinee,
+            .then_ = then_blk,
+            .@"else" = else_branch,
+        } });
     }
-    return appendExpr(e, .{ .if_else = .{ .cond = cond_id, .then_ = then_blk, .@"else" = else_branch } });
+
+    const cond_id = try lowerExpr(e, cond_node);
+    const then_blk = try lowerBlock(e, then_node);
+    e.locals.items.len = outer_local_count;
+    const else_branch = try lowerElseBranch(e, else_node);
+    return appendExpr(e, .{ .if_else = .{
+        .cond = cond_id,
+        .then_ = then_blk,
+        .@"else" = else_branch,
+    } });
 }
 
 fn opOf(e: *const Ext, node: ts.Node) []const u8 {
@@ -3481,7 +5870,6 @@ fn mapAssignOp(op: []const u8) ?exprs.AssignOp {
 }
 
 fn unsupported(e: *Ext, reason: []const u8) anyerror!exprs.NodeId {
-    std.debug.print("unsupported: {s}\n", .{reason});
     return appendExpr(e, .{ .unsupported = .{ .reason = reason, .suggested_version = .v3 } });
 }
 
@@ -3538,6 +5926,92 @@ fn parseAndLowerSubExpr(e: *Ext, arg_str: []const u8) anyerror!exprs.NodeId {
 
     return lowerExpr(e, expr_node);
 }
+fn lowerPanic(e: *Ext, message: []const u8) anyerror!exprs.NodeId {
+    const id = try appendExpr(e, .{ .panic_ = .{
+        .message = try e.ctx.alloc.dupe(u8, message),
+    } });
+    const never_id = try appendType(e, .{ .prim = .never });
+    e.ctx.exprs.items[id].ty = never_id;
+    return id;
+}
+
+/// Decode the literal format string carried by `write!`/`writeln!`.
+/// Keep the template as bytes because the format IR stores its source text
+/// after Rust escape processing.
+fn decodeFormatLiteral(alloc: std.mem.Allocator, raw: []const u8) anyerror![]const u8 {
+    const literal = std.mem.trim(u8, raw, " \t\r\n");
+    if (literal.len == 0) return error.InvalidFormatLiteral;
+    if (literal[0] == 'b') return error.InvalidFormatLiteral;
+    if (literal[0] == 'r') {
+        const decoded = try decodeRawBytes(alloc, literal, 1);
+        return decoded orelse error.InvalidFormatLiteral;
+    }
+    if (literal[0] != '"' or literal.len < 2 or literal[literal.len - 1] != '"') {
+        return error.InvalidFormatLiteral;
+    }
+    return decodeEscapedBytes(alloc, literal[1 .. literal.len - 1]);
+}
+
+fn isBuiltinFormatMacroName(raw: []const u8, basename: []const u8) bool {
+    var name = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.endsWith(u8, name, "!")) {
+        name = std.mem.trim(u8, name[0 .. name.len - 1], " \t\r\n");
+    }
+    var segments: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.splitSequence(u8, name, "::");
+    while (it.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (count >= segments.len) return false;
+        segments[count] = std.mem.trim(u8, segment, " \t\r\n");
+        count += 1;
+    }
+    if (count == 1) return std.mem.eql(u8, segments[0], basename);
+    return count == 2 and
+        (std.mem.eql(u8, segments[0], "core") or std.mem.eql(u8, segments[0], "std")) and
+        std.mem.eql(u8, segments[1], basename);
+}
+
+fn lowerFormatWrite(
+    e: *Ext,
+    raw_tokens: []const u8,
+    newline: bool,
+) anyerror!exprs.NodeId {
+    const macro_args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
+    defer e.ctx.alloc.free(macro_args);
+    if (macro_args.len < 2) {
+        if (!newline or macro_args.len != 1) {
+            return unsupported(e, "format write requires a writer and format literal");
+        }
+    }
+
+    const writer = try parseAndLowerSubExpr(e, macro_args[0]);
+    var template = if (macro_args.len == 1)
+        try e.ctx.alloc.dupe(u8, "")
+    else
+        decodeFormatLiteral(e.ctx.alloc, macro_args[1]) catch
+            return unsupported(e, "format write requires a string literal");
+    errdefer e.ctx.alloc.free(template);
+
+    if (newline) {
+        const with_newline = try std.fmt.allocPrint(e.ctx.alloc, "{s}\n", .{template});
+        e.ctx.alloc.free(template);
+        template = with_newline;
+    }
+
+    var lowered_args: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer lowered_args.deinit(e.ctx.alloc);
+    if (macro_args.len > 2) {
+        for (macro_args[2..]) |arg| {
+            try lowered_args.append(e.ctx.alloc, try parseAndLowerSubExpr(e, arg));
+        }
+    }
+    return appendExpr(e, .{ .format_write = .{
+        .writer = writer,
+        .template = template,
+        .args = try lowered_args.toOwnedSlice(e.ctx.alloc),
+    } });
+}
 
 fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     var mname_node: ?ts.Node = null;
@@ -3575,17 +6049,23 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
 
     switch (kind) {
-        .panic, .todo, .unimplemented => {
+        .panic => {
             const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
             defer e.ctx.alloc.free(args);
             const msg = try expand.expandPanicMessage(e.ctx.alloc, args);
             defer e.ctx.alloc.free(msg);
-            const prefix = switch (kind) {
-                .panic => "panic",
-                .todo => "todo",
-                .unimplemented => "unimplemented",
-                else => unreachable,
-            };
+            const full_msg = if (msg.len > 0)
+                try std.fmt.allocPrint(e.ctx.alloc, "panic: {s}", .{msg})
+            else
+                try std.fmt.allocPrint(e.ctx.alloc, "panic", .{});
+            return lowerPanic(e, full_msg);
+        },
+        .todo, .unimplemented => {
+            const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
+            defer e.ctx.alloc.free(args);
+            const msg = try expand.expandPanicMessage(e.ctx.alloc, args);
+            defer e.ctx.alloc.free(msg);
+            const prefix = if (kind == .todo) "todo" else "unimplemented";
             const full_msg = if (msg.len > 0)
                 try std.fmt.allocPrint(e.ctx.alloc, "{s}: {s}", .{ prefix, msg })
             else
@@ -3593,7 +6073,7 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             return unsupported(e, full_msg);
         },
         .unreachable_ => {
-            return unsupported(e, "unreachable");
+            return lowerPanic(e, "unreachable");
         },
         .assert_eq, .assert_ne => {
             const args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
@@ -3661,6 +6141,16 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 },
             }
         },
+        .write => {
+            if (!isBuiltinFormatMacroName(mname, "write"))
+                return unsupported(e, "unsupported qualified write macro");
+            return lowerFormatWrite(e, raw_tokens, false);
+        },
+        .writeln => {
+            if (!isBuiltinFormatMacroName(mname, "writeln"))
+                return unsupported(e, "unsupported qualified writeln macro");
+            return lowerFormatWrite(e, raw_tokens, true);
+        },
         .println, .eprintln, .format => {
             return unsupported(e, try std.fmt.allocPrint(e.ctx.alloc, "macro {s}", .{@tagName(kind)}));
         },
@@ -3672,21 +6162,53 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
 // ── top-level entry ──────────────────────────────────────────────────────────
 
-/// Register every local binding introduced by a function parameter node
-/// (`parameter`, `self_parameter`, or a plain `mut`/destructuring pattern) so
-/// the body resolves references to them.
-fn registerParamLocals(e: *Ext, node: ts.Node) anyerror!void {
-    const k = node.kind();
-    if (std.mem.eql(u8, k, "identifier")) {
-        _ = try pushLocal(e, text(e, node));
-    } else if (std.mem.eql(u8, k, "self_parameter")) {
-        _ = try pushLocal(e, "self");
-    } else {
-        var i: u32 = 0;
-        while (node.namedChild(i)) |c| : (i += 1) {
-            try registerParamLocals(e, c);
-        }
+/// Return the pattern node carried by a source parameter.
+fn paramPatternNode(node: ts.Node) ?ts.Node {
+    if (std.mem.eql(u8, node.kind(), "self_parameter")) return null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (isPatternNode(child)) return child;
     }
+    return null;
+}
+
+/// Return a plain immutable parameter identifier. Any mutable or destructured
+/// pattern must use a synthetic outer parameter and a root-body prologue.
+fn plainParamName(e: *const Ext, node: ts.Node) ?[]const u8 {
+    if (std.mem.eql(u8, node.kind(), "identifier")) return text(e, node);
+    if (!std.mem.eql(u8, node.kind(), "pattern") or node.namedChildCount() != 1) return null;
+    return plainParamName(e, node.namedChild(0).?);
+}
+
+/// Register one source parameter and lower a single destructuring prologue.
+fn registerParamLocal(
+    e: *Ext,
+    source_node: ts.Node,
+    param: items.Param,
+    prelude: *std.ArrayListUnmanaged(exprs.NodeId),
+) anyerror!void {
+    if (std.mem.eql(u8, source_node.kind(), "self_parameter")) {
+        const def = try pushLocal(e, "self");
+        setLocalType(e, def, param.ty);
+        return;
+    }
+    const pattern = paramPatternNode(source_node) orelse return error.MalformedCst;
+    const def = try pushLocal(e, param.name);
+    setLocalType(e, def, param.ty);
+    if (plainParamName(e, pattern) != null) return;
+
+    const pattern_id = try lowerPattern(e, pattern);
+    const init_id = try appendExpr(e, .{ .path = .{
+        .def = def,
+        .generic_args = &.{},
+    } });
+    const ty = try appendType(e, param.ty);
+    const stmt_id = try appendStmt(e, .{ .let = .{
+        .pattern = pattern_id,
+        .init = init_id,
+        .ty = ty,
+    } });
+    try prelude.append(e.ctx.alloc, stmt_id);
 }
 
 fn ctxText(ctx: *const Ctx, node: ts.Node) []const u8 {
@@ -3864,16 +6386,43 @@ pub fn extractFunction(
     ex.self_ty = findSelfType(&ex, ent);
     defer ex.deinit();
 
-    // Register params as locals so the body resolves them. Handles
-    // `self`, `mut x: T`, destructured patterns, and plain identifiers.
+    // Register outer parameter locals first. Nontrivial source patterns use
+    // the synthetic names supplied by the CST pass and one root-body prologue.
+    var param_prelude: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer param_prelude.deinit(ctx.alloc);
+    const fn_params: []const items.Param = switch (ctx.bodies_list.items[fn_entity]) {
+        .fn_ => |body| body.params,
+        else => return error.FunctionBodyMissing,
+    };
     if (params_node) |pn| {
         var p: u32 = 0;
+        var param_index: usize = 0;
         while (pn.namedChild(p)) |pnode| : (p += 1) {
-            try registerParamLocals(&ex, pnode);
+            const kind = pnode.kind();
+            if (!std.mem.eql(u8, kind, "parameter") and
+                !std.mem.eql(u8, kind, "self_parameter")) continue;
+            if (param_index >= fn_params.len) return error.MalformedCst;
+            try registerParamLocal(&ex, pnode, fn_params[param_index], &param_prelude);
+            param_index += 1;
         }
+        if (param_index != fn_params.len) return error.MalformedCst;
     }
 
     const body_expr = try lowerExpr(&ex, blk_node);
+    if (param_prelude.items.len > 0) {
+        switch (ctx.exprs.items[body_expr].kind) {
+            .block => |*body| {
+                const old_statements = body.statements;
+                const merged = try ctx.alloc.alloc(exprs.NodeId, param_prelude.items.len + old_statements.len);
+                @memcpy(merged[0..param_prelude.items.len], param_prelude.items);
+                @memcpy(merged[param_prelude.items.len..], old_statements);
+                if (old_statements.len > 0) ctx.alloc.free(old_statements);
+                body.statements = merged;
+            },
+            else => return error.MalformedCst,
+        }
+    }
+
     // Lossless partial lower: keep the full lowered body even when
     // sub-expressions are `.unsupported`; emit renders those as loud
     // runtime `@panic` unsoundness markers (never a silent wrong value).
@@ -4066,7 +6615,7 @@ test "lower built-in macro invocations in fn bodies" {
     defer bodies_list.deinit(alloc);
     try bodies_list.append(alloc, .none);
     try bodies_list.append(alloc, .{ .fn_ = .{
-        .params = &.{},
+        .params = &.{.{ .name = "self", .ty = .{ .prim = .unit }, .span = span }},
         .ret = .{ .prim = .unit },
         .body = 0,
     } });
@@ -4112,6 +6661,8 @@ test "lower built-in macro invocations in fn bodies" {
     var found_ne = false;
     var found_vec_lit = false;
     var found_unsupported = false;
+    var found_panic = false;
+    var found_unreachable = false;
     var found_assert_marker = false;
     var found_debug_assert_ge = false;
     const expected_assign_ops = [_]exprs.AssignOp{
@@ -4145,6 +6696,18 @@ test "lower built-in macro invocations in fn bodies" {
             .vec_lit => |vec_lit| {
                 if (vec_lit.elements.len == 3 and vec_lit.repeat == null) found_vec_lit = true;
             },
+            .panic_ => |panic_value| {
+                const panic_type_id = ex.ty orelse return error.ExpectedPanicType;
+                switch (types_list.items[panic_type_id]) {
+                    .prim => |primitive| try std.testing.expectEqual(types.Prim.never, primitive),
+                    else => return error.ExpectedPanicType,
+                }
+                if (std.mem.eql(u8, panic_value.message, "unreachable")) {
+                    found_unreachable = true;
+                } else {
+                    found_panic = true;
+                }
+            },
             .unsupported => |u| {
                 if (std.mem.startsWith(u8, u.reason, "assertion:")) {
                     found_assert_marker = true;
@@ -4170,7 +6733,9 @@ test "lower built-in macro invocations in fn bodies" {
     try std.testing.expect(found_vec_lit); // vec![1,2,3] → non-repeated three-element Vec literal
     try std.testing.expect(found_assert_marker); // assert!/debug_assert! → assertion: marker
     try std.testing.expect(found_debug_assert_ge); // debug_assert!(x > 0) → .gt binary
-    try std.testing.expect(found_unsupported); // panic!/unreachable!/unresolved → .unsupported
+    try std.testing.expect(found_panic); // panic! -> diverging panic expression
+    try std.testing.expect(found_unreachable); // unreachable! -> diverging panic expression
+    try std.testing.expect(found_unsupported); // unresolved names remain explicit refusal
 }
 
 test "lower literal vec macro forms to vec literals" {
@@ -4433,7 +6998,15 @@ test "lower struct_expression to .struct_lit and match_expression to .match" {
     var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
     defer bodies_list.deinit(alloc);
     try bodies_list.append(alloc, .none);
-    try bodies_list.append(alloc, .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .f64 }, .body = 0 } });
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{.{
+            .name = "shape",
+            .ty = .{ .path = .{ .segments = &.{.{ .name = "Shape", .id = null }} } },
+            .span = span,
+        }},
+        .ret = .{ .prim = .f64 },
+        .body = 0,
+    } });
     try bodies_list.append(alloc, .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .f64 }, .body = 0 } });
     try bodies_list.append(alloc, .{ .struct_ = .{ .generic_params = &.{}, .layout = .named, .fields = &.{} } });
     try bodies_list.append(alloc, .{ .enum_ = .{
@@ -4601,6 +7174,14 @@ test "lowerCall resolves associated, enum-variant, constructor, and free calls" 
             } }),
             else => try bodies_list.append(alloc, .none),
         }
+    }
+
+    const calc_params = try alloc.dupe(items.Param, &.{
+        .{ .name = "x", .ty = .{ .prim = .u16 }, .span = span },
+    });
+    switch (bodies_list.items[10]) {
+        .fn_ => |*body| body.params = calc_params,
+        else => return error.ExpectedFunctionBody,
     }
 
     const src =
@@ -5313,7 +7894,7 @@ test "preserve non-generic function body fidelity" {
     defer bodies_list.deinit(alloc);
     try bodies_list.append(alloc, .none);
     try bodies_list.append(alloc, .{ .fn_ = .{
-        .params = &.{},
+        .params = &.{.{ .name = "flag", .ty = .{ .prim = .bool }, .span = span }},
         .ret = .{ .tuple = &.{ .{ .prim = .u16 }, .{ .prim = .u8 } } },
         .body = 0,
     } });
@@ -5380,13 +7961,16 @@ test "preserve non-generic function body fidelity" {
     const nul_init = nul_let.init orelse return error.ExpectedNulInitializer;
     const nul_literal = switch (exprs_list.items[nul_init].kind) {
         .literal => |literal| switch (literal) {
-            .byte_array => |byte_array| byte_array,
+            .int => |integer| integer,
             else => return error.ExpectedByteLiteral,
         },
         else => return error.ExpectedLiteralExpression,
     };
-    try std.testing.expectEqual(@as(usize, 1), nul_literal.items.len);
-    try std.testing.expectEqual(@as(u8, 0), nul_literal.items[0]);
+    try std.testing.expectEqual(@as(i128, 0), nul_literal.value);
+    try std.testing.expectEqualStrings(
+        "u8",
+        nul_literal.ty_suffix orelse return error.ExpectedByteType,
+    );
 
     const tuple_let = switch (stmts_list.items[body.statements[2]].kind) {
         .let => |statement| statement,
@@ -5925,7 +8509,7 @@ test "extract and infer concrete cast types while rejecting references" {
     try std.testing.expectEqualStrings("cast target type", reference_reason);
 }
 
-test "alignment-increasing raw pointer cast fails during inference" {
+test "raw pointer cast across pointee sizes succeeds during inference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -5937,7 +8521,7 @@ test "alignment-increasing raw pointer cast fails during inference" {
         alloc,
         &g,
         .fn_,
-        "reject_alignment_increase",
+        "unaligned_pointer_cast",
         root_id,
         null,
     );
@@ -5969,8 +8553,8 @@ test "alignment-increasing raw pointer cast fails during inference" {
         .types = &tables.types_list,
         .bodies_list = &tables.bodies_list,
         .src =
-        \\fn reject_alignment_increase(source: *const u8) {
-        \\    let alignment_increase = source as *const u32;
+        \\fn unaligned_pointer_cast(source: *const u8) {
+        \\    let unaligned_cast = source as *const u32;
         \\}
         ,
         .mod_id = root_id,
@@ -5984,9 +8568,33 @@ test "alignment-increasing raw pointer cast fails during inference" {
         .types = tables.types_list.items,
         .bodies = tables.bodies_list.items,
     };
+    var inferred = try infer.solveWithGraph(alloc, &extracted, &g);
+    defer inferred.deinit(alloc);
+}
+
+test "reference to raw pointer with pointee mismatch is rejected for translation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_ref = try alloc.create(types.Ref);
+    source_ref.* = .{ .mut = false, .pointee = .{ .prim = .u8 } };
+    const params = try alloc.dupe(items.Param, &.{
+        .{ .name = "source", .ty = .{ .reference = source_ref }, .span = span_of },
+    });
+    var fixture = try SourceTestFixture.init(
+        alloc,
+        "reject_reference_mismatch",
+        \\fn reject_reference_mismatch(source: &u8) {
+        \\    let invalid_ref_cast = source as *const u32;
+        \\}
+    ,
+        params,
+        .{ .prim = .unit },
+    );
     try std.testing.expectError(
-        error.InvalidCast,
-        infer.solveWithGraph(alloc, &extracted, &g),
+        error.UnsupportedExpression,
+        fixture.validate(),
     );
 }
 
@@ -6050,7 +8658,14 @@ test "preserve function block while refusing unsupported slice match pattern" {
     defer bodies_list.deinit(alloc);
     try bodies_list.append(alloc, .none);
     try bodies_list.append(alloc, .{ .fn_ = .{
-        .params = &.{},
+        .params = &.{.{
+            .name = "values",
+            .ty = .{ .reference = &.{
+                .mut = false,
+                .pointee = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
+            } },
+            .span = span,
+        }},
         .ret = .{ .prim = .u8 },
         .body = 0,
     } });
@@ -6839,7 +9454,8 @@ test "lower bounded flat_map collect chains into canonical iterator IR" {
         },
         else => return error.ExpectedRangeStartLiteral,
     };
-    const range_end = switch (tables.exprs_list.items[range.end].kind) {
+    const range_end_id = range.end orelse return error.ExpectedRangeEndLiteral;
+    const range_end = switch (tables.exprs_list.items[range_end_id].kind) {
         .literal => |value| switch (value) {
             .int => |integer| integer,
             else => return error.ExpectedRangeEndLiteral,
@@ -6897,7 +9513,7 @@ test "lower bounded flat_map collect chains into canonical iterator IR" {
     }
 }
 
-test "refuse unrelated and malformed iterator collection chains" {
+test "refuse malformed iterator closure arity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -6929,7 +9545,6 @@ test "refuse unrelated and malformed iterator collection chains" {
         .bodies_list = &tables.bodies_list,
         .src =
         \\fn reject(bytes: &[u8]) {
-        \\    let unrelated = (0..3).map(|_| bytes.iter().cloned()).collect();
         \\    let malformed = (0..3).flat_map(|a, b| bytes.iter().cloned()).collect();
         \\}
         ,
@@ -6942,18 +9557,295 @@ test "refuse unrelated and malformed iterator collection chains" {
         .block => |value| value,
         else => return error.ExpectedFunctionBlock,
     };
-    try std.testing.expectEqual(@as(usize, 2), block.statements.len);
+    try std.testing.expectEqual(@as(usize, 1), block.statements.len);
     for (block.statements) |statement_id| {
         const statement = switch (tables.stmts_list.items[statement_id].kind) {
             .let => |value| value,
             else => return error.ExpectedLetStatement,
         };
         const init_id = statement.init orelse return error.ExpectedIteratorRefusal;
-        switch (tables.exprs_list.items[init_id].kind) {
-            .unsupported => |value| {
-                try std.testing.expect(std.mem.startsWith(u8, value.reason, "iterator"));
+        try std.testing.expect(tables.exprs_list.items[init_id].kind == .unsupported);
+    }
+}
+
+const SourceTestFixture = struct {
+    graph_store: graph.CrateGraph,
+    tables: LookupTestTables,
+    function_id: spine.EntityId,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        function_name: []const u8,
+        source: []const u8,
+        params: []const items.Param,
+        return_type: types.Type,
+    ) !SourceTestFixture {
+        std.debug.assert(function_name.len > 0);
+        std.debug.assert(source.len > 0);
+
+        var graph_store = graph.CrateGraph.init(alloc);
+        errdefer graph_store.deinit();
+        const root_id = try addLookupTestEntity(alloc, &graph_store, .module, "", null, null);
+        const function_id = try addLookupTestEntity(
+            alloc,
+            &graph_store,
+            .fn_,
+            function_name,
+            root_id,
+            null,
+        );
+        const root_items = try alloc.dupe(spine.EntityId, &.{function_id});
+        try addLookupTestModule(alloc, &graph_store, "", null, true, root_items);
+        try graph_store.addCrate(.{
+            .name = try alloc.dupe(u8, "source-test"),
+            .edition = 2021,
+            .kind = .lib,
+            .root = root_id,
+            .deps = &.{},
+            .is_translated = true,
+        });
+
+        var tables: LookupTestTables = .{};
+        errdefer tables.deinit(alloc);
+        try appendLookupTestBodies(alloc, &graph_store, &tables.bodies_list);
+        switch (tables.bodies_list.items[function_id]) {
+            .fn_ => |*function_body| {
+                function_body.params = params;
+                function_body.ret = return_type;
             },
-            else => return error.ExpectedIteratorRefusal,
+            else => return error.ExpectedFunctionBody,
+        }
+
+        var ctx: Ctx = .{
+            .alloc = alloc,
+            .g = &graph_store,
+            .exprs = &tables.exprs_list,
+            .stmts = &tables.stmts_list,
+            .pats = &tables.pats_list,
+            .types = &tables.types_list,
+            .bodies_list = &tables.bodies_list,
+            .src = source,
+            .mod_id = root_id,
+        };
+        if (!try extractFunction(&ctx, function_id)) return error.FunctionBodyMissing;
+        return .{
+            .graph_store = graph_store,
+            .tables = tables,
+            .function_id = function_id,
+        };
+    }
+
+    fn deinit(fixture: *SourceTestFixture, alloc: std.mem.Allocator) void {
+        fixture.tables.deinit(alloc);
+        fixture.graph_store.deinit();
+        fixture.* = undefined;
+    }
+
+    fn bodyTables(fixture: *const SourceTestFixture) bodies.Bodies {
+        std.debug.assert(fixture.tables.exprs_list.items.len > 0);
+        std.debug.assert(fixture.function_id < fixture.tables.bodies_list.items.len);
+        return .{
+            .exprs = fixture.tables.exprs_list.items,
+            .stmts = fixture.tables.stmts_list.items,
+            .pats = fixture.tables.pats_list.items,
+            .types = fixture.tables.types_list.items,
+            .bodies = fixture.tables.bodies_list.items,
+        };
+    }
+
+    fn validate(fixture: *const SourceTestFixture) !void {
+        const extracted = fixture.bodyTables();
+        const rust_ir: ir.RustIr = .{
+            .crate_name = "source-test",
+            .graph = fixture.graph_store,
+            .types = fixture.tables.types_list.items,
+            .bodies = extracted,
+        };
+        try ir.validateForTranslation(&rust_ir);
+    }
+};
+
+test "Wyhash open-ended byte slice validates without dropping its start" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const slice = try alloc.create(types.Slice);
+    slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const reference = try alloc.create(types.Ref);
+    reference.* = .{ .mut = false, .pointee = .{ .slice = slice } };
+    const slice_reference: types.Type = .{ .reference = reference };
+    const params = try alloc.dupe(items.Param, &.{
+        .{ .name = "data", .ty = slice_reference, .span = span_of },
+    });
+    var fixture = try SourceTestFixture.init(
+        alloc,
+        "tail",
+        "fn tail(data: &[u8]) -> &[u8] { &data[4..] }",
+        params,
+        slice_reference,
+    );
+    defer fixture.deinit(alloc);
+    try fixture.tables.types_list.append(alloc, slice_reference);
+
+    const extracted = fixture.bodyTables();
+    _ = try infer.solveWithGraph(alloc, &extracted, &fixture.graph_store);
+
+    const body_id = fixture.tables.bodies_list.items[fixture.function_id].fn_.body;
+    const body = switch (fixture.tables.exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    _ = body.tail orelse return error.ExpectedFunctionTail;
+
+    try fixture.validate();
+
+    var found_start = false;
+    for (fixture.tables.exprs_list.items) |expression| {
+        if (expression.kind != .literal) continue;
+        switch (expression.kind.literal) {
+            .int => |integer| {
+                if (integer.value == 4) found_start = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_start);
+}
+
+test "Adler typed local constants resolve and retain multiply initializer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fixture = try SourceTestFixture.init(
+        alloc,
+        "checksum",
+        \\fn checksum() -> usize {
+        \\    const MOD: usize = 65_521;
+        \\    const CHUNK_SIZE: usize = 5_552 * 4;
+        \\    MOD * CHUNK_SIZE
+        \\}
+    ,
+        &.{},
+        .{ .prim = .usize },
+    );
+    defer fixture.deinit(alloc);
+    try fixture.tables.types_list.append(alloc, .{ .prim = .usize });
+
+    const extracted = fixture.bodyTables();
+    var inferred = try infer.solveWithGraph(alloc, &extracted, &fixture.graph_store);
+    defer inferred.deinit(alloc);
+    const body_id = fixture.tables.bodies_list.items[fixture.function_id].fn_.body;
+    const body = switch (fixture.tables.exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    const tail_id = body.tail orelse return error.ExpectedFunctionTail;
+    const tail_type_id = inferred.getType(tail_id) orelse return error.ExpectedUsizeType;
+    try std.testing.expectEqual(
+        types.Type{ .prim = .usize },
+        fixture.tables.types_list.items[tail_type_id],
+    );
+
+    try fixture.validate();
+
+    var found_mod_path = false;
+    var found_chunk_path = false;
+    var initializer_multiply: ?exprs.NodeId = null;
+    for (fixture.tables.exprs_list.items) |expression| {
+        switch (expression.kind) {
+            .path => |path| {
+                const entity = fixture.graph_store.symbol_table.get(path.def) orelse continue;
+                if (entity.parent != fixture.function_id) continue;
+                if (std.mem.eql(u8, entity.name, "MOD")) found_mod_path = true;
+                if (std.mem.eql(u8, entity.name, "CHUNK_SIZE")) found_chunk_path = true;
+            },
+            .binary => |binary| {
+                if (binary.op != .mul) continue;
+                const lhs_is_chunk = switch (fixture.tables.exprs_list.items[binary.lhs].kind) {
+                    .literal => |literal| switch (literal) {
+                        .int => |integer| integer.value == 5_552,
+                        else => false,
+                    },
+                    else => false,
+                };
+                const rhs_is_factor = switch (fixture.tables.exprs_list.items[binary.rhs].kind) {
+                    .literal => |literal| switch (literal) {
+                        .int => |integer| integer.value == 4,
+                        else => false,
+                    },
+                    else => false,
+                };
+                if (lhs_is_chunk and rhs_is_factor) initializer_multiply = expression.id;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_mod_path);
+    try std.testing.expect(found_chunk_path);
+    const multiply_id = initializer_multiply orelse return error.ExpectedConstMultiplyInitializer;
+    const multiply_type_id = inferred.getType(multiply_id) orelse return error.ExpectedUsizeType;
+    try std.testing.expectEqual(
+        types.Type{ .prim = .usize },
+        fixture.tables.types_list.items[multiply_type_id],
+    );
+}
+
+test "panic and unreachable match arms preserve diverging branch types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const params = try alloc.dupe(items.Param, &.{
+        .{ .name = "tag", .ty = .{ .prim = .u8 }, .span = span_of },
+    });
+    var fixture = try SourceTestFixture.init(
+        alloc,
+        "choose",
+        \\fn choose(tag: u8) -> u64 {
+        \\    match tag {
+        \\        0 => 7u64,
+        \\        1 => panic!("invalid tag"),
+        \\        _ => unreachable!(),
+        \\    }
+        \\}
+    ,
+        params,
+        .{ .prim = .u64 },
+    );
+    defer fixture.deinit(alloc);
+    try fixture.tables.types_list.append(alloc, .{ .prim = .u8 });
+    try fixture.tables.types_list.append(alloc, .{ .prim = .u64 });
+    try fixture.tables.types_list.append(alloc, .{ .prim = .never });
+
+    const extracted = fixture.bodyTables();
+    var inferred = try infer.solveWithGraph(alloc, &extracted, &fixture.graph_store);
+    defer inferred.deinit(alloc);
+    const body_id = fixture.tables.bodies_list.items[fixture.function_id].fn_.body;
+    const body = switch (fixture.tables.exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    const tail_id = body.tail orelse return error.ExpectedFunctionTail;
+    const match_expression = switch (fixture.tables.exprs_list.items[tail_id].kind) {
+        .match => |match_expression| match_expression,
+        else => return error.ExpectedMatchExpression,
+    };
+    try std.testing.expectEqual(@as(usize, 3), match_expression.arms.len);
+    const result_type_id = inferred.getType(tail_id) orelse return error.ExpectedU64Type;
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u64 },
+        fixture.tables.types_list.items[result_type_id],
+    );
+
+    try fixture.validate();
+
+    for (match_expression.arms[1..]) |arm| {
+        const branch_type_id = inferred.getType(arm.body) orelse return error.ExpectedNeverType;
+        switch (fixture.tables.types_list.items[branch_type_id]) {
+            .prim => |primitive| try std.testing.expectEqual(types.Prim.never, primitive),
+            else => return error.ExpectedNeverType,
         }
     }
 }

@@ -14,6 +14,7 @@ const GenericNames = []const []const u8;
 
 /// Errors returned when the IR cannot safely enter backend lowering.
 pub const ValidationError = error{
+    OutOfMemory,
     NoCrate,
     MissingRootModule,
     InvalidEntityId,
@@ -37,8 +38,10 @@ pub const ValidationError = error{
     InvalidStatementRef,
     InvalidPatternRef,
     InvalidTypeRef,
+    InvalidTypeTraversal,
     InvalidEntityReference,
     InvalidLiteralDefinition,
+    InvalidExternalVariant,
     InvalidFunctionBody,
     InvalidTypePath,
     UnresolvedTypePath,
@@ -47,8 +50,9 @@ pub const ValidationError = error{
     UnsupportedPattern,
     UnsupportedType,
     IncompleteGenericMetadata,
+    InvalidCoreCallArity,
+    InvalidCoreFunctionArity,
 };
-
 /// Validate all invariants required before target-specific lowering.
 ///
 /// This is intentionally strict. A missing record, unresolved reference, or
@@ -203,6 +207,32 @@ fn validateGraph(ir: *const RustIr) ValidationError!void {
             return error.MissingModuleItem;
         }
         if (requiresParent(ent.kind)) try validateEntityOwnership(ir, ent);
+        if (ent.kind == .method_ref) {
+            const parent_id = ent.parent orelse return error.MissingModuleItem;
+            const parent = entities[parent_id];
+            switch (parent.kind) {
+                .fn_ => {},
+                .trait_ => {
+                    if (@as(usize, parent_id) >= ir.bodies.bodies.len) {
+                        return error.MissingBodyMetadata;
+                    }
+                    const trait_body = switch (ir.bodies.bodies[parent_id]) {
+                        .trait_ => |body| body,
+                        else => return error.BodyKindMismatch,
+                    };
+                    var found = false;
+                    for (trait_body.methods) |method| {
+                        if (std.mem.eql(u8, method.name, ent.name)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return error.InvalidParent;
+                },
+                else => return error.InvalidParent,
+            }
+            if (ent.resolved != null) return error.InvalidResolvedEntity;
+        }
         if (ent.resolved) |resolved_id| {
             if (!validEntity(ir, resolved_id)) return error.InvalidResolvedEntity;
         }
@@ -269,6 +299,22 @@ fn validateInstantiations(ir: *const RustIr) ValidationError!void {
     }
 }
 
+fn isTraitAssocConstDeclaration(ir: *const RustIr, id: spine.EntityId) bool {
+    const entity_value = ir.graph.symbol_table.entities.items[id];
+    const parent_id = entity_value.parent orelse return false;
+    if (@as(usize, parent_id) >= ir.graph.symbol_table.entities.items.len) return false;
+    if (ir.graph.symbol_table.entities.items[parent_id].kind != .trait_) return false;
+    if (@as(usize, parent_id) >= ir.bodies.bodies.len) return false;
+    const trait_body = switch (ir.bodies.bodies[parent_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.assoc_consts) |assoc_const| {
+        if (std.mem.eql(u8, assoc_const.name, entity_value.name)) return true;
+    }
+    return false;
+}
+
 fn validateBodies(ir: *const RustIr) ValidationError!void {
     const b = &ir.bodies;
     const entity_count = ir.graph.symbol_table.entities.items.len;
@@ -277,10 +323,54 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
     if (b.bodies.len == 0) return error.InvalidBodyTable;
     if (b.bodies.len > entity_count) return error.InvalidBodyTable;
 
-    // Validate both type tables. RustIr.types is the canonical lowering table;
-    // Bodies.types is the node-side table used by Expr/Pattern/Statement.ty.
-    for (ir.types) |ty| try validateType(ir, b, ty, &.{});
-    for (b.types) |ty| try validateType(ir, b, ty, &.{});
+    // Types are validated at their actual use sites below. A generic type may
+    // be legal in one owner's context and invalid when reused elsewhere.
+    var context_seen: ContextSeen = .{
+        .expressions = &.{},
+        .statements = &.{},
+        .patterns = &.{},
+        .body_types = &.{},
+        .root_types = &.{},
+        .paired_types = &.{},
+    };
+    defer {
+        ir.graph.allocator.free(context_seen.expressions);
+        ir.graph.allocator.free(context_seen.statements);
+        ir.graph.allocator.free(context_seen.patterns);
+        ir.graph.allocator.free(context_seen.body_types);
+        ir.graph.allocator.free(context_seen.root_types);
+        ir.graph.allocator.free(context_seen.paired_types);
+    }
+    context_seen.expressions = ir.graph.allocator.alloc(bool, b.exprs.len) catch
+        return error.OutOfMemory;
+    context_seen.statements = ir.graph.allocator.alloc(bool, b.stmts.len) catch
+        return error.OutOfMemory;
+    context_seen.patterns = ir.graph.allocator.alloc(bool, b.pats.len) catch
+        return error.OutOfMemory;
+    context_seen.body_types = ir.graph.allocator.alloc(bool, b.types.len) catch
+        return error.OutOfMemory;
+    context_seen.root_types = ir.graph.allocator.alloc(bool, ir.types.len) catch
+        return error.OutOfMemory;
+    const paired_count = @min(ir.types.len, b.types.len);
+    context_seen.paired_types = ir.graph.allocator.alloc(bool, paired_count) catch
+        return error.OutOfMemory;
+    for (context_seen.paired_types, 0..) |*paired, index| {
+        paired.* = types_mod.deepEqual(ir.types[index], b.types[index]);
+    }
+    @memset(context_seen.expressions, false);
+    @memset(context_seen.statements, false);
+    @memset(context_seen.patterns, false);
+    @memset(context_seen.body_types, false);
+    @memset(context_seen.root_types, false);
+
+    var walker = exprs.NodeWalker.init(
+        ir.graph.allocator,
+        b.exprs,
+        b.stmts,
+        b.pats,
+        b.types,
+    ) catch return error.OutOfMemory;
+    defer walker.deinit();
 
     for (ir.graph.symbol_table.entities.items, 0..) |ent, entity_id| {
         const body = if (entity_id < b.bodies.len) b.bodies[entity_id] else null;
@@ -291,7 +381,14 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                     .fn_ => |value| value,
                     else => return error.BodyKindMismatch,
                 };
-                try validateFnBody(ir, b, fn_body);
+                try validateFnBody(
+                    ir,
+                    b,
+                    @intCast(entity_id),
+                    fn_body,
+                    &walker,
+                    &context_seen,
+                );
             },
             .struct_ => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
@@ -299,7 +396,14 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                     .struct_ => |value| value,
                     else => return error.BodyKindMismatch,
                 };
-                try validateStructBody(ir, b, struct_body);
+                try validateStructBody(
+                    ir,
+                    b,
+                    @intCast(entity_id),
+                    struct_body,
+                    &walker,
+                    &context_seen,
+                );
             },
             .union_ => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
@@ -307,7 +411,14 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                     .struct_ => |value| value,
                     else => return error.BodyKindMismatch,
                 };
-                try validateStructBody(ir, b, struct_body);
+                try validateStructBody(
+                    ir,
+                    b,
+                    @intCast(entity_id),
+                    struct_body,
+                    &walker,
+                    &context_seen,
+                );
             },
             .enum_ => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
@@ -315,15 +426,28 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                     .enum_ => |value| value,
                     else => return error.BodyKindMismatch,
                 };
-                try validateEnumBody(ir, b, enum_body);
+                try validateEnumBody(ir, b, @intCast(entity_id), enum_body);
             },
             .const_, .static_ => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
-                const const_body = switch (body_kind) {
-                    .const_ => |value| value,
+                switch (body_kind) {
+                    .none => {
+                        if (ent.kind != .const_ or
+                            !isTraitAssocConstDeclaration(ir, @intCast(entity_id)))
+                        {
+                            return error.BodyKindMismatch;
+                        }
+                    },
+                    .const_ => |const_body| try validateConstBody(
+                        ir,
+                        b,
+                        @intCast(entity_id),
+                        const_body,
+                        &walker,
+                        &context_seen,
+                    ),
                     else => return error.BodyKindMismatch,
-                };
-                try validateConstBody(ir, b, const_body);
+                }
             },
             .type_alias => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
@@ -333,13 +457,34 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                 };
                 try validateType(ir, b, alias_body.target, &.{});
             },
+            .impl_ => {
+                const body_kind = body orelse return error.MissingBodyMetadata;
+                const impl_body = switch (body_kind) {
+                    .impl_ => |value| value,
+                    else => return error.BodyKindMismatch,
+                };
+                try validateImplBody(ir, b, @intCast(entity_id), impl_body);
+            },
             .trait_ => {
                 if (body) |body_kind| {
                     switch (body_kind) {
                         .none => {},
-                        .trait_ => |trait_body| try validateTraitBody(ir, b, trait_body),
+                        .trait_ => |trait_body| try validateTraitBody(
+                            ir,
+                            b,
+                            trait_body,
+                            &walker,
+                            &context_seen,
+                        ),
                         else => return error.BodyKindMismatch,
                     }
+                }
+            },
+            .method_ref => {
+                const body_kind = body orelse return error.MissingBodyMetadata;
+                switch (body_kind) {
+                    .none => {},
+                    else => return error.BodyKindMismatch,
                 }
             },
             else => {
@@ -353,61 +498,327 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
         }
     }
 
-    for (b.exprs, 0..) |expr, index| try validateExpr(ir, b, expr, index);
-    for (b.pats, 0..) |pattern, index| try validatePattern(ir, b, pattern, index);
-    for (b.stmts, 0..) |statement, index| try validateStatement(ir, b, statement, index);
-}
-
-fn validateFnBody(ir: *const RustIr, b: *const Bodies, body: bodies_mod.FnBody) ValidationError!void {
-    try validateGenericNames(body.generic_params);
-    for (body.params) |param| try validateType(ir, b, param.ty, body.generic_params);
-    try validateType(ir, b, body.ret, body.generic_params);
-    try validateExprRef(b, body.body);
-    if (b.exprs[body.body].kind != .block) return error.InvalidFunctionBody;
-}
-
-fn validateStructBody(ir: *const RustIr, b: *const Bodies, body: bodies_mod.StructBody) ValidationError!void {
-    try validateGenericNames(body.generic_params);
-    for (body.trait_bounds) |bound| {
-        if (bound.len == 0) return error.IncompleteGenericMetadata;
+    for (b.exprs, 0..) |expr, index| {
+        try validateExpr(ir, b, expr, index);
+        if (!context_seen.expressions[index]) {
+            try validateCoreCallsInRoot(
+                ir,
+                b,
+                @intCast(index),
+                .{ .names = &.{} },
+                &walker,
+                &context_seen,
+            );
+        }
     }
-    for (body.fields) |field| try validateField(ir, b, field, body.generic_params);
-    for (body.methods) |method| {
-        if (method.name.len == 0) return error.IncompleteGenericMetadata;
-        try validateGenericNames(method.generic_params);
-        for (method.params) |param| try validateType(ir, b, param.ty, method.generic_params);
-        try validateType(ir, b, method.ret, method.generic_params);
-        try validateExprRef(b, method.body);
-        if (b.exprs[method.body].kind != .block) return error.InvalidFunctionBody;
+    for (b.pats, 0..) |pattern, index| {
+        try validatePattern(ir, b, pattern, index);
+        if (!context_seen.patterns[index]) {
+            try validateContextualNode(
+                ir,
+                b,
+                .{ .pattern = @intCast(index) },
+                .{ .names = &.{} },
+                &context_seen,
+            );
+        }
     }
-}
-
-fn validateEnumBody(ir: *const RustIr, b: *const Bodies, body: bodies_mod.EnumBody) ValidationError!void {
-    for (body.variants) |variant| {
-        if (variant.name.len == 0) return error.IncompleteGenericMetadata;
-        switch (variant.fields) {
-            .none => {},
-            .tuple => |field_types| for (field_types) |ty| try validateType(ir, b, ty, &.{}),
-            .named => |fields| for (fields) |field| try validateField(ir, b, field, &.{}),
+    for (b.stmts, 0..) |statement, index| {
+        try validateStatement(ir, b, statement, index);
+        if (!context_seen.statements[index]) {
+            try validateContextualNode(
+                ir,
+                b,
+                .{ .statement = @intCast(index) },
+                .{ .names = &.{} },
+                &context_seen,
+            );
+        }
+    }
+    for (ir.types, 0..) |ty, index| {
+        if (!context_seen.root_types[index]) {
+            try validateType(ir, b, ty, &.{});
+        }
+    }
+    for (b.types, 0..) |ty, index| {
+        if (!context_seen.body_types[index]) {
+            try validateType(ir, b, ty, &.{});
         }
     }
 }
 
-fn validateTraitBody(ir: *const RustIr, b: *const Bodies, body: bodies_mod.TraitBody) ValidationError!void {
+fn validateImplBody(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+    body: bodies_mod.ImplBody,
+) ValidationError!void {
+    const params = if (body.generics) |generics| generics.params else &.{};
+    const self_entity = concreteSelfEntity(ir, body.self_ty);
+    if (body.generics) |generics| {
+        try validateGenericsContext(
+            ir,
+            b,
+            generics,
+            &.{},
+            .{
+                .names = &.{},
+                .params = &.{},
+                .implicit_self = true,
+                .self_entity = self_entity,
+            },
+        );
+    }
+    const impl_context: GenericContext = .{
+        .names = &.{},
+        .params = params,
+        .implicit_self = true,
+        .self_entity = self_entity,
+    };
+    try validateTypeContext(ir, b, body.self_ty, impl_context);
+    if (body.trait_path) |path| {
+        try validateTraitPathContext(ir, path, impl_context);
+        for (body.trait_args) |arg| try validateTypeContext(ir, b, arg, impl_context);
+        try validateAssociatedTypeBindings(ir, b, body.trait_associated_types, impl_context);
+    } else if (body.trait_args.len != 0 or body.trait_associated_types.len != 0) {
+        return error.InvalidTypePath;
+    }
+    for (body.assoc_items, 0..) |assoc_id, index| {
+        try validateEntityRef(ir, assoc_id);
+        const assoc = ir.graph.symbol_table.entities.items[assoc_id];
+        if (assoc.parent == null or assoc.parent.? != owner) {
+            return error.InvalidEntityReference;
+        }
+        switch (assoc.kind) {
+            .fn_, .const_, .static_, .type_alias => {},
+            else => return error.InvalidEntityReference,
+        }
+        for (body.assoc_items[0..index]) |prior| {
+            if (prior == assoc_id) return error.InvalidEntityReference;
+        }
+    }
+}
+
+fn validateFnBody(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+    body: bodies_mod.FnBody,
+    walker: *exprs.NodeWalker,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    try validateGenericNames(body.generic_params);
+    const outer = try ownerGenericContext(ir, b, owner);
+    const params = if (body.generics) |generics| generics.params else &.{};
+    const context: GenericContext = .{
+        .names = body.generic_params,
+        .params = params,
+        .outer_names = outer.names,
+        .outer_params = outer.params,
+        .implicit_self = outer.implicit_self,
+        .self_entity = outer.self_entity,
+    };
+    for (body.params) |param| try validateTypeContext(ir, b, param.ty, context);
+    try validateTypeContext(ir, b, body.ret, context);
+    if (body.generics) |generics| {
+        try validateGenericsContext(ir, b, generics, body.generic_params, outer);
+    }
+    try validateExprRef(b, body.body);
+    if (b.exprs[body.body].kind != .block) return error.InvalidFunctionBody;
+    try validateCoreCallsInRoot(
+        ir,
+        b,
+        body.body,
+        context,
+        walker,
+        context_seen,
+    );
+}
+
+fn validateStructBody(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+    body: bodies_mod.StructBody,
+    walker: *exprs.NodeWalker,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    try validateGenericNames(body.generic_params);
+    for (body.trait_bounds) |bound| {
+        if (bound.len == 0) return error.IncompleteGenericMetadata;
+    }
+    const struct_context: GenericContext = .{
+        .names = body.generic_params,
+        .implicit_self = true,
+        .self_entity = owner,
+    };
+    for (body.fields) |field| try validateTypeContext(ir, b, field.ty, struct_context);
+    for (body.methods) |method| {
+        if (method.name.len == 0) return error.IncompleteGenericMetadata;
+        try validateGenericNames(method.generic_params);
+        const method_params = if (method.generics) |generics| generics.params else &.{};
+        const method_context: GenericContext = .{
+            .names = method.generic_params,
+            .params = method_params,
+            .outer_names = struct_context.names,
+            .outer_params = struct_context.params,
+            .implicit_self = true,
+            .self_entity = owner,
+        };
+        if (method.generics) |generics| {
+            try validateGenericsContext(
+                ir,
+                b,
+                generics,
+                method.generic_params,
+                struct_context,
+            );
+        }
+        for (method.params) |param| try validateTypeContext(ir, b, param.ty, method_context);
+        try validateTypeContext(ir, b, method.ret, method_context);
+        try validateExprRef(b, method.body);
+        if (b.exprs[method.body].kind != .block) return error.InvalidFunctionBody;
+        try validateCoreCallsInRoot(
+            ir,
+            b,
+            method.body,
+            method_context,
+            walker,
+            context_seen,
+        );
+    }
+}
+fn validateEnumBody(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+    body: bodies_mod.EnumBody,
+) ValidationError!void {
+    try validateGenericNames(body.generic_params);
+    const enum_context: GenericContext = .{
+        .names = body.generic_params,
+        .implicit_self = true,
+        .self_entity = owner,
+    };
+    for (body.variants) |variant| {
+        if (variant.name.len == 0) return error.IncompleteGenericMetadata;
+        switch (variant.fields) {
+            .none => {},
+            .tuple => |field_types| for (field_types) |ty| {
+                try validateTypeContext(ir, b, ty, enum_context);
+            },
+            .named => |fields| for (fields) |field| {
+                if (field.name.len == 0) return error.IncompleteGenericMetadata;
+                try validateTypeContext(ir, b, field.ty, enum_context);
+            },
+        }
+    }
+}
+fn validateTraitBody(
+    ir: *const RustIr,
+    b: *const Bodies,
+    body: bodies_mod.TraitBody,
+    walker: *exprs.NodeWalker,
+    context_seen: *ContextSeen,
+) ValidationError!void {
     if (body.name.len == 0) return error.IncompleteGenericMetadata;
+    try validateGenericNames(body.generic_params);
+    const trait_params: []const types_mod.GenericParam = if (body.generics) |generics| blk: {
+        try validateGenericsContext(
+            ir,
+            b,
+            generics,
+            body.generic_params,
+            .{ .names = &.{}, .implicit_self = true },
+        );
+        break :blk generics.params;
+    } else &.{};
+    const trait_context: GenericContext = .{
+        .names = body.generic_params,
+        .params = trait_params,
+        .implicit_self = true,
+    };
     for (body.supertraits) |supertrait| {
         if (supertrait.len == 0) return error.IncompleteGenericMetadata;
     }
     for (body.methods) |method| {
         if (method.name.len == 0) return error.IncompleteGenericMetadata;
-        for (method.params) |param| try validateType(ir, b, param.ty, &.{});
-        try validateType(ir, b, method.ret, &.{});
+        try validateGenericNames(method.generic_params);
+        const method_params: []const types_mod.GenericParam = if (method.generics) |generics| blk: {
+            try validateGenericsContext(
+                ir,
+                b,
+                generics,
+                method.generic_params,
+                trait_context,
+            );
+            break :blk generics.params;
+        } else &.{};
+        const method_context: GenericContext = .{
+            .names = method.generic_params,
+            .params = method_params,
+            .outer_names = body.generic_params,
+            .outer_params = trait_params,
+            .implicit_self = true,
+        };
+        for (method.params) |param| try validateTypeContext(ir, b, param.ty, method_context);
+        try validateTypeContext(ir, b, method.ret, method_context);
+    }
+    for (body.assoc_types) |assoc_type| {
+        if (assoc_type.name.len == 0) return error.IncompleteGenericMetadata;
+        const assoc_context: GenericContext = if (assoc_type.generics) |generics| blk: {
+            try validateGenericsContext(ir, b, generics, &.{}, trait_context);
+            break :blk .{
+                .names = &.{},
+                .params = generics.params,
+                .outer_names = body.generic_params,
+                .outer_params = trait_params,
+                .implicit_self = true,
+            };
+        } else trait_context;
+        for (assoc_type.bounds) |bound| {
+            try validateBoundContext(ir, b, bound, assoc_context);
+        }
+        if (assoc_type.default) |default| {
+            try validateTypeContext(ir, b, default, assoc_context);
+        }
+    }
+    for (body.assoc_consts) |assoc_const| {
+        if (assoc_const.name.len == 0) return error.IncompleteGenericMetadata;
+        try validateTypeContext(ir, b, assoc_const.ty, trait_context);
+        if (assoc_const.default) |default| {
+            try validateExprRef(b, default);
+            try validateCoreCallsInRoot(
+                ir,
+                b,
+                default,
+                trait_context,
+                walker,
+                context_seen,
+            );
+        }
     }
 }
 
-fn validateConstBody(ir: *const RustIr, b: *const Bodies, body: bodies_mod.ConstBody) ValidationError!void {
-    try validateType(ir, b, body.ty, &.{});
+fn validateConstBody(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+    body: bodies_mod.ConstBody,
+    walker: *exprs.NodeWalker,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    const context = try ownerGenericContext(ir, b, owner);
+    try validateTypeContext(ir, b, body.ty, context);
     try validateExprRef(b, body.init);
+    try validateCoreCallsInRoot(
+        ir,
+        b,
+        body.init,
+        context,
+        walker,
+        context_seen,
+    );
 }
 
 fn validateStructLiteralDefinition(ir: *const RustIr, id: spine.EntityId) ValidationError!void {
@@ -437,11 +848,247 @@ fn validateGenericNames(names: GenericNames) ValidationError!void {
     }
 }
 
+fn validateGenericPathContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    path: types_mod.Path,
+    context: GenericContext,
+) ValidationError!void {
+    if (path.segments.len == 0) return error.InvalidTypePath;
+    if (try validateImplicitSelfPath(ir, b, path, context)) return;
+    var generic_root = false;
+    for (path.segments, 0..) |segment, index| {
+        if (segment.name.len == 0) return error.InvalidTypePath;
+        if (segment.id) |id| {
+            try validateEntityRef(ir, id);
+        } else if (index == 0 and contextGenericNameKnown(context, segment.name)) {
+            generic_root = true;
+        } else if (!generic_root) {
+            return error.UnresolvedTypePath;
+        }
+    }
+}
+fn normalizedNameEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_char, right_char| {
+        const normalized_left = if (left_char == '-') '_' else left_char;
+        const normalized_right = if (right_char == '-') '_' else right_char;
+        if (normalized_left != normalized_right) return false;
+    }
+    return true;
+}
+
+fn isExternalRootName(ir: *const RustIr, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "alloc") or
+        std.mem.eql(u8, name, "core") or
+        std.mem.eql(u8, name, "std"))
+    {
+        return true;
+    }
+    for (ir.graph.crates.items) |crate| {
+        for (crate.deps) |dependency| {
+            if (normalizedNameEqual(dependency.local_alias, name) or
+                normalizedNameEqual(dependency.extern_name, name))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn isExternalRoot(ir: *const RustIr, path: []const []const u8) bool {
+    if (path.len == 0) return false;
+    return isExternalRootName(ir, path[0]);
+}
+
+fn isExternalTraitPath(ir: *const RustIr, path: types_mod.Path) bool {
+    if (path.segments.len == 0) return false;
+    if (!isExternalRootName(ir, path.segments[0].name)) return false;
+    for (path.segments) |segment| {
+        if (segment.id != null) return false;
+    }
+    return true;
+}
+
+fn validateTraitPath(
+    ir: *const RustIr,
+    path: types_mod.Path,
+    generic_names: GenericNames,
+    generic_params: []const types_mod.GenericParam,
+) ValidationError!void {
+    return validateTraitPathContext(
+        ir,
+        path,
+        .{ .names = generic_names, .params = generic_params },
+    );
+}
+
+fn validateTraitPathContext(
+    ir: *const RustIr,
+    path: types_mod.Path,
+    context: GenericContext,
+) ValidationError!void {
+    if (path.segments.len == 0) return error.InvalidTypePath;
+    if (isExternalTraitPath(ir, path)) {
+        for (path.segments) |segment| {
+            if (segment.name.len == 0) return error.InvalidTypePath;
+        }
+        return;
+    }
+
+    const terminal = path.segments[path.segments.len - 1];
+    const terminal_id = terminal.id orelse return error.UnresolvedTypePath;
+    const terminal_entity = try entity(ir, terminal_id);
+    if (terminal_entity.kind != .trait_) return error.InvalidTypePath;
+    for (path.segments, 0..) |segment, index| {
+        if (segment.name.len == 0) return error.InvalidTypePath;
+        if (segment.id) |id| {
+            const resolved = try entity(ir, id);
+            if (!std.mem.eql(u8, resolved.name, segment.name)) {
+                return error.InvalidTypePath;
+            }
+            if (index + 1 < path.segments.len and
+                resolved.kind != .module and resolved.kind != .extern_crate)
+            {
+                return error.InvalidTypePath;
+            }
+        } else if (index == 0 and contextGenericNameKnown(context, segment.name)) {
+            continue;
+        }
+    }
+}
+
+fn validateAssociatedTypeBindings(
+    ir: *const RustIr,
+    b: *const Bodies,
+    bindings: []const types_mod.AssociatedTypeBinding,
+    context: GenericContext,
+) ValidationError!void {
+    return validateAssociatedTypeBindingsDepth(ir, b, bindings, context, 0);
+}
+
+fn validateAssociatedTypeBindingsDepth(
+    ir: *const RustIr,
+    b: *const Bodies,
+    bindings: []const types_mod.AssociatedTypeBinding,
+    context: GenericContext,
+    depth: usize,
+) ValidationError!void {
+    for (bindings, 0..) |binding, index| {
+        if (binding.name.len == 0) return error.IncompleteGenericMetadata;
+        for (bindings[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, binding.name)) {
+                return error.IncompleteGenericMetadata;
+            }
+        }
+        try validateTypeContextDepth(ir, b, binding.ty, context, depth);
+    }
+}
+
+fn validateBoundContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    bound: types_mod.Bound,
+    context: GenericContext,
+) ValidationError!void {
+    return validateBoundContextDepth(ir, b, bound, context, 0);
+}
+
+fn validateBoundContextDepth(
+    ir: *const RustIr,
+    b: *const Bodies,
+    bound: types_mod.Bound,
+    context: GenericContext,
+    depth: usize,
+) ValidationError!void {
+    try validateTraitPathContext(ir, bound.path, context);
+    for (bound.args) |arg| {
+        try validateTypeContextDepth(ir, b, arg, context, depth);
+    }
+    try validateAssociatedTypeBindingsDepth(ir, b, bound.associated_types, context, depth);
+}
+
+fn validateGenerics(
+    ir: *const RustIr,
+    b: *const Bodies,
+    generics: types_mod.Generics,
+    generic_names: GenericNames,
+) ValidationError!void {
+    return validateGenericsContext(
+        ir,
+        b,
+        generics,
+        generic_names,
+        .{ .names = &.{} },
+    );
+}
+fn validateGenericsContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    generics: types_mod.Generics,
+    generic_names: GenericNames,
+    outer: GenericContext,
+) ValidationError!void {
+    const context: GenericContext = .{
+        .names = generic_names,
+        .params = generics.params,
+        .outer_names = outer.names,
+        .outer_params = outer.params,
+        .implicit_self = outer.implicit_self,
+        .self_entity = outer.self_entity,
+    };
+    for (generics.params, 0..) |param, index| {
+        const name = switch (param) {
+            .type_ => |value| value.name,
+            .const_ => |value| value.name,
+            .lifetime => |value| value.name,
+        };
+        if (name.len == 0) return error.IncompleteGenericMetadata;
+        for (generics.params[0..index]) |prior| {
+            const prior_name = switch (prior) {
+                .type_ => |value| value.name,
+                .const_ => |value| value.name,
+                .lifetime => |value| value.name,
+            };
+            if (std.mem.eql(u8, name, prior_name)) return error.IncompleteGenericMetadata;
+        }
+        switch (param) {
+            .type_ => |value| for (value.bounds) |bound| {
+                try validateBoundContext(ir, b, bound, context);
+            },
+            .const_ => |value| try validateTypeContext(ir, b, value.ty, context),
+            .lifetime => {},
+        }
+    }
+    for (generics.where_clauses) |clause| {
+        try validateGenericPathContext(ir, b, clause.self_ty, context);
+        for (clause.bounds) |bound| {
+            try validateBoundContext(ir, b, bound, context);
+        }
+    }
+}
+
+const ContextSeen = struct {
+    expressions: []bool,
+    statements: []bool,
+    patterns: []bool,
+    body_types: []bool,
+    root_types: []bool,
+    paired_types: []bool,
+};
 fn genericCountForEntity(ir: *const RustIr, id: spine.EntityId) ?usize {
     if (@as(usize, id) >= ir.bodies.bodies.len) return null;
+    if (@as(usize, id) < ir.graph.symbol_table.entities.items.len and
+        isTraitAssocConstDeclaration(ir, id))
+    {
+        return 1;
+    }
+
     return switch (ir.bodies.bodies[id]) {
         .fn_ => |body| body.generic_params.len,
         .struct_ => |body| body.generic_params.len,
+        .enum_ => |body| body.generic_params.len,
         else => null,
     };
 }
@@ -452,22 +1099,190 @@ fn genericNameKnown(generic_names: GenericNames, name: []const u8) bool {
     }
     return false;
 }
-fn isExternalRoot(path: []const []const u8) bool {
-    if (path.len == 0) return false;
-    return std.mem.eql(u8, path[0], "alloc") or
-        std.mem.eql(u8, path[0], "core") or std.mem.eql(u8, path[0], "std");
+
+const GenericContext = struct {
+    names: GenericNames,
+    params: []const types_mod.GenericParam = &.{},
+    outer_names: GenericNames = &.{},
+    outer_params: []const types_mod.GenericParam = &.{},
+    implicit_self: bool = false,
+    self_entity: ?spine.EntityId = null,
+};
+fn ownerGenericContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+) ValidationError!GenericContext {
+    const entities = ir.graph.symbol_table.entities.items;
+    if (@as(usize, owner) >= entities.len) return error.InvalidEntityReference;
+
+    var parent_id = entities[owner].parent orelse return .{ .names = &.{} };
+    var depth: usize = 0;
+    while (depth < entities.len) : (depth += 1) {
+        if (@as(usize, parent_id) >= entities.len) return error.InvalidParent;
+        const parent = entities[parent_id];
+        switch (parent.kind) {
+            .impl_ => {
+                if (@as(usize, parent_id) >= b.bodies.len) return error.MissingBodyMetadata;
+                const impl_body = switch (b.bodies[parent_id]) {
+                    .impl_ => |body| body,
+                    else => return error.BodyKindMismatch,
+                };
+                return .{
+                    .names = &.{},
+                    .params = if (impl_body.generics) |generics| generics.params else &.{},
+                    .implicit_self = true,
+                    .self_entity = concreteSelfEntity(ir, impl_body.self_ty),
+                };
+            },
+            .struct_, .union_ => {
+                if (@as(usize, parent_id) >= b.bodies.len) return error.MissingBodyMetadata;
+                const struct_body = switch (b.bodies[parent_id]) {
+                    .struct_ => |body| body,
+                    else => return error.BodyKindMismatch,
+                };
+                return .{
+                    .names = struct_body.generic_params,
+                    .implicit_self = true,
+                    .self_entity = parent.id,
+                };
+            },
+            .trait_ => {
+                if (@as(usize, parent_id) >= b.bodies.len) return error.MissingBodyMetadata;
+                return switch (b.bodies[parent_id]) {
+                    .trait_ => |body| .{
+                        .names = body.generic_params,
+                        .params = if (body.generics) |generics| generics.params else &.{},
+                        .implicit_self = true,
+                    },
+                    .none => .{ .names = &.{}, .implicit_self = true },
+                    else => error.BodyKindMismatch,
+                };
+            },
+            .fn_, .module, .crate_ => return .{ .names = &.{} },
+            else => {},
+        }
+        parent_id = parent.parent orelse return .{ .names = &.{} };
+    }
+    return error.InvalidParent;
 }
 
-fn validateType(ir: *const RustIr, b: *const Bodies, ty: Type, generic_names: GenericNames) ValidationError!void {
+fn genericParamNameKnown(params: []const types_mod.GenericParam, name: []const u8) bool {
+    for (params) |param| {
+        const candidate = switch (param) {
+            .type_ => |value| value.name,
+            .const_ => |value| value.name,
+            .lifetime => |value| value.name,
+        };
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+fn contextGenericNameKnown(context: GenericContext, name: []const u8) bool {
+    return (context.implicit_self and std.mem.eql(u8, name, "Self")) or
+        genericNameKnown(context.names, name) or
+        genericParamNameKnown(context.params, name) or
+        genericNameKnown(context.outer_names, name) or
+        genericParamNameKnown(context.outer_params, name);
+}
+
+fn concreteSelfEntity(ir: *const RustIr, ty: Type) ?spine.EntityId {
+    const candidate: ?spine.EntityId = switch (ty) {
+        .path => |path| if (path.segments.len == 0)
+            null
+        else
+            path.segments[path.segments.len - 1].id,
+        .generic_inst => |generic| generic.decl,
+        .reference => |reference| concreteSelfEntity(ir, reference.pointee),
+        .raw_ptr => |raw_ptr| concreteSelfEntity(ir, raw_ptr.pointee),
+        .boxed => |boxed| concreteSelfEntity(ir, boxed.*),
+        else => null,
+    };
+    if (candidate) |id| {
+        if (validEntity(ir, id)) return id;
+    }
+    return null;
+}
+
+fn validateImplicitSelfPath(
+    ir: *const RustIr,
+    b: *const Bodies,
+    path: types_mod.Path,
+    context: GenericContext,
+) ValidationError!bool {
+    if (path.segments.len == 0) return false;
+    const first = path.segments[0];
+    if (!std.mem.eql(u8, first.name, "Self")) return false;
+    if (!context.implicit_self) return false;
+    if (first.id) |id| {
+        const expected = context.self_entity orelse return error.InvalidTypePath;
+        if (id != expected) return error.InvalidTypePath;
+        const self_entity = try entity(ir, id);
+        switch (self_entity.kind) {
+            .struct_, .union_, .enum_ => {},
+            else => return error.InvalidTypePath,
+        }
+    }
+    if (path.segments.len == 1) return true;
+    if (path.segments.len != 3) return error.InvalidTypePath;
+    const trait_segment = path.segments[1];
+    const assoc_segment = path.segments[2];
+    const trait_id = trait_segment.id orelse return error.UnresolvedTypePath;
+    const trait = try entity(ir, trait_id);
+    if (trait.kind != .trait_ or
+        !std.mem.eql(u8, trait.name, trait_segment.name) or
+        assoc_segment.id != null or trait_segment.name.len == 0 or
+        assoc_segment.name.len == 0)
+    {
+        return error.InvalidTypePath;
+    }
+    const trait_body = if (@as(usize, trait_id) < b.bodies.len) switch (b.bodies[trait_id]) {
+        .trait_ => |body| body,
+        else => return error.InvalidTypePath,
+    } else return error.InvalidEntityReference;
+    for (trait_body.assoc_types) |assoc_type| {
+        if (std.mem.eql(u8, assoc_type.name, assoc_segment.name)) return true;
+    }
+    return error.UnresolvedTypePath;
+}
+
+fn validateType(
+    ir: *const RustIr,
+    b: *const Bodies,
+    ty: Type,
+    generic_names: GenericNames,
+) ValidationError!void {
+    return validateTypeContext(ir, b, ty, .{ .names = generic_names });
+}
+
+fn validateTypeContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    ty: Type,
+    context: GenericContext,
+) ValidationError!void {
+    return validateTypeContextDepth(ir, b, ty, context, 0);
+}
+
+fn validateTypeContextDepth(
+    ir: *const RustIr,
+    b: *const Bodies,
+    ty: Type,
+    context: GenericContext,
+    depth: usize,
+) ValidationError!void {
+    if (depth >= types_mod.traversal_depth_max) return error.InvalidTypeTraversal;
+    const child_depth = depth + 1;
     switch (ty) {
         .path => |path| {
             if (path.segments.len == 0) return error.InvalidTypePath;
+            if (try validateImplicitSelfPath(ir, b, path, context)) return;
             var generic_root = false;
             for (path.segments, 0..) |segment, index| {
                 if (segment.name.len == 0) return error.InvalidTypePath;
                 if (segment.id) |id| {
                     try validateEntityRef(ir, id);
-                } else if (index == 0 and genericNameKnown(generic_names, segment.name)) {
+                } else if (index == 0 and contextGenericNameKnown(context, segment.name)) {
                     generic_root = true;
                 } else if (!generic_root) {
                     return error.UnresolvedTypePath;
@@ -475,32 +1290,38 @@ fn validateType(ir: *const RustIr, b: *const Bodies, ty: Type, generic_names: Ge
             }
         },
         .external_nominal => |external| {
-            if (external.path.len == 0) return error.InvalidTypePath;
-            if (!isExternalRoot(external.path)) return error.UnsupportedExternalNominalType;
-            for (external.path) |segment| {
-                if (segment.len == 0) return error.InvalidTypePath;
-            }
-            for (external.args) |arg| {
-                try validateType(ir, b, arg, generic_names);
-            }
+            try validateExternalNominal(ir, b, external, context, child_depth);
         },
         .prim => {},
-        .reference => |reference| try validateType(ir, b, reference.pointee, generic_names),
-        .raw_ptr => |raw_ptr| try validateType(ir, b, raw_ptr.pointee, generic_names),
-        .slice => |slice| try validateType(ir, b, slice.elem, generic_names),
+        .reference => |reference| {
+            try validateTypeContextDepth(ir, b, reference.pointee, context, child_depth);
+        },
+        .raw_ptr => |raw_ptr| {
+            try validateTypeContextDepth(ir, b, raw_ptr.pointee, context, child_depth);
+        },
+        .slice => |slice| try validateTypeContextDepth(ir, b, slice.elem, context, child_depth),
         .array => |array| {
-            try validateType(ir, b, array.elem, generic_names);
+            try validateTypeContextDepth(ir, b, array.elem, context, child_depth);
             switch (array.len) {
                 .literal => {},
                 .generic => |index| {
-                    if (@as(usize, index) >= generic_names.len) return error.IncompleteGenericMetadata;
+                    if (@as(usize, index) >= context.names.len and
+                        @as(usize, index) >= context.params.len)
+                    {
+                        return error.IncompleteGenericMetadata;
+                    }
                 },
+                .expression => |expression| try validateExprRef(b, expression),
             }
         },
-        .tuple => |elements| for (elements) |element| try validateType(ir, b, element, generic_names),
+        .tuple => |elements| for (elements) |element| {
+            try validateTypeContextDepth(ir, b, element, context, child_depth);
+        },
         .fn_ptr => |fn_ptr| {
-            for (fn_ptr.params) |param| try validateType(ir, b, param, generic_names);
-            try validateType(ir, b, fn_ptr.ret, generic_names);
+            for (fn_ptr.params) |param| {
+                try validateTypeContextDepth(ir, b, param, context, child_depth);
+            }
+            try validateTypeContextDepth(ir, b, fn_ptr.ret, context, child_depth);
         },
         .generic_inst => |generic| {
             try validateEntityRef(ir, generic.decl);
@@ -509,15 +1330,355 @@ fn validateType(ir: *const RustIr, b: *const Bodies, ty: Type, generic_names: Ge
             if (generic_count == 0 or generic.args.params.len != generic_count) {
                 return error.IncompleteGenericMetadata;
             }
-            for (generic.args.params) |arg| try validateType(ir, b, arg, generic_names);
+            for (generic.args.params) |arg| {
+                try validateTypeContextDepth(ir, b, arg, context, child_depth);
+            }
         },
-        .option => |option| try validateType(ir, b, option.*, generic_names),
+        .option => |option| try validateTypeContextDepth(ir, b, option.*, context, child_depth),
         .result => |result| {
-            try validateType(ir, b, result.ok, generic_names);
-            try validateType(ir, b, result.err, generic_names);
+            try validateTypeContextDepth(ir, b, result.ok, context, child_depth);
+            try validateTypeContextDepth(ir, b, result.err, context, child_depth);
         },
-        .boxed => |boxed| try validateType(ir, b, boxed.*, generic_names),
+        .boxed => |boxed| try validateTypeContextDepth(ir, b, boxed.*, context, child_depth),
+        .@"opaque" => |opaque_ty| {
+            for (opaque_ty.bounds) |bound| {
+                try validateBoundContextDepth(ir, b, bound, context, child_depth);
+            }
+            if (opaque_ty.concrete) |concrete| {
+                try validateTypeContextDepth(ir, b, concrete.*, context, child_depth);
+            }
+        },
+        .dyn_trait => |bounds| {
+            for (bounds) |bound| {
+                try validateBoundContextDepth(ir, b, bound, context, child_depth);
+            }
+        },
         .unsupported => return error.UnsupportedType,
+    }
+}
+
+fn validateExternalNominal(
+    ir: *const RustIr,
+    b: *const Bodies,
+    external: types_mod.ExternalNominal,
+    context: GenericContext,
+    depth: usize,
+) ValidationError!void {
+    if (external.path.len == 0) return error.InvalidTypePath;
+    if (!isExternalRoot(ir, external.path)) return error.UnsupportedExternalNominalType;
+    for (external.path) |segment| {
+        if (segment.len == 0) return error.InvalidTypePath;
+    }
+    for (external.args) |arg| {
+        try validateTypeContextDepth(ir, b, arg, context, depth);
+    }
+}
+
+fn validateExternalVariantOwner(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: types_mod.ExternalNominal,
+    context: GenericContext,
+) ValidationError!void {
+    try validateExternalNominal(ir, b, owner, context, 0);
+    if (owner.path.len < 3) return error.InvalidExternalVariant;
+    if (!std.mem.eql(u8, owner.path[owner.path.len - 2], "borrow") or
+        !std.mem.eql(u8, owner.path[owner.path.len - 1], "Cow"))
+    {
+        return error.InvalidExternalVariant;
+    }
+}
+
+fn validateExternalVariant(
+    ir: *const RustIr,
+    b: *const Bodies,
+    variant: exprs.ExternalVariant,
+    context: GenericContext,
+) ValidationError!void {
+    try validateExternalVariantOwner(ir, b, variant.owner, context);
+    if (!std.mem.eql(u8, variant.variant, "Owned") and
+        !std.mem.eql(u8, variant.variant, "Borrowed"))
+    {
+        return error.InvalidExternalVariant;
+    }
+    for (variant.tuple_fields) |field| try validateExprRef(b, field);
+    for (variant.named_fields) |field| try validateFieldInit(b, field);
+}
+
+fn validateExternalVariantPattern(
+    ir: *const RustIr,
+    b: *const Bodies,
+    variant: exprs.ExternalVariantPattern,
+    context: GenericContext,
+) ValidationError!void {
+    try validateExternalVariantOwner(ir, b, variant.owner, context);
+    if (!std.mem.eql(u8, variant.variant, "Owned") and
+        !std.mem.eql(u8, variant.variant, "Borrowed"))
+    {
+        return error.InvalidExternalVariant;
+    }
+    for (variant.fields) |field| {
+        if (field.field.len == 0) return error.InvalidExternalVariant;
+        if (field.pat) |pattern| try validatePatRef(b, pattern);
+    }
+}
+
+const CoreCallArity = struct {
+    generic_count: usize,
+    value_count: usize,
+};
+
+fn coreCallArity(function: exprs.CoreFunction) CoreCallArity {
+    return switch (function) {
+        .mem_transmute => .{ .generic_count = 2, .value_count = 1 },
+        .mem_size_of => .{ .generic_count = 1, .value_count = 0 },
+        .mem_size_of_val => .{ .generic_count = 1, .value_count = 1 },
+        .ptr_copy_nonoverlapping => .{ .generic_count = 1, .value_count = 3 },
+        .ptr_write_bytes => .{ .generic_count = 1, .value_count = 3 },
+        .ptr_read_unaligned => .{ .generic_count = 1, .value_count = 1 },
+        .slice_from_raw_parts => .{ .generic_count = 1, .value_count = 2 },
+        .slice_from_raw_parts_mut => .{ .generic_count = 1, .value_count = 2 },
+        .str_from_utf8 => .{ .generic_count = 0, .value_count = 1 },
+        .str_from_utf8_unchecked => .{ .generic_count = 0, .value_count = 1 },
+        .string_from_utf8 => .{ .generic_count = 0, .value_count = 1 },
+        .string_from_utf8_lossy => .{ .generic_count = 0, .value_count = 1 },
+        .string_from_utf8_unchecked => .{ .generic_count = 0, .value_count = 1 },
+        .cmp_min => .{ .generic_count = 1, .value_count = 2 },
+        .cmp_max => .{ .generic_count = 1, .value_count = 2 },
+        .default_value => .{ .generic_count = 1, .value_count = 0 },
+        .convert_from => .{ .generic_count = 1, .value_count = 1 },
+    };
+}
+
+fn coreFunctionGenericCount(function: exprs.CoreFunction) usize {
+    return switch (function) {
+        .mem_transmute => 2,
+        .mem_size_of, .mem_size_of_val, .ptr_copy_nonoverlapping, .ptr_write_bytes, .ptr_read_unaligned, .slice_from_raw_parts, .slice_from_raw_parts_mut, .cmp_min, .cmp_max, .default_value, .convert_from => 1,
+        .str_from_utf8, .str_from_utf8_unchecked, .string_from_utf8, .string_from_utf8_lossy, .string_from_utf8_unchecked => 0,
+    };
+}
+
+fn validateCoreFunction(
+    ir: *const RustIr,
+    b: *const Bodies,
+    function: exprs.CoreFunctionValue,
+    context: GenericContext,
+) ValidationError!void {
+    if (function.generic_args.len != coreFunctionGenericCount(function.function)) {
+        return error.InvalidCoreFunctionArity;
+    }
+    for (function.generic_args) |argument| {
+        try validateTypeContext(ir, b, argument, context);
+    }
+}
+
+fn validateCoreCallShape(b: *const Bodies, call: exprs.CoreCall) ValidationError!void {
+    const arity = coreCallArity(call.function);
+    if (call.generic_args.len != arity.generic_count or
+        call.args.len != arity.value_count)
+    {
+        return error.InvalidCoreCallArity;
+    }
+    for (call.args) |argument| {
+        try validateExprRef(b, argument);
+    }
+}
+
+fn validateCoreCall(
+    ir: *const RustIr,
+    b: *const Bodies,
+    call: exprs.CoreCall,
+    context: GenericContext,
+) ValidationError!void {
+    try validateCoreCallShape(b, call);
+    for (call.generic_args) |argument| {
+        try validateTypeContext(ir, b, argument, context);
+    }
+}
+
+fn markBodyTypeSeen(context_seen: *ContextSeen, index: usize) void {
+    context_seen.body_types[index] = true;
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        context_seen.root_types[index] = true;
+    }
+}
+
+fn markRootTypeSeen(context_seen: *ContextSeen, index: usize) void {
+    context_seen.root_types[index] = true;
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        context_seen.body_types[index] = true;
+    }
+}
+
+fn validateContextualTypeRef(
+    ir: *const RustIr,
+    b: *const Bodies,
+    id: exprs.TypeId,
+    context: GenericContext,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    try validateTypeRef(b, id);
+    const index = @as(usize, id);
+    markBodyTypeSeen(context_seen, index);
+    try validateTypeContext(ir, b, b.types[index], context);
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        try validateTypeContext(ir, b, ir.types[index], context);
+    }
+}
+
+fn validateContextualRootType(
+    ir: *const RustIr,
+    b: *const Bodies,
+    id: exprs.TypeId,
+    context: GenericContext,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    const index = @as(usize, id);
+    if (index >= ir.types.len) return error.InvalidTypeRef;
+    markRootTypeSeen(context_seen, index);
+    try validateTypeContext(ir, b, ir.types[index], context);
+    if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
+        try validateTypeContext(ir, b, b.types[index], context);
+    }
+}
+
+fn validateContextualClosure(
+    ir: *const RustIr,
+    b: *const Bodies,
+    closure: exprs.ClosureExpr,
+    context: GenericContext,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    for (closure.captures) |capture| {
+        try validateContextualTypeRef(ir, b, capture.ty, context, context_seen);
+    }
+    if (closure.return_ty) |return_ty| {
+        try validateContextualTypeRef(ir, b, return_ty, context, context_seen);
+    }
+}
+
+fn validateContextualExpr(
+    ir: *const RustIr,
+    b: *const Bodies,
+    expression: exprs.Expr,
+    context: GenericContext,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    if (expression.ty) |type_id| {
+        try validateContextualTypeRef(ir, b, type_id, context, context_seen);
+    }
+    switch (expression.kind) {
+        .path => |path| for (path.generic_args) |argument| {
+            try validateTypeContext(ir, b, argument, context);
+        },
+        .core_call => |call| try validateCoreCall(ir, b, call, context),
+        .core_function => |function| try validateCoreFunction(ir, b, function, context),
+        .external_variant => |variant| try validateExternalVariant(ir, b, variant, context),
+        .cast => |cast| {
+            try validateTypeContext(ir, b, cast.source_type, context);
+            if (@as(usize, cast.target) < ir.types.len) {
+                try validateContextualRootType(ir, b, cast.target, context, context_seen);
+            } else {
+                try validateContextualTypeRef(ir, b, cast.target, context, context_seen);
+            }
+        },
+        .closure => |closure| try validateContextualClosure(
+            ir,
+            b,
+            closure,
+            context,
+            context_seen,
+        ),
+        .iterator_chain => |chain| {
+            switch (chain.terminal) {
+                .iterator, .collect_vec, .sum => {},
+            }
+            for (chain.adapters) |adapter| switch (adapter) {
+                .map => |map| try validateContextualClosure(
+                    ir,
+                    b,
+                    map.closure,
+                    context,
+                    context_seen,
+                ),
+                .filter => |filter| try validateContextualClosure(
+                    ir,
+                    b,
+                    filter.closure,
+                    context,
+                    context_seen,
+                ),
+                .flat_map => |closure| try validateContextualClosure(
+                    ir,
+                    b,
+                    closure,
+                    context,
+                    context_seen,
+                ),
+                .enumerate, .zip, .range_rev, .other => {},
+            };
+        },
+        else => {},
+    }
+}
+
+fn validateContextualNode(
+    ir: *const RustIr,
+    b: *const Bodies,
+    node: exprs.ReachableNode,
+    context: GenericContext,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    switch (node) {
+        .expression => |id| {
+            const index = @as(usize, id);
+            context_seen.expressions[index] = true;
+            try validateContextualExpr(ir, b, b.exprs[index], context, context_seen);
+        },
+        .statement => |id| {
+            const index = @as(usize, id);
+            const statement = b.stmts[index];
+            context_seen.statements[index] = true;
+            if (statement.ty) |type_id| {
+                try validateContextualTypeRef(ir, b, type_id, context, context_seen);
+            }
+            switch (statement.kind) {
+                .let => |let_statement| {
+                    if (let_statement.ty) |type_id| {
+                        try validateContextualTypeRef(ir, b, type_id, context, context_seen);
+                    }
+                },
+                else => {},
+            }
+        },
+        .pattern => |id| {
+            const index = @as(usize, id);
+            const pattern = b.pats[index];
+            context_seen.patterns[index] = true;
+            if (pattern.ty) |type_id| {
+                try validateContextualTypeRef(ir, b, type_id, context, context_seen);
+            }
+            switch (pattern.kind) {
+                .external_variant => |variant| {
+                    try validateExternalVariantPattern(ir, b, variant, context);
+                },
+                else => {},
+            }
+        },
+    }
+}
+
+fn validateCoreCallsInRoot(
+    ir: *const RustIr,
+    b: *const Bodies,
+    root: exprs.NodeId,
+    context: GenericContext,
+    walker: *exprs.NodeWalker,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    try walker.reset(root);
+    while (try walker.next()) |node| {
+        try validateContextualNode(ir, b, node, context, context_seen);
     }
 }
 
@@ -525,6 +1686,45 @@ fn typeSliceEqual(left: []const Type, right: []const Type) bool {
     if (left.len != right.len) return false;
     for (left, right) |left_type, right_type| {
         if (!sameType(left_type, right_type)) return false;
+    }
+    return true;
+}
+fn samePath(left: types_mod.Path, right: types_mod.Path) bool {
+    if (left.segments.len != right.segments.len) return false;
+    for (left.segments, right.segments) |left_segment, right_segment| {
+        if (!std.mem.eql(u8, left_segment.name, right_segment.name) or
+            left_segment.id != right_segment.id)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sameBound(left: types_mod.Bound, right: types_mod.Bound) bool {
+    if (left.optional != right.optional or !samePath(left.path, right.path)) return false;
+    if (left.args.len != right.args.len or
+        left.associated_types.len != right.associated_types.len)
+    {
+        return false;
+    }
+    for (left.args, right.args) |left_arg, right_arg| {
+        if (!sameType(left_arg, right_arg)) return false;
+    }
+    for (left.associated_types, right.associated_types) |left_binding, right_binding| {
+        if (!std.mem.eql(u8, left_binding.name, right_binding.name) or
+            !sameType(left_binding.ty, right_binding.ty))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sameBoundSlice(left: []const types_mod.Bound, right: []const types_mod.Bound) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_bound, right_bound| {
+        if (!sameBound(left_bound, right_bound)) return false;
     }
     return true;
 }
@@ -588,6 +1788,14 @@ fn sameType(left: Type, right: Type) bool {
                 sameType(left_result.err, right_result.err);
         },
         .boxed => |left_boxed| sameType(left_boxed.*, right.boxed.*),
+        .@"opaque" => |left_opaque| {
+            const right_opaque = right.@"opaque";
+            if (!sameBoundSlice(left_opaque.bounds, right_opaque.bounds)) return false;
+            const left_concrete = left_opaque.concrete orelse return right_opaque.concrete == null;
+            const right_concrete = right_opaque.concrete orelse return false;
+            return sameType(left_concrete.*, right_concrete.*);
+        },
+        .dyn_trait => |left_bounds| sameBoundSlice(left_bounds, right.dyn_trait),
         .unsupported => false,
     };
 }
@@ -601,39 +1809,55 @@ fn isScalarCastType(ty: Type) bool {
         else => false,
     };
 }
-const ScalarPointeeLayout = enum {
-    byte_1,
-    byte_2,
-    byte_4,
-    byte_8,
-    byte_16,
-    pointer,
-};
-
-fn scalarPointeeLayout(primitive: types_mod.Prim) ?ScalarPointeeLayout {
+fn isIntegerPrimitive(primitive: types_mod.Prim) bool {
     return switch (primitive) {
-        .i8, .u8, .bool => .byte_1,
-        .i16, .u16 => .byte_2,
-        .i32, .u32, .f32, .char => .byte_4,
-        .i64, .u64, .f64 => .byte_8,
-        .i128, .u128 => .byte_16,
-        .isize, .usize => .pointer,
-        .unit, .never => null,
+        .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => true,
+        .f32, .f64, .bool, .char, .unit, .never => false,
     };
 }
 
-fn pointerPointeesCompatible(source: Type, target: Type) bool {
-    return switch (source) {
-        .prim => |source_primitive| switch (target) {
-            .prim => |target_primitive| {
-                const source_layout = scalarPointeeLayout(source_primitive) orelse return false;
-                const target_layout = scalarPointeeLayout(target_primitive) orelse return false;
-                return source_layout == target_layout;
-            },
-            else => false,
-        },
-        else => false,
+fn isThinRawPointer(raw_ptr: *const types_mod.RawPtr) bool {
+    return switch (raw_ptr.pointee) {
+        .slice => false,
+        else => true,
     };
+}
+
+fn rawPointeesCastCompatible(
+    source_ptr: *const types_mod.RawPtr,
+    target_ptr: *const types_mod.RawPtr,
+) bool {
+    const source_is_fat = (source_ptr.pointee == .slice);
+    const target_is_fat = (target_ptr.pointee == .slice);
+    if (target_is_fat and !source_is_fat) return false;
+    return true;
+}
+
+fn referenceToRawPointerCompatible(source_ref: *const types_mod.Ref, target_raw: *const types_mod.RawPtr) bool {
+    if (target_raw.mut and !source_ref.mut) return false;
+    if (sameType(source_ref.pointee, target_raw.pointee)) return true;
+    switch (source_ref.pointee) {
+        .array => |arr| {
+            if (sameType(arr.elem, target_raw.pointee)) return true;
+            if (target_raw.pointee == .slice and sameType(arr.elem, target_raw.pointee.slice.elem)) {
+                return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn referenceArrayToSliceCompatible(
+    source_ref: *const types_mod.Ref,
+    target_slice: *const types_mod.Slice,
+) bool {
+    if (!target_slice.const_ and !source_ref.mut) return false;
+    const source_array = switch (source_ref.pointee) {
+        .array => |array| array,
+        else => return false,
+    };
+    return sameType(source_array.elem, target_slice.elem);
 }
 
 fn unsignedPrimitiveWidth(primitive: types_mod.Prim) ?u16 {
@@ -665,12 +1889,23 @@ fn isValidPrimitiveFrom(source: Type, target: Type) bool {
 fn isValidCastType(kind: exprs.ConversionKind, source: Type, target: Type) bool {
     return switch (kind) {
         .as_ => switch (target) {
-            .prim => isScalarCastType(source) and isScalarCastType(target),
+            .prim => |target_prim| blk: {
+                if (isScalarCastType(target)) {
+                    if (isScalarCastType(source) or (source == .prim and source.prim == .bool)) break :blk true;
+                    if (source == .raw_ptr and isThinRawPointer(source.raw_ptr) and isIntegerPrimitive(target_prim)) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
             .raw_ptr => |target_pointer| switch (source) {
-                .raw_ptr => |source_pointer| pointerPointeesCompatible(
-                    source_pointer.pointee,
-                    target_pointer.pointee,
-                ),
+                .raw_ptr => |source_pointer| rawPointeesCastCompatible(source_pointer, target_pointer),
+                .reference => |source_reference| referenceToRawPointerCompatible(source_reference, target_pointer),
+                .prim => |source_prim| isIntegerPrimitive(source_prim) and isThinRawPointer(target_pointer),
+                else => false,
+            },
+            .slice => |target_slice| switch (source) {
+                .reference => |source_ref| referenceArrayToSliceCompatible(source_ref, target_slice),
                 else => false,
             },
             else => false,
@@ -704,7 +1939,11 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
         .vec_lit => |vector| for (vector.elements) |id| try validateExprRef(b, id),
         .range => |range| {
             try validateExprRef(b, range.start);
-            try validateExprRef(b, range.end);
+            if (range.end) |end| {
+                try validateExprRef(b, end);
+            } else if (range.inclusive) {
+                return error.UnsupportedExpression;
+            }
         },
         .path => |path| {
             try validateEntityRef(ir, path.def);
@@ -715,10 +1954,16 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
                     return error.IncompleteGenericMetadata;
                 }
             }
-            for (path.generic_args) |arg| try validateType(ir, b, arg, &.{});
         },
         .block => |block| try validateBlock(ir, b, block, &.{}),
         .unit => {},
+        .panic_ => {
+            const type_id = expr.ty orelse return error.UnsupportedExpression;
+            switch (b.types[type_id]) {
+                .prim => |primitive| if (primitive != .never) return error.UnsupportedExpression,
+                else => return error.UnsupportedExpression,
+            }
+        },
         .if_else => |if_expr| {
             try validateExprRef(b, if_expr.cond);
             try validateBlock(ir, b, if_expr.then_, &.{});
@@ -748,7 +1993,7 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
             try validatePatRef(b, for_expr.pattern);
             try validateExprRef(b, for_expr.iterable);
             try validateBlock(ir, b, for_expr.body, &.{});
-            try validateIterKind(ir, b, for_expr.iter_kind);
+            try validateIterKind(ir, b, for_expr.iterable, for_expr.iter_kind);
         },
         .break_ => |break_expr| if (break_expr.value) |value| try validateExprRef(b, value),
         .continue_ => {},
@@ -760,6 +2005,8 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
             }
             for (call.args) |id| try validateExprRef(b, id);
         },
+        .core_call => |call| try validateCoreCallShape(b, call),
+        .core_function => {},
         .method_call => |method| {
             try validateExprRef(b, method.receiver);
             try validateEntityRef(ir, method.method);
@@ -775,6 +2022,11 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
             for (variant.tuple_fields) |id| try validateExprRef(b, id);
             for (variant.named_fields) |field| try validateFieldInit(b, field);
         },
+        .external_variant => {},
+        .format_write => |format_write| {
+            try validateExprRef(b, format_write.writer);
+            for (format_write.args) |id| try validateExprRef(b, id);
+        },
         .field => |field| {
             try validateExprRef(b, field.base);
             try validateEntityRef(ir, field.resolved);
@@ -788,7 +2040,6 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
             try validateTypeRef(b, cast.target);
             if (expr.ty == null or expr.ty.? != cast.target) return error.UnsupportedExpression;
 
-            try validateType(ir, b, cast.source_type, &.{});
             const target = if (cast.target < ir.types.len)
                 ir.types[cast.target]
             else
@@ -839,6 +2090,7 @@ fn validateElse(ir: *const RustIr, b: *const Bodies, branch: exprs.ElseBranch, g
 }
 
 fn validateFieldInit(b: *const Bodies, field: exprs.FieldInit) ValidationError!void {
+    if (field.field.len == 0) return error.IncompleteGenericMetadata;
     try validateExprRef(b, field.value);
 }
 
@@ -849,9 +2101,21 @@ fn validateClosure(ir: *const RustIr, b: *const Bodies, closure: exprs.ClosureEx
     try validateBlock(ir, b, closure.body, &.{});
 }
 
-fn validateIterKind(ir: *const RustIr, b: *const Bodies, iter_kind: exprs.IterKind) ValidationError!void {
+fn validateIterKind(
+    ir: *const RustIr,
+    b: *const Bodies,
+    iterable: exprs.NodeId,
+    iter_kind: exprs.IterKind,
+) ValidationError!void {
     switch (iter_kind) {
-        .range, .slice, .enumerate => {},
+        .range => {
+            const range = switch (b.exprs[iterable].kind) {
+                .range => |value| value,
+                else => return error.UnsupportedExpression,
+            };
+            if (range.end == null) return error.UnsupportedExpression;
+        },
+        .slice, .enumerate => {},
         .multi => |ids| for (ids) |id| try validateExprRef(b, id),
         .adapter => |adapter| try validateIteratorChain(ir, b, adapter),
     }
@@ -882,6 +2146,7 @@ fn validatePattern(ir: *const RustIr, b: *const Bodies, pattern: exprs.Pattern, 
         .path => |path| {
             try validateEntityRef(ir, path.def);
         },
+        .external_variant => {},
         .tuple => |tuple| for (tuple.elements) |id| try validatePatRef(b, id),
         .slice => |slice| {
             for (slice.elements) |id| try validatePatRef(b, id);
@@ -890,6 +2155,7 @@ fn validatePattern(ir: *const RustIr, b: *const Bodies, pattern: exprs.Pattern, 
         .struct_pat => |struct_pat| {
             try validateEntityRef(ir, struct_pat.def);
             for (struct_pat.fields) |field| {
+                if (field.field.len == 0) return error.IncompleteGenericMetadata;
                 if (field.pat) |pat| try validatePatRef(b, pat);
             }
         },
@@ -1004,6 +2270,12 @@ fn validReducedIr(allocator: std.mem.Allocator) !RustIr {
             .ty = null,
             .kind = .{ .unit = {} },
         },
+        .{
+            .id = 2,
+            .span = test_span,
+            .ty = null,
+            .kind = .{ .unit = {} },
+        },
     });
 
     const body_table = try allocator.alloc(bodies_mod.BodyKind, 7);
@@ -1023,11 +2295,11 @@ fn validReducedIr(allocator: std.mem.Allocator) !RustIr {
     } };
     body_table[4] = .{ .const_ = .{
         .ty = .{ .prim = .unit },
-        .init = 1,
+        .init = 2,
     } };
     body_table[5] = .{ .const_ = .{
         .ty = .{ .prim = .unit },
-        .init = 1,
+        .init = 2,
     } };
     body_table[6] = .{ .type_alias = .{
         .target = .{ .prim = .unit },
@@ -1046,6 +2318,127 @@ fn validReducedIr(allocator: std.mem.Allocator) !RustIr {
         },
     };
 }
+fn appendCoreCallForValidation(ir: *RustIr, call: exprs.CoreCall) !void {
+    const allocator = ir.graph.allocator;
+    const old_exprs = ir.bodies.exprs;
+    const core_call_id: exprs.NodeId = @intCast(old_exprs.len);
+    const new_exprs = try allocator.alloc(exprs.Expr, old_exprs.len + 1);
+    @memcpy(new_exprs[0..old_exprs.len], old_exprs);
+    new_exprs[@as(usize, core_call_id)] = .{
+        .id = core_call_id,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .core_call = call },
+    };
+    var root = new_exprs[0];
+    var root_block = switch (root.kind) {
+        .block => |block| block,
+        else => return error.InvalidFunctionBody,
+    };
+    root_block.tail = core_call_id;
+    root.kind = .{ .block = root_block };
+    new_exprs[0] = root;
+    ir.bodies.exprs = new_exprs;
+}
+
+test "validation accepts a core call generic in its declaring function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    var function_body = ir.bodies.bodies[1].fn_;
+    function_body.generic_params = &.{"T"};
+    @constCast(ir.bodies.bodies)[1] = .{ .fn_ = function_body };
+    try appendCoreCallForValidation(&ir, .{
+        .function = .mem_size_of,
+        .generic_args = &.{.{ .path = .{
+            .segments = &.{.{ .name = "T", .id = null }},
+        } }},
+    });
+
+    try validateForTranslation(&ir);
+}
+test "validation accepts owner-bound canonical body types in context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    var expressions = try arena.allocator().dupe(exprs.Expr, ir.bodies.exprs);
+    expressions[1].ty = 0;
+    expressions[0].kind.block.tail = 1;
+    ir.bodies.exprs = expressions;
+    ir.bodies.types = &.{.{
+        .path = .{ .segments = &.{.{ .name = "T", .id = null }} },
+    }};
+    var function_body = ir.bodies.bodies[1].fn_;
+    function_body.generic_params = &.{"T"};
+    @constCast(ir.bodies.bodies)[1] = .{ .fn_ = function_body };
+
+    try validateForTranslation(&ir);
+}
+
+test "validation rejects owner-bound canonical body types outside context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    var expressions = try arena.allocator().dupe(exprs.Expr, ir.bodies.exprs);
+    expressions[1].ty = 0;
+    expressions[0].kind.block.tail = 1;
+    ir.bodies.exprs = expressions;
+    ir.bodies.types = &.{.{
+        .path = .{ .segments = &.{.{ .name = "T", .id = null }} },
+    }};
+
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
+}
+
+test "validation rejects an invalid core call arity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    try appendCoreCallForValidation(&ir, .{
+        .function = .mem_size_of,
+        .generic_args = &.{},
+    });
+
+    try std.testing.expectError(error.InvalidCoreCallArity, validateForTranslation(&ir));
+}
+
+test "validation enforces String core call arity" {
+    const functions = [_]exprs.CoreFunction{
+        .string_from_utf8,
+        .string_from_utf8_lossy,
+        .string_from_utf8_unchecked,
+    };
+    for (functions) |function| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var ir = try validReducedIr(arena.allocator());
+        try appendCoreCallForValidation(&ir, .{
+            .function = function,
+            .generic_args = &.{.{ .prim = .u8 }},
+            .args = &.{1},
+        });
+        try std.testing.expectError(error.InvalidCoreCallArity, validateForTranslation(&ir));
+    }
+}
+
+test "validation rejects an invalid core call value reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    try appendCoreCallForValidation(&ir, .{
+        .function = .mem_size_of_val,
+        .generic_args = &.{.{ .prim = .u8 }},
+        .args = &.{99},
+    });
+
+    try std.testing.expectError(error.InvalidExprRef, validateForTranslation(&ir));
+}
+
 const CastValidationFixture = struct {
     ir: RustIr,
     cast_id: exprs.NodeId,
@@ -1520,24 +2913,26 @@ test "validation accepts a well-formed assertion marker" {
     const allocator = arena.allocator();
 
     var ir = try validReducedIr(allocator);
+    const condition_id: exprs.NodeId = @intCast(ir.bodies.exprs.len);
+    const assertion_id = condition_id + 1;
     const expressions = try allocator.alloc(exprs.Expr, ir.bodies.exprs.len + 2);
     @memcpy(expressions[0..ir.bodies.exprs.len], ir.bodies.exprs);
-    expressions[2] = .{
-        .id = 2,
+    expressions[condition_id] = .{
+        .id = condition_id,
         .span = test_span,
         .ty = null,
         .kind = .{ .literal = .{ .boolean = true } },
     };
-    expressions[3] = .{
-        .id = 3,
+    expressions[assertion_id] = .{
+        .id = assertion_id,
         .span = test_span,
         .ty = null,
         .kind = .{ .unsupported = .{
-            .reason = "assertion:2",
+            .reason = try std.fmt.allocPrint(allocator, "assertion:{d}", .{condition_id}),
             .suggested_version = .v3,
         } },
     };
-    expressions[0].kind.block.tail = 3;
+    expressions[0].kind.block.tail = assertion_id;
     ir.bodies.exprs = expressions;
 
     try validateForTranslation(&ir);

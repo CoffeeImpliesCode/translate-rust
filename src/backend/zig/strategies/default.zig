@@ -8,7 +8,7 @@
 //!
 //! Boxed types owned by a returned `ast.Type` (`.opt`, `.err_union`,
 //! `.ptr`/`.slice` element, `.array`) come from a thread-local cell pool. Tuple
-//! element slices use fixed backing storage owned by the `DefaultStrategy`
+//! elements and function parameters use fixed backing storage owned by the `DefaultStrategy`
 //! instance passed through the opaque context. A pointer returned by one
 //! lowering call stays valid until the next lowering call on the same owner —
 //! sufficient for the single-call lowering pattern the engine uses.
@@ -24,7 +24,7 @@ const BoxCells = struct {
 threadlocal var box_cells: BoxCells = .{};
 
 /// The default lowering strategy. The caller owns each strategy instance and
-/// passes its address through the opaque context for tuple lowering.
+/// passes its address through the opaque context for tuple and function types.
 pub const DefaultStrategy = struct {
     tuple_cells: [32][16]ast.Type = undefined,
     next_tuple_cell: usize = 0,
@@ -41,7 +41,7 @@ pub const DefaultStrategy = struct {
                     .elem = box(try lowerTypeImpl(ctx, a.elem)),
                     .len = switch (a.len) {
                         .literal => |n| n,
-                        .generic => 0,
+                        .generic, .expression => return error.TypeRequiresExpressionContext,
                     },
                 },
             },
@@ -49,7 +49,13 @@ pub const DefaultStrategy = struct {
                 const self: *DefaultStrategy = @ptrCast(@alignCast(ctx));
                 break :blk ast.Type{ .tuple = try lowerTuple(self, ctx, elems) };
             },
-            .fn_ptr => ast.Type{ .named = "fnptr" },
+            .fn_ptr => |function| blk: {
+                const self: *DefaultStrategy = @ptrCast(@alignCast(ctx));
+                break :blk .{ .fn_ptr = .{
+                    .params = try lowerTuple(self, ctx, function.params),
+                    .ret = box(try lowerTypeImpl(ctx, function.ret)),
+                } };
+            },
             .generic_inst => |gi| blk: {
                 const maybe = try lowerStdGeneric(ctx, "", gi.args.params);
                 break :blk maybe orelse ast.Type.any_opaque;
@@ -57,6 +63,8 @@ pub const DefaultStrategy = struct {
             .option => |inner| ast.Type{ .opt = box(try lowerTypeImpl(ctx, inner.*)) },
             .result => |r| resultToAst(ctx, r.*),
             .boxed => |inner| ast.Type{ .opt = box(try lowerTypeImpl(ctx, inner.*)) },
+            .@"opaque" => |opaque_type| try lowerTypeImpl(ctx, (opaque_type.concrete orelse return error.UnresolvedOpaqueType).*),
+            .dyn_trait => return error.UnsupportedDynamicTrait,
             .unsupported => ast.Type.any_opaque,
         };
     }
@@ -79,10 +87,11 @@ pub const DefaultStrategy = struct {
             externalPathEqual(external.path, &.{ "std", "result", "Result" }))
         {
             if (external.args.len != 2) return error.GenericArgumentArityMismatch;
-            return .{ .err_union = .{
-                .err_set = null,
-                .payload = box(try lowerTypeImpl(ctx, external.args[0])),
-            } };
+            return resultToAst(ctx, .{
+                .ok = external.args[0],
+                .err = external.args[1],
+                .is_error_unionable = false,
+            });
         }
         if (externalPathEqual(external.path, &.{ "std", "string", "String" })) {
             if (external.args.len != 0) return error.GenericArgumentArityMismatch;
@@ -149,16 +158,16 @@ pub const DefaultStrategy = struct {
     }
 
     fn resultToAst(ctx: *anyopaque, r: ir.types.Result) anyerror!ast.Type {
-        const err_unionable = switch (r.err) {
-            .prim => |p| p == .unit,
-            else => false,
-        };
-        if (err_unionable) {
+        if (r.is_error_unionable) {
             return .{ .err_union = .{
                 .payload = box(try lowerTypeImpl(ctx, r.ok)),
             } };
         }
-        return ast.Type.any_opaque;
+        const self: *DefaultStrategy = @ptrCast(@alignCast(ctx));
+        return .{ .generic = .{
+            .name = "r2z.Result",
+            .params = try self.lowerTuple(ctx, &.{ r.ok, r.err }),
+        } };
     }
 
     fn lowerPath(p: ir.types.Path) anyerror!ast.Type {

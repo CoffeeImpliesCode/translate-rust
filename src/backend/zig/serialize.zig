@@ -147,6 +147,12 @@ fn freeDecodedType(allocator: std.mem.Allocator, ty: ast.Type) void {
             freeDecodedType(allocator, err_union.payload.*);
             allocator.destroy(@constCast(err_union.payload));
         },
+        .projected => |projected| {
+            freeDecodedBytes(allocator, projected.descriptor);
+            freeDecodedType(allocator, projected.receiver.*);
+            allocator.destroy(@constCast(projected.receiver));
+            freeDecodedBytes(allocator, projected.member);
+        },
         .named => |name| freeDecodedBytes(allocator, name),
         .generic => |generic| {
             freeDecodedBytes(allocator, generic.name);
@@ -156,12 +162,73 @@ fn freeDecodedType(allocator: std.mem.Allocator, ty: ast.Type) void {
             freeDecodedType(allocator, array.elem.*);
             allocator.destroy(@constCast(array.elem));
         },
+        .array_expr => |array| {
+            freeDecodedType(allocator, array.elem.*);
+            allocator.destroy(@constCast(array.elem));
+            freeDecodedExpr(allocator, array.len.*);
+            allocator.destroy(@constCast(array.len));
+        },
         .tuple => |elements| freeDecodedTypeSlice(allocator, elements),
+        .fn_ptr => |function| {
+            freeDecodedTypeSlice(allocator, function.params);
+            freeDecodedType(allocator, function.ret.*);
+            allocator.destroy(@constCast(function.ret));
+        },
         .anon_struct => |anon_struct| {
             freeDecodedStructFieldSlice(allocator, anon_struct.fields);
         },
         .prim, .any_opaque, .void_type => {},
     }
+}
+
+fn freeDecodedTraitDescriptorMember(
+    allocator: std.mem.Allocator,
+    member: ast.TraitDescriptorMember,
+) void {
+    switch (member) {
+        .type_ => |type_member| {
+            freeDecodedBytes(allocator, type_member.name);
+            freeDecodedType(allocator, type_member.ty);
+        },
+        .const_ => |const_member| {
+            freeDecodedBytes(allocator, const_member.name);
+            freeDecodedExpr(allocator, const_member.value);
+        },
+    }
+}
+
+fn freeDecodedTraitDescriptorMemberSlice(
+    allocator: std.mem.Allocator,
+    members: []const ast.TraitDescriptorMember,
+) void {
+    for (members) |member| freeDecodedTraitDescriptorMember(allocator, member);
+    if (members.len != 0) allocator.free(members);
+}
+
+fn freeDecodedTraitDescriptorCase(
+    allocator: std.mem.Allocator,
+    descriptor_case: ast.TraitDescriptorCase,
+) void {
+    freeDecodedType(allocator, descriptor_case.receiver);
+    freeDecodedTraitDescriptorMemberSlice(allocator, descriptor_case.members);
+}
+
+fn freeDecodedTraitDescriptorCaseSlice(
+    allocator: std.mem.Allocator,
+    cases: []const ast.TraitDescriptorCase,
+) void {
+    for (cases) |descriptor_case| {
+        freeDecodedTraitDescriptorCase(allocator, descriptor_case);
+    }
+    if (cases.len != 0) allocator.free(cases);
+}
+
+fn freeDecodedTraitDescriptorDecl(
+    allocator: std.mem.Allocator,
+    descriptor: ast.TraitDescriptorDecl,
+) void {
+    freeDecodedBytes(allocator, descriptor.name);
+    freeDecodedTraitDescriptorCaseSlice(allocator, descriptor.cases);
 }
 
 fn freeDecodedTypeSlice(allocator: std.mem.Allocator, types: []const ast.Type) void {
@@ -201,10 +268,60 @@ fn freeDecodedPatternSlice(
     if (patterns.len != 0) allocator.free(patterns);
 }
 
+fn freeDecodedPatternList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.Pattern),
+) void {
+    for (list.items) |pattern| freeDecodedPattern(allocator, pattern);
+    list.deinit(allocator);
+}
+
+fn freeDecodedStructPatternField(
+    allocator: std.mem.Allocator,
+    field: ast.StructPatternField,
+) void {
+    freeDecodedBytes(allocator, field.name);
+    freeDecodedPattern(allocator, field.pat);
+}
+
+fn freeDecodedStructPatternFieldList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.StructPatternField),
+) void {
+    for (list.items) |field| freeDecodedStructPatternField(allocator, field);
+    list.deinit(allocator);
+}
+
+fn freeDecodedCapture(allocator: std.mem.Allocator, capture: ast.Capture) void {
+    freeDecodedBytes(allocator, capture.name);
+}
+
+fn freeDecodedCaptureSlice(
+    allocator: std.mem.Allocator,
+    captures: []const ast.Capture,
+) void {
+    for (captures) |capture| freeDecodedCapture(allocator, capture);
+    if (captures.len != 0) allocator.free(captures);
+}
+
+fn freeDecodedMatchArm(allocator: std.mem.Allocator, arm: ast.MatchArm) void {
+    freeDecodedPatternSlice(allocator, arm.patterns);
+    if (arm.capture) |capture| freeDecodedCapture(allocator, capture);
+    freeDecodedExpr(allocator, arm.body);
+}
+
+fn freeDecodedMatchArmList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.MatchArm),
+) void {
+    for (list.items) |arm| freeDecodedMatchArm(allocator, arm);
+    list.deinit(allocator);
+}
+
 fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
     switch (expr) {
         .lit => |literal| freeDecodedLiteral(allocator, literal),
-        .ident, .unsupported => |name| freeDecodedBytes(allocator, name),
+        .ident, .unsupported, .panic_ => |name| freeDecodedBytes(allocator, name),
         .field_access => |field_access| {
             freeDecodedExpr(allocator, field_access.target.*);
             allocator.destroy(@constCast(field_access.target));
@@ -220,10 +337,7 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
         .match_expr => |match_expr| {
             freeDecodedExpr(allocator, match_expr.target.*);
             allocator.destroy(@constCast(match_expr.target));
-            for (match_expr.arms) |arm| {
-                freeDecodedPatternSlice(allocator, arm.patterns);
-                freeDecodedExpr(allocator, arm.body);
-            }
+            for (match_expr.arms) |arm| freeDecodedMatchArm(allocator, arm);
             if (match_expr.arms.len != 0) allocator.free(match_expr.arms);
         },
         .bin_op => |bin_op| {
@@ -263,6 +377,7 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
             if (multi_array.type_name) |type_name| freeDecodedType(allocator, type_name);
             freeDecodedExprSlice(allocator, multi_array.elements);
         },
+        .tuple => |elements| freeDecodedExprSlice(allocator, elements),
         .builtin => |builtin| {
             freeDecodedBytes(allocator, builtin.name);
             freeDecodedExprSlice(allocator, builtin.args);
@@ -293,7 +408,7 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
         },
         .for_expr => |for_expr| {
             freeDecodedExprSlice(allocator, for_expr.inputs);
-            freeDecodedStringSlice(allocator, for_expr.captures);
+            freeDecodedCaptureSlice(allocator, for_expr.captures);
             freeDecodedBlock(allocator, for_expr.body);
             if (for_expr.else_body) |else_body| {
                 freeDecodedExpr(allocator, else_body.*);
@@ -314,7 +429,7 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
                 allocator.destroy(@constCast(expr_ptr));
             }
         },
-        .continue_expr => {},
+        .unit, .continue_expr => {},
     }
 }
 
@@ -440,6 +555,9 @@ fn freeDecodedFnParamSlice(
 
 fn freeDecodedDecl(allocator: std.mem.Allocator, decl: ast.Decl) void {
     switch (decl) {
+        .trait_descriptor => |descriptor| {
+            freeDecodedTraitDescriptorDecl(allocator, descriptor);
+        },
         .struct_decl => |struct_decl| {
             freeDecodedBytes(allocator, struct_decl.name);
             freeDecodedStructFieldSlice(allocator, struct_decl.fields);
@@ -561,6 +679,30 @@ fn appendDecodedExpr(
     owns_decoded = false;
 }
 
+fn appendDecodedPattern(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.Pattern),
+    value: Json,
+) !void {
+    const decoded = try decodePattern(allocator, value);
+    var owns_decoded = true;
+    errdefer if (owns_decoded) freeDecodedPattern(allocator, decoded);
+    try list.append(allocator, decoded);
+    owns_decoded = false;
+}
+
+fn appendDecodedMatchArm(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.MatchArm),
+    value: Json,
+) !void {
+    const decoded = try decodeMatchArm(allocator, value);
+    var owns_decoded = true;
+    errdefer if (owns_decoded) freeDecodedMatchArm(allocator, decoded);
+    try list.append(allocator, decoded);
+    owns_decoded = false;
+}
+
 fn appendDecodedStmt(
     allocator: std.mem.Allocator,
     list: *std.ArrayListUnmanaged(ast.Stmt),
@@ -597,6 +739,18 @@ fn appendDecodedString(
     owns_decoded = false;
 }
 
+fn appendDecodedCapture(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.Capture),
+    value: Json,
+) !void {
+    const decoded = try decodeCapture(allocator, value);
+    var owns_decoded = true;
+    errdefer if (owns_decoded) freeDecodedCapture(allocator, decoded);
+    try list.append(allocator, decoded);
+    owns_decoded = false;
+}
+
 fn freeDecodedTypeList(
     allocator: std.mem.Allocator,
     list: *std.ArrayListUnmanaged(ast.Type),
@@ -610,6 +764,14 @@ fn freeDecodedStringList(
     list: *std.ArrayListUnmanaged([]const u8),
 ) void {
     for (list.items) |string| freeDecodedBytes(allocator, string);
+    list.deinit(allocator);
+}
+
+fn freeDecodedCaptureList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ast.Capture),
+) void {
+    for (list.items) |capture| freeDecodedCapture(allocator, capture);
     list.deinit(allocator);
 }
 
@@ -834,6 +996,10 @@ pub fn encodeType(allocator: std.mem.Allocator, ty: ast.Type) anyerror!Json {
             try o.put(allocator, "elem", try encodeType(allocator, ptr.elem.*));
             try o.put(allocator, "is_const", .{ .bool = ptr.is_const });
             try o.put(allocator, "is_allowzero", .{ .bool = ptr.is_allowzero });
+            try o.put(allocator, "alignment", if (ptr.alignment) |alignment|
+                .{ .integer = alignment }
+            else
+                .null);
             try o.put(allocator, "size", .{ .string = encodePtrSize(ptr.size) });
         },
         .slice => |sl| {
@@ -849,6 +1015,12 @@ pub fn encodeType(allocator: std.mem.Allocator, ty: ast.Type) anyerror!Json {
             try o.put(allocator, "kind", .{ .string = "err_union" });
             try o.put(allocator, "err_set", encodeOptStr(eu.err_set));
             try o.put(allocator, "payload", try encodeType(allocator, eu.payload.*));
+        },
+        .projected => |projected| {
+            try o.put(allocator, "kind", .{ .string = "projected" });
+            try o.put(allocator, "descriptor", .{ .string = projected.descriptor });
+            try o.put(allocator, "receiver", try encodeType(allocator, projected.receiver.*));
+            try o.put(allocator, "member", .{ .string = projected.member });
         },
         .named => |name| {
             try o.put(allocator, "kind", .{ .string = "named" });
@@ -868,6 +1040,11 @@ pub fn encodeType(allocator: std.mem.Allocator, ty: ast.Type) anyerror!Json {
             try o.put(allocator, "elem", try encodeType(allocator, arr.elem.*));
             try o.put(allocator, "len", mkInt(arr.len));
         },
+        .array_expr => |arr| {
+            try o.put(allocator, "kind", .{ .string = "array_expr" });
+            try o.put(allocator, "elem", try encodeType(allocator, arr.elem.*));
+            try o.put(allocator, "len", try encodeExpr(allocator, arr.len.*));
+        },
         .tuple => |tup| {
             try o.put(allocator, "kind", .{ .string = "tuple" });
             var elements_arr = Array.init(allocator);
@@ -875,6 +1052,15 @@ pub fn encodeType(allocator: std.mem.Allocator, ty: ast.Type) anyerror!Json {
                 try elements_arr.append(try encodeType(allocator, t));
             }
             try o.put(allocator, "elements", .{ .array = elements_arr });
+        },
+        .fn_ptr => |function| {
+            try o.put(allocator, "kind", .{ .string = "fn_ptr" });
+            var params = Array.init(allocator);
+            for (function.params) |param| {
+                try params.append(try encodeType(allocator, param));
+            }
+            try o.put(allocator, "params", .{ .array = params });
+            try o.put(allocator, "ret", try encodeType(allocator, function.ret.*));
         },
         .anon_struct => |as| {
             try o.put(allocator, "kind", .{ .string = "anon_struct" });
@@ -903,7 +1089,9 @@ pub fn decodeType(allocator: std.mem.Allocator, v: Json) anyerror!ast.Type {
         return .{ .prim = try decodePrim(val) };
     } else if (std.mem.eql(u8, kind, "ptr")) {
         const elem_ptr = try allocator.create(ast.Type);
+        errdefer allocator.destroy(elem_ptr);
         elem_ptr.* = try decodeType(allocator, try req(o, "elem"));
+        errdefer freeDecodedType(allocator, elem_ptr.*);
         const is_const = try reqBool(o, "is_const");
         const is_allowzero = if (o.get("is_allowzero")) |b| (switch (b) {
             .bool => |x| x,
@@ -911,11 +1099,16 @@ pub fn decodeType(allocator: std.mem.Allocator, v: Json) anyerror!ast.Type {
         }) else false;
         const size_str = try reqStr(o, "size");
         const size = try decodePtrSize(size_str);
+        const alignment = if (o.get("alignment")) |value|
+            if (value == .null) null else try reqU32(o, "alignment")
+        else
+            null;
         return .{
             .ptr = .{
                 .elem = elem_ptr,
                 .is_const = is_const,
                 .is_allowzero = is_allowzero,
+                .alignment = alignment,
                 .size = size,
             },
         };
@@ -943,6 +1136,25 @@ pub fn decodeType(allocator: std.mem.Allocator, v: Json) anyerror!ast.Type {
                 .payload = payload_ptr,
             },
         };
+    } else if (std.mem.eql(u8, kind, "projected")) {
+        const descriptor = try reqStr(o, "descriptor");
+        const descriptor_owned = try allocator.dupe(u8, descriptor);
+        errdefer allocator.free(descriptor_owned);
+        const receiver_ptr = try allocator.create(ast.Type);
+        receiver_ptr.* = .void_type;
+        errdefer {
+            freeDecodedType(allocator, receiver_ptr.*);
+            allocator.destroy(receiver_ptr);
+        }
+        receiver_ptr.* = try decodeType(allocator, try req(o, "receiver"));
+        const member = try reqStr(o, "member");
+        const member_owned = try allocator.dupe(u8, member);
+        errdefer allocator.free(member_owned);
+        return .{ .projected = .{
+            .descriptor = descriptor_owned,
+            .receiver = receiver_ptr,
+            .member = member_owned,
+        } };
     } else if (std.mem.eql(u8, kind, "named")) {
         const name = try reqStr(o, "name");
         return .{ .named = try allocator.dupe(u8, name) };
@@ -979,6 +1191,28 @@ pub fn decodeType(allocator: std.mem.Allocator, v: Json) anyerror!ast.Type {
                 .len = len,
             },
         };
+    } else if (std.mem.eql(u8, kind, "array_expr")) {
+        const elem_ptr = try allocator.create(ast.Type);
+        elem_ptr.* = .void_type;
+        errdefer {
+            freeDecodedType(allocator, elem_ptr.*);
+            allocator.destroy(elem_ptr);
+        }
+        elem_ptr.* = try decodeType(allocator, try req(o, "elem"));
+
+        const len_ptr = try allocator.create(ast.Expr);
+        len_ptr.* = .unit;
+        errdefer {
+            freeDecodedExpr(allocator, len_ptr.*);
+            allocator.destroy(len_ptr);
+        }
+        len_ptr.* = try decodeExpr(allocator, try req(o, "len"));
+        return .{
+            .array_expr = .{
+                .elem = elem_ptr,
+                .len = len_ptr,
+            },
+        };
     } else if (std.mem.eql(u8, kind, "tuple")) {
         const elem_v = try req(o, "elements");
         const elem_arr = switch (elem_v) {
@@ -990,6 +1224,21 @@ pub fn decodeType(allocator: std.mem.Allocator, v: Json) anyerror!ast.Type {
             try elem_list.append(allocator, try decodeType(allocator, ev));
         }
         return .{ .tuple = try elem_list.toOwnedSlice(allocator) };
+    } else if (std.mem.eql(u8, kind, "fn_ptr")) {
+        const values = switch (try req(o, "params")) {
+            .array => |array| array.items,
+            else => return error.BadWireFormat,
+        };
+        var list: std.ArrayListUnmanaged(ast.Type) = .empty;
+        errdefer freeDecodedTypeList(allocator, &list);
+        try list.ensureTotalCapacity(allocator, values.len);
+        for (values) |value| try appendDecodedType(allocator, &list, value);
+        const params = try list.toOwnedSlice(allocator);
+        errdefer freeDecodedTypeSlice(allocator, params);
+        const ret = try allocator.create(ast.Type);
+        errdefer allocator.destroy(ret);
+        ret.* = try decodeType(allocator, try req(o, "ret"));
+        return .{ .fn_ptr = .{ .params = params, .ret = ret } };
     } else if (std.mem.eql(u8, kind, "anon_struct")) {
         const fields_v = try req(o, "fields");
         const fields_arr = switch (fields_v) {
@@ -1160,36 +1409,66 @@ pub fn decodePattern(allocator: std.mem.Allocator, v: Json) anyerror!ast.Pattern
             else => return error.BadWireFormat,
         };
         var list: std.ArrayListUnmanaged(ast.Pattern) = .empty;
+        errdefer freeDecodedPatternList(allocator, &list);
         for (arr.items) |item| {
-            try list.append(allocator, try decodePattern(allocator, item));
+            try appendDecodedPattern(allocator, &list, item);
         }
         return .{ .tuple = try list.toOwnedSlice(allocator) };
     } else if (std.mem.eql(u8, kind, "struct_pat")) {
         const name = if (try optStr(o, "name")) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (name) |owned_name| freeDecodedBytes(allocator, owned_name);
         const fields_v = try req(o, "fields");
         const fields_arr = switch (fields_v) {
             .array => |a| a,
             else => return error.BadWireFormat,
         };
         var list: std.ArrayListUnmanaged(ast.StructPatternField) = .empty;
+        errdefer freeDecodedStructPatternFieldList(allocator, &list);
         for (fields_arr.items) |item| {
             const fo = try getObj(item);
             const fname = try reqStr(fo, "name");
             const fpat = try decodePattern(allocator, try req(fo, "pat"));
+            var owns_fpat = true;
+            errdefer if (owns_fpat) freeDecodedPattern(allocator, fpat);
+            const owned_fname = try allocator.dupe(u8, fname);
+            var owns_fname = true;
+            errdefer if (owns_fname) freeDecodedBytes(allocator, owned_fname);
             try list.append(allocator, .{
-                .name = try allocator.dupe(u8, fname),
+                .name = owned_fname,
                 .pat = fpat,
             });
+            owns_fname = false;
+            owns_fpat = false;
         }
+        const fields = try list.toOwnedSlice(allocator);
         return .{
             .struct_pat = .{
                 .name = name,
-                .fields = try list.toOwnedSlice(allocator),
+                .fields = fields,
             },
         };
     }
 
     return error.UnknownPatternKind;
+}
+
+fn encodeCapture(allocator: std.mem.Allocator, capture: ast.Capture) anyerror!Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "name", .{ .string = capture.name });
+    try o.put(allocator, "by_ref", .{ .bool = capture.by_ref });
+    return .{ .object = o };
+}
+
+fn decodeCapture(allocator: std.mem.Allocator, value: Json) anyerror!ast.Capture {
+    const object = try getObj(value);
+    const name = try reqStr(object, "name");
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer freeDecodedBytes(allocator, owned_name);
+    const by_ref = if (object.get("by_ref")) |encoded_by_ref| switch (encoded_by_ref) {
+        .bool => |value_by_ref| value_by_ref,
+        else => return error.BadWireFormat,
+    } else false;
+    return .{ .name = owned_name, .by_ref = by_ref };
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,6 +1531,11 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
         .call => |c| {
             try o.put(allocator, "kind", .{ .string = "call" });
             try o.put(allocator, "callee", try encodeExpr(allocator, c.callee.*));
+            var generic_args = Array.init(allocator);
+            for (c.generic_args) |argument| {
+                try generic_args.append(try encodeType(allocator, argument));
+            }
+            try o.put(allocator, "generic_args", .{ .array = generic_args });
             var args_arr = Array.init(allocator);
             for (c.args) |a| {
                 try args_arr.append(try encodeExpr(allocator, a));
@@ -1273,6 +1557,11 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
                     try pat_arr.append(try encodePattern(allocator, p));
                 }
                 try ao.put(allocator, "patterns", .{ .array = pat_arr });
+                if (arm.capture) |capture| {
+                    try ao.put(allocator, "capture", try encodeCapture(allocator, capture));
+                } else {
+                    try ao.put(allocator, "capture", .{ .null = {} });
+                }
                 try ao.put(allocator, "body", try encodeExpr(allocator, arm.body));
                 try arms_arr.append(.{ .object = ao });
             }
@@ -1341,6 +1630,14 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
             }
             try o.put(allocator, "elements", .{ .array = elem_arr });
         },
+        .tuple => |elements| {
+            try o.put(allocator, "kind", .{ .string = "tuple" });
+            var element_array = Array.init(allocator);
+            for (elements) |element| {
+                try element_array.append(try encodeExpr(allocator, element));
+            }
+            try o.put(allocator, "elements", .{ .array = element_array });
+        },
         .repeat => |rp| {
             try o.put(allocator, "kind", .{ .string = "repeat" });
             if (rp.type_name) |tn| {
@@ -1359,6 +1656,13 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
                 try args_arr.append(try encodeExpr(allocator, a));
             }
             try o.put(allocator, "args", .{ .array = args_arr });
+        },
+        .unit => {
+            try o.put(allocator, "kind", .{ .string = "unit" });
+        },
+        .panic_ => |message| {
+            try o.put(allocator, "kind", .{ .string = "panic" });
+            try o.put(allocator, "message", .{ .string = message });
         },
         .unsupported => |reason| {
             try o.put(allocator, "kind", .{ .string = "unsupported" });
@@ -1408,7 +1712,7 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
 
             var cap_arr = Array.init(allocator);
             for (fe.captures) |cap| {
-                try cap_arr.append(.{ .string = cap });
+                try cap_arr.append(try encodeCapture(allocator, cap));
             }
             try o.put(allocator, "captures", .{ .array = cap_arr });
 
@@ -1451,6 +1755,35 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
     return .{ .object = o };
 }
 
+fn decodeMatchArm(allocator: std.mem.Allocator, value: Json) anyerror!ast.MatchArm {
+    const object = try getObj(value);
+    const patterns_value = try req(object, "patterns");
+    const patterns_array = switch (patterns_value) {
+        .array => |array| array,
+        else => return error.BadWireFormat,
+    };
+    var patterns_list: std.ArrayListUnmanaged(ast.Pattern) = .empty;
+    errdefer freeDecodedPatternList(allocator, &patterns_list);
+    for (patterns_array.items) |pattern_value| {
+        try appendDecodedPattern(allocator, &patterns_list, pattern_value);
+    }
+    const patterns = try patterns_list.toOwnedSlice(allocator);
+    errdefer freeDecodedPatternSlice(allocator, patterns);
+
+    const capture = if (object.get("capture")) |capture_value|
+        if (capture_value == .null) null else try decodeCapture(allocator, capture_value)
+    else
+        null;
+    errdefer if (capture) |decoded_capture| freeDecodedCapture(allocator, decoded_capture);
+
+    const body = try decodeExpr(allocator, try req(object, "body"));
+    return .{
+        .patterns = patterns,
+        .capture = capture,
+        .body = body,
+    };
+}
+
 pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
     const o = try getObj(v);
     const kind = try reqStr(o, "kind");
@@ -1472,6 +1805,11 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
         };
     } else if (std.mem.eql(u8, kind, "call")) {
         const callee_ptr = try allocator.create(ast.Expr);
+        callee_ptr.* = .unit;
+        errdefer {
+            freeDecodedExpr(allocator, callee_ptr.*);
+            allocator.destroy(callee_ptr);
+        }
         callee_ptr.* = try decodeExpr(allocator, try req(o, "callee"));
         const args_v = try req(o, "args");
         const args_arr = switch (args_v) {
@@ -1479,13 +1817,27 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
             else => return error.BadWireFormat,
         };
         var list: std.ArrayListUnmanaged(ast.Expr) = .empty;
+        errdefer freeDecodedExprList(allocator, &list);
         for (args_arr.items) |item| {
-            try list.append(allocator, try decodeExpr(allocator, item));
+            try appendDecodedExpr(allocator, &list, item);
         }
+        const args = try list.toOwnedSlice(allocator);
+        errdefer freeDecodedExprSlice(allocator, args);
+        const generic_values = switch (try req(o, "generic_args")) {
+            .array => |array| array.items,
+            else => return error.BadWireFormat,
+        };
+        var generic_list: std.ArrayListUnmanaged(ast.Type) = .empty;
+        errdefer freeDecodedTypeList(allocator, &generic_list);
+        try generic_list.ensureTotalCapacity(allocator, generic_values.len);
+        for (generic_values) |value| try appendDecodedType(allocator, &generic_list, value);
+        const generic_args = try generic_list.toOwnedSlice(allocator);
+        errdefer freeDecodedTypeSlice(allocator, generic_args);
         return .{
             .call = .{
                 .callee = callee_ptr,
-                .args = try list.toOwnedSlice(allocator),
+                .generic_args = generic_args,
+                .args = args,
             },
         };
     } else if (std.mem.eql(u8, kind, "block")) {
@@ -1493,6 +1845,12 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
         return .{ .block = blk };
     } else if (std.mem.eql(u8, kind, "match_expr")) {
         const target_ptr = try allocator.create(ast.Expr);
+        target_ptr.* = .unit;
+        var owns_target = true;
+        errdefer if (owns_target) {
+            freeDecodedExpr(allocator, target_ptr.*);
+            allocator.destroy(target_ptr);
+        };
         target_ptr.* = try decodeExpr(allocator, try req(o, "target"));
         const arms_v = try req(o, "arms");
         const arms_arr = switch (arms_v) {
@@ -1500,27 +1858,16 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
             else => return error.BadWireFormat,
         };
         var arms_list: std.ArrayListUnmanaged(ast.MatchArm) = .empty;
+        errdefer freeDecodedMatchArmList(allocator, &arms_list);
         for (arms_arr.items) |item| {
-            const ao = try getObj(item);
-            const pat_v = try req(ao, "patterns");
-            const pat_arr = switch (pat_v) {
-                .array => |a| a,
-                else => return error.BadWireFormat,
-            };
-            var pats_list: std.ArrayListUnmanaged(ast.Pattern) = .empty;
-            for (pat_arr.items) |pv| {
-                try pats_list.append(allocator, try decodePattern(allocator, pv));
-            }
-            const body = try decodeExpr(allocator, try req(ao, "body"));
-            try arms_list.append(allocator, .{
-                .patterns = try pats_list.toOwnedSlice(allocator),
-                .body = body,
-            });
+            try appendDecodedMatchArm(allocator, &arms_list, item);
         }
+        const arms = try arms_list.toOwnedSlice(allocator);
+        owns_target = false;
         return .{
             .match_expr = .{
                 .target = target_ptr,
-                .arms = try arms_list.toOwnedSlice(allocator),
+                .arms = arms,
             },
         };
     } else if (std.mem.eql(u8, kind, "cast")) {
@@ -1630,6 +1977,16 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 .elements = try elem_list.toOwnedSlice(allocator),
             },
         };
+    } else if (std.mem.eql(u8, kind, "tuple")) {
+        const elements_value = try req(o, "elements");
+        const elements = switch (elements_value) {
+            .array => |array| array.items,
+            else => return error.BadWireFormat,
+        };
+        var decoded: std.ArrayListUnmanaged(ast.Expr) = .empty;
+        errdefer freeDecodedExprList(allocator, &decoded);
+        for (elements) |element| try appendDecodedExpr(allocator, &decoded, element);
+        return .{ .tuple = try decoded.toOwnedSlice(allocator) };
     } else if (std.mem.eql(u8, kind, "repeat")) {
         const type_name = if (o.get("type_name")) |tn| (switch (tn) {
             .null => null,
@@ -1670,6 +2027,11 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 .args = args,
             },
         };
+    } else if (std.mem.eql(u8, kind, "unit")) {
+        return .{ .unit = {} };
+    } else if (std.mem.eql(u8, kind, "panic")) {
+        const message = try reqStr(o, "message");
+        return .{ .panic_ = try allocator.dupe(u8, message) };
     } else if (std.mem.eql(u8, kind, "unsupported")) {
         const reason = try reqStr(o, "reason");
         return .{ .unsupported = try allocator.dupe(u8, reason) };
@@ -1751,14 +2113,10 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
             .array => |a| a,
             else => return error.BadWireFormat,
         };
-        var cap_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        errdefer freeDecodedStringList(allocator, &cap_list);
+        var cap_list: std.ArrayListUnmanaged(ast.Capture) = .empty;
+        errdefer freeDecodedCaptureList(allocator, &cap_list);
         for (cap_arr.items) |item| {
-            const s = switch (item) {
-                .string => |str| str,
-                else => return error.BadWireFormat,
-            };
-            try appendDecodedString(allocator, &cap_list, s);
+            try appendDecodedCapture(allocator, &cap_list, item);
         }
 
         const body = try decodeBlock(allocator, try req(o, "body"));
@@ -1779,7 +2137,7 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
         const inputs = try in_list.toOwnedSlice(allocator);
         errdefer freeDecodedExprSlice(allocator, inputs);
         const captures = try cap_list.toOwnedSlice(allocator);
-        errdefer freeDecodedStringSlice(allocator, captures);
+        errdefer freeDecodedCaptureSlice(allocator, captures);
         return .{
             .for_expr = .{
                 .inputs = inputs,
@@ -2128,6 +2486,150 @@ pub fn decodeFnParam(allocator: std.mem.Allocator, v: Json) anyerror!ast.FnParam
     };
 }
 
+fn encodeTraitDescriptorMember(
+    allocator: std.mem.Allocator,
+    member: ast.TraitDescriptorMember,
+) anyerror!Json {
+    var o = ObjectMap.empty;
+    switch (member) {
+        .type_ => |type_member| {
+            try o.put(allocator, "kind", .{ .string = "type" });
+            try o.put(allocator, "name", .{ .string = type_member.name });
+            try o.put(allocator, "ty", try encodeType(allocator, type_member.ty));
+        },
+        .const_ => |const_member| {
+            try o.put(allocator, "kind", .{ .string = "const" });
+            try o.put(allocator, "name", .{ .string = const_member.name });
+            try o.put(allocator, "value", try encodeExpr(allocator, const_member.value));
+        },
+    }
+    return .{ .object = o };
+}
+
+fn decodeTraitDescriptorMember(
+    allocator: std.mem.Allocator,
+    value: Json,
+) anyerror!ast.TraitDescriptorMember {
+    const o = try getObj(value);
+    const kind = try reqStr(o, "kind");
+    const name = try reqStr(o, "name");
+    const name_owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_owned);
+    if (std.mem.eql(u8, kind, "type")) {
+        const ty = try decodeType(allocator, try req(o, "ty"));
+        errdefer freeDecodedType(allocator, ty);
+        return .{ .type_ = .{
+            .name = name_owned,
+            .ty = ty,
+        } };
+    }
+    if (std.mem.eql(u8, kind, "const")) {
+        const value_expr = try decodeExpr(allocator, try req(o, "value"));
+        errdefer freeDecodedExpr(allocator, value_expr);
+        return .{ .const_ = .{
+            .name = name_owned,
+            .value = value_expr,
+        } };
+    }
+    return error.UnknownTraitDescriptorMemberKind;
+}
+
+fn encodeTraitDescriptorCase(
+    allocator: std.mem.Allocator,
+    descriptor_case: ast.TraitDescriptorCase,
+) anyerror!Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "receiver", try encodeType(allocator, descriptor_case.receiver));
+    var members = Array.init(allocator);
+    for (descriptor_case.members) |member| {
+        try members.append(try encodeTraitDescriptorMember(allocator, member));
+    }
+    try o.put(allocator, "members", .{ .array = members });
+    return .{ .object = o };
+}
+
+fn decodeTraitDescriptorCase(
+    allocator: std.mem.Allocator,
+    value: Json,
+) anyerror!ast.TraitDescriptorCase {
+    const o = try getObj(value);
+    const receiver = try decodeType(allocator, try req(o, "receiver"));
+    errdefer freeDecodedType(allocator, receiver);
+    const members_value = try req(o, "members");
+    const members_array = switch (members_value) {
+        .array => |array| array,
+        else => return error.BadWireFormat,
+    };
+    var members_list: std.ArrayListUnmanaged(ast.TraitDescriptorMember) = .empty;
+    errdefer {
+        for (members_list.items) |member| {
+            freeDecodedTraitDescriptorMember(allocator, member);
+        }
+        members_list.deinit(allocator);
+    }
+    for (members_array.items) |item| {
+        try members_list.append(allocator, try decodeTraitDescriptorMember(allocator, item));
+    }
+    return .{
+        .receiver = receiver,
+        .members = try members_list.toOwnedSlice(allocator),
+    };
+}
+
+fn encodeTraitDescriptorDecl(
+    allocator: std.mem.Allocator,
+    descriptor: ast.TraitDescriptorDecl,
+) anyerror!Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "kind", .{ .string = "trait_descriptor" });
+    var value = ObjectMap.empty;
+    try value.put(allocator, "name", .{ .string = descriptor.name });
+    try value.put(allocator, "is_pub", .{ .bool = descriptor.is_pub });
+    var cases = Array.init(allocator);
+    for (descriptor.cases) |descriptor_case| {
+        try cases.append(try encodeTraitDescriptorCase(allocator, descriptor_case));
+    }
+    try value.put(allocator, "cases", .{ .array = cases });
+    try o.put(allocator, "value", .{ .object = value });
+    return .{ .object = o };
+}
+
+fn decodeTraitDescriptorDecl(
+    allocator: std.mem.Allocator,
+    value: Json,
+) anyerror!ast.TraitDescriptorDecl {
+    const o = try getObj(value);
+    const descriptor_value = try req(o, "value");
+    const descriptor_object = try getObj(descriptor_value);
+    const name = try reqStr(descriptor_object, "name");
+    const name_owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_owned);
+    const is_pub = if (descriptor_object.get("is_pub")) |flag| switch (flag) {
+        .bool => |value_bool| value_bool,
+        else => true,
+    } else true;
+    const cases_value = try req(descriptor_object, "cases");
+    const cases_array = switch (cases_value) {
+        .array => |array| array,
+        else => return error.BadWireFormat,
+    };
+    var cases_list: std.ArrayListUnmanaged(ast.TraitDescriptorCase) = .empty;
+    errdefer {
+        for (cases_list.items) |descriptor_case| {
+            freeDecodedTraitDescriptorCase(allocator, descriptor_case);
+        }
+        cases_list.deinit(allocator);
+    }
+    for (cases_array.items) |item| {
+        try cases_list.append(allocator, try decodeTraitDescriptorCase(allocator, item));
+    }
+    return .{
+        .name = name_owned,
+        .is_pub = is_pub,
+        .cases = try cases_list.toOwnedSlice(allocator),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Decl Serialization
 // ---------------------------------------------------------------------------
@@ -2135,6 +2637,9 @@ pub fn decodeFnParam(allocator: std.mem.Allocator, v: Json) anyerror!ast.FnParam
 pub fn encodeDecl(allocator: std.mem.Allocator, decl: ast.Decl) anyerror!Json {
     var o = ObjectMap.empty;
     switch (decl) {
+        .trait_descriptor => |descriptor| {
+            return encodeTraitDescriptorDecl(allocator, descriptor);
+        },
         .struct_decl => |sd| {
             try o.put(allocator, "kind", .{ .string = "struct_decl" });
             var so = ObjectMap.empty;
@@ -2278,6 +2783,9 @@ pub fn encodeDecl(allocator: std.mem.Allocator, decl: ast.Decl) anyerror!Json {
 pub fn decodeDecl(allocator: std.mem.Allocator, v: Json) anyerror!ast.Decl {
     const o = try getObj(v);
     const kind = try reqStr(o, "kind");
+    if (std.mem.eql(u8, kind, "trait_descriptor")) {
+        return .{ .trait_descriptor = try decodeTraitDescriptorDecl(allocator, v) };
+    }
 
     if (std.mem.eql(u8, kind, "struct_decl")) {
         const so = try getObj(try req(o, "value"));

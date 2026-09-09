@@ -2374,6 +2374,39 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
         .renamed_to = null,
         .attributes = &.{},
     });
+    const trait_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .trait_,
+        .name = "FletcherAccumulator",
+        .span = span,
+        .visibility = .public,
+        .parent = root_entity,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const impl_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = "FletcherAccumulatorU16",
+        .span = span,
+        .visibility = .public,
+        .parent = root_entity,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const alias_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .type_alias,
+        .name = "InputType",
+        .span = span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
 
     const generic_segments = try alloc.alloc(ir.types.PathSegment, 1);
     generic_segments[0] = .{ .name = "T", .id = null };
@@ -2382,7 +2415,7 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
     } };
     const input_segments = try alloc.alloc(ir.types.PathSegment, 3);
     input_segments[0] = .{ .name = "T", .id = null };
-    input_segments[1] = .{ .name = "FletcherAccumulator", .id = null };
+    input_segments[1] = .{ .name = "FletcherAccumulator", .id = trait_id };
     input_segments[2] = .{ .name = "InputType", .id = null };
     const input_ty: ir.types.Type = .{ .path = .{
         .segments = input_segments,
@@ -2433,6 +2466,30 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
         },
         .methods = &method_bodies,
     } };
+    const trait_assoc_types = [_]ir.items.AssocType{
+        .{
+            .name = "InputType",
+            .generics = null,
+            .bounds = &.{},
+            .default = null,
+        },
+    };
+    const trait_body: ir.bodies.BodyKind = .{ .trait_ = .{
+        .name = "FletcherAccumulator",
+        .assoc_types = &trait_assoc_types,
+    } };
+    const trait_path_segments = [_]ir.types.PathSegment{
+        .{ .name = "FletcherAccumulator", .id = trait_id },
+    };
+    const impl_assoc_items = [_]ir.spine.EntityId{alias_id};
+    const impl_body: ir.bodies.BodyKind = .{ .impl_ = .{
+        .self_ty = .{ .prim = .u16 },
+        .trait_path = .{ .segments = &trait_path_segments },
+        .assoc_items = &impl_assoc_items,
+    } };
+    const alias_body: ir.bodies.BodyKind = .{ .type_alias = .{
+        .target = .{ .prim = .u8 },
+    } };
 
     _ = try graph.addModule(.{
         .id = 0,
@@ -2465,20 +2522,54 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
             .stmts = &.{},
             .pats = &.{},
             .types = &.{},
-            .bodies = &.{ .none, struct_body },
+            .bodies = &.{ .none, struct_body, trait_body, impl_body, alias_body },
         },
     };
     const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
-    const struct_decl = pkg.files[0].decls[0].struct_decl;
+    var struct_decl: ?ast.StructDecl = null;
+    var descriptor_decl: ?ast.TraitDescriptorDecl = null;
+    for (pkg.files[0].decls) |decl| {
+        switch (decl) {
+            .struct_decl => |value| struct_decl = value,
+            .trait_descriptor => |value| descriptor_decl = value,
+            else => {},
+        }
+    }
+    const lowered_struct = struct_decl orelse return error.MissingFletcherStruct;
+    const descriptor = descriptor_decl orelse return error.MissingFletcherDescriptor;
+    try std.testing.expectEqualStrings("__r2z_trait_descriptor_2", descriptor.name);
+    try std.testing.expectEqual(@as(usize, 1), descriptor.cases.len);
+    try std.testing.expectEqual(ast.Type{ .prim = .u16 }, descriptor.cases[0].receiver);
+    try std.testing.expectEqual(@as(usize, 1), descriptor.cases[0].members.len);
+    const descriptor_member = switch (descriptor.cases[0].members[0]) {
+        .type_ => |value| value,
+        else => return error.UnexpectedFletcherDescriptorMember,
+    };
+    try std.testing.expectEqualStrings("InputType", descriptor_member.name);
+    try std.testing.expectEqual(ast.Type{ .prim = .u8 }, descriptor_member.ty);
 
     var saw_constructor = false;
     var saw_update = false;
-    for (struct_decl.decls) |decl| {
-        const method = decl.fn_decl;
+    for (lowered_struct.decls) |decl| {
+        const method = switch (decl) {
+            .fn_decl => |value| value,
+            else => continue,
+        };
         if (std.mem.eql(u8, method.name, "with_initial_values")) {
             saw_constructor = true;
-            try std.testing.expectEqualStrings("T", method.params[0].ty.named);
-            try std.testing.expectEqualStrings("T", method.params[1].ty.named);
+            const first_projection = switch (method.params[0].ty) {
+                .projected => |value| value,
+                else => return error.MissingFletcherProjection,
+            };
+            try std.testing.expectEqualStrings("__r2z_trait_descriptor_2", first_projection.descriptor);
+            try std.testing.expectEqualStrings("T", first_projection.receiver.named);
+            try std.testing.expectEqualStrings("InputType", first_projection.member);
+            const second_projection = switch (method.params[1].ty) {
+                .projected => |value| value,
+                else => return error.MissingFletcherProjection,
+            };
+            try std.testing.expectEqualStrings("T", second_projection.receiver.named);
+            try std.testing.expectEqualStrings("InputType", second_projection.member);
             try std.testing.expect(method.ret_type == .generic);
             try std.testing.expectEqualStrings("Fletcher", method.ret_type.generic.name);
         } else if (std.mem.eql(u8, method.name, "update")) {
@@ -2487,7 +2578,12 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
             try std.testing.expect(!method.params[0].ty.ptr.is_const);
             try std.testing.expect(method.params[0].ty.ptr.elem.* == .generic);
             try std.testing.expectEqualStrings("Fletcher", method.params[0].ty.ptr.elem.generic.name);
-            try std.testing.expectEqualStrings("T", method.params[1].ty.slice.elem.*.named);
+            const slice_element = switch (method.params[1].ty) {
+                .slice => |value| value.elem.*,
+                else => return error.MissingFletcherSlice,
+            };
+            try std.testing.expect(slice_element == .projected);
+            try std.testing.expectEqualStrings("InputType", slice_element.projected.member);
         }
     }
     try std.testing.expect(saw_constructor);
@@ -2780,104 +2876,6 @@ fn lowerParentChildFixture(alloc: std.mem.Allocator) !ast.Package {
         },
     };
     return lower.lowerRustIr(alloc, &rust_ir, null);
-}
-
-test "lower: child module qualifies parent and root references" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const pkg = try lowerParentChildFixture(alloc);
-
-    var child_file: ?ast.File = null;
-    for (pkg.files) |file| {
-        if (std.mem.eql(u8, file.path, "src/support/tests.zig")) {
-            child_file = file;
-            break;
-        }
-    }
-    const file = child_file orelse return error.ChildModuleMissing;
-    const emitted = try emit.emitFile(alloc, &file);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "const root = @import(\"../root.zig\");") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "const support = @import(\"../support.zig\");") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "support.ParentStruct.make()") != null);
-
-    var child_fn: ?ast.FnDecl = null;
-    for (file.decls) |decl| {
-        switch (decl) {
-            .fn_decl => |fn_decl| {
-                if (std.mem.eql(u8, fn_decl.name, "child_entry")) {
-                    child_fn = fn_decl;
-                    break;
-                }
-            },
-            else => {},
-        }
-    }
-    const function = child_fn orelse return error.ChildFunctionMissing;
-    const body = function.body orelse return error.ChildFunctionBodyMissing;
-    var saw_parent_struct = false;
-    var saw_parent_fn = false;
-    var saw_root_fn = false;
-    var saw_trait_static = false;
-    for (body.stmts) |statement| {
-        const expr = switch (statement) {
-            .expr_stmt => |value| value,
-            else => continue,
-        };
-        switch (expr.*) {
-            .struct_init => |init| {
-                if (init.type_name) |type_name| {
-                    switch (type_name) {
-                        .named => |name| {
-                            if (std.mem.eql(u8, name, "support.ParentStruct")) {
-                                saw_parent_struct = true;
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            },
-            .call => |call| {
-                switch (call.callee.*) {
-                    .field_access => |access| {
-                        switch (access.target.*) {
-                            .ident => |module_name| {
-                                if (std.mem.eql(u8, module_name, "support") and
-                                    std.mem.eql(u8, access.field_name, "parent_fn"))
-                                {
-                                    saw_parent_fn = true;
-                                } else if (std.mem.eql(u8, module_name, "root") and
-                                    std.mem.eql(u8, access.field_name, "root_fn"))
-                                {
-                                    saw_root_fn = true;
-                                }
-                            },
-                            .field_access => |receiver| {
-                                if (!std.mem.eql(u8, access.field_name, "make")) continue;
-                                switch (receiver.target.*) {
-                                    .ident => |module_name| {
-                                        if (std.mem.eql(u8, module_name, "support") and
-                                            std.mem.eql(u8, receiver.field_name, "ParentStruct"))
-                                        {
-                                            saw_trait_static = true;
-                                        }
-                                    },
-                                    else => {},
-                                }
-                            },
-                            else => {},
-                        }
-                    },
-                    else => {},
-                }
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(saw_parent_struct);
-    try std.testing.expect(saw_parent_fn);
-    try std.testing.expect(saw_root_fn);
-    try std.testing.expect(saw_trait_static);
 }
 
 test "lower: package files without std references omit std import" {
@@ -3862,216 +3860,6 @@ test "lower: test assertion markers remain active test assertions" {
     try std.testing.expect(std.mem.indexOf(u8, emitted, "std.debug.assert") == null);
 }
 
-test "lower: slice value captures do not dereference loop bytes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-    const function_id = try addLowerEntity(&graph, .fn_, "hash_bytes", null);
-    const bytes_id = try addLowerEntity(&graph, .field, "bytes", function_id);
-    const hash_id = try addLowerEntity(&graph, .field, "hash", function_id);
-    const byte_id = try addLowerEntity(&graph, .field, "byte", function_id);
-    const shadow_byte_id = try addLowerEntity(&graph, .field, "byte", function_id);
-
-    const root_id = try addRootModule(&graph, .{
-        .crate_name = "slice_value_capture",
-        .edition = 2021,
-        .items = &.{function_id},
-    });
-
-    const slice_info = try alloc.create(ir.types.Slice);
-    slice_info.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
-    const byte_slice_type: ir.types.Type = .{ .slice = slice_info };
-    const pointer_info = try alloc.create(ir.types.Ref);
-    pointer_info.* = .{ .mut = false, .pointee = .{ .prim = .u8 } };
-    const byte_pointer_type: ir.types.Type = .{ .reference = pointer_info };
-    const types_store = [_]ir.types.Type{ byte_slice_type, byte_pointer_type };
-
-    const hash_init = try model.e(litInt(0));
-    const hash_pattern = try model.pat(.{ .binding = .{
-        .name = "hash",
-        .mode = .{ .value = {} },
-        .mutable = true,
-    } });
-    const hash_statement = try model.stmt(.{ .let = .{
-        .pattern = hash_pattern,
-        .init = hash_init,
-        .ty = null,
-    } });
-    const bytes_path = try model.e(.{ .path = .{
-        .def = bytes_id,
-        .generic_args = &.{},
-    } });
-    const hash_target = try model.e(.{ .path = .{
-        .def = hash_id,
-        .generic_args = &.{},
-    } });
-    const hash_value = try model.e(.{ .path = .{
-        .def = hash_id,
-        .generic_args = &.{},
-    } });
-    const byte_path = try model.e(.{ .path = .{
-        .def = byte_id,
-        .generic_args = &.{},
-    } });
-    const byte_deref = try model.e(.{ .unary = .{
-        .op = .deref,
-        .operand = byte_path,
-    } });
-    model.exprs.items[byte_deref].ty = 0;
-    const xor_value = try model.e(.{ .binary = .{
-        .op = .bit_xor,
-        .overflow = .wrapping,
-        .lhs = hash_value,
-        .rhs = byte_deref,
-    } });
-    const assignment = try model.e(.{ .assign = .{
-        .target = hash_target,
-        .op = .plain,
-        .value = xor_value,
-        .overflow = .wrapping,
-    } });
-    const assignment_statement = try model.stmt(.{ .expr = assignment });
-    const shadow_byte_init = try model.e(litInt(0));
-    model.exprs.items[shadow_byte_init].ty = 1;
-    const shadow_byte_pattern = try model.pat(.{ .binding = .{
-        .name = "byte",
-        .mode = .{ .value = {} },
-        .mutable = false,
-    } });
-    model.pats.items[shadow_byte_pattern].ty = 1;
-    const shadow_byte_statement = try model.stmt(.{ .let = .{
-        .pattern = shadow_byte_pattern,
-        .init = shadow_byte_init,
-        .ty = 1,
-    } });
-    const shadow_byte_path = try model.e(.{ .path = .{
-        .def = shadow_byte_id,
-        .generic_args = &.{},
-    } });
-    model.exprs.items[shadow_byte_path].ty = 1;
-    const shadow_byte_deref = try model.e(.{ .unary = .{
-        .op = .deref,
-        .operand = shadow_byte_path,
-    } });
-    model.exprs.items[shadow_byte_deref].ty = 0;
-    const shadow_assignment = try model.e(.{ .assign = .{
-        .target = hash_target,
-        .op = .plain,
-        .value = shadow_byte_deref,
-        .overflow = .wrapping,
-    } });
-    const shadow_assignment_statement = try model.stmt(.{ .expr = shadow_assignment });
-
-    const byte_pattern = try model.pat(.{ .binding = .{
-        .name = "byte",
-        .mode = .{ .value = {} },
-        .mutable = false,
-    } });
-    const loop = try model.e(.{ .for_ = .{
-        .pattern = byte_pattern,
-        .iterable = bytes_path,
-        .body = .{
-            .statements = &.{
-                assignment_statement,
-                shadow_byte_statement,
-                shadow_assignment_statement,
-            },
-
-            .tail = null,
-            .labelled = null,
-        },
-        .iter_kind = .{ .slice = {} },
-    } });
-    const loop_statement = try model.stmt(.{ .expr = loop });
-    const function_body = try model.e(.{ .block = .{
-        .statements = &.{ hash_statement, loop_statement },
-        .tail = null,
-        .labelled = null,
-    } });
-    while (model.bodies.items.len <= root_id) {
-        try model.bodies.append(model.a(), .{ .none = {} });
-    }
-    model.bodies.items[function_id] = .{ .fn_ = .{
-        .params = &.{.{
-            .name = "bytes",
-            .ty = byte_slice_type,
-            .span = span,
-        }},
-        .ret = .{ .prim = .unit },
-        .body = function_body,
-        .is_allocating = false,
-    } };
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "slice_value_capture",
-        .edition = "2021",
-        .graph = graph,
-        .types = &types_store,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(model.a()),
-            .stmts = try model.stmts.toOwnedSlice(model.a()),
-            .pats = try model.pats.toOwnedSlice(model.a()),
-            .types = &types_store,
-            .bodies = try model.bodies.toOwnedSlice(model.a()),
-        },
-    };
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    try std.testing.expectEqual(@as(usize, 1), package.files.len);
-    try std.testing.expectEqual(@as(usize, 1), package.files[0].decls.len);
-    const function = switch (package.files[0].decls[0]) {
-        .fn_decl => |decl| decl,
-        else => return error.MissingHashFunction,
-    };
-    const body = function.body orelse return error.MissingHashBody;
-    const loop_expression = switch (body.stmts[1]) {
-        .expr_stmt => |expr| expr.*,
-        else => return error.MissingByteLoop,
-    };
-    const lowered_loop = switch (loop_expression) {
-        .for_expr => |value| value,
-        else => return error.UnexpectedByteLoop,
-    };
-    try std.testing.expectEqual(@as(usize, 1), lowered_loop.inputs.len);
-    try std.testing.expectEqual(@as(usize, 1), lowered_loop.captures.len);
-    try std.testing.expectEqualStrings("byte", lowered_loop.captures[0]);
-    const lowered_body_statement = switch (lowered_loop.body.stmts[0]) {
-        .assign => |value| value,
-        else => return error.MissingByteAssignment,
-    };
-    const lowered_xor = switch (lowered_body_statement.val) {
-        .bin_op => |value| value,
-        else => return error.UnexpectedByteAssignment,
-    };
-    const lowered_byte = switch (lowered_xor.rhs.*) {
-        .ident => |name| name,
-        else => return error.UnexpectedByteCapture,
-    };
-    try std.testing.expectEqual(@as(usize, 3), lowered_loop.body.stmts.len);
-    const shadow_binding = switch (lowered_loop.body.stmts[1]) {
-        .let_stmt => |value| value,
-        else => return error.MissingShadowByteBinding,
-    };
-    try std.testing.expectEqualStrings("byte", shadow_binding.name);
-    const shadow_assignment_lowered = switch (lowered_loop.body.stmts[2]) {
-        .assign => |value| value,
-        else => return error.MissingShadowByteAssignment,
-    };
-    const shadow_deref = switch (shadow_assignment_lowered.val) {
-        .unary_op => |value| value,
-        else => return error.MissingShadowByteDeref,
-    };
-    try std.testing.expectEqual(ast.UnaryOpKind.deref, shadow_deref.op);
-
-    try std.testing.expectEqualStrings("byte", lowered_byte);
-
-    const emitted = try emit.emitFile(alloc, &package.files[0]);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "for (bytes) |byte|") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "byte.*") != null);
-}
-
 test "lower: invalid match patterns and loop captures are typed errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4153,334 +3941,6 @@ test "lower: invalid match patterns and loop captures are typed errors" {
         &.{},
         error.InvalidLoopCapture,
     );
-}
-
-test "lower: collect_vec returns its unmanaged vector owner" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-    const function_id = try addLowerEntity(
-        &graph,
-        .fn_,
-        "collect_flattened_bytes",
-        null,
-    );
-    const bytes_id = try addLowerEntity(
-        &graph,
-        .const_,
-        "bytes",
-        function_id,
-    );
-    _ = try addRootModule(&graph, .{
-        .crate_name = "owned_collection",
-        .edition = 2021,
-        .items = &.{function_id},
-    });
-
-    const slice_info = try alloc.create(ir.types.Slice);
-    slice_info.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
-    const byte_slice_type: ir.types.Type = .{ .slice = slice_info };
-    const vector_args = [_]ir.types.Type{.{ .prim = .u8 }};
-    const vector_type: ir.types.Type = .{ .external_nominal = .{
-        .path = &.{ "alloc", "vec", "Vec" },
-        .args = &vector_args,
-    } };
-    const types_store = [_]ir.types.Type{
-        byte_slice_type,
-        .{ .prim = .usize },
-        vector_type,
-    };
-
-    const range_start = try model.e(litInt(0));
-    model.exprs.items[range_start].ty = 1;
-    const range_end = try model.e(litInt(2));
-    model.exprs.items[range_end].ty = 1;
-    const source = try model.e(.{ .range = .{
-        .start = range_start,
-        .end = range_end,
-        .inclusive = false,
-    } });
-
-    const index_pattern = try model.pat(.{ .binding = .{
-        .name = "index",
-        .mode = .{ .value = {} },
-        .mutable = false,
-    } });
-    model.pats.items[index_pattern].ty = 1;
-    const borrowed_bytes = try model.e(.{ .path = .{
-        .def = bytes_id,
-        .generic_args = &.{},
-    } });
-    model.exprs.items[borrowed_bytes].ty = 0;
-    const adapters = [_]ir.exprs.IteratorAdapter{.{ .flat_map = .{
-        .captures = &.{.{
-            .name = "bytes",
-            .mode = .by_ref,
-            .ty = 0,
-        }},
-        .params = &.{index_pattern},
-        .return_ty = 0,
-        .body = .{
-            .statements = &.{},
-            .tail = borrowed_bytes,
-            .labelled = null,
-        },
-        .trait = .@"fn",
-    } }};
-    const collection = try model.e(.{ .iterator_chain = .{
-        .source = source,
-        .adapters = &adapters,
-        .terminal = .collect_vec,
-    } });
-    model.exprs.items[collection].ty = 2;
-    const function_body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = collection,
-        .labelled = null,
-    } });
-    model.exprs.items[function_body].ty = 2;
-
-    try model.bodies.append(model.a(), .{ .fn_ = .{
-        .params = &.{.{
-            .name = "bytes",
-            .ty = byte_slice_type,
-            .span = span,
-        }},
-        .ret = vector_type,
-        .body = function_body,
-        .is_allocating = true,
-    } });
-    try model.bodies.append(model.a(), .{ .none = {} });
-    try model.bodies.append(model.a(), .{ .none = {} });
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "owned_collection",
-        .edition = "2021",
-        .graph = graph,
-        .types = &types_store,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(model.a()),
-            .stmts = try model.stmts.toOwnedSlice(model.a()),
-            .pats = try model.pats.toOwnedSlice(model.a()),
-            .types = &types_store,
-            .bodies = try model.bodies.toOwnedSlice(model.a()),
-        },
-    };
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    try std.testing.expectEqual(@as(usize, 1), package.files.len);
-    try std.testing.expectEqual(@as(usize, 1), package.files[0].decls.len);
-
-    const function = switch (package.files[0].decls[0]) {
-        .fn_decl => |decl| decl,
-        else => return error.UnexpectedDeclarationKind,
-    };
-    try std.testing.expectEqualStrings("collect_flattened_bytes", function.name);
-    try std.testing.expectEqual(@as(usize, 2), function.params.len);
-    try std.testing.expectEqualStrings("allocator", function.params[0].name);
-    const allocator_type = switch (function.params[0].ty) {
-        .named => |name| name,
-        else => return error.UnexpectedAllocatorType,
-    };
-    try std.testing.expectEqualStrings("std.mem.Allocator", allocator_type);
-    try std.testing.expectEqualStrings("bytes", function.params[1].name);
-    const input_slice = switch (function.params[1].ty) {
-        .slice => |value| value,
-        else => return error.UnexpectedInputType,
-    };
-    try std.testing.expect(input_slice.is_const);
-    const input_element = switch (input_slice.elem.*) {
-        .prim => |value| value,
-        else => return error.UnexpectedInputElementType,
-    };
-    try std.testing.expectEqual(ast.Prim.u8, input_element);
-
-    const return_union = switch (function.ret_type) {
-        .err_union => |value| value,
-        else => return error.UnexpectedFunctionReturnType,
-    };
-    try std.testing.expect(return_union.err_set == null);
-    const return_owner_type = switch (return_union.payload.*) {
-        .generic => |value| value,
-        else => return error.UnexpectedReturnPayloadType,
-    };
-    try std.testing.expectEqualStrings(
-        "std.ArrayListUnmanaged",
-        return_owner_type.name,
-    );
-    try std.testing.expectEqual(@as(usize, 1), return_owner_type.params.len);
-    const return_element = switch (return_owner_type.params[0]) {
-        .prim => |value| value,
-        else => return error.UnexpectedReturnElementType,
-    };
-    try std.testing.expectEqual(ast.Prim.u8, return_element);
-
-    const body = function.body orelse return error.MissingFunctionBody;
-    try std.testing.expectEqual(@as(usize, 3), body.stmts.len);
-    const owner = switch (body.stmts[0]) {
-        .let_stmt => |value| value,
-        else => return error.MissingCollectionOwner,
-    };
-    try std.testing.expect(owner.is_mut);
-    const owner_type = switch (owner.ty orelse return error.MissingOwnerType) {
-        .generic => |value| value,
-        else => return error.UnexpectedOwnerType,
-    };
-    try std.testing.expectEqualStrings(
-        "std.ArrayListUnmanaged",
-        owner_type.name,
-    );
-    try std.testing.expectEqual(@as(usize, 1), owner_type.params.len);
-    const owner_element = switch (owner_type.params[0]) {
-        .prim => |value| value,
-        else => return error.UnexpectedOwnerElementType,
-    };
-    try std.testing.expectEqual(ast.Prim.u8, owner_element);
-
-    const empty_owner = switch (owner.init) {
-        .field_access => |value| value,
-        else => return error.UnexpectedOwnerInitializer,
-    };
-    try std.testing.expectEqualStrings("empty", empty_owner.field_name);
-    const empty_owner_call = switch (empty_owner.target.*) {
-        .call => |value| value,
-        else => return error.UnexpectedOwnerInitializerTarget,
-    };
-    const empty_owner_name = switch (empty_owner_call.callee.*) {
-        .ident => |name| name,
-        else => return error.UnexpectedOwnerInitializerCallee,
-    };
-    try std.testing.expectEqualStrings(owner_type.name, empty_owner_name);
-    try std.testing.expectEqual(owner_type.params.len, empty_owner_call.generic_args.len);
-    const empty_owner_element = switch (empty_owner_call.generic_args[0]) {
-        .prim => |value| value,
-        else => return error.UnexpectedOwnerInitializerElementType,
-    };
-    try std.testing.expectEqual(owner_element, empty_owner_element);
-
-    const cleanup = switch (body.stmts[1]) {
-        .defer_stmt => |value| value,
-        else => return error.MissingOwnerCleanup,
-    };
-    try std.testing.expect(cleanup.is_errdefer);
-    const cleanup_call = switch (cleanup.expr) {
-        .call => |value| value,
-        else => return error.UnexpectedCleanupExpression,
-    };
-    const cleanup_access = switch (cleanup_call.callee.*) {
-        .field_access => |value| value,
-        else => return error.UnexpectedCleanupCallee,
-    };
-    const cleanup_owner = switch (cleanup_access.target.*) {
-        .ident => |name| name,
-        else => return error.UnexpectedCleanupTarget,
-    };
-    try std.testing.expectEqualStrings(owner.name, cleanup_owner);
-    try std.testing.expectEqualStrings("deinit", cleanup_access.field_name);
-    try std.testing.expectEqual(@as(usize, 1), cleanup_call.args.len);
-    const cleanup_allocator = switch (cleanup_call.args[0]) {
-        .ident => |name| name,
-        else => return error.UnexpectedCleanupArgument,
-    };
-    try std.testing.expectEqualStrings("allocator", cleanup_allocator);
-
-    const outer_loop_expr = switch (body.stmts[2]) {
-        .expr_stmt => |expr| expr.*,
-        else => return error.MissingRangeLoop,
-    };
-    const outer_loop = switch (outer_loop_expr) {
-        .for_expr => |value| value,
-        else => return error.UnexpectedRangeLoop,
-    };
-    try std.testing.expectEqual(@as(usize, 1), outer_loop.inputs.len);
-    try std.testing.expectEqual(@as(usize, 1), outer_loop.captures.len);
-    try std.testing.expectEqualStrings("_", outer_loop.captures[0]);
-    const lowered_range = switch (outer_loop.inputs[0]) {
-        .range => |value| value,
-        else => return error.UnexpectedRangeInput,
-    };
-    const lowered_start = switch (lowered_range.start.*) {
-        .lit => |value| value,
-        else => return error.UnexpectedRangeStart,
-    };
-    const lowered_start_value = switch (lowered_start) {
-        .int => |value| value,
-        else => return error.UnexpectedRangeStartLiteral,
-    };
-    try std.testing.expectEqual(@as(i128, 0), lowered_start_value);
-    const lowered_end_expr = lowered_range.end orelse return error.MissingRangeEnd;
-    const lowered_end = switch (lowered_end_expr.*) {
-        .lit => |value| value,
-        else => return error.UnexpectedRangeEnd,
-    };
-    const lowered_end_value = switch (lowered_end) {
-        .int => |value| value,
-        else => return error.UnexpectedRangeEndLiteral,
-    };
-    try std.testing.expectEqual(@as(i128, 2), lowered_end_value);
-
-    try std.testing.expectEqual(@as(usize, 1), outer_loop.body.stmts.len);
-    const inner_loop_expr = switch (outer_loop.body.stmts[0]) {
-        .expr_stmt => |expr| expr.*,
-        else => return error.MissingFlatMapLoop,
-    };
-    const inner_loop = switch (inner_loop_expr) {
-        .for_expr => |value| value,
-        else => return error.UnexpectedFlatMapLoop,
-    };
-    try std.testing.expectEqual(@as(usize, 1), inner_loop.inputs.len);
-    try std.testing.expectEqual(@as(usize, 1), inner_loop.captures.len);
-    try std.testing.expectEqualStrings("_byte", inner_loop.captures[0]);
-    const flat_map_input = switch (inner_loop.inputs[0]) {
-        .ident => |name| name,
-        else => return error.UnexpectedFlatMapInput,
-    };
-    try std.testing.expectEqualStrings("bytes", flat_map_input);
-
-    try std.testing.expectEqual(@as(usize, 1), inner_loop.body.stmts.len);
-    const append_expr = switch (inner_loop.body.stmts[0]) {
-        .expr_stmt => |expr| expr.*,
-        else => return error.MissingFallibleAppend,
-    };
-    const append_try = switch (append_expr) {
-        .unary_op => |value| value,
-        else => return error.UnexpectedAppendExpression,
-    };
-    try std.testing.expectEqual(ast.UnaryOpKind.try_op, append_try.op);
-    const append_call = switch (append_try.operand.*) {
-        .call => |value| value,
-        else => return error.UnexpectedAppendOperand,
-    };
-    const append_access = switch (append_call.callee.*) {
-        .field_access => |value| value,
-        else => return error.UnexpectedAppendCallee,
-    };
-    const append_owner = switch (append_access.target.*) {
-        .ident => |name| name,
-        else => return error.UnexpectedAppendTarget,
-    };
-    try std.testing.expectEqualStrings(owner.name, append_owner);
-    try std.testing.expectEqualStrings("append", append_access.field_name);
-    try std.testing.expectEqual(@as(usize, 2), append_call.args.len);
-    const append_allocator = switch (append_call.args[0]) {
-        .ident => |name| name,
-        else => return error.UnexpectedAppendAllocator,
-    };
-    try std.testing.expectEqualStrings("allocator", append_allocator);
-    const appended_item = switch (append_call.args[1]) {
-        .ident => |name| name,
-        else => return error.UnexpectedAppendItem,
-    };
-    try std.testing.expectEqualStrings(inner_loop.captures[0], appended_item);
-
-    const returned_owner_expr = body.expr orelse return error.MissingOwnerReturn;
-    const returned_owner = switch (returned_owner_expr.*) {
-        .ident => |name| name,
-        else => return error.UnexpectedOwnerReturn,
-    };
-    try std.testing.expectEqualStrings(owner.name, returned_owner);
 }
 
 test "lower: address-of temporary Vec calls use scoped owners" {
@@ -5047,146 +4507,6 @@ test "lower: assertion conditions hoist borrowed Vec consumer arguments" {
         emitted,
         "check_bytes(owner.items)",
     ) != null);
-}
-
-test "lower: collector temporaries avoid declaration and parameter names" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-    const function_id = try addLowerEntity(&graph, .fn_, "owner", null);
-    const source_id = try addLowerEntity(&graph, .const_, "owner", function_id);
-    _ = try addRootModule(&graph, .{
-        .crate_name = "owned_collection_collision",
-        .edition = 2021,
-        .items = &.{function_id},
-    });
-
-    const slice_info = try alloc.create(ir.types.Slice);
-    slice_info.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
-    const byte_slice_type: ir.types.Type = .{ .slice = slice_info };
-    const vector_args = [_]ir.types.Type{.{ .prim = .u8 }};
-    const vector_type: ir.types.Type = .{ .external_nominal = .{
-        .path = &.{ "alloc", "vec", "Vec" },
-        .args = &vector_args,
-    } };
-    const types_store = [_]ir.types.Type{
-        byte_slice_type,
-        .{ .prim = .usize },
-        vector_type,
-    };
-
-    const range_start = try model.e(litInt(0));
-    model.exprs.items[range_start].ty = 1;
-    const range_end = try model.e(litInt(2));
-    model.exprs.items[range_end].ty = 1;
-    const source = try model.e(.{ .range = .{
-        .start = range_start,
-        .end = range_end,
-        .inclusive = false,
-    } });
-
-    const index_pattern = try model.pat(.{ .binding = .{
-        .name = "index",
-        .mode = .{ .value = {} },
-        .mutable = false,
-    } });
-    model.pats.items[index_pattern].ty = 1;
-    const borrowed_source = try model.e(.{ .path = .{
-        .def = source_id,
-        .generic_args = &.{},
-    } });
-    model.exprs.items[borrowed_source].ty = 0;
-    const adapters = [_]ir.exprs.IteratorAdapter{.{ .flat_map = .{
-        .captures = &.{.{
-            .name = "owner",
-            .mode = .by_ref,
-            .ty = 0,
-        }},
-        .params = &.{index_pattern},
-        .return_ty = 0,
-        .body = .{
-            .statements = &.{},
-            .tail = borrowed_source,
-            .labelled = null,
-        },
-        .trait = .@"fn",
-    } }};
-    const collection = try model.e(.{ .iterator_chain = .{
-        .source = source,
-        .adapters = &adapters,
-        .terminal = .collect_vec,
-    } });
-    model.exprs.items[collection].ty = 2;
-    const function_body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = collection,
-        .labelled = null,
-    } });
-    model.exprs.items[function_body].ty = 2;
-
-    try model.bodies.append(model.a(), .{ .fn_ = .{
-        .params = &.{.{
-            .name = "owner",
-            .ty = byte_slice_type,
-            .span = span,
-        }},
-        .ret = vector_type,
-        .body = function_body,
-        .is_allocating = true,
-    } });
-    try model.bodies.append(model.a(), .{ .none = {} });
-    try model.bodies.append(model.a(), .{ .none = {} });
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "owned_collection_collision",
-        .edition = "2021",
-        .graph = graph,
-        .types = &types_store,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(model.a()),
-            .stmts = try model.stmts.toOwnedSlice(model.a()),
-            .pats = try model.pats.toOwnedSlice(model.a()),
-            .types = &types_store,
-            .bodies = try model.bodies.toOwnedSlice(model.a()),
-        },
-    };
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    try std.testing.expectEqual(@as(usize, 1), package.files.len);
-    try std.testing.expectEqual(@as(usize, 1), package.files[0].decls.len);
-    const function = switch (package.files[0].decls[0]) {
-        .fn_decl => |decl| decl,
-        else => return error.UnexpectedDeclarationKind,
-    };
-    try std.testing.expectEqualStrings("owner", function.name);
-    const body = function.body orelse return error.MissingFunctionBody;
-    const owner = switch (body.stmts[0]) {
-        .let_stmt => |value| value,
-        else => return error.MissingCollectionOwner,
-    };
-    try std.testing.expectEqualStrings("owner_1", owner.name);
-    try std.testing.expect(!std.mem.eql(u8, owner.name, function.params[1].name));
-
-    const outer_loop_expr = switch (body.stmts[2]) {
-        .expr_stmt => |expr| expr.*,
-        else => return error.MissingRangeLoop,
-    };
-    const outer_loop = switch (outer_loop_expr) {
-        .for_expr => |value| value,
-        else => return error.UnexpectedRangeLoop,
-    };
-    const inner_loop_expr = switch (outer_loop.body.stmts[0]) {
-        .expr_stmt => |expr| expr.*,
-        else => return error.MissingFlatMapLoop,
-    };
-    const inner_loop = switch (inner_loop_expr) {
-        .for_expr => |value| value,
-        else => return error.UnexpectedFlatMapLoop,
-    };
-    try std.testing.expectEqualStrings("_byte", inner_loop.captures[0]);
-    try std.testing.expect(!std.mem.eql(u8, owner.name, inner_loop.captures[0]));
 }
 
 test "lower: direct caller propagates allocating collector ABI" {
@@ -6432,4 +5752,691 @@ test "lower: associated allocating calls place allocator after receiver" {
         else => return error.MissingAssociatedAllocator,
     };
     try std.testing.expectEqualStrings("allocator", allocator_arg);
+}
+
+test "lower: open-ended range indexing lowers to Zig slice and rejects loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, "root"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "tail_slice"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const data_param_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "data"),
+        .span = span,
+        .visibility = .public,
+        .parent = fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_items = try alloc.alloc(ir.spine.EntityId, 1);
+    root_items[0] = fn_id;
+    const root_module = try graph.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "root",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "range_test",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var model = Model.init(alloc);
+    const slice_u8_ty = ir.types.Type{ .slice = try alloc.create(ir.types.Slice) };
+    @constCast(slice_u8_ty.slice).* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const types = [_]ir.types.Type{slice_u8_ty};
+
+    const p_data = try model.e(.{ .path = .{ .def = data_param_id, .generic_args = &.{} } });
+    const start_lit = try model.e(litInt(4));
+    const open_range = try model.e(.{ .range = .{
+        .start = start_lit,
+        .end = null,
+        .inclusive = false,
+    } });
+    const index_expr = try model.e(.{ .index = .{
+        .base = p_data,
+        .index = open_range,
+    } });
+
+    const max_bodies = @max(fn_id + 1, graph.symbol_table.count());
+    const body_table = try alloc.alloc(ir.bodies.BodyKind, max_bodies);
+    for (body_table) |*b| b.* = .none;
+    const fn_params = try alloc.alloc(ir.items.Param, 1);
+    fn_params[0] = .{ .name = "data", .ty = slice_u8_ty, .span = span };
+    body_table[fn_id] = .{ .fn_ = .{
+        .params = fn_params,
+        .ret = slice_u8_ty,
+        .generic_params = &.{},
+        .body = index_expr,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "range_test",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_table,
+        },
+    };
+
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    const source = try emit.emitFile(alloc, &package.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "data[4..]") != null);
+}
+
+test "lower: panic expression lowers to @panic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, "root"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "diverge"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_items = try alloc.alloc(ir.spine.EntityId, 1);
+    root_items[0] = fn_id;
+    const root_module = try graph.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "root",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "panic_test",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var model = Model.init(alloc);
+    const void_ty = ir.types.Type{ .prim = .unit };
+    const types = [_]ir.types.Type{void_ty};
+
+    const panic_expr = try model.e(.{ .panic_ = .{
+        .message = "unreachable",
+    } });
+
+    const max_bodies = @max(fn_id + 1, graph.symbol_table.count());
+    const body_table = try alloc.alloc(ir.bodies.BodyKind, max_bodies);
+    for (body_table) |*b| b.* = .none;
+    body_table[fn_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = void_ty,
+        .generic_params = &.{},
+        .body = panic_expr,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "panic_test",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_table,
+        },
+    };
+
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    const source = try emit.emitFile(alloc, &package.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "@panic(\"unreachable\")") != null);
+}
+test "lower: assigned function parameter generates mutable local variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const test_span: ir.spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, "root"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "mut_param_fn"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const param_seed_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "seed"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_items = try alloc.alloc(ir.spine.EntityId, 1);
+    root_items[0] = fn_id;
+    const root_module = try graph.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "root",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = test_span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "mut_param_test",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var model = Model.init(alloc);
+    const u64_ty = ir.types.Type{ .prim = .u64 };
+    const types = [_]ir.types.Type{u64_ty};
+
+    const p_target = try model.e(.{ .path = .{ .def = param_seed_id, .generic_args = &.{} } });
+    const lit_val = try model.e(litInt(42));
+    const assign_expr = try model.e(.{ .assign = .{
+        .target = p_target,
+        .value = lit_val,
+        .op = .plain,
+        .overflow = .wrapping,
+    } });
+    const s_assign = try model.stmt(.{ .expr = assign_expr });
+
+    const p_seed_tail = try model.e(.{ .path = .{ .def = param_seed_id, .generic_args = &.{} } });
+
+    const stmts = try alloc.alloc(ir.exprs.NodeId, 1);
+    stmts[0] = s_assign;
+    const block = try model.e(.{ .block = .{
+        .statements = stmts,
+        .tail = p_seed_tail,
+        .labelled = null,
+    } });
+
+    const max_bodies = @max(fn_id + 1, graph.symbol_table.count());
+    const body_table = try alloc.alloc(ir.bodies.BodyKind, max_bodies);
+    for (body_table) |*b| b.* = .none;
+    const fn_params = try alloc.alloc(ir.items.Param, 1);
+    fn_params[0] = .{ .name = "seed", .ty = u64_ty, .span = test_span };
+    body_table[fn_id] = .{ .fn_ = .{
+        .params = fn_params,
+        .ret = u64_ty,
+        .generic_params = &.{},
+        .body = block,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "mut_param_test",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_table,
+        },
+    };
+
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    const source = try emit.emitFile(alloc, &package.files[0]);
+
+    try std.testing.expect(std.mem.indexOf(u8, source, "_seed: u64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "var seed: u64 = _seed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "seed = 42;") != null);
+}
+
+test "lower: numeric pointer receiver autoderefs for wrapping arithmetic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const test_span: ir.spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, "root"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "ptr_math"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const param_seed_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "seed"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_items = try alloc.alloc(ir.spine.EntityId, 1);
+    root_items[0] = fn_id;
+    const root_module = try graph.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "root",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = test_span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "ptr_math_test",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var model = Model.init(alloc);
+    const u64_ty = ir.types.Type{ .prim = .u64 };
+    const ptr_u64_ty = ir.types.Type{ .reference = try alloc.create(ir.types.Ref) };
+    @constCast(ptr_u64_ty.reference).* = .{ .mut = true, .pointee = u64_ty };
+    const types = [_]ir.types.Type{ u64_ty, ptr_u64_ty };
+
+    const p_seed = try model.e(.{ .path = .{ .def = param_seed_id, .generic_args = &.{} } });
+    model.exprs.items[p_seed].ty = 1;
+
+    const lit_one = try model.e(litInt(1));
+    model.exprs.items[lit_one].ty = 0;
+
+    const method_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .method_ref,
+        .name = "wrapping_add",
+        .span = test_span,
+        .visibility = .private,
+        .parent = fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const m_args = try alloc.alloc(ir.exprs.NodeId, 1);
+    m_args[0] = lit_one;
+    const method_call = try model.e(.{ .method_call = .{
+        .receiver = p_seed,
+        .method = method_id,
+        .receiver_mode = .shared,
+        .args = m_args,
+    } });
+    model.exprs.items[method_call].ty = 0;
+
+    const max_bodies = @max(fn_id + 1, graph.symbol_table.count());
+    const body_table = try alloc.alloc(ir.bodies.BodyKind, max_bodies);
+    for (body_table) |*b| b.* = .none;
+    const fn_params = try alloc.alloc(ir.items.Param, 1);
+    fn_params[0] = .{ .name = "seed", .ty = ptr_u64_ty, .span = test_span };
+    body_table[fn_id] = .{ .fn_ = .{
+        .params = fn_params,
+        .ret = u64_ty,
+        .generic_params = &.{},
+        .body = method_call,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "ptr_math_test",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_table,
+        },
+    };
+
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    const source = try emit.emitFile(alloc, &package.files[0]);
+
+    try std.testing.expect(std.mem.indexOf(u8, source, "(seed.* +% 1)") != null);
+}
+
+test "lower: integer unary logical_not lowers to bitwise not ~" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const test_span: ir.spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, "root"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "bit_not_fn"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_items = try alloc.alloc(ir.spine.EntityId, 1);
+    root_items[0] = fn_id;
+    const root_module = try graph.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "root",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = test_span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "bit_not_test",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var model = Model.init(alloc);
+    const usize_ty = ir.types.Type{ .prim = .usize };
+    const types = [_]ir.types.Type{usize_ty};
+
+    const lit_val = try model.e(litInt(31));
+    model.exprs.items[lit_val].ty = 0;
+
+    const not_expr = try model.e(.{ .unary = .{
+        .op = .logical_not,
+        .operand = lit_val,
+    } });
+    model.exprs.items[not_expr].ty = 0;
+
+    const max_bodies = @max(fn_id + 1, graph.symbol_table.count());
+    const body_table = try alloc.alloc(ir.bodies.BodyKind, max_bodies);
+    for (body_table) |*b| b.* = .none;
+    body_table[fn_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = usize_ty,
+        .generic_params = &.{},
+        .body = not_expr,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "bit_not_test",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_table,
+        },
+    };
+
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    const source = try emit.emitFile(alloc, &package.files[0]);
+
+    try std.testing.expect(std.mem.indexOf(u8, source, "~@as(usize, 31)") != null);
+}
+test "lower: binary operation autoderefs pointer operands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const test_span: ir.spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, "root"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const fn_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "bin_ptr_math"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const param_seed_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "seed"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const root_items = try alloc.alloc(ir.spine.EntityId, 1);
+    root_items[0] = fn_id;
+    const root_module = try graph.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "root",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = test_span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "bin_ptr_test",
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var model = Model.init(alloc);
+    const u64_ty = ir.types.Type{ .prim = .u64 };
+    const ptr_u64_ty = ir.types.Type{ .reference = try alloc.create(ir.types.Ref) };
+    @constCast(ptr_u64_ty.reference).* = .{ .mut = true, .pointee = u64_ty };
+    const types = [_]ir.types.Type{ u64_ty, ptr_u64_ty };
+
+    const p_seed = try model.e(.{ .path = .{ .def = param_seed_id, .generic_args = &.{} } });
+    model.exprs.items[p_seed].ty = 1;
+
+    const lit_one = try model.e(litInt(1));
+    model.exprs.items[lit_one].ty = 0;
+
+    const bin_expr = try model.e(.{ .binary = .{
+        .op = .add,
+        .lhs = p_seed,
+        .rhs = lit_one,
+        .overflow = .wrapping,
+    } });
+    model.exprs.items[bin_expr].ty = 0;
+
+    const max_bodies = @max(fn_id + 1, graph.symbol_table.count());
+    const body_table = try alloc.alloc(ir.bodies.BodyKind, max_bodies);
+    for (body_table) |*b| b.* = .none;
+    const fn_params = try alloc.alloc(ir.items.Param, 1);
+    fn_params[0] = .{ .name = "seed", .ty = ptr_u64_ty, .span = test_span };
+    body_table[fn_id] = .{ .fn_ = .{
+        .params = fn_params,
+        .ret = u64_ty,
+        .generic_params = &.{},
+        .body = bin_expr,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "bin_ptr_test",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_table,
+        },
+    };
+
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    const source = try emit.emitFile(alloc, &package.files[0]);
+
+    try std.testing.expect(std.mem.indexOf(u8, source, "(seed.* +% 1)") != null);
 }

@@ -22,11 +22,9 @@ const exprs = ir.exprs;
 
 // ── §1 Deep structural equality ─────────────────────────────────────────────
 
-/// Structural equality of two `types.Type` values. A `Path` is compared by
-/// its last non-empty segment name only ? resolution ids are not yet
-/// guaranteed stable across every construction path, so a name comparison
-/// gives the deduplication that the emitter needs for non-generic paths
-/// (which never reach the table anyway).
+/// Structural equality of two `types.Type` values. Paths retain every segment
+/// and resolution id so associated projections from distinct generic roots do
+/// not collapse into the same instantiation.
 pub fn typeEquals(a: types.Type, b: types.Type) bool {
     return switch (a) {
         .path => |ap| switch (b) {
@@ -87,6 +85,8 @@ pub fn typeEquals(a: types.Type, b: types.Type) bool {
             .boxed => |bp| typeEquals(ap.*, bp.*),
             else => false,
         },
+        .@"opaque" => |left| if (b == .@"opaque") opaqueEquals(left, b.@"opaque") else false,
+        .dyn_trait => |left| if (b == .dyn_trait) boundsEqual(left, b.dyn_trait) else false,
         .unsupported => |ap| switch (b) {
             .unsupported => |bp| ap.reason == bp.reason and std.mem.eql(u8, ap.message, bp.message),
             else => false,
@@ -95,20 +95,31 @@ pub fn typeEquals(a: types.Type, b: types.Type) bool {
 }
 
 fn pathEquals(a: types.Path, b: types.Path) bool {
-    const an = lastSegment(a);
-    const bn = lastSegment(b);
-    return std.mem.eql(u8, an, bn);
+    if (a.segments.len != b.segments.len) return false;
+    for (a.segments, b.segments) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name) or left.id != right.id) return false;
+    }
+    return true;
 }
 
-/// Last non-empty segment name of a path (`""` if none/none non-empty).
-fn lastSegment(p: types.Path) []const u8 {
-    var i = p.segments.len;
-    while (i > 0) {
-        i -= 1;
-        const s = p.segments[i];
-        if (s.name.len > 0) return s.name;
+fn opaqueEquals(left: types.Opaque, right: types.Opaque) bool {
+    if (!boundsEqual(left.bounds, right.bounds)) return false;
+    const concrete = left.concrete orelse return right.concrete == null;
+    return typeEquals(concrete.*, (right.concrete orelse return false).*);
+}
+
+fn boundsEqual(left: []const types.Bound, right: []const types.Bound) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (a.optional != b.optional or !pathEquals(a.path, b.path)) return false;
+        if (!typesSliceEqual(a.args, b.args)) return false;
+        if (a.associated_types.len != b.associated_types.len) return false;
+        for (a.associated_types, b.associated_types) |a_binding, b_binding| {
+            if (!std.mem.eql(u8, a_binding.name, b_binding.name)) return false;
+            if (!typeEquals(a_binding.ty, b_binding.ty)) return false;
+        }
     }
-    return "";
+    return true;
 }
 
 fn arrayLenEquals(a: types.ArrayLen, b: types.ArrayLen) bool {
@@ -119,6 +130,10 @@ fn arrayLenEquals(a: types.ArrayLen, b: types.ArrayLen) bool {
         },
         .generic => |av| switch (b) {
             .generic => |bv| av == bv,
+            else => false,
+        },
+        .expression => |av| switch (b) {
+            .expression => |bv| av == bv,
             else => false,
         },
     };
@@ -205,6 +220,10 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
                     try w.append(alloc, 'g');
                     try appendInt(alloc, w, gidx);
                 },
+                .expression => |id| {
+                    try w.append(alloc, 'e');
+                    try appendInt(alloc, w, id);
+                },
             }
         },
         .tuple => |t| {
@@ -246,7 +265,36 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
             try appendMangled(alloc, w, bx.*);
             try w.appendSlice(alloc, "_box");
         },
+        .@"opaque" => |opaque_type| {
+            try w.appendSlice(alloc, "opaque");
+            try appendMangledBounds(alloc, w, opaque_type.bounds);
+            if (opaque_type.concrete) |concrete| {
+                try w.appendSlice(alloc, "_concrete_");
+                try appendMangled(alloc, w, concrete.*);
+            }
+        },
+        .dyn_trait => |bounds| {
+            try w.appendSlice(alloc, "dyn");
+            try appendMangledBounds(alloc, w, bounds);
+        },
         else => try w.appendSlice(alloc, "unsupported"),
+    }
+}
+
+fn appendMangledBounds(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), bounds: []const types.Bound) std.mem.Allocator.Error!void {
+    for (bounds) |bound| {
+        try w.appendSlice(alloc, if (bound.optional) "_maybe_" else "_bound_");
+        try appendMangledPath(alloc, w, bound.path);
+        for (bound.args) |arg| {
+            try w.appendSlice(alloc, "_arg_");
+            try appendMangled(alloc, w, arg);
+        }
+        for (bound.associated_types) |binding| {
+            try w.appendSlice(alloc, "_assoc_");
+            try appendMangledName(alloc, w, binding.name);
+            try w.append(alloc, '_');
+            try appendMangled(alloc, w, binding.ty);
+        }
     }
 }
 
@@ -259,7 +307,14 @@ fn appendInt(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), v: u64) s
 }
 
 fn appendMangledPath(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), p: types.Path) std.mem.Allocator.Error!void {
-    try appendMangledName(alloc, w, lastSegment(p));
+    if (p.segments.len == 0) {
+        try w.appendSlice(alloc, "unsupported");
+        return;
+    }
+    for (p.segments, 0..) |segment, index| {
+        if (index > 0) try w.append(alloc, '_');
+        try appendMangledName(alloc, w, segment.name);
+    }
 }
 
 fn appendMangledName(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), name: []const u8) std.mem.Allocator.Error!void {
@@ -386,7 +441,85 @@ const Visited = struct {
     }
 };
 
-/// Determine whether a `Type` reachable through the model is itself a generic
+/// A generic-instantiation record is emitted only for concrete arguments.
+/// Generic declaration signatures such as `Fletcher<T>` are traversed for
+/// nested types but must not become monomorphization records: their `T` path
+/// is valid only in the declaration's generic scope, not as a standalone
+/// instantiation argument.
+fn isConcreteType(ty: types.Type) bool {
+    if (!hasValidTypeTag(ty)) return false;
+    return switch (ty) {
+        .path => |path| blk: {
+            if (path.segments.len == 0) break :blk false;
+            const first = path.segments[0];
+            const lexical_root = std.mem.eql(u8, first.name, "crate") or
+                std.mem.eql(u8, first.name, "self") or
+                std.mem.eql(u8, first.name, "super");
+            if (first.id == null and !lexical_root) break :blk false;
+            const terminal = path.segments[path.segments.len - 1];
+            break :blk terminal.id != null;
+        },
+        .external_nominal => |external| blk: {
+            if (external.path.len == 0) break :blk false;
+            for (external.args) |arg| {
+                if (!isConcreteType(arg)) break :blk false;
+            }
+            break :blk true;
+        },
+        .prim => true,
+        .reference => |reference| isConcreteType(reference.pointee),
+        .raw_ptr => |raw_ptr| isConcreteType(raw_ptr.pointee),
+        .slice => |slice| isConcreteType(slice.elem),
+        .array => |array| switch (array.len) {
+            .literal => isConcreteType(array.elem),
+            .generic, .expression => false,
+        },
+        .tuple => |tuple| blk: {
+            for (tuple) |element| {
+                if (!isConcreteType(element)) break :blk false;
+            }
+            break :blk true;
+        },
+        .fn_ptr => |fn_ptr| blk: {
+            for (fn_ptr.params) |param| {
+                if (!isConcreteType(param)) break :blk false;
+            }
+            break :blk isConcreteType(fn_ptr.ret);
+        },
+        .generic_inst => |generic| blk: {
+            if (generic.decl == std.math.maxInt(spine.EntityId)) break :blk false;
+            for (generic.args.params) |arg| {
+                if (!isConcreteType(arg)) break :blk false;
+            }
+            break :blk true;
+        },
+        .option => |inner| isConcreteType(inner.*),
+        .result => |result| isConcreteType(result.ok) and isConcreteType(result.err),
+        .boxed => |inner| isConcreteType(inner.*),
+        .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete| isConcreteType(concrete.*) else false,
+        .dyn_trait => |bounds| concreteBounds(bounds),
+        .unsupported => false,
+    };
+}
+
+fn concreteBounds(bounds: []const types.Bound) bool {
+    for (bounds) |bound| {
+        if (!concreteArgs(bound.args)) return false;
+        for (bound.associated_types) |binding| {
+            if (!isConcreteType(binding.ty)) return false;
+        }
+    }
+    return true;
+}
+
+fn concreteArgs(args: []const types.Type) bool {
+    for (args) |arg| {
+        if (!isConcreteType(arg)) return false;
+    }
+    return true;
+}
+
+/// Determine whether a Type reachable through the model is itself a generic
 /// instantiation; register it (and recurse into its nested args). Repeated
 /// registration is deduplicated by `addOrGet`, so a simple recursive scan is
 /// safe.
@@ -394,10 +527,10 @@ fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, ty: types.T
     if (!hasValidTypeTag(ty)) return;
     switch (ty) {
         .generic_inst => |g| {
-            // A generic_inst guards on decl + args; only register when it has
-            // at least one concrete argument (a no-arg "generic" is not a
-            // monomorphization and would produce an empty suffix).
-            if (g.args.params.len > 0) {
+            // Declaration signatures can contain `Wrapper<T>`. It is not a
+            // concrete instantiation until every argument has a resolved
+            // nominal identity (or is otherwise structurally concrete).
+            if (g.args.params.len > 0 and concreteArgs(g.args.params)) {
                 _ = try table.addOrGet(alloc, g.decl, g.args);
             }
             for (g.args.params) |a| try collectType(table, alloc, a);
@@ -420,7 +553,19 @@ fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, ty: types.T
             try collectType(table, alloc, r.err);
         },
         .boxed => |bx| try collectType(table, alloc, bx.*),
+        .@"opaque" => |opaque_type| {
+            try collectBounds(table, alloc, opaque_type.bounds);
+            if (opaque_type.concrete) |concrete| try collectType(table, alloc, concrete.*);
+        },
+        .dyn_trait => |bounds| try collectBounds(table, alloc, bounds),
         else => {},
+    }
+}
+
+fn collectBounds(table: *InstantiationTable, alloc: std.mem.Allocator, bounds: []const types.Bound) std.mem.Allocator.Error!void {
+    for (bounds) |bound| {
+        for (bound.args) |arg| try collectType(table, alloc, arg);
+        for (bound.associated_types) |binding| try collectType(table, alloc, binding.ty);
     }
 }
 
@@ -443,7 +588,7 @@ fn collectExpr(
     }
     switch (e.kind) {
         .path => |p| {
-            if (p.generic_args.len > 0) {
+            if (p.generic_args.len > 0 and concreteArgs(p.generic_args)) {
                 _ = try table.addOrGet(alloc, p.def, .{ .params = p.generic_args });
             }
             for (p.generic_args) |a| try collectType(table, alloc, a);
@@ -488,12 +633,12 @@ fn collectExpr(
             }
         },
         .break_ => |br| if (br.value) |bval| try collectExpr(table, alloc, b, v, bval),
-        .continue_, .literal, .unit, .unsupported => {},
+        .continue_, .literal, .unit, .panic_, .unsupported => {},
         .array => |a| for (a.elements) |el| try collectExpr(table, alloc, b, v, el),
         .vec_lit => |vec| for (vec.elements) |el| try collectExpr(table, alloc, b, v, el),
         .range => |range| {
             try collectExpr(table, alloc, b, v, range.start);
-            try collectExpr(table, alloc, b, v, range.end);
+            if (range.end) |end| try collectExpr(table, alloc, b, v, end);
         },
         .call => |c| for (c.args) |a| try collectExpr(table, alloc, b, v, a),
         .method_call => |mc| {
@@ -507,6 +652,20 @@ fn collectExpr(
         .enum_variant => |ev| {
             for (ev.tuple_fields) |tf| try collectExpr(table, alloc, b, v, tf);
             for (ev.named_fields) |nf| try collectExpr(table, alloc, b, v, nf.value);
+        },
+        .external_variant => |variant| {
+            for (variant.tuple_fields) |field| try collectExpr(table, alloc, b, v, field);
+            for (variant.named_fields) |field| try collectExpr(table, alloc, b, v, field.value);
+        },
+        .core_function => {},
+        .core_call => |call| {
+            for (call.args) |arg| try collectExpr(table, alloc, b, v, arg);
+        },
+        .format_write => |format_write| {
+            try collectExpr(table, alloc, b, v, format_write.writer);
+            for (format_write.args) |arg| {
+                try collectExpr(table, alloc, b, v, arg);
+            }
         },
         .field => |f| try collectExpr(table, alloc, b, v, f.base),
         .index => |ix| {
@@ -612,6 +771,9 @@ fn collectPat(
         .wildcard, .literal => {},
         .binding => {},
         .path => {},
+        .external_variant => |variant| for (variant.fields) |field| {
+            if (field.pat) |pattern| try collectPat(table, alloc, b, v, pattern);
+        },
         .tuple => |t| for (t.elements) |e| try collectPat(table, alloc, b, v, e),
         .slice => |s| {
             for (s.elements) |e| try collectPat(table, alloc, b, v, e);
@@ -678,6 +840,21 @@ fn collectSignatureKind(
                 for (method.params) |param| try collectType(table, alloc, param.ty);
                 try collectType(table, alloc, method.ret);
             }
+            for (trait_body.assoc_types) |assoc| {
+                if (assoc.default) |default| try collectType(table, alloc, default);
+            }
+            for (trait_body.assoc_consts) |assoc| try collectType(table, alloc, assoc.ty);
+        },
+        .impl_ => |impl_body| {
+            try collectType(table, alloc, impl_body.self_ty);
+            if (impl_body.generics) |generics| {
+                for (generics.params) |param| {
+                    switch (param) {
+                        .const_ => |constant| try collectType(table, alloc, constant.ty),
+                        else => {},
+                    }
+                }
+            }
         },
         .const_ => |constant| try collectType(table, alloc, constant.ty),
         .fn_ => |function| {
@@ -715,7 +892,7 @@ fn collectBodyKind(
 ) std.mem.Allocator.Error!void {
     try collectSignatureKind(table, alloc, kind);
     switch (kind) {
-        .none, .enum_, .trait_, .type_alias => {},
+        .none, .enum_, .trait_, .impl_, .type_alias => {},
         .struct_ => {},
         .const_ => |c| try collectExpr(table, alloc, b, v, c.init),
         .fn_ => |f| try collectExpr(table, alloc, b, v, f.body),
@@ -789,6 +966,23 @@ test "mangleSuffix — primitives, slices, multiple args, empty" {
     const s4 = try mangleSuffix(a, .{ .params = &.{} });
     defer a.free(s4);
     try testing.expectEqualStrings("", s4);
+}
+
+test "typeEquals and mangleSuffix retain complete associated paths" {
+    const a = testing.allocator;
+    const t_input: types.Type = .{ .path = .{ .segments = &.{
+        .{ .name = "T", .id = null },
+        .{ .name = "InputType", .id = null },
+    } } };
+    const u_input: types.Type = .{ .path = .{ .segments = &.{
+        .{ .name = "U", .id = null },
+        .{ .name = "InputType", .id = null },
+    } } };
+
+    try testing.expect(!typeEquals(t_input, u_input));
+    const suffix = try mangleSuffix(a, .{ .params = &.{t_input} });
+    defer a.free(suffix);
+    try testing.expectEqualStrings("_T_InputType", suffix);
 }
 
 test "InstantiationTable.addOrGet — dedup by id+args, distinct suffix" {

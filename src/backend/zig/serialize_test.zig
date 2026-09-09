@@ -498,3 +498,167 @@ test "serialize: package decoder releases malformed and allocation failures" {
         serialize.decodePackage(testing.allocator, malformed.value),
     );
 }
+
+fn checkTupleDecodeAllocations(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    const decoded = try serialize.decodeExpr(allocator, value);
+    defer {
+        allocator.free(decoded.tuple[0].lit.str);
+        allocator.free(decoded.tuple);
+    }
+    try testing.expectEqualStrings("value", decoded.tuple[0].lit.str);
+    try testing.expectEqual(@as(i128, 42), decoded.tuple[1].lit.int);
+}
+
+test "serialize: tuple values survive roundtrip and allocation failures" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const encoded = try serialize.encodeExpr(arena.allocator(), .{
+        .tuple = &.{
+            .{ .lit = .{ .str = "value" } },
+            .{ .lit = .{ .int = 42 } },
+        },
+    });
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkTupleDecodeAllocations,
+        .{encoded},
+    );
+}
+
+fn checkMatchDecodeAllocations(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    const decoded = try serialize.decodeExpr(allocator, value);
+    defer {
+        allocator.free(decoded.match_expr.target.ident);
+        allocator.destroy(@constCast(decoded.match_expr.target));
+        for (decoded.match_expr.arms) |arm| {
+            for (arm.patterns) |pattern| {
+                switch (pattern) {
+                    .enum_literal => |name| allocator.free(name),
+                    else => {},
+                }
+            }
+            allocator.free(arm.patterns);
+            if (arm.capture) |capture| allocator.free(capture.name);
+            allocator.free(arm.body.ident);
+        }
+        allocator.free(decoded.match_expr.arms);
+    }
+    try testing.expect(decoded.match_expr.arms[0].capture != null);
+    try testing.expect(decoded.match_expr.arms[1].capture.?.by_ref);
+}
+
+test "serialize: match captures survive roundtrip and allocation failures" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const encoded = try serialize.encodeExpr(arena.allocator(), .{
+        .match_expr = .{
+            .target = &ast.Expr{ .ident = "input" },
+            .arms = &.{
+                .{
+                    .patterns = &.{.{ .enum_literal = "value" }},
+                    .capture = .{ .name = "payload" },
+                    .body = .{ .ident = "payload" },
+                },
+                .{
+                    .patterns = &.{.{ .enum_literal = "pointer" }},
+                    .capture = .{ .name = "pointer_payload", .by_ref = true },
+                    .body = .{ .ident = "pointer_payload" },
+                },
+            },
+        },
+    });
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkMatchDecodeAllocations,
+        .{encoded},
+    );
+}
+
+fn checkArrayExprTypeAllocations(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const decoded = try serialize.decodeType(allocator, value);
+    defer {
+        const array = decoded.array_expr;
+        const call = array.len.call;
+        allocator.free(call.callee.*.ident);
+        allocator.destroy(@constCast(call.callee));
+        allocator.free(call.args);
+        allocator.destroy(@constCast(array.len));
+        allocator.destroy(@constCast(array.elem));
+    }
+    try testing.expect(decoded == .array_expr);
+    try testing.expect(decoded.array_expr.elem.* == .prim);
+    try testing.expect(decoded.array_expr.len.* == .call);
+    try testing.expectEqualStrings("arrayLen", decoded.array_expr.len.call.callee.*.ident);
+    try testing.expectEqual(@as(usize, 1), decoded.array_expr.len.call.args.len);
+}
+
+test "serialize: expression-sized arrays survive allocation failures" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const encoded = try serialize.encodeType(arena.allocator(), .{
+        .array_expr = .{
+            .elem = &ast.Type{ .prim = .u8 },
+            .len = &ast.Expr{ .call = .{
+                .callee = &ast.Expr{ .ident = "arrayLen" },
+                .args = &.{.{ .lit = .{ .int = 4 } }},
+            } },
+        },
+    });
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkArrayExprTypeAllocations,
+        .{encoded},
+    );
+}
+
+test "serialize: nested expression-sized arrays roundtrip" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const inner = ast.Type{ .array_expr = .{
+        .elem = &ast.Type{ .prim = .u8 },
+        .len = &ast.Expr{ .lit = .{ .int = 2 } },
+    } };
+    const outer = ast.Type{ .array_expr = .{
+        .elem = &inner,
+        .len = &ast.Expr{ .lit = .{ .int = 3 } },
+    } };
+
+    const decoded = try serialize.decodeType(
+        arena.allocator(),
+        try serialize.encodeType(arena.allocator(), outer),
+    );
+    try testing.expect(decoded == .array_expr);
+    try testing.expect(decoded.array_expr.elem.* == .array_expr);
+    try testing.expect(decoded.array_expr.elem.array_expr.elem.* == .prim);
+    try testing.expect(decoded.array_expr.len.* == .lit);
+    try testing.expectEqual(@as(i128, 3), decoded.array_expr.len.lit.int);
+    try testing.expect(decoded.array_expr.elem.array_expr.len.* == .lit);
+    try testing.expectEqual(@as(i128, 2), decoded.array_expr.elem.array_expr.len.lit.int);
+}
+
+test "serialize: for captures preserve pointer mode" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const encoded = try serialize.encodeExpr(arena.allocator(), .{
+        .for_expr = .{
+            .inputs = &.{.{ .ident = "items" }},
+            .captures = &.{.{ .name = "item", .by_ref = true }},
+            .body = .{
+                .stmts = &.{.{ .expr_stmt = &ast.Expr{ .ident = "item" } }},
+            },
+        },
+    });
+    const captures = encoded.object.get("captures").?.array.items;
+    try testing.expect(captures[0].object.get("by_ref").?.bool);
+
+    const decoded = try serialize.decodeExpr(arena.allocator(), encoded);
+    try testing.expect(decoded == .for_expr);
+    try testing.expectEqual(@as(usize, 1), decoded.for_expr.captures.len);
+    try testing.expectEqualStrings("item", decoded.for_expr.captures[0].name);
+    try testing.expect(decoded.for_expr.captures[0].by_ref);
+}

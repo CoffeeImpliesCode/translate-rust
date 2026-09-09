@@ -5,6 +5,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const emit = @import("emit.zig");
+const serialize = @import("serialize.zig");
 
 fn emitFile(a: std.mem.Allocator, file: ast.File) ![]const u8 {
     return emit.emitFile(a, &file);
@@ -385,6 +386,106 @@ test "emitExpr: destructuring match uses ordinary fresh names and direct capture
     try std.testing.expect(std.mem.indexOf(u8, out, "@\"match arm\"") == null);
 }
 
+test "match captures: tagged union payloads survive public roundtrip and emission" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const payload_union: ast.Decl = .{ .union_decl = .{
+        .name = "Payload",
+        .fields = &.{
+            .{ .name = "value", .ty = .{ .prim = .u32 } },
+            .{ .name = "pointer", .ty = .{ .prim = .u32 } },
+            .{ .name = "pair", .ty = .{ .anon_struct = .{ .fields = &.{
+                .{ .name = "left", .ty = .{ .prim = .u32 } },
+                .{ .name = "right", .ty = .{ .prim = .u32 } },
+            } } } },
+        },
+    } };
+    const payload_match: ast.Expr = .{ .match_expr = .{
+        .target = &ast.Expr{ .ident = "input" },
+        .arms = &.{
+            .{
+                .patterns = &.{.{ .enum_literal = "value" }},
+                .capture = .{ .name = "__r2z_match_payload" },
+                .body = .{ .ident = "__r2z_match_payload" },
+            },
+            .{
+                .patterns = &.{.{ .enum_literal = "pointer" }},
+                .capture = .{ .name = "pointer_payload", .by_ref = true },
+                .body = .{ .unary_op = .{
+                    .op = .deref,
+                    .operand = &ast.Expr{ .ident = "pointer_payload" },
+                } },
+            },
+            .{
+                .patterns = &.{.{ .struct_pat = .{
+                    .name = "pair",
+                    .fields = &.{
+                        .{ .name = "left", .pat = .{ .binding = "left" } },
+                        .{ .name = "right", .pat = .{ .binding = "right" } },
+                    },
+                } }},
+                .body = .{ .bin_op = .{
+                    .op = .add,
+                    .lhs = &ast.Expr{ .ident = "left" },
+                    .rhs = &ast.Expr{ .ident = "right" },
+                } },
+            },
+        },
+    } };
+    const read_payload: ast.Decl = .{ .fn_decl = .{
+        .name = "readPayload",
+        .params = &.{.{ .name = "input", .ty = .{ .named = "Payload" } }},
+        .ret_type = .{ .prim = .u32 },
+        .body = .{ .expr = &payload_match },
+    } };
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{ payload_union, read_payload },
+    };
+    const package: ast.Package = .{
+        .name = "match_capture",
+        .fingerprint = 0xCA97_0001,
+        .files = &.{file},
+    };
+
+    try ast.validateForTranslation(&package);
+    const encoded = try serialize.encode(allocator, &package);
+    const decoded = try serialize.decode(allocator, encoded);
+    const decoded_match = decoded.files[0].decls[1].fn_decl.body.?.expr.?.match_expr;
+    const value_capture = decoded_match.arms[0].capture.?;
+    try std.testing.expectEqualStrings("__r2z_match_payload", value_capture.name);
+    try std.testing.expect(!value_capture.by_ref);
+    const pointer_capture = decoded_match.arms[1].capture.?;
+    try std.testing.expectEqualStrings("pointer_payload", pointer_capture.name);
+    try std.testing.expect(pointer_capture.by_ref);
+    try std.testing.expect(decoded_match.arms[2].capture == null);
+
+    const source = try emit.emitFile(allocator, &decoded.files[0]);
+    try std.testing.expectEqualStrings(
+        \\pub const Payload = union(enum) {
+        \\    value: u32,
+        \\    pointer: u32,
+        \\    pair: struct { left: u32, right: u32 },
+        \\};
+        \\
+        \\pub fn readPayload(input: Payload) u32 {
+        \\    return switch (input) {
+        \\        .value => |__r2z_match_payload| __r2z_match_payload,
+        \\        .pointer => |*pointer_payload| pointer_payload.*,
+        \\        .pair => |__r2z_match_payload_1| __r2z_match_arm: {
+        \\            const left = __r2z_match_payload_1.left;
+        \\            const right = __r2z_match_payload_1.right;
+        \\            break :__r2z_match_arm (left + right);
+        \\        },
+        \\    };
+        \\}
+    ,
+        source,
+    );
+}
+
 test "emitExpr: match fresh names skip source identifiers bindings and labels" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -512,4 +613,105 @@ test "emitExpr: nested repeated destructuring names follow source order" {
         "    },\n" ++
         "}";
     try std.testing.expectEqualStrings(expected, first);
+}
+
+test "emitExpr: Rust unit uses an explicit void value" {
+    const unit: ast.Expr = .{ .unit = {} };
+    const emitted = try emitExpression(std.testing.allocator, unit);
+    defer std.testing.allocator.free(emitted);
+    try std.testing.expectEqualStrings("@as(void, {})", emitted);
+}
+
+test "expression-sized arrays survive public roundtrip and emission" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const length_call: ast.Expr = .{ .call = .{
+        .callee = &ast.Expr{ .ident = "arrayLen" },
+        .args = &.{.{ .lit = .{ .int = 4 } }},
+    } };
+    const array_type: ast.Type = .{ .array_expr = .{
+        .elem = &ast.Type{ .prim = .u8 },
+        .len = &length_call,
+    } };
+    const package: ast.Package = .{
+        .name = "expression_array",
+        .files = &.{.{
+            .path = "src/root.zig",
+            .decls = &.{
+                .{ .fn_decl = .{
+                    .name = "arrayLen",
+                    .params = &.{.{
+                        .name = "length",
+                        .ty = .{ .prim = .usize },
+                        .is_comptime = true,
+                    }},
+                    .ret_type = .{ .prim = .usize },
+                    .body = .{ .expr = &ast.Expr{ .ident = "length" } },
+                } },
+                .{ .fn_decl = .{
+                    .name = "identityArray",
+                    .params = &.{.{ .name = "input", .ty = array_type }},
+                    .ret_type = array_type,
+                    .body = .{ .expr = &ast.Expr{ .ident = "input" } },
+                } },
+            },
+        }},
+    };
+
+    try ast.validateForTranslation(&package);
+    const encoded = try serialize.encode(allocator, &package);
+    const decoded = try serialize.decode(allocator, encoded);
+    const decoded_type = decoded.files[0].decls[1].fn_decl.params[0].ty;
+    try std.testing.expect(decoded_type == .array_expr);
+    try std.testing.expect(decoded_type.array_expr.elem.* == .prim);
+    try std.testing.expect(decoded_type.array_expr.len.* == .call);
+    try std.testing.expectEqualStrings(
+        "arrayLen",
+        decoded_type.array_expr.len.call.callee.ident,
+    );
+
+    const source = try emit.emitFile(allocator, &decoded.files[0]);
+    try std.testing.expectEqualStrings(
+        \\pub fn arrayLen(comptime length: usize) usize {
+        \\    return length;
+        \\}
+        \\
+        \\pub fn identityArray(input: [arrayLen(4)]u8) [arrayLen(4)]u8 {
+        \\    return input;
+        \\}
+    ,
+        source,
+    );
+}
+
+test "emitExpr: repeated array uses the whole type's element" {
+    const expression: ast.Expr = .{ .repeat = .{
+        .type_name = .{ .array = .{
+            .elem = &ast.Type{ .prim = .u32 },
+            .len = 4,
+        } },
+        .elem = &ast.Expr{ .lit = .{ .int = 0 } },
+        .len = 4,
+    } };
+
+    const emitted = try emitExpression(std.testing.allocator, expression);
+    defer std.testing.allocator.free(emitted);
+    try std.testing.expectEqualStrings("[_]u32{ 0 } ** 4", emitted);
+}
+
+test "emitExpr: for captures emit pointer bindings" {
+    const expression: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{.{ .ident = "items" }},
+        .captures = &.{.{ .name = "item", .by_ref = true }},
+        .body = .{
+            .stmts = &.{},
+            .expr = &ast.Expr{ .ident = "item" },
+        },
+    } };
+
+    const emitted = try emitExpression(std.testing.allocator, expression);
+    defer std.testing.allocator.free(emitted);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "for (items) |*item|") != null);
 }

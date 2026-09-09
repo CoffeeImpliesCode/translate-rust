@@ -19,6 +19,8 @@
 //! `@"or"`. Trailing-underscore tags (`loop_`, `while_`, `for_`, `break_`,
 //! `continue_`, `try_`, `return_`) keep JSON discriminants valid Zig idents.
 
+const std = @import("std");
+
 const spine = @import("spine.zig");
 const types = @import("types.zig");
 
@@ -68,9 +70,13 @@ pub const ExprKind = union(enum) {
 
     // — calls & construction (§1.3) —
     call: Call,
+    core_call: CoreCall,
+    core_function: CoreFunctionValue,
     method_call: MethodCall,
     struct_lit: StructLit,
     enum_variant: EnumVariant,
+    external_variant: ExternalVariant,
+    format_write: FormatWriteExpr,
 
     // — access (§1.4) —
     field: FieldExpr,
@@ -86,13 +92,16 @@ pub const ExprKind = union(enum) {
     try_: TryExpr,
     return_: ReturnExpr,
 
-    // — deferred seams (§4, not emitted in v1) —
     closure: ClosureExpr,
     iterator_chain: IteratorChainExpr,
+
+    // — explicit divergence —
+    panic_: PanicExpr,
 
     // — explicit refusal —
     unsupported: Unsupported,
 };
+
 pub const FieldExpr = struct {
     base: NodeId,
     field: []const u8,
@@ -165,13 +174,19 @@ pub const VecLit = struct {
     repeat: ?usize,
 };
 
-/// A bounded range expression (`start..end` or `start..=end`).
-/// Both bounds are expression-table references so nested lowering passes
-/// preserve the canonical node graph.
+/// A range expression (`start..end`, `start..=end`, or `start..`).
+/// The absent end is valid for open-ended indexing/slicing only; iteration
+/// requires a bounded range.
 pub const RangeExpr = struct {
     start: NodeId,
-    end: NodeId,
+    end: ?NodeId,
     inclusive: bool = false,
+};
+
+/// A source-level panic or unreachable expression. Diverging expressions
+/// must carry the never type in their shared expression header.
+pub const PanicExpr = struct {
+    message: []const u8,
 };
 
 /// A resolved reference, not a name. Collapses Rust's `x`, `Foo::Bar` (unit
@@ -288,6 +303,41 @@ pub const Call = struct {
     args: []const NodeId,
 };
 
+/// A call to a supported Rust core or standard-library primitive.
+pub const CoreFunction = enum {
+    mem_size_of,
+    mem_transmute,
+    mem_size_of_val,
+    ptr_copy_nonoverlapping,
+    ptr_write_bytes,
+    ptr_read_unaligned,
+    slice_from_raw_parts,
+    slice_from_raw_parts_mut,
+    str_from_utf8,
+    str_from_utf8_unchecked,
+    string_from_utf8,
+    string_from_utf8_lossy,
+    string_from_utf8_unchecked,
+    cmp_min,
+    cmp_max,
+    default_value,
+    convert_from,
+};
+
+/// A core-library function item. It carries type arguments but no value
+/// arguments; applying it remains a distinct `core_call` expression.
+pub const CoreFunctionValue = struct {
+    function: CoreFunction,
+    generic_args: []const types.Type = &.{},
+};
+
+/// An actual core-library call. This never denotes a function value.
+pub const CoreCall = struct {
+    function: CoreFunction,
+    generic_args: []const types.Type = &.{},
+    args: []const NodeId = &.{},
+};
+
 pub const CallKind = union(enum) {
     free: DefId, // f(a)
     associated: DefId, // Foo::f(a) → Foo.f(a)
@@ -301,6 +351,11 @@ pub const MethodCall = struct {
     receiver_mode: ReceiverMode,
     method: DefId,
     /// Argument expression indices (expr table).
+    args: []const NodeId,
+};
+pub const FormatWriteExpr = struct {
+    writer: NodeId,
+    template: []const u8,
     args: []const NodeId,
 };
 
@@ -332,6 +387,14 @@ pub const EnumVariant = struct {
     tuple_fields: []const NodeId,
     /// Named fields (Shape::Rect { w, h }).
     named_fields: []const FieldInit,
+};
+
+/// A variant owned by an external nominal enum with no local graph entity.
+pub const ExternalVariant = struct {
+    owner: types.ExternalNominal,
+    variant: []const u8,
+    tuple_fields: []const NodeId = &.{},
+    named_fields: []const FieldInit = &.{},
 };
 
 // §1.5 Scalar conversions ───────────────────────────────────────────────────
@@ -479,6 +542,8 @@ pub const IteratorTerminal = enum {
     iterator,
     /// Materialize the chain into an owned `Vec`.
     collect_vec,
+    /// Fold the chain with integer addition.
+    sum,
 };
 
 pub const IteratorChainExpr = struct {
@@ -535,6 +600,7 @@ pub const PatternKind = union(enum) {
     binding: Binding,
     literal: Literal, // `1`, `'a'`
     path: PathPat, // unit enum variant / const pattern
+    external_variant: ExternalVariantPattern,
     tuple: TuplePat, // (a, b, ..)
     slice: SlicePat, // [a, b, ..rest, c]
     struct_pat: StructPat, // Point { x, y, .. }
@@ -582,6 +648,14 @@ pub const StructPat = struct {
     fields: []const FieldPat, // name : pat  |  shorthand name
     rest: bool, // `..`
     // #[non_exhaustive] handled at the arm/switch level.
+};
+
+/// A pattern for a variant whose enum owner has no local graph entity.
+pub const ExternalVariantPattern = struct {
+    owner: types.ExternalNominal,
+    variant: []const u8,
+    fields: []const FieldPat = &.{},
+    rest: bool = false,
 };
 
 pub const FieldPat = struct {
@@ -644,6 +718,437 @@ pub const LetElseStmt = struct {
     else_block: BlockExpr,
 };
 
+/// A typed reference into one of the three flat node tables.
+pub const ReachableNode = union(enum) {
+    expression: NodeId,
+    statement: NodeId,
+    pattern: NodeId,
+};
+
+pub const NodeWalkError = error{
+    InvalidExprRef,
+    InvalidStatementRef,
+    InvalidPatternRef,
+    InvalidTypeRef,
+    InvalidTypeTraversal,
+};
+
+/// Iterates all nodes reachable from one expression root.
+///
+/// Nodes are marked when queued, so shared subgraphs and cycles visit each
+/// table row at most once. The fixed-capacity worklist cannot exceed the total
+/// number of rows in the three node tables.
+pub const NodeWalker = struct {
+    allocator: std.mem.Allocator,
+    expressions: []const Expr,
+    statements: []const Statement,
+    patterns: []const Pattern,
+    type_table: []const types.Type,
+    seen: []bool,
+    worklist: []ReachableNode,
+    worklist_len: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        expressions: []const Expr,
+        statements: []const Statement,
+        patterns: []const Pattern,
+        type_table: []const types.Type,
+    ) std.mem.Allocator.Error!NodeWalker {
+        std.debug.assert(expressions.len <= std.math.maxInt(usize) - statements.len);
+        const expression_statement_count = expressions.len + statements.len;
+        std.debug.assert(expression_statement_count <= std.math.maxInt(usize) - patterns.len);
+        const node_count = expression_statement_count + patterns.len;
+
+        const seen = try allocator.alloc(bool, node_count);
+        errdefer allocator.free(seen);
+        const worklist = try allocator.alloc(ReachableNode, node_count);
+        @memset(seen, false);
+        return .{
+            .allocator = allocator,
+            .expressions = expressions,
+            .statements = statements,
+            .patterns = patterns,
+            .type_table = type_table,
+            .seen = seen,
+            .worklist = worklist,
+        };
+    }
+
+    pub fn deinit(self: *NodeWalker) void {
+        self.allocator.free(self.seen);
+        self.allocator.free(self.worklist);
+        self.* = undefined;
+    }
+
+    pub fn reset(self: *NodeWalker, root: NodeId) NodeWalkError!void {
+        @memset(self.seen, false);
+        self.worklist_len = 0;
+        try self.enqueueExpression(root);
+    }
+
+    pub fn next(self: *NodeWalker) NodeWalkError!?ReachableNode {
+        if (self.worklist_len == 0) return null;
+        self.worklist_len -= 1;
+        const node = self.worklist[self.worklist_len];
+        try self.enqueueChildren(node);
+        return node;
+    }
+
+    fn enqueue(self: *NodeWalker, node: ReachableNode, seen_index: usize) void {
+        if (self.seen[seen_index]) return;
+        std.debug.assert(self.worklist_len < self.worklist.len);
+        self.seen[seen_index] = true;
+        self.worklist[self.worklist_len] = node;
+        self.worklist_len += 1;
+    }
+
+    fn enqueueExpression(self: *NodeWalker, id: NodeId) NodeWalkError!void {
+        if (@as(usize, id) >= self.expressions.len) return error.InvalidExprRef;
+        self.enqueue(.{ .expression = id }, @as(usize, id));
+    }
+
+    fn enqueueStatement(self: *NodeWalker, id: NodeId) NodeWalkError!void {
+        if (@as(usize, id) >= self.statements.len) return error.InvalidStatementRef;
+        self.enqueue(
+            .{ .statement = id },
+            self.expressions.len + @as(usize, id),
+        );
+    }
+
+    fn enqueuePattern(self: *NodeWalker, id: NodeId) NodeWalkError!void {
+        if (@as(usize, id) >= self.patterns.len) return error.InvalidPatternRef;
+        self.enqueue(
+            .{ .pattern = id },
+            self.expressions.len + self.statements.len + @as(usize, id),
+        );
+    }
+
+    // Assertion markers carry a real condition expression in their reason.
+    fn enqueueUnsupported(self: *NodeWalker, unsupported: Unsupported) NodeWalkError!void {
+        const prefix = "assertion:";
+        if (!std.mem.startsWith(u8, unsupported.reason, prefix)) return;
+        const suffix = unsupported.reason[prefix.len..];
+        const condition = std.fmt.parseUnsigned(NodeId, suffix, 10) catch return;
+        try self.enqueueExpression(condition);
+    }
+
+    fn enqueueTypeRef(self: *NodeWalker, id: TypeRef) NodeWalkError!void {
+        if (@as(usize, id) >= self.type_table.len) return error.InvalidTypeRef;
+        try self.enqueueType(self.type_table[id], 0);
+    }
+
+    fn enqueueExternalNominal(
+        self: *NodeWalker,
+        external: types.ExternalNominal,
+        depth: usize,
+    ) NodeWalkError!void {
+        for (external.args) |argument| try self.enqueueType(argument, depth);
+    }
+
+    fn enqueueBound(
+        self: *NodeWalker,
+        bound: types.Bound,
+        depth: usize,
+    ) NodeWalkError!void {
+        for (bound.args) |argument| try self.enqueueType(argument, depth);
+        for (bound.associated_types) |binding| try self.enqueueType(binding.ty, depth);
+    }
+
+    fn enqueueType(
+        self: *NodeWalker,
+        ty: types.Type,
+        depth: usize,
+    ) NodeWalkError!void {
+        if (depth >= types.traversal_depth_max) return error.InvalidTypeTraversal;
+        const child_depth = depth + 1;
+        switch (ty) {
+            .path, .prim, .unsupported => {},
+            .external_nominal => |external| {
+                try self.enqueueExternalNominal(external, child_depth);
+            },
+            .reference => |reference| {
+                try self.enqueueType(reference.pointee, child_depth);
+            },
+            .raw_ptr => |raw_ptr| try self.enqueueType(raw_ptr.pointee, child_depth),
+            .slice => |slice| try self.enqueueType(slice.elem, child_depth),
+            .array => |array| {
+                try self.enqueueType(array.elem, child_depth);
+                switch (array.len) {
+                    .literal, .generic => {},
+                    .expression => |expression| try self.enqueueExpression(expression),
+                }
+            },
+            .tuple => |tuple| {
+                for (tuple) |element| try self.enqueueType(element, child_depth);
+            },
+            .fn_ptr => |fn_ptr| {
+                for (fn_ptr.params) |parameter| {
+                    try self.enqueueType(parameter, child_depth);
+                }
+                try self.enqueueType(fn_ptr.ret, child_depth);
+            },
+            .generic_inst => |generic_inst| {
+                for (generic_inst.args.params) |parameter| {
+                    try self.enqueueType(parameter, child_depth);
+                }
+            },
+            .option => |option| try self.enqueueType(option.*, child_depth),
+            .result => |result| {
+                try self.enqueueType(result.ok, child_depth);
+                try self.enqueueType(result.err, child_depth);
+            },
+            .boxed => |boxed| try self.enqueueType(boxed.*, child_depth),
+            .@"opaque" => |opaque_ty| {
+                for (opaque_ty.bounds) |bound| {
+                    try self.enqueueBound(bound, child_depth);
+                }
+                if (opaque_ty.concrete) |concrete| {
+                    try self.enqueueType(concrete.*, child_depth);
+                }
+            },
+            .dyn_trait => |bounds| {
+                for (bounds) |bound| try self.enqueueBound(bound, child_depth);
+            },
+        }
+    }
+
+    fn enqueueBlock(self: *NodeWalker, block: BlockExpr) NodeWalkError!void {
+        for (block.statements) |statement| try self.enqueueStatement(statement);
+        if (block.tail) |tail| try self.enqueueExpression(tail);
+    }
+
+    fn enqueueElse(self: *NodeWalker, branch: ElseBranch) NodeWalkError!void {
+        switch (branch) {
+            .none => {},
+            .block => |block| try self.enqueueBlock(block),
+            .chain => |chain| try self.enqueueExpression(chain),
+        }
+    }
+
+    fn enqueueClosure(self: *NodeWalker, closure: ClosureExpr) NodeWalkError!void {
+        for (closure.captures) |capture| try self.enqueueTypeRef(capture.ty);
+        for (closure.params) |parameter| try self.enqueuePattern(parameter);
+        if (closure.return_ty) |return_ty| try self.enqueueTypeRef(return_ty);
+        try self.enqueueBlock(closure.body);
+    }
+
+    fn enqueueIteratorAdapter(
+        self: *NodeWalker,
+        adapter: IteratorAdapter,
+    ) NodeWalkError!void {
+        switch (adapter) {
+            .map => |map| try self.enqueueClosure(map.closure),
+            .filter => |filter| try self.enqueueClosure(filter.closure),
+            .flat_map => |closure| try self.enqueueClosure(closure),
+            .enumerate, .range_rev, .other => {},
+            .zip => |zip| try self.enqueueExpression(zip.other),
+        }
+    }
+
+    fn enqueueIteratorChain(
+        self: *NodeWalker,
+        chain: IteratorChainExpr,
+    ) NodeWalkError!void {
+        try self.enqueueExpression(chain.source);
+        switch (chain.terminal) {
+            .iterator, .collect_vec, .sum => {},
+        }
+        for (chain.adapters) |adapter| try self.enqueueIteratorAdapter(adapter);
+    }
+
+    fn enqueueIterKind(self: *NodeWalker, kind: IterKind) NodeWalkError!void {
+        switch (kind) {
+            .range, .slice, .enumerate => {},
+            .multi => |expressions| {
+                for (expressions) |expression| try self.enqueueExpression(expression);
+            },
+            .adapter => |chain| try self.enqueueIteratorChain(chain),
+        }
+    }
+
+    fn enqueueExpressionChildren(
+        self: *NodeWalker,
+        expression: Expr,
+    ) NodeWalkError!void {
+        if (expression.ty) |type_id| try self.enqueueTypeRef(type_id);
+        switch (expression.kind) {
+            .literal, .unit, .panic_, .continue_ => {},
+            .path => |path| {
+                for (path.generic_args) |argument| try self.enqueueType(argument, 0);
+            },
+            .array => |array| {
+                for (array.elements) |element| try self.enqueueExpression(element);
+            },
+            .vec_lit => |vector| {
+                for (vector.elements) |element| try self.enqueueExpression(element);
+            },
+            .range => |range| {
+                try self.enqueueExpression(range.start);
+                if (range.end) |end| try self.enqueueExpression(end);
+            },
+            .block => |block| try self.enqueueBlock(block),
+            .if_else => |if_else| {
+                try self.enqueueExpression(if_else.cond);
+                try self.enqueueBlock(if_else.then_);
+                try self.enqueueElse(if_else.@"else");
+            },
+            .if_let => |if_let| {
+                try self.enqueuePattern(if_let.pattern);
+                try self.enqueueExpression(if_let.scrutinee);
+                try self.enqueueBlock(if_let.then_);
+                try self.enqueueElse(if_let.@"else");
+            },
+            .match => |match| {
+                try self.enqueueExpression(match.scrutinee);
+                for (match.arms) |arm| {
+                    for (arm.patterns) |pattern| try self.enqueuePattern(pattern);
+                    if (arm.guard) |guard| try self.enqueueExpression(guard);
+                    try self.enqueueExpression(arm.body);
+                }
+            },
+            .loop_ => |loop| try self.enqueueBlock(loop.body),
+            .while_ => |while_| {
+                try self.enqueueExpression(while_.cond);
+                if (while_.capture) |capture| try self.enqueuePattern(capture);
+                try self.enqueueBlock(while_.body);
+            },
+            .for_ => |for_| {
+                try self.enqueuePattern(for_.pattern);
+                try self.enqueueExpression(for_.iterable);
+                try self.enqueueBlock(for_.body);
+                try self.enqueueIterKind(for_.iter_kind);
+            },
+            .break_ => |break_| {
+                if (break_.value) |value| try self.enqueueExpression(value);
+            },
+            .call => |call| {
+                for (call.args) |argument| try self.enqueueExpression(argument);
+            },
+            .core_call => |call| {
+                for (call.generic_args) |argument| try self.enqueueType(argument, 0);
+                for (call.args) |argument| try self.enqueueExpression(argument);
+            },
+            .core_function => |function| {
+                for (function.generic_args) |argument| try self.enqueueType(argument, 0);
+            },
+            .method_call => |method| {
+                try self.enqueueExpression(method.receiver);
+                for (method.args) |argument| try self.enqueueExpression(argument);
+            },
+            .struct_lit => |literal| {
+                for (literal.fields) |field| try self.enqueueExpression(field.value);
+                if (literal.base) |base| try self.enqueueExpression(base);
+            },
+            .enum_variant => |variant| {
+                for (variant.tuple_fields) |field| try self.enqueueExpression(field);
+                for (variant.named_fields) |field| try self.enqueueExpression(field.value);
+            },
+            .external_variant => |variant| {
+                try self.enqueueExternalNominal(variant.owner, 0);
+                for (variant.tuple_fields) |field| try self.enqueueExpression(field);
+                for (variant.named_fields) |field| try self.enqueueExpression(field.value);
+            },
+            .format_write => |format_write| {
+                try self.enqueueExpression(format_write.writer);
+                for (format_write.args) |argument| try self.enqueueExpression(argument);
+            },
+            .field => |field| try self.enqueueExpression(field.base),
+            .index => |index| {
+                try self.enqueueExpression(index.base);
+                try self.enqueueExpression(index.index);
+            },
+            .cast => |cast| {
+                try self.enqueueExpression(cast.operand);
+                try self.enqueueType(cast.source_type, 0);
+                try self.enqueueTypeRef(cast.target);
+            },
+            .binary => |binary| {
+                try self.enqueueExpression(binary.lhs);
+                try self.enqueueExpression(binary.rhs);
+            },
+            .unary => |unary| try self.enqueueExpression(unary.operand),
+            .assign => |assign| {
+                try self.enqueueExpression(assign.target);
+                try self.enqueueExpression(assign.value);
+            },
+            .try_ => |try_| try self.enqueueExpression(try_.inner),
+            .return_ => |return_| {
+                if (return_.value) |value| try self.enqueueExpression(value);
+            },
+            .closure => |closure| try self.enqueueClosure(closure),
+            .iterator_chain => |chain| try self.enqueueIteratorChain(chain),
+            .unsupported => |unsupported| try self.enqueueUnsupported(unsupported),
+        }
+    }
+
+    fn enqueueStatementChildren(
+        self: *NodeWalker,
+        statement: Statement,
+    ) NodeWalkError!void {
+        if (statement.ty) |type_id| try self.enqueueTypeRef(type_id);
+        switch (statement.kind) {
+            .let => |let| {
+                try self.enqueuePattern(let.pattern);
+                if (let.init) |initializer| try self.enqueueExpression(initializer);
+                if (let.ty) |type_id| try self.enqueueTypeRef(type_id);
+            },
+            .let_else => |let_else| {
+                try self.enqueuePattern(let_else.pattern);
+                try self.enqueueExpression(let_else.init);
+                try self.enqueueBlock(let_else.else_block);
+            },
+            .expr => |expression| try self.enqueueExpression(expression),
+            .item => {},
+        }
+    }
+
+    fn enqueuePatternChildren(
+        self: *NodeWalker,
+        pattern: Pattern,
+    ) NodeWalkError!void {
+        if (pattern.ty) |type_id| try self.enqueueTypeRef(type_id);
+        switch (pattern.kind) {
+            .wildcard, .binding, .literal, .path, .unsupported => {},
+            .tuple => |tuple| {
+                for (tuple.elements) |element| try self.enqueuePattern(element);
+            },
+            .slice => |slice| {
+                for (slice.elements) |element| try self.enqueuePattern(element);
+                if (slice.rest) |rest| try self.enqueuePattern(rest);
+            },
+            .struct_pat => |struct_pattern| {
+                for (struct_pattern.fields) |field| {
+                    if (field.pat) |field_pattern| try self.enqueuePattern(field_pattern);
+                }
+            },
+            .external_variant => |variant| {
+                try self.enqueueExternalNominal(variant.owner, 0);
+                for (variant.fields) |field| {
+                    if (field.pat) |field_pattern| try self.enqueuePattern(field_pattern);
+                }
+            },
+            .reference => |reference| try self.enqueuePattern(reference.inner),
+            .@"or" => |or_pattern| {
+                for (or_pattern.alternatives) |alternative| {
+                    try self.enqueuePattern(alternative);
+                }
+            },
+            .range => |range| {
+                if (range.lo) |lo| try self.enqueueExpression(lo);
+                if (range.hi) |hi| try self.enqueueExpression(hi);
+            },
+        }
+    }
+
+    fn enqueueChildren(self: *NodeWalker, node: ReachableNode) NodeWalkError!void {
+        switch (node) {
+            .expression => |id| try self.enqueueExpressionChildren(self.expressions[id]),
+            .statement => |id| try self.enqueueStatementChildren(self.statements[id]),
+            .pattern => |id| try self.enqueuePatternChildren(self.patterns[id]),
+        }
+    }
+};
 // =============================================================================
 // Tests — instantiate every union arm and struct to prove compile.  All values
 // use compile-time static slices; no allocator needed (mirrors items.zig).
@@ -735,6 +1240,37 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     _ = for_enum;
     _ = break_no_val;
 
+    // §1.3 — Call / CoreCall / CallKind.
+    const core_functions = [_]CoreFunction{
+        .mem_size_of,
+        .mem_transmute,
+        .mem_size_of_val,
+        .ptr_copy_nonoverlapping,
+        .ptr_write_bytes,
+        .ptr_read_unaligned,
+        .slice_from_raw_parts,
+        .slice_from_raw_parts_mut,
+        .str_from_utf8,
+        .str_from_utf8_unchecked,
+        .string_from_utf8,
+        .string_from_utf8_lossy,
+        .string_from_utf8_unchecked,
+        .cmp_min,
+        .cmp_max,
+        .default_value,
+        .convert_from,
+    };
+    const core_call: CoreCall = .{
+        .function = .mem_size_of,
+        .generic_args = &.{.{ .prim = .u8 }},
+        .args = &.{},
+    };
+    const core_function: CoreFunctionValue = .{
+        .function = .mem_transmute,
+        .generic_args = &.{ .{ .prim = .u8 }, .{ .prim = .u64 } },
+    };
+    _ = core_functions;
+
     // §1.3 — Call / CallKind (all three)
     const call_free: Call = .{ .call_kind = .{ .free = 30 }, .args = &.{ 1, 2 } };
     const call_assoc: Call = .{ .call_kind = .{ .associated = 31 }, .args = &.{} };
@@ -757,6 +1293,15 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const enum_variant: EnumVariant = .{
         .def = 44,
         .variant = "Circle",
+        .tuple_fields = &.{45},
+        .named_fields = &.{fi_a},
+    };
+    const external_variant: ExternalVariant = .{
+        .owner = .{
+            .path = &.{ "alloc", "borrow", "Cow" },
+            .args = &.{.{ .prim = .u8 }},
+        },
+        .variant = "Owned",
         .tuple_fields = &.{45},
         .named_fields = &.{fi_a},
     };
@@ -861,7 +1406,20 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const ret_val: ReturnExpr = .{ .value = 56 };
     _ = ret_unit;
 
-    // Explicit refusal
+    const e_core_call: Expr = .{
+        .id = 32,
+        .span = span,
+        .ty = null,
+        .kind = .{ .core_call = core_call },
+    };
+    const e_core_function: Expr = .{
+        .id = 33,
+        .span = span,
+        .ty = null,
+        .kind = .{ .core_function = core_function },
+    };
+    // Explicit divergence and refusal
+    const panic_expr: PanicExpr = .{ .message = "unreachable" };
     const unsup: Unsupported = .{ .reason = "match guards", .suggested_version = .v2 };
 
     // ── Wrap every ExprKind arm into an Expr (final _ = block) ─────────────
@@ -884,13 +1442,22 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const e_mc: Expr = .{ .id = 14, .span = span, .ty = null, .kind = .{ .method_call = mc_value } };
     const e_struct: Expr = .{ .id = 15, .span = span, .ty = null, .kind = .{ .struct_lit = struct_lit } };
     const e_enum: Expr = .{ .id = 16, .span = span, .ty = null, .kind = .{ .enum_variant = enum_variant } };
+    const e_external_enum: Expr = .{
+        .id = 34,
+        .span = span,
+        .ty = null,
+        .kind = .{ .external_variant = external_variant },
+    };
     const e_field: Expr = .{ .id = 17, .span = span, .ty = null, .kind = .{ .field = field_expr } };
     const e_index: Expr = .{ .id = 18, .span = span, .ty = null, .kind = .{ .index = index_expr } };
     const e_bin: Expr = .{ .id = 19, .span = span, .ty = null, .kind = .{ .binary = bin_expr } };
     const e_unary: Expr = .{ .id = 20, .span = span, .ty = null, .kind = .{ .unary = unary_expr } };
     const e_assign: Expr = .{ .id = 21, .span = span, .ty = null, .kind = .{ .assign = assign_expr } };
     const e_try: Expr = .{ .id = 22, .span = span, .ty = null, .kind = .{ .try_ = try_expr } };
+    _ = e_core_call;
+    _ = e_core_function;
     const e_ret: Expr = .{ .id = 23, .span = span, .ty = null, .kind = .{ .return_ = ret_val } };
+    const e_panic: Expr = .{ .id = 24, .span = span, .ty = null, .kind = .{ .panic_ = panic_expr } };
     const e_unsup: Expr = .{ .id = 25, .span = span, .ty = null, .kind = .{ .unsupported = unsup } };
     _ = e_lit;
     _ = e_array;
@@ -911,12 +1478,14 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     _ = e_mc;
     _ = e_struct;
     _ = e_enum;
+    _ = e_external_enum;
     _ = e_field;
     _ = e_index;
     _ = e_bin;
     _ = e_unary;
     _ = e_assign;
     _ = e_try;
+    _ = e_panic;
     _ = e_ret;
     _ = e_unsup;
     // closure / iterator_chain exercised in deferred test.
@@ -1137,8 +1706,10 @@ test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter
 
     const terminal_iterator: IteratorTerminal = .iterator;
     const terminal_collect_vec: IteratorTerminal = .collect_vec;
+    const terminal_sum: IteratorTerminal = .sum;
     _ = terminal_iterator;
     _ = terminal_collect_vec;
+    _ = terminal_sum;
 
     // IteratorChainExpr (consumed by IterKind.adapter below)
     const chain: IteratorChainExpr = .{

@@ -81,7 +81,7 @@ test "trait method dispatch rewrites a unique concrete receiver candidate" {
         .bodies = &.{},
     };
 
-    const stats = resolve_methods.resolveMethods(&g, &b);
+    const stats = try resolve_methods.resolveMethods(&g, &b);
     try std.testing.expectEqual(@as(usize, 1), stats.trait_resolved);
     try std.testing.expectEqual(@as(spine.EntityId, fn_render), b.exprs[1].kind.method_call.method);
 }
@@ -126,7 +126,7 @@ test "trait method dispatch marks distinct candidates as unsupported" {
         .bodies = &.{},
     };
 
-    _ = resolve_methods.resolveMethods(&g, &b);
+    _ = try resolve_methods.resolveMethods(&g, &b);
     try expectUnsupported(&b.exprs[1]);
 }
 
@@ -164,7 +164,7 @@ test "unknown method dispatch marks only the call as unsupported" {
         .bodies = &.{},
     };
 
-    _ = resolve_methods.resolveMethods(&g, &b);
+    _ = try resolve_methods.resolveMethods(&g, &b);
     try expectUnsupported(&b.exprs[1]);
 }
 
@@ -204,7 +204,7 @@ test "inherent dispatch normalizes generic impl receiver spelling" {
         .bodies = &.{},
     };
 
-    const stats = resolve_methods.resolveMethods(&g, &b);
+    const stats = try resolve_methods.resolveMethods(&g, &b);
     try std.testing.expectEqual(@as(usize, 1), stats.inherent_resolved);
     try std.testing.expectEqual(@as(spine.EntityId, fn_update), b.exprs[1].kind.method_call.method);
 }
@@ -440,7 +440,7 @@ test "resolveMethods on bodies with inferred types updates method entity id" {
         .bodies = &.{},
     };
 
-    const stats = resolve_methods.resolveMethods(&g, &b);
+    const stats = try resolve_methods.resolveMethods(&g, &b);
 
     // Inherent method "update" resolved and entity ID updated
     try std.testing.expectEqual(@as(usize, 1), stats.inherent_resolved);
