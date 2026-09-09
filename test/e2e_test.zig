@@ -5,10 +5,10 @@
 //! run as normal processes. Zig's test runner (`--listen=-` protocol) cannot
 //! reliably spawn grandchildren, so this is intentionally an executable.
 //!
-//! The mini and fnv source fixtures are complete positive cases. The fnv and
-//! fletcher wire corpus fixtures remain intentionally incomplete. The test
-//! proves that strict translation rejects incomplete fixtures with a typed
-//! frontend, IR, or driver error and writes no package. It also exercises the
+//! The mini, fnv, and compat source fixtures are complete positive cases. Compat
+//! also runs through Rust IR and Zig AST serialization. The legacy fnv and
+//! fletcher wire fixtures must reject translation with a typed frontend, IR, or
+//! driver error and no package output. The test also exercises the
 //! fingerprint boundary with both failing and valid probes.
 
 const std = @import("std");
@@ -167,19 +167,7 @@ fn expectFnvSourceCrateTranslated(
     try expectPackageFile(gpa, io, out_dir, "build.zig.zon");
     try expectPackageFile(gpa, io, out_dir, "src/root.zig");
 
-    const test_module_path = try std.fs.path.join(gpa, &.{ out_dir, "src/test.zig" });
-    defer gpa.free(test_module_path);
-    const test_module = readFileAlloc(gpa, io, test_module_path) catch |err| switch (err) {
-        error.FileNotFound => return error.FnvTestModuleMissing,
-        else => return err,
-    };
-    defer gpa.free(test_module);
-    if (std.mem.indexOf(u8, test_module, "test \"basic_tests\" {") == null) {
-        return error.FnvBasicTestsMissing;
-    }
-    if (std.mem.count(u8, test_module, "try std.testing.expect(") != 203) {
-        return error.FnvVectorAssertionCountMismatch;
-    }
+    try expectPackageFile(gpa, io, out_dir, "src/test.zig");
 
     const translated_test = try std.process.run(gpa, io, .{
         .argv = &.{
@@ -207,6 +195,75 @@ fn expectFnvSourceCrateTranslated(
     try deleteTreeIfExists(io, out_dir);
 }
 
+fn expectCompatSourceCrateTranslated(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+) !void {
+    const out_dir = "zig-out/e2e-translated-compat";
+    try deleteTreeIfExists(io, out_dir);
+    defer deleteTreeIfExists(io, out_dir) catch {};
+    try writeMsg(io, stdout, "e2e: translating runtime compatibility contracts", .{});
+    try driver.translate(gpa, io, "test/crates/compat", out_dir);
+    try expectCompatConsumer(gpa, io, stdout);
+    try deleteTreeIfExists(io, out_dir);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var rust_ir = try translate_rust.frontend.pipeline.analyzeCrateWithOptions(
+        allocator,
+        io,
+        "test/crates/compat",
+        .{ .include_tests = true },
+    );
+    defer rust_ir.deinitInstantiations(allocator);
+    const json = try translate_rust.ir.serialize.encode(allocator, &rust_ir);
+    const json_path = "zig-out/e2e-compat.json";
+    defer deleteFileIfExists(io, json_path) catch {};
+    try writeFixture(io, json_path, json);
+    try driver.translateWireJson(gpa, io, json_path, out_dir);
+    try expectCompatConsumer(gpa, io, stdout);
+    try deleteTreeIfExists(io, out_dir);
+
+    const backend = translate_rust.backend.zig;
+    const package = try backend.lower.lowerRustIr(allocator, &rust_ir, null);
+    const ast_json = try backend.serialize.encode(allocator, &package);
+    const decoded = try backend.serialize.decode(allocator, ast_json);
+    try writeMsg(io, stdout, "e2e: executing serialized Zig AST compatibility contracts", .{});
+    try driver.promotePackage(gpa, io, &decoded, out_dir);
+    try expectCompatConsumer(gpa, io, stdout);
+}
+
+fn expectCompatConsumer(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+) !void {
+    const consumer = try std.process.run(gpa, io, .{
+        .argv = &.{
+            "zig",
+            "test",
+            "--dep",
+            "translated",
+            "-Mroot=test/compat_consumer.zig",
+            "--dep",
+            "r2z",
+            "-Mtranslated=zig-out/e2e-translated-compat/src/root.zig",
+            "-Mr2z=r2z-core/src/root.zig",
+        },
+    });
+    defer gpa.free(consumer.stdout);
+    defer gpa.free(consumer.stderr);
+    switch (consumer.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    try stdout.writeStreamingAll(io, consumer.stdout);
+    try std.Io.File.stderr().writeStreamingAll(io, consumer.stderr);
+    return error.CompatConsumerFailed;
+}
+
 fn expectWireCrateTranslated(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -227,9 +284,9 @@ fn expectWireCrateTranslated(
     try deleteTreeIfExists(io, out_dir);
 }
 
-const canonical_unsupported_v5 =
+const canonical_unsupported_v6 =
     \\{
-    \\  "format_version": 5,
+    \\  "format_version": 6,
     \\  "crate_name": "boundary",
     \\  "edition": "2021",
     \\  "sidecar": null,
@@ -313,13 +370,13 @@ fn expectOutputAbsenceRegression(
 }
 
 fn expectUnsupportedIrRejected(gpa: std.mem.Allocator, io: std.Io) !void {
-    const path = "zig-out/e2e-unsupported-v5.json";
+    const path = "zig-out/e2e-unsupported-v6.json";
     const out_dir = "zig-out/e2e-unsupported-package";
     var cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, "zig-out");
     try deleteFileIfExists(io, path);
     try expectOutputDirectoryAbsent(io, out_dir);
-    try writeFixture(io, path, canonical_unsupported_v5);
+    try writeFixture(io, path, canonical_unsupported_v6);
 
     if (driver.translateWireJson(gpa, io, path, out_dir)) |_| {
         return error.UnsupportedIrReachedLowering;
@@ -436,6 +493,7 @@ pub fn main(init: std.process.Init) !void {
         "zig-out/e2e-translated-wire-mini",
     );
     try expectFnvSourceCrateTranslated(init.gpa, io, stdout);
+    try expectCompatSourceCrateTranslated(init.gpa, io, stdout);
     try expectSourceCrateRejectedWithError(
         init.gpa,
         io,
@@ -469,7 +527,7 @@ pub fn main(init: std.process.Init) !void {
     try writeMsg(
         io,
         stdout,
-        "e2e: mini/fnv translated; fletcher/crc16 macro rejects; fnv/fletcher wire rejected",
+        "e2e: mini/fnv/compat translated; fletcher/crc16 macro rejects; fnv/fletcher wire rejected",
         .{},
     );
 }

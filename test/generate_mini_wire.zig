@@ -1,4 +1,4 @@
-//! Regenerate the canonical v3 wire fixture for `test/crates/mini`.
+//! Regenerate the canonical wire fixture for `test/crates/mini`.
 
 const std = @import("std");
 const translate_rust = @import("translate_rust");

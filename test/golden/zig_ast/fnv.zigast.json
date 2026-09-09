@@ -129,6 +129,7 @@
                         },
                         "is_const": true,
                         "is_allowzero": false,
+                        "alignment": null,
                         "size": "one"
                       },
                       "is_comptime": false
@@ -170,6 +171,7 @@
                         },
                         "is_const": false,
                         "is_allowzero": false,
+                        "alignment": null,
                         "size": "one"
                       },
                       "is_comptime": false
@@ -197,7 +199,10 @@
                       {
                         "kind": "let_stmt",
                         "name": "hash",
-                        "ty": null,
+                        "ty": {
+                          "kind": "prim",
+                          "value": "u64"
+                        },
                         "init": {
                           "kind": "field_access",
                           "target": {
@@ -219,7 +224,10 @@
                             }
                           ],
                           "captures": [
-                            "byte"
+                            {
+                              "name": "byte",
+                              "by_ref": true
+                            }
                           ],
                           "body": {
                             "label": null,
@@ -245,8 +253,12 @@
                                     },
                                     "source": null,
                                     "operand": {
-                                      "kind": "ident",
-                                      "name": "byte"
+                                      "kind": "unary_op",
+                                      "op": "deref",
+                                      "operand": {
+                                        "kind": "ident",
+                                        "name": "byte"
+                                      }
                                     }
                                   }
                                 },
@@ -331,6 +343,12 @@
                 "kind": "ident",
                 "name": "r2z.BuildHasherDefault"
               },
+              "generic_args": [
+                {
+                  "kind": "named",
+                  "name": "FnvHasher"
+                }
+              ],
               "args": []
             }
           }

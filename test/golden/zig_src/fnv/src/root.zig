@@ -18,9 +18,9 @@ pub const FnvHasher = struct {
     }
 
     pub fn write(self: *FnvHasher, bytes: []const u8) void {
-        var hash = self.@"0";
-        for (bytes) |byte| {
-            hash = (hash ^ @as(u64, byte));
+        var hash: u64 = self.@"0";
+        for (bytes) |*byte| {
+            hash = (hash ^ @as(u64, byte.*));
             hash = (hash *% 1099511628211);
         }
         self.* = FnvHasher{ .@"0" = hash };

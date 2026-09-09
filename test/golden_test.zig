@@ -138,7 +138,7 @@ fn runGoldenFixture(
     const rust_ir = try frontend.analyzeCrate(allocator, test_io, crate_dir);
 
     // 2. Encode the complete canonical RustIr to JSON and snapshot. The
-    // frontend and serializer intentionally share the same nominal v5 model;
+    // frontend and serializer intentionally share the same nominal model;
     // assigning the value directly preserves every field, including graph
     // metadata and monomorphization instantiations.
     const wire_ir: ir.serialize.RustIr = rust_ir;
@@ -312,7 +312,7 @@ test "golden: fnv preserves hasher methods" {
 }
 
 test "golden: hex rejects incomplete translation" {
-    try runGoldenFixture("hex", "test/crates/hex", error.UnsupportedCfgPredicate, &.{}, false, false);
+    try runGoldenFixture("hex", "test/crates/hex", error.UnsupportedExpression, &.{}, false, false);
 }
 test "golden: missing source directory propagates ingestion failure" {
     try std.testing.expectError(
