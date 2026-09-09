@@ -902,7 +902,7 @@ fn printUsage(io: std.Io, stdout: std.Io.File) !void {
         \\translate-rust — Rust → Zig translation pipeline
         \\
         \\usage: translate-rust <crate-dir> -o <dir>  translate Rust source to a Zig package
-        \\       translate-rust <file.json> [-o dir]  translate canonical v5 wire JSON
+        \\       translate-rust <file.json> [-o dir]  translate canonical v6 wire JSON
         \\       translate-rust --emit-package <file.json> -o <dir>  emit a standalone Zig package
         \\       translate-rust --dump model <file>   parse a sidecar wire-format JSON dump and print
         \\                                            the crate/module inventory

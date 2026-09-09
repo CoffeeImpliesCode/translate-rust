@@ -156,7 +156,7 @@ pub fn translateWithOptions(
     try promotePackage(arena_alloc, io, &pkg, out_dir);
 }
 
-/// Translate canonical v5 wire JSON into a standalone Zig package.
+/// Translate canonical v6 wire JSON into a standalone Zig package.
 /// Unsupported wire versions fail before decoding or package creation.
 pub fn translateWireJson(
     allocator: std.mem.Allocator,
@@ -176,7 +176,7 @@ pub fn translateWireJson(
     try promotePackage(arena_alloc, io, &pkg, out_dir);
 }
 
-/// Translate canonical v5 wire JSON and write canonical emitted source files
+/// Translate canonical v6 wire JSON and write canonical emitted source files
 /// to stdout. Unsupported wire versions fail before lowering.
 pub fn emitWireJson(
     allocator: std.mem.Allocator,
@@ -515,13 +515,13 @@ const canonical_wire_payload_suffix =
     "\"types\":[],\"instantiations\":[],\"bodies\":{\"exprs\":[],\"stmts\":[]," ++
     "\"pats\":[],\"types\":[],\"bodies\":[{\"owner\":0,\"body\":{\"kind\":\"none\"}}]}}";
 
-test "wire dispatch sends canonical v5 to canonical decoder" {
+test "wire dispatch sends canonical v6 to canonical decoder" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var decoded = try decodeWireJson(
         arena.allocator(),
-        "{\"format_version\":5" ++ canonical_wire_payload_suffix,
+        "{\"format_version\":6" ++ canonical_wire_payload_suffix,
     );
     defer decoded.graph.deinit();
     defer decoded.deinitInstantiations(arena.allocator());
@@ -596,12 +596,12 @@ test "wire dispatch rejects v4 before canonical decode" {
     );
 }
 
-test "wire dispatch rejects v6 before canonical decode" {
+test "wire dispatch rejects v5 before canonical decode" {
     try std.testing.expectError(
         error.UnsupportedWireVersion,
         decodeWireJson(
             std.testing.allocator,
-            "{\"format_version\":6" ++ canonical_wire_payload_suffix,
+            "{\"format_version\":5" ++ canonical_wire_payload_suffix,
         ),
     );
 }

@@ -122,7 +122,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // `zig build generate-mini-wire` runs the trusted source → validation →
-    // canonical v3 encoder path and atomically refreshes test/mini.json.
+    // canonical encoder path and atomically refreshes test/mini.json.
     const mini_wire_generator = b.addExecutable(.{
         .name = "generate-mini-wire",
         .root_module = b.createModule(.{
@@ -334,4 +334,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(golden_tests).step);
+
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = exe.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate documentation");
+    docs_step.dependOn(&install_docs.step);
 }

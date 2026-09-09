@@ -14,7 +14,7 @@ pub const translate = pipeline.translate;
 /// Translate a Rust crate directory with explicit frontend analysis options.
 pub const translateWithOptions = pipeline.translateWithOptions;
 
-/// Translate canonical v5 wire JSON into a standalone Zig package.
+/// Translate canonical v6 wire JSON into a standalone Zig package.
 /// Every other wire version is rejected before IR construction or package creation.
 pub const translateWireJson = pipeline.translateWireJson;
 
