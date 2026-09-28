@@ -82,71 +82,9 @@ fn validatePackageShape(pkg: *const ast.Package) !void {
     try ast.validateForTranslation(&package_for_validation);
 }
 
-fn appendNonRootTestArtifacts(
-    allocator: std.mem.Allocator,
-    pkg: *const ast.Package,
-    artifacts: *std.ArrayListUnmanaged(u8),
-    step_dependencies: *std.ArrayListUnmanaged(u8),
-) !void {
-    for (pkg.files, 0..) |file, file_index| {
-        if (std.mem.eql(u8, file.path, "src/root.zig")) continue;
-        if (file.tests.len == 0) continue;
-
-        try appendFmt(
-            "    const tests_{d} = b.addTest(.{{\n" ++
-                "        .root_module = b.createModule(.{{\n" ++
-                "            .root_source_file = b.path(\"src/root.zig\"),\n" ++
-                "            .target = target,\n" ++
-                "            .optimize = optimize,\n",
-            allocator,
-            artifacts,
-            .{file_index},
-        );
-        if (pkg.zon_deps.len > 0) {
-            try artifacts.appendSlice(allocator, "            .imports = &.{\n");
-            for (pkg.zon_deps) |dep| {
-                const dep_id = try zonIdentName(allocator, dep.name);
-                defer allocator.free(dep_id);
-                try appendFmt(
-                    "                .{{ .name = \"{s}\", " ++
-                        ".module = dep_{s}.module(\"{s}\") }},\n",
-                    allocator,
-                    artifacts,
-                    .{ dependencyModuleName(dep.name), dep_id, dependencyModuleName(dep.name) },
-                );
-            }
-            try artifacts.appendSlice(allocator, "            },\n");
-        }
-        try appendFmt(
-            "        }}),\n" ++
-                "    }});\n" ++
-                "    const run_tests_{d} = b.addRunArtifact(tests_{d});\n",
-            allocator,
-            artifacts,
-            .{ file_index, file_index },
-        );
-        try appendFmt(
-            "    test_step.dependOn(&run_tests_{d}.step);\n",
-            allocator,
-            step_dependencies,
-            .{file_index},
-        );
-    }
-}
-
 fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]const u8 {
     try validatePackageShape(pkg);
     const module_name = packageIdName(pkg);
-    var test_artifacts: std.ArrayListUnmanaged(u8) = .empty;
-    defer test_artifacts.deinit(allocator);
-    var test_step_dependencies: std.ArrayListUnmanaged(u8) = .empty;
-    defer test_step_dependencies.deinit(allocator);
-    try appendNonRootTestArtifacts(
-        allocator,
-        pkg,
-        &test_artifacts,
-        &test_step_dependencies,
-    );
     if (pkg.zon_deps.len == 0) {
         return std.fmt.allocPrint(
             allocator,
@@ -164,9 +102,9 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
             \\
             \\    const tests = b.addTest(.{{ .root_module = pkg_mod }});
             \\    const run_tests = b.addRunArtifact(tests);
-            \\{s}    const test_step = b.step("test", "Run unit tests");
+            \\    const test_step = b.step("test", "Run unit tests");
             \\    test_step.dependOn(&run_tests.step);
-            \\{s}
+            \\
             \\    const lib = b.addLibrary(.{{
             \\        .name = "{s}",
             \\        .root_module = pkg_mod,
@@ -176,7 +114,7 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
             \\}}
             \\
         ,
-            .{ module_name, test_artifacts.items, test_step_dependencies.items, module_name },
+            .{ module_name, module_name },
         );
     }
 
@@ -222,9 +160,9 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
         \\
         \\    const tests = b.addTest(.{{ .root_module = pkg_mod }});
         \\    const run_tests = b.addRunArtifact(tests);
-        \\{s}    const test_step = b.step("test", "Run unit tests");
+        \\    const test_step = b.step("test", "Run unit tests");
         \\    test_step.dependOn(&run_tests.step);
-        \\{s}
+        \\
         \\    const lib = b.addLibrary(.{{
         \\        .name = "{s}",
         \\        .root_module = pkg_mod,
@@ -238,8 +176,6 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
             bindings.items,
             module_name,
             imports.items,
-            test_artifacts.items,
-            test_step_dependencies.items,
             module_name,
         },
     );
@@ -1008,7 +944,7 @@ fn buildTestPackage() ast.Package {
     };
 }
 
-test "generateBuildZig: runs translated tests from non-root file ASTs" {
+test "generateBuildZig: runs every translated test through the root module" {
     const allocator = std.testing.allocator;
     var pkg = buildTestPackage();
     const root_file = pkg.files[0];
@@ -1041,6 +977,10 @@ test "generateBuildZig: runs translated tests from non-root file ASTs" {
     const files = [_]ast.File{ root_file, test_file };
     pkg.files = &files;
 
+    // Exactly one test artifact, rooted at the package root. A test file that
+    // is compiled as its own module root cannot import its siblings, so a
+    // per-file artifact would fail to build for any nested test module. The
+    // lowerer keeps nested tests reachable from the root instead.
     const build_zig = try generateBuildZig(allocator, &pkg);
     defer allocator.free(build_zig);
 
@@ -1059,32 +999,16 @@ test "generateBuildZig: runs translated tests from non-root file ASTs" {
         ) != null,
     );
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 1),
+        std.mem.count(u8, build_zig, "b.addTest("),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
         std.mem.count(u8, build_zig, "b.addRunArtifact("),
     );
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 1),
         std.mem.count(u8, build_zig, "test_step.dependOn("),
-    );
-
-    var testless_file = test_file;
-    testless_file.tests = &.{};
-    const testless_files = [_]ast.File{ root_file, testless_file };
-    pkg.files = &testless_files;
-
-    const testless_build_zig = try generateBuildZig(allocator, &pkg);
-    defer allocator.free(testless_build_zig);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, testless_build_zig, "b.addTest("),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, testless_build_zig, "b.addRunArtifact("),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, testless_build_zig, "test_step.dependOn("),
     );
 }
 

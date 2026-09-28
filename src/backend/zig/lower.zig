@@ -665,6 +665,8 @@ const Lowerer = struct {
     strat: strategy.LoweringStrategy,
     def_strat_inst: default_strat.DefaultStrategy = .{},
     current_module_id: ?ir.spine.EntityId = null,
+    /// True while the crate root module is lowered into `src/root.zig`.
+    current_file_is_root: bool = false,
     current_imports: ?*std.ArrayListUnmanaged(ast.Import) = null,
     pending_module_imports: std.AutoHashMapUnmanaged(ModuleImportKey, []const u8) = .empty,
     runtime_import_modules: std.AutoHashMapUnmanaged(ir.spine.EntityId, void) = .empty,
@@ -1324,6 +1326,144 @@ const Lowerer = struct {
         }
     }
 
+    /// Zig collects `test` blocks only from files it analyzes, and a
+    /// container-level `@import` is analyzed only when something references
+    /// it. A translated test module that nothing uses therefore compiles away,
+    /// and `zig build test` reports success over zero assertions. Emit one
+    /// synthetic test per file import that reaches a test block, so the whole
+    /// test graph is analyzed from the package root.
+    fn appendTestReachabilityRefs(self: *Lowerer, files: *std.ArrayListUnmanaged(ast.File)) !void {
+        if (files.items.len < 2) return;
+
+        var path_index: std.StringHashMapUnmanaged(usize) = .empty;
+        defer path_index.deinit(self.alloc);
+        for (files.items, 0..) |file, index| {
+            try path_index.put(self.alloc, file.path, index);
+        }
+
+        // Resolve each file's relative imports to package file indices.
+        var edges = try self.alloc.alloc([]usize, files.items.len);
+        defer {
+            for (edges) |edge| self.alloc.free(edge);
+            self.alloc.free(edges);
+        }
+        for (files.items, 0..) |file, index| {
+            var targets: std.ArrayListUnmanaged(usize) = .empty;
+            defer targets.deinit(self.alloc);
+            for (file.imports) |import| {
+                if (!std.mem.endsWith(u8, import.module_or_path, ".zig")) continue;
+                const dir = std.fs.path.dirname(file.path) orelse continue;
+                const resolved = try std.fs.path.resolve(
+                    self.alloc,
+                    &.{ dir, import.module_or_path },
+                );
+                defer self.alloc.free(resolved);
+                const target = path_index.get(resolved) orelse continue;
+                var duplicate = false;
+                for (targets.items) |existing| {
+                    if (existing == target) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) try targets.append(self.alloc, target);
+            }
+            edges[index] = try targets.toOwnedSlice(self.alloc);
+        }
+
+        // reaches[i] is true when file i transitively holds a test block.
+        var reaches = try self.alloc.alloc(bool, files.items.len);
+        defer self.alloc.free(reaches);
+        @memset(reaches, false);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (files.items, 0..) |file, index| {
+                if (reaches[index]) continue;
+                if (file.tests.len > 0) {
+                    reaches[index] = true;
+                    changed = true;
+                    continue;
+                }
+                for (edges[index]) |target| {
+                    if (!reaches[target]) continue;
+                    reaches[index] = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        for (files.items) |*file| {
+            var refs: std.ArrayListUnmanaged(ast.TestDecl) = .empty;
+            defer refs.deinit(self.alloc);
+            var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
+            defer seen.deinit(self.alloc);
+            for (file.imports) |import| {
+                if (!std.mem.endsWith(u8, import.module_or_path, ".zig")) continue;
+                const dir = std.fs.path.dirname(file.path) orelse continue;
+                const resolved = try std.fs.path.resolve(
+                    self.alloc,
+                    &.{ dir, import.module_or_path },
+                );
+                defer self.alloc.free(resolved);
+                const target = path_index.get(resolved) orelse continue;
+                if (!reaches[target]) continue;
+                // A file may import the same target more than once; one
+                // reference is enough to make Zig analyze it.
+                const entry = try seen.getOrPut(self.alloc, target);
+                if (entry.found_existing) continue;
+
+                const name = try std.fmt.allocPrint(
+                    self.alloc,
+                    "translated tests reachable through {s}",
+                    .{import.module_or_path},
+                );
+                const operand = try self.alloc.create(ast.Expr);
+                operand.* = .{ .ident = import.local_name };
+                const discard = try self.alloc.create(ast.Expr);
+                discard.* = .{ .ident = "_" };
+                const stmts = try self.alloc.alloc(ast.Stmt, 1);
+                stmts[0] = .{ .assign = .{
+                    .target = discard.*,
+                    .val = operand.*,
+                } };
+                try refs.append(self.alloc, .{
+                    .name = name,
+                    .body = .{ .stmts = stmts },
+                });
+            }
+            if (refs.items.len == 0) continue;
+
+            // A file with test decls is validated as needing `std`, and the
+            // synthetic reachability test itself uses none. Supply the import
+            // so the file keeps passing that check.
+            var imports = file.imports;
+            var needs_std = true;
+            for (imports) |import| {
+                if (std.mem.eql(u8, import.local_name, "std")) {
+                    needs_std = false;
+                    break;
+                }
+            }
+            if (needs_std) {
+                const with_std = try self.alloc.alloc(ast.Import, imports.len + 1);
+                with_std[0] = .{ .local_name = "std", .module_or_path = "std" };
+                @memcpy(with_std[1..], imports);
+                imports = with_std;
+                file.imports = imports;
+            }
+
+            const combined = try self.alloc.alloc(
+                ast.TestDecl,
+                file.tests.len + refs.items.len,
+            );
+            @memcpy(combined[0..file.tests.len], file.tests);
+            @memcpy(combined[file.tests.len..], refs.items);
+            file.tests = combined;
+        }
+    }
+
     pub fn lowerPackage(self: *Lowerer) !ast.Package {
         defer self.local_static_names.deinit(self.alloc);
         try self.prepareLocalStaticNames();
@@ -1353,6 +1493,7 @@ const Lowerer = struct {
         }
 
         try self.materializeTraitDescriptors(&files_list);
+        try self.appendTestReachabilityRefs(&files_list);
         const pkg_name = try self.alloc.dupe(u8, self.ir.crate_name);
         errdefer self.alloc.free(pkg_name);
         const files = try files_list.toOwnedSlice(self.alloc);
@@ -2197,6 +2338,9 @@ const Lowerer = struct {
     fn lowerModule(self: *Lowerer, mod: ir.graph.Module) !ast.File {
         const file_path = try self.moduleFilePath(mod);
         const current_mod_id = self.moduleEntityId(mod) orelse mod.id;
+        const previous_is_root = self.current_file_is_root;
+        self.current_file_is_root = mod.id == 0;
+        defer self.current_file_is_root = previous_is_root;
 
         var imports_list: std.ArrayListUnmanaged(ast.Import) = .empty;
         if (mod.id == 0) {
@@ -2268,6 +2412,9 @@ const Lowerer = struct {
     }
 
     fn lowerRootFileFromSymbolTable(self: *Lowerer) !ast.File {
+        const previous_is_root = self.current_file_is_root;
+        self.current_file_is_root = true;
+        defer self.current_file_is_root = previous_is_root;
         var imports_list: std.ArrayListUnmanaged(ast.Import) = .empty;
         try self.appendCrateDependencyImports(&imports_list);
         var decls_list: std.ArrayListUnmanaged(ast.Decl) = .empty;
@@ -2494,7 +2641,12 @@ const Lowerer = struct {
         if (try self.entityBelongsToExternalModule(entity_id)) return null;
         const is_pub = switch (ent.visibility) {
             .public, .crate_restricted, .super_restricted, .in_path => true,
-            .private => false,
+            // Rust `private` means "this module and its descendants". Zig files
+            // are hard module boundaries, so a descendant Rust module becomes a
+            // sibling file that cannot see a non-`pub` item. Emit module-level
+            // items as `pub` outside the crate root; `src/root.zig` re-exports
+            // still define the crate's public surface.
+            .private => !self.current_file_is_root,
         };
         if (ent.kind == .extern_crate) {
             return switch (ent.visibility) {
@@ -2541,7 +2693,7 @@ const Lowerer = struct {
                                 .ty = f_ty,
                                 .is_pub = switch (f.visibility) {
                                     .public, .crate_restricted, .super_restricted, .in_path => true,
-                                    .private => false,
+                                    .private => !self.current_file_is_root,
                                 },
                             });
                         }
@@ -5077,7 +5229,12 @@ const Lowerer = struct {
 
         const is_pub = switch (ent.visibility) {
             .public, .crate_restricted, .super_restricted, .in_path => true,
-            .private => false,
+            // Rust `private` means "this module and its descendants". Zig files
+            // are hard module boundaries, so a descendant Rust module becomes a
+            // sibling file that cannot see a non-`pub` item. Emit module-level
+            // items as `pub` outside the crate root; `src/root.zig` re-exports
+            // still define the crate's public surface.
+            .private => !self.current_file_is_root,
         };
 
         if (entity_id >= self.ir.bodies.bodies.len) {
@@ -5755,7 +5912,7 @@ const Lowerer = struct {
             .name = try self.alloc.dupe(u8, m.name),
             .is_pub = switch (m.visibility) {
                 .public, .crate_restricted, .super_restricted, .in_path => true,
-                .private => false,
+                .private => !self.current_file_is_root,
             },
             .params = final_params,
             .ret_type = ret_type,

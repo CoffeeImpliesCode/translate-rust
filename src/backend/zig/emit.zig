@@ -1071,9 +1071,14 @@ fn emitChunkLoop(
     else
         .{ .name = "chunk" };
     if (chunks.iterator) {
-        try buf.appendSlice(allocator, "while (");
+        // `next` takes `*Self`, so the iterator must live in a mutable place.
+        // A Rust `for x in expr` consumes `expr` by value, so binding a fresh
+        // temporary also matches the move semantics.
+        try buf.appendSlice(allocator, "var __r2z_iter = ");
         try emitExprScoped(context, allocator, buf, chunks.target, depth);
-        try buf.appendSlice(allocator, ".next()) |");
+        try buf.appendSlice(allocator, ";\n");
+        try emitIndent(allocator, buf, depth);
+        try buf.appendSlice(allocator, "while (__r2z_iter.next()) |");
         try emitCaptureBinding(allocator, buf, capture);
         try buf.appendSlice(allocator, "| {\n");
         for (loop.body.stmts) |stmt| {
