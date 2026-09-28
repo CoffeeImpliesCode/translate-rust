@@ -7370,6 +7370,47 @@ const Lowerer = struct {
             else => false,
         };
     }
+
+    /// True when `ty` names a local struct that carries a `next` method, which
+    /// is how a user-defined Rust `Iterator` is consumed in Zig: the value is
+    /// iterated with `while (iter.next())`, not with a Zig `for`.
+    fn isUserIteratorType(self: *const Lowerer, ty: ir.types.Type) bool {
+        var maybe_path: ?ir.types.Path = null;
+        switch (ty) {
+            .path => |value| maybe_path = value,
+            .@"opaque" => |opaque_type| {
+                if (opaque_type.concrete) |concrete| {
+                    switch (concrete.*) {
+                        .path => |value| maybe_path = value,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+        const path = maybe_path orelse return false;
+        const target = lastPathSegment(path.segments) orelse return false;
+        const struct_id = target.id orelse return false;
+        const entity = self.ir.graph.symbol_table.get(struct_id) orelse return false;
+        if (entity.kind != .struct_) return false;
+        if (struct_id >= self.ir.bodies.bodies.len) return false;
+        switch (self.ir.bodies.bodies[struct_id]) {
+            .struct_ => |structure| {
+                for (structure.methods) |method| {
+                    if (std.mem.eql(u8, method.name, "next")) return true;
+                }
+            },
+            else => {},
+        }
+        // A method hoisted from a separate `impl` block is not listed on the
+        // StructBody, so consult the collected declarations as well.
+        if (self.hoisted_by_id.get(struct_id)) |list| {
+            for (list.items) |decl| {
+                if (decl == .fn_decl and std.mem.eql(u8, decl.fn_decl.name, "next")) return true;
+            }
+        }
+        return false;
+    }
     const RecognizedStdMethod = enum {
         io_read_exact,
         io_write_all,
@@ -9254,15 +9295,29 @@ const Lowerer = struct {
                     .slice => {
                         value_capture_name = try self.valueCaptureName(fe.pattern);
                         const iterable = try self.lowerForInput(fe.iterable, try self.patternCapturesByReference(fe.pattern));
-                        const exact_type = if (try self.exprType(fe.iterable)) |iterable_ty|
-                            isChunksExactType(iterable_ty)
+                        const iterable_ty = try self.exprType(fe.iterable);
+                        const exact_type = if (iterable_ty) |value|
+                            isChunksExactType(value)
                         else
                             false;
                         const direct_exact = switch (self.ir.bodies.exprs[fe.iterable].kind) {
                             .method_call => exact_type,
                             else => false,
                         };
-                        if (exact_type and !direct_exact) {
+                        const user_iterator = if (iterable_ty) |value|
+                            isUserIteratorType(self, value)
+                        else
+                            false;
+                        if (user_iterator) {
+                            // A user-defined `Iterator` has no Zig `for`
+                            // shape; it is driven through `next()`.
+                            const iterator_args = try self.alloc.alloc(ast.Expr, 1);
+                            iterator_args[0] = iterable;
+                            try inputs.append(self.alloc, .{ .builtin = .{
+                                .name = "iteratorValue",
+                                .args = iterator_args,
+                            } });
+                        } else if (exact_type and !direct_exact) {
                             const iterator_args = try self.alloc.alloc(ast.Expr, 1);
                             iterator_args[0] = iterable;
                             try inputs.append(self.alloc, .{ .builtin = .{
@@ -10230,6 +10285,15 @@ const Lowerer = struct {
                     },
                     else => {
                         const lowered = try self.lowerExpr(e_id);
+                        // `return`, `break`, `continue`, and `panic` are
+                        // statements that happen to produce a type. Wrapping
+                        // them in a discard is a syntax error.
+                        switch (lowered) {
+                            .return_expr, .break_expr, .continue_expr, .panic_ => {
+                                break :blk ast.Stmt{ .expr_stmt = try self.allocExpr(lowered) };
+                            },
+                            else => {},
+                        }
                         if (try self.exprType(e_id)) |expression_type| {
                             if (expression_type != .prim or
                                 (expression_type.prim != .unit and expression_type.prim != .never))

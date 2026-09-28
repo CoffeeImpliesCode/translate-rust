@@ -1024,7 +1024,8 @@ fn emitChunkLoop(
     const chunks: ChunkLoop = switch (iterable) {
         .builtin => |builtin| blk: {
             if (builtin.args.len == 1 and
-                std.mem.eql(u8, builtin.name, "sliceChunksExactIterator"))
+                (std.mem.eql(u8, builtin.name, "sliceChunksExactIterator") or
+                    std.mem.eql(u8, builtin.name, "iteratorValue")))
             {
                 break :blk .{ .target = builtin.args[0], .iterator = true };
             }
@@ -1044,7 +1045,8 @@ fn emitChunkLoop(
         .call => |call| switch (call.callee.*) {
             .builtin => |builtin| blk: {
                 if (builtin.args.len == 1 and
-                    std.mem.eql(u8, builtin.name, "sliceChunksExactIterator"))
+                    (std.mem.eql(u8, builtin.name, "sliceChunksExactIterator") or
+                        std.mem.eql(u8, builtin.name, "iteratorValue")))
                 {
                     break :blk .{ .target = builtin.args[0], .iterator = true };
                 }
