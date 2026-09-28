@@ -3950,6 +3950,7 @@ const Lowerer = struct {
         chain: ir.exprs.IteratorChainExpr,
         adapter_index: usize,
         item: ast.Expr,
+        sink: CollectorSink,
         owner_name: []const u8,
         state: IteratorStructuralState,
         statements: *std.ArrayListUnmanaged(ast.Stmt),
@@ -3957,7 +3958,7 @@ const Lowerer = struct {
         if (adapter_index == chain.adapters.len) {
             const callee = try self.allocExpr(.{ .field_access = .{
                 .target = try self.allocExpr(.{ .ident = owner_name }),
-                .field_name = "append",
+                .field_name = if (sink == .string) "push" else "append",
             } });
             const args = try self.alloc.alloc(ast.Expr, 2);
             args[0] = .{ .ident = "allocator" };
@@ -3982,6 +3983,7 @@ const Lowerer = struct {
                     chain,
                     adapter_index + 1,
                     mapped_value,
+                    sink,
                     owner_name,
                     state,
                     &nested,
@@ -3996,6 +3998,7 @@ const Lowerer = struct {
                     chain,
                     adapter_index + 1,
                     item,
+                    sink,
                     owner_name,
                     state,
                     &then_stmts,
@@ -4033,6 +4036,7 @@ const Lowerer = struct {
                         chain,
                         adapter_index + 1,
                         range_loop.item,
+                        sink,
                         owner_name,
                         state,
                         &inner_stmts,
@@ -4057,6 +4061,7 @@ const Lowerer = struct {
                         chain,
                         adapter_index + 1,
                         .{ .ident = inner_name },
+                        sink,
                         owner_name,
                         state,
                         &inner_stmts,
@@ -4096,6 +4101,7 @@ const Lowerer = struct {
                     chain,
                     adapter_index + 1,
                     .{ .ident = stage_name },
+                    sink,
                     owner_name,
                     state,
                     &nested,
@@ -4151,6 +4157,7 @@ const Lowerer = struct {
                     chain,
                     adapter_index + 1,
                     .{ .ident = stage_name },
+                    sink,
                     owner_name,
                     state,
                     &nested,
@@ -4167,25 +4174,44 @@ const Lowerer = struct {
         }
     }
 
+    /// Where a `collect` terminal deposits each item.
+    const CollectorSink = enum {
+        /// Append to an owned `Vec` (`Vec<T>` maps to `ArrayList`).
+        vec,
+        /// Push a codepoint onto an owned `String`.
+        string,
+    };
+
+    /// True when a `collect` result is a `String` rather than a `Vec`.
+    fn isStringCollectionType(ty: ir.types.Type) bool {
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return false,
+        };
+        return externalPathEqual(external.path, &.{ "alloc", "string", "String" }) or
+            externalPathEqual(external.path, &.{ "std", "string", "String" });
+    }
+
     fn lowerIteratorCollectionBlock(
         self: *Lowerer,
         chain: ir.exprs.IteratorChainExpr,
         return_type: ir.types.Type,
     ) anyerror!ast.Block {
         if (chain.terminal != .collect_vec) return error.UnsupportedIteratorTerminal;
+        const sink: CollectorSink = if (isStringCollectionType(return_type)) .string else .vec;
         const owner_type = try self.lowerType(return_type);
-        const owner_generic = switch (owner_type) {
-            .generic => |generic| generic,
+        const owner_name = try self.iteratorTemporaryName("__r2z_owner");
+        const owner_type_expr: ast.Expr = switch (owner_type) {
+            .named => |name| .{ .ident = name },
+            .generic => |generic| .{ .call = .{
+                .callee = try self.allocExpr(.{ .ident = generic.name }),
+                .generic_args = generic.params,
+                .args = &.{},
+            } },
             else => return error.UnsupportedCollectionType,
         };
-        const owner_name = try self.iteratorTemporaryName("__r2z_owner");
-        const owner_type_expr = try self.allocExpr(.{ .call = .{
-            .callee = try self.allocExpr(.{ .ident = owner_generic.name }),
-            .generic_args = owner_generic.params,
-            .args = &.{},
-        } });
         const owner_init: ast.Expr = .{ .field_access = .{
-            .target = owner_type_expr,
+            .target = try self.allocExpr(owner_type_expr),
             .field_name = "empty",
         } };
 
@@ -4301,6 +4327,7 @@ const Lowerer = struct {
                 chain,
                 if (reverse) 1 else 0,
                 range_loop.item,
+                sink,
                 owner_name,
                 state,
                 &loop_stmts,
@@ -4313,12 +4340,28 @@ const Lowerer = struct {
                 chain,
                 0,
                 .{ .ident = item_name },
+                sink,
                 owner_name,
                 state,
                 &loop_stmts,
             );
             const inputs = try self.alloc.alloc(ast.Expr, 1);
-            inputs[0] = source.?;
+            // A user-defined `Iterator` is driven through `next()`, exactly
+            // as in a plain `for` loop over the same value.
+            const source_is_user_iterator = if (try self.exprType(chain.source)) |value|
+                isUserIteratorType(self, value)
+            else
+                false;
+            if (source_is_user_iterator) {
+                const iterator_args = try self.alloc.alloc(ast.Expr, 1);
+                iterator_args[0] = source.?;
+                inputs[0] = .{ .builtin = .{
+                    .name = "iteratorValue",
+                    .args = iterator_args,
+                } };
+            } else {
+                inputs[0] = source.?;
+            }
             const captures = try self.alloc.alloc(ast.Capture, 1);
             captures[0] = .{ .name = item_name, .by_ref = source_by_ref };
             try prefix.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .for_expr = .{

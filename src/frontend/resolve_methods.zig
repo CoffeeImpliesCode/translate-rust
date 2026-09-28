@@ -895,6 +895,22 @@ fn pathDeclaredType(
     path: exprs.PathExpr,
 ) ?types.Type {
     const entity = g.symbol_table.get(path.def) orelse return null;
+    // A field carries its declared type on the owning struct, which is
+    // reachable without going through an enclosing function body.
+    if (entity.kind == .field) {
+        if (entity.parent) |owner| {
+            if (owner < b.bodies.len) {
+                switch (b.bodies[owner]) {
+                    .struct_ => |structure| {
+                        for (structure.fields) |field| {
+                            if (std.mem.eql(u8, field.name, entity.name)) return field.ty;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
     const fn_id = entity.parent orelse return null;
     if (fn_id >= b.bodies.len) return null;
     const fn_body = switch (b.bodies[fn_id]) {
@@ -1036,9 +1052,27 @@ fn operandTypeResolved(
     }
     return switch (operand.kind) {
         .literal => true,
-        .path => |path| pathDeclaredType(g, b, path) != null,
+        .path => |path| blk: {
+            if (pathDeclaredType(g, b, path) != null) break :blk true;
+            // A binding a macro expansion introduced is parented to its
+            // function rather than to a struct, and its type only becomes
+            // known once inference runs. It is a real operand, so leave the
+            // decision to the primitive and operator checks below.
+            if (g.symbol_table.get(path.def)) |entity| {
+                if (entity.kind == .field) {
+                    if (entity.parent) |owner| {
+                        if (owner < b.bodies.len and b.bodies[owner] == .fn_) break :blk true;
+                    }
+                }
+            }
+            break :blk false;
+        },
         .binary => |binary| operandTypeResolved(g, b, binary.lhs) and operandTypeResolved(g, b, binary.rhs),
         .cast => |cast| operandTypeResolved(g, b, cast.operand),
+        // A deref takes its type from the reference it dereferences, and an
+        // enum variant always has its owner's type.
+        .unary => |unary| operandTypeResolved(g, b, unary.operand),
+        .enum_variant => true,
         else => false,
     };
 }

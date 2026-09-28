@@ -311,8 +311,30 @@ test "golden: fnv preserves hasher methods" {
     try std.testing.expect(found_write);
 }
 
-test "golden: hex rejects incomplete translation" {
-    try runGoldenFixture("hex", "test/crates/hex", error.UnsupportedExpression, &.{}, false, false);
+test "golden: hex library translates and its test module still rejects" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const test_io = std.testing.io;
+
+    // The library half of hex lowers now that a declared `Option` return
+    // type reaches its variants, a user-defined `Iterator` drives a `for`
+    // loop through `next()`, and `collect` builds an owned `String`.
+    const library = try frontend.analyzeCrate(allocator, test_io, "test/crates/hex");
+    try ir.validateForTranslation(&library);
+
+    // Its `#[cfg(test)]` module still needs structural equality for `Result`
+    // and for payload-carrying enums, so the full pipeline still rejects it.
+    const with_tests = try frontend.pipeline.analyzeCrateWithOptions(
+        allocator,
+        test_io,
+        "test/crates/hex",
+        .{ .include_tests = true },
+    );
+    try std.testing.expectError(
+        error.UnsupportedExpression,
+        ir.validateForTranslation(&with_tests),
+    );
 }
 test "golden: missing source directory propagates ingestion failure" {
     try std.testing.expectError(

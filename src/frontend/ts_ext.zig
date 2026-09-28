@@ -83,6 +83,74 @@ fn resolveTypeMethod(e: *const Ext, type_id: spine.EntityId, method: []const u8)
     }
     return null;
 }
+
+/// True when `type_id` is a local struct that carries a `next` method, which
+/// is what makes a user type an `Iterator` that a chain can drive.
+fn isUserIteratorType(e: *const Ext, type_id: spine.EntityId) bool {
+    const entity = e.ctx.g.symbol_table.get(type_id) orelse return false;
+    if (entity.kind != .struct_) return false;
+    if (type_id >= e.ctx.bodies_list.items.len) return false;
+    switch (e.ctx.bodies_list.items[type_id]) {
+        .struct_ => |structure| {
+            for (structure.methods) |method| {
+                if (std.mem.eql(u8, method.name, "next")) return true;
+            }
+        },
+        else => {},
+    }
+    return resolveTypeMethod(e, type_id, "next") != null;
+}
+
+/// Resolve a syntactic expression to the local struct type it denotes, for the
+/// shapes a user `Iterator` is usually written in: a struct literal, a
+/// `Type::method(..)` associated call, or a binding of that type.
+fn userIteratorSourceType(e: *const Ext, node: ts.Node) ?spine.EntityId {
+    const current = peelParenthesized(node);
+    const kind = current.kind();
+    if (std.mem.eql(u8, kind, "identifier")) {
+        const def = resolveName(e, text(e, current)) orelse return null;
+        const ty = localType(e, def) orelse return null;
+        return switch (ty) {
+            .path => |path| blk: {
+                if (path.segments.len == 0) break :blk null;
+                break :blk path.segments[path.segments.len - 1].id;
+            },
+            .@"opaque" => |opaque_type| blk: {
+                const concrete = opaque_type.concrete orelse break :blk null;
+                break :blk switch (concrete.*) {
+                    .path => |path| if (path.segments.len == 0)
+                        null
+                    else
+                        path.segments[path.segments.len - 1].id,
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+    if (std.mem.eql(u8, kind, "struct_expression")) {
+        const name_node = current.childByFieldName("name") orelse return null;
+        return resolvePatternPath(e, name_node) orelse resolveName(e, text(e, name_node));
+    }
+    if (std.mem.eql(u8, kind, "call_expression")) {
+        const callee = current.childByFieldName("function") orelse return null;
+        const raw = text(e, callee);
+        // `Type::new(..)` constructs a `Type`, so the prefix is the type and
+        // not the method. Resolving the whole callee would yield the method.
+        if (std.mem.lastIndexOf(u8, raw, "::")) |split| {
+            return resolveName(e, raw[0..split]) orelse
+                resolvePatternPath(e, callee);
+        }
+        return resolvePatternPath(e, callee) orelse resolveName(e, raw);
+    }
+    return null;
+}
+
+/// True when `node` is a value of a local struct type implementing `Iterator`.
+fn isUserIteratorSource(e: *const Ext, node: ts.Node) bool {
+    const type_id = userIteratorSourceType(e, node) orelse return false;
+    return isUserIteratorType(e, type_id);
+}
 fn resolveNominalTypePath(
     e: *const Ext,
     alias_id: spine.EntityId,
@@ -2139,10 +2207,17 @@ fn isStandardIteratorSource(e: *Ext, node: ts.Node) bool {
     return isSliceIteratorSourceType(source_type);
 }
 
+/// A user `Iterator` is a chain source too, even though it is neither a slice
+/// nor a range. The backend drives such a source through `next()`.
+fn isIteratorSourceNode(e: *Ext, node: ts.Node) bool {
+    if (isStandardIteratorSource(e, node)) return true;
+    return isUserIteratorSource(e, node);
+}
+
 fn isSimpleIteratorSource(e: *Ext, node: ts.Node) bool {
     const current = peelParenthesized(node);
     if (std.mem.eql(u8, current.kind(), "range_expression")) return true;
-    if (isStandardIteratorSource(e, current)) return true;
+    if (isIteratorSourceNode(e, current)) return true;
     if (!std.mem.eql(u8, current.kind(), "call_expression")) return false;
 
     const method = methodNameOf(e, current) orelse return false;
@@ -2207,7 +2282,7 @@ fn lowerIteratorSource(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (e.ctx.exprs.items[source].kind != .range) return error.UnsupportedIteratorChain;
         return source;
     }
-    if (isStandardIteratorSource(e, current)) return lowerExpr(e, current);
+    if (isIteratorSourceNode(e, current)) return lowerExpr(e, current);
     if (!std.mem.eql(u8, current.kind(), "call_expression")) {
         return error.UnsupportedIteratorChain;
     }
@@ -2249,6 +2324,10 @@ fn lowerIteratorChainParts(
     const current = peelParenthesized(node);
     if (std.mem.eql(u8, current.kind(), "range_expression")) {
         source.* = try lowerIteratorSource(e, current);
+        return;
+    }
+    if (isUserIteratorSource(e, current)) {
+        source.* = try lowerExpr(e, current);
         return;
     }
     if (!std.mem.eql(u8, current.kind(), "call_expression")) {
@@ -4176,6 +4255,18 @@ fn lowerStructExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return appendExpr(e, .{ .enum_variant = .{
             .def = entity.parent orelse return error.MalformedCst,
             .variant = try e.ctx.alloc.dupe(u8, entity.name),
+            .tuple_fields = &.{},
+            .named_fields = try fields.toOwnedSlice(e.ctx.alloc),
+        } });
+    }
+    // A variant carrying named fields has no `.variant` entity of its own, so
+    // path resolution lands on the enum. Recognize the variant by name so
+    // `Enum::Variant { .. }` is not mistaken for a struct literal.
+    if (entity.kind == .enum_ and enumBodyHasVariant(e, def, leaf_name)) {
+        if (base_id != null) return unsupported(e, "enum variant update expression");
+        return appendExpr(e, .{ .enum_variant = .{
+            .def = def,
+            .variant = try e.ctx.alloc.dupe(u8, leaf_name),
             .tuple_fields = &.{},
             .named_fields = try fields.toOwnedSlice(e.ctx.alloc),
         } });
