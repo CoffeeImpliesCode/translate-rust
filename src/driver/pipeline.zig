@@ -108,17 +108,31 @@ pub fn promotePackageWithHooks(
 }
 
 /// Translate a Rust crate directory into a standalone Zig package at `out_dir`
-/// using the default host analysis configuration.
+/// using the default host analysis configuration. No feature selection is
+/// made here, so the manifest's `default` feature closure applies.
 pub fn translate(
     allocator: std.mem.Allocator,
     io: std.Io,
     crate_dir: []const u8,
     out_dir: []const u8,
 ) !void {
+    return translateWithFeatures(allocator, io, crate_dir, out_dir, &.{});
+}
+
+/// Translate a Rust crate directory with an explicit `#[cfg(feature = ...)]`
+/// selection. An empty `features` list means no selection was made, so the
+/// manifest's `default` feature closure applies; a non-empty list replaces it.
+pub fn translateWithFeatures(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    crate_dir: []const u8,
+    out_dir: []const u8,
+    features: []const []const u8,
+) !void {
     return translateWithOptions(allocator, io, crate_dir, out_dir, .{
         .include_tests = true,
         .cfg = .{
-            .features = &.{},
+            .features = features,
             .target_pointer_width = @bitSizeOf(usize),
             .docsrs = false,
         },
@@ -128,6 +142,8 @@ pub fn translate(
 /// Translate a Rust crate directory with explicit frontend analysis options.
 /// The package is generated in a sibling staging directory and is not
 /// published until its manifest, sources, and `zig build test` pass.
+/// An empty `cfg.features` is not "no features": it means no selection was
+/// made, so the manifest's `default` feature closure applies.
 pub fn translateWithOptions(
     allocator: std.mem.Allocator,
     io: std.Io,

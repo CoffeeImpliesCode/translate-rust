@@ -14,6 +14,8 @@ pub const package = @import("package.zig");
 pub const lower = @import("lower.zig");
 /// Lowering engine tests.
 pub const lower_test = @import("lower_test.zig");
+/// Text emitter tests.
+pub const emit_test = @import("emit_test.zig");
 /// JSON encoder/decoder for ast.Package.
 pub const serialize = @import("serialize.zig");
 /// Pluggable lowering strategies.

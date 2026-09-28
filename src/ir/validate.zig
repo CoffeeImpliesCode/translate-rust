@@ -53,12 +53,29 @@ pub const ValidationError = error{
     InvalidCoreCallArity,
     InvalidCoreFunctionArity,
 };
+/// Reason text of the most recent `.unsupported` expression this module
+/// rejected, or null when none is pending. The frontend records a precise
+/// reason per unsupported construct ("cast target type", "macro {s}", ...);
+/// without this the only thing a caller could ever see was the bare error.
+/// Thread-local so concurrent validations cannot cross-contaminate.
+threadlocal var pending_unsupported_reason: ?[]const u8 = null;
+
+/// Read and clear the pending unsupported-expression reason. Returns null
+/// when the last validation failed for some other reason, or accepted the IR.
+pub fn takeUnsupportedReason() ?[]const u8 {
+    const reason = pending_unsupported_reason;
+    pending_unsupported_reason = null;
+    return reason;
+}
+
 /// Validate all invariants required before target-specific lowering.
 ///
 /// This is intentionally strict. A missing record, unresolved reference, or
 /// explicit unsupported marker is an error instead of an empty declaration or
 /// a skipped item.
 pub fn validateForTranslation(ir: *const RustIr) ValidationError!void {
+    // A fresh run never inherits the previous run's diagnosis.
+    pending_unsupported_reason = null;
     try validateGraph(ir);
     try validateInstantiations(ir);
     try validateBodies(ir);
@@ -455,7 +472,10 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                     .type_alias => |value| value,
                     else => return error.BodyKindMismatch,
                 };
-                try validateType(ir, b, alias_body.target, &.{});
+                try validateGenericNames(alias_body.generic_params);
+                // The alias's own parameters are in scope in its target, so the
+                // target's null-id path segments must resolve against them.
+                try validateType(ir, b, alias_body.target, alias_body.generic_params);
             },
             .impl_ => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
@@ -1077,6 +1097,20 @@ const ContextSeen = struct {
     root_types: []bool,
     paired_types: []bool,
 };
+/// The declared generic-parameter count of `id`, or null when the entity
+/// carries none.
+///
+/// A `.method_ref` is a call-site reference with no body of its own, so its
+/// count has to be read from the declaration it names: its parent is the
+/// trait or `fn_` that declares the method, and the matching child carries
+/// the signature. This is a read of already-lowered metadata — it does NOT
+/// perform method resolution, which stays with `resolveMethods` and the
+/// backend's `methodEntityForDefinition`.
+///
+/// A `.method_ref` whose parent is missing, is not a declaration, or declares
+/// no child of that name yields null, so every caller keeps rejecting with
+/// `IncompleteGenericMetadata` exactly as before. The walk visits entities
+/// strictly below the parent, so it cannot recurse.
 fn genericCountForEntity(ir: *const RustIr, id: spine.EntityId) ?usize {
     if (@as(usize, id) >= ir.bodies.bodies.len) return null;
     if (@as(usize, id) < ir.graph.symbol_table.entities.items.len and
@@ -1085,12 +1119,72 @@ fn genericCountForEntity(ir: *const RustIr, id: spine.EntityId) ?usize {
         return 1;
     }
 
-    return switch (ir.bodies.bodies[id]) {
-        .fn_ => |body| body.generic_params.len,
-        .struct_ => |body| body.generic_params.len,
-        .enum_ => |body| body.generic_params.len,
-        else => null,
-    };
+    switch (ir.bodies.bodies[id]) {
+        .fn_ => |body| return body.generic_params.len,
+        .struct_ => |body| return body.generic_params.len,
+        .enum_ => |body| return body.generic_params.len,
+        else => {},
+    }
+    return methodRefGenericCount(ir, id);
+}
+
+/// True when `id` is a `.method_ref` that names a method no entity in this
+/// crate declares — the shape a standard-library method call has.
+///
+/// `resolveMethods` deliberately leaves a std method as a bodiless
+/// `.method_ref`, because the backend selects the implementation from the
+/// receiver type and the method name. There is no arity to check against such
+/// a callee, and reporting missing metadata would misdescribe the situation:
+/// nothing is missing, none is owed. A `.method_ref` whose parent DOES declare
+/// the method is excluded, so a real declaration is still arity-checked.
+fn isUndeclaredMethodReference(ir: *const RustIr, id: spine.EntityId) bool {
+    const entities = ir.graph.symbol_table.entities.items;
+    if (@as(usize, id) >= entities.len) return false;
+    if (entities[id].kind != .method_ref) return false;
+    return methodRefGenericCount(ir, id) == null;
+}
+
+/// Generic count of the method a `.method_ref` names, found by matching its
+/// name against the `fn_` children of the entity that declares it. Returns
+/// null when the reference cannot be tied to a declaration.
+fn methodRefGenericCount(ir: *const RustIr, method_ref: spine.EntityId) ?usize {
+    const entities = ir.graph.symbol_table.entities.items;
+    if (@as(usize, method_ref) >= entities.len) return null;
+    if (entities[method_ref].kind != .method_ref) return null;
+    const parent_id = entities[method_ref].parent orelse return null;
+    if (@as(usize, parent_id) >= entities.len) return null;
+
+    // A trait declares its methods in the body, not as child entities, so read
+    // the signature from the trait's own method list.
+    if (entities[parent_id].kind == .trait_) {
+        if (@as(usize, parent_id) >= ir.bodies.bodies.len) return null;
+        const trait_body = switch (ir.bodies.bodies[parent_id]) {
+            .trait_ => |body| body,
+            else => return null,
+        };
+        for (trait_body.methods) |method| {
+            if (std.mem.eql(u8, method.name, entities[method_ref].name)) {
+                return method.generic_params.len;
+            }
+        }
+        return null;
+    }
+
+    // Otherwise the declaring owner is the parent itself, and the method is a
+    // child `fn_` of it. The walk descends exactly one level, so a `fn_` parent
+    // (the shape `pushMethodRef` produces) simply finds nothing and returns
+    // null rather than chasing its own children.
+    for (entities, 0..) |candidate, index| {
+        if (candidate.parent == null or candidate.parent.? != parent_id) continue;
+        if (candidate.kind != .fn_) continue;
+        if (!std.mem.eql(u8, candidate.name, entities[method_ref].name)) continue;
+        if (index >= ir.bodies.bodies.len) continue;
+        return switch (ir.bodies.bodies[index]) {
+            .fn_ => |body| body.generic_params.len,
+            else => null,
+        };
+    }
+    return null;
 }
 
 fn genericNameKnown(generic_names: GenericNames, name: []const u8) bool {
@@ -1914,18 +2008,27 @@ fn isValidCastType(kind: exprs.ConversionKind, source: Type, target: Type) bool 
     };
 }
 
+/// Record the reason the frontend gave for an unsupported expression, then
+/// return the catchable bare error. The reason stays out of the error NAME so
+/// every existing `error.UnsupportedExpression` match keeps working; a caller
+/// that wants the detail reads it back with `takeUnsupportedReason`.
+fn rejectUnsupportedMarker(reason: []const u8) ValidationError {
+    pending_unsupported_reason = reason;
+    return error.UnsupportedExpression;
+}
+
 fn validateAssertionMarker(b: *const Bodies, reason: []const u8) ValidationError!void {
     const prefix = "assertion:";
-    if (!std.mem.startsWith(u8, reason, prefix)) return error.UnsupportedExpression;
+    if (!std.mem.startsWith(u8, reason, prefix)) return rejectUnsupportedMarker(reason);
 
     const suffix = reason[prefix.len..];
-    if (suffix.len == 0) return error.UnsupportedExpression;
+    if (suffix.len == 0) return rejectUnsupportedMarker(reason);
     for (suffix) |character| {
-        if (character < '0' or character > '9') return error.UnsupportedExpression;
+        if (character < '0' or character > '9') return rejectUnsupportedMarker(reason);
     }
 
     const condition_id = std.fmt.parseInt(exprs.NodeId, suffix, 10) catch
-        return error.UnsupportedExpression;
+        return rejectUnsupportedMarker(reason);
     try validateExprRef(b, condition_id);
 }
 
@@ -2010,6 +2113,26 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
         .method_call => |method| {
             try validateExprRef(b, method.receiver);
             try validateEntityRef(ir, method.method);
+            if (method.generic_args.len > 0 and
+                !isUndeclaredMethodReference(ir, method.method))
+            {
+                // A `.method_ref` callee is a call-site reference with no body,
+                // which is how a standard-library method reaches lowering: the
+                // backend selects the implementation from the receiver type and
+                // the method name. A callee this crate does not declare has no
+                // arity to violate and no metadata is owed — the frontend is not
+                // dropping anything — so the gate is skipped for exactly that
+                // shape and nothing else. A declared callee, whether a `fn_` or
+                // a `.method_ref` whose parent declares it, is still checked.
+                const generic_count = genericCountForEntity(ir, method.method) orelse
+                    return error.IncompleteGenericMetadata;
+                if (generic_count == 0 or method.generic_args.len != generic_count) {
+                    return error.IncompleteGenericMetadata;
+                }
+                for (method.generic_args) |argument| {
+                    try validateType(ir, b, argument, &.{});
+                }
+            }
             for (method.args) |id| try validateExprRef(b, id);
         },
         .struct_lit => |literal| {
@@ -2337,6 +2460,339 @@ fn appendCoreCallForValidation(ir: *RustIr, call: exprs.CoreCall) !void {
     root.kind = .{ .block = root_block };
     new_exprs[0] = root;
     ir.bodies.exprs = new_exprs;
+}
+
+/// Attach a method call to the root block's tail, mirroring
+/// `appendCoreCallForValidation` for the call forms that carry a callee.
+fn appendMethodCallForValidation(ir: *RustIr, call: exprs.MethodCall) !void {
+    const allocator = ir.graph.allocator;
+    const old_exprs = ir.bodies.exprs;
+    const call_id: exprs.NodeId = @intCast(old_exprs.len);
+    const receiver_id: exprs.NodeId = @intCast(old_exprs.len + 1);
+    const new_exprs = try allocator.alloc(exprs.Expr, old_exprs.len + 2);
+    @memcpy(new_exprs[0..old_exprs.len], old_exprs);
+    new_exprs[call_id] = .{
+        .id = call_id,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .method_call = call },
+    };
+    new_exprs[receiver_id] = .{ .id = receiver_id, .span = test_span, .ty = null, .kind = .unit };
+    new_exprs[call_id].kind.method_call.receiver = receiver_id;
+    var root = new_exprs[0];
+    var root_block = switch (root.kind) {
+        .block => |block| block,
+        else => return error.InvalidFunctionBody,
+    };
+    root_block.tail = call_id;
+    root.kind = .{ .block = root_block };
+    new_exprs[0] = root;
+    ir.bodies.exprs = new_exprs;
+}
+
+/// Declare entity 1 (`run`) as a one-parameter generic function so a method
+/// call naming it has a generic count to check a turbofish against.
+fn makeMethodEntityGeneric(ir: *RustIr) !void {
+    var function_body = ir.bodies.bodies[1].fn_;
+    function_body.generic_params = try ir.graph.allocator.dupe([]const u8, &.{"T"});
+    @constCast(ir.bodies.bodies)[1] = .{ .fn_ = function_body };
+}
+
+/// `count` distinct generic-parameter names (`T0`, `T1`, ...). Built at runtime
+/// because the arity under test is a value, not a comptime constant.
+fn dupRepeatedParamNames(allocator: std.mem.Allocator, count: usize) ![]const []const u8 {
+    const names = try allocator.alloc([]const u8, count);
+    for (names, 0..) |*name, index| {
+        name.* = try std.fmt.allocPrint(allocator, "T{d}", .{index});
+    }
+    return names;
+}
+
+/// A crate whose `method_call` names a `.method_ref` — the shape every method
+/// call has before `resolveMethods` rewrites it to a concrete `fn_`. A
+/// `.method_ref` carries no body of its own, so its generic count has to come
+/// from the trait that declares the method.
+///
+/// `method_param_count` is the declared parameter count of the trait's method.
+fn methodRefIr(
+    allocator: std.mem.Allocator,
+    method_param_count: usize,
+) !RustIr {
+    var ir = try validReducedIr(allocator);
+    const entities = ir.graph.symbol_table.entities.items;
+
+    // Entity 7 = trait `Reader` declaring a generic `read`, 8 = the
+    // `.method_ref` that names it, and 9 = a plain `fn_` with the same name so
+    // the "walk to the fn child whose name matches" path has a target.
+    const trait_id: spine.EntityId = @intCast(entities.len);
+    const method_ref_id: spine.EntityId = @intCast(trait_id + 1);
+    const method_fn_id: spine.EntityId = @intCast(trait_id + 2);
+
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .trait_,
+        .name = try allocator.dupe(u8, "Reader"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .method_ref,
+        .name = try allocator.dupe(u8, "read"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = trait_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "read"),
+        .span = test_span,
+        .visibility = .public,
+        .parent = trait_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // The body table is indexed by EntityId, so extend it to cover the three
+    // new entities: trait, method_ref (no body), and the method's `fn_`.
+    const old_bodies = ir.bodies.bodies;
+    const body_table = try allocator.alloc(bodies_mod.BodyKind, old_bodies.len + 3);
+    @memcpy(body_table[0..old_bodies.len], old_bodies);
+
+    var trait_methods = try allocator.alloc(bodies_mod.TraitMethodSig, 1);
+    trait_methods[0] = .{
+        .name = "read",
+        .ret = .{ .prim = .unit },
+        .generic_params = try dupRepeatedParamNames(allocator, method_param_count),
+    };
+    body_table[trait_id] = .{ .trait_ = .{
+        .name = "Reader",
+        .methods = trait_methods,
+    } };
+    // A `.method_ref` has no body by construction; that is the whole point of
+    // the fix.
+    body_table[method_ref_id] = .none;
+    body_table[method_fn_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .generic_params = try dupRepeatedParamNames(allocator, method_param_count),
+        .body = 0,
+    } };
+    ir.bodies.bodies = body_table;
+
+    // Only the trait is a module item; the method's `fn_` is a child of the
+    // trait, and the `.method_ref` points at the trait, which is what the
+    // count walk follows. `validateGraph` rejects a module list containing an
+    // entity whose parent is not the module, so the two lists differ.
+    ir.graph.symbol_table.entities.items[@as(usize, trait_id)].parent = 0;
+    ir.graph.symbol_table.entities.items[@as(usize, method_fn_id)].parent = trait_id;
+    const module_items = try allocator.dupe(
+        spine.EntityId,
+        &.{ 1, 2, 3, 4, 5, 6, trait_id },
+    );
+    const module = ir.graph.moduleById(0) orelse return error.InvalidModuleId;
+    @constCast(module).items = module_items;
+
+    try appendMethodCallForValidation(&ir, .{
+        .receiver = 0,
+        .receiver_mode = .shared,
+        .method = method_ref_id,
+        .generic_args = &.{.{ .prim = .u32 }},
+        .args = &.{},
+    });
+    return ir;
+}
+
+test "a method_ref turbofish is arity checked against the declared method" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // One declared parameter, one turbofish argument: the `.method_ref` has no
+    // body, so this only validates if the count is resolved through the trait.
+    const matching = try methodRefIr(allocator, 1);
+    try validateForTranslation(&matching);
+
+    // Two declared parameters against one argument still rejects. This is the
+    // case that proves the rule RUNS for a `.method_ref` rather than being
+    // bypassed by returning null.
+    const mismatched = try methodRefIr(allocator, 2);
+    try std.testing.expectError(error.IncompleteGenericMetadata, validateForTranslation(&mismatched));
+}
+
+test "a method_ref callee this crate does not declare owes no arity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // The `fn_`-parented `.method_ref` is the shape `pushMethodRef` produces for
+    // an ordinary `recv.method(..)`, and the shape `collect::<Vec<_>>()` has in
+    // hex. Its parent is the ENCLOSING function, which owns no method of that
+    // name, so this crate declares no callee and no arity is owed. The gate is
+    // skipped for exactly this shape — no panic, no unbounded recursion, and no
+    // misleading "missing metadata" error for something that was never owed.
+    var ir = try validReducedIr(allocator);
+    const entities = ir.graph.symbol_table.entities.items;
+    const method_ref_id: spine.EntityId = @intCast(entities.len);
+
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .method_ref,
+        .name = try allocator.dupe(u8, "unowned"),
+        .span = test_span,
+        .visibility = .public,
+        // Parent 1 is the `run` fn_ from validReducedIr: a legal method_ref
+        // parent that declares no method named `unowned`.
+        .parent = 1,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const old_bodies = ir.bodies.bodies;
+    const body_table = try allocator.alloc(bodies_mod.BodyKind, old_bodies.len + 1);
+    @memcpy(body_table[0..old_bodies.len], old_bodies);
+    body_table[method_ref_id] = .none;
+    ir.bodies.bodies = body_table;
+
+    try appendMethodCallForValidation(&ir, .{
+        .receiver = 0,
+        .receiver_mode = .shared,
+        .method = method_ref_id,
+        .generic_args = &.{.{ .prim = .u32 }},
+        .args = &.{},
+    });
+    try validateForTranslation(&ir);
+}
+
+test "a declared method_ref callee is still arity checked after the skip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // The skip is narrow: a `.method_ref` whose parent DOES declare the method
+    // is excluded from it, so a wrong-length turbofish on a declared method
+    // still rejects. Two declared parameters against one argument.
+    const mismatched = try methodRefIr(allocator, 2);
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        validateForTranslation(&mismatched),
+    );
+}
+
+test "a method_ref with a missing parent preserves the previous null count" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // An out-of-range entity id never reaches the walk at all, so the count is
+    // null before any dereference and the IR is refused, not crashed on.
+    var ir = try validReducedIr(allocator);
+    try appendMethodCallForValidation(&ir, .{
+        .receiver = 0,
+        .receiver_mode = .shared,
+        .method = @intCast(ir.graph.symbol_table.entities.items.len + 10),
+        .generic_args = &.{.{ .prim = .u32 }},
+        .args = &.{},
+    });
+    try std.testing.expectError(error.InvalidEntityReference, validateForTranslation(&ir));
+}
+
+test "method call turbofish arity is checked only when present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // No turbofish: an unannotated generic method call stays legal, because
+    // Rust infers the argument at that call site.
+    var bare = try validReducedIr(allocator);
+    try makeMethodEntityGeneric(&bare);
+    try appendMethodCallForValidation(&bare, .{
+        .receiver = 0,
+        .receiver_mode = .value,
+        .method = 1,
+        .generic_args = &.{},
+        .args = &.{},
+    });
+    try validateForTranslation(&bare);
+
+    // A turbofish naming exactly the declared parameter count is accepted.
+    var matched = try validReducedIr(allocator);
+    try makeMethodEntityGeneric(&matched);
+    try appendMethodCallForValidation(&matched, .{
+        .receiver = 0,
+        .receiver_mode = .value,
+        .method = 1,
+        .generic_args = &.{.{ .prim = .u32 }},
+        .args = &.{},
+    });
+    try validateForTranslation(&matched);
+
+    // Too many arguments, and too few, both reject with the same error the
+    // path expression already uses for a mis-sized turbofish.
+    var too_many = try validReducedIr(allocator);
+    try makeMethodEntityGeneric(&too_many);
+    try appendMethodCallForValidation(&too_many, .{
+        .receiver = 0,
+        .receiver_mode = .value,
+        .method = 1,
+        .generic_args = &.{ .{ .prim = .u32 }, .{ .prim = .u8 } },
+        .args = &.{},
+    });
+    try std.testing.expectError(error.IncompleteGenericMetadata, validateForTranslation(&too_many));
+
+    var too_few = try validReducedIr(allocator);
+    try makeMethodEntityGeneric(&too_few);
+    try appendMethodCallForValidation(&too_few, .{
+        .receiver = 0,
+        .receiver_mode = .value,
+        .method = 1,
+        .generic_args = &.{},
+        .args = &.{},
+    });
+    try validateForTranslation(&too_few);
+
+    // A turbofish on a method whose entity declares no generics at all is
+    // incomplete metadata, not a silently ignored argument.
+    var non_generic = try validReducedIr(allocator);
+    try appendMethodCallForValidation(&non_generic, .{
+        .receiver = 0,
+        .receiver_mode = .value,
+        .method = 1,
+        .generic_args = &.{.{ .prim = .u32 }},
+        .args = &.{},
+    });
+    try std.testing.expectError(error.IncompleteGenericMetadata, validateForTranslation(&non_generic));
+}
+
+test "method call turbofish argument types are validated in context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // A type parameter the method's own generic context does not declare is
+    // unresolvable, exactly as it is for a path expression's arguments.
+    var ir = try validReducedIr(allocator);
+    try makeMethodEntityGeneric(&ir);
+    try appendMethodCallForValidation(&ir, .{
+        .receiver = 0,
+        .receiver_mode = .value,
+        .method = 1,
+        .generic_args = &.{.{ .path = .{
+            .segments = &.{.{ .name = "Undeclared", .id = null }},
+        } }},
+        .args = &.{},
+    });
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
 }
 
 test "validation accepts a core call generic in its declaring function" {
@@ -2720,6 +3176,62 @@ test "validation rejects a generic path outside its declaring function" {
     try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
 }
 
+test "validation accepts a type alias naming its own generic parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    var alias_body = ir.bodies.bodies[6].type_alias;
+    alias_body.generic_params = &.{ "K", "V" };
+    alias_body.target = .{ .external_nominal = .{
+        .path = &.{ "std", "collections", "HashMap" },
+        .args = &.{
+            .{ .path = .{ .segments = &.{.{ .name = "K", .id = null }} } },
+            .{ .path = .{ .segments = &.{.{ .name = "V", .id = null }} } },
+        },
+    } };
+    @constCast(ir.bodies.bodies)[6] = .{ .type_alias = alias_body };
+
+    try validateForTranslation(&ir);
+}
+
+test "validation rejects a type alias naming an undeclared parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    var alias_body = ir.bodies.bodies[6].type_alias;
+    // The alias declares `K` but its target names `V`, which is out of scope.
+    alias_body.generic_params = &.{"K"};
+    alias_body.target = .{ .path = .{ .segments = &.{.{ .name = "V", .id = null }} } };
+    @constCast(ir.bodies.bodies)[6] = .{ .type_alias = alias_body };
+
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
+}
+
+test "validation rejects a type alias with empty or duplicate generic names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var empty = try validReducedIr(arena.allocator());
+    var empty_body = empty.bodies.bodies[6].type_alias;
+    empty_body.generic_params = &.{""};
+    @constCast(empty.bodies.bodies)[6] = .{ .type_alias = empty_body };
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        validateForTranslation(&empty),
+    );
+
+    var duplicate = try validReducedIr(arena.allocator());
+    var duplicate_body = duplicate.bodies.bodies[6].type_alias;
+    duplicate_body.generic_params = &.{ "K", "K" };
+    @constCast(duplicate.bodies.bodies)[6] = .{ .type_alias = duplicate_body };
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        validateForTranslation(&duplicate),
+    );
+}
+
 test "validation accepts alloc external nominal and rejects unknown root" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2973,6 +3485,53 @@ test "validation rejects an ordinary unsupported expression" {
         .suggested_version = .v1,
     } };
     try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&ir));
+}
+
+test "validation carries the unsupported expression reason out to the caller" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A stale reason from an earlier run must not be attributed to this one.
+    _ = takeUnsupportedReason();
+
+    var ir = try validReducedIr(arena.allocator());
+    @constCast(ir.bodies.exprs)[1].kind = .{ .unsupported = .{
+        .reason = "cast target type",
+        .suggested_version = .v1,
+    } };
+
+    // The error NAME is unchanged, so existing callers keep matching on it.
+    try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&ir));
+    try std.testing.expectEqualStrings("cast target type", takeUnsupportedReason().?);
+    // Reading it is a one-shot: a second read must not replay it.
+    try std.testing.expect(takeUnsupportedReason() == null);
+
+    // A clean run clears whatever was pending.
+    var clean = try validReducedIr(arena.allocator());
+    @constCast(clean.bodies.exprs)[1].kind = .{ .unsupported = .{
+        .reason = "local const initializer is not a pure scalar",
+        .suggested_version = .v1,
+    } };
+    try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&clean));
+    const reason = takeUnsupportedReason().?;
+    try std.testing.expectEqualStrings("local const initializer is not a pure scalar", reason);
+
+    var accepted = try validReducedIr(arena.allocator());
+    try validateForTranslation(&accepted);
+    try std.testing.expect(takeUnsupportedReason() == null);
+}
+
+test "a malformed assertion marker still reports its marker text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    @constCast(ir.bodies.exprs)[1].kind = .{ .unsupported = .{
+        .reason = "assertion:not-a-node",
+        .suggested_version = .v3,
+    } };
+    try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&ir));
+    try std.testing.expectEqualStrings("assertion:not-a-node", takeUnsupportedReason().?);
 }
 
 test "validation rejects explicit unsupported pattern and type" {

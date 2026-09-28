@@ -92,7 +92,18 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
             \\
             \\pub fn build(b: *std.Build) void {{
             \\    const target = b.standardTargetOptions(.{{}});
-            \\    const optimize = b.standardOptimizeOption(.{{}});
+            \\    // ReleaseSafe by default: it is the mode a consumer of this
+            \\    // package actually runs. -Doptimize still selects any other.
+            \\    const optimize: std.builtin.OptimizeMode = b.option(
+            \\        std.builtin.OptimizeMode,
+            \\        "optimize",
+            \\        "Prioritize performance, safety, or binary size",
+            \\    ) orelse switch (b.release_mode) {{
+            \\        .off, .any => .ReleaseSafe,
+            \\        .fast => .ReleaseFast,
+            \\        .safe => .ReleaseSafe,
+            \\        .small => .ReleaseSmall,
+            \\    }};
             \\
             \\    const pkg_mod = b.addModule("{s}", .{{
             \\        .root_source_file = b.path("src/root.zig"),
@@ -147,7 +158,18 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
         \\
         \\pub fn build(b: *std.Build) void {{
         \\    const target = b.standardTargetOptions(.{{}});
-        \\    const optimize = b.standardOptimizeOption(.{{}});
+        \\    // ReleaseSafe by default: it is the mode a consumer of this
+        \\    // package actually runs. -Doptimize still selects any other.
+        \\    const optimize: std.builtin.OptimizeMode = b.option(
+        \\        std.builtin.OptimizeMode,
+        \\        "optimize",
+        \\        "Prioritize performance, safety, or binary size",
+        \\    ) orelse switch (b.release_mode) {{
+        \\        .off, .any => .ReleaseSafe,
+        \\        .fast => .ReleaseFast,
+        \\        .safe => .ReleaseSafe,
+        \\        .small => .ReleaseSmall,
+        \\    }};
         \\
         \\{s}
         \\    const pkg_mod = b.addModule("{s}", .{{
@@ -646,21 +668,72 @@ fn validateStagedPackage(
     if (std.mem.indexOf(u8, zon, "\"src\"") == null) return error.InvalidGeneratedManifest;
 }
 
-fn runGeneratedBuildTest(
+/// The `-Doptimize` flags the promotion gate compiles the staged package in.
+/// Debug catches compile-time breakage; ReleaseSafe is what a consumer runs,
+/// where the optimizer is on and `std.debug.assert` guards are load-bearing.
+const promotion_optimize_flags = [_][]const u8{
+    "-Doptimize=Debug",
+    "-Doptimize=ReleaseSafe",
+};
+
+const RunGateMode = *const fn (
     allocator: std.mem.Allocator,
-    io: std.Io,
-    _: ?*anyopaque,
-    staging_dir: []const u8,
+    context: ?*anyopaque,
+    flag: []const u8,
+) anyerror!BuildTestResult;
+
+/// Compile the staged package once per optimize mode. The first failure is
+/// returned unchanged: a second run would repeat the same manifest
+/// fingerprint hint, and `resolveFingerprint` rejects a hint it sees twice.
+fn runGateOptimizeModes(
+    allocator: std.mem.Allocator,
+    run_mode: RunGateMode,
+    context: ?*anyopaque,
 ) anyerror!BuildTestResult {
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "zig", "build", "test" },
-        .cwd = .{ .path = staging_dir },
+    for (promotion_optimize_flags) |flag| {
+        const result = try run_mode(allocator, context, flag);
+        if (result.term == .exited and result.term.exited == 0) {
+            releaseBuildTestResult(allocator, result);
+            continue;
+        }
+        return result;
+    }
+    return .{ .term = .{ .exited = 0 }, .stdout = "", .stderr = "" };
+}
+
+const GeneratedGateContext = struct {
+    io: std.Io,
+    staging_dir: []const u8,
+};
+
+fn runGeneratedGateMode(
+    allocator: std.mem.Allocator,
+    opaque_context: ?*anyopaque,
+    flag: []const u8,
+) anyerror!BuildTestResult {
+    const context: *GeneratedGateContext = @ptrCast(@alignCast(opaque_context.?));
+    const result = try std.process.run(allocator, context.io, .{
+        .argv = &.{ "zig", "build", "test", flag },
+        .cwd = .{ .path = context.staging_dir },
     });
     return .{
         .term = result.term,
         .stdout = result.stdout,
         .stderr = result.stderr,
     };
+}
+
+fn runGeneratedBuildTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    _: ?*anyopaque,
+    staging_dir: []const u8,
+) anyerror!BuildTestResult {
+    var context = GeneratedGateContext{
+        .io = io,
+        .staging_dir = staging_dir,
+    };
+    return runGateOptimizeModes(allocator, runGeneratedGateMode, &context);
 }
 
 fn recordFingerprint(
@@ -1012,6 +1085,67 @@ test "generateBuildZig: runs every translated test through the root module" {
     );
 }
 
+test "generateBuildZig: selects the optimize mode explicitly, defaulting to ReleaseSafe" {
+    const allocator = std.testing.allocator;
+    const pkg = buildTestPackage();
+    const build_zig = try generateBuildZig(allocator, &pkg);
+    defer allocator.free(build_zig);
+
+    // `b.standardOptimizeOption(.{})` resolves to Debug unless the consumer
+    // passes -Doptimize, so a promoted package was only ever compiled in the
+    // one mode nobody ships. ReleaseSafe is the mode a consumer runs, and it
+    // keeps `std.debug.assert` guards live under the optimizer.
+    try std.testing.expect(std.mem.indexOf(u8, build_zig, "standardOptimizeOption") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, build_zig, "std.builtin.OptimizeMode,") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, build_zig, "\"optimize\",") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, build_zig, ".off, .any => .ReleaseSafe,") != null,
+    );
+
+    // Without this annotation the `orelse` switch yields an untyped
+    // `@EnumLiteral`, and the generated build rejects itself: "value with
+    // comptime-only type depends on runtime control flow".
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            build_zig,
+            "const optimize: std.builtin.OptimizeMode = b.option(",
+        ) != null,
+    );
+}
+
+test "generateBuildZig: the ReleaseSafe default survives the dependency template" {
+    const allocator = std.testing.allocator;
+    var pkg = buildTestPackage();
+    pkg.zon_deps = &.{.{ .name = "r2z-helper", .path = "../helper" }};
+    const build_zig = try generateBuildZig(allocator, &pkg);
+    defer allocator.free(build_zig);
+
+    // The dependency-carrying template is a second copy of the same preamble;
+    // a ReleaseSafe default in one and a Debug default in the other would
+    // leave the gate mode-dependent on which shape a package lowers to.
+    try std.testing.expect(std.mem.indexOf(u8, build_zig, "standardOptimizeOption") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, build_zig, ".off, .any => .ReleaseSafe,") != null,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, build_zig, ".off, .any => .ReleaseSafe,"),
+    );
+
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            build_zig,
+            "const optimize: std.builtin.OptimizeMode = b.option(",
+        ) != null,
+    );
+}
+
 fn readFileContent(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
     var io_buf: [4096]u8 = undefined;
     var dir = std.Io.Dir.cwd();
@@ -1068,7 +1202,12 @@ test "writeToDisk: writes build files and sources to a temp dir" {
     try std.testing.expect(std.mem.indexOf(u8, src, "const std = @import(\"std\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "pub const LIMIT: u32 = 42;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "pub fn add(a: u32, b: u32) u32 {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "return (a + b);") != null);
+    // The group is gone on purpose: a top-level `bin_op` is already the whole
+    // operand, so the emitter writes `return a + b;` and only re-wraps a
+    // nested operator that precedence would otherwise swallow. What this test
+    // pins is that the function body survived the write, not the parentheses
+    // an earlier emitter sprayed around every binary expression.
+    try std.testing.expect(std.mem.indexOf(u8, src, "return a + b;") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "test \"add sums\" {") != null);
 }
 
@@ -1144,11 +1283,20 @@ test "writeToDisk: binds r2z imports to the r2z-core dependency key" {
 
 test "generateBuildZigZon: excludes runtime dependency from emitted paths" {
     const allocator = std.testing.allocator;
+    // Manifest generation runs on a package that has already lowered, and a
+    // root that declares nothing is not one. The declaration is incidental to
+    // the manifest text these tests assert on; it only keeps the fixture on the
+    // real code path.
+    const marker_decl: ast.Decl = .{ .const_decl = .{
+        .name = "MARKER",
+        .init = ast.Expr{ .lit = .{ .int = 1 } },
+    } };
     const pkg: ast.Package = .{
         .name = "demo",
         .files = &.{.{
             .path = "src/root.zig",
             .imports = &.{.{ .local_name = "r2z", .module_or_path = "r2z" }},
+            .decls = &.{marker_decl},
         }},
     };
     const with_runtime = try appendRuntimeDependency(allocator, &pkg);
@@ -1177,11 +1325,16 @@ test "generateBuildZigZon: excludes runtime dependency from emitted paths" {
 
 test "generateBuildZigZon: allows a missing absolute output directory" {
     const allocator = std.testing.allocator;
+    const marker_decl: ast.Decl = .{ .const_decl = .{
+        .name = "MARKER",
+        .init = ast.Expr{ .lit = .{ .int = 1 } },
+    } };
     const pkg: ast.Package = .{
         .name = "demo",
         .files = &.{.{
             .path = "src/root.zig",
             .imports = &.{.{ .local_name = "r2z", .module_or_path = "r2z" }},
+            .decls = &.{marker_decl},
         }},
     };
     const with_runtime = try appendRuntimeDependency(allocator, &pkg);
@@ -1220,6 +1373,25 @@ test "writeToDisk: rejects a package without src/root.zig" {
     pkg.files = &.{file};
 
     try expectWriteValidationError(error.MissingRootFile, &pkg);
+}
+
+test "writeToDisk: rejects a package whose root file declares nothing" {
+    // The staged package would still link and its own `zig build test` would
+    // pass on a zero-test binary, so an empty root has to stop here rather
+    // than be published as a translation. Sibling declarations do not help.
+    var pkg = buildTestPackage();
+    var root = pkg.files[0];
+    root.decls = &.{};
+    root.tests = &.{};
+    pkg.files = &.{ root, .{
+        .path = "src/util.zig",
+        .decls = &.{.{ .const_decl = .{
+            .name = "util",
+            .init = ast.Expr{ .lit = .{ .int = 1 } },
+        } }},
+    } };
+
+    try expectWriteValidationError(error.EmptyRootFile, &pkg);
 }
 
 test "writeToDisk: rejects duplicate source files" {
@@ -1377,6 +1549,106 @@ fn fakePromotionFingerprint(
         .resolver_failure => error.FingerprintResolverFailed,
         .success_without_fingerprint => null,
     };
+}
+
+const GateModeTestContext = struct {
+    allocator: std.mem.Allocator,
+    flags: std.ArrayListUnmanaged([]const u8) = .empty,
+    fail_flag: ?[]const u8 = null,
+    fail_stderr: []const u8 = "",
+};
+
+fn fakeGateModeBuild(
+    allocator: std.mem.Allocator,
+    opaque_context: ?*anyopaque,
+    flag: []const u8,
+) anyerror!BuildTestResult {
+    const context: *GateModeTestContext = @ptrCast(@alignCast(opaque_context.?));
+    try context.flags.append(context.allocator, flag);
+    const fails = if (context.fail_flag) |fail| std.mem.eql(u8, fail, flag) else false;
+    const stdout = try allocator.dupe(u8, "");
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, if (fails) context.fail_stderr else "");
+    return .{
+        .term = .{ .exited = if (fails) 1 else 0 },
+        .stdout = stdout,
+        .stderr = stderr,
+    };
+}
+
+test "promotion gate compiles the staged package in Debug and ReleaseSafe" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var context = GateModeTestContext{ .allocator = allocator };
+    defer context.flags.deinit(allocator);
+
+    const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
+    defer releaseBuildTestResult(allocator, result);
+
+    // Debug alone left every ReleaseSafe-only defect (elided
+    // `std.debug.assert` guards, optimizer-exposed UB) unpublished.
+    try std.testing.expectEqual(@as(usize, 2), context.flags.items.len);
+    try std.testing.expectEqualStrings("-Doptimize=Debug", context.flags.items[0]);
+    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", context.flags.items[1]);
+    try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+    try std.testing.expectEqual(@as(?u64, null), try resolveFingerprint(
+        allocator,
+        test_io,
+        null,
+        "unused",
+        &result,
+    ));
+}
+
+test "promotion gate returns the first failing mode output without running later modes" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var context = GateModeTestContext{
+        .allocator = allocator,
+        .fail_flag = "-Doptimize=Debug",
+        .fail_stderr = "error: use this value: 0xdeadbeefcafebabe",
+    };
+    defer context.flags.deinit(allocator);
+
+    const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
+    defer releaseBuildTestResult(allocator, result);
+
+    // Running the second mode would repeat the same manifest fingerprint
+    // hint, and `resolveFingerprint` rejects a hint it sees twice.
+    try std.testing.expectEqual(@as(usize, 1), context.flags.items.len);
+    try std.testing.expectEqual(@as(u8, 1), result.term.exited);
+    try std.testing.expectEqual(
+        @as(?u64, 0xdeadbeefcafebabe),
+        try resolveFingerprint(allocator, test_io, null, "unused", &result),
+    );
+}
+
+test "promotion gate fails when the package breaks only under ReleaseSafe" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var context = GateModeTestContext{
+        .allocator = allocator,
+        .fail_flag = "-Doptimize=ReleaseSafe",
+        .fail_stderr = "error: use of undeclared identifier 'undefined_value'",
+    };
+    defer context.flags.deinit(allocator);
+
+    const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
+    defer releaseBuildTestResult(allocator, result);
+
+    // Debug passed; the ReleaseSafe run is the only thing that catches this,
+    // and its output carries no fingerprint hint, so promotion must report a
+    // build failure rather than patch the manifest and re-run.
+    try std.testing.expectEqual(@as(usize, 2), context.flags.items.len);
+    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", context.flags.items[1]);
+    try std.testing.expectEqual(@as(u8, 1), result.term.exited);
+    try std.testing.expectEqual(@as(?u64, null), try resolveFingerprint(
+        allocator,
+        test_io,
+        null,
+        "unused",
+        &result,
+    ));
 }
 
 fn expectDirectoryAbsent(io: std.Io, path: []const u8) !void {

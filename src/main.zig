@@ -8,6 +8,11 @@ const translate_rust = @import("translate_rust");
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| {
         std.log.err("translate-rust failed: {s}", .{@errorName(err)});
+        if (err == error.UnsupportedExpression) {
+            if (translate_rust.ir.validation.takeUnsupportedReason()) |reason| {
+                std.log.err("unsupported construct: {s}", .{reason});
+            }
+        }
         return err;
     };
 }
@@ -67,6 +72,50 @@ fn run(init: std.process.Init) !void {
             try printUsage(io, stdout);
             return error.MissingCliArgument;
         };
+    }
+
+    // `--features <a,b>` is a leading flag like `--strategy`: it selects the
+    // `#[cfg(feature = ...)]` set for a crate-directory translation and is
+    // read before the positional path. Omitting it leaves the manifest's
+    // `default` feature closure in charge.
+    var features: ?[]const []const u8 = null;
+    if (std.mem.eql(u8, first, "--features")) {
+        const list = arg_it.next() orelse {
+            try stdout.writeStreamingAll(
+                io,
+                "translate-rust: --features requires a comma-separated list\n",
+            );
+            try printUsage(io, stdout);
+            return error.MissingCliArgument;
+        };
+        if (list.len == 0 or std.mem.startsWith(u8, list, "-")) {
+            try stdout.writeStreamingAll(
+                io,
+                "translate-rust: --features requires a comma-separated list\n",
+            );
+            try printUsage(io, stdout);
+            return error.MissingCliArgument;
+        }
+        features = try parseFeatureList(init.gpa, list);
+        first = arg_it.next() orelse {
+            freeFeatureList(init.gpa, features);
+            try printUsage(io, stdout);
+            return error.MissingCliArgument;
+        };
+    }
+    // A feature selection only means something to the source frontend, and
+    // only for a crate directory. Wire JSON and the diagnostic verbs carry
+    // their own input shape, so reject the flag there instead of ignoring it.
+    if (features != null and
+        (std.mem.startsWith(u8, first, "-") or std.mem.endsWith(u8, first, ".json")))
+    {
+        try stdout.writeStreamingAll(
+            io,
+            "translate-rust: --features applies to crate-directory translation only\n",
+        );
+        try printUsage(io, stdout);
+        freeFeatureList(init.gpa, features);
+        return error.UnexpectedCliArgument;
     }
 
     if (std.mem.eql(u8, first, "--dump")) {
@@ -157,7 +206,42 @@ fn run(init: std.process.Init) !void {
     // A non-JSON positional path selects the source-native frontend.
     // Package output requires -o.
     const out_dir = (try parseOutputArgument(io, stdout, &arg_it, true)).?;
-    try translate_rust.driver.translate(init.gpa, io, first, out_dir);
+    try translate_rust.driver.pipeline.translateWithFeatures(
+        init.gpa,
+        io,
+        first,
+        out_dir,
+        features orelse &.{},
+    );
+    freeFeatureList(init.gpa, features);
+}
+
+/// Split a `--features a,b` value into owned feature names. Empty entries are
+/// dropped, so `a,,b` and `a, b` both select two features.
+fn parseFeatureList(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |feature| allocator.free(feature);
+        list.deinit(allocator);
+    }
+    var entries = std.mem.splitScalar(u8, value, ',');
+    while (entries.next()) |entry| {
+        const name = std.mem.trim(u8, entry, " \t");
+        if (name.len == 0) continue;
+        try list.append(allocator, try allocator.dupe(u8, name));
+    }
+    if (list.items.len == 0) return &.{};
+    return list.toOwnedSlice(allocator);
+}
+
+fn freeFeatureList(allocator: std.mem.Allocator, features: ?[]const []const u8) void {
+    const list = features orelse return;
+    if (list.len == 0) return;
+    for (list) |feature| allocator.free(feature);
+    allocator.free(list);
 }
 
 fn expectNoMoreArguments(
@@ -910,6 +994,8 @@ fn printUsage(io: std.Io, stdout: std.Io.File) !void {
         \\                                            serialized Rust semantic IR (JSON)
         \\       translate-rust --dump zigast <crate-dir>  lower to ZigAST and print the serialized
         \\                                            package AST (JSON)
+        \\       translate-rust --features <a,b> <crate-dir> -o <dir>  select the cfg feature set,
+        \\                                            overriding the manifest's default closure
         \\       translate-rust --strategy <default|embedded>  select the Zig lowering strategy
         \\       translate-rust --version             print version
         \\       translate-rust --help                show this help

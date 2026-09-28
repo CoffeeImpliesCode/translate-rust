@@ -21,6 +21,10 @@ Current positive end-to-end paths are:
 - The canonical v6 `mini` wire fixture produces a validated standalone package.
 - The `fnv` source fixture translates and runs all 203 original assertions.
 - The `compat` fixture passes 10 translated tests and 5 Zig consumer tests through source, canonical v6 wire, and serialized Zig AST paths. Coverage includes casts, callable types, typed iterator ranges, closure state, module references, formatting, and `String`/`Cow` ownership.
+- The `wyhash` source fixture translates into a multi-file package and runs all 9 original assertions across 2 test vectors (`read_rest` and `read64` byte sorting).
+- The `xxhash-rust` source fixture translates into a validated standalone package.
+- The `adler` source fixture translates into a multi-file package and runs all 5 original test vectors (`zeroes`, `ones`, `mixed`, `wiki`, `resume`).
+- The `hex` source fixture translates into a three-file package (`src/root.zig`, `src/error.zig`, `src/test.zig`) and runs 5 tests under the generated package's own `zig build test`. Three are upstream `#[cfg(test)]` functions that carry no feature gate (`test_encode_to_slice`, `test_decode_to_slice`, `test_from_hex_array`); the other two are added by the emitter. The remaining upstream tests are `#[cfg(feature = "alloc")]`, and the driver passes no cargo features, so they are not present.
 
 Current rejection coverage is:
 
@@ -65,6 +69,11 @@ zig build run -- test/crates/mini -o zig-out/r2z-mini
 
 # Emit source from canonical v6 wire JSON.
 zig build translate -- test/mini.json
+
+# Regenerate checked-in wire fixtures and source goldens from validated canonical IR.
+zig build generate-mini-wire
+zig build generate-fnv-golden
+zig build generate-hex-golden
 
 # Inspect canonical frontend and backend representations.
 zig build run -- --dump rustir test/crates/mini

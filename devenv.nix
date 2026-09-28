@@ -15,6 +15,11 @@ rec {
     INCLUDE_DIRECTORIES = "${pkgs.lib.makeIncludePath packages}";
     ZIGLINT_ARGS = "--ignore Z024 --ignore Z011";
     GATE_EXCLUDE = "test vendor r2z-core";
+    # Zig flocks every global-cache manifest. A build that dies holding one
+    # of its manifest locks wedges every later build that wants the same
+    # global cache. A project-local global cache keeps `zig build`
+    # independent of that; the cost is one extra compiler_rt build.
+    ZIG_GLOBAL_CACHE_DIR = ".zig-global-cache";
   };
 
   # https://devenv.sh/languages/

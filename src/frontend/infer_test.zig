@@ -18,6 +18,7 @@ const bodies = ir.bodies;
 const types = ir.types;
 const items = ir.items;
 const spine = ir.spine;
+const crate_graph = ir.graph;
 
 const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
@@ -2071,3 +2072,1963 @@ test "chained raw pointer cast resolves a wildcard pointee" {
     try std.testing.expectEqual(types.Type{ .prim = .u8 }, resolved.raw_ptr.pointee);
     try std.testing.expectEqual(@as(?exprs.TypeId, 2), inferred.getType(3));
 }
+
+test "a wildcard scalar cast target resolves from the destination annotation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Types:
+    //   0 = u32      — the `n` operand
+    //   1 = `_`      — the wildcard `as _` destination placeholder
+    //   2 = usize    — the `let` annotation that pins the destination
+    const types_store = try alloc.alloc(types.Type, 3);
+    types_store[0] = .{ .prim = .u32 };
+    types_store[1] = .{ .external_nominal = .{ .path = &.{"_"} } };
+    types_store[2] = .{ .prim = .usize };
+
+    // Exprs:
+    //   0 = path(def=7)      — `n`
+    //   1 = `n as _`         — cast whose target is the placeholder
+    //   2 = path(def=8)      — `x`
+    //   3 = fn body block
+    const exprs_store = try alloc.alloc(exprs.Expr, 4);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = 1,
+        .kind = .{ .cast = .{
+            .kind = .as_,
+            .operand = 0,
+            .source_type = .{ .prim = .u32 },
+            .target = 1,
+        } },
+    };
+    exprs_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = 2,
+        .kind = .{ .path = .{ .def = 8, .generic_args = &.{} } },
+    };
+    exprs_store[3] = .{
+        .id = 3,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = 2,
+            .labelled = null,
+        } },
+    };
+
+    // Stmts:
+    //   0 = `let x: usize = n as _;`
+    const stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = 2,
+        .kind = .{ .let = .{ .pattern = 0, .init = 1, .ty = 2 } },
+    }};
+    const pats_store = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "x",
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } },
+    }};
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .usize },
+            .body = 3,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solve(alloc, &b);
+    defer inferred.deinit(alloc);
+
+    // The cast itself takes the annotated destination type.
+    try std.testing.expectEqual(@as(exprs.TypeId, 2), inferred.getType(1).?);
+
+    // The driver writes the solved types back onto the exprs, so a cast must
+    // end up pointing at the same entry as its own `ty`. Repointing the target
+    // keeps that invariant; leaving it on the placeholder slot breaks it.
+    inferred.apply(exprs_store);
+    try std.testing.expectEqual(exprs_store[1].ty.?, exprs_store[1].kind.cast.target);
+    // The destination is the annotated type, so no `_` survives into the
+    // backend through the cast.
+    try std.testing.expectEqual(
+        types.Type{ .prim = .usize },
+        b.types[exprs_store[1].kind.cast.target],
+    );
+}
+
+test "a wildcard scalar cast target with no constraining destination still rejects" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Types:
+    //   0 = u32      — the `n` operand
+    //   1 = `_`      — the wildcard `as _` destination placeholder
+    //   2 = unit     — the fn return
+    const types_store = try alloc.alloc(types.Type, 3);
+    types_store[0] = .{ .prim = .u32 };
+    types_store[1] = .{ .external_nominal = .{ .path = &.{"_"} } };
+    types_store[2] = .{ .prim = .unit };
+
+    // `n as _;` as a bare expression statement: nothing constrains the
+    // destination, so the placeholder must not silently become the source.
+    const exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .cast = .{
+                .kind = .as_,
+                .operand = 0,
+                .source_type = .{ .prim = .u32 },
+                .target = 1,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    const stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = 1 },
+    }};
+    const bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 2,
+        },
+    }};
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = types_store,
+        .bodies = &bodies_store,
+    };
+
+    try std.testing.expectError(error.InvalidCast, infer.solve(alloc, &b));
+}
+
+// ── Borrow of a local array literal ────────────────────────────────────────
+
+/// Expr-table layout shared by the borrow-constraining fixtures:
+///   0 = `[0; 4]`
+///   1 = its repeated `0` element
+///   2 = the `out` path
+///   3 = `&mut out` (or `&mut [0; 4]`)
+///   4 = the `callee(...)` call
+///   5 = the tested function's body block
+///   6 = the callee's empty body block
+const borrow_array_node: exprs.NodeId = 0;
+const borrow_element_node: exprs.NodeId = 1;
+const borrow_path_node: exprs.NodeId = 2;
+const borrow_call_node: exprs.NodeId = 4;
+const borrow_body_node: exprs.NodeId = 5;
+
+/// Whether the call borrows the `out` binding or the array literal itself.
+const ArrayArgument = enum { borrow_of_local, direct_literal };
+
+/// How the callee's `&mut [T]` parameter is modelled. The frontend lowers
+/// `&mut [T]` to a mutable slice; the reference form is what a `&[T; N]`
+/// parameter carries instead.
+const BorrowParameter = enum { mutable_slice, reference_to_slice };
+
+const BorrowFixture = struct {
+    types: std.ArrayListUnmanaged(types.Type),
+    inferred: infer.Inferred,
+
+    fn deinit(self: *BorrowFixture, alloc: std.mem.Allocator) void {
+        self.inferred.deinit(alloc);
+        self.types.deinit(alloc);
+        self.* = undefined;
+    }
+
+    /// The type the solver settled on for `node`, read back out of the
+    /// interned type table the frontend materializes derived types into.
+    fn typeOf(self: *const BorrowFixture, node: exprs.NodeId) !types.Type {
+        const type_id = self.inferred.getType(node) orelse return error.MissingInferredType;
+        return self.types.items[type_id];
+    }
+};
+
+/// Build a one-statement function whose only call passes an array to a callee
+/// declared `out: &mut [T]`. `let mut out = [0; 4];` names no element type, so
+/// the parameter is the only source for it — which is the Rust rule that an
+/// integer literal's `i32` fallback is filtered by the expected type.
+fn buildBorrowFixture(
+    alloc: std.mem.Allocator,
+    argument: ArrayArgument,
+    parameter: BorrowParameter,
+    element: types.Prim,
+) !BorrowFixture {
+    const slice = try alloc.create(types.Slice);
+    slice.* = .{ .const_ = false, .elem = .{ .prim = element } };
+    const reference = try alloc.create(types.Ref);
+    reference.* = .{ .mut = true, .pointee = .{ .slice = slice } };
+    const parameter_type: types.Type = switch (parameter) {
+        .mutable_slice => .{ .slice = slice },
+        .reference_to_slice => .{ .reference = reference },
+    };
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer types_list.deinit(alloc);
+    try types_list.appendSlice(alloc, &.{
+        .{ .prim = .u8 },
+        .{ .prim = .u16 },
+        .{ .prim = .unit },
+        .{ .slice = slice },
+        .{ .reference = reference },
+    });
+
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = borrow_array_node,
+            .span = span,
+            .ty = null,
+            .kind = .{ .array = .{ .elements = &.{borrow_element_node}, .repeat = 4 } },
+        },
+        .{
+            .id = borrow_element_node,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "0",
+                .value = 0,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        // Without a crate graph `bindPattern` keys locals by pattern index,
+        // so `out` is def 0 and its initializer is the `[0; 4]` node.
+        .{
+            .id = borrow_path_node,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = 0, .generic_args = &.{} } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .unary = .{
+                .op = .{ .ref = .mutable },
+                .operand = if (argument == .direct_literal) borrow_array_node else borrow_path_node,
+            } },
+        },
+        .{
+            .id = borrow_call_node,
+            .span = span,
+            .ty = null,
+            .kind = .{ .call = .{ .call_kind = .{ .free = 0 }, .args = &.{3} } },
+        },
+        .{
+            .id = borrow_body_node,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = if (argument == .direct_literal)
+                    all_statements[1..]
+                else
+                    all_statements[0..],
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 6,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    // `let mut out = [0; 4];` precedes the call only when the call borrows it.
+    var pats_store = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "out",
+            .mode = .{ .value = {} },
+            .mutable = true,
+        } },
+    }};
+    const stmts_store = [_]exprs.Statement{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .let = .{
+                .pattern = 0,
+                .init = borrow_array_node,
+                .ty = null,
+            } },
+        },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = borrow_call_node } },
+    };
+    const callee_params = [_]items.Param{.{
+        .name = "out",
+        .ty = parameter_type,
+        .span = span,
+    }};
+    const bodies_store = [_]bodies.BodyKind{
+        .{
+            .fn_ = .{
+                .params = &callee_params,
+                .ret = .{ .prim = .unit },
+                .body = 6,
+            },
+        },
+        .{
+            .fn_ = .{
+                .params = &.{},
+                .ret = .{ .prim = .unit },
+                .body = borrow_body_node,
+            },
+        },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &pats_store, &generated);
+    b.types = types_list.items;
+    return .{
+        .types = types_list,
+        .inferred = try infer.solveWithGen(alloc, &b, &generated),
+    };
+}
+
+/// Statement ids for the tested body; the `let` is dropped when the call takes
+/// the array literal directly and has no binding to borrow.
+const all_statements = [_]exprs.NodeId{ 0, 1 };
+
+fn expectArrayType(ty: types.Type, element: types.Prim, len: u64) !void {
+    const array = switch (ty) {
+        .array => |array| array,
+        else => return error.NotAnArrayType,
+    };
+    try std.testing.expectEqual(types.Type{ .prim = element }, array.elem);
+    const actual_len = switch (array.len) {
+        .literal => |literal| literal,
+        else => return error.NotALiteralArrayLen,
+    };
+    try std.testing.expectEqual(len, actual_len);
+}
+
+test "borrowing a local array into a &mut [u8] parameter types the literal's element as u8" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var fixture = try buildBorrowFixture(alloc, .borrow_of_local, .mutable_slice, .u8);
+    defer fixture.deinit(alloc);
+
+    try expectArrayType(try fixture.typeOf(borrow_array_node), .u8, 4);
+    try expectArrayType(try fixture.typeOf(borrow_path_node), .u8, 4);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, try fixture.typeOf(borrow_element_node));
+}
+
+test "a &mut [u8] parameter bound directly to an array literal keeps its u8 element" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var fixture = try buildBorrowFixture(alloc, .direct_literal, .mutable_slice, .u8);
+    defer fixture.deinit(alloc);
+
+    try expectArrayType(try fixture.typeOf(borrow_array_node), .u8, 4);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, try fixture.typeOf(borrow_element_node));
+}
+
+test "a &mut [u16] parameter types the borrowed local's element as u16" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var fixture = try buildBorrowFixture(alloc, .borrow_of_local, .mutable_slice, .u16);
+    defer fixture.deinit(alloc);
+
+    try expectArrayType(try fixture.typeOf(borrow_array_node), .u16, 4);
+    try expectArrayType(try fixture.typeOf(borrow_path_node), .u16, 4);
+    try std.testing.expectEqual(types.Type{ .prim = .u16 }, try fixture.typeOf(borrow_element_node));
+}
+
+test "a &mut [u8] reference parameter types the borrowed local's element as u8" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var fixture = try buildBorrowFixture(alloc, .borrow_of_local, .reference_to_slice, .u8);
+    defer fixture.deinit(alloc);
+
+    try expectArrayType(try fixture.typeOf(borrow_array_node), .u8, 4);
+    try expectArrayType(try fixture.typeOf(borrow_path_node), .u8, 4);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, try fixture.typeOf(borrow_element_node));
+}
+
+test "a generic callee's concrete &mut [u8] parameter types the borrowed local's element as u8" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `fn callee<T>(input: T, out: &mut [u8])` borrows exactly like the
+    // non-generic fixtures, but `T` must be bound before the second argument
+    // can be matched. A generic callee that gives up on an argument inference
+    // has not typed would leave the array literal untyped, which is how
+    // `hex::encode_to_slice` reached the backend without an element type.
+    const slice = try alloc.create(types.Slice);
+    slice.* = .{ .const_ = false, .elem = .{ .prim = .u8 } };
+    const type_param: types.Type = .{ .path = .{
+        .segments = &.{.{ .name = "T", .id = null }},
+    } };
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer types_list.deinit(alloc);
+    try types_list.appendSlice(alloc, &.{
+        .{ .prim = .u8 },
+        .{ .prim = .unit },
+        .{ .slice = slice },
+        type_param,
+    });
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .array = .{ .elements = &.{1}, .repeat = 4 } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "0",
+                .value = 0,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = 0, .generic_args = &.{} } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .unary = .{ .op = .{ .ref = .mutable }, .operand = 2 } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "1u8",
+                .value = 1,
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } },
+        },
+        .{
+            .id = 5,
+            .span = span,
+            .ty = null,
+            .kind = .{ .call = .{ .call_kind = .{ .free = 0 }, .args = &.{ 4, 3 } } },
+        },
+        .{
+            .id = 6,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{ 0, 1 },
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 7,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = null, .labelled = null } },
+        },
+    };
+    var pats_store = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "out",
+            .mode = .{ .value = {} },
+            .mutable = true,
+        } },
+    }};
+    var stmts_store = [_]exprs.Statement{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .let = .{ .pattern = 0, .init = 0, .ty = null } },
+        },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 5 } },
+    };
+    const callee_params = [_]items.Param{
+        .{ .name = "input", .ty = type_param, .span = span },
+        .{ .name = "out", .ty = .{ .slice = slice }, .span = span },
+    };
+    const callee_generic_params = [_][]const u8{"T"};
+    const bodies_store = [_]bodies.BodyKind{
+        .{
+            .fn_ = .{
+                .params = &callee_params,
+                .ret = .{ .prim = .unit },
+                .generic_params = &callee_generic_params,
+                .body = 7,
+            },
+        },
+        .{
+            .fn_ = .{
+                .params = &.{},
+                .ret = .{ .prim = .unit },
+                .body = 6,
+            },
+        },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &pats_store, &generated);
+    b.types = types_list.items;
+    var inferred = try infer.solveWithGen(alloc, &b, &generated);
+    defer inferred.deinit(alloc);
+
+    const array_id = inferred.getType(0) orelse return error.MissingInferredType;
+    const array = switch (types_list.items[array_id]) {
+        .array => |array| array,
+        else => return error.NotAnArrayType,
+    };
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, array.elem);
+    const element_id = inferred.getType(1) orelse return error.MissingInferredType;
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, types_list.items[element_id]);
+}
+
+// ── Typing across a comparison ──────────────────────────────────────────────
+
+/// Expr-table layout shared by the nested-call fixtures:
+///   0 = `1u8`, the first argument of `f`
+///   1 = `0u8`, the argument of `g`
+///   2 = `g(0u8)`, nested in `f`'s argument list
+///   3 = `f(1u8, g(0u8))`
+///   4 = the tested function's body block
+///   5 = `g`'s empty body block
+///   6 = `f`'s empty body block
+const nested_call_node: exprs.NodeId = 2;
+
+const NestedCallFixture = struct {
+    types: std.ArrayListUnmanaged(types.Type),
+    inferred: infer.Inferred,
+
+    fn deinit(self: *NestedCallFixture, alloc: std.mem.Allocator) void {
+        self.inferred.deinit(alloc);
+        self.types.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn typeOf(self: *const NestedCallFixture, node: exprs.NodeId) !types.Type {
+        const type_id = self.inferred.getType(node) orelse return error.MissingInferredType;
+        return self.types.items[type_id];
+    }
+};
+
+/// Build a body whose only statement nests `g(0u8)` inside `f(..)`, with `g`
+/// declared `-> ret` over `callee_generics`. A call in argument position
+/// receives no expected type from the caller's signature unless that
+/// signature names a concrete one, so `g`'s own declaration is the only
+/// source for the nested call's type. `ret` stays out of the interned type
+/// table: a declared return type that is still a type parameter is not a
+/// resolved type, and interning it would make it look like one.
+fn buildNestedCallFixture(
+    alloc: std.mem.Allocator,
+    ret: types.Type,
+    callee_generics: []const []const u8,
+) !NestedCallFixture {
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer types_list.deinit(alloc);
+    try types_list.appendSlice(alloc, &.{ .{ .prim = .u8 }, .{ .prim = .u16 } });
+
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "1u8",
+                .value = 1,
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "0u8",
+                .value = 0,
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .call = .{ .call_kind = .{ .free = 0 }, .args = &.{1} } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .call = .{ .call_kind = .{ .free = 2 }, .args = &.{ 0, nested_call_node } } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 5,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = null, .labelled = null } },
+        },
+        .{
+            .id = 6,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = null, .labelled = null } },
+        },
+    };
+    var stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 3 } },
+    };
+    const callee_params = [_]items.Param{
+        .{ .name = "x", .ty = .{ .prim = .u8 }, .span = span },
+    };
+    const caller_params = [_]items.Param{
+        .{ .name = "a", .ty = .{ .prim = .u8 }, .span = span },
+        .{ .name = "b", .ty = ret, .span = span },
+    };
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{ .params = &callee_params, .ret = ret, .generic_params = callee_generics, .body = 5 } },
+        .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 4 } },
+        .{ .fn_ = .{ .params = &caller_params, .ret = .{ .prim = .unit }, .body = 6 } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &.{}, &generated);
+    b.types = types_list.items;
+    return .{
+        .types = types_list,
+        .inferred = try infer.solveWithGen(alloc, &b, &generated),
+    };
+}
+
+test "a call in argument position takes the callee's declared u16 return type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `g` returns a concrete `u16`, so `f(1u8, g(0u8))` types the nested call
+    // even though no signature passes a type into that position.
+    var fixture = try buildNestedCallFixture(alloc, .{ .prim = .u16 }, &.{});
+    defer fixture.deinit(alloc);
+
+    try std.testing.expectEqual(types.Type{ .prim = .u16 }, try fixture.typeOf(nested_call_node));
+}
+
+test "a call whose declared return type is a bare type parameter stays untyped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `-> T` names a type parameter, which is meaningful only inside `g`'s own
+    // body. No argument here binds it, so pinning it would put a symbolic
+    // path on the call node instead of a type the backend can emit.
+    const type_param: types.Type = .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } };
+    var fixture = try buildNestedCallFixture(alloc, type_param, &.{"T"});
+    defer fixture.deinit(alloc);
+
+    try std.testing.expect(fixture.inferred.getType(nested_call_node) == null);
+}
+
+/// Expr-table layout shared by the `assert_eq!` fixtures, which model
+/// `assert_eq!(from_hex(0u8), Ok([1, 2, 3, 4, 5, 6]))`:
+///   0     = the `[1, 2, 3, 4, 5, 6]` array literal
+///   1     = `Ok(<array>)`
+///   2     = `0u8`, the call's argument
+///   3     = `from_hex(0u8)`
+///   4     = the `==` comparison
+///   5     = the `assert_eq!` marker, which names node 4
+///   6     = the tested function's body block
+///   7     = `from_hex`'s empty body block
+///   8..13 = the array's six unsuffixed integer literals
+const comparison_array_node: exprs.NodeId = 0;
+const comparison_ok_node: exprs.NodeId = 1;
+
+const ComparisonFixture = struct {
+    types: std.ArrayListUnmanaged(types.Type),
+    inferred: infer.Inferred,
+
+    fn deinit(self: *ComparisonFixture, alloc: std.mem.Allocator) void {
+        self.inferred.deinit(alloc);
+        self.types.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn typeOf(self: *const ComparisonFixture, node: exprs.NodeId) !types.Type {
+        const type_id = self.inferred.getType(node) orelse return error.MissingInferredType;
+        return self.types.items[type_id];
+    }
+};
+
+/// Assert the node carries a `Result` whose `Ok` payload is `[element; len]`.
+fn expectResultArray(ty: types.Type, element: types.Prim, len: u64) !void {
+    const result = switch (ty) {
+        .result => |value| value,
+        else => return error.NotAResultType,
+    };
+    try expectArrayType(result.ok, element, len);
+}
+
+/// Build the `assert_eq!` fixture with `from_hex` declared
+/// `-> Result<[element; 6], FromHexError>`. `Ok(..)` states nothing about its
+/// payload, so the array literal can only be typed from the `Result` the call
+/// it is compared against declares.
+fn buildComparisonFixture(
+    alloc: std.mem.Allocator,
+    element: types.Prim,
+) !ComparisonFixture {
+    const array = try alloc.create(types.Array);
+    array.* = .{ .elem = .{ .prim = element }, .len = .{ .literal = 6 } };
+    const payload = types.Result{
+        .ok = .{ .array = array },
+        .err = .{ .external_nominal = .{ .path = &.{"FromHexError"} } },
+        .is_error_unionable = true,
+    };
+    const result = try alloc.create(types.Result);
+    result.* = payload;
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer types_list.deinit(alloc);
+    try types_list.appendSlice(alloc, &.{
+        .{ .prim = .u8 },
+        .{ .prim = .unit },
+        .{ .result = result },
+    });
+
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .array = .{ .elements = &.{ 8, 9, 10, 11, 12, 13 }, .repeat = null } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .enum_variant = .{
+                .def = 2,
+                .variant = "Ok",
+                .tuple_fields = &.{0},
+                .named_fields = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "0u8",
+                .value = 0,
+                .base = .dec,
+                .ty_suffix = "u8",
+            } } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .call = .{ .call_kind = .{ .free = 0 }, .args = &.{2} } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .binary = .{ .op = .eq, .overflow = .wrapping, .lhs = 3, .rhs = 1 } },
+        },
+        .{
+            .id = 5,
+            .span = span,
+            .ty = null,
+            .kind = .{ .unsupported = .{ .reason = "assertion:4", .suggested_version = .v1 } },
+        },
+        .{
+            .id = 6,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 7,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = null, .labelled = null } },
+        },
+    } ++ [_]exprs.Expr{
+        .{
+            .id = 8,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "1",
+                .value = 1,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 9,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "2",
+                .value = 2,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 10,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "3",
+                .value = 3,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 11,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "4",
+                .value = 4,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 12,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "5",
+                .value = 5,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 13,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "6",
+                .value = 6,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+    };
+    var stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 5 } },
+    };
+    const callee_params = [_]items.Param{
+        .{ .name = "hex", .ty = .{ .prim = .u8 }, .span = span },
+    };
+    const variant_params = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    };
+    const result_variants = [_]items.Variant{.{
+        .name = "Ok",
+        .fields = .{ .tuple = &variant_params },
+        .discriminant = null,
+    }};
+    const bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{ .params = &callee_params, .ret = .{ .result = result }, .body = 7 } },
+        .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 6 } },
+        .{ .enum_ = .{ .kind = .data, .variants = &result_variants } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &.{}, &generated);
+    b.types = types_list.items;
+    return .{
+        .types = types_list,
+        .inferred = try infer.solveWithGen(alloc, &b, &generated),
+    };
+}
+
+test "an Ok(array) compared against Result<[u8; 6], E> types the array as [u8; 6]" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // This is the shape `hex::test_from_hex_array` reaches through
+    // `assert_eq!(<[u8; 6] as FromHex>::from_hex(..), Ok([0x66, ..]))`: the
+    // comparison yields `bool`, so the only type the `Ok` payload can take is
+    // the one the call declares.
+    var fixture = try buildComparisonFixture(alloc, .u8);
+    defer fixture.deinit(alloc);
+
+    try expectResultArray(try fixture.typeOf(comparison_ok_node), .u8, 6);
+    try expectArrayType(try fixture.typeOf(comparison_array_node), .u8, 6);
+}
+
+test "the Ok(array) payload type follows the compared Result's element type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // The same source shape with a `[u16; 6]` payload: the element type is
+    // carried by the compared operand, never fixed by `Ok` itself.
+    var fixture = try buildComparisonFixture(alloc, .u16);
+    defer fixture.deinit(alloc);
+
+    try expectResultArray(try fixture.typeOf(comparison_ok_node), .u16, 6);
+    try expectArrayType(try fixture.typeOf(comparison_array_node), .u16, 6);
+}
+
+/// `receiver.chunks(2).enumerate()` — the shape `hex::from_hex` reaches at
+/// `hex.chunks(2).enumerate().map(..).collect()`:
+///   0 = the receiver path
+///   1 = the `2` chunk-size argument
+///   2 = `chunks(2)`
+///   3 = `enumerate()`
+///   4 = the tested function's body block
+const chunks_receiver_node: exprs.NodeId = 0;
+const chunks_call_node: exprs.NodeId = 2;
+const chunks_enumerate_node: exprs.NodeId = 3;
+
+/// The body block reaches the two calls through statements, not directly.
+const chunks_call_stmt: exprs.NodeId = 0;
+const chunks_enumerate_stmt: exprs.NodeId = 1;
+
+const ChunksFixture = struct {
+    graph: ir.graph.CrateGraph,
+    types: std.ArrayListUnmanaged(types.Type),
+    inferred: infer.Inferred,
+
+    fn deinit(self: *ChunksFixture, alloc: std.mem.Allocator) void {
+        self.inferred.deinit(alloc);
+        self.types.deinit(alloc);
+        self.graph.deinit();
+        self.* = undefined;
+    }
+
+    fn typeOf(self: *const ChunksFixture, node: exprs.NodeId) !types.Type {
+        const type_id = self.inferred.getType(node) orelse return error.MissingInferredType;
+        return self.types.items[type_id];
+    }
+
+    /// The type the node ended up with, or null when inference left it
+    /// untyped. A `chunks` receiver outside the slice whitelist must stay
+    /// here, never in `typeOf`'s error.
+    fn typeOrNull(self: *const ChunksFixture, node: exprs.NodeId) ?types.Type {
+        const type_id = self.inferred.getType(node) orelse return null;
+        return self.types.items[type_id];
+    }
+};
+
+/// Assert `ty` is the `core::slice::<name><element>` chunked-slice carrier.
+fn expectSliceChunkCarrier(
+    ty: types.Type,
+    name: []const u8,
+    element: types.Prim,
+) !void {
+    const external = switch (ty) {
+        .external_nominal => |value| value,
+        else => return error.NotAnExternalNominalType,
+    };
+    try std.testing.expectEqual(@as(usize, 3), external.path.len);
+    try std.testing.expectEqualStrings("core", external.path[0]);
+    try std.testing.expectEqualStrings("slice", external.path[1]);
+    try std.testing.expectEqualStrings(name, external.path[2]);
+    try std.testing.expectEqual(@as(usize, 1), external.args.len);
+    const expected: types.Type = .{ .prim = element };
+    try std.testing.expectEqual(expected, external.args[0]);
+}
+
+/// Assert `ty` is `core::iter::Enumerate<core::slice::Chunks<element>>`, the
+/// receiver type `.enumerate()` hands to the next call in the chain.
+fn expectEnumerateOfChunks(ty: types.Type, element: types.Prim) !void {
+    const external = switch (ty) {
+        .external_nominal => |value| value,
+        else => return error.NotAnExternalNominalType,
+    };
+    try std.testing.expectEqual(@as(usize, 3), external.path.len);
+    try std.testing.expectEqualStrings("core", external.path[0]);
+    try std.testing.expectEqualStrings("iter", external.path[1]);
+    try std.testing.expectEqualStrings("Enumerate", external.path[2]);
+    try std.testing.expectEqual(@as(usize, 1), external.args.len);
+    try expectSliceChunkCarrier(external.args[0], "Chunks", element);
+}
+
+/// Build `receiver.chunks(2).enumerate()` with `receiver` as the receiver
+/// node's declared type. The element follows the receiver, so one builder
+/// serves the plain-slice, `&[T]` and non-slice cases.
+fn buildChunksFixture(alloc: std.mem.Allocator, receiver: types.Type) !ChunksFixture {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    errdefer graph.deinit();
+    const chunks_ent = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "chunks"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const enumerate_ent = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "enumerate"),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // Type 0 is the receiver; type 1 is the tested function's `()` return.
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer types_list.deinit(alloc);
+    try types_list.appendSlice(alloc, &.{ receiver, .{ .prim = .unit } });
+
+    // The receiver def names no entity, so only its declared type is read.
+    const recv_def: exprs.DefId = @intCast(graph.symbol_table.count());
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = recv_def, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "2",
+                .value = 2,
+                .base = .dec,
+                .ty_suffix = null,
+            } } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = chunks_receiver_node,
+                .receiver_mode = .shared,
+                .method = chunks_ent,
+                .args = &.{1},
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = chunks_call_node,
+                .receiver_mode = .value,
+                .method = enumerate_ent,
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{ chunks_call_stmt, chunks_enumerate_stmt },
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    var stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = chunks_call_node } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = chunks_enumerate_node } },
+    };
+    var bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 4 } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.genWithGraph(alloc, &b, &graph);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &.{}, &generated);
+    b.types = types_list.items;
+    return .{
+        .graph = graph,
+        .types = types_list,
+        .inferred = try infer.solveWithGen(alloc, &b, &generated),
+    };
+}
+
+test "slice.chunks(n) infers core::slice::Chunks<T> and types its .enumerate() receiver" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // A bare `[u8]`: the element comes off the slice itself, so the carrier is
+    // `Chunks<u8>` and the chained `.enumerate()` sees a typed receiver.
+    const slice = try alloc.create(types.Slice);
+    slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var fixture = try buildChunksFixture(alloc, .{ .slice = slice });
+    defer fixture.deinit(alloc);
+
+    try expectSliceChunkCarrier(try fixture.typeOf(chunks_call_node), "Chunks", .u8);
+    try expectEnumerateOfChunks(try fixture.typeOf(chunks_enumerate_node), .u8);
+}
+
+test "a &[T] receiver infers the same core::slice::Chunks<T> a bare [T] does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `&[T]` must reach the same element as `[T]`: the reference is peeled
+    // before the carrier is named, and mutability must not change the result.
+    const slice = try alloc.create(types.Slice);
+    slice.* = .{ .const_ = false, .elem = .{ .prim = .u8 } };
+    const reference = try alloc.create(types.Ref);
+    reference.* = .{ .mut = false, .pointee = .{ .slice = slice } };
+    var fixture = try buildChunksFixture(alloc, .{ .reference = reference });
+    defer fixture.deinit(alloc);
+
+    try expectSliceChunkCarrier(try fixture.typeOf(chunks_call_node), "Chunks", .u8);
+    try expectEnumerateOfChunks(try fixture.typeOf(chunks_enumerate_node), .u8);
+}
+
+test "chunks infers nothing for a receiver that is not a slice" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `core::option::Option<u8>` is a three-segment external nominal with one
+    // generic argument, the shape a `chunks` whitelist keyed on arity alone
+    // would swallow. Nothing may be inferred, so the whole chain stays
+    // untyped instead of inventing a `Chunks<u8>`.
+    var fixture = try buildChunksFixture(alloc, .{ .external_nominal = .{
+        .path = &.{ "core", "option", "Option" },
+        .args = &.{.{ .prim = .u8 }},
+    } });
+    defer fixture.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?types.Type, null), fixture.typeOrNull(chunks_call_node));
+    try std.testing.expectEqual(@as(?types.Type, null), fixture.typeOrNull(chunks_enumerate_node));
+}
+
+// ── `as _` in a struct-literal field ────────────────────────────────────────
+
+/// Expr-table layout shared by the wildcard-field fixtures, modelling
+/// ```rust
+/// pub struct Buf<T> { pub off: usize }
+/// pub fn go(n: u32) -> Buf<u8> { Buf { off: n as _ } }
+/// ```
+///   0 = `n`, the `u32` parameter the cast reads
+///   1 = `n as _`, a wildcard cast sitting in a struct-literal field
+///   2 = `Buf { off: n as _ }`, a literal of a generic struct
+///   3 = `go`'s body block, whose tail is the literal
+const wildcard_field_cast_node: exprs.NodeId = 1;
+
+const WildcardFieldFixture = struct {
+    types: std.ArrayListUnmanaged(types.Type),
+    exprs_store: []exprs.Expr,
+    inferred: infer.Inferred,
+
+    fn deinit(self: *WildcardFieldFixture, alloc: std.mem.Allocator) void {
+        self.inferred.deinit(alloc);
+        alloc.free(self.exprs_store);
+        self.types.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn typeOf(self: *const WildcardFieldFixture, node: exprs.NodeId) !types.Type {
+        const type_id = self.inferred.getType(node) orelse return error.MissingInferredType;
+        return self.types.items[type_id];
+    }
+};
+
+/// Build the `Buf<T> { off: source as _ }` fixture with `off` declared
+/// `field_ty` and the cast operand of primitive `source_prim`. The declared
+/// field type is the wildcard's only destination, so this is what decides the
+/// cast's target.
+fn buildWildcardFieldFixture(
+    alloc: std.mem.Allocator,
+    field_ty: types.Type,
+    source_prim: types.Prim,
+) !WildcardFieldFixture {
+    // Type table: 0 = the operand's type, 1 = the `as _` placeholder,
+    // 2 = the field's declared type, 3 = `Buf<u8>`, the declared return type.
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer types_list.deinit(alloc);
+    try types_list.appendSlice(alloc, &.{
+        .{ .prim = source_prim },
+        .{ .external_nominal = .{ .path = &.{"_"}, .args = &.{} } },
+        field_ty,
+        .{ .generic_inst = .{ .decl = 0, .args = .{ .params = &.{.{ .prim = .u8 }} } } },
+    });
+
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .cast = .{
+                .kind = .as_,
+                .operand = 0,
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = 1,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .struct_lit = .{
+                .def = 0,
+                .fields = &.{.{ .field = "off", .value = 1, .shorthand = false }},
+                .base = null,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 2,
+                .labelled = null,
+            } },
+        },
+    };
+
+    var stmts_store = [_]exprs.Statement{};
+    const struct_fields = [_]items.Field{
+        .{ .name = "off", .ty = field_ty, .visibility = .public, .span = span },
+    };
+    const fn_params = [_]items.Param{
+        .{ .name = "n", .ty = .{ .prim = source_prim }, .span = span },
+    };
+    var bodies_store = [_]bodies.BodyKind{
+        .{ .struct_ = .{
+            .generic_params = &.{"T"},
+            .trait_bounds = &.{},
+            .layout = .named,
+            .fields = &struct_fields,
+            .methods = &.{},
+        } },
+        .{ .fn_ = .{
+            .params = &fn_params,
+            .ret = types_list.items[3],
+            .body = 3,
+        } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &.{}, &generated);
+    b.types = types_list.items;
+    b.exprs = &exprs_store;
+    var inferred = try infer.solveWithGen(alloc, &b, &generated);
+    inferred.apply(exprs_store[0..]);
+    return .{
+        .types = types_list,
+        .exprs_store = &exprs_store,
+        .inferred = inferred,
+    };
+}
+
+test "a wildcard cast in a struct-literal field takes the field's declared type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `Buf<T> { off: n as _ }` with `off: usize`. Nothing at the use site
+    // annotates the cast, so the field declaration is the only destination:
+    // the cast must resolve to `usize` and record `u32` as its source.
+    var fixture = try buildWildcardFieldFixture(alloc, .{ .prim = .usize }, .u32);
+    defer fixture.deinit(alloc);
+
+    try std.testing.expectEqual(
+        types.Type{ .prim = .usize },
+        try fixture.typeOf(wildcard_field_cast_node),
+    );
+    const cast = fixture.exprs_store[wildcard_field_cast_node].kind.cast;
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u32 },
+        cast.source_type,
+    );
+    try std.testing.expectEqual(
+        types.Type{ .prim = .usize },
+        fixture.types.items[cast.target],
+    );
+}
+
+test "a struct field's declared type beats the wildcard cast's source type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // A field declared `u64` fed a `u8`: defaulting the destination to the
+    // source type, or to any primitive of the source's class, would silently
+    // emit the wrong destination. The declaration wins.
+    var fixture = try buildWildcardFieldFixture(alloc, .{ .prim = .u64 }, .u8);
+    defer fixture.deinit(alloc);
+
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u64 },
+        try fixture.typeOf(wildcard_field_cast_node),
+    );
+    const cast = fixture.exprs_store[wildcard_field_cast_node].kind.cast;
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, cast.source_type);
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u64 },
+        fixture.types.items[cast.target],
+    );
+}
+
+test "a wildcard cast in a field whose declared type is a type parameter is rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `Buf<T> { off: n as _ }` with `T` left unbound, so `off`'s declaration
+    // is the symbolic `T`. A field declaration resolves a wildcard only while
+    // it is concrete; one that still names a type parameter constrains
+    // nothing, so the cast must stay unresolved and be refused rather than
+    // pinned to a path the backend cannot emit.
+    const type_param: types.Type = .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } };
+    try std.testing.expectError(
+        error.InvalidCast,
+        buildWildcardFieldFixture(alloc, type_param, .u32),
+    );
+}
+
+test "two wildcard casts sharing one placeholder slot both reach their field type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Every `as _` lowers to the same `_` entry in the type table, so both
+    // casts here start out aimed at one slot. Resolving the first rewrites
+    // that slot, which used to leave the second looking like a cast whose
+    // destination was always concrete: it was skipped, kept the raw slot as
+    // its target, and then disagreed with the type the solver wrote to it.
+    // Exprs:
+    //   0 = `n`, 1 = `n as _`, 2 = the first literal, 3 = the second cast,
+    //   4 = the second literal, 5 = the body block
+    // Types:
+    //   0 = u32, 1 = `_`, 2 = usize, 3 = unit
+    var types_store = [_]types.Type{
+        .{ .prim = .u32 },
+        .{ .external_nominal = .{ .path = &.{"_"}, .args = &.{} } },
+        .{ .prim = .usize },
+        .{ .prim = .unit },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .cast = .{
+                .kind = .as_,
+                .operand = 0,
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = 1,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .struct_lit = .{
+                .def = 0,
+                .fields = &.{.{ .field = "off", .value = 1, .shorthand = false }},
+                .base = null,
+            } },
+        },
+        .{
+            .id = 3,
+            .span = span,
+            .ty = 1,
+            .kind = .{ .cast = .{
+                .kind = .as_,
+                .operand = 0,
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = 1,
+            } },
+        },
+        .{
+            .id = 4,
+            .span = span,
+            .ty = null,
+            .kind = .{ .struct_lit = .{
+                .def = 0,
+                .fields = &.{.{ .field = "off", .value = 3, .shorthand = false }},
+                .base = null,
+            } },
+        },
+        .{
+            .id = 5,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{ 0, 1 },
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    var stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 2 } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 4 } },
+    };
+    const struct_fields = [_]items.Field{
+        .{ .name = "off", .ty = .{ .prim = .usize }, .visibility = .public, .span = span },
+    };
+    const fn_params = [_]items.Param{
+        .{ .name = "n", .ty = .{ .prim = .u32 }, .span = span },
+    };
+    var bodies_store = [_]bodies.BodyKind{
+        .{ .struct_ = .{
+            .generic_params = &.{"T"},
+            .trait_bounds = &.{},
+            .layout = .named,
+            .fields = &struct_fields,
+            .methods = &.{},
+        } },
+        .{ .fn_ = .{
+            .params = &fn_params,
+            .ret = .{ .prim = .unit },
+            .body = 5,
+        } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    var inferred = try infer.solve(alloc, &b);
+    defer inferred.deinit(alloc);
+    inferred.apply(exprs_store[0..]);
+
+    // Both casts name the field's `usize`, and both end up agreeing with the
+    // type the driver writes back onto them.
+    for ([_]exprs.NodeId{ 1, 3 }) |cast_node| {
+        const cast = exprs_store[cast_node].kind.cast;
+        try std.testing.expectEqual(types.Type{ .prim = .u32 }, cast.source_type);
+        try std.testing.expectEqual(
+            types.Type{ .prim = .usize },
+            types_store[cast.target],
+        );
+        try std.testing.expectEqual(cast.target, exprs_store[cast_node].ty.?);
+    }
+}
+
+/// A method call on a nominal receiver whose declared method return type is
+/// the bare type parameter `T`. Nothing but a turbofish can name `T`, so any
+/// concrete result the solver reaches for this call came from the turbofish.
+///
+/// `receiver_type` is what the receiver expression is pinned to, so a test can
+/// make the receiver imply a type that disagrees with the turbofish.
+const TurbofishFixture = struct {
+    exprs_store: []exprs.Expr,
+    types_store: []types.Type,
+    bodies_store: []bodies.BodyKind,
+    b: bodies.Bodies,
+    graph: crate_graph.CrateGraph,
+    call_node: exprs.NodeId,
+
+    fn deinit(self: *TurbofishFixture, alloc: std.mem.Allocator) void {
+        self.graph.deinit();
+        const fn_body = self.bodies_store[2].fn_;
+        alloc.free(fn_body.params);
+        alloc.free(fn_body.generic_params);
+        // The declared return is the bare parameter `T`; the segment name is
+        // a string literal, so only the slice itself is owned.
+        alloc.free(fn_body.ret.path.segments);
+        alloc.free(self.bodies_store);
+        alloc.free(self.types_store);
+        alloc.free(self.exprs_store);
+    }
+};
+
+fn buildTurbofishFixture(
+    alloc: std.mem.Allocator,
+    turbofish: []const types.Type,
+    method_name: []const u8,
+    receiver_type: types.Type,
+) !TurbofishFixture {
+    var graph = crate_graph.CrateGraph.init(alloc);
+    errdefer graph.deinit();
+
+    // 0 = module, 1 = struct `Parser` (the receiver's named type), 2 = the
+    // method `read`. The method is a plain `fn_` so `getGenericParamNames`
+    // reads its declared `T` and `walkMethodCall` can substitute into it.
+    _ = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const receiver_def: exprs.DefId = 1;
+    _ = try graph.symbol_table.add(.{
+        .id = receiver_def,
+        .kind = .struct_,
+        .name = try alloc.dupe(u8, "Parser"),
+        .span = span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const method_id: exprs.DefId = 2;
+    _ = try graph.symbol_table.add(.{
+        .id = method_id,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, method_name),
+        .span = span,
+        .visibility = .public,
+        .parent = receiver_def,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = try alloc.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = try alloc.dupe(spine.EntityId, &.{ receiver_def, method_id }),
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = try alloc.dupe(u8, "turbofish"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = 0,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    // Types: 0 = the receiver's pinned type, 1 = the turbofish argument.
+    // 2 = the slice `T` would fall back to when no turbofish is present.
+    const types_store = try alloc.alloc(types.Type, 3);
+    types_store[0] = receiver_type;
+    types_store[1] = turbofish[0];
+    types_store[2] = .{ .prim = .i32 };
+
+    const declared_return: types.Type = .{ .path = .{
+        .segments = try alloc.dupe(types.PathSegment, &.{.{ .name = "T", .id = null }}),
+    } };
+    const exprs_store = try alloc.alloc(exprs.Expr, 3);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = receiver_def, .generic_args = &.{} } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = null,
+        .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = method_id,
+            .generic_args = turbofish,
+            .args = &.{},
+        } },
+    };
+    exprs_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{},
+            .tail = 1,
+            .labelled = null,
+        } },
+    };
+
+    // The body table is indexed by EntityId, so the method's `fn_` must sit at
+    // its own entity id (2), not at the front of the table.
+    const bodies_store = try alloc.alloc(bodies.BodyKind, 3);
+    bodies_store[0] = .none;
+    bodies_store[1] = .{ .struct_ = .{} };
+    bodies_store[2] = .{ .fn_ = .{
+        .params = try alloc.dupe(items.Param, &.{}),
+        .ret = declared_return,
+        .generic_params = try alloc.dupe([]const u8, &.{"T"}),
+        .body = 2,
+    } };
+
+    return .{
+        .exprs_store = exprs_store,
+        .types_store = types_store,
+        .bodies_store = bodies_store,
+        .b = .{
+            .exprs = exprs_store,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = types_store,
+            .bodies = bodies_store,
+        },
+        .graph = graph,
+        .call_node = 1,
+    };
+}
+
+test "a method turbofish names the call's result type" {
+    const alloc = std.testing.allocator;
+    const turbofish = [_]types.Type{.{ .prim = .u32 }};
+    var fixture = try buildTurbofishFixture(
+        alloc,
+        &turbofish,
+        "read",
+        .{ .prim = .u8 },
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+    const result_id = inferred.getType(fixture.call_node) orelse
+        return error.UntypedTurbofishMethodCall;
+    // The declared return type is `T` and the turbofish says `u32`, so `u32`
+    // is the only type the solver can have reached.
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u32 },
+        fixture.b.types[result_id],
+    );
+}
+
+test "a method turbofish overrides the receiver-implied result type" {
+    const alloc = std.testing.allocator;
+    // The receiver is a `u8` and a `.as_bytes()`-shaped method name would make
+    // the receiver drive the result; here the declared return is `T`, so the
+    // only competitor is the receiver's own `u8`. Rust binds the turbofish.
+    const turbofish = [_]types.Type{.{ .prim = .u32 }};
+    var fixture = try buildTurbofishFixture(
+        alloc,
+        &turbofish,
+        "read",
+        .{ .prim = .u8 },
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+    const result_id = inferred.getType(fixture.call_node) orelse
+        return error.UntypedTurbofishMethodCall;
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u32 },
+        fixture.b.types[result_id],
+    );
+}
+
+test "a method call without a turbofish keeps its inferred result type" {
+    const alloc = std.testing.allocator;
+    // No turbofish: the recorded list is empty and the walk behaves exactly as
+    // it did before the field existed, leaving the call to fall through to the
+    // receiver-implied type.
+    var fixture = try buildTurbofishFixture(
+        alloc,
+        &.{.{ .prim = .u32 }},
+        "read",
+        .{ .prim = .u8 },
+    );
+    defer fixture.deinit(alloc);
+    fixture.exprs_store[fixture.call_node].kind.method_call.generic_args = &.{};
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+    // The untyped call must not borrow the turbofish that the fixture used to
+    // parameterise its type table: the receiver is `u8` and that is the only
+    // concrete type the walk can reach here.
+    const result_id = inferred.getType(fixture.call_node);
+    if (result_id) |id| {
+        try std.testing.expectEqual(
+            types.Type{ .prim = .u8 },
+            fixture.b.types[id],
+        );
+    }
+}
+
+/// The receiver of `generate_iter(..).collect::<Vec<_>>()`: an OPAQUE whose
+/// only bound is `Iterator`, with the element type spelled out in the bound's
+/// own `associated_types` when `declare_item` is set. The recovered concrete
+/// is a `u8` on purpose — a carrier that says nothing about the element, which
+/// is the whole point: the bound, not the concrete, is what names it.
+fn iteratorItemBoundReceiver(alloc: std.mem.Allocator, declare_item: bool) !types.Type {
+    const item = try alloc.alloc(types.Type, 2);
+    item[0] = .{ .prim = .usize };
+    item[1] = .{ .prim = .usize };
+    const bindings = try alloc.alloc(types.AssociatedTypeBinding, if (declare_item) 1 else 0);
+    if (declare_item) bindings[0] = .{ .name = "Item", .ty = .{ .tuple = item } };
+    const bounds = try alloc.alloc(types.Bound, 1);
+    bounds[0] = .{
+        .path = .{ .segments = &.{.{ .name = "Iterator", .id = null }} },
+        .associated_types = bindings,
+    };
+    const concrete: types.Type = .{ .prim = .u8 };
+    return .{ .@"opaque" = .{ .bounds = bounds, .concrete = &concrete } };
+}
+
+/// `collect::<Vec<_>>()` exactly as the frontend records it: the container is
+/// named and the element is a bare inference placeholder.
+fn collectElementTurbofish(alloc: std.mem.Allocator) ![]const types.Type {
+    const element = try alloc.alloc(types.Type, 1);
+    element[0] = .{ .external_nominal = .{ .path = &.{"_"} } };
+    const container = try alloc.alloc(types.Type, 1);
+    container[0] = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = element,
+    } };
+    return container;
+}
+
+test "a collect turbofish takes its element from the receiver's declared Item" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const turbofish = try collectElementTurbofish(alloc);
+    var fixture = try buildTurbofishFixture(
+        alloc,
+        turbofish,
+        "collect",
+        try iteratorItemBoundReceiver(alloc, true),
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    // The `_` is gone. `impl Iterator<Item = (usize, usize)>` is the only
+    // place the element type is written down, and the container the turbofish
+    // named keeps its own path and arity.
+    const element = try alloc.alloc(types.Type, 2);
+    element[0] = .{ .prim = .usize };
+    element[1] = .{ .prim = .usize };
+    const expected_args = try alloc.alloc(types.Type, 1);
+    expected_args[0] = .{ .tuple = element };
+    const expected: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = expected_args,
+    } };
+    const bound = fixture.exprs_store[fixture.call_node].kind.method_call.generic_args[0];
+    try std.testing.expect(types.deepEqual(expected, bound));
+}
+
+test "a collect turbofish stays open when the opaque bound declares no Item" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const turbofish = try collectElementTurbofish(alloc);
+    var fixture = try buildTurbofishFixture(
+        alloc,
+        turbofish,
+        "collect",
+        try iteratorItemBoundReceiver(alloc, false),
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    // Nothing declares the element, so nothing may stand in for it. A
+    // placeholder is left standing rather than filled from the concrete
+    // carrier, which names a `u8` and would be a different type entirely.
+    const bound = fixture.exprs_store[fixture.call_node].kind.method_call.generic_args[0];
+    try std.testing.expect(types.deepEqual(turbofish[0], bound));
+    try std.testing.expect(infer.isInferPlaceholderType(bound.external_nominal.args[0]));
+}
+
+test "a slice receiver collects nothing, declared Item or not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const element = try alloc.create(types.Slice);
+    element.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const turbofish = try collectElementTurbofish(alloc);
+    var fixture = try buildTurbofishFixture(
+        alloc,
+        turbofish,
+        "collect",
+        .{ .slice = element },
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    // A slice is a list, not an iterator carrier: it declares no bound, so
+    // there is no `Item` to read and the element stays a placeholder.
+    const bound = fixture.exprs_store[fixture.call_node].kind.method_call.generic_args[0];
+    try std.testing.expect(types.deepEqual(turbofish[0], bound));
+    try std.testing.expect(infer.isInferPlaceholderType(bound.external_nominal.args[0]));
+}
+

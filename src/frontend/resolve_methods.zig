@@ -36,6 +36,7 @@ pub const StdMethod = enum {
     result_is_err,
     result_ok,
     result_unwrap,
+    result_unwrap_err,
     result_unwrap_or,
     result_map,
     result_map_err,
@@ -74,7 +75,14 @@ pub const StdMethod = enum {
     char_to_digit,
     byte_is_ascii,
     range_contains,
+
+    /// Rust `String::into_bytes`. The runtime hands the backing `Vec(u8)`
+    /// over and leaves the string empty.
+    string_into_bytes,
     format_write_str,
+    /// Rust `ToString::to_string`. Blanket-implemented for `T: Display`;
+    /// see `hasGraphFreeDisplay` and `isBoundStandardMethod`.
+    to_string,
 
     default,
     clone,
@@ -104,7 +112,13 @@ const reason_receiver_unavailable = "method receiver unavailable";
 const reason_method_dispatch_unavailable = "method dispatch unavailable";
 const reason_method_dispatch_ambiguous = "method dispatch ambiguous";
 const reason_operator_operands_unresolved = "operator operands unresolved";
+const reason_operator_operand_dispatched_call =
+    "operator operand is a dispatched method call whose result type this pass does not name";
 const reason_operator_requires_primitives = "operator requires primitive operands";
+const reason_blanket_impl_receiver =
+    "blanket impl names no receiver type: backend validateMethodTopology has no parent to hoist onto";
+const reason_opaque_iterator_method =
+    "opaque receiver: backend lookupRecognizedStdMethod has no arm for this iterator method";
 
 /// Strip references, paths, and generic arguments from a nominal spelling.
 fn normalizeNominalName(name: []const u8) []const u8 {
@@ -163,6 +177,89 @@ fn lookupTraitMethodCandidates(
     return lookup;
 }
 
+/// The `method_name` a crate-local blanket `impl<T: AsRef<[u8]>> Trait for T`
+/// provides, or null when no such impl has it.
+///
+/// A blanket impl is the one piece of evidence a receiver with no type of its
+/// own can carry: the impl names no concrete self type, so it provides its
+/// method for every type its bound admits, and Rust checks that bound against
+/// the type inference settles on. Resolving the call therefore asserts
+/// nothing the bound has not already promised — in particular it never names
+/// an element type for an array literal, which is what an unsuffixed
+/// `[0x66, 0x6f, ..]` has not got. Two blanket impls providing the same
+/// method are ambiguous, and stay refused.
+fn lookupBlanketAsRefBytesMethod(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    method_name: []const u8,
+) ?spine.EntityId {
+    if (method_name.len == 0) return null;
+    var candidate: ?spine.EntityId = null;
+    for (g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .impl_) continue;
+        const parts = parseTraitImplName(ent.name) orelse continue;
+        if (!isBlanketAsRefBytesImpl(b, ent.id, parts.type_name)) continue;
+        for (g.symbol_table.entities.items) |child| {
+            if (child.kind != .fn_ or child.parent != ent.id) continue;
+            if (!std.mem.eql(u8, child.name, method_name)) continue;
+            if (candidate != null) return null;
+            candidate = child.id;
+        }
+    }
+    return candidate;
+}
+
+/// Whether `impl_id` is a trait impl whose own self type is the type
+/// parameter `self_name`, and whose only requirement on that parameter is a
+/// byte-sequence `AsRef`. A concrete self type, a differently bounded
+/// parameter, and an inherited bound that the impl does not itself declare
+/// all fail here.
+fn isBlanketAsRefBytesImpl(
+    b: *const bodies.Bodies,
+    impl_id: spine.EntityId,
+    self_name: []const u8,
+) bool {
+    if (impl_id >= b.bodies.len) return false;
+    const implementation = switch (b.bodies[impl_id]) {
+        .impl_ => |value| value,
+        else => return false,
+    };
+    const generics = implementation.generics orelse return false;
+    for (generics.params) |parameter| {
+        const type_param = switch (parameter) {
+            .type_ => |value| value,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, type_param.name, self_name)) continue;
+        for (type_param.bounds) |bound| {
+            if (isByteSequenceAsRef(bound)) return true;
+        }
+    }
+    return false;
+}
+
+/// `AsRef` applied to a byte sequence, however the source spelled the trait
+/// path. The method this admits comes from the same impl that declared the
+/// bound, so a crate that means a different `AsRef` still dispatches to its
+/// own impl.
+fn isByteSequenceAsRef(bound: types.Bound) bool {
+    if (bound.optional) return false;
+    if (bound.args.len != 1) return false;
+    const segments = bound.path.segments;
+    if (segments.len == 0) return false;
+    if (!std.mem.eql(u8, segments[segments.len - 1].name, "AsRef")) return false;
+    return isByteSequenceType(bound.args[0]);
+}
+
+fn isByteSequenceType(t: types.Type) bool {
+    return switch (t) {
+        .slice => |slice| slice.elem == .prim and slice.elem.prim == .u8,
+        .array => |array| array.elem == .prim and array.elem.prim == .u8,
+        .reference => |reference| isByteSequenceType(reference.pointee),
+        else => false,
+    };
+}
+
 /// Lookup an inherent method for `type_name` with `method_name`.
 /// Returns the EntityId of the matching `fn` if found.
 pub fn lookupInherentMethod(
@@ -217,7 +314,40 @@ pub fn lookupConstructor(
     return lookupInherentMethod(g, type_name, fn_name);
 }
 
-/// Match std prelude methods on known types, automatically unwrapping references/pointers/boxes.
+/// How far a receiver's `&T` / `*T` / `Box<T>` / `impl Trait` chain is
+/// followed before the walk gives up. It bounds the one rule every receiver
+/// predicate shares, so the bound is part of that rule too.
+const receiver_unpeel_depth_max: usize = 128;
+
+/// The type a receiver really is, behind the layers that never change which
+/// type is named: a reference, a raw pointer, a box, and an `impl Trait` the
+/// frontend recovered a concrete carrier for. The Zig backend peels exactly
+/// these before it matches a method, so every predicate here that asks
+/// "what does this receiver name?" has to ask it of this walk. A copy of
+/// this rule per predicate is how two of them came to disagree about one
+/// type.
+///
+/// `null` means the walk could not finish: an `impl Trait` that recovered no
+/// carrier names nothing at all, and no side downstream can peel it.
+fn unpeelReceiverType(t: types.Type) ?types.Type {
+    var current = t;
+    for (0..receiver_unpeel_depth_max) |_| {
+        switch (current) {
+            .reference => |reference| current = reference.pointee,
+            .raw_ptr => |raw_ptr| current = raw_ptr.pointee,
+            .boxed => |boxed| current = boxed.*,
+            .@"opaque" => |opaque_type| {
+                const concrete = opaque_type.concrete orelse return null;
+                current = concrete.*;
+            },
+            else => return current,
+        }
+    }
+    return null;
+}
+
+/// Match std prelude methods on known types, automatically unwrapping
+/// references/pointers/boxes.
 pub fn lookupStdMethod(
     t: types.Type,
     method_name: []const u8,
@@ -225,23 +355,12 @@ pub fn lookupStdMethod(
     std.debug.assert(method_name.len >= 0);
     if (method_name.len == 0) return null;
 
-    // Unpeel reference / raw_ptr / boxed to find underlying concrete type.
-    var cur_t = t;
-    while (true) {
-        switch (cur_t) {
-            .reference => |r| cur_t = r.pointee,
-            .raw_ptr => |ptr| cur_t = ptr.pointee,
-            .boxed => |b| cur_t = b.*,
-            .@"opaque" => |opaque_type| {
-                if (opaque_type.concrete) |concrete| {
-                    cur_t = concrete.*;
-                } else {
-                    break;
-                }
-            },
-            else => break,
-        }
-    }
+    // An opaque that recovered no carrier still reaches the tail of this
+    // function: it names nothing that `default` or `clone` would not, and
+    // the switch below has no arm for it either way.
+    const cur_t = unpeelReceiverType(t) orelse t;
+
+    if (std.mem.eql(u8, method_name, "to_string") and hasGraphFreeDisplay(cur_t)) return .to_string;
 
     switch (cur_t) {
         .option => {
@@ -259,6 +378,10 @@ pub fn lookupStdMethod(
             if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
             if (std.mem.eql(u8, method_name, "ok")) return .result_ok;
             if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
+            // `unwrap_err` is NOT decided here: whether a `Result` receiver
+            // has an error VALUE to hand back depends on how it lowers, not
+            // on its type, and that is `lookupResultRepresentationMethod`'s
+            // one question.
             if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
             if (std.mem.eql(u8, method_name, "map")) return .result_map;
             if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
@@ -302,10 +425,26 @@ pub fn lookupStdMethod(
                 if (std.mem.eql(u8, method_name, "is_ok")) return .result_is_ok;
                 if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
                 if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
+                if (std.mem.eql(u8, method_name, "unwrap_err")) return .result_unwrap_err;
                 if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
                 if (std.mem.eql(u8, method_name, "map")) return .result_map;
                 if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
                 if (std.mem.eql(u8, method_name, "as_ref")) return .result_as_ref;
+            }
+            // `String` is the one Rust owner whose runtime type is a distinct
+            // Zig type (`r2z.alloc.String`) rather than a plain list, and
+            // `into_bytes` is the one method that only it has: it hands the
+            // backing `Vec(u8)` over and leaves the string empty. A `&str`,
+            // a `Vec<u8>`, and a slice borrow each reach a different runtime
+            // type, so all of them stay refused.
+            if (external.args.len == 0 and external.path.len == 3 and
+                (std.mem.eql(u8, external.path[0], "alloc") or
+                    std.mem.eql(u8, external.path[0], "std")) and
+                std.mem.eql(u8, external.path[1], "string") and
+                std.mem.eql(u8, external.path[2], "String") and
+                std.mem.eql(u8, method_name, "into_bytes"))
+            {
+                return .string_into_bytes;
             }
             if (external.path.len == 3 and
                 (std.mem.eql(u8, external.path[0], "core") or std.mem.eql(u8, external.path[0], "std")))
@@ -363,63 +502,214 @@ pub fn lookupStdMethod(
 
     return null;
 }
+
+/// The `Result` method that the receiver's TYPE does not decide.
+///
+/// `Result<T, E>` is one Rust type and two Zig representations. When `E` is a
+/// fieldless enum it lowers to the error union `E!T`, which holds the error
+/// IN the union; otherwise it lowers to the runtime's tagged
+/// `r2z.Result(T, E)`, which holds it in a value. `unwrap_err` returns that
+/// value, so it exists for the second form and not for the first, and
+/// `is_error_unionable` alone cannot say which form a receiver is: it records
+/// that `E` is a FINITE error set, and a crate enum that carries data
+/// (`FromHexError::InvalidHexCharacter { c, index }`) is finite and still
+/// lowers to a value. The backend asks the same question with the same data
+/// before it picks a representation (`resultUsesErrorUnion` in `lower.zig`).
+pub fn lookupResultRepresentationMethod(
+    b: *const bodies.Bodies,
+    receiver: types.Type,
+    method_name: []const u8,
+) ?StdMethod {
+    if (!std.mem.eql(u8, method_name, "unwrap_err")) return null;
+    // A receiver that is not a `Result` is never this method's receiver.
+    // Admitting one would be admitting a Rust type error the runtime has no
+    // way to express, so the refusal has to happen before the representation
+    // is even considered.
+    const result = switch (unpeelReceiverType(receiver) orelse return null) {
+        .result => |value| value.*,
+        else => return null,
+    };
+    if (result.is_error_unionable and errorTypeIsZigErrorSet(b, result.err)) return null;
+    return .result_unwrap_err;
+}
+
+/// The entity a type names, behind the indirections that never change which
+/// type is named. This peels one layer more than the backend's own
+/// `nominalEntityForType` — a raw pointer — and only ever in the direction
+/// that refuses: a type this walk reaches and that one stops short of is one
+/// the backend already treats as not naming an error set.
+fn nominalEntityForType(t: types.Type) ?spine.EntityId {
+    const current = unpeelReceiverType(t) orelse return null;
+    if (current == .generic_inst) return current.generic_inst.decl;
+    const path = switch (current) {
+        .path => |value| value,
+        else => return null,
+    };
+    var last: ?spine.EntityId = null;
+    for (path.segments) |segment| last = segment.id;
+    return last;
+}
+
+/// Whether `t` is a Zig error set: a Rust enum with at least one variant and
+/// no variant that carries anything, which is the only shape that lowers to
+/// one. A crate error enum that carries data does not, and a `Result` over it
+/// keeps its error in a value.
+fn errorTypeIsZigErrorSet(b: *const bodies.Bodies, t: types.Type) bool {
+    const id = nominalEntityForType(t) orelse return false;
+    if (id >= b.bodies.len) return false;
+    const enum_body = switch (b.bodies[id]) {
+        .enum_ => |value| value,
+        else => return false,
+    };
+    if (enum_body.variants.len == 0) return false;
+    for (enum_body.variants) |variant| {
+        if (variant.fields != .none) return false;
+    }
+    return true;
+}
+
+/// What an adapter's own type parameter past the source iterator is.
+const AdapterPayload = enum {
+    /// The adapter carries only its source (`Enumerate<I>`, `Take<I>`, ...).
+    none,
+    /// The adapter carries a closure (`Map<I, F>`, `Filter<I, F>`, ...). The
+    /// frontend never names a closure's type, and no rule reads this
+    /// parameter: it is recorded so the carrier keeps Rust's own arity.
+    closure,
+    /// The adapter carries a second iterator, recovered from the argument the
+    /// call itself supplies (`Zip<L, R>`).
+    other_iterator,
+};
+
+/// A `core::iter` adapter. Rust fixes both the arguments the method call
+/// takes and the parameters the adapter type carries, so a chain built from
+/// these entries is typed exactly as the source names it.
+const IteratorAdapter = struct {
+    method: []const u8,
+    /// `core::iter::<carrier>`.
+    carrier: []const u8,
+    call_args: usize,
+    type_args: usize,
+    payload: AdapterPayload,
+};
+
+const iterator_adapters = [_]IteratorAdapter{
+    .{ .method = "enumerate", .carrier = "Enumerate", .call_args = 0, .type_args = 1, .payload = .none },
+    .{ .method = "rev", .carrier = "Rev", .call_args = 0, .type_args = 1, .payload = .none },
+    .{ .method = "peekable", .carrier = "Peekable", .call_args = 0, .type_args = 1, .payload = .none },
+    .{ .method = "fuse", .carrier = "Fuse", .call_args = 0, .type_args = 1, .payload = .none },
+    .{ .method = "by_ref", .carrier = "ByRef", .call_args = 0, .type_args = 1, .payload = .none },
+    .{ .method = "take", .carrier = "Take", .call_args = 1, .type_args = 1, .payload = .none },
+    .{ .method = "skip", .carrier = "Skip", .call_args = 1, .type_args = 1, .payload = .none },
+    .{ .method = "step_by", .carrier = "StepBy", .call_args = 1, .type_args = 1, .payload = .none },
+    .{ .method = "map", .carrier = "Map", .call_args = 1, .type_args = 2, .payload = .closure },
+    .{ .method = "filter", .carrier = "Filter", .call_args = 1, .type_args = 2, .payload = .closure },
+    .{ .method = "filter_map", .carrier = "FilterMap", .call_args = 1, .type_args = 2, .payload = .closure },
+    .{ .method = "flat_map", .carrier = "FlatMap", .call_args = 1, .type_args = 2, .payload = .closure },
+    .{ .method = "inspect", .carrier = "Inspect", .call_args = 1, .type_args = 2, .payload = .closure },
+    .{ .method = "take_while", .carrier = "TakeWhile", .call_args = 1, .type_args = 2, .payload = .closure },
+    .{ .method = "skip_while", .carrier = "SkipWhile", .call_args = 1, .type_args = 2, .payload = .closure },
+    .{ .method = "zip", .carrier = "Zip", .call_args = 1, .type_args = 2, .payload = .other_iterator },
+};
+
+fn iteratorAdapter(method_name: []const u8) ?*const IteratorAdapter {
+    for (&iterator_adapters) |*adapter| {
+        if (std.mem.eql(u8, adapter.method, method_name)) return adapter;
+    }
+    return null;
+}
+
+fn iteratorAdapterCarrier(carrier: []const u8) ?*const IteratorAdapter {
+    for (&iterator_adapters) |*adapter| {
+        if (std.mem.eql(u8, adapter.carrier, carrier)) return adapter;
+    }
+    return null;
+}
+
+/// The number of type parameters an iterator carrier must carry, or null when
+/// `external` names no carrier this frontend models.
+/// `isRuntimeIteratorMethod` dispatches on the carrier, and the adapter
+/// synthesis below refuses to extend a chain whose source is not one.
+fn iteratorCarrierArgCount(external: types.ExternalNominal) ?usize {
+    if (external.path.len != 3) return null;
+    if (!std.mem.eql(u8, external.path[0], "core") and
+        !std.mem.eql(u8, external.path[0], "std"))
+    {
+        return null;
+    }
+    // The slice-owned iterators, all `core::slice::*<T>` with one argument.
+    // `Chunks` and `ChunksExact` are here because the frontend now synthesises
+    // a type for them, so a chain rooted at `.chunks(n)` has a carrier to
+    // dispatch on; without them `.enumerate()` off such a chain is refused.
+    if (std.mem.eql(u8, external.path[1], "slice") and
+        (std.mem.eql(u8, external.path[2], "Iter") or
+            std.mem.eql(u8, external.path[2], "IterMut") or
+            std.mem.eql(u8, external.path[2], "Chunks") or
+            std.mem.eql(u8, external.path[2], "ChunksExact"))) return 1;
+    if (std.mem.eql(u8, external.path[1], "iter")) {
+        const adapter = iteratorAdapterCarrier(external.path[2]) orelse return null;
+        return adapter.type_args;
+    }
+    if (std.mem.eql(u8, external.path[1], "ops") and
+        std.mem.eql(u8, external.path[2], "Range")) return 1;
+    return null;
+}
+
+fn isIteratorCarrier(t: types.Type) bool {
+    const external = switch (t) {
+        .external_nominal => |value| value,
+        else => return false,
+    };
+    return iteratorCarrierArgCount(external) != null;
+}
+
+/// Whether a receiver type names a type the Zig backend can render in the
+/// source. A nominal is named. An `impl Trait` return is an OPAQUE, and the
+/// backend peels it to the concrete the frontend recovered beside it before
+/// it matches anything — so an opaque WITH a carrier names exactly what the
+/// carrier names, and this asks the same question of the same walk as
+/// `lookupStdMethod` and `isRuntimeIteratorMethod`. An opaque with NO carrier
+/// is named by nothing, and neither is the receiver.
+fn hasNamedReceiverType(t: types.Type) bool {
+    const current = unpeelReceiverType(t) orelse return false;
+    return current == .external_nominal or current == .generic_inst;
+}
+
+/// Whether the receiver is an `impl Trait` the walk cannot peel, because the
+/// frontend recovered no concrete carrier for it. Nothing downstream reads
+/// such a receiver, so a call on it is a call against a type no side can
+/// name.
+fn isUnpeelableOpaqueReceiver(t: types.Type) bool {
+    return unpeelReceiverType(t) == null;
+}
+
 /// Return whether `t` is one of the public iterator carriers whose methods
 /// remain ordinary runtime-backed calls. These methods are intentionally not
 /// `StdMethod` entries: the Zig backend lowers their receiver and method name
 /// directly instead of routing them through `lowerUnsupportedStdMethod`.
 fn isRuntimeIteratorMethod(t: types.Type, method_name: []const u8) bool {
-    var current = t;
-    while (true) {
-        switch (current) {
-            .reference => |reference| current = reference.pointee,
-            .raw_ptr => |raw_ptr| current = raw_ptr.pointee,
-            .boxed => |boxed| current = boxed.*,
-            .@"opaque" => |opaque_type| {
-                if (opaque_type.concrete) |concrete| {
-                    current = concrete.*;
-                } else {
-                    return false;
-                }
-            },
-            else => break,
-        }
-    }
+    const current = unpeelReceiverType(t) orelse return false;
 
     const external = switch (current) {
         .external_nominal => |value| value,
         else => return false,
     };
-    if (external.path.len != 3) return false;
-    if (!std.mem.eql(u8, external.path[0], "core") and
-        !std.mem.eql(u8, external.path[0], "std"))
-    {
-        return false;
-    }
+    // A carrier only dispatches when it carries exactly the arguments its own
+    // definition names. `iterator_adapters` is that definition for every
+    // `core::iter` adapter, so `Map<I, F>` and `Zip<L, R>` are admitted by
+    // the same rule as `Enumerate<I>`.
+    const required_args = iteratorCarrierArgCount(external) orelse return false;
+    if (external.args.len != required_args) return false;
 
-    const is_slice_iter = std.mem.eql(u8, external.path[1], "slice") and
-        (std.mem.eql(u8, external.path[2], "Iter") or
-            std.mem.eql(u8, external.path[2], "IterMut"));
-    const is_iterator_adapter = std.mem.eql(u8, external.path[1], "iter") and
-        (std.mem.eql(u8, external.path[2], "StepBy") or
-            std.mem.eql(u8, external.path[2], "Skip") or
-            std.mem.eql(u8, external.path[2], "Zip") or
-            std.mem.eql(u8, external.path[2], "Enumerate") or
-            std.mem.eql(u8, external.path[2], "Rev"));
-    const is_range = std.mem.eql(u8, external.path[1], "ops") and
-        std.mem.eql(u8, external.path[2], "Range");
-    const valid_shape = if (is_slice_iter)
-        external.args.len == 1
-    else if (is_iterator_adapter)
-        if (std.mem.eql(u8, external.path[2], "Zip"))
-            external.args.len == 2
-        else
-            external.args.len == 1
-    else if (is_range)
-        external.args.len == 1
-    else
-        false;
-    if (!valid_shape) return false;
+    return isRuntimeIteratorMethodName(method_name);
+}
 
+/// The method names a public iterator carrier keeps as ordinary runtime-backed
+/// calls. Which NAMES those are is a property of the runtime, not of the
+/// receiver, so this half of the rule is asked of a name alone and shared by
+/// the two places that need it: the carrier that dispatches them, and the
+/// receiver-type refusal that says which arm is missing.
+fn isRuntimeIteratorMethodName(method_name: []const u8) bool {
     return std.mem.eql(u8, method_name, "next") or
         std.mem.eql(u8, method_name, "next_back") or
         std.mem.eql(u8, method_name, "nth") or
@@ -461,6 +751,67 @@ fn isRuntimeIteratorMethod(t: types.Type, method_name: []const u8) bool {
         std.mem.eql(u8, method_name, "clone") or
         std.mem.eql(u8, method_name, "cloned") or
         std.mem.eql(u8, method_name, "copied");
+}
+
+/// Whether `Display` for `t` is reachable without consulting the crate graph,
+/// which is what a graph-free whitelist entry may assert.
+///
+/// Rust declares exactly one blanket implementation,
+/// `impl<T: fmt::Display + ?Sized> ToString for T`, so admitting a receiver
+/// here is a claim that `r2z.format.writeValue` can render it in `Display`
+/// mode. That holds for:
+///
+///  * `bool`, `char`, and every integer primitive, which the runtime prints
+///    directly;
+///  * `str`, which the runtime writes byte-for-byte;
+///  * `alloc::string::String` and `alloc::borrow::Cow<str>`, both of which
+///    carry a `fmt` method in `r2z.alloc`.
+///
+/// Floats are refused even though Rust gives them a `Display`: the runtime's
+/// `writeValue` has no float arm, so admitting one would resolve a call the
+/// backend cannot emit. They stay refused until that gap is closed.
+///
+/// Everything else stays refused and the table stays a whitelist: slices and
+/// arrays (Rust renders `[T]` through `Debug`, not `Display`), `Vec<T>`,
+/// `Option`, `Result`, and crate-local nominals. A crate-local type is
+/// admitted only where the crate itself proves the bound — `isBoundStandardMethod`
+/// requires a real `impl Display for T` carrying a `fmt` member.
+///
+/// `Debug` is deliberately not accepted anywhere on this path. There is no
+/// `impl<T: Debug> ToString for T`, so a `Debug`-only type cannot call
+/// `.to_string()` in Rust and must keep resolving as unsupported here.
+fn hasGraphFreeDisplay(t: types.Type) bool {
+    return switch (t) {
+        .prim => |primitive| switch (primitive) {
+            // `()` and `!` have no `Display` implementation.
+            .unit, .never => false,
+            // `r2z.format.writeValue` renders integers and `u21` chars only.
+            .f32, .f64 => false,
+            else => true,
+        },
+        .external_nominal => |external| {
+            if (types.isStr(t)) return true;
+            if (external.args.len == 0 and external.path.len == 3 and
+                (std.mem.eql(u8, external.path[0], "alloc") or
+                    std.mem.eql(u8, external.path[0], "std")) and
+                std.mem.eql(u8, external.path[1], "string") and
+                std.mem.eql(u8, external.path[2], "String"))
+            {
+                return true;
+            }
+            if (external.path.len == 3 and external.args.len == 1 and
+                (std.mem.eql(u8, external.path[0], "alloc") or
+                    std.mem.eql(u8, external.path[0], "std")) and
+                std.mem.eql(u8, external.path[1], "borrow") and
+                std.mem.eql(u8, external.path[2], "Cow") and
+                types.isStr(external.args[0]))
+            {
+                return true;
+            }
+            return false;
+        },
+        else => false,
+    };
 }
 
 fn boundTypeName(bounds: []const types.Bound) ?[]const u8 {
@@ -846,6 +1197,212 @@ fn initializerNominalName(
     };
 }
 
+/// `&T` to a pointee the receiver's own shape fixes. A Rust literal carries
+/// its own borrow — `b"kiwi"` is `&'static [u8; 4]` — so the reference is part
+/// of the type rather than an inference about the call site.
+fn sharedRefType(g: *const graph.CrateGraph, pointee: types.Type) ?types.Type {
+    const reference = g.allocator.create(types.Ref) catch return null;
+    reference.* = .{ .mut = false, .pointee = pointee };
+    return .{ .reference = reference };
+}
+
+/// The type of a string or byte-array literal receiver. `"..."` is
+/// `&'static str` and `b"..."` is `&'static [u8; N]`.
+///
+/// Numeric literals are deliberately not covered. An unsuffixed integer or
+/// float literal has no type until its surrounding context fixes one, so
+/// attaching a primitive here would resolve method calls that Rust itself
+/// rejects. A suffixed literal already carries a `ty` and never reaches this.
+fn literalReceiverType(g: *const graph.CrateGraph, receiver: exprs.Expr) ?types.Type {
+    const literal = switch (receiver.kind) {
+        .literal => |value| value,
+        else => return null,
+    };
+    return switch (literal) {
+        .string => sharedRefType(g, types.str_type),
+        .byte_array => |bytes| blk: {
+            const array = g.allocator.create(types.Array) catch break :blk null;
+            array.* = .{
+                .elem = .{ .prim = .u8 },
+                .len = .{ .literal = @intCast(bytes.items.len) },
+            };
+            break :blk sharedRefType(g, .{ .array = array });
+        },
+        else => null,
+    };
+}
+
+/// The type of an array-literal receiver, `[T; N]`. The element type is taken
+/// from the element expressions themselves, and only when inference has
+/// already fixed one and every element agrees. An element with no type, or a
+/// heterogeneous list, is not `[T; N]` for any `T`, so the array stays
+/// untyped rather than acquiring a guessed element primitive.
+fn arrayReceiverType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver: exprs.Expr,
+) ?types.Type {
+    const array_expr = switch (receiver.kind) {
+        .array => |value| value,
+        else => return null,
+    };
+    if (array_expr.elements.len == 0) return null;
+
+    var element_id: ?exprs.TypeId = null;
+    for (array_expr.elements) |element| {
+        if (element >= b.exprs.len) return null;
+        const element_type = b.exprs[element].ty orelse return null;
+        if (element_type >= b.types.len) return null;
+        if (element_id) |first| {
+            if (first != element_type) return null;
+        } else {
+            element_id = element_type;
+        }
+    }
+
+    const array = g.allocator.create(types.Array) catch return null;
+    array.* = .{
+        .elem = b.types[element_id.?],
+        .len = .{ .literal = @intCast(array_expr.repeat orelse array_expr.elements.len) },
+    };
+    return .{ .array = array };
+}
+
+/// The type of a method receiver, recovered from the node itself when
+/// inference left it without a TypeId. A `path` binds to a local or parameter
+/// whose declaration carries the type; an `enum_variant` is a value of the
+/// enum that owns the variant and a `struct_lit` a value of the struct it
+/// spells, so each is a value of the type that declares it; a string,
+/// byte-array, or array literal carries its type in its own shape; a call
+/// carries the return type its own signature declares; and a method call
+/// carries the result of the method it applies.
+fn receiverDeclaredType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver_node: exprs.NodeId,
+) ?types.Type {
+    return receiverDeclaredTypeAt(g, b, receiver_node, 0);
+}
+
+/// `receiverDeclaredType` bounded by its own recursion: a chain of calls is
+/// followed only as deep as the expression table is walked, and a cycle in a
+/// malformed table stops the walk instead of hanging it.
+fn receiverDeclaredTypeAt(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver_node: exprs.NodeId,
+    depth: usize,
+) ?types.Type {
+    if (depth >= 32 or receiver_node >= b.exprs.len) return null;
+    const receiver = b.exprs[receiver_node];
+    if (receiver.ty) |type_id| {
+        if (type_id < b.types.len) return b.types[type_id];
+        return null;
+    }
+    return switch (receiver.kind) {
+        .path => |path| pathDeclaredType(g, b, path),
+        .enum_variant => |variant| ownerPathType(
+            g,
+            enumVariantOwner(g, variant.def) orelse return null,
+            .enum_,
+        ),
+        .struct_lit => |literal| ownerPathType(g, literal.def, .struct_),
+        .literal => literalReceiverType(g, receiver),
+        .array => arrayReceiverType(g, b, receiver),
+        // `Foo::new(..)` and `make(..)` produce what their own signature
+        // declares, so the call node names the type without any help from
+        // inference.
+        .call => |call| callDeclaredReturnType(g, b, call),
+        .method_call => methodCallResultType(g, b, receiver_node, depth),
+        else => null,
+    };
+}
+
+/// The nominal of the declaration that owns a variant or a struct literal,
+/// when that entity is a `kind` at all.
+fn ownerPathType(
+    g: *const graph.CrateGraph,
+    entity_id: spine.EntityId,
+    kind: spine.EntityKind,
+) ?types.Type {
+    const owner = g.symbol_table.get(entity_id) orelse return null;
+    if (owner.kind != kind) return null;
+    const segments = g.allocator.alloc(types.PathSegment, 1) catch return null;
+    segments[0] = .{ .name = owner.name, .id = entity_id };
+    return .{ .path = .{ .segments = segments } };
+}
+
+/// Result type of a method call whose own type the frontend cannot name. Two
+/// sources are exact. A std method the runtime types — `to_string` returns
+/// the owned `String`. And a `core::iter` adapter applied to a source
+/// iterator this resolver can already type: Rust gives every adapter the
+/// source as its first type parameter, so naming the carrier and the source
+/// is enough to know the chain is still an iterator. Everything else — an
+/// inherent method the resolver cannot see, a trait method reached through a
+/// bound it cannot name — stays untyped.
+fn methodCallResultType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+    depth: usize,
+) ?types.Type {
+    if (stdMethodResultType(g, b, node, depth + 1)) |ty| return ty;
+    return iteratorAdapterType(g, b, node, depth + 1);
+}
+
+/// The `core::iter` adapter a method call builds, or null when the call is
+/// not one. The source must already be a carrier this frontend models: an
+/// adapter over anything else is not a chain, and the call on it stays
+/// refused.
+fn iteratorAdapterType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+    depth: usize,
+) ?types.Type {
+    if (node >= b.exprs.len) return null;
+    const method = switch (b.exprs[node].kind) {
+        .method_call => |value| value,
+        else => return null,
+    };
+    const entity = g.symbol_table.get(method.method) orelse return null;
+    const adapter = iteratorAdapter(entity.name) orelse return null;
+    if (method.args.len != adapter.call_args) return null;
+    if (method.receiver >= b.exprs.len) return null;
+    const source = receiverDeclaredTypeAt(g, b, method.receiver, depth + 1) orelse return null;
+    if (!isIteratorCarrier(source)) return null;
+
+    const path = g.allocator.alloc([]const u8, 3) catch return null;
+    path[0] = "core";
+    path[1] = "iter";
+    path[2] = adapter.carrier;
+    if (adapter.type_args == 1) {
+        const args = g.allocator.alloc(types.Type, 1) catch return null;
+        args[0] = source;
+        return .{ .external_nominal = .{ .path = path, .args = args } };
+    }
+    const args = g.allocator.alloc(types.Type, 2) catch return null;
+    args[0] = source;
+    args[1] = switch (adapter.payload) {
+        .none => return null,
+        // A closure's own type is not in the table, and no rule reads this
+        // parameter: it is present so `Map<I, F>` keeps Rust's arity.
+        .closure => closureTypeMarker(g) orelse return null,
+        .other_iterator => receiverDeclaredTypeAt(g, b, method.args[0], depth + 1) orelse
+            return null,
+    };
+    return .{ .external_nominal = .{ .path = path, .args = args } };
+}
+
+/// A function type that names nothing, used only as the payload parameter of
+/// an adapter whose payload is a closure. No rule reads that parameter, so
+/// the empty signature says only "some function".
+fn closureTypeMarker(g: *const graph.CrateGraph) ?types.Type {
+    const signature = g.allocator.create(types.FnPtr) catch return null;
+    signature.* = .{ .params = &.{}, .ret = .{ .prim = .unit } };
+    return .{ .fn_ptr = signature };
+}
+
 fn receiverNominalName(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
@@ -854,15 +1411,9 @@ fn receiverNominalName(
     if (receiver_node >= b.exprs.len) return null;
     const receiver = b.exprs[receiver_node];
 
-    var receiver_ty: ?types.Type = null;
-    if (receiver.ty) |type_id| {
-        if (type_id < b.types.len) receiver_ty = b.types[type_id];
-    } else if (receiver.kind == .path) {
-        // The path's resolved EntityId is the local binding identity. Use its
-        // declaration/inferred type directly; never infer a type from spelling.
-        receiver_ty = pathDeclaredType(g, b, receiver.kind.path);
-    }
-    if (receiver_ty) |ty| {
+    // The path's resolved EntityId is the local binding identity. Use its
+    // declaration/inferred type directly; never infer a type from spelling.
+    if (receiverDeclaredType(g, b, receiver_node)) |ty| {
         if (getTypeName(g, ty)) |type_name| {
             const nominal_name = normalizeNominalName(type_name);
             if (nominal_name.len > 0) return nominal_name;
@@ -885,8 +1436,24 @@ fn receiverNominalName(
             else => null,
         },
         .method_call => |method| inherentImplTypeName(g, method.method),
+        // `FromHexError::OddLength` is a `FromHexError`. A variant node names
+        // the enum that owns it, so the receiver's type is recoverable even
+        // when inference left the node untyped.
+        .enum_variant => |variant| if (enumVariantOwner(g, variant.def)) |owner_id|
+            (g.symbol_table.get(owner_id) orelse return null).name
+        else
+            null,
         else => null,
     };
+}
+
+/// The enum that owns an `enum_variant` expression. The node names the
+/// variant entity when the graph linked one and the enum otherwise, so the
+/// owner is one level up in the first case — the same two shapes the Zig
+/// backend reads in `enumOwnerName`.
+fn enumVariantOwner(g: *const graph.CrateGraph, def: spine.EntityId) ?spine.EntityId {
+    const entity = g.symbol_table.get(def) orelse return null;
+    return if (entity.kind == .variant) entity.parent else def;
 }
 
 fn pathDeclaredType(
@@ -1073,6 +1640,47 @@ fn operandTypeResolved(
         // enum variant always has its owner's type.
         .unary => |unary| operandTypeResolved(g, b, unary.operand),
         .enum_variant => true,
+        // A call whose callee has a declared return type is a typed operand.
+        .call => |call| callDeclaredReturnType(g, b, call) != null,
+        // A method call is typed on the same rule a free call follows: once
+        // its result type is known, the operand is a real value.
+        .method_call => stdMethodResultType(g, b, node, 0) != null,
+        else => false,
+    };
+}
+
+/// Whether an operand already carries a refusal of its own.
+///
+/// The wrappers that carry no type of their own are followed, because they
+/// read the value they wrap: `&expr`, `*expr`, `(expr as T)`, `expr.field`,
+/// and `expr[i]` are all refused exactly when what they read is. Everything
+/// else is a value in its own right, and only reports its own kind.
+fn operandIsRefused(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+) bool {
+    return operandRefused(g, b, node, 0);
+}
+
+/// `operandIsRefused` bounded by its own recursion: a chain of wrappers is
+/// followed only as deep as the expression table is walked.
+fn operandRefused(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+    depth: usize,
+) bool {
+    if (depth >= 32 or node >= b.exprs.len) return false;
+    return switch (b.exprs[node].kind) {
+        .unsupported => true,
+        .unary => |unary| operandRefused(g, b, unary.operand, depth + 1),
+        .cast => |cast| operandRefused(g, b, cast.operand, depth + 1),
+        .field => |field| operandRefused(g, b, field.base, depth + 1),
+        .index => |index| operandRefused(g, b, index.base, depth + 1),
+        .try_ => |attempt| operandRefused(g, b, attempt.inner, depth + 1),
+        .binary => |binary| operandRefused(g, b, binary.lhs, depth + 1) or
+            operandRefused(g, b, binary.rhs, depth + 1),
         else => false,
     };
 }
@@ -1188,6 +1796,18 @@ fn isBoundStandardMethod(
     receiver: types.Type,
     name: []const u8,
 ) bool {
+    // `ToString::to_string` is blanket-implemented for `T: Display`. The
+    // method entity is a synthesized reference with no owning declaration, so
+    // this bound is proven from the crate's own trait impls instead of from
+    // the method's generic bounds.
+    if (std.mem.eql(u8, name, "to_string")) {
+        const type_name = getTypeName(g, receiver) orelse return false;
+        // Requiring the `fmt` member is deliberate: it is the evidence that a
+        // `Display` path exists, and it is exactly what `r2z.format.write`
+        // calls on the lowered type. `Debug` is not a substitute, because
+        // Rust declares only `impl<T: Display + ?Sized> ToString for T`.
+        return lookupTraitMethod(g, "Display", type_name, "fmt") != null;
+    }
     const method = g.symbol_table.get(expression.kind.method_call.method) orelse return false;
     const owner = method.parent orelse return false;
     if (std.mem.eql(u8, name, "as_ref")) {
@@ -1268,10 +1888,145 @@ fn resolveAssociatedTraitCall(g: *const graph.CrateGraph, b: *const bodies.Bodie
 }
 
 fn operatorOperandType(g: *const graph.CrateGraph, b: *const bodies.Bodies, node: exprs.NodeId) ?types.Type {
-    if (node >= b.exprs.len) return null;
+    return operatorOperandTypeAt(g, b, node, 0);
+}
+
+/// A borrow or a deref carries no type of its own — the operand's type is the
+/// only source — so `&output` must report `&[u8; 4]`, not a bare null. Without
+/// this, every `&local == ..` comparison looks untyped to the equality checks.
+/// The wrapper reference borrows storage from the crate graph's allocator,
+/// which the pipeline backs with an arena spanning the whole analysis.
+fn operatorOperandTypeAt(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+    depth: usize,
+) ?types.Type {
+    if (depth >= 128 or node >= b.exprs.len) return null;
     const expression = b.exprs[node];
     if (expression.ty) |id| return if (id < b.types.len) b.types[id] else null;
-    return if (expression.kind == .path) pathDeclaredType(g, b, expression.kind.path) else null;
+    return switch (expression.kind) {
+        .path => |path| pathDeclaredType(g, b, path),
+        .unary => |unary| blk: {
+            const inner = operatorOperandTypeAt(g, b, unary.operand, depth + 1) orelse break :blk null;
+            const mode = switch (unary.op) {
+                .ref => |reference_mode| reference_mode,
+                else => break :blk inner,
+            };
+            const reference = g.allocator.create(types.Ref) catch break :blk inner;
+            reference.* = .{ .mut = mode == .mutable, .pointee = inner };
+            break :blk .{ .reference = reference };
+        },
+        .call => |call| callDeclaredReturnType(g, b, call),
+        .method_call => stdMethodResultType(g, b, node, depth),
+        else => null,
+    };
+}
+
+/// The `alloc::string::String` nominal. The path is allocated from the crate
+/// graph's allocator, which the pipeline backs with an arena.
+fn ownedStringType(g: *const graph.CrateGraph) ?types.Type {
+    const path = g.allocator.alloc([]const u8, 3) catch return null;
+    path[0] = "alloc";
+    path[1] = "string";
+    path[2] = "String";
+    return .{ .external_nominal = .{ .path = path, .args = &.{} } };
+}
+
+/// Result type of a std method whose result the RUNTIME owns, read off the
+/// receiver rather than from a signature in the graph.
+///
+/// Two methods reach this, and both name their own result exactly:
+///
+/// - `to_string` returns the owned `String` of Rust's blanket
+///   `impl<T: Display> ToString for T`, which the backend lowers to
+///   `r2z.alloc.String`.
+/// - `Result<T, E>::unwrap_err(&self) -> E` returns the error arm of the
+///   receiver, and the receiver is the `Result` that arm sits in.
+///
+/// Every other std method returns a primitive, an iterator, or something this
+/// pass cannot name, so it stays unresolved and an operator over it is still
+/// refused instead of being emitted against a guessed type.
+fn stdMethodResultType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+    depth: usize,
+) ?types.Type {
+    if (depth >= 128 or node >= b.exprs.len) return null;
+    const expression = b.exprs[node];
+    if (expression.ty) |id| return if (id < b.types.len) b.types[id] else null;
+    const method = switch (expression.kind) {
+        .method_call => |value| value,
+        else => return null,
+    };
+    if (method.receiver >= b.exprs.len) return null;
+    const entity = g.symbol_table.get(method.method) orelse return null;
+    const is_to_string = std.mem.eql(u8, entity.name, "to_string");
+    if (!is_to_string and !std.mem.eql(u8, entity.name, "unwrap_err")) return null;
+    const receiver_ty = receiverDeclaredType(g, b, method.receiver) orelse return null;
+    if (is_to_string) {
+        // The call is admitted on exactly the two rules the resolver applies to
+        // it: the graph-free `Display` set, or a crate-local `impl Display`.
+        // Requiring the same evidence keeps this from typing a call the
+        // resolver will replace with an unsupported marker.
+        const std_method = lookupStdMethod(receiver_ty, "to_string");
+        if (std_method == null or std_method.? != .to_string) {
+            if (!isBoundStandardMethod(g, b, expression, receiver_ty, "to_string")) return null;
+        }
+        return ownedStringType(g);
+    }
+    // The question is the one `lookupResultRepresentationMethod` already
+    // answers for the CALL, so the two cannot disagree: a `Result` that lowers
+    // to a Zig error union keeps its error in the union and has no value to
+    // hand back, and that receiver is refused as a method call too. Reading
+    // `is_error_unionable` alone would type an operand the resolver refuses,
+    // and an operator over it would be emitted against a value the backend's
+    // switch has no arm for.
+    const representation = lookupResultRepresentationMethod(b, receiver_ty, "unwrap_err") orelse return null;
+    if (representation != .result_unwrap_err) return null;
+    const result = switch (unpeelReceiverType(receiver_ty) orelse return null) {
+        .result => |value| value.*,
+        else => return null,
+    };
+    return result.err;
+}
+
+/// Declared return type of a call's callee. A call is a typed operand as soon
+/// as its signature is known, exactly as a `path` operand is typed by its
+/// declaration. Both a plain function and a method reached through an `impl`
+/// block are covered.
+fn callDeclaredReturnType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    call: exprs.Call,
+) ?types.Type {
+    const target: spine.EntityId = switch (call.call_kind) {
+        .free, .associated, .constructor => |id| id,
+    };
+    if (target >= b.bodies.len) return null;
+    return switch (b.bodies[target]) {
+        .fn_ => |body| body.ret,
+        .impl_ => |body| blk: {
+            const entity = g.symbol_table.get(target) orelse break :blk null;
+            for (body.assoc_items) |assoc_id| {
+                const assoc = g.symbol_table.get(assoc_id) orelse continue;
+                if (!std.mem.eql(u8, assoc.name, entity.name)) continue;
+                if (assoc.id >= b.bodies.len) continue;
+                switch (b.bodies[assoc.id]) {
+                    .fn_ => |method| break :blk method.ret,
+                    .struct_ => |structure| {
+                        for (structure.methods) |method| {
+                            if (std.mem.eql(u8, method.name, entity.name)) break :blk method.ret;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            break :blk null;
+        },
+        else => null,
+    };
 }
 
 fn expressionOwner(g: *const graph.CrateGraph, b: *const bodies.Bodies, node: exprs.NodeId, depth: usize) ?spine.EntityId {
@@ -1303,16 +2058,232 @@ fn boundOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, lhs: exprs
     return bodies.genericBound(g, b, owner, receiver, &.{ "core", module, name }) != null;
 }
 
-fn builtInEqualityType(ty: types.Type) bool {
-    var current = ty;
-    for (0..128) |_| {
-        if (current == .reference) {
-            current = current.reference.pointee;
-            continue;
-        }
-        return current == .slice or current == .array or current == .option or current == .raw_ptr;
+/// True when `r2z.ops.equal` has value semantics for `ty`.
+///
+/// A `Result` is admitted whenever both payloads have value semantics, because
+/// the runtime compares the variant tag first and then the active payload —
+/// including payloads that are themselves slices, lists, or nested results.
+/// Payloads that carry no comparable value (function pointers, trait objects,
+/// opaque declarations) are refused.
+fn equalityPayloadComparable(ty: types.Type, depth: usize) bool {
+    if (depth >= 128) return false;
+    return switch (ty) {
+        .fn_ptr, .boxed, .dyn_trait, .@"opaque", .unsupported => false,
+        .reference => |reference| equalityPayloadComparable(reference.pointee, depth + 1),
+        .result => |result| equalityPayloadComparable(result.ok, depth + 1) and
+            equalityPayloadComparable(result.err, depth + 1),
+        else => true,
+    };
+}
+
+/// Rust owners the runtime lowers to a list-backed Zig container.
+///
+/// `String` lowers to `r2z.alloc.String` (one `bytes` list field) and `Vec<T>`
+/// to `std.ArrayListUnmanaged(T)`. `r2z.ops.equal` reaches the list's `items`
+/// for both, so the comparison is by CONTENT: the allocated capacity is never
+/// read, and a string's length is only ever read as the length of the slice
+/// the element walk already compares.
+fn isListBackedOwnerNominal(external: types.ExternalNominal) bool {
+    const path = external.path;
+    if (path.len != 3) return false;
+    if (!std.mem.eql(u8, path[0], "alloc") and !std.mem.eql(u8, path[0], "std")) return false;
+    if (std.mem.eql(u8, path[1], "string") and std.mem.eql(u8, path[2], "String")) {
+        return external.args.len == 0;
+    }
+    if (std.mem.eql(u8, path[1], "vec") and std.mem.eql(u8, path[2], "Vec")) {
+        return external.args.len == 1 and equalityPayloadComparable(external.args[0], 0);
     }
     return false;
+}
+
+/// Whether `ty` is a Rust owner the runtime holds behind a list. A borrow of
+/// one still names the owner, because the runtime walks through the pointer.
+fn isListBackedOwner(ty: types.Type) bool {
+    return switch (ty) {
+        .reference => |reference| isListBackedOwner(reference.pointee),
+        .external_nominal => |external| isListBackedOwnerNominal(external),
+        else => false,
+    };
+}
+
+/// Whether an operand is a Rust BORROW of a list rather than an owner of one.
+///
+/// `&[T]`, `&[T; N]` and `&str` are borrows, and so is the `"..."` / `b"..."`
+/// literal that stands for one. A DECLARED type decides first: inference
+/// sometimes types a string literal as the owned `String` it will become, and
+/// reading that operand by shape would report an owner as a borrow. Only a
+/// literal the frontend left untyped — the shape `assert_eq!` produces — is
+/// read by shape at all, and there the literal form IS the borrow.
+fn isListBackedBorrow(b: *const bodies.Bodies, node: exprs.NodeId) bool {
+    if (node >= b.exprs.len) return false;
+    if (b.exprs[node].ty) |id| {
+        return id < b.types.len and isListBorrowType(b.types[id]);
+    }
+    return switch (b.exprs[node].kind) {
+        .literal => |literal| switch (literal) {
+            .string, .byte_array => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// A type the runtime compares as a sequence. `String` and `Vec<T>` are not
+/// among them: they are the owners a borrow is measured against. `str` is
+/// Rust's unsized byte sequence, so it is one whatever form it is reached in.
+fn isListBorrowType(ty: types.Type) bool {
+    if (types.isStr(ty)) return true;
+    return switch (ty) {
+        .reference => |reference| isListBorrowType(reference.pointee),
+        .slice, .array => true,
+        else => false,
+    };
+}
+
+/// Both operands of an `==` or `!=`, decided as a pair.
+///
+/// `r2z.ops.equal` walks a list-backed owner by descending into the list it
+/// holds, so an owner and a BORROW of a list are the same Rust value in two
+/// forms: either side may be the owner, and the walk meets the other side's
+/// items. Rust compares `String == &str` the same way, which is why the pair is
+/// admitted instead of staged as a package that cannot build. An owner against
+/// a value that is neither an owner nor a borrow has no list to meet, and
+/// stays refused: the walk would read a field the far side does not have.
+/// Owner against owner, and borrow against borrow, keep the per-type whitelist.
+fn equalityOperandsComparable(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    lhs: exprs.NodeId,
+    rhs: exprs.NodeId,
+) bool {
+    const lhs_ty = operatorOperandType(g, b, lhs);
+    const rhs_ty = operatorOperandType(g, b, rhs);
+    const lhs_is_owner = lhs_ty != null and isListBackedOwner(lhs_ty.?);
+    const rhs_is_owner = rhs_ty != null and isListBackedOwner(rhs_ty.?);
+    if (lhs_is_owner != rhs_is_owner) {
+        return if (lhs_is_owner) isListBackedBorrow(b, rhs) else isListBackedBorrow(b, lhs);
+    }
+    if (lhs_ty) |ty| {
+        if (builtInEqualityType(b, ty)) return true;
+    }
+    if (rhs_ty) |ty| {
+        if (builtInEqualityType(b, ty)) return true;
+    }
+    return false;
+}
+
+fn builtInEqualityType(b: *const bodies.Bodies, ty: types.Type) bool {
+    return switch (ty) {
+        .reference => |reference| builtInEqualityType(b, reference.pointee),
+        .slice, .array, .option, .raw_ptr => true,
+        .result => |result| equalityPayloadComparable(result.ok, 0) and
+            equalityPayloadComparable(result.err, 0),
+        .external_nominal => |external| isListBackedOwnerNominal(external),
+        .path => |path| enumVariantsComparable(b, path),
+        else => false,
+    };
+}
+
+/// A crate enum, which the runtime compares as a tagged union: the tag first,
+/// then the ACTIVE payload (`r2z.ops.equal`, `equalUnion`). The walk reaches
+/// that payload through the same recursion it reaches a `Result` arm through,
+/// so the type is comparable exactly when every variant's payload is — the
+/// question `equalityPayloadComparable` already answers for a `Result`.
+/// A data-carrying enum is the one this covers that has no other route: Rust
+/// compares it by value through a `derive`d `PartialEq` that never appears in
+/// the graph as an `impl`, and Zig cannot `==` a union with a payload at all.
+///
+/// A name that resolves to anything but an enum in the body table stays out. A
+/// struct is not walked by this rule, an enum this pass cannot see the
+/// variants of is one it cannot show the walk reaching, and a type parameter
+/// names no variants at all.
+fn enumVariantsComparable(b: *const bodies.Bodies, path: types.Path) bool {
+    var last: ?spine.EntityId = null;
+    for (path.segments) |segment| last = segment.id;
+    const id = last orelse return false;
+    if (id >= b.bodies.len) return false;
+    const body = switch (b.bodies[id]) {
+        .enum_ => |value| value,
+        else => return false,
+    };
+    for (body.variants) |variant| {
+        switch (variant.fields) {
+            .none => {},
+            .tuple => |fields| for (fields) |field| {
+                if (!equalityPayloadComparable(field, 0)) return false;
+            },
+            .named => |fields| for (fields) |field| {
+                if (!equalityPayloadComparable(field.ty, 0)) return false;
+            },
+        }
+    }
+    return true;
+}
+
+/// Element type a literal contributes to a comparison. A byte or string
+/// literal pins the element to `u8`, which is what lets an untyped local be
+/// compared against it: Rust's `PartialEq<Rhs>` fixes the left element type
+/// from the right.
+fn literalElementType(b: *const bodies.Bodies, node: exprs.NodeId) ?types.Type {
+    if (node >= b.exprs.len) return null;
+    return switch (b.exprs[node].kind) {
+        .literal => |literal| switch (literal) {
+            .byte_array, .string => types.Type{ .prim = .u8 },
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn arrayElementType(ty: types.Type) ?types.Type {
+    return switch (ty) {
+        .array => |array| array.elem,
+        .reference => |reference| arrayElementType(reference.pointee),
+        else => null,
+    };
+}
+
+/// Repeat length of a local's `[element; N]` initializer, when the local has
+/// exactly that shape. `let mut output = [0; 4 * 2];` has no declared type,
+/// so its length is only recoverable from the initializer.
+fn repeatedArrayInitializerLen(g: *const graph.CrateGraph, b: *const bodies.Bodies, node: exprs.NodeId) ?usize {
+    if (node >= b.exprs.len) return null;
+    const target = switch (b.exprs[node].kind) {
+        .unary => |unary| unary.operand,
+        else => node,
+    };
+    if (target >= b.exprs.len) return null;
+    const path = switch (b.exprs[target].kind) {
+        .path => |value| value,
+        else => return null,
+    };
+    const init = findLocalInitializer(g, b, path) orelse return null;
+    if (init >= b.exprs.len) return null;
+    const array = switch (b.exprs[init].kind) {
+        .array => |value| value,
+        else => return null,
+    };
+    const repeat = array.repeat orelse return null;
+    if (repeat == 0 or array.elements.len != 1) return null;
+    return repeat;
+}
+
+/// An `&local == b"..."` comparison whose local is an untyped `[0; N]`
+/// buffer. Both the length and the element type come from the operands
+/// themselves, so no declared type is invented for the local.
+fn untypedArrayEqualityOperand(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    lhs: exprs.NodeId,
+    rhs: exprs.NodeId,
+) bool {
+    const len = repeatedArrayInitializerLen(g, b, lhs) orelse return false;
+    const elem = literalElementType(b, rhs) orelse
+        (if (operatorOperandType(g, b, rhs)) |ty| arrayElementType(ty) else null) orelse
+        return false;
+    const array = g.allocator.create(types.Array) catch return false;
+    array.* = .{ .elem = elem, .len = .{ .literal = len } };
+    return builtInEqualityType(b, .{ .array = array });
 }
 
 fn supportsBinaryOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, binary: exprs.BinaryExpr) bool {
@@ -1332,15 +2303,16 @@ fn supportsBinaryOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, b
         .boolean_and, .boolean_or => return false,
     };
     if (binary.op == .eq or binary.op == .ne) {
-        if (operatorOperandType(g, b, binary.lhs)) |ty| {
-            if (builtInEqualityType(ty)) return true;
-        }
+        // Both sides are consulted: a comparison is admitted when the pair
+        // pins a comparable type for both of its operands.
+        if (equalityOperandsComparable(g, b, binary.lhs, binary.rhs)) return true;
+        if (untypedArrayEqualityOperand(g, b, binary.lhs, binary.rhs)) return true;
+        if (untypedArrayEqualityOperand(g, b, binary.rhs, binary.lhs)) return true;
     }
     if (boundOperator(g, b, binary.lhs, binary.rhs, operation[0], operation[1])) return true;
     const receiver = receiverNominalName(g, b, binary.lhs) orelse return false;
     return lookupTraitMethod(g, operation[1], receiver, operation[2]) != null;
 }
-
 fn resolveAssignmentOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, expression: *exprs.Expr) std.mem.Allocator.Error!bool {
     const assignment = expression.kind.assign;
     if (assignment.op == .plain or operandIsPrimitive(g, b, assignment.target)) return false;
@@ -1398,13 +2370,7 @@ pub fn resolveMethods(
             }
 
             const receiver = b.exprs[receiver_node];
-            var receiver_ty: ?types.Type = null;
-            if (receiver.ty) |type_id| {
-                if (type_id < b.types.len) receiver_ty = b.types[type_id];
-            } else if (receiver.kind == .path) {
-                receiver_ty = pathDeclaredType(g, b, receiver.kind.path);
-            }
-
+            const receiver_ty = receiverDeclaredType(g, b, receiver_node);
             const iterator_projection = isRetainedIteratorProjection(g, b, receiver_node);
             if (iterator_projection) {
                 if (std.mem.eql(u8, method_name, "cloned")) {
@@ -1450,7 +2416,36 @@ pub fn resolveMethods(
             // iterator carrier and method name.
             if (!resolved) {
                 if (receiver_ty) |ty| {
+                    // A runtime iterator method is lowered by the Zig backend
+                    // from the receiver's EXTERNAL carrier type, and it peels
+                    // an `impl Trait` to the concrete the frontend recovered
+                    // beside it before it looks. An opaque that recovered a
+                    // carrier therefore reaches the same arm a nominal reaches,
+                    // which is why every predicate here reads the opaque's own
+                    // `concrete` and they all answer alike.
+                    //
+                    // What no side can reach is an opaque that recovered
+                    // NOTHING. There is no carrier to peel to, so a runtime
+                    // iterator method on it would be emitted as a bare
+                    // `receiver.method(..)` against a type nothing can write.
+                    // Refuse that here, where the reason can say what is
+                    // missing. Each clause below is load-bearing for the
+                    // REASON, not only for the refusal: the method has to be
+                    // a runtime iterator method, or no such arm is missing;
+                    // the receiver has to be one no side can name; and that
+                    // has to be because it is an `impl Trait` with no
+                    // carrier, because a slice and a `u8` are just as
+                    // unnameable and just as have no opaque arm to lack.
+                    if (isRuntimeIteratorMethodName(method_name) and
+                        !hasNamedReceiverType(ty) and
+                        isUnpeelableOpaqueReceiver(ty))
+                    {
+                        replaceWithUnsupported(e, reason_opaque_iterator_method);
+                        stats.unsupported_methods += 1;
+                        continue;
+                    }
                     if (lookupStdMethod(ty, method_name) != null or
+                        lookupResultRepresentationMethod(b, ty, method_name) != null or
                         isRuntimeIteratorMethod(ty, method_name) or
                         isRuntimeMemoryMethod(ty, method_name) or
                         isBoundStandardMethod(g, b, e.*, ty, method_name) or
@@ -1461,7 +2456,29 @@ pub fn resolveMethods(
                     }
                 }
             }
-
+            // A blanket `impl<T: AsRef<[u8]>> Trait for T` provides its method
+            // for every type its bound admits, and it does admit an array
+            // literal — but it does not say WHICH type, and that is the whole
+            // of what a call needs here. The Zig backend hoists a method onto
+            // the type that implements it, and a blanket impl over a type
+            // parameter has no such type: `validateMethodTopology` refuses it
+            // outright with `GenericDefinitionMismatch`.
+            //
+            // The turbofish is no longer part of the reason. `MethodCall`
+            // carries `generic_args`, so `encode_hex::<String>()` now binds its
+            // result type in the IR and reaches this rule intact. What is
+            // still missing is the HOST type to hoist the method onto, which
+            // only a backend change can supply, so the call stays refused and
+            // the reason names the cause that remains. A receiver that HAS a
+            // type of its own still reaches the impl the ordinary way, through
+            // the name lookup above.
+            if (!resolved and receiver.kind == .array) {
+                if (lookupBlanketAsRefBytesMethod(g, b, method_name) != null) {
+                    replaceWithUnsupported(e, reason_blanket_impl_receiver);
+                    stats.unsupported_methods += 1;
+                    continue;
+                }
+            }
             if (!resolved) {
                 const reason = if (receiver_name == null and receiver_ty == null)
                     reason_receiver_unavailable
@@ -1479,8 +2496,16 @@ pub fn resolveMethods(
             }
         } else if (e.kind == .binary) {
             const binary = e.kind.binary;
+            // An operand that already carries a refusal needs no second,
+            // vaguer marker here. The operator is not itself untranslatable —
+            // the value it reads is — and the refusal already in the tree is
+            // the one that names the cause, so re-marking the operator only
+            // hides it behind a generic "operands unresolved".
+            if (operandIsRefused(g, b, binary.lhs) or operandIsRefused(g, b, binary.rhs)) {
+                continue;
+            }
             if (!operandTypeResolved(g, b, binary.lhs) or !operandTypeResolved(g, b, binary.rhs)) {
-                replaceWithUnsupported(e, reason_operator_operands_unresolved);
+                replaceWithUnsupported(e, operatorOperandsUnresolvedReason(b, binary));
                 stats.unsupported_operators += 1;
             } else if ((!operandIsPrimitive(g, b, binary.lhs) or !operandIsPrimitive(g, b, binary.rhs)) and
                 !supportsBinaryOperator(g, b, binary))
@@ -1492,6 +2517,35 @@ pub fn resolveMethods(
     }
 
     return stats;
+}
+
+/// The reason an operator over an untyped operand carries.
+///
+/// A method call the resolver DISPATCHED and left in the tree is the one
+/// operand whose own refusal is not already there to name the cause: the call
+/// was admitted, so nothing on it is marked, and the operator then says only
+/// that a type is missing. What is missing is the call's own result type, so
+/// that is what the reason says.
+///
+/// `generate_iter(..).collect::<Vec<_>>() == result` is the shape this is for.
+/// `collect` is a runtime iterator method: the resolver admits it on the
+/// carrier the opaque recovered, and nothing downstream names what it hands
+/// back, so the operator is refused over a CALL that the tree says is fine.
+/// Reading the general reason for it buries which half is missing behind a
+/// remark about the operator.
+///
+/// Every other untyped operand keeps the general reason, and the two strings
+/// are what they are because a reason outlives this pass: the marker is
+/// printed after the graph is gone, so it cannot borrow from the graph.
+fn operatorOperandsUnresolvedReason(b: *const bodies.Bodies, binary: exprs.BinaryExpr) []const u8 {
+    for ([_]exprs.NodeId{ binary.lhs, binary.rhs }) |node| {
+        if (node >= b.exprs.len) continue;
+        switch (b.exprs[node].kind) {
+            .method_call => return reason_operator_operand_dispatched_call,
+            else => {},
+        }
+    }
+    return reason_operator_operands_unresolved;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

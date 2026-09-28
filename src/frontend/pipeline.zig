@@ -146,7 +146,10 @@ pub fn analyzeCrate(
     return analyzeCrateWithOptions(allocator, io, crate_dir, .{ .cfg = .{} });
 }
 
-/// Analyze a crate directory with explicit frontend options.
+/// Analyze a crate directory with explicit frontend options. An empty
+/// `cfg.features` means "no selection was made", so the manifest's `default`
+/// feature closure applies; a non-empty list is the caller's explicit
+/// selection and replaces the manifest default.
 pub fn analyzeCrateWithOptions(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -157,7 +160,11 @@ pub fn analyzeCrateWithOptions(
     const manifest = try ingest.loadCrateManifest(allocator, io, crate_dir);
     const src = try ingest.readFileAlloc(allocator, io, manifest.root_path);
 
-    return analyzeSourceWithGraph(allocator, io, crate_dir, manifest, src, options);
+    var resolved = options;
+    if (resolved.cfg.features.len == 0) {
+        resolved.cfg.features = try ingest.defaultFeatureClosure(allocator, manifest.features);
+    }
+    return analyzeSourceWithGraph(allocator, io, crate_dir, manifest, src, resolved);
 }
 
 /// Analyze a crate when source is already loaded in memory.
@@ -1092,6 +1099,58 @@ test "analyzeSourceWithOptions includes cfg test module and function body" {
     try std.testing.expect(rhs.kind == .literal);
     try std.testing.expect(rhs.kind.literal == .int);
     try std.testing.expectEqual(@as(i128, 1), rhs.kind.literal.int.value);
+}
+
+test "analyzeSourceWithOptions resolves a qualified trait call" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // `<[u8; 2] as FromHex>::from_hex(..)` names the trait explicitly. The self
+    // type is only a coercion target, so the call must resolve through
+    // `FromHex` rather than through a `[u8; 2]` impl.
+    const source =
+        \\#[derive(Debug, PartialEq)]
+        \\enum DecodeError { OddLength, BadDigit { index: usize } }
+        \\
+        \\trait FromHex { fn from_hex(text: &str) -> Result<Self, DecodeError>; }
+        \\
+        \\impl FromHex for [u8; 2] {
+        \\    fn from_hex(text: &str) -> Result<Self, DecodeError> {
+        \\        if text.len() != 2 { return Err(DecodeError::OddLength); }
+        \\        Ok([0, 0])
+        \\    }
+        \\}
+        \\
+        \\fn check() -> bool {
+        \\    <[u8; 2] as FromHex>::from_hex("ab") == Ok([0x61, 0x62])
+        \\}
+    ;
+
+    const rust_ir = try analyzeSourceWithOptions(
+        allocator,
+        "qualified_trait_call",
+        "2021",
+        source,
+        .{ .include_tests = true },
+    );
+
+    var saw_call = false;
+    for (rust_ir.bodies.exprs) |expression| {
+        switch (expression.kind) {
+            .unsupported => |unresolved| {
+                if (std.mem.eql(u8, unresolved.reason, "unresolved call")) {
+                    return error.UnresolvedCallStillRejected;
+                }
+            },
+            .call => |call| switch (call.call_kind) {
+                .associated => saw_call = true,
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_call);
 }
 
 test "shift and arithmetic on a reference operand yield the pointee type" {
@@ -3127,4 +3186,89 @@ test "generic conversion results remain dispatchable in their declaration scope"
         \\}
     );
     try ir.validateForTranslation(&result);
+}
+
+test "analyzeCrate enables the manifest default feature closure" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", &tmp.sub_path },
+    );
+    // `gated` is the crate's only item, and it sits behind `gated`, which the
+    // manifest enables by default. `default` also pulls in `extra` through
+    // one hop, so the closure has to be followed rather than read off the
+    // `default` list alone.
+    try writeTestFile(
+        allocator,
+        io,
+        root,
+        "Cargo.toml",
+        \\[package]
+        \\name = "gated_crate"
+        \\edition = "2021"
+        \\
+        \\[features]
+        \\default = ["gated", "extra"]
+        \\gated = ["shared"]
+        \\shared = []
+        \\extra = ["shared"]
+    ,
+    );
+    try writeTestFile(
+        allocator,
+        io,
+        root,
+        "src/lib.rs",
+        \\#[cfg(feature = "gated")]
+        \\pub fn gated() -> u8 { 1 }
+    );
+
+    const defaults = try analyzeCrate(allocator, io, root);
+    const overridden = try analyzeCrateWithOptions(allocator, io, root, .{
+        .cfg = .{ .features = &.{"extra"} },
+    });
+
+    const find = struct {
+        fn fnEntity(rust_ir_: *const ir.RustIr, name_: []const u8) ?spine.Entity {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != .fn_) continue;
+                if (std.mem.eql(u8, entity.name, name_)) return entity;
+            }
+            return null;
+        }
+    }.fnEntity;
+
+    const gated = find(&defaults, "gated") orelse return error.MissingGatedFunction;
+    try std.testing.expect(gated.id < defaults.bodies.bodies.len);
+    const function_body = switch (defaults.bodies.bodies[gated.id]) {
+        .fn_ => |body| body,
+        else => return error.MissingGatedBody,
+    };
+    try std.testing.expect(function_body.body < defaults.bodies.exprs.len);
+    const block = switch (defaults.bodies.exprs[function_body.body].kind) {
+        .block => |value| value,
+        else => return error.MissingGatedBlock,
+    };
+    // `{ 1 }` is a tail expression, so a lowered body carries the literal as
+    // the block's value rather than as a statement.
+    const tail = block.tail orelse return error.MissingGatedValue;
+    const literal = switch (defaults.bodies.exprs[tail].kind) {
+        .literal => |value| value,
+        else => return error.MissingGatedLiteral,
+    };
+    const integer = switch (literal) {
+        .int => |value| value,
+        else => return error.MissingGatedLiteral,
+    };
+    try std.testing.expectEqual(@as(i128, 1), integer.value);
+
+    // A caller-supplied selection replaces the manifest default, so the same
+    // item drops back out when `gated` is not among the requested features.
+    try std.testing.expect(find(&overridden, "gated") == null);
 }

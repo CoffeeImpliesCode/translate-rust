@@ -352,6 +352,11 @@ pub const MethodCall = struct {
     method: DefId,
     /// Argument expression indices (expr table).
     args: []const NodeId,
+    /// The method's own turbofish: `xs.collect::<Vec<u8>>()` pins the result
+    /// type at the call site, exactly as it does in Rust. Empty when the
+    /// source wrote no turbofish, in which case inference decides. Same
+    /// representation as `PathExpr.generic_args`.
+    generic_args: []const types.Type = &.{},
 };
 pub const FormatWriteExpr = struct {
     writer: NodeId,
@@ -1034,6 +1039,7 @@ pub const NodeWalker = struct {
             },
             .method_call => |method| {
                 try self.enqueueExpression(method.receiver);
+                for (method.generic_args) |argument| try self.enqueueType(argument, 0);
                 for (method.args) |argument| try self.enqueueExpression(argument);
             },
             .struct_lit => |literal| {

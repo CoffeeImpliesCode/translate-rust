@@ -256,6 +256,10 @@ fn freeDecodedPattern(allocator: std.mem.Allocator, pattern: ast.Pattern) void {
             }
             if (struct_pat.fields.len != 0) allocator.free(struct_pat.fields);
         },
+        .range_pat => |range_pattern| {
+            if (range_pattern.lo) |lo| freeDecodedLiteral(allocator, lo);
+            if (range_pattern.hi) |hi| freeDecodedLiteral(allocator, hi);
+        },
         .wildcard => {},
     }
 }
@@ -1342,6 +1346,18 @@ pub fn decodeLiteral(allocator: std.mem.Allocator, v: Json) anyerror!ast.Literal
     return error.UnknownLiteralKind;
 }
 
+fn encodeOptLiteral(allocator: std.mem.Allocator, lit: ?ast.Literal) anyerror!Json {
+    return if (lit) |l| try encodeLiteral(allocator, l) else .{ .null = {} };
+}
+
+fn optLiteral(allocator: std.mem.Allocator, o: ObjectMap, key: []const u8) anyerror!?ast.Literal {
+    const v = o.get(key) orelse return null;
+    return switch (v) {
+        .null => null,
+        else => try decodeLiteral(allocator, v),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Pattern Serialization
 // ---------------------------------------------------------------------------
@@ -1383,6 +1399,12 @@ pub fn encodePattern(allocator: std.mem.Allocator, pat: ast.Pattern) anyerror!Js
                 try fields_arr.append(.{ .object = fo });
             }
             try o.put(allocator, "fields", .{ .array = fields_arr });
+        },
+        .range_pat => |rp| {
+            try o.put(allocator, "kind", .{ .string = "range_pat" });
+            try o.put(allocator, "lo", try encodeOptLiteral(allocator, rp.lo));
+            try o.put(allocator, "hi", try encodeOptLiteral(allocator, rp.hi));
+            try o.put(allocator, "inclusive", .{ .bool = rp.inclusive });
         },
     }
     return .{ .object = o };
@@ -1445,6 +1467,23 @@ pub fn decodePattern(allocator: std.mem.Allocator, v: Json) anyerror!ast.Pattern
             .struct_pat = .{
                 .name = name,
                 .fields = fields,
+            },
+        };
+    } else if (std.mem.eql(u8, kind, "range_pat")) {
+        const lo = try optLiteral(allocator, o, "lo");
+        errdefer if (lo) |owned_lo| freeDecodedLiteral(allocator, owned_lo);
+        const hi = try optLiteral(allocator, o, "hi");
+        // An absent `inclusive` takes the ast.RangePattern default, mirroring
+        // how decodeCapture defaults an absent `by_ref`.
+        const inclusive = if (o.get("inclusive")) |encoded_inclusive| switch (encoded_inclusive) {
+            .bool => |flag| flag,
+            else => return error.BadWireFormat,
+        } else true;
+        return .{
+            .range_pat = .{
+                .lo = lo,
+                .hi = hi,
+                .inclusive = inclusive,
             },
         };
     }

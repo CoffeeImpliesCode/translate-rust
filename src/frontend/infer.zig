@@ -1027,6 +1027,21 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
         .gt,
         .ge,
         => {
+            // A comparison yields `bool`, so neither operand takes its type
+            // from the result: both sides of `==` must already agree, and Rust
+            // requires them to have the same type. Whichever side inference
+            // already typed is therefore the only available source for the
+            // other one, and an untyped side must receive it structurally —
+            // `addEq` alone reaches only the node itself, so an `Ok([..])`
+            // compared against a `Result` call would leave the array literal
+            // inside it without an element type.
+            if (getKnownType(ctx, bin.lhs)) |lhs_ty| {
+                if (getKnownType(ctx, bin.rhs) == null) {
+                    try constrainExpectedType(ctx, bin.rhs, lhs_ty);
+                }
+            } else if (getKnownType(ctx, bin.rhs)) |rhs_ty| {
+                try constrainExpectedType(ctx, bin.lhs, rhs_ty);
+            }
             try addEq(ctx, bin.lhs, bin.rhs);
             try pinKnownType(ctx, node, .{ .prim = .bool });
         },
@@ -1416,6 +1431,16 @@ fn walkStmt(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
     }
 }
 
+/// True when a declared return type carries no concrete type and therefore
+/// cannot constrain anything. `-> impl Trait` is exactly this: the frontend
+/// models it as an opaque placeholder that `materializeOpaqueFunctionReturns`
+/// later fills in from the tail's own type. Pinning that placeholder onto the
+/// tail would overwrite the real type with itself, leaving both the
+/// materialization pass and the backend staring at an unresolved opaque.
+fn returnTypeNamesNoType(t: types.Type) bool {
+    return t == .@"opaque" and t.@"opaque".concrete == null;
+}
+
 /// Walk a block expression's statements and optional tail expression.
 fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?exprs.NodeId) std.mem.Allocator.Error!void {
     std.debug.assert(fn_body < ctx.b.exprs.len);
@@ -1428,7 +1453,9 @@ fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?
         // their own type and must stay unconstrained.
         if (blk_node != null and blk_node.? == fn_body) {
             if (findFnReturnType(ctx.b, fn_body)) |ret_ty| {
-                try constrainExpectedType(ctx, t, ret_ty);
+                if (!returnTypeNamesNoType(ret_ty)) {
+                    try constrainExpectedType(ctx, t, ret_ty);
+                }
             }
         }
     }
@@ -2035,13 +2062,17 @@ fn makeSliceType(ctx: *Ctx, elem: types.Type, mutable: bool) ?types.Type {
     return .{ .slice = slice };
 }
 
-fn chunksExactElement(ty: types.Type) ?types.Type {
+/// The element of a chunked-slice carrier. `chunks` and `chunks_exact`
+/// differ only in the carrier they name — both yield `&[T]` — so one matcher
+/// serves both. The root stays `core`: `std::slice` is a re-export of the
+/// same type, and inference only ever names the `core` path.
+fn sliceChunkedElement(ty: types.Type, comptime name: []const u8) ?types.Type {
     return switch (ty) {
         .external_nominal => |external| blk: {
             if (external.path.len != 3 or external.args.len != 1) break :blk null;
             if (!std.mem.eql(u8, external.path[0], "core") or
                 !std.mem.eql(u8, external.path[1], "slice") or
-                !std.mem.eql(u8, external.path[2], "ChunksExact"))
+                !std.mem.eql(u8, external.path[2], name))
             {
                 break :blk null;
             }
@@ -2051,13 +2082,31 @@ fn chunksExactElement(ty: types.Type) ?types.Type {
     };
 }
 
-fn chunksExactType(ctx: *Ctx, elem: types.Type) ?types.Type {
+fn sliceChunkedType(ctx: *Ctx, elem: types.Type, comptime name: []const u8) ?types.Type {
     const args = ctx.alloc.alloc(types.Type, 1) catch return null;
     args[0] = elem;
     return .{ .external_nominal = .{
-        .path = &.{ "core", "slice", "ChunksExact" },
+        .path = &.{ "core", "slice", name },
         .args = args,
     } };
+}
+
+fn chunksExactElement(ty: types.Type) ?types.Type {
+    return sliceChunkedElement(ty, "ChunksExact");
+}
+
+fn chunksExactType(ctx: *Ctx, elem: types.Type) ?types.Type {
+    return sliceChunkedType(ctx, elem, "ChunksExact");
+}
+
+/// `Chunks<T>` is the carrier `chunks(n)` returns. Unlike `ChunksExact`, it has
+/// no remainder, so nothing narrows its element.
+fn chunksElement(ty: types.Type) ?types.Type {
+    return sliceChunkedElement(ty, "Chunks");
+}
+
+fn chunksType(ctx: *Ctx, elem: types.Type) ?types.Type {
+    return sliceChunkedType(ctx, elem, "Chunks");
 }
 fn makeOptionType(ctx: *Ctx, inner: types.Type) ?types.Type {
     const ptr = ctx.alloc.create(types.Type) catch return null;
@@ -2313,7 +2362,41 @@ fn iteratorChainElementType(ctx: *Ctx, chain: exprs.IteratorChainExpr) ?types.Ty
     return current;
 }
 
+/// The type an `impl Trait` receiver's own bound declares under `name`.
+///
+/// `fn generate_iter(len: usize) -> impl Iterator<Item = (usize, usize)>`
+/// returns an OPAQUE whose `Iterator` bound carries the binding in
+/// `associated_types`. That list is the only place the source writes the
+/// element type down: the concrete carrier the frontend may have recovered
+/// alongside the opaque describes the ADAPTER, not what it yields, and a
+/// receiver that is not an opaque at all — a slice, a `Vec`, a local struct —
+/// declares no bound, so it reads as "nothing declared here" and the caller
+/// keeps looking or gives up as before.
+pub fn declaredBoundType(ty: types.Type, name: []const u8) ?types.Type {
+    var current = ty;
+    while (true) {
+        switch (current) {
+            .reference => |reference| current = reference.pointee,
+            .raw_ptr => |raw_ptr| current = raw_ptr.pointee,
+            .boxed => |boxed| current = boxed.*,
+            .@"opaque" => |opaque_type| {
+                for (opaque_type.bounds) |bound| {
+                    for (bound.associated_types) |binding| {
+                        if (std.mem.eql(u8, binding.name, name)) return binding.ty;
+                    }
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+}
+
 fn iteratorItemType(ctx: *Ctx, ty: types.Type) ?types.Type {
+    // `impl Iterator<Item = T>` states the element outright. The carrier
+    // reconstruction below can only rediscover it for the adapters it
+    // models, so the declared binding is asked first and stands on its own.
+    if (declaredBoundType(ty, "Item")) |declared| return declared;
     var base = ty;
     while (true) {
         switch (base) {
@@ -2646,6 +2729,19 @@ fn traitAssociatedReturnType(ctx: *Ctx, def: exprs.DefId) ?types.Type {
         if (std.mem.eql(u8, method.name, entity.name)) return method.ret;
     }
     return null;
+}
+
+/// The declared return type of the method a call names, whether the call still
+/// holds a `method_ref` (whose trait signature carries it) or `resolveMethods`
+/// already rewrote the entity to the concrete `fn_`.
+fn methodDeclaredReturnType(ctx: *Ctx, def: exprs.DefId) ?types.Type {
+    if (def < ctx.b.bodies.len) {
+        switch (ctx.b.bodies[def]) {
+            .fn_ => |fn_body| return fn_body.ret,
+            else => {},
+        }
+    }
+    return traitAssociatedReturnType(ctx, def);
 }
 
 fn knownCallReturnType(ctx: *Ctx, node: exprs.NodeId, call: exprs.Call) ?types.Type {
@@ -3282,6 +3378,12 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                             }
                         }
                     }
+                } else if (std.mem.eql(u8, method_name, "chunks")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (sliceElementForMethod(receiver_ty)) |element| {
+                            return chunksType(ctx, element);
+                        }
+                    }
                 } else if (std.mem.eql(u8, method_name, "chunks_exact")) {
                     if (getKnownType(ctx, method.receiver)) |receiver_ty| {
                         if (sliceElementForMethod(receiver_ty)) |element| {
@@ -3606,7 +3708,13 @@ fn isThinRawPointer(raw_ptr: *const types.RawPtr) bool {
     };
 }
 
-fn isInferPlaceholderType(ty: types.Type) bool {
+/// True for the type table's stand-in for a Rust `_` inference placeholder.
+/// The placeholder is a real, resolvable entry rather than a hole: solving
+/// rewrites the entry in place once surrounding constraints name a concrete
+/// type. Lowering therefore keeps an `_` destination and defers the decision
+/// to this module, instead of rejecting the construct while the placeholder
+/// is still standing in for the type.
+pub fn isInferPlaceholderType(ty: types.Type) bool {
     return switch (ty) {
         .external_nominal => |external| external.path.len > 0 and
             std.mem.eql(u8, external.path[external.path.len - 1], "_"),
@@ -3768,7 +3876,7 @@ fn isValidCast(
 fn loopCarrierElementType(ctx: *Ctx, iterable: exprs.NodeId) ?types.Type {
     if (iterable >= ctx.b.exprs.len) return null;
     const iterable_ty = getKnownType(ctx, iterable) orelse return null;
-    if (chunksExactElement(iterable_ty)) |element| {
+    if (chunksElement(iterable_ty) orelse chunksExactElement(iterable_ty)) |element| {
         return makeSliceType(ctx, element, false);
     }
     switch (iterable_ty) {
@@ -3917,18 +4025,76 @@ fn constrainExpectedType(
         .unary => |unary| {
             if (unary.op == .ref) {
                 switch (target) {
-                    .reference => |reference| try constrainExpectedType(ctx, unary.operand, reference.pointee),
+                    .reference => |reference| {
+                        try constrainExpectedType(ctx, unary.operand, reference.pointee);
+                        try constrainBorrowedLocalInitializer(ctx, unary.operand, reference.pointee);
+                    },
                     .slice => {
                         if (unary.operand < ctx.b.exprs.len and ctx.b.exprs[unary.operand].kind == .array) {
                             try constrainExpectedType(ctx, unary.operand, target);
                         }
+                        // `&mut [T]` lowers to a mutable slice, not a reference,
+                        // so a borrowed binding reaches this arm too.
+                        try constrainBorrowedLocalInitializer(ctx, unary.operand, target);
                     },
                     else => {},
                 }
             }
         },
+        .enum_variant => |variant| switch (target) {
+            // `Ok(v)` is `Result<typeof v, E>`, so a known `Result` type is
+            // what gives the payload its type: the variant node itself says
+            // nothing about `v`. The first tuple field is the `Ok` payload
+            // and the second the `Err` one, matching the lowering of both
+            // variants onto the same pair of positions.
+            .result => |result| {
+                if (variant.tuple_fields.len > 0) {
+                    try constrainExpectedType(ctx, variant.tuple_fields[0], result.ok);
+                }
+                if (variant.tuple_fields.len > 1) {
+                    try constrainExpectedType(ctx, variant.tuple_fields[1], result.err);
+                }
+            },
+            else => {},
+        },
         else => {},
     }
+}
+
+/// Follow a borrow of a local binding back to that binding's initializer.
+/// `let mut out = [0; 4];` declares no element type, and in Rust the element
+/// type arrives from the use: a parameter declared `&mut [u8]` coerces the
+/// array to a slice and thereby fixes `out` to `[u8; 4]`. Without this step
+/// the array literal stays untyped, its `0` element falls back to the `i32`
+/// default, and the backend later rejects the repeat literal for having no
+/// element type identity. `pointee` is the borrowed type itself: a mutable
+/// slice for `&mut [T]`, a reference's pointee for `&[T; N]`.
+fn constrainBorrowedLocalInitializer(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    pointee: types.Type,
+) std.mem.Allocator.Error!void {
+    switch (pointee) {
+        .slice, .array => {},
+        else => return,
+    }
+    if (node >= ctx.b.exprs.len) return;
+    const path = switch (ctx.b.exprs[node].kind) {
+        .path => |path| path,
+        else => return,
+    };
+    const init_node = ctx.def_map.get(path.def) orelse return;
+    if (init_node == node or init_node >= ctx.b.exprs.len) return;
+    switch (ctx.b.exprs[init_node].kind) {
+        .array => {},
+        else => return,
+    }
+    try constrainExpectedType(ctx, init_node, pointee);
+    // The binding holds the array, not the slice it was borrowed as, so record
+    // the array shape the literal just resolved to. A later `&out` then types
+    // from that instead of defaulting again.
+    const init_ty = getKnownType(ctx, init_node) orelse return;
+    if (init_ty == .array) try ctx.local_types.put(ctx.alloc, path.def, init_ty);
 }
 
 fn constrainConcreteArguments(
@@ -3990,7 +4156,41 @@ fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeI
         c.args,
         &.{},
     );
-    if (expected_type) |expected| try pinKnownType(ctx, node, expected);
+    if (expected_type) |expected| {
+        try pinKnownType(ctx, node, expected);
+        return;
+    }
+    // Rust gives a call the callee's declared return type wherever it appears,
+    // so a call in argument or comparison position carries that type even
+    // though no enclosing signature propagates one to it. That declared type
+    // is the only source the other operand of a comparison has, so leaving
+    // the node untyped there leaves the whole comparison untyped.
+    try pinDeclaredReturnType(ctx, node, def);
+}
+
+/// Pin a callee's declared return type onto its call node. A declared type
+/// that still names a type parameter, or an `impl Trait` the frontend models
+/// as an unresolved opaque, carries no information at this call site: it is
+/// valid only in the callee's own generic context, and pinning it would
+/// overwrite a real type with a placeholder. Such a declaration is skipped,
+/// exactly as `returnTypeNamesNoType` skips it for a function's own tail.
+fn pinDeclaredReturnType(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    def: exprs.DefId,
+) std.mem.Allocator.Error!void {
+    if (def >= ctx.b.bodies.len) return;
+    const function = switch (ctx.b.bodies[def]) {
+        .fn_ => |declaration| declaration,
+        else => return,
+    };
+    const declared = findFnReturnType(ctx.b, function.body) orelse function.ret;
+    if (returnTypeNamesNoType(declared)) return;
+    if (!isConcreteType(declared)) return;
+    const param_names = getGenericParamNames(ctx, def) catch return;
+    defer ctx.alloc.free(param_names);
+    if (param_names.len > 0 and typeContainsParam(declared, param_names)) return;
+    try pinKnownType(ctx, node, declared);
 }
 
 /// Walk a struct literal: recurse into field values and, when the struct is
@@ -3998,6 +4198,7 @@ fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeI
 fn handleStructLit(ctx: *Ctx, node: exprs.NodeId, s: exprs.StructLit) std.mem.Allocator.Error!void {
     for (s.fields) |f| try walkExpr(ctx, f.value, node);
     if (s.base) |b0| try walkExpr(ctx, b0, node);
+    try constrainWildcardFieldCasts(ctx, s.def, s.fields);
     try instantiateGenericDef(
         ctx,
         node,
@@ -4006,6 +4207,47 @@ fn handleStructLit(ctx: *Ctx, node: exprs.NodeId, s: exprs.StructLit) std.mem.Al
         &.{},
         s.fields,
     );
+}
+
+/// Pin a struct-literal field's declared type onto a wildcard `as _` written
+/// as that field's value. Rust types a field initializer against the field's
+/// own declaration, so the declaration is the wildcard's destination; without
+/// it, `Buf { off: n as _ }` names the cast nowhere and stays unresolvable.
+///
+/// Only a fully concrete declared type qualifies. A field whose type still
+/// names a type parameter (`Box<T>`'s `T`) is not resolved until the generic
+/// arguments are, so pinning it would put a symbolic path on the cast instead
+/// of a type the backend can emit, and the wildcard must stay pending.
+fn constrainWildcardFieldCasts(
+    ctx: *Ctx,
+    def: exprs.DefId,
+    fields: []const exprs.FieldInit,
+) std.mem.Allocator.Error!void {
+    if (fields.len == 0 or def >= ctx.b.bodies.len) return;
+    const structure = switch (ctx.b.bodies[def]) {
+        .struct_ => |structure| structure,
+        else => return,
+    };
+    const param_names = getGenericParamNames(ctx, def) catch |err| switch (err) {
+        error.Unsupported => return,
+        else => |allocator_error| return allocator_error,
+    };
+    defer ctx.alloc.free(param_names);
+    for (fields) |field| {
+        if (field.value >= ctx.b.exprs.len) continue;
+        const cast = switch (ctx.b.exprs[field.value].kind) {
+            .cast => |cast| cast,
+            else => continue,
+        };
+        if (cast.target >= ctx.b.types.len) continue;
+        if (!isInferPlaceholderType(ctx.b.types[cast.target])) continue;
+        for (structure.fields) |declared| {
+            if (!std.mem.eql(u8, declared.name, field.field)) continue;
+            if (typeContainsParam(declared.ty, param_names)) break;
+            try constrainExpectedType(ctx, field.value, declared.ty);
+            break;
+        }
+    }
 }
 
 /// Match argument expression types against the callee's substituted parameter
@@ -4057,14 +4299,26 @@ fn instantiateGenericDef(
         .fn_ => |fb| {
             if (args.len != fb.params.len) return;
             for (fb.params, args) |param, arg_node| {
-                const actual_ty = getKnownType(ctx, arg_node) orelse {
-                    valid = false;
-                    break;
-                };
-                if (!matchGenericType(param.ty, actual_ty, param_names, inferred_args)) {
+                const actual_ty = getKnownType(ctx, arg_node);
+                if (actual_ty) |actual| {
+                    if (!matchGenericType(param.ty, actual, param_names, inferred_args)) {
+                        valid = false;
+                        break;
+                    }
+                    continue;
+                }
+                // A parameter naming no type parameter is already concrete, so
+                // it still fixes an argument inference has not typed. That is
+                // how `&mut [u8]` gives `let mut out = [0; 4];` its element type
+                // through a generic callee such as
+                // `fn f<T: AsRef<[u8]>>(.., ..: &mut [u8])`. An argument whose
+                // parameter does name a type parameter stays unmatchable: the
+                // type argument it would bind is still unknown.
+                if (typeContainsParam(param.ty, param_names)) {
                     valid = false;
                     break;
                 }
+                try constrainExpectedType(ctx, arg_node, param.ty);
             }
         },
         .struct_ => |sb| {
@@ -4734,7 +4988,9 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
                 // the value here instead. Without this, a bare `return None;`
                 // reaches the backend untyped.
                 if (findFnReturnType(ctx.b, fn_body)) |ret_ty| {
-                    try constrainExpectedType(ctx, v, ret_ty);
+                    if (!returnTypeNamesNoType(ret_ty)) {
+                        try constrainExpectedType(ctx, v, ret_ty);
+                    }
                 }
             }
         },
@@ -4821,10 +5077,174 @@ fn constrainInherentMethodArguments(
     }
 }
 
+/// Pin the result type a method call's own turbofish declares.
+///
+/// `xs.collect::<Vec<u8>>()` and `s.parse::<u32>()` name the result type at the
+/// call site. Substituting those arguments into the method's declared return
+/// type is what makes the call typed at all: the declared return is the bare
+/// parameter, so nothing else can resolve it. Returns true when a type was
+/// pinned, which is the caller's signal to stop — a turbofish outranks every
+/// receiver-shaped rule, because that is what Rust does. Returns false when
+/// there is no turbofish, or when substitution cannot produce a concrete
+/// type, leaving the ordinary inference rules to run.
+fn pinTurbofishResultType(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall) std.mem.Allocator.Error!bool {
+    if (m.generic_args.len == 0) return false;
+    const declared = methodDeclaredReturnType(ctx, m.method) orelse return false;
+    const param_names = getGenericParamNames(ctx, m.method) catch return false;
+    defer ctx.alloc.free(param_names);
+    if (param_names.len == 0 or param_names.len != m.generic_args.len) return false;
+    // The declared return has to actually mention a parameter: a turbofish on
+    // a method that returns something concrete says nothing new, and the
+    // receiver-shaped rules below already reach that type.
+    if (!typeContainsParam(declared, param_names)) return false;
+    const substituted = substType(ctx.alloc, declared, param_names, m.generic_args) catch
+        return false;
+    if (!isConcreteDerivedType(substituted)) {
+        freeSubstitutedType(ctx.alloc, declared, substituted, param_names, m.generic_args);
+        return false;
+    }
+    try pinKnownType(ctx, node, substituted);
+    // `pinKnownType` records the type on the solver's derived list, which the
+    // driver reads; the arena owns the substitution, so nothing is freed here.
+    return true;
+}
+
+/// True when `ty` still carries a Rust `_` somewhere inside it.
+fn containsInferPlaceholder(ty: types.Type) bool {
+    if (isInferPlaceholderType(ty)) return true;
+    return switch (ty) {
+        .external_nominal => |external| blk: {
+            for (external.args) |arg| {
+                if (containsInferPlaceholder(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .generic_inst => |generic| blk: {
+            for (generic.args.params) |arg| {
+                if (containsInferPlaceholder(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .tuple => |elements| blk: {
+            for (elements) |arg| {
+                if (containsInferPlaceholder(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .option => |inner| containsInferPlaceholder(inner.*),
+        .result => |result| containsInferPlaceholder(result.ok) or
+            containsInferPlaceholder(result.err),
+        else => false,
+    };
+}
+
+/// A `Vec` as the frontend spells it: `alloc::vec::Vec` with exactly one type
+/// argument, the element it collects.
+fn isCollectedElementContainer(ty: types.Type) bool {
+    const external = switch (ty) {
+        .external_nominal => |value| value,
+        else => return false,
+    };
+    if (external.args.len != 1 or external.path.len != 3) return false;
+    if (!std.mem.eql(u8, external.path[0], "alloc") and
+        !std.mem.eql(u8, external.path[0], "std"))
+    {
+        return false;
+    }
+    return std.mem.eql(u8, external.path[1], "vec") and
+        std.mem.eql(u8, external.path[2], "Vec");
+}
+
+/// Replace the `_` in `collect::<Vec<_>>()` with the element the receiver
+/// declares, or return null when there is nothing to replace.
+///
+/// Only the collected element is bound, and only from a type the source
+/// wrote down. `Result<Vec<_>, _>` leaves TWO placeholders and they are not
+/// the same type: the `Vec`'s is `Self::Item`, while the `Result`'s is the
+/// `FromIterator` error, which no bound on the receiver says anything about.
+/// So the walk descends through the container spine and stops at the `Vec`
+/// argument, leaving every other placeholder standing.
+fn bindCollectedElementPlaceholder(
+    alloc: std.mem.Allocator,
+    ty: types.Type,
+    item: types.Type,
+) ?types.Type {
+    if (isCollectedElementContainer(ty)) {
+        const external = ty.external_nominal;
+        if (!containsInferPlaceholder(external.args[0])) return null;
+        const bound = alloc.alloc(types.Type, 1) catch return null;
+        bound[0] = item;
+        return .{ .external_nominal = .{
+            .path = external.path,
+            .args = bound,
+        } };
+    }
+    if (!containsInferPlaceholder(ty)) return null;
+    return switch (ty) {
+        .external_nominal => |external| blk: {
+            const args = alloc.alloc(types.Type, external.args.len) catch break :blk null;
+            for (external.args, 0..) |arg, i| {
+                args[i] = bindCollectedElementPlaceholder(alloc, arg, item) orelse arg;
+            }
+            break :blk types.Type{ .external_nominal = .{
+                .path = external.path,
+                .args = args,
+            } };
+        },
+        .generic_inst => |generic| blk: {
+            const params = alloc.alloc(types.Type, generic.args.params.len) catch break :blk null;
+            for (generic.args.params, 0..) |arg, i| {
+                params[i] = bindCollectedElementPlaceholder(alloc, arg, item) orelse arg;
+            }
+            break :blk types.Type{ .generic_inst = .{
+                .decl = generic.decl,
+                .args = .{ .params = params },
+            } };
+        },
+        .tuple => |elements| blk: {
+            const rebuilt = alloc.alloc(types.Type, elements.len) catch break :blk null;
+            for (elements, 0..) |arg, i| {
+                rebuilt[i] = bindCollectedElementPlaceholder(alloc, arg, item) orelse arg;
+            }
+            break :blk types.Type{ .tuple = rebuilt };
+        },
+        .option => |inner| blk: {
+            const bound = bindCollectedElementPlaceholder(alloc, inner.*, item) orelse
+                break :blk null;
+            const rebuilt = alloc.create(types.Type) catch break :blk null;
+            rebuilt.* = bound;
+            break :blk types.Type{ .option = rebuilt };
+        },
+        else => null,
+    };
+}
+
+/// Bind an open turbofish element to the `Item` the receiver's own bound
+/// declares, in the IR the rest of the frontend reads.
+///
+/// `generate_iter(5).collect::<Vec<_>>()` names its container and leaves the
+/// element to inference. The element is not free: the receiver is
+/// `impl Iterator<Item = (usize, usize)>` and that bound says what it yields.
+/// A receiver that declares no Item binds nothing, and the placeholder is
+/// left standing for the resolver to refuse — this never guesses.
+fn bindTurbofishCollectedElement(ctx: *Ctx, node: exprs.NodeId, receiver: exprs.NodeId) void {
+    if (node >= ctx.b.exprs.len or receiver >= ctx.b.exprs.len) return;
+    const call = &@constCast(ctx.b.exprs)[node].kind.method_call;
+    if (call.generic_args.len == 0) return;
+    const receiver_ty = getKnownType(ctx, receiver) orelse return;
+    const item = declaredBoundType(receiver_ty, "Item") orelse return;
+    for (@constCast(call.generic_args)) |*argument| {
+        argument.* = bindCollectedElementPlaceholder(ctx.alloc, argument.*, item) orelse
+            argument.*;
+    }
+}
+
 fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
+    bindTurbofishCollectedElement(ctx, node, m.receiver);
     const m_name = getMethodName(ctx, m.method) orelse {
         try walkExpr(ctx, m.receiver, fn_body);
         for (m.args) |a| try walkExpr(ctx, a, fn_body);
+        _ = try pinTurbofishResultType(ctx, node, m);
         return;
     };
     try walkExpr(ctx, m.receiver, fn_body);
@@ -4841,6 +5261,12 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
         try walkExpr(ctx, a, fn_body);
     }
     try constrainInherentMethodArguments(ctx, m_name, receiver_ty, m.args);
+    // An explicit turbofish is the caller's own binding for the method's type
+    // parameters, so it decides the result type here — ahead of every
+    // receiver-shaped rule below, exactly as `recv.m::<u32>()` wins over what
+    // `recv` alone would imply. With no turbofish this is a no-op and the
+    // existing rules run unchanged.
+    if (try pinTurbofishResultType(ctx, node, m)) return;
     if (std.mem.eql(u8, m_name, "ok")) {
         if (receiver_ty) |known_receiver| {
             if (resultPayloadType(known_receiver, false)) |ok_payload| {
@@ -4910,6 +5336,7 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
     }
 
     if (std.mem.eql(u8, m_name, "split_at") or
+        std.mem.eql(u8, m_name, "chunks") or
         std.mem.eql(u8, m_name, "chunks_exact") or
         std.mem.eql(u8, m_name, "remainder"))
     {
@@ -5438,6 +5865,16 @@ pub fn solveWithGen(
     // applied a return-type or assignment constraint.
     try finalizeCoreCallTypeArguments(alloc, b, result_types);
 
+    // Every `as _` in a crate lowers to one shared `_` entry in the type
+    // table, so the first wildcard resolved here rewrites the very slot the
+    // next one still points at. A cast aimed at such a slot is a wildcard
+    // that has already been given a destination, not a cast whose
+    // destination was always concrete, and it must still resolve from its
+    // own solved type rather than inherit the first one's.
+    const resolved_wildcards = try alloc.alloc(bool, b.types.len);
+    defer alloc.free(resolved_wildcards);
+    @memset(resolved_wildcards, false);
+
     for (b.exprs, 0..) |expression, node| {
         const cast = switch (expression.kind) {
             .cast => |value| value,
@@ -5447,7 +5884,11 @@ pub fn solveWithGen(
             return error.InvalidCast;
         }
         const target_is_placeholder = isInferPlaceholderType(b.types[cast.target]);
-        if (std.meta.activeTag(cast.source_type) != .unsupported and !target_is_placeholder) {
+        const target_is_resolved_wildcard = !target_is_placeholder and
+            resolved_wildcards[cast.target];
+        if (std.meta.activeTag(cast.source_type) != .unsupported and
+            !target_is_placeholder and !target_is_resolved_wildcard)
+        {
             continue;
         }
 
@@ -5463,7 +5904,8 @@ pub fn solveWithGen(
             return error.InvalidCast;
         };
 
-        const resolved_target_id: ?exprs.TypeId = if (!target_is_placeholder)
+        const resolved_target_id: ?exprs.TypeId = if (!target_is_placeholder and
+            !target_is_resolved_wildcard)
             cast.target
         else blk: {
             const candidate = if (node < result_types.len)
@@ -5499,8 +5941,18 @@ pub fn solveWithGen(
         else
             cast.source_type;
         const target_type = b.types[final_target_id];
-        if (target_is_placeholder) {
-            @constCast(b.types)[cast.target] = target_type;
+        if (target_is_placeholder or target_is_resolved_wildcard) {
+            // Rewrite the placeholder slot so anything else still pointing at
+            // it sees a concrete type, and repoint the cast at its own
+            // resolved entry. `Inferred.apply` writes that same entry into
+            // the cast's `ty`, so the IR keeps `ty == target`. The slot is
+            // written once: a second `as _` sharing it must not overwrite the
+            // destination the first one already published there.
+            if (!target_is_resolved_wildcard) {
+                @constCast(b.types)[cast.target] = target_type;
+                resolved_wildcards[cast.target] = true;
+            }
+            @constCast(b.exprs)[node].kind.cast.target = final_target_id;
         }
         @constCast(b.exprs)[node].kind.cast.source_type = source_type;
         if (!isValidCast(cast.kind, source_type, target_type, source_type)) {

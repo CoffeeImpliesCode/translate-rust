@@ -219,8 +219,25 @@
                           "kind": "for_expr",
                           "inputs": [
                             {
-                              "kind": "ident",
-                              "name": "bytes"
+                              "kind": "builtin",
+                              "name": "index",
+                              "args": [
+                                {
+                                  "kind": "ident",
+                                  "name": "bytes"
+                                },
+                                {
+                                  "kind": "range",
+                                  "start": {
+                                    "kind": "lit",
+                                    "value": {
+                                      "kind": "int",
+                                      "value": "0"
+                                    }
+                                  },
+                                  "end": null
+                                }
+                              ]
                             }
                           ],
                           "captures": [

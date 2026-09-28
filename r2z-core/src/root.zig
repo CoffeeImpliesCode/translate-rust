@@ -24,8 +24,10 @@ pub const Result = @import("result.zig").Result;
 pub const convert = @import("convert.zig");
 pub const option = @import("option.zig");
 pub const ops = @import("ops.zig");
+pub const collections = @import("collections.zig");
 
 test {
+    _ = @import("collections.zig");
     _ = @import("alloc.zig");
     _ = @import("character.zig");
     _ = @import("format.zig");

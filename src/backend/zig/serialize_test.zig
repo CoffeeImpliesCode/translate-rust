@@ -662,3 +662,187 @@ test "serialize: for captures preserve pointer mode" {
     try testing.expectEqualStrings("item", decoded.for_expr.captures[0].name);
     try testing.expect(decoded.for_expr.captures[0].by_ref);
 }
+
+fn expectRangePatternEqual(expected: ast.Pattern, actual: ast.Pattern) !void {
+    try testing.expect(actual == .range_pat);
+    try testing.expectEqual(expected.range_pat.inclusive, actual.range_pat.inclusive);
+    try testing.expectEqual(expected.range_pat.lo != null, actual.range_pat.lo != null);
+    try testing.expectEqual(expected.range_pat.hi != null, actual.range_pat.hi != null);
+    if (expected.range_pat.lo) |lo| {
+        try testing.expectEqual(lo, actual.range_pat.lo.?);
+    }
+    if (expected.range_pat.hi) |hi| {
+        try testing.expectEqual(hi, actual.range_pat.hi.?);
+    }
+}
+
+test "serialize: range patterns roundtrip through JSON text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const patterns = [_]ast.Pattern{
+        .{ .range_pat = .{ .lo = .{ .int = 65 }, .hi = .{ .int = 70 }, .inclusive = true } },
+        .{ .range_pat = .{ .lo = .{ .char_lit = 'A' }, .hi = .{ .char_lit = 'F' }, .inclusive = true } },
+        .{ .range_pat = .{ .lo = null, .hi = .{ .uint = 9 }, .inclusive = true } },
+        .{ .range_pat = .{ .lo = .{ .char_lit = 'a' }, .hi = null, .inclusive = false } },
+        .{ .range_pat = .{ .lo = null, .hi = null, .inclusive = false } },
+        .{ .range_pat = .{} },
+    };
+
+    for (patterns) |original| {
+        const encoded = try serialize.encodePattern(allocator, original);
+        try testing.expectEqualStrings("range_pat", encoded.object.get("kind").?.string);
+
+        // Full text round trip: value -> text -> value -> pattern.
+        const text = try std.json.Stringify.valueAlloc(allocator, encoded, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+        defer parsed.deinit();
+
+        const decoded = try serialize.decodePattern(allocator, parsed.value);
+        try expectRangePatternEqual(original, decoded);
+    }
+}
+
+test "serialize: range pattern bounds are encoded as literals or null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // `char_lit` bounds keep a JSON integer, `int` bounds are stringified.
+    const encoded = try serialize.encodePattern(allocator, .{
+        .range_pat = .{ .lo = null, .hi = .{ .char_lit = 'F' }, .inclusive = false },
+    });
+
+    const object = encoded.object;
+    try testing.expect(object.get("lo").? == .null);
+    try testing.expectEqualStrings("char_lit", object.get("hi").?.object.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 'F'), object.get("hi").?.object.get("value").?.integer);
+    try testing.expect(!object.get("inclusive").?.bool);
+
+    const wide = try serialize.encodePattern(allocator, .{
+        .range_pat = .{ .lo = .{ .int = 0 }, .hi = .{ .uint = 9 }, .inclusive = true },
+    });
+    try testing.expectEqualStrings("0", wide.object.get("lo").?.object.get("value").?.string);
+    try testing.expectEqualStrings("9", wide.object.get("hi").?.object.get("value").?.string);
+    try testing.expect(wide.object.get("inclusive").?.bool);
+}
+
+test "serialize: range patterns survive inside match arms" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const original = ast.Pattern{ .range_pat = .{
+        .lo = .{ .char_lit = '0' },
+        .hi = .{ .char_lit = '9' },
+        .inclusive = true,
+    } };
+    const encoded = try serialize.encodeExpr(allocator, .{
+        .match_expr = .{
+            .target = &ast.Expr{ .ident = "c" },
+            .arms = &.{
+                .{ .patterns = &.{original}, .body = .{ .ident = "digit" } },
+                .{
+                    .patterns = &.{.{ .range_pat = .{
+                        .lo = .{ .char_lit = 'A' },
+                        .hi = null,
+                        .inclusive = false,
+                    } }},
+                    .body = .{ .ident = "letter" },
+                },
+            },
+        },
+    });
+
+    const decoded = try serialize.decodeExpr(allocator, encoded);
+    try testing.expect(decoded == .match_expr);
+    try testing.expectEqual(@as(usize, 2), decoded.match_expr.arms.len);
+    try expectRangePatternEqual(original, decoded.match_expr.arms[0].patterns[0]);
+    try expectRangePatternEqual(
+        .{ .range_pat = .{ .lo = .{ .char_lit = 'A' }, .hi = null, .inclusive = false } },
+        decoded.match_expr.arms[1].patterns[0],
+    );
+}
+
+fn checkRangePatternDecodeAllocations(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const decoded = try serialize.decodePattern(allocator, value);
+    if (decoded.range_pat.lo) |lo| allocator.free(lo.str);
+    if (decoded.range_pat.hi) |hi| allocator.free(hi.str);
+}
+
+test "serialize: range pattern string bounds survive allocation failures" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const encoded = try serialize.encodePattern(arena.allocator(), .{
+        .range_pat = .{
+            .lo = .{ .str = "lower" },
+            .hi = .{ .str = "upper" },
+            .inclusive = true,
+        },
+    });
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkRangePatternDecodeAllocations,
+        .{encoded},
+    );
+}
+
+const MalformedRangePattern = struct {
+    json: []const u8,
+    expected: anyerror,
+};
+
+test "serialize: malformed range pattern payloads are rejected" {
+    const cases = [_]MalformedRangePattern{
+        .{
+            .json =
+            \\{"kind":"range_pat","lo":5,"hi":null,"inclusive":true}
+            ,
+            .expected = error.BadWireFormat,
+        },
+        .{
+            .json =
+            \\{"kind":"range_pat","lo":null,"hi":null,"inclusive":"yes"}
+            ,
+            .expected = error.BadWireFormat,
+        },
+        .{
+            .json =
+            \\{"kind":"range_pat","lo":null,"hi":{"kind":"nope"},"inclusive":true}
+            ,
+            .expected = error.UnknownLiteralKind,
+        },
+        .{
+            .json =
+            \\{"kind":"range_pat","lo":{"kind":"int"},"inclusive":true}
+            ,
+            .expected = error.MissingField,
+        },
+        // A misspelled discriminator is an unknown pattern kind, not a
+        // range_pat with defaults.
+        .{
+            .json =
+            \\{"kind":"range","lo":null,"hi":null,"inclusive":true}
+            ,
+            .expected = error.UnknownPatternKind,
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            testing.allocator,
+            case.json,
+            .{},
+        );
+        defer parsed.deinit();
+        try testing.expectError(
+            case.expected,
+            serialize.decodePattern(testing.allocator, parsed.value),
+        );
+    }
+}

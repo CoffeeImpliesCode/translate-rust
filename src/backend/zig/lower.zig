@@ -55,10 +55,61 @@ const IteratorStructuralState = struct {
     zip_items: []const []const u8,
     zip_right_by_ref: []const bool,
 };
+/// One `for` input that is a runtime iterator rather than a value a Zig
+/// `for` can walk. The loop header cannot list it, so the iterator is
+/// hoisted into a `var` and pulled with `next`.
+const RuntimeIteratorInput = struct {
+    /// Name of the hoisted `var` that holds the iterator.
+    binding: []const u8,
+    /// `binding.next()`: the call that yields this input's next item.
+    step: *const ast.Expr,
+    /// The `while` capture name when this input drives the loop.
+    capture: ?[]const u8,
+};
 const IteratorRangeDirection = enum {
     forward,
     reverse,
 };
+
+fn nameInList(names: []const []const u8, candidate: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+/// Identifiers Zig reserves at container scope. A module named `error` is
+/// ordinary Rust, but `error.FromHexError` then reads as an error *value*
+/// rather than the imported type, and `const error = ...` does not compile at
+/// all — the emitter can only escape the declaration as `@"error"`, which
+/// leaves every reference pointing at the built-in. An import alias must
+/// therefore avoid these names.
+fn isReservedZigIdentifier(name: []const u8) bool {
+    const reserved = [_][]const u8{
+        "addrspace",    "align",       "allowzero", "and",            "anyerror",
+        "anyframe",     "anyopaque",   "anytype",   "asm",            "async",
+        "await",        "break",       "callconv",  "c_int",          "c_long",
+        "c_longdouble", "c_longlong",  "c_short",   "c_uint",         "c_ulong",
+        "c_ulonglong",  "c_ushort",    "catch",     "comptime",       "comptime_float",
+        "comptime_int", "const",       "continue",  "defer",          "else",
+        "enum",         "errdefer",    "error",     "export",         "extern",
+        "f128",         "f16",         "f32",       "f64",            "f80",
+        "false",        "fn",          "for",       "i128",           "i16",
+        "i32",          "i64",         "i8",        "if",             "inline",
+        "isize",        "linksection", "noalias",   "noinline",       "noreturn",
+        "nosuspend",    "null",        "opaque",    "or",             "orelse",
+        "packed",       "pub",         "resume",    "return",         "struct",
+        "suspend",      "switch",      "test",      "threadlocal",    "true",
+        "try",          "type",        "u128",      "u16",            "u32",
+        "u64",          "u8",          "usize",     "usingnamespace", "var",
+        "void",         "volatile",    "while",     "undefined",
+    };
+    for (reserved) |word| {
+        if (std.mem.eql(u8, name, word)) return true;
+    }
+    return false;
+}
+
 const IteratorRangeTail = struct {
     id: ir.exprs.NodeId,
 };
@@ -428,7 +479,7 @@ const StdImportDemand = struct {
 
     fn patternRequiresStd(pattern: ast.Pattern) bool {
         return switch (pattern) {
-            .wildcard, .binding, .lit => false,
+            .wildcard, .binding, .lit, .range_pat => false,
             .enum_literal => |name| isQualifiedStdName(name),
             .tuple => |patterns| patternsRequireStd(patterns),
             .struct_pat => |struct_pat| {
@@ -678,6 +729,11 @@ const Lowerer = struct {
     allocation_effects: ?[]bool = null,
     /// Allocation effect accumulated while lowering the current callable.
     current_callable_is_allocating: bool = false,
+    /// Type parameters an enclosing `impl` binds that a module-hoisted method
+    /// has to declare itself. A blanket `impl<T: Bound> Trait for T` has no
+    /// declaration body for its self type, so its methods land at module scope
+    /// where nothing else binds `T` — yet the receiver still spells `&T`.
+    hoisted_impl_generic_params: []const []const u8 = &.{},
     /// Direct call expression currently lowered by an explicit source `try`.
     explicit_try_expr: ?ir.exprs.NodeId = null,
     /// An explicit floating-point function result supplies the expected type
@@ -723,6 +779,20 @@ const Lowerer = struct {
 
     /// Map from target struct/enum EntityId to hoisted method declarations
     hoisted_by_id: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.ArrayListUnmanaged(ast.Decl)) = .empty,
+    /// Emitted name for every hoisted method EntityId. A method reaches the
+    /// output under a name that is not always its source name, so a call site
+    /// resolves through this map rather than through `renamed_to`.
+    hoisted_method_names: std.AutoHashMapUnmanaged(ir.spine.EntityId, []const u8) = .empty,
+    /// Target EntityId → source method name → self-type key of the impl that
+    /// already claimed the name on that target. It is what separates a second
+    /// impl block for the SAME self type, which collapses, from an impl for a
+    /// different one, which must be emitted beside it.
+    hoisted_self_type_keys: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.StringHashMapUnmanaged([]const u8)) = .empty,
+    /// Struct EntityId → source field name → emitted field name. Only a field
+    /// that collides with a method on the same struct appears; Zig has one
+    /// namespace for both, so the method keeps the source name (the iterator
+    /// protocol is called by name) and the field takes a fresh one.
+    renamed_struct_fields: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.StringHashMapUnmanaged([]const u8)) = .empty,
     /// Generic trait projections request one descriptor declaration per trait.
     trait_descriptor_requests: std.ArrayListUnmanaged(TraitDescriptorRequest) = .empty,
 
@@ -1476,6 +1546,9 @@ const Lowerer = struct {
         try self.computeAllocationEffects();
         defer if (self.allocation_effects) |effects| self.alloc.free(effects);
         try self.collectHoistedMethods();
+        // Hoisting decides which method names land on each struct, so the
+        // field/method collision pass has to read the finished lists.
+        try self.prepareStructFieldNames();
 
         var files_list: std.ArrayListUnmanaged(ast.File) = .empty;
 
@@ -1544,10 +1617,23 @@ const Lowerer = struct {
                     if (try self.isStructMethodRegistered(tid, ent.name)) continue;
                     // Both inherent (`impl Target`) and trait (`impl Trait for
                     // Target`) blocks collect methods onto the target here.
-                    // Guard by method name so an identical name supplied by a
-                    // second impl block is not appended twice.
-                    if (self.isHoistedMethodRegistered(tid, ent.name)) continue;
-                    const fn_decl = try self.lowerFnEntity(entity_id, ent);
+                    // Two impl blocks that name the same self type contribute
+                    // the same function, so they collapse; two that name
+                    // different self types are distinct functions and the
+                    // later one is emitted under a name of its own.
+                    const emitted_name = try self.hoistedMethodName(tid, parent_ent, ent.name);
+                    if (self.isHoistedMethodRegistered(tid, emitted_name)) continue;
+                    const previous_hoisted_generics = self.hoisted_impl_generic_params;
+                    self.hoisted_impl_generic_params = self.moduleHoistGenericParams(
+                        parent_ent,
+                        tid,
+                    );
+                    defer self.hoisted_impl_generic_params = previous_hoisted_generics;
+                    var fn_decl = try self.lowerFnEntity(entity_id, ent);
+                    if (!std.mem.eql(u8, fn_decl.name, emitted_name)) {
+                        fn_decl.name = emitted_name;
+                    }
+                    try self.hoisted_method_names.put(self.alloc, entity_id, emitted_name);
                     const decl: ast.Decl = .{ .fn_decl = fn_decl };
                     var list: std.ArrayListUnmanaged(ast.Decl) =
                         self.hoisted_by_id.get(tid) orelse .empty;
@@ -1558,23 +1644,355 @@ const Lowerer = struct {
         }
     }
 
+    /// The name a method called `name` is emitted under on `tid`.
+    ///
+    /// The first impl block to claim a name on a target keeps it. A later
+    /// block for the same self type resolves to the same name, which is what
+    /// collapses the redeclaration. A later block for a DIFFERENT self type
+    /// gets `name__<self type>`, because the target holds one Zig namespace
+    /// and the two functions are genuinely different: `impl FromHex for [u8; 6]`
+    /// and `impl FromHex for [u8; 5]` declare the same Rust method name and
+    /// two different return types, and each call site must reach its own.
+    fn hoistedMethodName(
+        self: *Lowerer,
+        tid: ir.spine.EntityId,
+        parent_ent: ir.spine.Entity,
+        name: []const u8,
+    ) ![]const u8 {
+        const entry = try self.hoisted_self_type_keys.getOrPut(self.alloc, tid);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        const keys = &entry.value_ptr.*;
+        const key = try self.implSelfTypeKey(parent_ent);
+        if (keys.get(name)) |claimed_key| {
+            if (std.mem.eql(u8, claimed_key, key)) return name;
+            const mangled = try std.fmt.allocPrint(self.alloc, "{s}__{s}", .{ name, key });
+            if (self.isHoistedMethodRegistered(tid, mangled)) return mangled;
+            try keys.put(self.alloc, mangled, key);
+            return mangled;
+        }
+        try keys.put(self.alloc, name, key);
+        return name;
+    }
+
+    /// A stable discriminator for the self type an `impl` block names.
+    ///
+    /// The rendering is a pure function of the IR type, so it neither moves
+    /// between runs nor depends on the order entities are visited in. Only
+    /// `[A-Za-z0-9_]` is produced, so a mangled name stays a plain Zig
+    /// identifier instead of reaching for `@"..."` escaping.
+    fn implSelfTypeKey(self: *Lowerer, parent_ent: ir.spine.Entity) ![]const u8 {
+        if (parent_ent.kind != .impl_) return self.alloc.dupe(u8, "none");
+        if (parent_ent.id >= self.ir.bodies.bodies.len) return self.alloc.dupe(u8, "none");
+        const impl_body = switch (self.ir.bodies.bodies[parent_ent.id]) {
+            .impl_ => |body| body,
+            else => return self.alloc.dupe(u8, "none"),
+        };
+        var key: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer key.deinit(self.alloc);
+        try self.writeTypeKey(impl_body.self_ty, &key, 0);
+        return key.toOwnedSlice(self.alloc);
+    }
+
+    fn writeTypeKey(
+        self: *Lowerer,
+        ty: ir.types.Type,
+        key: *std.ArrayListUnmanaged(u8),
+        depth: usize,
+    ) !void {
+        if (depth >= ir.types.traversal_depth_max) return key.append(self.alloc, '_');
+        switch (ty) {
+            .path => |path| {
+                for (path.segments, 0..) |segment, index| {
+                    if (index != 0) try key.append(self.alloc, '_');
+                    try self.writeIdentifierKey(segment.name, key);
+                }
+            },
+            .external_nominal => |nominal| {
+                for (nominal.path, 0..) |segment, index| {
+                    if (index != 0) try key.append(self.alloc, '_');
+                    try self.writeIdentifierKey(segment, key);
+                }
+                for (nominal.args) |arg| {
+                    try key.append(self.alloc, '_');
+                    try self.writeTypeKey(arg, key, depth + 1);
+                }
+            },
+            .prim => |prim| try self.writeIdentifierKey(@tagName(prim), key),
+            .reference => |ref| {
+                try self.writeIdentifierKey(if (ref.mut) "mutref" else "ref", key);
+                try self.writeTypeKey(ref.pointee, key, depth + 1);
+            },
+            .raw_ptr => |ptr| {
+                try self.writeIdentifierKey(if (ptr.mut) "mutraw" else "raw", key);
+                try self.writeTypeKey(ptr.pointee, key, depth + 1);
+            },
+            .slice => |slice| {
+                try self.writeIdentifierKey(if (slice.const_) "cslice" else "slice", key);
+                try self.writeTypeKey(slice.elem, key, depth + 1);
+            },
+            .array => |array| {
+                try self.writeTypeKey(array.elem, key, depth + 1);
+                try key.append(self.alloc, '_');
+                var len_buf: [24]u8 = undefined;
+                try key.appendSlice(self.alloc, switch (array.len) {
+                    .literal => |len| std.fmt.bufPrint(&len_buf, "{d}", .{len}) catch unreachable,
+                    .generic => |index| std.fmt.bufPrint(&len_buf, "g{d}", .{index}) catch unreachable,
+                    .expression => |index| std.fmt.bufPrint(&len_buf, "e{d}", .{index}) catch unreachable,
+                });
+            },
+            .tuple => |members| {
+                try self.writeIdentifierKey("tuple", key);
+                for (members, 0..) |member, index| {
+                    if (index != 0) try key.append(self.alloc, '_');
+                    try self.writeTypeKey(member, key, depth + 1);
+                }
+            },
+            .fn_ptr => |ptr| {
+                try self.writeIdentifierKey("fnptr", key);
+                try self.writeTypeKey(ptr.ret, key, depth + 1);
+            },
+            .generic_inst => |inst| {
+                try self.writeIdentifierKey("inst", key);
+                try key.append(self.alloc, '_');
+                var decl_buf: [12]u8 = undefined;
+                try key.appendSlice(
+                    self.alloc,
+                    std.fmt.bufPrint(&decl_buf, "{d}", .{inst.decl}) catch unreachable,
+                );
+                for (inst.args.params) |arg| {
+                    try key.append(self.alloc, '_');
+                    try self.writeTypeKey(arg, key, depth + 1);
+                }
+            },
+            .option => |inner| {
+                try self.writeIdentifierKey("opt", key);
+                try self.writeTypeKey(inner.*, key, depth + 1);
+            },
+            .result => |res| {
+                try self.writeIdentifierKey("res", key);
+                try self.writeTypeKey(res.ok, key, depth + 1);
+                try self.writeTypeKey(res.err, key, depth + 1);
+            },
+            .boxed => |inner| {
+                try self.writeIdentifierKey("box", key);
+                try self.writeTypeKey(inner.*, key, depth + 1);
+            },
+            .@"opaque" => |opaque_ty| {
+                try self.writeIdentifierKey("opaque", key);
+                if (opaque_ty.concrete) |concrete| {
+                    try self.writeTypeKey(concrete.*, key, depth + 1);
+                }
+            },
+            .dyn_trait => try self.writeIdentifierKey("dyn", key),
+            .unsupported => |unsupported| try self.writeIdentifierKey(
+                @tagName(unsupported.reason),
+                key,
+            ),
+        }
+    }
+
+    /// Append `name` to `key`, mapping every byte outside `[A-Za-z0-9_]` to
+    /// an underscore so the result can never split into a dotted path or need
+    /// identifier escaping when it is spliced into a declaration name.
+    fn writeIdentifierKey(
+        self: *Lowerer,
+        name: []const u8,
+        key: *std.ArrayListUnmanaged(u8),
+    ) !void {
+        for (name) |c| {
+            const word = (c >= 'a' and c <= 'z') or
+                (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or c == '_';
+            try key.append(self.alloc, if (word) c else '_');
+        }
+    }
+
+    /// Type parameters an `impl` binds that a method hoisted onto `target_id`
+    /// has to declare on its own signature.
+    ///
+    /// A blanket `impl<T: Bound> Trait for T` names a type parameter as its
+    /// self type, so the target has no declaration body of its own and every
+    /// method lands at module scope. The emitted receiver is still `*const T`,
+    /// and a module file binds nothing else named `T`, so the hoisted function
+    /// has to carry the impl's type parameter with it. An impl whose self type
+    /// is a real declaration keeps the parameter inside that declaration, and
+    /// the hoisted method stays inside it too, so it needs nothing here.
+    fn moduleHoistGenericParams(
+        self: *Lowerer,
+        parent_ent: ir.spine.Entity,
+        target_id: ir.spine.EntityId,
+    ) []const []const u8 {
+        if (parent_ent.kind != .impl_) return &.{};
+        const target_ent = self.ir.graph.symbol_table.get(target_id) orelse return &.{};
+        if (target_ent.kind != .module) return &.{};
+        if (parent_ent.id >= self.ir.bodies.bodies.len) return &.{};
+        const impl_body = switch (self.ir.bodies.bodies[parent_ent.id]) {
+            .impl_ => |body| body,
+            else => return &.{},
+        };
+        const generics = impl_body.generics orelse return &.{};
+        const self_segment = switch (impl_body.self_ty) {
+            .path => |path| lastPathSegment(path.segments) orelse return &.{},
+            else => return &.{},
+        };
+        var carried: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (generics.params) |param| {
+            const name = switch (param) {
+                .type_ => |type_param| type_param.name,
+                // A lifetime is erased and a const parameter needs a value the
+                // method does not have, so neither becomes a Zig type parameter.
+                .const_, .lifetime => continue,
+            };
+            if (!std.mem.eql(u8, name, self_segment.name)) continue;
+            var already_carried = false;
+            for (carried.items) |carried_name| {
+                if (std.mem.eql(u8, carried_name, name)) {
+                    already_carried = true;
+                    break;
+                }
+            }
+            if (already_carried) continue;
+            carried.append(self.alloc, name) catch return &.{};
+        }
+        return carried.items;
+    }
+
+    /// Record every struct field whose source name is also a method name on
+    /// the same struct, and give it a fresh emitted name.
+    ///
+    /// Rust keeps fields and methods in separate namespaces, so `struct
+    /// BytesToHexChars { next: Option<char> }` beside `fn next(&mut self)` is
+    /// legal. Zig has one namespace for fields and declarations, so one of the
+    /// two has to move. The method keeps the name — `Iterator` is driven by
+    /// calling `.next()` — and the field takes a fresh one, which is invisible
+    /// outside the struct.
+    fn prepareStructFieldNames(self: *Lowerer) !void {
+        const count = self.ir.graph.symbol_table.count();
+        for (0..count) |idx| {
+            const entity_id: ir.spine.EntityId = @intCast(idx);
+            const ent = self.ir.graph.symbol_table.get(entity_id) orelse continue;
+            if (ent.kind != .struct_) continue;
+            if (entity_id >= self.ir.bodies.bodies.len) continue;
+            const struct_body = switch (self.ir.bodies.bodies[entity_id]) {
+                .struct_ => |sb| sb,
+                else => continue,
+            };
+
+            // The struct's single Zig namespace holds its methods, its other
+            // declarations, and its fields, so a generated name must avoid
+            // all three.
+            var taken: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer taken.deinit(self.alloc);
+            for (struct_body.methods) |method| try taken.append(self.alloc, method.name);
+            if (self.hoisted_by_id.get(entity_id)) |hoisted| {
+                for (hoisted.items) |decl| {
+                    if (decl == .fn_decl) try taken.append(self.alloc, decl.fn_decl.name);
+                }
+            }
+            const method_names = try self.alloc.alloc([]const u8, taken.items.len);
+            defer self.alloc.free(method_names);
+            @memcpy(method_names, taken.items);
+            for (struct_body.fields) |field| try taken.append(self.alloc, field.name);
+
+            var renames: std.StringHashMapUnmanaged([]const u8) = .empty;
+            var renamed_any = false;
+            for (struct_body.fields) |field| {
+                if (!nameInList(method_names, field.name)) continue;
+                const base = try self.collectorBindingName("field", taken.items);
+                const candidate = try std.fmt.allocPrint(
+                    self.alloc,
+                    "{s}_{s}",
+                    .{ field.name, base },
+                );
+                try taken.append(self.alloc, candidate);
+                try renames.put(self.alloc, field.name, candidate);
+                renamed_any = true;
+            }
+            if (renamed_any) try self.renamed_struct_fields.put(self.alloc, entity_id, renames);
+        }
+    }
+
+    /// Emitted name of the enum that owns `def`. An `enum_variant` node names
+    /// the variant entity when the graph linked one, and the enum otherwise,
+    /// so the owner is one level up in the first case.
+    fn enumOwnerName(self: *Lowerer, def: ir.spine.EntityId) ![]const u8 {
+        const entity = self.ir.graph.symbol_table.get(def) orelse
+            return error.MissingDefinition;
+        const owner_id = if (entity.kind == .variant)
+            entity.parent orelse return error.MissingParentId
+        else
+            def;
+        return self.lowerResolvedEntityName(owner_id);
+    }
+
+    /// Emitted name of a field-less variant: the owning enum exactly as
+    /// `enumOwnerName` spells it — module alias included — then the variant.
+    /// A bare variant name names nothing once the enum lives in another
+    /// module, so the qualification the type reference needs is the
+    /// qualification this value needs.
+    fn unitVariantName(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        variant_name: []const u8,
+    ) ![]const u8 {
+        return std.fmt.allocPrint(
+            self.alloc,
+            "{s}.{s}",
+            .{ try self.enumOwnerName(def), variant_name },
+        );
+    }
+
+    /// Emitted name of a struct field, applying any collision rename.
+    fn structFieldName(
+        self: *const Lowerer,
+        struct_id: ir.spine.EntityId,
+        source_name: []const u8,
+    ) []const u8 {
+        const renames = self.renamed_struct_fields.get(struct_id) orelse return source_name;
+        return renames.get(source_name) orelse source_name;
+    }
+
+    /// Struct EntityId behind an expression type, if the type names one.
+    fn structDefForType(self: *const Lowerer, ty: ir.types.Type) ?ir.spine.EntityId {
+        var current = ty;
+        for (0..32) |_| {
+            switch (current) {
+                .reference => |reference| current = reference.pointee,
+                .boxed => |boxed| current = boxed.*,
+                else => break,
+            }
+        }
+        const path = switch (current) {
+            .path => |p| p,
+            else => return null,
+        };
+        const segment = lastPathSegment(path.segments) orelse return null;
+        const id = segment.id orelse return null;
+        const ent = self.ir.graph.symbol_table.get(id) orelse return null;
+        if (ent.kind != .struct_) return null;
+        return id;
+    }
+
     /// True when the target entity carries a `.struct_` body whose
     /// `StructBody.methods` already registers a method named `name`.
+    ///
+    /// Only a struct has that list, so an enum or union target is never
+    /// "already registered" there: its impl methods are hoisted and rendered
+    /// by `lowerEntityDecl` from the hoisted list instead.
     fn isStructMethodRegistered(
         self: *Lowerer,
         tid: ir.spine.EntityId,
         name: []const u8,
     ) !bool {
         if (tid >= self.ir.bodies.bodies.len) return error.MissingBodyId;
-        switch (self.ir.bodies.bodies[tid]) {
-            .struct_ => |sb| {
-                for (sb.methods) |m| {
-                    if (std.mem.eql(u8, m.name, name)) return true;
-                }
-                return false;
-            },
-            else => return error.DeclarationBodyMismatch,
+        const struct_body = switch (self.ir.bodies.bodies[tid]) {
+            .struct_ => |sb| sb,
+            else => return false,
+        };
+        for (struct_body.methods) |method| {
+            if (std.mem.eql(u8, method.name, name)) return true;
         }
+        return false;
     }
 
     /// True when a hoisted declaration already exists for `name` on `tid`.
@@ -1594,10 +2012,16 @@ const Lowerer = struct {
         module_or_path: []const u8,
         is_pub: bool,
     ) !void {
-        for (imports.items) |existing| {
+        for (imports.items) |*existing| {
             if (std.mem.eql(u8, existing.local_name, local_name) and
                 std.mem.eql(u8, existing.module_or_path, module_or_path))
             {
+                // An import can be requested privately first and publicly
+                // later, when a `pub mod` is re-exported from the crate root.
+                // Widening the existing entry is what makes the re-export
+                // reachable; keeping the first-seen visibility would discard
+                // the `pub`.
+                existing.is_pub = existing.is_pub or is_pub;
                 return;
             }
         }
@@ -1610,6 +2034,25 @@ const Lowerer = struct {
             .module_or_path = owned_module_or_path,
             .is_pub = is_pub,
         });
+    }
+
+    /// Rust `pub mod foo;` at the crate root is a re-export: the module
+    /// namespace is part of the crate's public API, so the Zig import has to
+    /// be `pub const` or nothing outside the package can reach it. A private
+    /// `mod` stays a private import — publishing it would widen the generated
+    /// API beyond what the source declared.
+    ///
+    /// Scoped to the crate root, where a `pub` binding is genuinely the
+    /// crate's public surface. Inside a nested module the binding is only as
+    /// visible as that module, so re-exporting it changes nothing reachable.
+    fn moduleImportIsReExport(
+        self: *const Lowerer,
+        importing_module: ir.graph.Module,
+        target_module_id: ir.spine.EntityId,
+    ) bool {
+        if (!importing_module.is_crate) return false;
+        const target = self.ir.graph.symbol_table.get(target_module_id) orelse return false;
+        return target.visibility == .public;
     }
     fn appendStdImportIfNeeded(
         self: *Lowerer,
@@ -1651,7 +2094,7 @@ const Lowerer = struct {
             }
         }
 
-        if (std.mem.eql(u8, candidate, "std")) return true;
+        if (isReservedZigIdentifier(candidate)) return true;
         for (current_module.items) |item_id| {
             const entity = self.ir.graph.symbol_table.get(item_id) orelse continue;
             if (entity.kind == .module and entity.id == target_module_id) continue;
@@ -1709,9 +2152,10 @@ const Lowerer = struct {
             .importing = importing_module_id,
             .target = target_module_id,
         };
+        const re_export = self.moduleImportIsReExport(current_module, target_module_id);
         if (self.pending_module_imports.get(key)) |alias| {
             if (self.current_imports) |imports| {
-                try self.appendImport(imports, alias, module_path, false);
+                try self.appendImport(imports, alias, module_path, re_export);
             }
             return alias;
         }
@@ -1724,7 +2168,7 @@ const Lowerer = struct {
         );
         try self.pending_module_imports.put(self.alloc, key, alias);
         if (self.current_imports) |imports| {
-            try self.appendImport(imports, alias, module_path, false);
+            try self.appendImport(imports, alias, module_path, re_export);
         }
         return alias;
     }
@@ -1744,7 +2188,12 @@ const Lowerer = struct {
             };
             const module_path = try self.moduleImportPath(importing_module, target_module);
             defer self.alloc.free(module_path);
-            try self.appendImport(imports, entry.value_ptr.*, module_path, false);
+            try self.appendImport(
+                imports,
+                entry.value_ptr.*,
+                module_path,
+                self.moduleImportIsReExport(importing_module, key.target),
+            );
         }
     }
 
@@ -2161,7 +2610,10 @@ const Lowerer = struct {
         const entity = self.ir.graph.symbol_table.get(def) orelse {
             return error.MissingDefinition;
         };
-        const name = entity.renamed_to orelse entity.name;
+        // A hoisted method can be emitted under a name of its own when a
+        // second impl for a different self type claimed the source name.
+        const name = self.hoisted_method_names.get(def) orelse
+            (entity.renamed_to orelse entity.name);
         if (name.len == 0) return error.MissingDefinitionName;
         const owner = try self.owningModuleEntity(def);
         if (owner == null and entity.parent != null) return error.MissingModuleOwner;
@@ -2188,7 +2640,10 @@ const Lowerer = struct {
         const entity = self.ir.graph.symbol_table.get(def) orelse {
             return error.MissingDefinition;
         };
-        const name = entity.renamed_to orelse entity.name;
+        // A hoisted method can be emitted under a name of its own when a
+        // second impl for a different self type claimed the source name.
+        const name = self.hoisted_method_names.get(def) orelse
+            (entity.renamed_to orelse entity.name);
         if (name.len == 0) return error.MissingDefinitionName;
         const owner = try self.owningModuleEntity(def);
         if (owner == null) {
@@ -2262,7 +2717,8 @@ const Lowerer = struct {
         const entity = self.ir.graph.symbol_table.get(entity_id) orelse {
             return error.MissingDefinition;
         };
-        const name = entity.renamed_to orelse entity.name;
+        const name = self.hoisted_method_names.get(entity_id) orelse
+            (entity.renamed_to orelse entity.name);
         if (name.len == 0) return error.MissingDefinitionName;
         const target = try self.allocExpr(receiver);
         errdefer self.alloc.destroy(target);
@@ -2393,6 +2849,18 @@ const Lowerer = struct {
                 try decls_list.append(self.alloc, decl);
             }
         }
+        // An `impl` on a type with no declaration body of its own — an array,
+        // a primitive — hoists onto the enclosing module, and only the
+        // struct/enum/union branches of `lowerEntityDecl` ever render a
+        // hoisted list. Without this the methods vanish from the package.
+        try self.appendModuleHoistedMethods(&decls_list, current_mod_id);
+        // At the crate root a `pub mod` is re-exported as a real
+        // declaration, so the root declares its public API instead of only
+        // referencing it. Nested modules keep plain imports: there a `pub`
+        // binding is only as visible as the file that holds it.
+        if (mod.id == 0) {
+            try self.promotePublicModuleImportsToReExports(&decls_list, &imports_list);
+        }
 
         try self.appendRuntimeImport(&imports_list, current_mod_id);
         try self.appendStdImportIfNeeded(&imports_list, decls_list.items, tests_list.items);
@@ -2409,6 +2877,50 @@ const Lowerer = struct {
             .decls = decls,
             .tests = tests,
         };
+    }
+
+    /// Rust `pub mod foo;` at the crate root is a re-export: the module
+    /// namespace is part of the crate's public API, so it has to be reachable
+    /// from outside the generated package. A top-level
+    /// `pub const foo = @import("./foo.zig");` is a Zig *declaration*, so a
+    /// public submodule import is promoted from the import list to a real
+    /// decl. That is what makes the root genuinely declare its API, which is
+    /// exactly what the empty-root guard looks for, and the submodule stays
+    /// reachable as `root.foo`.
+    ///
+    /// Only a `pub` submodule is promoted. A private `mod` keeps its private
+    /// import, so the generated surface stays exactly what the source
+    /// declared. `./…` is the only path that is a sibling module of this
+    /// package; `std.…` and `r2z` are not crate modules and are never
+    /// re-exported.
+    fn promotePublicModuleImportsToReExports(
+        self: *Lowerer,
+        decls: *std.ArrayListUnmanaged(ast.Decl),
+        imports: *std.ArrayListUnmanaged(ast.Import),
+    ) !void {
+        var kept: usize = 0;
+        for (imports.items) |entry| {
+            if (!entry.is_pub or !std.mem.startsWith(u8, entry.module_or_path, "./")) {
+                imports.items[kept] = entry;
+                kept += 1;
+                continue;
+            }
+            const path = try self.allocExpr(.{ .lit = .{ .str = entry.module_or_path } });
+            // The argument slice must outlive this statement; a `&.{}`
+            // temporary would dangle once the decl is stored.
+            const args = try self.alloc.alloc(ast.Expr, 1);
+            args[0] = path.*;
+            const builtin = try self.allocExpr(.{ .builtin = .{
+                .name = "import",
+                .args = args,
+            } });
+            try decls.append(self.alloc, .{ .const_decl = .{
+                .name = entry.local_name,
+                .is_pub = true,
+                .init = builtin.*,
+            } });
+        }
+        imports.shrinkRetainingCapacity(kept);
     }
 
     fn lowerRootFileFromSymbolTable(self: *Lowerer) !ast.File {
@@ -2457,6 +2969,10 @@ const Lowerer = struct {
                 try decls_list.append(self.alloc, decl);
             }
         }
+        try self.appendModuleHoistedMethods(&decls_list, 0);
+        // A `pub mod` is re-exported as a real declaration, so the root
+        // declares its public API instead of only referencing it.
+        try self.promotePublicModuleImportsToReExports(&decls_list, &imports_list);
 
         try self.appendRuntimeImport(&imports_list, 0);
         try self.appendStdImportIfNeeded(&imports_list, decls_list.items, tests_list.items);
@@ -2473,6 +2989,21 @@ const Lowerer = struct {
             .decls = decls,
             .tests = tests,
         };
+    }
+
+    /// Append the hoisted methods whose target is `module_id` itself.
+    ///
+    /// `collectHoistedMethods` targets a struct, enum, or union when the impl
+    /// has one, and otherwise the impl's enclosing module. Only the first
+    /// three get rendered by `lowerEntityDecl`; a module target has no
+    /// declaration of its own to hang them on, so they are appended here.
+    fn appendModuleHoistedMethods(
+        self: *Lowerer,
+        decls: *std.ArrayListUnmanaged(ast.Decl),
+        module_id: ir.spine.EntityId,
+    ) !void {
+        const hoisted = self.hoisted_by_id.get(module_id) orelse return;
+        for (hoisted.items) |decl| try decls.append(self.alloc, decl);
     }
 
     fn isExternalMarkerPath(path: []const []const u8) bool {
@@ -2507,6 +3038,30 @@ const Lowerer = struct {
                     std.mem.eql(u8, name, "Write")));
     }
 
+    /// External module namespaces whose `use` emits no declaration.
+    ///
+    /// `use core::iter;` names the standard iteration namespace. Nothing under
+    /// it is ever declared: iteration traits are erased at emit and the
+    /// adapters are reached through the r2z mappings, which add their own
+    /// imports on demand. The lexical import is therefore a no-op, exactly as
+    /// `use std::io;` already is.
+    ///
+    /// Only the bare two-segment module is a no-op. A three-segment path under
+    /// one of these namespaces names a *type*, and a type is only importable
+    /// once the lowerer owns a mapping for it — see `isRuntimeTypeImport` and
+    /// `lowerExternalNominal`. `std::collections::HashMap` and
+    /// `std::collections::HashSet` have such a mapping; every other
+    /// three-segment path under that namespace (`VecDeque`, `BinaryHeap`,
+    /// ...) keeps rejecting. Dropping their import would emit a package that
+    /// names a type the translator cannot build.
+    fn isExternalModuleNamespace(path: []const []const u8) bool {
+        if (path.len != 2) return false;
+        if (!std.mem.eql(u8, path[0], "core") and !std.mem.eql(u8, path[0], "std")) return false;
+        return std.mem.eql(u8, path[1], "iter") or
+            std.mem.eql(u8, path[1], "io") or
+            std.mem.eql(u8, path[1], "collections");
+    }
+
     fn isBuildHasherDefaultPath(path: []const []const u8) bool {
         if (path.len != 3 or !std.mem.eql(u8, path[1], "hash") or
             !std.mem.eql(u8, path[2], "BuildHasherDefault"))
@@ -2521,6 +3076,30 @@ const Lowerer = struct {
         return std.mem.eql(u8, path[0], "alloc") and
             std.mem.eql(u8, path[1], "vec") and
             std.mem.eql(u8, path[2], "Vec");
+    }
+
+    /// `core::collections`, `std::collections`, and `alloc::collections` are
+    /// the same Rust module; only `HashMap` and `HashSet` have a lowering.
+    fn isCollectionsPath(path: []const []const u8) bool {
+        if (path.len != 3) return false;
+        if (!std.mem.eql(u8, path[0], "core") and
+            !std.mem.eql(u8, path[0], "std") and
+            !std.mem.eql(u8, path[0], "alloc")) return false;
+        return std.mem.eql(u8, path[1], "collections");
+    }
+
+    fn isCollectionsMapPath(path: []const []const u8) bool {
+        return isCollectionsPath(path) and std.mem.eql(u8, path[2], "HashMap");
+    }
+
+    fn isCollectionsSetPath(path: []const []const u8) bool {
+        return isCollectionsPath(path) and std.mem.eql(u8, path[2], "HashSet");
+    }
+
+    /// `HashMap`/`HashSet` type paths the lowerer can name, so a `use` of
+    /// them emits no declaration of its own.
+    fn isCollectionsTypePath(path: []const []const u8) bool {
+        return isCollectionsMapPath(path) or isCollectionsSetPath(path);
     }
 
     fn isCoreFunctionImport(path: []const []const u8) bool {
@@ -2540,7 +3119,8 @@ const Lowerer = struct {
     }
 
     fn isRuntimeTypeImport(path: []const []const u8) bool {
-        if (isBuildHasherDefaultPath(path) or isAllocVecPath(path) or isCowPath(path)) return true;
+        if (isBuildHasherDefaultPath(path) or isAllocVecPath(path) or isCowPath(path) or
+            isCollectionsTypePath(path)) return true;
         if (path.len < 2 or path.len > 3) return false;
         const is_core = std.mem.eql(u8, path[0], "core") or std.mem.eql(u8, path[0], "std");
         const is_alloc = std.mem.eql(u8, path[0], "alloc") or std.mem.eql(u8, path[0], "std");
@@ -2562,6 +3142,26 @@ const Lowerer = struct {
         return false;
     }
 
+    /// True when a `use` path is rooted at something this crate does not
+    /// declare: neither one of its modules, nor a `self`/`super`/`crate`
+    /// relative prefix, nor a declared dependency binding.
+    fn useNamesUntranslatedCrate(self: *const Lowerer, use_name: []const u8) bool {
+        const separator = std.mem.indexOf(u8, use_name, "::") orelse return false;
+        const root = use_name[0..separator];
+        if (root.len == 0) return false;
+        if (std.mem.eql(u8, root, "self") or std.mem.eql(u8, root, "super") or
+            std.mem.eql(u8, root, "crate")) return false;
+        for (self.ir.graph.modules.items) |module| {
+            if (std.mem.eql(u8, module.name, root)) return false;
+        }
+        for (self.ir.graph.crates.items) |entry| {
+            for (entry.deps) |dep| {
+                if (std.mem.eql(u8, dep.local_alias, root)) return false;
+            }
+        }
+        return true;
+    }
+
     fn useHasLowerableTarget(
         self: *const Lowerer,
         use_decl: ir.graph.UseDecl,
@@ -2570,6 +3170,7 @@ const Lowerer = struct {
             .external => |external| {
                 if (use_decl.is_pub_export) return error.UnsupportedExternalUse;
                 if (isExternalMarkerPath(external.path)) return false;
+                if (isExternalModuleNamespace(external.path)) return false;
                 if (isCoreFunctionImport(external.path)) return false;
                 if (external.path.len >= 2 and external.path.len <= 3 and
                     std.mem.eql(u8, external.path[0], "std") and
@@ -2598,7 +3199,17 @@ const Lowerer = struct {
             return error.MissingUseDeclaration;
         };
         if (use_entity.kind != .use_) return error.UseDeclarationMismatch;
-        if (use_entity.resolved == null) return error.UnresolvedUseTarget;
+        if (use_entity.resolved == null) {
+            // A `use` whose root names no module of this crate imports from a
+            // dependency. Dependency crates enter the IR as metadata and are
+            // never translated, so the import has nothing to declare — the same
+            // no-emission policy `std::io` and `core::iter` already take. A
+            // macro import such as `use pretty_assertions::assert_eq;` lands
+            // here too: the macro itself is expanded by the frontend, so the
+            // import is already spent.
+            if (self.useNamesUntranslatedCrate(use_entity.name)) return false;
+            return error.UnresolvedUseTarget;
+        }
 
         const target = self.ir.graph.symbol_table.get(use_decl.target) orelse {
             return error.MissingUseTarget;
@@ -2689,7 +3300,7 @@ const Lowerer = struct {
                         for (sb.fields) |f| {
                             const f_ty = try self.lowerType(f.ty);
                             try fields_list.append(self.alloc, .{
-                                .name = try self.alloc.dupe(u8, f.name),
+                                .name = try self.alloc.dupe(u8, self.structFieldName(entity_id, f.name)),
                                 .ty = f_ty,
                                 .is_pub = switch (f.visibility) {
                                     .public, .crate_restricted, .super_restricted, .in_path => true,
@@ -2876,10 +3487,11 @@ const Lowerer = struct {
                 };
             },
             .type_alias => {
-                const target_ty = switch (body_kind) {
-                    .type_alias => |tab| try self.lowerType(tab.target),
+                const alias = switch (body_kind) {
+                    .type_alias => |tab| tab,
                     else => return error.DeclarationBodyMismatch,
                 };
+                const target_ty = try self.lowerType(alias.target);
 
                 const init_expr: ast.Expr = switch (target_ty) {
                     .named => |n| ast.Expr{ .ident = try self.alloc.dupe(u8, n) },
@@ -2914,6 +3526,28 @@ const Lowerer = struct {
                     else => return error.UnsupportedTypeAliasTarget,
                 };
 
+                // `pub type X<K, V> = ...` binds K and V inside its own
+                // target, so the Zig form has to be a comptime type
+                // function. A `const` cannot mention them: the names would
+                // dangle and the generated package would not compile.
+                if (alias.generic_params.len != 0) {
+                    const generic_params = try self.alloc.alloc(ast.GenericParam, alias.generic_params.len);
+                    for (alias.generic_params, 0..) |param_name, i| {
+                        generic_params[i] = .{
+                            .name = try self.alloc.dupe(u8, param_name),
+                            .is_comptime = true,
+                            .ty = ast.Type{ .named = "type" },
+                        };
+                    }
+                    return ast.Decl{ .fn_decl = .{
+                        .name = try self.alloc.dupe(u8, ent.name),
+                        .is_pub = is_pub,
+                        .params = &.{},
+                        .ret_type = ast.Type{ .named = "type" },
+                        .body = .{ .expr = try self.allocExpr(init_expr) },
+                        .generic_params = generic_params,
+                    } };
+                }
                 return ast.Decl{
                     .const_decl = .{
                         .name = try self.alloc.dupe(u8, ent.name),
@@ -2980,6 +3614,13 @@ const Lowerer = struct {
             },
             .impl_ => {
                 // Impl items are hoisted into their target structs/enums; skip at module root.
+                return null;
+            },
+            .trait_ => {
+                // A trait has no Zig counterpart. Its methods reach the output
+                // through the impl blocks, which `collectHoistedMethods` hoists
+                // onto the implementing type, and its bounds are erased at
+                // emit. The declaration itself therefore contributes nothing.
                 return null;
             },
             else => return error.UnsupportedEntityKind,
@@ -3536,6 +4177,128 @@ const Lowerer = struct {
             },
             else => return error.UnsupportedIteratorAdapter,
         }
+    }
+
+    /// Whether a `for` input is a runtime iterator. Zig's `for` walks a
+    /// range, array, slice, tuple or vector, and every `r2z` iterator is a
+    /// struct, so such an input has to be pulled with `next` instead. A `for`
+    /// input is a statement position, so a range node keeps the bare Zig range
+    /// form and is never an iterator value.
+    fn isRuntimeIteratorInput(self: *Lowerer, node: ir.exprs.NodeId) anyerror!bool {
+        if (node >= self.ir.bodies.exprs.len) return false;
+        if (self.ir.bodies.exprs[node].kind == .range) return false;
+        const ty = try self.exprType(node) orelse return false;
+        return isRuntimeIteratorCarrier(peelReceiverType(ty));
+    }
+
+    /// Hoist one runtime-iterator `for` input and bind its item. `capture` is
+    /// the `while` capture name when this input drives the loop; without one
+    /// the item is pulled from the top of the body instead, and an input that
+    /// runs dry breaks the loop — which is how a multi-input Zig `for` stops
+    /// at its shortest input.
+    fn appendRuntimeIteratorInput(
+        self: *Lowerer,
+        source: ir.exprs.NodeId,
+        pattern: ir.exprs.NodeId,
+        index: usize,
+        capture: ?[]const u8,
+        hoist: *std.ArrayListUnmanaged(ast.Stmt),
+        items: *std.ArrayListUnmanaged(ast.Stmt),
+        scope_names: *std.ArrayListUnmanaged([]const u8),
+    ) anyerror!RuntimeIteratorInput {
+        if (try self.patternCapturesByReference(pattern)) {
+            return error.UnsupportedIteratorInput;
+        }
+        // The iterator has to be a value here: a `for` header spells a range
+        // as a statement, and a `var` initializer has to be an expression.
+        const value = try self.lowerMemoryReceiver(source, try self.allocExpr(try self.lowerExpr(source)));
+        const binding = try self.iteratorTemporaryName(
+            try std.fmt.allocPrint(self.alloc, "__r2z_iter_{d}", .{index}),
+        );
+        try hoist.append(self.alloc, .{ .let_stmt = .{
+            .name = binding,
+            .init = value.*,
+            .is_mut = true,
+        } });
+        const step = try self.allocExpr(.{ .call = .{
+            .callee = try self.allocExpr(.{ .field_access = .{
+                .target = try self.allocExpr(.{ .ident = binding }),
+                .field_name = "next",
+            } }),
+            .args = &.{},
+        } });
+        try self.appendIteratorClosurePatternNames(pattern, scope_names);
+
+        if (capture) |capture_name| {
+            try self.appendIteratorClosureBindings(pattern, .{ .ident = capture_name }, items);
+            return .{ .binding = binding, .step = step, .capture = capture_name };
+        }
+
+        // `const item = iter.next();` / `if (item == null) break;` /
+        // `const <pattern> = r2z.option.unwrap(item);`
+        const pending = try self.iteratorTemporaryName(
+            try std.fmt.allocPrint(self.alloc, "__r2z_pending_{d}", .{index}),
+        );
+        try items.append(self.alloc, .{ .let_stmt = .{
+            .name = pending,
+            .init = step.*,
+        } });
+        const is_null = try self.allocExpr(.{ .bin_op = .{
+            .op = .equal,
+            .lhs = try self.allocExpr(.{ .ident = pending }),
+            .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+        } });
+        const break_stmts = try self.alloc.alloc(ast.Stmt, 1);
+        break_stmts[0] = .{ .expr_stmt = try self.allocExpr(.{ .break_expr = null }) };
+        try items.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .if_expr = .{
+            .cond = is_null,
+            .then_body = try self.allocExpr(.{ .block = .{ .stmts = break_stmts } }),
+        } }) });
+        try self.markRuntimeImport();
+        const unwrap_args = try self.alloc.alloc(ast.Expr, 1);
+        unwrap_args[0] = .{ .ident = pending };
+        const unwrapped = try self.allocExpr(.{ .call = .{
+            .callee = try self.allocExpr(.{ .ident = "r2z.option.unwrap" }),
+            .args = unwrap_args,
+        } });
+        try self.appendIteratorClosureBindings(pattern, unwrapped.*, items);
+        return .{ .binding = binding, .step = step, .capture = null };
+    }
+
+    /// Build the loop that walks a set of runtime iterators. A plain input
+    /// keeps the Zig `for` and preserves its by-reference captures; the first
+    /// iterator with no plain sibling drives a `while` instead.
+    fn lowerRuntimeIteratorFor(
+        self: *Lowerer,
+        runtime_inputs: []const RuntimeIteratorInput,
+        plain_inputs: []const ast.Expr,
+        plain_captures: []const ast.Capture,
+        body: ast.Block,
+    ) anyerror!ast.Expr {
+        // Exactly one input drives the loop: the first runtime iterator when
+        // there is no plain input to walk, and otherwise the Zig `for`.
+        if (runtime_inputs.len > 0 and runtime_inputs[0].capture != null) {
+            if (plain_inputs.len != 0) return error.InvalidIteratorInput;
+            for (runtime_inputs[1..]) |other| {
+                if (other.capture != null) return error.InvalidIteratorInput;
+            }
+            const captures = try self.alloc.alloc([]const u8, 1);
+            captures[0] = runtime_inputs[0].capture.?;
+            return .{ .while_expr = .{
+                .cond = runtime_inputs[0].step,
+                .captures = captures,
+                .body = body,
+            } };
+        }
+        for (runtime_inputs) |other| {
+            if (other.capture != null) return error.InvalidIteratorInput;
+        }
+        if (plain_inputs.len == 0) return error.MissingLoopInput;
+        return .{ .for_expr = .{
+            .inputs = plain_inputs,
+            .captures = plain_captures,
+            .body = body,
+        } };
     }
 
     fn appendIteratorClosureScope(
@@ -5308,8 +6071,13 @@ const Lowerer = struct {
                 self.current_callable_is_allocating = stable_callable_effect;
                 defer self.current_callable_is_allocating = previous_callable_effect;
                 callable_is_allocating = stable_callable_effect;
-                allocator_param_index = fb.generic_params.len;
+                // A module-hoisted method declares the impl's own type
+                // parameters first: the method's own parameters and its
+                // receiver may all name them.
+                const impl_generic_params = self.hoisted_impl_generic_params;
+                allocator_param_index = impl_generic_params.len + fb.generic_params.len;
                 has_allocator_param = stable_callable_effect;
+                try self.appendFunctionGenericParams(impl_generic_params, &params_list);
                 try self.appendFunctionGenericParams(fb.generic_params, &params_list);
                 if (stable_callable_effect) {
                     try params_list.append(self.alloc, .{
@@ -5360,7 +6128,12 @@ const Lowerer = struct {
                 // concrete type from the tail expression so the emitted fn
                 // carries a real `ret_type` (e.g. `origin() -> Point`,
                 // `area(s) -> f64`).
-                const effective_ret = if (fb.ret == .prim and fb.ret.prim == .unit)
+                // A declared `-> ()` and a declared `impl Trait` that the
+                // frontend could not resolve to a concrete type are the same
+                // situation: the signature names no type, so the tail decides.
+                const ret_needs_tail = (fb.ret == .prim and fb.ret.prim == .unit) or
+                    (fb.ret == .@"opaque" and fb.ret.@"opaque".concrete == null);
+                const effective_ret = if (ret_needs_tail)
                     if (try self.inferTailReturnType(fb.body)) |t| t else fb.ret
                 else
                     fb.ret;
@@ -5606,7 +6379,21 @@ const Lowerer = struct {
                 .float => .{ .prim = .f64 },
                 .boolean => .{ .prim = .bool },
                 .character => .{ .prim = .char },
-                else => null,
+                // Rust types both literals for us: `"..."` is `&'static str`
+                // and `b"..."` is `&'static [u8; N]`. Without these the
+                // frontend leaves the node untyped, and a generic callee's
+                // type parameter can then never be bound from the argument.
+                .string => .{ .slice = (try self.sliceU8Alloc()) orelse return null },
+                .byte_array => |bytes| blk: {
+                    const array = try self.alloc.create(ir.types.Array);
+                    array.* = .{
+                        .elem = .{ .prim = .u8 },
+                        .len = .{ .literal = bytes.items.len },
+                    };
+                    const reference = try self.alloc.create(ir.types.Ref);
+                    reference.* = .{ .mut = false, .pointee = .{ .array = array } };
+                    break :blk .{ .reference = reference };
+                },
             },
             .struct_lit => |sl| try self.namedFromDef(sl.def),
             .path => |pe| blk: {
@@ -6472,7 +7259,11 @@ const Lowerer = struct {
     fn concreteExprType(self: *Lowerer, expr_id: ir.exprs.NodeId) ?ir.types.Type {
         if (expr_id >= self.ir.bodies.exprs.len) return null;
         const expr = self.ir.bodies.exprs[expr_id];
-        const type_id = expr.ty orelse return null;
+        // Fall back to the lowerer's own resolver for nodes the frontend left
+        // untyped. A string or byte-array literal has no `ty` but a perfectly
+        // well-known Rust type, and generic inference needs that type to bind
+        // a callee's parameter.
+        const type_id = expr.ty orelse return self.exprType(expr_id) catch null;
         if (type_id < self.ir.types.len) return self.ir.types[type_id];
         if (type_id < self.ir.bodies.types.len) return self.ir.bodies.types[type_id];
         return null;
@@ -6544,6 +7335,9 @@ const Lowerer = struct {
             switch (self.ir.bodies.bodies[def]) {
                 .fn_ => |fb| return fb.generic_params.len,
                 .struct_ => |sb| return sb.generic_params.len,
+                // A bare path naming an enum is a variant construction, and a
+                // generic enum applies its parameters at that path.
+                .enum_ => |eb| return eb.generic_params.len,
                 else => {},
             }
         }
@@ -6575,6 +7369,101 @@ const Lowerer = struct {
                 return self.inferGenericArgs(names, field_types, arg_ids);
             },
             else => return null,
+        }
+    }
+
+    /// Generic arguments recovered from the call's *result* position.
+    ///
+    /// A callee may mention a type parameter only in its return type — Rust's
+    /// `fn collect<T: FromIterator<_>>(..) -> T` is the canonical shape. No
+    /// argument carries that parameter, so argument unification cannot bind
+    /// it. Unifying the callee's declared return type against the return type
+    /// of the callable currently being lowered does bind it, and it binds it to
+    /// the caller's own type parameter, which is exactly what the emitted Zig
+    /// needs: inside a generic `fn encode_hex(comptime U: type)`, the call
+    /// becomes `encode_to_iter(U, ..)`.
+    fn inferredReturnArgs(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+    ) !?[]const ir.types.Type {
+        const names = self.genericParamsForDef(def) orelse return null;
+        if (def >= self.ir.bodies.bodies.len) return null;
+        const fn_body = switch (self.ir.bodies.bodies[def]) {
+            .fn_ => |fb| fb,
+            else => return null,
+        };
+        const callee_ret = fn_body.ret;
+
+        // The type this call site wants the call's value to have, strongest
+        // evidence first. The declared type of the parameter this call is
+        // passed as is exact, and it stays set for nested sub-expressions, so
+        // it also covers a generic call that only a method receiver sits on:
+        // `round(acc, get_chunk::<u32>(p).to_le())`. The enclosing callable's
+        // return type is the weaker fallback — it is only the right shape for
+        // a call in tail position. Both are tried, so every binding that
+        // already worked still works; this only adds bindings.
+        if (try self.bindReturnShape(callee_ret, names, self.expected_argument_type)) |bound| {
+            return bound;
+        }
+        return self.bindReturnShape(callee_ret, names, self.current_return_type);
+    }
+
+    /// Bind a callee's type parameters by unifying its declared return type
+    /// against the type its call site wants.
+    ///
+    /// A dereference in the source removes one borrow layer between the two:
+    /// `*f()` where `f()` is declared `-> &T` supplies `T`, not `&T`, to a
+    /// context that asked for `T`. `matchGenericType` compares borrows
+    /// structurally, so while the shapes disagree its `.reference` arm never
+    /// matches and the parameter stays unbound. Normalize the callee to the
+    /// requested shape rather than adding a second inference door for it.
+    ///
+    /// Only the callee is peeled, and only while it stays more borrowed than
+    /// the context, so a call whose shapes already agree keeps its declared
+    /// return type and its existing binding.
+    fn bindReturnShape(
+        self: *Lowerer,
+        callee_ret: ir.types.Type,
+        names: []const []const u8,
+        maybe_expected: ?ir.types.Type,
+    ) !?[]const ir.types.Type {
+        const expected = maybe_expected orelse return null;
+        var shaped = callee_ret;
+        while (referenceDepth(shaped) > referenceDepth(expected)) {
+            const borrowed = switch (shaped) {
+                .reference => |value| value,
+                else => break,
+            };
+            shaped = borrowed.pointee;
+        }
+
+        const slots = try self.alloc.alloc(?ir.types.Type, names.len);
+        defer self.alloc.free(slots);
+        for (slots) |*slot| slot.* = null;
+        matchGenericType(shaped, expected, names, slots);
+
+        for (slots) |slot| {
+            if (slot == null) return null;
+        }
+        const result = try self.alloc.alloc(ir.types.Type, names.len);
+        for (slots, 0..) |slot, index| result[index] = slot.?;
+        return result;
+    }
+
+    /// Borrow layers wrapping `ty`. A dereference is the only operation that
+    /// removes one, so this counts how many a context may have consumed
+    /// between a call and the value that call produced.
+    fn referenceDepth(ty: ir.types.Type) usize {
+        var depth: usize = 0;
+        var current = ty;
+        while (true) {
+            switch (current) {
+                .reference => |borrowed| {
+                    depth += 1;
+                    current = borrowed.pointee;
+                },
+                else => return depth,
+            }
         }
     }
 
@@ -6787,6 +7676,11 @@ const Lowerer = struct {
         if (try self.inferredMethodArgs(def, arg_ids)) |inferred| {
             return self.lowerGenericArgs(def, inferred);
         }
+        // Last door: the callee's type parameter may live only in its return
+        // type, in which case only the caller's own return type can supply it.
+        if (try self.inferredReturnArgs(def)) |inferred| {
+            return self.lowerGenericArgs(def, inferred);
+        }
         return self.lowerGenericArgs(def, null);
     }
     /// Lower a tuple-struct constructor as a typed struct literal. A
@@ -6849,6 +7743,60 @@ const Lowerer = struct {
         params[0] = try self.lowerType(ok);
         params[1] = try self.lowerType(err);
         return .{ .generic = .{ .name = "r2z.Result", .params = params } };
+    }
+
+    /// True when `ty` can be spelled as a Zig error set.
+    ///
+    /// A Zig error set is a finite list of payload-free names, so only a
+    /// fieldless `enum` qualifies. A data-carrying error enum
+    /// (`FromHexError::InvalidHexCharacter { c, index }`) cannot: an error
+    /// union would have to drop the payload, and the tagged `r2z.Result`
+    /// union keeps it. `ir.types.Result.is_error_unionable` records that the
+    /// frontend was asked to treat the error as a set, not that the shape
+    /// permits one.
+    fn errorTypeIsZigErrorSet(self: *const Lowerer, ty: ir.types.Type) bool {
+        const id = self.nominalEntityForType(ty) orelse return false;
+        if (id >= self.ir.bodies.bodies.len) return false;
+        const enum_body = switch (self.ir.bodies.bodies[id]) {
+            .enum_ => |body| body,
+            else => return false,
+        };
+        if (enum_body.variants.len == 0) return false;
+        for (enum_body.variants) |variant| {
+            if (variant.fields != .none) return false;
+        }
+        return true;
+    }
+
+    /// Entity behind a nominal type, looking through the indirections that
+    /// never change which type is named.
+    fn nominalEntityForType(_: *const Lowerer, ty: ir.types.Type) ?ir.spine.EntityId {
+        var current = ty;
+        for (0..32) |_| {
+            switch (current) {
+                .reference => |reference| current = reference.pointee,
+                .boxed => |boxed| current = boxed.*,
+                .@"opaque" => |opaque_type| current = (opaque_type.concrete orelse return null).*,
+                .generic_inst => |inst| return inst.decl,
+                else => break,
+            }
+        }
+        const path = switch (current) {
+            .path => |p| p,
+            else => return null,
+        };
+        const segment = lastPathSegment(path.segments) orelse return null;
+        return segment.id;
+    }
+
+    /// True when a `Result` type lowers to a Zig error union, which is the
+    /// representation `Ok`/`Err` constructors and `.unwrap()` must match.
+    fn resultUsesErrorUnion(self: *const Lowerer, ty: ir.types.Type) bool {
+        const result = switch (ty) {
+            .result => |r| r,
+            else => return false,
+        };
+        return result.is_error_unionable and self.errorTypeIsZigErrorSet(result.err);
     }
 
     const SyntheticExternalType = enum {
@@ -7127,6 +8075,33 @@ const Lowerer = struct {
             } };
         }
 
+        // `HashMap`/`HashSet` keep the `BuildHasher` the Rust source named.
+        // They must NOT become `std.AutoHashMap`: that would substitute
+        // Wyhash for the crate's own algorithm, which for the `fnv` crate
+        // silently deletes the only thing it provides. The builder argument
+        // is forwarded untouched and the r2z runtime builds a
+        // `std.hash_map` context from it.
+        //
+        // The builder parameter is required. A bare `HashMap<K, V>` means
+        // Rust's `RandomState`, which is seeded per process and has no
+        // static Zig equivalent, so it keeps rejecting.
+        if (isCollectionsMapPath(external.path)) {
+            if (external.args.len != 3) return error.GenericArgumentArityMismatch;
+            return self.lowerRuntimeGenericExternalType(
+                "r2z.collections.HashMap",
+                external.args,
+                3,
+            );
+        }
+        if (isCollectionsSetPath(external.path)) {
+            if (external.args.len != 2) return error.GenericArgumentArityMismatch;
+            return self.lowerRuntimeGenericExternalType(
+                "r2z.collections.HashSet",
+                external.args,
+                2,
+            );
+        }
+
         // Unknown external nominals have no faithful Zig equivalent here.
         // Do not emit a plausible-looking name or a null type.
         return error.UnsupportedExternalNominalType;
@@ -7168,16 +8143,30 @@ const Lowerer = struct {
                     .is_const = s.const_,
                 },
             },
+            // `&str` and `&[T]` are the borrow of a fat pointer, and Zig spells
+            // both as a slice. Emitting `*const []const T` instead is a
+            // pointer *to* the slice: it cannot borrow a `&[u8; N]`
+            // byte-string literal, and every `s[i]` then needs a manual
+            // dereference. `&[T; N]` stays a pointer to the array, which is
+            // what a byte-string literal already is.
             .reference => |r| if (ir.types.isStr(r.pointee)) ast.Type{
                 .slice = .{
                     .elem = try self.allocType(.{ .prim = .u8 }),
                     .is_const = !r.mut,
                 },
-            } else ast.Type{
-                .ptr = .{
-                    .elem = try self.allocType(try self.lowerType(r.pointee)),
-                    .is_const = !r.mut,
-                    .size = .one,
+            } else switch (r.pointee) {
+                .slice => |s| ast.Type{
+                    .slice = .{
+                        .elem = try self.allocType(try self.lowerType(s.elem)),
+                        .is_const = !r.mut,
+                    },
+                },
+                else => ast.Type{
+                    .ptr = .{
+                        .elem = try self.allocType(try self.lowerType(r.pointee)),
+                        .is_const = !r.mut,
+                        .size = .one,
+                    },
                 },
             },
             .raw_ptr => |r| ast.Type{
@@ -7217,7 +8206,7 @@ const Lowerer = struct {
                 .opt = try self.allocType(try self.lowerType(opt.*)),
             },
             .result => |r| blk: {
-                if (r.is_error_unionable) {
+                if (r.is_error_unionable and self.errorTypeIsZigErrorSet(r.err)) {
                     const payload_ty = try self.allocType(try self.lowerType(r.ok));
                     break :blk ast.Type{
                         .err_union = .{
@@ -7350,6 +8339,26 @@ const Lowerer = struct {
         return false;
     }
 
+    /// True when the declared type of `expr_id` is (or reference-wraps) a
+    /// slice.
+    fn receiverIsSlice(self: *const Lowerer, expr_id: ir.exprs.NodeId) bool {
+        if (expr_id >= self.ir.bodies.exprs.len) return false;
+        const e = self.ir.bodies.exprs[expr_id];
+        if (e.ty) |tid| {
+            if (tid < self.ir.bodies.types.len) {
+                var t = self.ir.bodies.types[tid];
+                while (true) {
+                    switch (t) {
+                        .slice => return true,
+                        .reference => |r| t = r.pointee,
+                        else => return false,
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     /// Grok the lowered receiver when it is a `&x` / `&mut x` unary-expression node,
     /// producing `x` for use as a by-value operand.
     fn lowerDeref(self: *Lowerer, recv_node: ir.exprs.NodeId, receiver: *const ast.Expr) anyerror!*const ast.Expr {
@@ -7397,6 +8406,27 @@ const Lowerer = struct {
                 };
                 switch (target.kind) {
                     .struct_, .enum_, .union_ => {},
+                    // A blanket `impl<T: Bound> Trait for T` has no concrete
+                    // self type: the frontend gives it the enclosing module
+                    // as its target, because the module is the scope the
+                    // impl's items actually belong to. Its methods still hoist
+                    // onto that module (see `collectHoistedMethods`), so the
+                    // emitted shape is a free function — the same shape a
+                    // method on a named type produces. Only the *self* type is
+                    // a type parameter rather than a declaration, and that is
+                    // the call site's business, not the topology's.
+                    //
+                    // This is deliberately narrow: the enclosing module must
+                    // actually BE the impl's parent, and a module that is not
+                    // a crate or root scope is still refused below, because a
+                    // stray module parent means the impl was never attached
+                    // to anything real.
+                    .module => {
+                        const module = self.moduleForEntity(target_id) orelse {
+                            return error.GenericDefinitionMismatch;
+                        };
+                        if (!module.is_crate) return error.GenericDefinitionMismatch;
+                    },
                     else => return error.GenericDefinitionMismatch,
                 }
             },
@@ -7410,6 +8440,56 @@ const Lowerer = struct {
                     std.mem.eql(u8, external.path[0], "std")) and
                 std.mem.eql(u8, external.path[1], "slice") and
                 std.mem.eql(u8, external.path[2], "ChunksExact"),
+            else => false,
+        };
+    }
+
+    /// Strip the indirections that do not change which Rust carrier a receiver
+    /// names: a borrow, a box, or an `impl Trait` with a known concrete type.
+    fn peelReceiverType(ty: ir.types.Type) ir.types.Type {
+        var current = ty;
+        for (0..128) |_| {
+            switch (current) {
+                .reference => |reference| current = reference.pointee,
+                .boxed => |boxed| current = boxed.*,
+                .@"opaque" => |opaque_type| current = (opaque_type.concrete orelse return current).*,
+                else => return current,
+            }
+        }
+        return current;
+    }
+
+    /// The `core::iter` adapters the runtime mirrors, each of which is a
+    /// single-argument generic over its source. `Zip` is the two-argument
+    /// exception and is handled alongside the others.
+    fn isRuntimeIteratorAdapterName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "StepBy") or
+            std.mem.eql(u8, name, "Skip") or
+            std.mem.eql(u8, name, "Enumerate") or
+            std.mem.eql(u8, name, "Rev");
+    }
+
+    /// True when `ty` is one of the Rust iterator carriers the runtime models
+    /// as an `r2z` iterator struct: a half-open `core::ops::Range` and the
+    /// `core::iter` adapters. Each of them is driven by `next` rather than by
+    /// a Zig `for`, and each adapter is built by a free function that takes
+    /// the source by value, so a method on one of them is that constructor.
+    fn isRuntimeIteratorCarrier(ty: ir.types.Type) bool {
+        return switch (ty) {
+            .external_nominal => |external| blk: {
+                if (external.path.len != 3) break :blk false;
+                if (!std.mem.eql(u8, external.path[0], "core") and
+                    !std.mem.eql(u8, external.path[0], "std")) break :blk false;
+                const is_range = std.mem.eql(u8, external.path[1], "ops") and
+                    std.mem.eql(u8, external.path[2], "Range");
+                const is_zip = std.mem.eql(u8, external.path[1], "iter") and
+                    std.mem.eql(u8, external.path[2], "Zip");
+                const is_adapter = std.mem.eql(u8, external.path[1], "iter") and
+                    isRuntimeIteratorAdapterName(external.path[2]);
+                if (!is_range and !is_zip and !is_adapter) break :blk false;
+                const arity: usize = if (is_zip) 2 else 1;
+                break :blk external.args.len == arity;
+            },
             else => false,
         };
     }
@@ -7477,6 +8557,8 @@ const Lowerer = struct {
         result_map_err,
         result_as_ref,
         result_as_mut,
+        /// `Result::unwrap` on a value already lowered to a Zig error union.
+        error_union_unwrap,
         memory_ptr_add,
         memory_ptr_sub,
         memory_ptr_offset,
@@ -7497,6 +8579,11 @@ const Lowerer = struct {
         slice_chunks_exact,
         slice_copy_from_slice,
         chunks_exact_remainder,
+
+        iterator_step_by,
+        iterator_skip,
+        iterator_zip,
+        iterator_collect,
         num_wrapping_add,
         num_wrapping_sub,
         num_wrapping_mul,
@@ -7516,6 +8603,7 @@ const Lowerer = struct {
         num_checked_mul,
         byte_is_ascii,
         format_write_str,
+        to_string,
 
         default,
         clone,
@@ -7580,6 +8668,13 @@ const Lowerer = struct {
             }
         }
 
+        // `ToString::to_string` is blanket-implemented for `T: Display`. The
+        // frontend proved the bound; re-deriving it here keeps the backend
+        // from emitting a runtime call for a receiver the resolver refuses.
+        if (std.mem.eql(u8, method_name, "to_string") and self.hasDisplayReceiver(cur_t)) {
+            return .to_string;
+        }
+
         switch (cur_t) {
             .option => {
                 if (std.mem.eql(u8, method_name, "is_some")) return .option_is_some;
@@ -7592,7 +8687,17 @@ const Lowerer = struct {
                 if (std.mem.eql(u8, method_name, "take")) return .option_take;
             },
             .result => |result| {
-                if (!result.is_error_unionable) {
+                // A `Result` lowers to a Zig error union only when its error
+                // type is a fieldless enum, which is the decision `lowerType`
+                // makes and `resultUsesErrorUnion` reads back. An error that
+                // carries a payload cannot be spelled as a Zig error set —
+                // a union would have to drop it — so the value is the tagged
+                // `r2z.Result`, which does carry the error value. Gating on
+                // `is_error_unionable` alone is therefore too coarse: it
+                // records what the frontend was ASKED to do, not what the
+                // shape permits, and it refuses every method below for a
+                // receiver that lowered to the tagged union.
+                if (!self.resultUsesErrorUnion(.{ .result = result })) {
                     if (std.mem.eql(u8, method_name, "is_ok")) return .result_is_ok;
                     if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
                     if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
@@ -7604,6 +8709,12 @@ const Lowerer = struct {
                     if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
                     if (std.mem.eql(u8, method_name, "as_ref")) return .result_as_ref;
                     if (std.mem.eql(u8, method_name, "as_mut")) return .result_as_mut;
+                } else if (self.errorTypeIsZigErrorSet(result.err) and
+                    std.mem.eql(u8, method_name, "unwrap"))
+                {
+                    // The receiver lowered to a Zig error union, so unwrapping
+                    // is propagating its error.
+                    return .error_union_unwrap;
                 }
             },
             .slice, .array => {
@@ -7692,6 +8803,12 @@ const Lowerer = struct {
                 if (isChunksExactType(cur_t) and std.mem.eql(u8, method_name, "remainder")) {
                     return .chunks_exact_remainder;
                 }
+                if (isRuntimeIteratorCarrier(cur_t)) {
+                    if (std.mem.eql(u8, method_name, "step_by")) return .iterator_step_by;
+                    if (std.mem.eql(u8, method_name, "skip")) return .iterator_skip;
+                    if (std.mem.eql(u8, method_name, "zip")) return .iterator_zip;
+                    if (std.mem.eql(u8, method_name, "collect")) return .iterator_collect;
+                }
             },
             .generic_inst => {
                 if (canonicalExternalMethodType(self, cur_t)) |synthetic_kind| {
@@ -7736,6 +8853,100 @@ const Lowerer = struct {
         if (std.mem.eql(u8, method_name, "default")) return .default;
         if (std.mem.eql(u8, method_name, "clone")) return .clone;
         return null;
+    }
+
+    /// The element type a `collect::<C>()` deposits, or null when the
+    /// turbofish does not name one.
+    ///
+    /// Rust writes the element down exactly once, as the `Item` of the
+    /// iterator's bound, and `collect::<Vec<_>>()` leaves the container's own
+    /// argument as an inference placeholder. Inference fills that placeholder
+    /// from the bound; when the bound declares no `Item` nothing stands in for
+    /// it and the placeholder survives. A placeholder is therefore not an
+    /// element type: admitting one would emit a `vec_collect` whose element
+    /// nothing in the program names.
+    ///
+    /// The receiver's own `Item` is deliberately not read here. It is the
+    /// same evidence, and reading it twice would give the two paths a chance
+    /// to disagree.
+    fn collectElementType(generic_args: []const ir.types.Type) ?ir.types.Type {
+        if (generic_args.len != 1) return null;
+        const external = switch (generic_args[0]) {
+            .external_nominal => |value| value,
+            else => return null,
+        };
+        if (external.args.len != 1) return null;
+        const element = external.args[0];
+        if (element == .external_nominal and element.external_nominal.path.len == 1 and
+            std.mem.eql(u8, element.external_nominal.path[0], "_"))
+        {
+            return null;
+        }
+        return element;
+    }
+
+    /// Whether the Zig backend can render `t` through a Rust `Display`
+    /// implementation. Mirrors the frontend's `hasGraphFreeDisplay` plus the
+    /// crate-local `impl Display for T` bound, because a runtime call must
+    /// never be emitted for a receiver the resolver would have refused.
+    fn hasDisplayReceiver(self: *const Lowerer, t: ir.types.Type) bool {
+        return switch (t) {
+            .prim => |primitive| switch (primitive) {
+                // `()`, `!`, and floats have no `r2z.format.writeValue` arm.
+                .unit, .never, .f32, .f64 => false,
+                else => true,
+            },
+            .external_nominal => |external| {
+                if (ir.types.isStr(t)) return true;
+                if (external.args.len == 0 and externalPathEqual(
+                    external.path,
+                    &.{ "alloc", "string", "String" },
+                )) return true;
+                if (externalPathEqual(external.path, &.{ "std", "string", "String" })) {
+                    return external.args.len == 0;
+                }
+                if (isCowPath(external.path) and external.args.len == 1 and
+                    ir.types.isStr(external.args[0])) return true;
+                return false;
+            },
+            // A crate-local nominal qualifies only when the crate declares the
+            // bound. `fmt` is required, not just `Display`: it is the decl
+            // `r2z.format.writeValue` looks for on the lowered type.
+            .path => |path| {
+                if (path.segments.len == 0) return false;
+                return self.declaresDisplayFmt(path.segments[path.segments.len - 1].name);
+            },
+            .generic_inst => |inst| {
+                const decl = self.ir.graph.symbol_table.get(inst.decl) orelse return false;
+                return self.declaresDisplayFmt(decl.name);
+            },
+            else => false,
+        };
+    }
+
+    /// Whether the crate declares `impl Display for <type_name>` carrying a
+    /// `fmt` member. `Debug` is never accepted: Rust declares only
+    /// `impl<T: Display + ?Sized> ToString for T`, so a `Debug`-only type
+    /// cannot call `.to_string()`.
+    fn declaresDisplayFmt(self: *const Lowerer, type_name: []const u8) bool {
+        if (type_name.len == 0) return false;
+        const entities = self.ir.graph.symbol_table.entities.items;
+        for (entities) |entity| {
+            if (entity.kind != .impl_) continue;
+            const separator = std.mem.indexOf(u8, entity.name, " for ") orelse continue;
+            if (!std.mem.eql(u8, entity.name[separator + 5 ..], type_name)) continue;
+            const trait_name = entity.name[0..separator];
+            // The impl header may spell the trait bare (`Display for T`) or
+            // path-qualified (`fmt::Display for T`); both name `Display`.
+            const colon = std.mem.lastIndexOf(u8, trait_name, "::");
+            const simple_trait = if (colon) |index| trait_name[index + 2 ..] else trait_name;
+            if (!std.mem.eql(u8, simple_trait, "Display")) continue;
+            for (entities) |child| {
+                if (child.kind == .fn_ and child.parent == entity.id and
+                    std.mem.eql(u8, child.name, "fmt")) return true;
+            }
+        }
+        return false;
     }
 
     fn lowerUnsupportedStdMethod(
@@ -8039,6 +9250,7 @@ const Lowerer = struct {
         receiver: *const ast.Expr,
         args: []const ast.Expr,
         argument_nodes: []const ir.exprs.NodeId,
+        turbofish: []const ir.types.Type,
     ) anyerror!?*const ast.Expr {
         const recognized_std_method = try self.lookupRecognizedStdMethod(receiver_node, method_name);
         const is_option_as_ref = if (recognized_std_method) |method|
@@ -8227,6 +9439,49 @@ const Lowerer = struct {
                         .args = builtin_args,
                     } });
                 },
+                .iterator_step_by,
+                .iterator_skip,
+                .iterator_zip,
+                => {
+                    if (args.len != 1) return try self.lowerUnsupportedStdMethod(method_name);
+                    const runtime_name = switch (std_method) {
+                        .iterator_step_by => "r2z.stepBy",
+                        .iterator_skip => "r2z.skip",
+                        .iterator_zip => "r2z.zip",
+                        else => unreachable,
+                    };
+                    try self.markRuntimeImport();
+                    const call_args = try self.alloc.alloc(ast.Expr, 2);
+                    call_args[0] = (try self.lowerMemoryReceiver(receiver_node, receiver)).*;
+                    call_args[1] = args[0];
+                    return try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .ident = runtime_name }),
+                        .args = call_args,
+                    } });
+                },
+                .iterator_collect => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    const element = collectElementType(turbofish) orelse
+                        return try self.lowerUnsupportedStdMethod(method_name);
+                    try self.markRuntimeImport();
+                    const generic_types = try self.alloc.alloc(ast.Type, 1);
+                    generic_types[0] = try self.lowerType(element);
+                    const call_args = try self.alloc.alloc(ast.Expr, 2);
+                    call_args[0] = .{ .ident = "allocator" };
+                    call_args[1] = (try self.lowerMemoryReceiver(receiver_node, receiver)).*;
+                    // The owned vector is built with the allocator the call
+                    // site already owns, so the enclosing callable declares
+                    // one and the fallible append propagates with `try`.
+                    self.current_callable_is_allocating = true;
+                    return try self.allocExpr(.{ .unary_op = .{
+                        .op = .try_op,
+                        .operand = try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{ .ident = "r2z.alloc.vec_collect" }),
+                            .generic_args = generic_types,
+                            .args = call_args,
+                        } }),
+                    } });
+                },
                 .option_is_some => {
                     if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
                     const null_value = try self.allocExpr(ast.Expr{ .lit = .null_lit });
@@ -8292,6 +9547,13 @@ const Lowerer = struct {
                     args,
                 ),
                 .result_unwrap_or => return try self.lowerUnsupportedStdMethod(method_name),
+                .error_union_unwrap => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    return try self.allocExpr(.{ .unary_op = .{
+                        .op = .try_op,
+                        .operand = receiver,
+                    } });
+                },
                 .num_rotate_left,
                 .num_rotate_right,
                 .num_to_le,
@@ -8333,6 +9595,29 @@ const Lowerer = struct {
                     return try self.allocExpr(ast.Expr{
                         .builtin = .{ .name = "popCount", .args = builtin_args },
                     });
+                },
+                .to_string => {
+                    if (args.len != 0) return error.UnsupportedStandardMethod;
+                    // The receiver is handed to the same `Display::fmt`
+                    // writer the `format!` route drives, and the result is
+                    // owned storage. The allocator leads the argument list
+                    // exactly as it does for every other allocating runtime
+                    // call, and its presence forces the enclosing callable to
+                    // declare one.
+                    const call_args = try self.alloc.alloc(ast.Expr, 2);
+                    call_args[0] = .{ .ident = "allocator" };
+                    call_args[1] = receiver.*;
+                    try self.markRuntimeImport();
+                    self.current_callable_is_allocating = true;
+                    return self.allocExpr(.{ .unary_op = .{
+                        .op = .try_op,
+                        .operand = try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{
+                                .ident = "r2z.format.toString",
+                            }),
+                            .args = call_args,
+                        } }),
+                    } });
                 },
                 else => {},
             }
@@ -8533,39 +9818,26 @@ const Lowerer = struct {
             else => false,
         };
     }
-    const ScalarPointeeLayout = enum {
-        byte_1,
-        byte_2,
-        byte_4,
-        byte_8,
-        byte_16,
-        pointer,
-    };
-
-    fn scalarPointeeLayout(primitive: ir.types.Prim) ?ScalarPointeeLayout {
-        return switch (primitive) {
-            .i8, .u8, .bool => .byte_1,
-            .i16, .u16 => .byte_2,
-            .i32, .u32, .f32, .char => .byte_4,
-            .i64, .u64, .f64 => .byte_8,
-            .i128, .u128 => .byte_16,
-            .isize, .usize => .pointer,
-            .unit, .never => null,
+    /// A raw-pointer cast reinterprets one address under a different pointee;
+    /// it never allocates or narrows. Every raw pointer lowers to
+    /// `[*]align(1) T` (see `lowerType`), so neither side can raise alignment
+    /// and `@ptrCast` stays legal at any pointee width — a `u32` chunk read
+    /// from a `u8` byte cursor, or a `u8` slice read as the generic `T`, are
+    /// both well-formed.
+    ///
+    /// The one combination Zig refuses is a change of pointer *width*: a
+    /// pointer to an unsized type is fat, and a thin pointer cannot
+    /// `@ptrCast` into one.
+    fn pointerPointeeIsSized(ty: ir.types.Type) bool {
+        if (ir.types.isStr(ty)) return false;
+        return switch (ty) {
+            .slice, .dyn_trait => false,
+            else => true,
         };
     }
 
     fn pointerPointeesCompatible(source: ir.types.Type, target: ir.types.Type) bool {
-        return switch (source) {
-            .prim => |source_primitive| switch (target) {
-                .prim => |target_primitive| {
-                    const source_layout = scalarPointeeLayout(source_primitive) orelse return false;
-                    const target_layout = scalarPointeeLayout(target_primitive) orelse return false;
-                    return source_layout == target_layout;
-                },
-                else => false,
-            },
-            else => false,
-        };
+        return pointerPointeeIsSized(source) and pointerPointeeIsSized(target);
     }
     fn unsignedPrimitiveWidth(primitive: ir.types.Prim) ?u16 {
         return switch (primitive) {
@@ -8788,7 +10060,37 @@ const Lowerer = struct {
         return error.MissingTypeId;
     }
 
+    /// Lower a Rust range used as a value. A Zig range is a statement rather
+    /// than an expression, so it cannot be a receiver, an argument or a
+    /// binding; the runtime's `r2z.Range` struct is the value form.
     fn lowerRangeExpr(
+        self: *Lowerer,
+        range: ir.exprs.RangeExpr,
+    ) anyerror!ast.Expr {
+        const end_id = range.end orelse return error.UnsupportedExpression;
+        const start = try self.allocExpr(try self.lowerExpr(range.start));
+        const lowered_end = try self.lowerExpr(end_id);
+        const end: ast.Expr = if (!range.inclusive)
+            lowered_end
+        else
+            .{ .bin_op = .{
+                .op = .add,
+                .lhs = try self.allocExpr(lowered_end),
+                .rhs = try self.allocExpr(.{ .lit = .{ .int = 1 } }),
+            } };
+        try self.markRuntimeImport();
+        const fields = try self.alloc.alloc(ast.StructInitField, 2);
+        fields[0] = .{ .name = "start", .expr = start.* };
+        fields[1] = .{ .name = "end", .expr = end };
+        return .{ .struct_init = .{
+            .type_name = .{ .named = "r2z.Range" },
+            .fields = fields,
+        } };
+    }
+
+    /// Lower a Rust range in a statement position, where Zig wants the bare
+    /// `start..end` form: a slice index, or the input of a `for` loop.
+    fn lowerRangeSliceExpr(
         self: *Lowerer,
         range: ir.exprs.RangeExpr,
         allow_open: bool,
@@ -9086,6 +10388,227 @@ const Lowerer = struct {
         return .{ .block = block };
     }
 
+    /// Return the inline closure carried by `arg_id`, if any.
+    fn inlineClosureArgument(
+        self: *const Lowerer,
+        arg_id: ir.exprs.NodeId,
+    ) ?ir.exprs.ClosureExpr {
+        if (arg_id >= self.ir.bodies.exprs.len) return null;
+        return switch (self.ir.bodies.exprs[arg_id].kind) {
+            .closure => |closure| closure,
+            else => null,
+        };
+    }
+
+    /// Expand `Option::map`/`and_then` and `Result::map`/`map_err` whose
+    /// mapper is an inline closure into an explicit `switch` over the receiver.
+    ///
+    /// This AST has no first-class closure: `r2z.option.map`/`and_then` and the
+    /// `r2z.Result` methods forward their mapper to `invokeMapper`, which only
+    /// accepts a `fn` or a struct exposing `call`, and neither a callable struct
+    /// literal nor an `if` with a payload capture is representable. Expanding
+    /// the combinator textually at the call site — the same trick
+    /// `lowerLocalClosureCall` uses for let-bound closures — keeps the closure
+    /// body's captures lexically in scope and mirrors `.iterator_chain`, which
+    /// likewise replaces closure-taking adapters with explicit control flow.
+    fn lowerInlineClosureCombinator(
+        self: *Lowerer,
+        method: RecognizedStdMethod,
+        receiver_node: ir.exprs.NodeId,
+        receiver: *const ast.Expr,
+        closure: ir.exprs.ClosureExpr,
+    ) anyerror!ast.Expr {
+        if (closure.params.len != 1) return error.UnsupportedExpression;
+        const value = try self.lowerMemoryReceiver(receiver_node, receiver);
+
+        var previous_overrides = self.active_closure_capture_overrides;
+        self.active_closure_capture_overrides = .empty;
+        defer {
+            self.active_closure_capture_overrides.deinit(self.alloc);
+            self.active_closure_capture_overrides = previous_overrides;
+        }
+        var previous_iterator = previous_overrides.iterator();
+        while (previous_iterator.next()) |entry| {
+            try self.active_closure_capture_overrides.put(
+                self.alloc,
+                entry.key_ptr.*,
+                entry.value_ptr.*,
+            );
+        }
+
+        // By-value captures are copied where the closure would have been
+        // created, i.e. before the receiver is inspected. Reference captures
+        // keep reading the outer binding directly, matching the policy in
+        // `registerLocalClosureStatement`.
+        var prologue: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer prologue.deinit(self.alloc);
+        for (closure.captures) |capture| {
+            if (capture.mode != .by_value) continue;
+            const source_name = self.active_closure_capture_overrides.get(capture.name) orelse
+                self.currentClosureBindingName(capture.name);
+            const snapshot_name = try self.iteratorTemporaryName(try std.fmt.allocPrint(
+                self.alloc,
+                "__r2z_capture_inline_{d}_{s}",
+                .{ receiver_node, capture.name },
+            ));
+            if (self.current_owner_reserved) |reserved| {
+                try reserved.append(self.alloc, snapshot_name);
+            }
+            try prologue.append(self.alloc, .{ .let_stmt = .{
+                .name = snapshot_name,
+                .init = .{ .ident = try self.alloc.dupe(u8, source_name) },
+                .is_mut = closure.trait == .fn_mut,
+            } });
+            try self.active_closure_capture_overrides.put(
+                self.alloc,
+                capture.name,
+                snapshot_name,
+            );
+        }
+
+        const body = try self.lowerIteratorClosureBody(closure);
+        const param_name = try self.patternName(closure.params[0]);
+        const payload_name = try self.iteratorTemporaryName(try std.fmt.allocPrint(
+            self.alloc,
+            "__r2z_in_{s}",
+            .{param_name},
+        ));
+
+        const expanded: ast.Expr = switch (method) {
+            .option_map, .option_and_then => blk: {
+                const mapped = try self.lowerInlineClosureBody(closure.params[0], payload_name, body);
+                const arms = try self.alloc.alloc(ast.MatchArm, 2);
+                const null_pattern: ast.Pattern = .{ .lit = .null_lit };
+                arms[0] = .{
+                    .patterns = &.{null_pattern},
+                    .body = .{ .lit = .null_lit },
+                };
+                arms[1] = .{
+                    .patterns = &.{.wildcard},
+                    .capture = .{ .name = payload_name },
+                    .body = mapped,
+                };
+                break :blk .{ .match_expr = .{
+                    .target = value,
+                    .arms = arms,
+                } };
+            },
+            .result_map, .result_map_err => blk: {
+                const maps_ok = method == .result_map;
+                const mapped_tag = if (maps_ok) "Ok" else "Err";
+                const passthrough_tag = if (maps_ok) "Err" else "Ok";
+                const mapped_pattern: ast.Pattern = .{ .enum_literal = mapped_tag };
+                const passthrough_pattern: ast.Pattern = .{ .enum_literal = passthrough_tag };
+                const error_payload = try self.iteratorTemporaryName(try std.fmt.allocPrint(
+                    self.alloc,
+                    "__r2z_in_{s}_err",
+                    .{param_name},
+                ));
+                const mapped_payload = if (maps_ok) payload_name else error_payload;
+                const passthrough_payload = if (maps_ok) error_payload else payload_name;
+                const mapped = try self.lowerInlineClosureBody(
+                    closure.params[0],
+                    mapped_payload,
+                    body,
+                );
+                // A `Result` payload has to be re-wrapped, and a `struct_init`
+                // with fields but no type name is not a valid AST node, so the
+                // mapped combinator's own `r2z.Result(..)` type is recomputed
+                // from the receiver and the closure's return type.
+                const result_info = (try self.taggedResultType(receiver_node)) orelse
+                    return error.UnsupportedStandardMethod;
+                const mapped_ty = if (closure.return_ty) |return_ty|
+                    try self.typeById(return_ty)
+                else if (maps_ok) result_info.ok else result_info.err;
+                const rebuilt = try self.alloc.create(ir.types.Result);
+                rebuilt.* = .{
+                    .ok = if (maps_ok) mapped_ty else result_info.ok,
+                    .err = if (maps_ok) result_info.err else mapped_ty,
+                    .is_error_unionable = false,
+                };
+                const passthrough_fields = try self.alloc.alloc(ast.StructInitField, 1);
+                passthrough_fields[0] = .{
+                    .name = passthrough_tag,
+                    .expr = .{ .ident = passthrough_payload },
+                };
+                const arms = try self.alloc.alloc(ast.MatchArm, 2);
+                arms[0] = .{
+                    .patterns = &.{mapped_pattern},
+                    .capture = .{ .name = mapped_payload },
+                    .body = mapped,
+                };
+                arms[1] = .{
+                    .patterns = &.{passthrough_pattern},
+                    .capture = .{ .name = passthrough_payload },
+                    .body = .{ .struct_init = .{
+                        .type_name = try self.lowerType(.{ .result = rebuilt }),
+                        .fields = passthrough_fields,
+                    } },
+                };
+                break :blk .{ .match_expr = .{
+                    .target = value,
+                    .arms = arms,
+                } };
+            },
+            else => return error.UnsupportedStandardMethod,
+        };
+        if (prologue.items.len == 0) return expanded;
+        return .{ .block = .{
+            .stmts = try prologue.toOwnedSlice(self.alloc),
+            .expr = try self.allocExpr(expanded),
+        } };
+    }
+
+    /// Bind the combinator's captured payload to its Rust parameter name and
+    /// re-derive the closure body as a self-contained block, so the body can
+    /// be spliced into a switch prong.
+    fn lowerInlineClosureBody(
+        self: *Lowerer,
+        param: ir.exprs.NodeId,
+        payload_name: []const u8,
+        body: ast.Expr,
+    ) anyerror!ast.Expr {
+        var statements: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer statements.deinit(self.alloc);
+        try self.appendIteratorClosureBindings(
+            param,
+            .{ .ident = payload_name },
+            &statements,
+        );
+        const scoped_statements = try statements.toOwnedSlice(self.alloc);
+        const block: ast.Block = .{
+            .stmts = scoped_statements,
+            .expr = try self.allocExpr(body),
+        };
+        for (scoped_statements) |*statement| {
+            if (statement.* == .let_stmt and statement.let_stmt.is_mut) {
+                statement.let_stmt.is_mut = try astMutatesBinding(block, statement.let_stmt.name, 0);
+            }
+        }
+        return .{ .block = block };
+    }
+
+    /// The `Result` payload behind a pointer-like receiver, or null when the
+    /// receiver is not a `Result`.
+    fn taggedResultType(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+    ) anyerror!?ir.types.Result {
+        var current = try self.exprType(receiver_node) orelse return null;
+        for (0..128) |_| {
+            switch (current) {
+                .reference => |reference| current = reference.pointee,
+                .boxed => |boxed| current = boxed.*,
+                .@"opaque" => |opaque_type| {
+                    current = (opaque_type.concrete orelse return null).*;
+                },
+                .result => |result| return result.*,
+                else => return null,
+            }
+        }
+        return null;
+    }
+
     fn lowerOptionalMatchArm(
         self: *Lowerer,
         patterns: []ast.Pattern,
@@ -9153,10 +10676,43 @@ const Lowerer = struct {
                 .float => |fl| ast.Expr{ .lit = .{ .float = fl.value } },
                 .character => |cl| ast.Expr{ .lit = .{ .char_lit = @intCast(cl.value) } },
                 .string => |sl| ast.Expr{ .lit = .{ .str = try self.alloc.dupe(u8, sl.bytes) } },
-                .byte_array => |ba| ast.Expr{ .lit = .{ .str = try self.alloc.dupe(u8, ba.items) } },
+                // A Zig string literal is a `*const [N:0]u8`, so a byte string
+                // that stands for a `[u8; N]` value has to be spelled as an
+                // array initializer. A byte string standing for a slice keeps
+                // the literal form, which is what a `&[u8; N]` argument wants.
+                .byte_array => |ba| blk_bytes: {
+                    const elem_ast: ?ast.Type = blk_elem: {
+                        const type_id = ir_expr.ty orelse break :blk_elem null;
+                        break :blk_elem switch (try self.typeById(type_id)) {
+                            .array => |array| try self.lowerType(array.elem),
+                            else => null,
+                        };
+                    };
+                    const literal = ast.Expr{ .lit = .{ .str = try self.alloc.dupe(u8, ba.items) } };
+                    const elem_type = elem_ast orelse break :blk_bytes literal;
+                    const items = try self.alloc.alloc(ast.Expr, ba.items.len);
+                    for (ba.items, 0..) |byte, i| items[i] = ast.Expr{ .lit = .{ .int = byte } };
+                    break :blk_bytes ast.Expr{ .multi_array = .{
+                        .type_name = elem_type,
+                        .elements = items,
+                    } };
+                },
                 .boolean => |b| ast.Expr{ .lit = .{ .bool_lit = b } },
             },
             .array => |a| blk: {
+                // A Rust tuple expression reaches the backend as an array
+                // node carrying a tuple type. Zig spells that value
+                // `.{ a, b }`; `[_]struct { A, B }{ a, b }` would be an
+                // array of tuples, which is a different value entirely.
+                if (a.repeat == null) {
+                    if (ir_expr.ty) |tid| {
+                        if (try self.typeById(tid) == .tuple) {
+                            var items = try self.alloc.alloc(ast.Expr, a.elements.len);
+                            for (a.elements, 0..) |el, i| items[i] = try self.lowerExpr(el);
+                            break :blk ast.Expr{ .tuple = items };
+                        }
+                    }
+                }
                 const elem_ast: ?ast.Type = if (ir_expr.ty) |tid| blk_type: {
                     const literal_type = try self.typeById(tid);
                     break :blk_type try self.lowerType(switch (literal_type) {
@@ -9238,10 +10794,7 @@ const Lowerer = struct {
                     if (arm.patterns.len > self.ir.bodies.pats.len) {
                         return error.MissingPatternNode;
                     }
-                    var lowered_patterns = try self.alloc.alloc(ast.Pattern, arm.patterns.len);
-                    for (arm.patterns, 0..) |p_id, j| {
-                        lowered_patterns[j] = try self.lowerPattern(p_id);
-                    }
+                    const lowered_patterns = try self.lowerArmPatterns(arm.patterns);
                     const capture = try self.referenceMatchCapture(arm.patterns);
                     if (option_name != null and capture != null) return error.UnsupportedPattern;
                     if (capture != null) {
@@ -9331,12 +10884,35 @@ const Lowerer = struct {
                 defer captures_list.deinit(self.alloc);
                 var destructure: std.ArrayListUnmanaged(ast.Stmt) = .empty;
                 defer destructure.deinit(self.alloc);
+                var iterator_hoist: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+                defer iterator_hoist.deinit(self.alloc);
+                var iterator_items: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+                defer iterator_items.deinit(self.alloc);
+                var iterator_scope_names: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer iterator_scope_names.deinit(self.alloc);
+                var runtime_inputs: std.ArrayListUnmanaged(RuntimeIteratorInput) = .empty;
+                defer runtime_inputs.deinit(self.alloc);
                 var value_capture_name: ?[]const u8 = null;
                 if (fe.pattern >= self.ir.bodies.pats.len) return error.MissingPatternNode;
 
                 switch (fe.iter_kind) {
-                    .slice => {
+                    .slice => slice_input: {
                         value_capture_name = try self.valueCaptureName(fe.pattern);
+                        if (try self.isRuntimeIteratorInput(fe.iterable)) {
+                            // A runtime iterator is a struct, not something a
+                            // Zig `for` can walk; with no sibling input it
+                            // drives the loop as a `while` over its `next`.
+                            try runtime_inputs.append(self.alloc, try self.appendRuntimeIteratorInput(
+                                fe.iterable,
+                                fe.pattern,
+                                0,
+                                try self.iteratorTemporaryName("__r2z_item"),
+                                &iterator_hoist,
+                                &iterator_items,
+                                &iterator_scope_names,
+                            ));
+                            break :slice_input;
+                        }
                         const iterable = try self.lowerForInput(fe.iterable, try self.patternCapturesByReference(fe.pattern));
                         const iterable_ty = try self.exprType(fe.iterable);
                         const exact_type = if (iterable_ty) |value|
@@ -9413,10 +10989,46 @@ const Lowerer = struct {
                             else => return error.InvalidLoopCapture,
                         };
                         if (tuple.elements.len != ids.len) return error.LoopCaptureArityMismatch;
+                        // A runtime iterator cannot sit in a Zig `for` header, so
+                        // plain inputs keep the loop — preserving their
+                        // by-reference captures — and each iterator is hoisted
+                        // and pulled with `next`. Without a plain input there
+                        // is nothing to drive the loop, so the first iterator
+                        // drives a `while` over its own `next` instead.
+                        var has_plain_input = false;
+                        for (ids) |mid| {
+                            if (!try self.isRuntimeIteratorInput(mid)) {
+                                has_plain_input = true;
+                                break;
+                            }
+                        }
                         for (ids, 0..) |mid, mi| {
-                            try inputs.append(self.alloc, try self.lowerForInput(mid, try self.patternCapturesByReference(tuple.elements[mi])));
+                            const element = tuple.elements[mi];
+                            if (try self.isRuntimeIteratorInput(mid)) {
+                                const driver: ?[]const u8 = if (has_plain_input or runtime_inputs.items.len != 0)
+                                    null
+                                else
+                                    try self.iteratorTemporaryName("__r2z_item");
+                                try runtime_inputs.append(self.alloc, try self.appendRuntimeIteratorInput(
+                                    mid,
+                                    element,
+                                    mi,
+                                    driver,
+                                    &iterator_hoist,
+                                    &iterator_items,
+                                    &iterator_scope_names,
+                                ));
+                                continue;
+                            }
+                            // Rust `x.iter()` yields references. The pattern
+                            // may not carry a type to say so, so the source
+                            // itself decides, as it does for a chain.
+                            const by_ref = try self.patternCapturesByReference(element) or
+                                try self.iteratorSourceByReference(mid);
+                            try inputs.append(self.alloc, try self.lowerForInput(mid, by_ref));
                             try self.appendMultiCapture(
-                                tuple.elements[mi],
+                                element,
+                                by_ref,
                                 &captures_list,
                                 &destructure,
                             );
@@ -9431,13 +11043,18 @@ const Lowerer = struct {
 
                 const previous_capture_names = self.current_capture_names;
                 var capture_names: ?[][]const u8 = null;
-                if (captures_list.items.len > 0) {
+                // A runtime iterator binds its item with a `const` rather than
+                // a `for` capture, so those names reach a nested closure
+                // through the same scope list.
+                const scope_count = captures_list.items.len + iterator_scope_names.items.len;
+                if (scope_count > 0) {
                     const names = try self.alloc.alloc(
                         []const u8,
-                        previous_capture_names.len + captures_list.items.len,
+                        previous_capture_names.len + scope_count,
                     );
                     @memcpy(names[0..previous_capture_names.len], previous_capture_names);
                     for (captures_list.items, previous_capture_names.len..) |capture, index| names[index] = capture.name;
+                    for (iterator_scope_names.items, previous_capture_names.len + captures_list.items.len..) |name, index| names[index] = name;
                     capture_names = names;
                     self.current_capture_names = names;
                 }
@@ -9464,10 +11081,12 @@ const Lowerer = struct {
 
                 var body = try self.lowerBlock(fe.body);
 
-                if (destructure.items.len > 0) {
-                    const merged = try self.alloc.alloc(ast.Stmt, destructure.items.len + body.stmts.len);
-                    @memcpy(merged[0..destructure.items.len], destructure.items);
-                    @memcpy(merged[destructure.items.len..], body.stmts);
+                const prologue = destructure.items.len + iterator_items.items.len;
+                if (prologue > 0) {
+                    const merged = try self.alloc.alloc(ast.Stmt, prologue + body.stmts.len);
+                    @memcpy(merged[0..iterator_items.items.len], iterator_items.items);
+                    @memcpy(merged[iterator_items.items.len..][0..destructure.items.len], destructure.items);
+                    @memcpy(merged[prologue..], body.stmts);
                     body.stmts = merged;
                 }
 
@@ -9476,13 +11095,26 @@ const Lowerer = struct {
                 const captures = try captures_list.toOwnedSlice(self.alloc);
                 errdefer self.alloc.free(captures);
 
-                break :blk ast.Expr{
-                    .for_expr = .{
-                        .inputs = for_inputs,
-                        .captures = captures,
-                        .body = body,
-                    },
-                };
+                if (runtime_inputs.items.len == 0) {
+                    break :blk ast.Expr{
+                        .for_expr = .{
+                            .inputs = for_inputs,
+                            .captures = captures,
+                            .body = body,
+                        },
+                    };
+                }
+                const loop = try self.lowerRuntimeIteratorFor(
+                    runtime_inputs.items,
+                    for_inputs,
+                    captures,
+                    body,
+                );
+                if (iterator_hoist.items.len == 0) break :blk loop;
+                const stmts = try self.alloc.alloc(ast.Stmt, iterator_hoist.items.len + 1);
+                @memcpy(stmts[0..iterator_hoist.items.len], iterator_hoist.items);
+                stmts[iterator_hoist.items.len] = .{ .expr_stmt = try self.allocExpr(loop) };
+                break :blk ast.Expr{ .block = .{ .stmts = stmts } };
             },
             .break_ => |be| blk: {
                 const val = if (be.value) |v| try self.allocExpr(try self.lowerExpr(v)) else null;
@@ -9521,7 +11153,10 @@ const Lowerer = struct {
                     if (c.args.len >= 1) {
                         const recv_ast = try self.lowerExpr(c.args[0]);
                         const recv_ptr = try self.allocExpr(recv_ast);
-                        if (try self.lowerStdMethodCall(callee_name, c.args[0], recv_ptr, &.{}, &.{})) |lowered| {
+                        // An associated call carries no turbofish of its own, so
+                        // a method that needs one (`collect`) refuses here
+                        // rather than guessing an element type.
+                        if (try self.lowerStdMethodCall(callee_name, c.args[0], recv_ptr, &.{}, &.{}, &.{})) |lowered| {
                             break :blk try self.lowerDirectCallResult(
                                 expr_id,
                                 lowered.*,
@@ -9651,6 +11286,32 @@ const Lowerer = struct {
                     self.current_owner_reserved = previous_owner_reserved;
                 }
 
+                // An inline closure argument cannot be lowered on its own, so
+                // the closure-taking combinators are expanded whole before the
+                // argument loop reaches the bare `.closure` node. Arguments
+                // that are not closures keep the runtime-call path below.
+                if (method_entity.kind == .method_ref and mc.args.len == 1) {
+                    if (try self.lookupRecognizedStdMethod(mc.receiver, method_name)) |recognized| {
+                        switch (recognized) {
+                            .option_map, .option_and_then, .result_map, .result_map_err => {
+                                if (self.inlineClosureArgument(mc.args[0])) |closure| {
+                                    break :blk try self.lowerDirectCallResult(
+                                        expr_id,
+                                        try self.lowerInlineClosureCombinator(
+                                            recognized,
+                                            mc.receiver,
+                                            receiver,
+                                            closure,
+                                        ),
+                                        allocates,
+                                    );
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
                 var args = try self.alloc.alloc(ast.Expr, mc.args.len);
                 for (mc.args, 0..) |arg_id, i| {
                     const previous_expected_type = self.expected_argument_type;
@@ -9673,9 +11334,23 @@ const Lowerer = struct {
                     receiver,
                     args,
                     mc.args,
+                    mc.generic_args,
                 ) else null;
+                const blanket_call = if (method_entity.kind == .method_ref)
+                    try self.lowerBlanketImplMethodCall(
+                        expr_id,
+                        mc,
+                        method_name,
+                        receiver.*,
+                        args,
+                        &owned_prelude,
+                    )
+                else
+                    null;
                 const lowered_call = if (standard_call) |lowered|
                     try self.lowerDirectCallResult(expr_id, lowered.*, allocates)
+                else if (blanket_call) |lowered|
+                    try self.lowerDirectCallResult(expr_id, lowered, allocates)
                 else blk_call: {
                     const call_args = if (allocates) alloc_args: {
                         const result = try self.alloc.alloc(ast.Expr, args.len + 1);
@@ -9727,7 +11402,10 @@ const Lowerer = struct {
                         }
                     }
                     if (!found) return error.MissingStructField;
-                    const name = try self.alloc.dupe(u8, fi.field);
+                    const name = try self.alloc.dupe(
+                        u8,
+                        self.structFieldName(sl.def, fi.field),
+                    );
                     errdefer self.alloc.free(name);
                     const expr = try self.lowerExpr(fi.value);
 
@@ -9789,7 +11467,9 @@ const Lowerer = struct {
                     return error.InvalidVariantDefinition;
                 }
                 if (ev.variant.len == 0) return error.MissingVariantName;
-                if (ev.named_fields.len > 0) return error.UnsupportedEnumVariantFields;
+                if (ev.named_fields.len > 0 and ev.tuple_fields.len > 0) {
+                    return error.VariantArityMismatch;
+                }
                 if (self.syntheticExternalType(ev.def)) |synthetic_kind| {
                     switch (synthetic_kind) {
                         .option => {
@@ -9828,16 +11508,41 @@ const Lowerer = struct {
                                 .name = name,
                                 .expr = expr,
                             };
+                            // `r2z.Result` is a union and `.{}` is a struct
+                            // literal, so the anonymous form only coerces
+                            // where an expected type already reaches it. Naming
+                            // the union keeps `Ok`/`Err` a `Result` in every
+                            // position. A `Result` that lowers to a Zig error
+                            // union carries its payload bare and has no union
+                            // to name, so it keeps the anonymous initializer.
+                            const tagged_name: ?ast.Type = tagged: {
+                                const node_type = try self.typeById(
+                                    ir_expr.ty orelse break :tagged null,
+                                );
+                                if (self.resultUsesErrorUnion(node_type)) break :tagged null;
+                                const result = switch (node_type) {
+                                    .result => |value| value.*,
+                                    else => break :tagged null,
+                                };
+                                break :tagged (try self.allocType(
+                                    try self.lowerTaggedResult(result.ok, result.err),
+                                )).*;
+                            };
                             break :blk .{ .struct_init = .{
-                                .type_name = null,
+                                .type_name = tagged_name,
                                 .fields = fields,
                             } };
                         },
                     }
                 }
-                const variant_fields = self.enumVariantFields(ev.def) orelse {
-                    return error.MissingVariantDefinition;
-                };
+                // `ev.def` names the variant when the entity graph linked it,
+                // and the owning enum otherwise; the variant name is always
+                // present, so resolve through whichever form the def took.
+                const variant_fields = self.enumVariantFields(ev.def) orelse
+                    self.enumVariantFieldsByName(ev.def, ev.variant) orelse
+                    {
+                        return error.MissingVariantDefinition;
+                    };
                 switch (variant_fields) {
                     .none => {
                         if (ev.tuple_fields.len != 0) return error.VariantArityMismatch;
@@ -9845,17 +11550,22 @@ const Lowerer = struct {
                     .tuple => |fields| {
                         if (ev.tuple_fields.len != fields.len) return error.VariantArityMismatch;
                     },
-                    .named => return error.UnsupportedEnumVariantFields,
+                    .named => |fields| {
+                        if (ev.named_fields.len != fields.len) return error.VariantArityMismatch;
+                    },
                 }
                 const variant_name = try self.alloc.dupe(u8, ev.variant);
                 const returns_error_union = if (self.current_return_type) |return_type|
-                    switch (return_type) {
-                        .result => |result| result.is_error_unionable,
-                        else => false,
-                    }
+                    self.resultUsesErrorUnion(return_type)
                 else
                     false;
-                if (returns_error_union and ev.tuple_fields.len == 0) {
+                // A payload-free variant of a Zig error set becomes
+                // `error.Name`. A variant that carries fields is a value, not
+                // an error name, so it keeps the union initializer below.
+                if (returns_error_union and
+                    ev.tuple_fields.len == 0 and
+                    ev.named_fields.len == 0)
+                {
                     const error_name = try self.alloc.dupe(u8, "error");
                     const error_target = try self.allocExpr(.{ .ident = error_name });
                     break :blk .{ .field_access = .{
@@ -9863,23 +11573,45 @@ const Lowerer = struct {
                         .field_name = variant_name,
                     } };
                 }
-                if (ev.tuple_fields.len > 0) {
-                    var fields = try self.alloc.alloc(ast.StructInitField, ev.tuple_fields.len);
-                    for (ev.tuple_fields, 0..) |tf, i| {
-                        const name = try std.fmt.allocPrint(self.alloc, "{d}", .{i});
+                if (ev.named_fields.len > 0) {
+                    // A struct-style variant carries an anonymous struct, so the
+                    // payload is a second initializer nested inside the variant
+                    // field: `.{ .Variant = .{ .field = value } }`.
+                    const payload_fields = try self.alloc.alloc(
+                        ast.StructInitField,
+                        ev.named_fields.len,
+                    );
+                    for (ev.named_fields, 0..) |named, index| {
+                        const name = try self.alloc.dupe(u8, named.field);
                         errdefer self.alloc.free(name);
-                        const expr = try self.lowerExpr(tf);
-
-                        fields[i] = .{
+                        payload_fields[index] = .{
                             .name = name,
-                            .expr = expr,
+                            .expr = try self.lowerExpr(named.value),
                         };
                     }
+                    const variant_fields_list = try self.alloc.alloc(ast.StructInitField, 1);
+                    variant_fields_list[0] = .{
+                        .name = variant_name,
+                        .expr = .{ .struct_init = .{
+                            .type_name = null,
+                            .fields = payload_fields,
+                        } },
+                    };
+                    // The initializer names the *enum*, not the variant: the
+                    // variant is the single field the initializer carries.
                     break :blk ast.Expr{
                         .struct_init = .{
-                            .type_name = ast.Type{ .named = variant_name },
-                            .fields = fields,
+                            .type_name = ast.Type{ .named = try self.enumOwnerName(ev.def) },
+                            .fields = variant_fields_list,
                         },
+                    };
+                }
+                // A field-less variant is a value of the union, so it names
+                // that union first. A variant carrying a tuple payload keeps
+                // the bare-identifier spelling below.
+                if (ev.tuple_fields.len == 0) {
+                    break :blk ast.Expr{
+                        .ident = try self.unitVariantName(ev.def, variant_name),
                     };
                 }
                 break :blk ast.Expr{ .ident = variant_name };
@@ -9887,7 +11619,16 @@ const Lowerer = struct {
             .field => |fe| blk: {
                 const base = try self.allocExpr(try self.lowerExpr(fe.base));
                 errdefer self.alloc.destroy(base);
-                const field_name = try self.alloc.dupe(u8, fe.field);
+                // A field that had to move because a method of the same name
+                // sits on the struct keeps its source name in the IR; the
+                // emitted name comes from the struct's rename table.
+                var source_name = fe.field;
+                if (try self.exprType(fe.base)) |base_type| {
+                    if (self.structDefForType(base_type)) |struct_id| {
+                        source_name = self.structFieldName(struct_id, fe.field);
+                    }
+                }
+                const field_name = try self.alloc.dupe(u8, source_name);
                 errdefer self.alloc.free(field_name);
                 break :blk ast.Expr{
                     .field_access = .{
@@ -9902,7 +11643,8 @@ const Lowerer = struct {
                 }
                 const base = try self.allocExpr(try self.lowerExpr(ie.base));
                 const idx = try self.allocExpr(switch (self.ir.bodies.exprs[ie.index].kind) {
-                    .range => |range| try self.lowerRangeExpr(range, true),
+                    // A slice index is a statement position: `s[0..n]`.
+                    .range => |range| try self.lowerRangeSliceExpr(range, true),
                     else => try self.lowerExpr(ie.index),
                 });
                 var args = try self.alloc.alloc(ast.Expr, 2);
@@ -10104,6 +11846,49 @@ const Lowerer = struct {
                     .deref => .deref,
                     .ref => .addr_of,
                 };
+                // A Rust raw pointer lowers to a Zig *many-item* pointer so
+                // that `ptr.add(n)` keeps working, and Zig indexes a
+                // many-item pointer with `[0]`, not `.*`. Only a known raw
+                // pointer is rewritten; an unknown operand type keeps the
+                // ordinary dereference.
+                const deref_operand_is_raw_ptr =
+                    if (try self.exprType(ue.operand)) |operand_ty| operand_ty == .raw_ptr else false;
+                if (ue.op == .deref and deref_operand_is_raw_ptr) {
+                    const index = try self.allocExpr(.{ .lit = .{ .int = 0 } });
+                    const index_args = try self.alloc.alloc(ast.Expr, 2);
+                    index_args[0] = final_operand.*;
+                    index_args[1] = index.*;
+                    break :blk (try self.allocExpr(.{ .builtin = .{
+                        .name = "index",
+                        .args = index_args,
+                    } })).*;
+                }
+                // Rust's `&T` asserts `align_of::<T>()`; a raw pointer does
+                // not, so the place reached through one carries alignment 1.
+                // Taking a reference to it has to re-establish the
+                // alignment the reference type promises, and `@alignCast` is
+                // how Zig asserts that.
+                //
+                // The trigger is deliberately narrow — the place must have
+                // come from dereferencing a raw pointer, and the pointee must
+                // be sized. A packed struct's field is a field access, not a
+                // raw-pointer dereference, so it keeps its real (possibly 1)
+                // alignment; and an unsized pointee (`&[u8]`, `&str`,
+                // `&dyn Trait`) lowers to a Zig slice or fat value rather than
+                // a pointer, so there is no alignment to assert. Putting this
+                // on the address-of rather than the deref is what keeps an
+                // unaligned read — `get_unaligned_chunk` — free of it.
+                if (ue.op == .ref and try self.addressOfAssertsAlignment(ue.operand)) {
+                    const align_args = try self.alloc.alloc(ast.Expr, 1);
+                    align_args[0] = (try self.allocExpr(.{ .unary_op = .{
+                        .op = .addr_of,
+                        .operand = final_operand,
+                    } })).*;
+                    break :blk (try self.allocExpr(.{ .builtin = .{
+                        .name = "alignCast",
+                        .args = align_args,
+                    } })).*;
+                }
                 break :blk ast.Expr{
                     .unary_op = .{
                         .op = op_kind,
@@ -10111,6 +11896,7 @@ const Lowerer = struct {
                     },
                 };
             },
+
             .assign => |assignment| blk: {
                 const statements = try self.alloc.alloc(ast.Stmt, 1);
                 errdefer self.alloc.free(statements);
@@ -10125,11 +11911,14 @@ const Lowerer = struct {
                 const previous_explicit_try = self.explicit_try_expr;
                 self.explicit_try_expr = te.inner;
                 defer self.explicit_try_expr = previous_explicit_try;
-                const operand = try self.allocExpr(try self.lowerExpr(te.inner));
+                const operand_expr = try self.lowerExpr(te.inner);
+                if (try self.lowerTaggedResultPropagation(operand_expr, te.inner)) |propagated| {
+                    break :blk propagated;
+                }
                 break :blk ast.Expr{
                     .unary_op = .{
                         .op = .try_op,
-                        .operand = operand,
+                        .operand = try self.allocExpr(operand_expr),
                     },
                 };
             },
@@ -10137,7 +11926,7 @@ const Lowerer = struct {
                 const val = if (re.value) |v| try self.allocExpr(try self.lowerExpr(v)) else null;
                 break :blk ast.Expr{ .return_expr = val };
             },
-            .range => |range| try self.lowerRangeExpr(range, false),
+            .range => |range| try self.lowerRangeExpr(range),
             .panic_ => |panic_expr| ast.Expr{
                 .panic_ = try self.alloc.dupe(u8, panic_expr.message),
             },
@@ -10158,6 +11947,374 @@ const Lowerer = struct {
                 }
                 return error.UnsupportedExpression;
             },
+        };
+    }
+    /// Lower `operand?` when the operand is a `Result` that becomes the tagged
+    /// `r2z.Result` union, and `null` when a Zig `try` is the right spelling.
+    ///
+    /// A Zig `try` only applies to error unions, so applying one to a tagged
+    /// union is a type error. Rust's `?` converts the error through `From`;
+    /// when the operand and the enclosing function already share one error
+    /// type that conversion is the identity and the propagation is a switch
+    /// over the two tags. A differing error type needs a conversion the
+    /// backend has no faithful spelling for, and dropping it would silently
+    /// change the program, so it is reported instead.
+
+
+    /// Emit a call to a blanket impl's method as a direct call to the hoisted
+    /// free function.
+    ///
+    /// A blanket `impl<T: AsRef<[u8]>> ToHex for T` has no concrete self type,
+    /// so its methods cannot live in a Zig struct. `collectHoistedMethods`
+    /// emits them as free functions on the enclosing module, which
+    /// `moduleHoistGenericParams` already shapes as
+    /// `fn encode_hex(comptime T: type, comptime U: type, allocator, self) U`.
+    /// Zig has no method dispatch, so `receiver.encode_hex(..)` — what the
+    /// general path emits — is not a call at all. This produces
+    /// `encode_hex(SelfType, U, ..., &receiver, ...)` instead.
+    ///
+    /// `SelfType` comes from the impl's DECLARED bound plus the receiver's
+    /// length. It is never inferred from the magnitude of the elements: an
+    /// unsuffixed literal has no type until context fixes one, and reading
+    /// "the values all fit in a u8" off the literal would type a program the
+    /// source never said. If the bound cannot produce a type that provably
+    /// accepts the receiver, this returns null and the general path runs,
+    /// refusing the call rather than guessing.
+    fn lowerBlanketImplMethodCall(
+        self: *Lowerer,
+        expr_id: ir.exprs.NodeId,
+        mc: ir.exprs.MethodCall,
+        method_name: []const u8,
+        receiver: ast.Expr,
+        args: []const ast.Expr,
+        prelude: *std.ArrayListUnmanaged(ast.Stmt),
+    ) !?ast.Expr {
+        const trait_id = self.methodRefTrait(mc.method) orelse return null;
+        const impl_id = self.blanketImplFor(trait_id) orelse return null;
+        const method_fn_id = self.blanketImplMethod(impl_id, method_name) orelse return null;
+
+        // Element type from the declared bound, never from the literal.
+        const element = self.blanketBoundElement(impl_id) orelse return null;
+        const self_type = (try self.blanketReceiverType(mc.receiver, element)) orelse return null;
+
+        const takes_allocator = self.hoistedMethodTakesAllocator(method_fn_id);
+
+        // Comptime type arguments: the impl's own `T` first, then the
+        // method's own parameters, matching the declared parameter order.
+        const self_type_ast = try self.lowerType(self_type);
+        const method_generics = try self.lowerCallGenericArgs(expr_id, method_fn_id, mc.args);
+        const generic_args = try self.alloc.alloc(ast.Type, method_generics.len + 1);
+        generic_args[0] = self_type_ast;
+        @memcpy(generic_args[1..], method_generics);
+
+        // The receiver is a value; the hoisted function takes `self: *const
+        // T`. Zig cannot take the address of an array literal, so a literal
+        // receiver is bound to a local first.
+        const receiver_ref = try self.bindReceiverForAddress(prelude, receiver, self_type_ast);
+
+        const call_args = try self.alloc.alloc(
+            ast.Expr,
+            1 + @as(usize, @intFromBool(takes_allocator)) + args.len,
+        );
+        call_args[0] = receiver_ref;
+        var at: usize = 1;
+        if (takes_allocator) {
+            call_args[at] = .{ .ident = "allocator" };
+            at += 1;
+        }
+        @memcpy(call_args[at..][0..args.len], args);
+
+        return ast.Expr{ .call = .{
+            .callee = try self.allocExpr(.{ .ident = try self.hoistedNameFor(method_fn_id) }),
+            .generic_args = generic_args,
+            .args = call_args,
+        } };
+    }
+
+    /// The `self` expression for a hoisted call, which takes a pointer. A
+    /// value that already has an address is taken directly; a literal is
+    /// bound to a local, because Zig has no address-of expression for one.
+    fn bindReceiverForAddress(
+        self: *Lowerer,
+        prelude: *std.ArrayListUnmanaged(ast.Stmt),
+        receiver: ast.Expr,
+        self_type: ast.Type,
+    ) !ast.Expr {
+        const needs_local = switch (receiver) {
+            .array_init, .repeat, .multi_array, .struct_init => true,
+            else => false,
+        };
+        if (!needs_local) {
+            const held = try self.allocExpr(receiver);
+            return (try self.allocExpr(.{
+                .unary_op = .{ .op = .addr_of, .operand = held },
+            })).*;
+        }
+        const name = try std.fmt.allocPrint(self.alloc, "__r2z_blanket_self_{d}", .{
+            prelude.items.len,
+        });
+        try prelude.append(self.alloc, .{ .let_stmt = .{
+            .name = name,
+            .ty = self_type,
+            .init = receiver,
+        } });
+        const held = try self.allocExpr(.{ .ident = name });
+        return (try self.allocExpr(.{
+            .unary_op = .{ .op = .addr_of, .operand = held },
+        })).*;
+    }
+
+    /// The trait a `.method_ref` names, if it is a trait method reference.
+    fn methodRefTrait(self: *const Lowerer, method: ir.spine.EntityId) ?ir.spine.EntityId {
+        const entity = self.ir.graph.symbol_table.get(method) orelse return null;
+        if (entity.kind != .method_ref) return null;
+        return entity.parent;
+    }
+
+    /// The blanket impl in this crate for `trait_id`: an impl whose own self
+    /// type is a type parameter rather than a concrete declaration.
+    fn blanketImplFor(self: *const Lowerer, trait_id: ir.spine.EntityId) ?ir.spine.EntityId {
+        const count = self.ir.graph.symbol_table.count();
+        for (0..count) |idx| {
+            const impl_id: ir.spine.EntityId = @intCast(idx);
+            if (impl_id >= self.ir.bodies.bodies.len) continue;
+            const impl_body = switch (self.ir.bodies.bodies[impl_id]) {
+                .impl_ => |body| body,
+                else => continue,
+            };
+            const trait_path = impl_body.trait_path orelse continue;
+            const last = lastPathSegment(trait_path.segments) orelse continue;
+            if (last.id == null or last.id.? != trait_id) continue;
+            if (blanketSelfTypeParam(impl_body.self_ty) == null) continue;
+            return impl_id;
+        }
+        return null;
+    }
+
+    /// The `fn` entity a blanket impl declares for `method_name`.
+    fn blanketImplMethod(
+        self: *const Lowerer,
+        impl_id: ir.spine.EntityId,
+        method_name: []const u8,
+    ) ?ir.spine.EntityId {
+        if (impl_id >= self.ir.bodies.bodies.len) return null;
+        const impl_body = switch (self.ir.bodies.bodies[impl_id]) {
+            .impl_ => |body| body,
+            else => return null,
+        };
+        for (impl_body.assoc_items) |item_id| {
+            const entity = self.ir.graph.symbol_table.get(item_id) orelse continue;
+            if (entity.kind != .fn_) continue;
+            if (!std.mem.eql(u8, entity.name, method_name)) continue;
+            return item_id;
+        }
+        return null;
+    }
+
+    /// The type-parameter name a blanket impl's self type is written as, if
+    /// the self type is a bare type parameter rather than a real type.
+    fn blanketSelfTypeParam(self_ty: ir.types.Type) ?[]const u8 {
+        return switch (self_ty) {
+            .path => |path| blk: {
+                if (path.segments.len != 1) break :blk null;
+                const segment = path.segments[0];
+                if (segment.id != null) break :blk null;
+                break :blk segment.name;
+            },
+            else => null,
+        };
+    }
+
+    /// The element type the impl's declared bound requires of its self type.
+    ///
+    /// Read from the bound the source wrote — `T: AsRef<[u8]>` gives `u8` —
+    /// so the concrete self type is the one the source declared, never a
+    /// guess fitted to the values at the call site.
+    fn blanketBoundElement(self: *const Lowerer, impl_id: ir.spine.EntityId) ?ir.types.Type {
+        if (impl_id >= self.ir.bodies.bodies.len) return null;
+        const impl_body = switch (self.ir.bodies.bodies[impl_id]) {
+            .impl_ => |body| body,
+            else => return null,
+        };
+        const self_param = blanketSelfTypeParam(impl_body.self_ty) orelse return null;
+        const generics = impl_body.generics orelse return null;
+        for (generics.params) |param| {
+            const type_param = switch (param) {
+                .type_ => |value| value,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, type_param.name, self_param)) continue;
+            for (type_param.bounds) |bound| {
+                for (bound.args) |arg| {
+                    // `AsRef<[u8]>` and friends: the first type argument names
+                    // the element type the self type must expose.
+                    switch (arg) {
+                        .slice => |slice| return slice.elem,
+                        .array => |array| return array.elem,
+                        else => {},
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// The concrete self type for this call site: the bound's element type
+    /// with the receiver's own length.
+    ///
+    /// A receiver whose type is already known is checked against the bound
+    /// and used as-is, so a receiver the bound does not accept is refused. A
+    /// receiver that is an array literal takes its LENGTH from the literal
+    /// and its ELEMENT type from the bound.
+    fn blanketReceiverType(
+        self: *Lowerer,
+        receiver: ir.exprs.NodeId,
+        element: ir.types.Type,
+    ) !?ir.types.Type {
+        if (receiver >= self.ir.bodies.exprs.len) return null;
+        if (try self.exprType(receiver)) |known| {
+            const array = switch (known) {
+                .array => |value| value,
+                else => return null,
+            };
+            // A known receiver must actually match the declared bound.
+            if (!sameIrType(array.elem, element)) return null;
+            return known;
+        }
+        const literal = switch (self.ir.bodies.exprs[receiver].kind) {
+            .array => |value| value,
+            else => return null,
+        };
+        if (literal.elements.len == 0) return null;
+        const array = try self.alloc.create(ir.types.Array);
+        array.* = .{ .elem = element, .len = .{ .literal = literal.elements.len } };
+        return ir.types.Type{ .array = array };
+    }
+
+    fn sameIrType(left: ir.types.Type, right: ir.types.Type) bool {
+        if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+        return switch (left) {
+            .prim => |value| value == right.prim,
+            else => false,
+        };
+    }
+
+    /// Whether a hoisted blanket method takes a leading allocator, matching
+    /// the parameter `lowerFnEntity` emits for an allocating callable.
+    fn hoistedMethodTakesAllocator(self: *const Lowerer, method_fn_id: ir.spine.EntityId) bool {
+        if (method_fn_id >= self.ir.bodies.bodies.len) return false;
+        const body = switch (self.ir.bodies.bodies[method_fn_id]) {
+            .fn_ => |value| value,
+            else => return false,
+        };
+        return self.callableAllocates(method_fn_id, body.is_allocating);
+    }
+
+    /// The name a hoisted method is emitted under, so the call site spells
+    /// the same identifier `collectHoistedMethods` declared.
+    fn hoistedNameFor(self: *const Lowerer, method_fn_id: ir.spine.EntityId) ![]const u8 {
+        if (self.hoisted_method_names.get(method_fn_id)) |name| return name;
+        const entity = self.ir.graph.symbol_table.get(method_fn_id) orelse {
+            return error.MissingDefinition;
+        };
+        return try self.alloc.dupe(u8, entity.name);
+    }
+    fn lowerTaggedResultPropagation(
+        self: *Lowerer,
+        operand: ast.Expr,
+        operand_id: ir.exprs.NodeId,
+    ) !?ast.Expr {
+        const operand_type = (try self.exprType(operand_id)) orelse return null;
+        if (self.resultUsesErrorUnion(operand_type)) return null;
+        const operand_result = switch (operand_type) {
+            .result => |value| value.*,
+            else => return null,
+        };
+        const enclosing = self.current_return_type orelse
+            return error.UnsupportedResultPropagation;
+        const enclosing_result = switch (enclosing) {
+            .result => |value| value.*,
+            else => return error.UnsupportedResultPropagation,
+        };
+        if (!typeEquals(operand_result.err, enclosing_result.err)) {
+            return error.UnsupportedResultErrorConversion;
+        }
+
+        const ok_patterns = try self.alloc.alloc(ast.Pattern, 1);
+        ok_patterns[0] = .{ .enum_literal = try self.alloc.dupe(u8, "Ok") };
+        const err_patterns = try self.alloc.alloc(ast.Pattern, 1);
+        err_patterns[0] = .{ .enum_literal = try self.alloc.dupe(u8, "Err") };
+
+        // A `void` payload has nothing to bind, so the success prong carries
+        // no capture at all.
+        const ok_capture: ?ast.Capture = if (operand_result.ok == .prim and
+            operand_result.ok.prim == .unit)
+            null
+        else
+            .{ .name = try self.alloc.dupe(u8, "__r2z_try_ok") };
+        const err_capture = try self.alloc.dupe(u8, "__r2z_try_err");
+        const ok_body: ast.Expr = if (ok_capture) |capture|
+            .{ .ident = capture.name }
+        else
+            .{ .unit = {} };
+
+        const err_fields = try self.alloc.alloc(ast.StructInitField, 1);
+        err_fields[0] = .{
+            .name = try self.alloc.dupe(u8, "Err"),
+            .expr = .{ .ident = err_capture },
+        };
+        const enclosing_name = (try self.allocType(
+            try self.lowerTaggedResult(enclosing_result.ok, enclosing_result.err),
+        )).*;
+        const err_value = try self.allocExpr(.{
+            .struct_init = .{ .type_name = enclosing_name, .fields = err_fields },
+        });
+
+        const arms = try self.alloc.alloc(ast.MatchArm, 2);
+        arms[0] = .{ .patterns = ok_patterns, .capture = ok_capture, .body = ok_body };
+        arms[1] = .{
+            .patterns = err_patterns,
+            .capture = .{ .name = err_capture },
+            .body = .{ .return_expr = err_value },
+        };
+        return .{ .match_expr = .{
+            .target = try self.allocExpr(operand),
+            .arms = arms,
+        } };
+    }
+
+    /// Whether taking a reference to this place must re-assert the alignment
+    /// the reference type promises.
+    ///
+    /// The rule, stated once: a Rust raw pointer carries no alignment
+    /// promise, so every place reached through one has alignment 1. Taking
+    /// `&T` from such a place re-establishes `align_of::<T>()`, and that
+    /// assertion is only meaningful — and only expressible — when `T` is
+    /// sized. An unsized pointee (`&[u8]`, `&str`, `&dyn Trait`) is a fat
+    /// pointer in Rust and a slice or fat value in Zig, so it has no pointer
+    /// alignment to assert; and a packed struct's field is reached by a field
+    /// access rather than a raw-pointer dereference, so it keeps whatever
+    /// alignment it really has.
+    ///
+    /// Every case that returns false is one where an `@alignCast` would be
+    /// wrong: either meaningless, or a runtime check Rust's `unsafe` code
+    /// never promised — which is what would break a deliberately unaligned
+    /// read.
+    fn addressOfAssertsAlignment(self: *Lowerer, operand: ir.exprs.NodeId) !bool {
+        const inner = switch (self.ir.bodies.exprs[operand].kind) {
+            .unary => |unary| unary,
+            else => return false,
+        };
+        if (inner.op != .deref) return false;
+        const pointer = (try self.exprType(inner.operand)) orelse return false;
+        const raw_pointer = switch (pointer) {
+            .raw_ptr => |raw| raw,
+            else => return false,
+        };
+        if (ir.types.isStr(raw_pointer.pointee)) return false;
+        return switch (raw_pointer.pointee) {
+            .slice, .dyn_trait => false,
+            else => true,
         };
     }
 
@@ -10435,20 +12592,44 @@ const Lowerer = struct {
         return (try self.typeById(type_id)) == .reference;
     }
 
-    fn lowerForInput(self: *Lowerer, node: ir.exprs.NodeId, by_ref: bool) anyerror!ast.Expr {
+    /// The node a `for` input actually walks. `.iter()` and `.iter_mut()` are
+    /// the iterator itself, and a Zig `for` walks the sequence underneath.
+    fn forInputSource(self: *Lowerer, node: ir.exprs.NodeId) anyerror!ir.exprs.NodeId {
         if (node >= self.ir.bodies.exprs.len) return error.MissingExpressionNode;
-        var source = node;
-        if (self.ir.bodies.exprs[node].kind == .method_call) {
-            const call = self.ir.bodies.exprs[node].kind.method_call;
-            const method = self.ir.graph.symbol_table.get(call.method) orelse return error.MissingDefinition;
-            if (std.mem.eql(u8, method.name, "iter") or std.mem.eql(u8, method.name, "iter_mut")) {
-                if (try self.memoryElementType(call.receiver) != null) source = call.receiver;
-            }
+        if (self.ir.bodies.exprs[node].kind != .method_call) return node;
+        const call = self.ir.bodies.exprs[node].kind.method_call;
+        const method = self.ir.graph.symbol_table.get(call.method) orelse return error.MissingDefinition;
+        if (std.mem.eql(u8, method.name, "iter") or std.mem.eql(u8, method.name, "iter_mut")) {
+            if (try self.memoryElementType(call.receiver) != null) return call.receiver;
         }
-        var value = try self.allocExpr(try self.lowerExpr(source));
+        return node;
+    }
+
+    fn lowerForInput(self: *Lowerer, node: ir.exprs.NodeId, by_ref: bool) anyerror!ast.Expr {
+        const source = try self.forInputSource(node);
+        // A `for` input is a statement position, so a range iterable keeps the
+        // bare Zig range form; the value form cannot be iterated.
+        var value = try self.allocExpr(switch (self.ir.bodies.exprs[source].kind) {
+            .range => |range| try self.lowerRangeSliceExpr(range, false),
+            else => try self.lowerExpr(source),
+        });
         value = try self.lowerMemoryReceiver(source, value);
-        if (by_ref) return (try self.lowerAsRef(source, value)).*;
-        return value.*;
+        if (!by_ref) return value.*;
+        if (self.receiverIsArray(source)) return (try self.lowerAsRef(source, value)).*;
+        // A pointer capture needs an addressable sequence. A bare slice is one
+        // and a bare array is not, and a dereferenced generic may be either,
+        // so a source the IR only knows as a slice is spelled `x[0..]`: that
+        // is the same sequence in both cases.
+        if (!self.receiverIsSlice(source)) return (try self.lowerAsRef(source, value)).*;
+        const zero = try self.allocExpr(ast.Expr{ .lit = .{ .int = 0 } });
+        const open = try self.allocExpr(ast.Expr{ .range = .{ .start = zero, .end = null } });
+        const index_args = try self.alloc.alloc(ast.Expr, 2);
+        index_args[0] = value.*;
+        index_args[1] = open.*;
+        return (try self.allocExpr(ast.Expr{ .builtin = .{
+            .name = "index",
+            .args = index_args,
+        } })).*;
     }
 
     /// Append the flat capture name(s) for a simple loop pattern (bindings,
@@ -10542,10 +12723,13 @@ const Lowerer = struct {
 
     /// Capture for one zip (`multi`) input. A plain binding/reference yields a
     /// single Zig capture; a tuple element yields a temporary capture plus a
-    /// `const` destructure injected at the top of the loop body.
+    /// `const` destructure injected at the top of the loop body. `by_ref` is
+    /// the caller's verdict for this input: Rust `x.iter()` yields references,
+    /// which the pattern's own type may not record.
     fn appendMultiCapture(
         self: *Lowerer,
         pat_id: ir.exprs.NodeId,
+        by_ref: bool,
         captures: *std.ArrayListUnmanaged(ast.Capture),
         destructure: *std.ArrayListUnmanaged(ast.Stmt),
     ) anyerror!void {
@@ -10558,7 +12742,6 @@ const Lowerer = struct {
                     try names.claimPatternName(self.alloc, &self.ir.graph.symbol_table, pat_id, b.name)
                 else
                     b.name;
-                const by_ref = try self.patternCapturesByReference(pat_id);
                 const name = try self.alloc.dupe(u8, binding_name);
                 errdefer self.alloc.free(name);
                 try captures.append(self.alloc, .{
@@ -10566,7 +12749,7 @@ const Lowerer = struct {
                     .by_ref = by_ref,
                 });
             },
-            .reference => |r| try self.appendMultiCapture(r.inner, captures, destructure),
+            .reference => |r| try self.appendMultiCapture(r.inner, by_ref, captures, destructure),
             .wildcard => try captures.append(self.alloc, .{ .name = "_" }),
             .tuple => |tp| {
                 const tmp = try self.alloc.dupe(u8, "_tup");
@@ -10676,6 +12859,25 @@ const Lowerer = struct {
             for (enum_body.variants) |variant| {
                 if (std.mem.eql(u8, variant.name, variant_entity.name)) return variant.fields;
             }
+        }
+        return null;
+    }
+
+    /// Field shape of a variant named `variant_name` inside the enum whose
+    /// entity id is `enum_id`. Used when an `enum_variant` expression carries
+    /// the owning enum rather than the linked variant entity.
+    fn enumVariantFieldsByName(
+        self: *Lowerer,
+        enum_id: ir.spine.EntityId,
+        variant_name: []const u8,
+    ) ?ir.items.VariantFields {
+        if (enum_id >= self.ir.bodies.bodies.len) return null;
+        const enum_body = switch (self.ir.bodies.bodies[enum_id]) {
+            .enum_ => |body| body,
+            else => return null,
+        };
+        for (enum_body.variants) |variant| {
+            if (std.mem.eql(u8, variant.name, variant_name)) return variant.fields;
         }
         return null;
     }
@@ -10822,7 +13024,7 @@ const Lowerer = struct {
                             else => try self.alloc.dupe(u8, f.field),
                         }
                     else
-                        try self.alloc.dupe(u8, f.field);
+                        try self.alloc.dupe(u8, self.structFieldName(sp.def, f.field));
                     fields[i] = .{
                         .name = field_name,
                         .pat = f_pat,
@@ -10835,11 +13037,55 @@ const Lowerer = struct {
                     },
                 };
             },
-            .@"or" => |op| blk: {
-                if (op.alternatives.len == 0) return error.MissingPatternAlternative;
-                break :blk try self.lowerPattern(op.alternatives[0]);
-            },
+            // A nested `a | b` has no `ast.Pattern` tag; match arms expand it
+            // through `lowerArmPatterns` before reaching this point.
+            .@"or" => return error.UnsupportedPattern,
+            .range => |rp| ast.Pattern{ .range_pat = .{
+                .lo = try self.lowerRangeBound(rp.lo),
+                .hi = try self.lowerRangeBound(rp.hi),
+                .inclusive = rp.inclusive,
+            } },
             else => return error.UnsupportedPattern,
+        };
+    }
+
+    /// Lower one match arm's pattern list. `ast.Pattern` has no or-pattern
+    /// tag, so a top-level `a | b` becomes one `ast.Pattern` per alternative;
+    /// `MatchArm.patterns` is a slice and the emitter prints those entries
+    /// comma-separated inside a single Zig prong.
+    fn lowerArmPatterns(self: *Lowerer, pat_ids: []const ir.exprs.NodeId) anyerror![]ast.Pattern {
+        var lowered: std.ArrayListUnmanaged(ast.Pattern) = .empty;
+        errdefer lowered.deinit(self.alloc);
+        for (pat_ids) |pat_id| try self.appendLoweredArmPattern(pat_id, &lowered);
+        return lowered.toOwnedSlice(self.alloc);
+    }
+
+    fn appendLoweredArmPattern(
+        self: *Lowerer,
+        pat_id: ir.exprs.NodeId,
+        lowered: *std.ArrayListUnmanaged(ast.Pattern),
+    ) anyerror!void {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        const alternatives = switch (self.ir.bodies.pats[pat_id].kind) {
+            .@"or" => |op| op.alternatives,
+            else => return lowered.append(self.alloc, try self.lowerPattern(pat_id)),
+        };
+        if (alternatives.len == 0) return error.MissingPatternAlternative;
+        for (alternatives) |alternative_id| try self.appendLoweredArmPattern(alternative_id, lowered);
+    }
+
+    /// Lower one range-pattern bound. Only integer and character bounds reach
+    /// a Zig range prong; a null bound stays null (unbounded on that side).
+    fn lowerRangeBound(self: *Lowerer, bound: ?ir.exprs.NodeId) anyerror!?ast.Literal {
+        const bound_id = bound orelse return null;
+        if (bound_id >= self.ir.bodies.exprs.len) return error.MissingExpressionNode;
+        return switch (self.ir.bodies.exprs[bound_id].kind) {
+            .literal => |lit| switch (lit) {
+                .int => |il| ast.Literal{ .int = il.value },
+                .character => |cl| ast.Literal{ .char_lit = @intCast(cl.value) },
+                else => error.UnsupportedPattern,
+            },
+            else => error.UnsupportedPattern,
         };
     }
 

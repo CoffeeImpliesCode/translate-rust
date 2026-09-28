@@ -654,6 +654,58 @@ fn enumBodyHasVariant(e: *const Ext, enum_id: spine.EntityId, variant: []const u
     };
 }
 
+/// True when `enum_id` declares `variant` as a unit variant. A unit variant is
+/// a value in Rust, so a path naming one is a value expression rather than a
+/// bare path to the enum type.
+fn enumBodyHasUnitVariant(e: *const Ext, enum_id: spine.EntityId, variant: []const u8) bool {
+    if (@as(usize, enum_id) >= e.ctx.bodies_list.items.len) return false;
+    return switch (e.ctx.bodies_list.items[@as(usize, enum_id)]) {
+        .enum_ => |body| blk: {
+            for (body.variants) |entry| {
+                if (entry.fields != .none) continue;
+                if (std.mem.eql(u8, entry.name, variant)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+/// The enum a path owner names, seeing through `type` aliases.
+fn pathOwnerEnum(e: *const Ext, owner: spine.EntityId) ?spine.EntityId {
+    const owner_entity = e.ctx.g.symbol_table.get(owner) orelse return null;
+    if (owner_entity.kind == .enum_) return owner;
+    if (owner_entity.kind != .type_alias) return null;
+    const target = resolveAliasNominalType(e, owner) orelse return null;
+    const target_entity = e.ctx.g.symbol_table.get(target) orelse return null;
+    return if (target_entity.kind == .enum_) target else null;
+}
+
+/// Lower a `Enum::Unit` path in value position to an `enum_variant` node.
+///
+/// The source extractor keeps variants in the enum body rather than the symbol
+/// table, so `resolvePatternPath` can only hand back the owning enum. Without
+/// this the variant identity is lost and the backend sees a type where a value
+/// is required. Only unit variants qualify: a variant with a payload names a
+/// constructor, which stays a path.
+fn lowerUnitVariantPath(e: *Ext, node: ts.Node) anyerror!?exprs.NodeId {
+    const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
+    const separator = std.mem.lastIndexOf(u8, raw, "::") orelse return null;
+    const owner_path = std.mem.trim(u8, raw[0..separator], " \t\r\n");
+    const variant_name = std.mem.trim(u8, raw[separator + 2 ..], " \t\r\n");
+    if (owner_path.len == 0 or variant_name.len == 0) return null;
+    const owner = resolvePatternOwner(e, owner_path) orelse return null;
+    const enum_id = pathOwnerEnum(e, owner) orelse return null;
+    if (!enumBodyHasUnitVariant(e, enum_id, variant_name)) return null;
+    const variant = try appendExpr(e, .{ .enum_variant = .{
+        .def = enum_id,
+        .variant = try e.ctx.alloc.dupe(u8, variant_name),
+        .tuple_fields = &.{},
+        .named_fields = &.{},
+    } });
+    return variant;
+}
+
 /// Resolve a pattern path, including an enum variant under its exact owner.
 fn resolvePatternPath(e: *const Ext, node: ts.Node) ?spine.EntityId {
     const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
@@ -749,13 +801,137 @@ fn ensureTraitMethodRefEntity(
     return id;
 }
 
+/// Trait named by Rust's explicit trait-qualified form, `<[u8; 6] as FromHex>`.
+/// Only the trait is meaningful here: the bracketed self type is a coercion
+/// target that names no entity, so resolution must go through the trait.
+fn qualifiedTraitName(raw: []const u8) ?[]const u8 {
+    const clean = std.mem.trim(u8, raw, " \t\r\n");
+    if (clean.len < 3 or clean[0] != '<' or clean[clean.len - 1] != '>') return null;
+    const inner = std.mem.trim(u8, clean[1 .. clean.len - 1], " \t\r\n");
+    const separator = std.mem.lastIndexOf(u8, inner, " as ") orelse return null;
+    const trait_name = std.mem.trim(u8, inner[separator + 4 ..], " \t\r\n");
+    if (trait_name.len == 0) return null;
+    return trait_name;
+}
+
+/// Concrete method entity behind `<[u8; 6] as FromHex>::from_hex`.
+///
+/// The explicit self type names exactly one impl, so the call binds straight to
+/// that impl's method. Resolving through the trait alone would leave an untyped
+/// trait method reference, because choosing the impl needs the self type that a
+/// trait signature only ever spells as `Self`.
+fn qualifiedImplMethod(
+    e: *Ext,
+    node: ts.Node,
+    trait_name: []const u8,
+    method_name: []const u8,
+) anyerror!?spine.EntityId {
+    const bracketed = node.child(0) orelse return null;
+    if (!std.mem.eql(u8, bracketed.kind(), "bracketed_type")) return null;
+    const qualified = bracketed.child(1) orelse return null;
+    if (!std.mem.eql(u8, qualified.kind(), "qualified_type")) return null;
+    const self_type = mapCstType(e, qualified.child(0) orelse return null) catch return null;
+
+    for (e.ctx.g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .impl_) continue;
+        if (!implImplementsTrait(e, entity.id, trait_name)) continue;
+        if (entity.id >= e.ctx.bodies_list.items.len) continue;
+        const impl_body = switch (e.ctx.bodies_list.items[entity.id]) {
+            .impl_ => |body| body,
+            else => continue,
+        };
+        if (!infer.typeEqual(impl_body.self_ty, self_type)) continue;
+        for (e.ctx.g.symbol_table.entities.items) |child| {
+            if (child.kind == .fn_ and child.parent == entity.id and
+                std.mem.eql(u8, child.name, method_name))
+            {
+                return child.id;
+            }
+        }
+    }
+    return null;
+}
+
+/// True when `impl_id` is a trait impl for the trait spelled `trait_name`.
+/// The impl's name carries both halves (`FromHex for [u8; 6]`), which is the
+/// only linkage a macro-generated impl keeps.
+fn implImplementsTrait(e: *const Ext, impl_id: spine.EntityId, trait_name: []const u8) bool {
+    const entity = e.ctx.g.symbol_table.get(impl_id) orelse return false;
+    const separator = std.mem.indexOf(u8, entity.name, " for ") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, entity.name[0..separator], " \t\r\n"), trait_name);
+}
+
+/// The head nominal name a type is written under, or null when the type has
+/// none. `Vec<u8>` and a local `Vec<T>` both answer `Vec`, which is the identity
+/// a `Type::method` path carries: the callee never spells the type arguments.
+fn nominalHeadName(e: *const Ext, t: types.Type) ?[]const u8 {
+    return switch (t) {
+        .path => |p| if (p.segments.len > 0) p.segments[p.segments.len - 1].name else null,
+        .external_nominal => |x| if (x.path.len > 0) x.path[x.path.len - 1] else null,
+        .generic_inst => |instance| blk: {
+            const entity = e.ctx.g.symbol_table.get(instance.decl) orelse break :blk null;
+            break :blk entity.name;
+        },
+        else => null,
+    };
+}
+
+/// Concrete method entity behind `Type::method(..)` when the owner names a type
+/// this crate has no entity for, such as `Vec::from_hex(..)`.
+///
+/// Rust reads that spelling as `<Vec<u8> as FromHex>::from_hex(..)`: the owner
+/// is the receiver type and the leaf is a trait method, so only a trait impl
+/// declared here can supply it. The owner has no entity to resolve against,
+/// which is why `resolvePatternOwner` cannot bind it; the impl that carries the
+/// method can still be, and binding it is what `qualifiedImplMethod` does for
+/// the explicit `<T as Trait>::` spelling. Leaving the call unbound instead
+/// destroys the callee, and every method chained off its result — `unwrap`,
+/// `unwrap_err` — then loses the receiver type it needs.
+///
+/// Two impls for the same type and method would leave the choice to the trait
+/// bounds, which this path does not spell. That stays unresolved rather than
+/// guessed.
+fn implMethodForOwnerType(
+    e: *const Ext,
+    owner_name: []const u8,
+    method_name: []const u8,
+) ?spine.EntityId {
+    var found: ?spine.EntityId = null;
+    for (e.ctx.g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .impl_) continue;
+        if (entity.id >= e.ctx.bodies_list.items.len) continue;
+        const impl_body = switch (e.ctx.bodies_list.items[entity.id]) {
+            .impl_ => |body| body,
+            else => continue,
+        };
+        if (impl_body.trait_path == null) continue;
+        const head = nominalHeadName(e, impl_body.self_ty) orelse continue;
+        if (!std.mem.eql(u8, head, owner_name)) continue;
+        for (e.ctx.g.symbol_table.entities.items) |child| {
+            if (child.kind != .fn_ or child.parent != entity.id) continue;
+            if (!std.mem.eql(u8, child.name, method_name)) continue;
+            if (found != null) return null;
+            found = child.id;
+        }
+    }
+    return found;
+}
+
 fn traitMethodForPath(e: *Ext, node: ts.Node) anyerror!?spine.EntityId {
     const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
     const separator = std.mem.lastIndexOf(u8, raw, "::") orelse return null;
     const owner_text = std.mem.trim(u8, raw[0..separator], " \t\r\n");
     const method_name = std.mem.trim(u8, raw[separator + 2 ..], " \t\r\n");
     if (owner_text.len == 0 or method_name.len == 0) return null;
-    const owner = resolvePatternOwner(e, owner_text) orelse return null;
+    if (qualifiedTraitName(owner_text)) |trait_name| {
+        if (try qualifiedImplMethod(e, node, trait_name, method_name)) |method| return method;
+    }
+    const owner = resolvePatternOwner(e, owner_text) orelse
+        (if (qualifiedTraitName(owner_text)) |trait_name|
+            resolvePatternOwner(e, trait_name)
+        else
+            null) orelse
+        return implMethodForOwnerType(e, owner_text, method_name);
     const owner_entity = e.ctx.g.symbol_table.get(owner) orelse return null;
     if (owner_entity.kind != .trait_) return null;
     return ensureTraitMethodRefEntity(e, owner, method_name);
@@ -1149,6 +1325,11 @@ fn isSliceTypeNode(node: ts.Node) bool {
 /// Unsupported syntax is explicit; unresolved nominal paths are typed errors.
 fn mapCstType(e: *Ext, node: ts.Node) anyerror!types.Type {
     const kind = node.kind();
+    // `_` is Rust's inference placeholder, not a nominal name. It shares the
+    // spelling a wildcard cast target lowers to, so inference can recover the
+    // concrete type later instead of extraction failing on an unresolvable
+    // path.
+    if (try wildcardScalarTarget(e, node)) |placeholder| return placeholder;
     if (std.mem.eql(u8, kind, "type")) {
         if (node.namedChildCount() > 0) {
             const mapped_type = try mapCstType(e, node.namedChild(0).?);
@@ -1398,10 +1579,11 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
     {
         try segs.append(e.ctx.alloc, .{ .name = try e.ctx.alloc.dupe(u8, nm), .id = null });
     }
-    if (segs.items.len > 0 and
-        (std.mem.eql(u8, segs.items[0].name, "core") or
-            std.mem.eql(u8, segs.items[0].name, "std") or
-            std.mem.eql(u8, segs.items[0].name, "alloc")))
+    // `core`/`std`/`alloc` name a crate, not a type, so a root segment needs a
+    // nominal segment after it. This is the same guard the declaration
+    // binder applies, and it keeps a bare `std` from resolving.
+    const ext_root = segs.items.len > 1 and isExternalCrateRoot(segs.items[0].name);
+    if (ext_root)
     {
         const external_path = try e.ctx.alloc.alloc([]const u8, segs.items.len);
         for (segs.items, 0..) |segment, index| {
@@ -1412,6 +1594,12 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
             .path = external_path,
             .args = args,
         } };
+    }
+
+    if (had_scoped_segments) {
+        if (try externalAliasNominalType(e, segs.items, args)) |external| {
+            return .{ .external_nominal = external };
+        }
     }
     if (!had_scoped_segments) {
         if (try externalUsePath(e, nm)) |external_path| {
@@ -1432,6 +1620,14 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
         return .{ .generic_inst = .{ .decl = base_def, .args = .{ .params = args } } };
     }
     return .{ .path = path };
+}
+
+/// True when `name` is a crate root whose types are never graph entities. A
+/// dependency root names real translated entities, so it is not one of these.
+fn isExternalCrateRoot(name: []const u8) bool {
+    return std.mem.eql(u8, name, "core") or
+        std.mem.eql(u8, name, "std") or
+        std.mem.eql(u8, name, "alloc");
 }
 
 /// Preserve every segment of a scoped type path. The body mapper resolves the
@@ -1499,8 +1695,18 @@ fn externalNominalForPath(e: *const Ext, raw_path: []const u8) !?types.ExternalN
         prefix = (try externalUsePath(e, parts[0])) orelse return null;
     }
 
-    const path_len = if (prefix.len > 0) prefix.len + part_count - 1 else part_count;
-    const owned_path = try e.ctx.alloc.alloc([]const u8, path_len);
+    const source_start: usize = if (prefix.len > 0) 1 else 0;
+    return .{ .path = try externalNominalPath(e, prefix, parts[source_start..part_count]) };
+}
+
+/// `prefix` followed by `parts` as one owned external path. The prefix is
+/// graph-owned and the parts come from source text, so both are copied.
+fn externalNominalPath(
+    e: *const Ext,
+    prefix: []const []const u8,
+    parts: []const []const u8,
+) ![]const []const u8 {
+    const owned_path = try e.ctx.alloc.alloc([]const u8, prefix.len + parts.len);
     var copied: usize = 0;
     errdefer {
         for (owned_path[0..copied]) |segment| e.ctx.alloc.free(segment);
@@ -1510,12 +1716,30 @@ fn externalNominalForPath(e: *const Ext, raw_path: []const u8) !?types.ExternalN
         owned_path[copied] = try e.ctx.alloc.dupe(u8, segment);
         copied += 1;
     }
-    const source_start: usize = if (prefix.len > 0) 1 else 0;
-    for (parts[source_start..part_count]) |segment| {
+    for (parts) |segment| {
         owned_path[copied] = try e.ctx.alloc.dupe(u8, segment);
         copied += 1;
     }
-    return .{ .path = owned_path, .args = &.{} };
+    return owned_path;
+}
+
+/// The external nominal a scoped type path names when its head is bound by an
+/// external `use` alias (`use core::iter;` then `iter::FromIterator`). The
+/// declaration binder prefers a graph entity for the head and only falls back
+/// to the alias, so a head that still resolves locally is left alone.
+fn externalAliasNominalType(
+    e: *const Ext,
+    segs: []const types.PathSegment,
+    args: []const types.Type,
+) !?types.ExternalNominal {
+    if (segs.len < 2) return null;
+    const module_id = owningModule(e, e.fn_id) orelse return null;
+    if (resolveModuleItem(e, module_id, segs[0].name) != null) return null;
+    const alias = (try externalUsePath(e, segs[0].name)) orelse return null;
+    const tail = try e.ctx.alloc.alloc([]const u8, segs.len - 1);
+    defer e.ctx.alloc.free(tail);
+    for (segs[1..], 0..) |segment, index| tail[index] = segment.name;
+    return .{ .path = try externalNominalPath(e, alias, tail), .args = args };
 }
 
 fn externalCowVariantForPath(
@@ -2805,6 +3029,10 @@ fn rawPointeesCastCompatible(source_pointee: types.Type, target_pointee: types.T
 }
 
 fn isSupportedCastTarget(ty: types.Type) bool {
+    // `x as _` names its destination with the inference placeholder, which is
+    // a real type-table entry that solving fills in from the surrounding
+    // constraints. The cast is valid; only the destination is not yet known.
+    if (infer.isInferPlaceholderType(ty)) return true;
     return switch (ty) {
         .prim => isScalarCastType(ty),
         .raw_ptr, .slice => true,
@@ -2855,6 +3083,9 @@ fn isWildcardRawPointerCst(e: *const Ext, node: ts.Node) bool {
 }
 
 fn knownCastCompatible(source: types.Type, target: types.Type) ?bool {
+    // An `as _` destination is not yet a type, so nothing can be decided about
+    // the cast until solving resolves it. Report "unknown", not "incompatible".
+    if (infer.isInferPlaceholderType(target)) return null;
     if (isScalarCastType(target)) {
         if (isScalarCastType(source) or isBoolType(source)) return true;
         if (source == .raw_ptr) {
@@ -3395,6 +3626,9 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
         if (primitiveAssociatedConstant(text(e, node))) |constant| {
             return lowerPrimitiveAssociatedConstant(e, constant);
+        }
+        if (try lowerUnitVariantPath(e, node)) |variant| {
+            return variant;
         }
         if (resolvePatternPath(e, node)) |def| {
             return lowerPathValue(e, def);
@@ -5027,10 +5261,12 @@ fn lowerMethodCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     const method_def = try pushMethodRef(e, method_name);
     const args = try lowerArgs(e, arguments);
+    const generic_args = try lowerGenericCallArgs(e, node);
     return appendExpr(e, .{ .method_call = .{
         .receiver = try lowerExpr(e, receiver),
         .receiver_mode = .value,
         .method = method_def,
+        .generic_args = generic_args,
         .args = args,
     } });
 }
@@ -5593,10 +5829,14 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
         const method_def = try pushMethodRef(e, mname);
         const args = try lowerArgs(e, call_args);
+        // The turbofish on `recv.method::<T>(..)` is the callee's own, so it is
+        // recorded here rather than dropped. `generic_args` is freed on
+        // function exit, hence the dupe.
         return appendExpr(e, .{ .method_call = .{
             .receiver = try lowerExpr(e, recv),
             .receiver_mode = .value,
             .method = method_def,
+            .generic_args = try e.ctx.alloc.dupe(types.Type, generic_args),
             .args = args,
         } });
     }
@@ -7513,6 +7753,257 @@ test "lowerCall resolves associated constructor through generic type alias" {
     }
 }
 
+/// Ids a `Type::trait_method` fixture needs a test to name.
+const OwnerTypeMethodFixture = struct {
+    /// The impl method a `Vec::from_hex(..)` call must bind to.
+    from_hex_id: spine.EntityId,
+    /// The function whose body spells the call.
+    caller_id: spine.EntityId,
+};
+
+/// Build the crate half of a `Type::trait_method` fixture and the body table
+/// that goes with it.
+///
+/// The trait impl's self type is `Vec<u8>`, an external nominal that gets no
+/// entity of its own. That is the whole shape under test: `Vec::from_hex(..)`
+/// names a receiver type and a trait method, and neither half resolves by name
+/// — only the impl that carries `from_hex` can.
+///
+/// `vec_impls` adds further trait impls for the same `Vec<u8>`, each declaring
+/// `from_hex`, so the ambiguous case is built from the same fixture.
+fn buildOwnerTypeMethodFixture(
+    alloc: std.mem.Allocator,
+    g: *graph.CrateGraph,
+    bodies_list: *std.ArrayListUnmanaged(bodies.BodyKind),
+    vec_impls: usize,
+) !OwnerTypeMethodFixture {
+    const root_id = try addLookupTestEntity(alloc, g, .module, "", null, null);
+    const trait_id = try addLookupTestEntity(alloc, g, .trait_, "FromHex", root_id, null);
+    const error_id = try addLookupTestEntity(alloc, g, .enum_, "FromHexError", root_id, null);
+
+    const self_ty: types.Type = .{ .external_nominal = .{
+        .path = try alloc.dupe([]const u8, &.{ "alloc", "vec", "Vec" }),
+        .args = try alloc.dupe(types.Type, &.{.{ .prim = .u8 }}),
+    } };
+    const trait_path: types.Path = .{ .segments = try alloc.dupe(
+        types.PathSegment,
+        &.{.{ .name = "FromHex", .id = trait_id }},
+    ) };
+    const result_ty = try alloc.create(types.Result);
+    result_ty.* = .{
+        .ok = self_ty,
+        .err = .{ .path = .{ .segments = try alloc.dupe(
+            types.PathSegment,
+            &.{.{ .name = "FromHexError", .id = error_id }},
+        ) } },
+        .is_error_unionable = false,
+    };
+
+    // The body table is indexed by entity id, and ids are dense in `add` order.
+    try bodies_list.append(alloc, .none); // root module
+    try bodies_list.append(alloc, .{ .trait_ = .{ .name = "FromHex" } });
+    try bodies_list.append(alloc, .{ .enum_ = .{} });
+
+    var from_hex_id: spine.EntityId = 0;
+    for (0..vec_impls) |index| {
+        const impl_name = if (index == 0)
+            "FromHex for Vec<u8>"
+        else
+            try std.fmt.allocPrint(alloc, "FromHex for Vec<u8> #{d}", .{index});
+        const impl_id = try addLookupTestEntity(alloc, g, .impl_, impl_name, root_id, null);
+        try bodies_list.append(alloc, .{ .impl_ = .{
+            .self_ty = self_ty,
+            .trait_path = trait_path,
+        } });
+        const method_id = try addLookupTestEntity(alloc, g, .fn_, "from_hex", impl_id, null);
+        try bodies_list.append(alloc, .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .result = result_ty },
+            .body = 0,
+        } });
+        if (index == 0) from_hex_id = method_id;
+    }
+
+    const caller_id = try addLookupTestEntity(alloc, g, .fn_, "decode_hex", root_id, null);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+    const root_items = try alloc.dupe(spine.EntityId, &.{caller_id});
+    try addLookupTestModule(alloc, g, "", null, true, root_items);
+    return .{ .from_hex_id = from_hex_id, .caller_id = caller_id };
+}
+
+test "lowerCall binds a trait method through an owner type that has no entity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    const fixture = try buildOwnerTypeMethodFixture(alloc, &g, &tables.bodies_list, 1);
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\fn decode_hex() {
+        \\    Vec::from_hex("00").unwrap()
+        \\}
+        ,
+        .mod_id = 0,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fixture.caller_id));
+
+    const body_id = tables.bodies_list.items[fixture.caller_id].fn_.body;
+    const block = switch (tables.exprs_list.items[body_id].kind) {
+        .block => |value| value,
+        else => return error.ExpectedFunctionBlock,
+    };
+    // `Vec::from_hex("00").unwrap()` — the chain a real caller writes, and the
+    // one whose receiver type decides whether `unwrap` resolves at all.
+    const unwrap = switch (tables.exprs_list.items[block.tail orelse
+        return error.MissingTailExpression].kind)
+    {
+        .method_call => |value| value,
+        else => return error.ExpectedMethodCall,
+    };
+    const lowered = tables.exprs_list.items[unwrap.receiver];
+    switch (lowered.kind) {
+        .call => |call| switch (call.call_kind) {
+            .associated => |target| try std.testing.expectEqual(fixture.from_hex_id, target),
+            else => return error.ExpectedAssociatedCall,
+        },
+        else => return error.ExpectedCall,
+    }
+    for (tables.exprs_list.items) |ex| {
+        if (ex.kind == .unsupported) {
+            try std.testing.expect(!std.mem.eql(u8, ex.kind.unsupported.reason, "unresolved call"));
+        }
+    }
+
+    // The call must carry its declared `Result`, so the `unwrap` receiver is a
+    // typed operand rather than an untyped hole the comparison operator can
+    // never resolve.
+    const b: bodies.Bodies = .{
+        .exprs = tables.exprs_list.items,
+        .stmts = tables.stmts_list.items,
+        .pats = tables.pats_list.items,
+        .types = tables.types_list.items,
+        .bodies = tables.bodies_list.items,
+    };
+    var inferred = try infer.solveWithGraph(alloc, &b, &g);
+    defer inferred.deinit(alloc);
+    const receiver_type_id = inferred.getType(unwrap.receiver) orelse
+        return error.UntypedUnwrapReceiver;
+    const receiver_ty = tables.types_list.items[receiver_type_id];
+    switch (receiver_ty) {
+        .result => {},
+        else => return error.ReceiverIsNotAResult,
+    }
+}
+
+test "lowerCall still rejects a trait method for a type no impl covers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    const fixture = try buildOwnerTypeMethodFixture(alloc, &g, &tables.bodies_list, 1);
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\fn decode_hex() {
+        \\    String::from_hex("00")
+        \\}
+        ,
+        .mod_id = 0,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fixture.caller_id));
+
+    const body_id = tables.bodies_list.items[fixture.caller_id].fn_.body;
+    const block = switch (tables.exprs_list.items[body_id].kind) {
+        .block => |value| value,
+        else => return error.ExpectedFunctionBlock,
+    };
+    const lowered = tables.exprs_list.items[block.tail orelse
+        return error.MissingTailExpression];
+    // No impl in this crate covers `String`, so the path still has to be
+    // rejected — with the reason that says which construct failed.
+    switch (lowered.kind) {
+        .unsupported => |marker| try std.testing.expectEqualStrings(
+            "unresolved call",
+            marker.reason,
+        ),
+        else => return error.ExpectedUnsupportedCall,
+    }
+}
+
+test "lowerCall rejects an owner type whose impls disagree on the method" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    const fixture = try buildOwnerTypeMethodFixture(alloc, &g, &tables.bodies_list, 2);
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\fn decode_hex() {
+        \\    Vec::from_hex("00")
+        \\}
+        ,
+        .mod_id = 0,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fixture.caller_id));
+
+    const body_id = tables.bodies_list.items[fixture.caller_id].fn_.body;
+    const block = switch (tables.exprs_list.items[body_id].kind) {
+        .block => |value| value,
+        else => return error.ExpectedFunctionBlock,
+    };
+    const lowered = tables.exprs_list.items[block.tail orelse
+        return error.MissingTailExpression];
+    // Two impls both claim `from_hex` for `Vec<u8>`, so nothing in the path
+    // chooses between them. Binding either one would emit a call into an
+    // implementation the source never named.
+    switch (lowered.kind) {
+        .unsupported => |marker| try std.testing.expectEqualStrings(
+            "unresolved call",
+            marker.reason,
+        ),
+        else => return error.ExpectedUnsupportedCall,
+    }
+}
+
 test "appendGenericCall uses declared nominal return type for associated calls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9145,6 +9636,7 @@ test "body type paths accept a leading global separator" {
     }
 }
 
+
 test "resolved parent glob exposes body-visible declarations and terminates cycles" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9480,6 +9972,105 @@ test "local collect and flat_map calls use normal method lowering" {
         "flat_map",
         (g.symbol_table.get(flat_map_call.method) orelse return error.ExpectedFlatMapMethod).name,
     );
+}
+
+test "a method turbofish is recorded on the method call node" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    const root_id = try addLookupTestEntity(alloc, &g, .module, "", null, null);
+    const source_id = try addLookupTestEntity(alloc, &g, .struct_, "Source", root_id, null);
+    const fn_id = try addLookupTestEntity(alloc, &g, .fn_, "turbofish_methods", root_id, null);
+    const root_items = try alloc.dupe(spine.EntityId, &.{ source_id, fn_id });
+    try addLookupTestModule(alloc, &g, "", null, true, root_items);
+
+    var source_segments = [_]types.PathSegment{.{ .name = "Source", .id = source_id }};
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    try tables.bodies_list.append(alloc, .none);
+    try tables.bodies_list.append(alloc, .{ .struct_ = .{} });
+    try tables.bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{.{
+            .name = "source",
+            .ty = .{ .path = .{ .segments = &source_segments } },
+            .span = span_of,
+        }},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\fn turbofish_methods(source: Source) {
+        \\    source.parse::<u32>();
+        \\    source.collect::<u8>();
+        \\    source.len();
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const body_id = tables.bodies_list.items[fn_id].fn_.body;
+    const block = switch (tables.exprs_list.items[body_id].kind) {
+        .block => |value| value,
+        else => return error.ExpectedFunctionBlock,
+    };
+    try std.testing.expectEqual(@as(usize, 3), block.statements.len);
+
+    const calls = [_][]const u8{ "parse", "collect", "len" };
+    for (calls, 0..) |expected_name, index| {
+        const statement = switch (tables.stmts_list.items[block.statements[index]].kind) {
+            .expr => |value| value,
+            else => return error.ExpectedExpressionStatement,
+        };
+        const call = switch (tables.exprs_list.items[statement].kind) {
+            .method_call => |value| value,
+            else => return error.ExpectedMethodCall,
+        };
+        try std.testing.expectEqualStrings(
+            expected_name,
+            (g.symbol_table.get(call.method) orelse return error.ExpectedMethodEntity).name,
+        );
+        // The turbofish survives as IR: `::<u32>` and `::<u8>` each carry one
+        // argument, and the unturbofished `.len()` carries none.
+        if (index < 2) {
+            try std.testing.expectEqual(@as(usize, 1), call.generic_args.len);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), call.generic_args.len);
+        }
+    }
+
+    // The two turbofish arguments name different primitives, so the recorded
+    // list is per-call-site state and not one shared node.
+    const parse_statement = switch (tables.stmts_list.items[block.statements[0]].kind) {
+        .expr => |value| value,
+        else => return error.ExpectedExpressionStatement,
+    };
+    const parse_call = switch (tables.exprs_list.items[parse_statement].kind) {
+        .method_call => |value| value,
+        else => return error.ExpectedMethodCall,
+    };
+    try std.testing.expectEqual(types.Prim.u32, parse_call.generic_args[0].prim);
+    const collect_statement = switch (tables.stmts_list.items[block.statements[1]].kind) {
+        .expr => |value| value,
+        else => return error.ExpectedExpressionStatement,
+    };
+    const collect_call = switch (tables.exprs_list.items[collect_statement].kind) {
+        .method_call => |value| value,
+        else => return error.ExpectedMethodCall,
+    };
+    try std.testing.expectEqual(types.Prim.u8, collect_call.generic_args[0].prim);
 }
 
 test "lower bounded flat_map collect chains into canonical iterator IR" {
@@ -9939,4 +10530,228 @@ test "panic and unreachable match arms preserve diverging branch types" {
             else => return error.ExpectedNeverType,
         }
     }
+}
+
+/// A `use_` entity binding `local_name` to a rooted path with no graph entity,
+/// the shape the extractor reads for `use alloc::vec::Vec;`.
+fn addExternalUseTestAlias(
+    alloc: std.mem.Allocator,
+    g: *graph.CrateGraph,
+    parent: spine.EntityId,
+    source_text: []const u8,
+    local_name: []const u8,
+    path: []const []const u8,
+) !spine.EntityId {
+    const use_id = try addLookupTestEntity(alloc, g, .use_, source_text, parent, null);
+    try g.addUse(.{
+        .id = use_id,
+        .kind = .{ .external = .{ .path = try alloc.dupe([]const u8, path) } },
+        .local_name = try alloc.dupe(u8, local_name),
+        .is_pub_export = false,
+        .target = 0,
+        .span = span_of,
+    });
+    return use_id;
+}
+
+/// The type of the first statement of a one-block fn body, for the type-path
+/// tests that assert on a single annotated `let`.
+fn annotatedLetType(tables: *const LookupTestTables, fn_id: spine.EntityId) !types.Type {
+    const body_id = tables.bodies_list.items[fn_id].fn_.body;
+    const block = switch (tables.exprs_list.items[body_id].kind) {
+        .block => |value| value,
+        else => return error.ExpectedFunctionBlock,
+    };
+    const statement = switch (tables.stmts_list.items[block.statements[0]].kind) {
+        .let => |value| value,
+        else => return error.ExpectedLetStatement,
+    };
+    const type_id = statement.ty orelse return error.ExpectedAnnotatedType;
+    return tables.types_list.items[type_id];
+}
+
+test "a type naming an external use alias lowers to that external nominal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    const root_id = try addLookupTestEntity(alloc, &g, .module, "", null, null);
+    const fn_id = try addLookupTestEntity(alloc, &g, .fn_, "alias_type", root_id, null);
+    const use_id = try addExternalUseTestAlias(
+        alloc,
+        &g,
+        root_id,
+        "alloc::vec::Vec",
+        "Vec",
+        &.{ "alloc", "vec", "Vec" },
+    );
+    const root_items = try alloc.dupe(spine.EntityId, &.{ fn_id, use_id });
+    try addLookupTestModule(alloc, &g, "", null, true, root_items);
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    try appendLookupTestBodies(alloc, &g, &tables.bodies_list);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\use alloc::vec::Vec;
+        \\
+        \\fn alias_type() {
+        \\    let v: Vec<u8>;
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const external = switch (try annotatedLetType(&tables, fn_id)) {
+        .external_nominal => |value| value,
+        else => return error.ExpectedExternalNominalType,
+    };
+    try std.testing.expectEqual(@as(usize, 3), external.path.len);
+    try std.testing.expectEqualStrings("alloc", external.path[0]);
+    try std.testing.expectEqualStrings("vec", external.path[1]);
+    try std.testing.expectEqualStrings("Vec", external.path[2]);
+    try std.testing.expectEqual(@as(usize, 1), external.args.len);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, external.args[0]);
+}
+
+test "a scoped type path head bound by an external use alias names that external" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    const root_id = try addLookupTestEntity(alloc, &g, .module, "", null, null);
+    const fn_id = try addLookupTestEntity(alloc, &g, .fn_, "scoped_alias_type", root_id, null);
+    const use_id = try addExternalUseTestAlias(
+        alloc,
+        &g,
+        root_id,
+        "core::iter",
+        "iter",
+        &.{ "core", "iter" },
+    );
+    const root_items = try alloc.dupe(spine.EntityId, &.{ fn_id, use_id });
+    try addLookupTestModule(alloc, &g, "", null, true, root_items);
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    try appendLookupTestBodies(alloc, &g, &tables.bodies_list);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\use core::iter;
+        \\
+        \\fn scoped_alias_type() {
+        \\    let sink: iter::FromIterator<char>;
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const external = switch (try annotatedLetType(&tables, fn_id)) {
+        .external_nominal => |value| value,
+        else => return error.ExpectedExternalNominalType,
+    };
+    try std.testing.expectEqual(@as(usize, 3), external.path.len);
+    try std.testing.expectEqualStrings("core", external.path[0]);
+    try std.testing.expectEqualStrings("iter", external.path[1]);
+    try std.testing.expectEqualStrings("FromIterator", external.path[2]);
+    try std.testing.expectEqual(@as(usize, 1), external.args.len);
+    try std.testing.expectEqual(types.Type{ .prim = .char }, external.args[0]);
+}
+
+test "a bare external crate root is not a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    const root_id = try addLookupTestEntity(alloc, &g, .module, "", null, null);
+    const fn_id = try addLookupTestEntity(alloc, &g, .fn_, "bare_root", root_id, null);
+    const root_items = try alloc.dupe(spine.EntityId, &.{fn_id});
+    try addLookupTestModule(alloc, &g, "", null, true, root_items);
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    try appendLookupTestBodies(alloc, &g, &tables.bodies_list);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\fn bare_root() {
+        \\    let v: std;
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expectError(error.UnresolvedNominalType, extractFunction(&ctx, fn_id));
+}
+
+test "a type argument placeholder lowers to the inference placeholder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    const root_id = try addLookupTestEntity(alloc, &g, .module, "", null, null);
+    const fn_id = try addLookupTestEntity(alloc, &g, .fn_, "inferred_arg", root_id, null);
+    const root_items = try alloc.dupe(spine.EntityId, &.{fn_id});
+    try addLookupTestModule(alloc, &g, "", null, true, root_items);
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    try appendLookupTestBodies(alloc, &g, &tables.bodies_list);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\fn inferred_arg() {
+        \\    let v: core::option::Option<_>;
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const inner = switch (try annotatedLetType(&tables, fn_id)) {
+        .option => |value| value,
+        else => return error.ExpectedOptionType,
+    };
+    const placeholder = switch (inner.*) {
+        .external_nominal => |value| value,
+        else => return error.ExpectedInferencePlaceholderArg,
+    };
+    try std.testing.expectEqual(@as(usize, 1), placeholder.path.len);
+    try std.testing.expectEqualStrings("_", placeholder.path[0]);
+    try std.testing.expectEqual(@as(usize, 0), placeholder.args.len);
 }

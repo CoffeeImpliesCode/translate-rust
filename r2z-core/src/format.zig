@@ -1,5 +1,6 @@
 const std = @import("std");
 const printable = @import("format_printable.zig");
+const alloc = @import("alloc.zig");
 const Mode = enum { display, debug };
 
 pub fn write(writer: *std.Io.Writer, comptime template: []const u8, args: anytype) std.Io.Writer.Error!void {
@@ -35,6 +36,21 @@ pub fn write(writer: *std.Io.Writer, comptime template: []const u8, args: anytyp
         cursor = close + 1;
     }
     if (argument != info.@"struct".fields.len) @compileError("unused Rust format argument");
+}
+
+/// Rust `ToString::to_string`: render `value` through its `Display`
+/// implementation and return the result as owned storage.
+///
+/// This deliberately reuses `write` with the `"{}"` template instead of
+/// introducing a second formatting route: the receiver reaches the same
+/// `Display::fmt` writer every `format!` expansion uses. A partially written
+/// buffer is released by `errdefer`, so a failing `fmt` leaks nothing.
+pub fn toString(gpa: std.mem.Allocator, value: anytype) std.Io.Writer.Error!alloc.String {
+    var writer: std.Io.Writer.Allocating = .init(gpa);
+    errdefer writer.deinit();
+    try write(&writer.writer, "{}", .{value});
+    var bytes: alloc.Vec(u8) = writer.toArrayList();
+    return alloc.String.from_utf8_unchecked(&bytes);
 }
 
 fn writeValue(writer: *std.Io.Writer, value: anytype, comptime mode: Mode) std.Io.Writer.Error!void {
@@ -116,4 +132,47 @@ test "Rust formatting propagates writer failure" {
     var writer: std.Io.Writer = .fixed(&buffer);
     try std.testing.expectError(error.WriteFailed, write(&writer, "abc{}", .{@as(u8, 7)}));
     try std.testing.expectEqualStrings("abc", writer.buffered());
+}
+
+test "toString renders Display output into owned storage" {
+    const Point = struct {
+        x: i32,
+
+        pub fn fmt(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("({d})", .{self.x});
+        }
+    };
+
+    const gpa = std.testing.allocator;
+
+    var rendered = try toString(gpa, Point{ .x = 7 });
+    defer rendered.deinit(gpa);
+    try std.testing.expectEqualStrings("(7)", rendered.as_str());
+
+    // A `&str` receiver copies its bytes; the borrow is not retained.
+    var copied = try toString(gpa, "borrowed");
+    defer copied.deinit(gpa);
+    try std.testing.expectEqualStrings("borrowed", copied.as_str());
+
+    // An empty render is an empty owned string, never a null or undefined
+    // slice pointer.
+    var empty = try toString(gpa, "");
+    defer empty.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), empty.len());
+    try std.testing.expectEqualStrings("", empty.as_bytes());
+}
+
+test "toString frees the partial buffer when Display fails part-way" {
+    const HalfWritten = struct {
+        pub fn fmt(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("partial");
+            return error.WriteFailed;
+        }
+    };
+
+    // `std.testing.allocator` fails the test if the half-built buffer leaks.
+    try std.testing.expectError(
+        error.WriteFailed,
+        toString(std.testing.allocator, HalfWritten{}),
+    );
 }

@@ -332,6 +332,15 @@ pub const Pattern = union(enum) {
     enum_literal: []const u8,
     tuple: []const Pattern,
     struct_pat: StructPattern,
+    range_pat: RangePattern,
+};
+
+/// A `lo..hi` or `lo..=hi` pattern, emitted as a Zig `switch` prong.
+/// A null bound is unbounded on that side.
+pub const RangePattern = struct {
+    lo: ?Literal = null,
+    hi: ?Literal = null,
+    inclusive: bool = true,
 };
 
 pub const StructPattern = struct {
@@ -522,6 +531,7 @@ pub const ValidationError = error{
     EmptyTranslatedFunction,
     EmptyTranslatedBody,
     EmptyTranslatedContainer,
+    EmptyRootFile,
     UnnamedMatchSelector,
     MissingTypedLiteralIdentity,
     UnsupportedTranslationNode,
@@ -769,6 +779,11 @@ fn sameOptionalString(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
+fn sameOptionalLiteral(left: ?Literal, right: ?Literal) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return sameLiteral(left.?, right.?);
+}
+
 fn sameStringSlice(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
     for (left, right) |left_string, right_string| {
@@ -837,6 +852,12 @@ fn samePattern(left: Pattern, right: Pattern) bool {
             const other = right.struct_pat;
             return sameOptionalString(struct_pattern.name, other.name) and
                 sameStructPatternFieldSlice(struct_pattern.fields, other.fields);
+        },
+        .range_pat => |range_pattern| {
+            const other = right.range_pat;
+            return range_pattern.inclusive == other.inclusive and
+                sameOptionalLiteral(range_pattern.lo, other.lo) and
+                sameOptionalLiteral(range_pattern.hi, other.hi);
         },
     };
 }
@@ -1004,39 +1025,28 @@ fn sameExpr(left: Expr, right: Expr) bool {
     };
 }
 
-const ScalarPointeeLayout = enum {
-    byte_1,
-    byte_2,
-    byte_4,
-    byte_8,
-    byte_16,
-    pointer,
-};
-
-fn scalarPointeeLayout(primitive: Prim) ?ScalarPointeeLayout {
-    return switch (primitive) {
-        .u8, .i8, .bool => .byte_1,
-        .u16, .i16 => .byte_2,
-        .u21, .u32, .i32, .f32 => .byte_4,
-        .u64, .i64, .f64 => .byte_8,
-        .u128, .i128 => .byte_16,
-        .usize, .isize => .pointer,
-        .void_type, .noreturn_type, .type_type, .anyerror_type => null,
+/// A raw-pointer cast reinterprets one address under a different pointee; it
+/// never allocates or narrows. `lowerType` spells every raw pointer
+/// `[*]align(1) T`, so neither side can raise alignment and the `@ptrCast`
+/// around the operand is legal at any pointee width.
+///
+/// The one combination Zig refuses is a change of pointer *width*: a pointer
+/// to an unsized type is fat, and a thin pointer cannot `@ptrCast` into one
+/// (`cannot infer length of slice from many pointer`).
+///
+/// This mirrors `lower.pointerPointeesCompatible`, which admits exactly the
+/// same casts. The two must stay in step: this one runs at emit time, so a
+/// cast admitted by the lowerer and refused here would translate to a
+/// validation failure instead of source.
+fn pointerPointeeIsSized(pointee: Type) bool {
+    return switch (pointee) {
+        .slice => false,
+        else => true,
     };
 }
 
 fn pointerPointeesCompatible(source: Type, target: Type) bool {
-    return switch (source) {
-        .prim => |source_primitive| switch (target) {
-            .prim => |target_primitive| {
-                const source_layout = scalarPointeeLayout(source_primitive) orelse return false;
-                const target_layout = scalarPointeeLayout(target_primitive) orelse return false;
-                return source_layout == target_layout;
-            },
-            else => false,
-        },
-        else => false,
-    };
+    return pointerPointeeIsSized(source) and pointerPointeeIsSized(target);
 }
 fn validPointerCastShape(source: Ptr, target: Ptr, operand: Expr) bool {
     const pointer_cast = switch (operand) {
@@ -1079,6 +1089,8 @@ fn patternContainsBinding(pattern: Pattern) bool {
             }
             return false;
         },
+        // A range prong can only ever be a range: it binds nothing.
+        .range_pat => false,
     };
 }
 
@@ -1109,6 +1121,13 @@ fn validatePattern(pattern: Pattern) ValidationError!void {
                 try validateFieldName(field.name);
                 try validatePattern(field.pat);
             }
+        },
+        .range_pat => |range_pat| {
+            // A range with neither bound is a catch-all, which must be spelled
+            // `_` so the match keeps an explicit fallback prong.
+            if (range_pat.lo == null and range_pat.hi == null) return error.UnnamedMatchSelector;
+            if (range_pat.lo) |lo| try validateLiteral(lo);
+            if (range_pat.hi) |hi| try validateLiteral(hi);
         },
     }
 }
@@ -1220,9 +1239,11 @@ fn validateExpr(expr: Expr) ValidationError!void {
         },
         .unary_op => |unary_op| try validateExpr(unary_op.operand.*),
         .struct_init => |struct_init| {
-            if (struct_init.fields.len > 0 and struct_init.type_name == null) {
-                return error.MissingTypedLiteralIdentity;
-            }
+            // A null type name is a Zig anonymous struct literal, which the
+            // emitter writes as `.{ .field = .. }`. That is required, not
+            // accidental, when the literal is the payload of a tagged union
+            // field declared with named fields: the field's type IS an
+            // anonymous struct, so the payload must be one too.
             if (struct_init.type_name) |type_name| try validateType(type_name);
             for (struct_init.fields) |field| {
                 try validateFieldName(field.name);
@@ -1415,14 +1436,23 @@ pub fn validateForTranslation(pkg: *const Package) ValidationError!void {
     if (pkg.fingerprint == null) return error.MissingFingerprint;
 
     var root_count: usize = 0;
+    var root_decl_count: usize = 0;
     for (pkg.files, 0..) |file, index| {
         try validateFileForTranslation(&file);
-        if (std.mem.eql(u8, file.path, "src/root.zig")) root_count += 1;
+        if (std.mem.eql(u8, file.path, "src/root.zig")) {
+            root_count += 1;
+            root_decl_count += file.decls.len;
+        }
         for (pkg.files[index + 1 ..]) |other| {
             if (std.mem.eql(u8, file.path, other.path)) return error.DuplicateFilePath;
         }
     }
     if (root_count != 1) return error.MissingRootFile;
+    // A root that declares nothing is not a translation: the package still
+    // links and its own `zig build test` still passes on a zero-test binary,
+    // so the emptiness has to be rejected before promotion, not reported as
+    // a successful run.
+    if (root_decl_count == 0) return error.EmptyRootFile;
     if (normalizedNameEqual(pkg.name, "r2z-core")) {
         return error.DuplicateDependencyName;
     }
@@ -1497,13 +1527,12 @@ test "ast validation: rejects empty functions, containers, match selectors, and 
     } };
     try std.testing.expectError(error.UnnamedMatchSelector, validateExpr(unnamed_match));
 
-    const untyped_literal: Expr = .{ .struct_init = .{
+    // An anonymous struct literal is valid, not a missing identity: it is how a
+    // named-field enum variant payload reaches Zig.
+    const anonymous_payload: Expr = .{ .struct_init = .{
         .fields = &.{.{ .name = "value", .expr = .{ .lit = .{ .int = 1 } } }},
     } };
-    try std.testing.expectError(
-        error.MissingTypedLiteralIdentity,
-        validateExpr(untyped_literal),
-    );
+    try validateExpr(anonymous_payload);
 
     const untyped_array: Expr = .{ .multi_array = .{
         .elements = &.{.{ .lit = .{ .int = 1 } }},
@@ -1763,4 +1792,136 @@ test "slice casts preserve borrowed element type and mutability" {
     try validateExpr(expression);
     expression.cast.target.slice.elem = &word;
     try std.testing.expectError(error.UnsupportedTranslationNode, validateExpr(expression));
+}
+
+// A raw-pointer cast reinterprets the address, so the pointee width is free
+// to change. `utils.rs` in xxhash-rust casts a `*const u8` cursor to the
+// caller's `*const T`, where `T` is a generic parameter; both sides lower to
+// `[*]align(1) …`, so this must validate. A slice pointee is fat and must not.
+// This is the emit-time half of the pair guarded by
+// `lower.pointerPointeesCompatible`; both must admit the same casts.
+test "pointer casts reinterpret across pointee widths but not into a fat pointer" {
+    const byte: Type = .{ .prim = .u8 };
+    const word: Type = .{ .prim = .u32 };
+    const fat: Type = .{ .slice = .{ .elem = &byte, .is_const = true } };
+    const operand: Expr = .{ .builtin = .{
+        .name = "ptrCast",
+        .args = &.{.{ .ident = "cursor" }},
+    } };
+
+    // A generic parameter lowers to a bare name, not a primitive.
+    const type_param: Type = .{ .named = "T" };
+    var expression: Expr = .{ .cast = .{
+        .target = .{ .ptr = .{
+            .elem = &type_param,
+            .size = .many,
+            .is_const = true,
+            .alignment = 1,
+        } },
+        .source = .{ .ptr = .{ .elem = &byte, .size = .many, .is_const = true, .alignment = 1 } },
+        .operand = &operand,
+    } };
+    try validateExpr(expression);
+
+    // Widening the pointee to a wider scalar is still a reinterpret.
+    expression.cast.target.ptr.elem = &word;
+    try validateExpr(expression);
+
+    // Widening it to an unsized type is not: that pointer is fat.
+    expression.cast.target.ptr.elem = &fat;
+    try std.testing.expectError(error.UnsupportedTranslationNode, validateExpr(expression));
+}
+
+test "ast validation: rejects a package whose root file declares nothing" {
+    // `test/crates/xxhash-rust` lowers to this shape: the package links,
+    // `zig build test` passes on a zero-test binary, and the run is reported
+    // as a translation while the promoted `src/root.zig` is 0 bytes.
+    const bare_root: File = .{ .path = "src/root.zig" };
+    try std.testing.expectError(
+        error.EmptyRootFile,
+        validateForTranslation(&.{
+            .name = "empty_root",
+            .fingerprint = 0x1,
+            .files = &.{bare_root},
+        }),
+    );
+
+    // Imports and translated tests are not declarations of their own: a root
+    // carrying only those still exposes nothing to link against.
+    const imports_only: File = .{
+        .path = "src/root.zig",
+        .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+    };
+    try std.testing.expectError(
+        error.EmptyRootFile,
+        validateForTranslation(&.{
+            .name = "imports_only",
+            .fingerprint = 0x2,
+            .files = &.{imports_only},
+        }),
+    );
+
+    const tests_only: File = .{
+        .path = "src/root.zig",
+        .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+        .tests = &.{.{
+            .name = "regression",
+            .body = .{ .expr = &Expr{ .continue_expr = {} } },
+        }},
+    };
+    try std.testing.expectError(
+        error.EmptyRootFile,
+        validateForTranslation(&.{
+            .name = "tests_only",
+            .fingerprint = 0x3,
+            .files = &.{tests_only},
+        }),
+    );
+
+    // Declarations in a sibling file do not rescue a root that is empty.
+    const util_file: File = .{
+        .path = "src/util.zig",
+        .decls = &.{.{ .const_decl = .{
+            .name = "util",
+            .init = Expr{ .lit = .{ .int = 1 } },
+        } }},
+    };
+    try std.testing.expectError(
+        error.EmptyRootFile,
+        validateForTranslation(&.{
+            .name = "sibling_only",
+            .fingerprint = 0x4,
+            .files = &.{ bare_root, util_file },
+        }),
+    );
+}
+
+test "ast validation: accepts a declared root that has no translated tests" {
+    // `test/crates/mini` is testless yet complete: it declares
+    // `pub const util` and `pub const helper`. Zero tests must not be
+    // mistaken for zero declarations.
+    const declared_root: File = .{
+        .path = "src/root.zig",
+        .decls = &.{
+            .{ .const_decl = .{ .name = "util", .init = Expr{ .lit = .{ .int = 1 } } } },
+            .{ .const_decl = .{ .name = "helper", .init = Expr{ .lit = .{ .int = 2 } } } },
+        },
+    };
+    try validateForTranslation(&.{
+        .name = "testless_crate",
+        .fingerprint = 0xabcd,
+        .files = &.{declared_root},
+    });
+
+    // A single declaration is enough; the rule is "declares nothing", not
+    // "declares little".
+    try validateForTranslation(&.{
+        .name = "single_decl_crate",
+        .fingerprint = 0xbcde,
+        .files = &.{.{ .path = "src/root.zig", .decls = &.{.{ .fn_decl = .{
+            .name = "run",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .expr = &Expr{ .continue_expr = {} } },
+        } }} }},
+    });
 }

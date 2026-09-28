@@ -159,6 +159,24 @@ pub fn build(b: *std.Build) void {
     const generate_fnv_golden_cmd = b.addRunArtifact(fnv_golden_generator);
     generate_fnv_golden_step.dependOn(&generate_fnv_golden_cmd.step);
 
+    const hex_golden_generator = b.addExecutable(.{
+        .name = "generate-hex-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_hex_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_hex_golden_step = b.step(
+        "generate-hex-golden",
+        "Regenerate hex source goldens from validated canonical IR",
+    );
+    const generate_hex_golden_cmd = b.addRunArtifact(hex_golden_generator);
+    generate_hex_golden_step.dependOn(&generate_hex_golden_cmd.step);
+
     // `zig build source` translates the complete mini source fixture and
     // checks that staged promotion publishes the generated package.
     const source_step = b.step("source", "Translate the complete mini source fixture");
@@ -240,6 +258,32 @@ pub fn build(b: *std.Build) void {
 
     // ── unit tests (one artifact per module, per house convention) ──
     const test_step = b.step("test", "Run unit tests");
+
+    // ── dead-source guard ───────────────────────────────────────────────
+    // Zig only type-checks files inside some root's import graph, so a
+    // `src/` file that no test root reaches is never compiled at all: its
+    // tests do not run, and its type errors stay invisible. The walk runs at
+    // configure time; only `check-sources` (and therefore `test`) fails on
+    // what it finds.
+    unreachable_sources = findUnreachableSources(b.graph.io, b.allocator) catch |err| {
+        std.log.err("check-sources: {s}", .{@errorName(err)});
+        @panic("check-sources: reachability walk failed");
+    };
+    const check_sources_step = b.step(
+        "check-sources",
+        "Fail when a src/**/*.zig file is reachable from no test root",
+    );
+    if (unreachable_sources.len != 0) {
+        check_sources_step.makeFn = struct {
+            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+                for (unreachable_sources) |path| {
+                    std.debug.print("check-sources: unreachable from every test root: {s}\n", .{path});
+                }
+                return error.DeadSources;
+            }
+        }.make;
+    }
+    test_step.dependOn(check_sources_step);
 
     const lib_tests = b.addTest(.{ .root_module = translate_rust });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
@@ -342,4 +386,125 @@ pub fn build(b: *std.Build) void {
     });
     const docs_step = b.step("docs", "Generate documentation");
     docs_step.dependOn(&install_docs.step);
+}
+
+// ---------------------------------------------------------------------------
+// Dead-source guard
+// ---------------------------------------------------------------------------
+
+/// `src/` files that no build root reaches, computed at configure time.
+var unreachable_sources: []const []const u8 = &.{};
+
+/// Every file the build graph compiles a test or artifact from. A `src/` file
+/// is compiled if and only if one of these reaches it through `@import`.
+const source_roots = [_][]const u8{
+    "src/root.zig",
+    "src/main.zig",
+    "src/ir/serialize_test.zig",
+    "src/backend/zig/serialize_test.zig",
+    "test/generate_mini_wire.zig",
+    "test/generate_fnv_golden.zig",
+    "test/generate_hex_golden.zig",
+    "test/e2e_test.zig",
+    "test/golden_test.zig",
+};
+
+/// Project modules, mapped to the root file that defines them. Names outside
+/// this table (`std`, `tree_sitter`, `rust`, `serde`) are not ours to walk.
+const module_roots = [_]struct { name: []const u8, path: []const u8 }{
+    .{ .name = "translate_rust", .path = "src/root.zig" },
+    .{ .name = "translate_rust.rust", .path = "src/rust.zig" },
+    .{ .name = "translate_rust.model", .path = "src/model/root.zig" },
+    .{ .name = "translate_rust.ir", .path = "src/ir/root.zig" },
+    .{ .name = "translate_rust.frontend", .path = "src/frontend/root.zig" },
+    .{ .name = "translate_rust.backend", .path = "src/backend/root.zig" },
+    .{ .name = "translate_rust.driver", .path = "src/driver/root.zig" },
+};
+
+const unreachable_limit = 8 << 20;
+
+/// The quoted operand of every `@import("...")` in `source`, as slices into
+/// `source`.
+fn importTargets(allocator: std.mem.Allocator, source: []const u8) ![][]const u8 {
+    const needle = "@import(\"";
+    var targets: std.ArrayListUnmanaged([]const u8) = .empty;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, needle)) |start| {
+        const name_start = start + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, source, name_start, '"') orelse break;
+        try targets.append(allocator, source[name_start..end]);
+        cursor = end + 1;
+    }
+    return targets.items;
+}
+
+/// Resolve one `@import` operand seen in `from` to a project file, or null
+/// when it names a module this build does not own.
+fn resolveImport(
+    allocator: std.mem.Allocator,
+    from: []const u8,
+    target: []const u8,
+) !?[]const u8 {
+    if (std.mem.endsWith(u8, target, ".zig")) {
+        const dir = std.fs.path.dirname(from) orelse ".";
+        return try std.fs.path.join(allocator, &.{ dir, target });
+    }
+    for (module_roots) |module| {
+        if (std.mem.eql(u8, module.name, target)) return module.path;
+    }
+    if (std.mem.startsWith(u8, target, "translate_rust")) {
+        std.log.err("check-sources: '{s}' imports unknown module '{s}'", .{ from, target });
+        return error.UnknownModule;
+    }
+    return null;
+}
+
+fn byPath(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Every `src/**/*.zig` file no build root reaches through `@import`.
+fn findUnreachableSources(io: std.Io, gpa: std.mem.Allocator) ![][]const u8 {
+    var present: std.StringHashMapUnmanaged(void) = .empty;
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walk(gpa);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+            try present.put(gpa, try std.fmt.allocPrint(gpa, "src/{s}", .{entry.path}), {});
+        }
+    }
+
+    var reached: std.StringHashMapUnmanaged(void) = .empty;
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (source_roots) |root| {
+        try reached.put(gpa, root, {});
+        try queue.append(gpa, root);
+    }
+    while (queue.pop()) |path| {
+        const source = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            gpa,
+            .limited(unreachable_limit),
+        );
+        for (try importTargets(gpa, source)) |target| {
+            const resolved = (try resolveImport(gpa, path, target)) orelse continue;
+            if (!present.contains(resolved)) continue;
+            if (reached.contains(resolved)) continue;
+            try reached.put(gpa, resolved, {});
+            try queue.append(gpa, resolved);
+        }
+    }
+
+    var dead: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = present.keyIterator();
+    while (it.next()) |key| {
+        if (!reached.contains(key.*)) try dead.append(gpa, key.*);
+    }
+    std.mem.sort([]const u8, dead.items, {}, byPath);
+    return dead.items;
 }

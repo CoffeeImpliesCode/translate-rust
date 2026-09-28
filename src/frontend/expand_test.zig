@@ -2452,6 +2452,91 @@ test "pipeline resolves chained const method initializers" {
     try std.testing.expectEqual(controls_id, base.def);
 }
 
+/// The value expression of a function whose body is a block with a tail.
+fn fnBodyTail(rust_ir: *const ir.RustIr, fn_id: ir.spine.EntityId) exprs.NodeId {
+    const body_id = switch (rust_ir.bodies.bodies[fn_id]) {
+        .fn_ => |body| body.body,
+        else => return 0,
+    };
+    const block = switch (rust_ir.bodies.exprs[body_id].kind) {
+        .block => |value| value,
+        else => return body_id,
+    };
+    return block.tail orelse 0;
+}
+
+test "pipeline lowers a unit enum variant path to an enum_variant value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source =
+        \\pub enum Signal {
+        \\    Stop,
+        \\    Level(u8),
+        \\}
+        \\pub fn stop() -> Signal {
+        \\    Signal::Stop
+        \\}
+    ;
+
+    const rust_ir = try pipeline.analyzeSource(allocator, "unit_variant_path", "2021", source);
+    try ir.validateForTranslation(&rust_ir);
+    const signal_id = findEntityId(&rust_ir.graph, .enum_, "Signal") orelse
+        return error.TestUnexpectedResult;
+    const stop_id = findEntityId(&rust_ir.graph, .fn_, "stop") orelse
+        return error.TestUnexpectedResult;
+    const body_id = fnBodyTail(&rust_ir, stop_id);
+    // A unit variant is a value in Rust, so the path must not survive as a
+    // bare path naming the enum type.
+    const variant = switch (rust_ir.bodies.exprs[body_id].kind) {
+        .enum_variant => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(signal_id, variant.def);
+    try std.testing.expectEqualStrings("Stop", variant.variant);
+    try std.testing.expectEqual(@as(usize, 0), variant.tuple_fields.len);
+    try std.testing.expectEqual(@as(usize, 0), variant.named_fields.len);
+}
+
+test "pipeline lowers a unit variant payload wrapped in Result::Err" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source =
+        \\pub enum Signal {
+        \\    Stop,
+        \\    Level(u8),
+        \\}
+        \\pub fn stop() -> Result<u8, Signal> {
+        \\    Err(Signal::Stop)
+        \\}
+    ;
+
+    const rust_ir = try pipeline.analyzeSource(allocator, "unit_variant_payload", "2021", source);
+    try ir.validateForTranslation(&rust_ir);
+    const signal_id = findEntityId(&rust_ir.graph, .enum_, "Signal") orelse
+        return error.TestUnexpectedResult;
+    const stop_id = findEntityId(&rust_ir.graph, .fn_, "stop") orelse
+        return error.TestUnexpectedResult;
+    const body_id = fnBodyTail(&rust_ir, stop_id);
+    const wrapper = switch (rust_ir.bodies.exprs[body_id].kind) {
+        .enum_variant => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("Err", wrapper.variant);
+    try std.testing.expectEqual(@as(usize, 1), wrapper.tuple_fields.len);
+    const payload_id = wrapper.tuple_fields[0];
+    if (payload_id >= rust_ir.bodies.exprs.len) return error.TestUnexpectedResult;
+    const payload = switch (rust_ir.bodies.exprs[payload_id].kind) {
+        .enum_variant => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(signal_id, payload.def);
+    try std.testing.expectEqualStrings("Stop", payload.variant);
+    try std.testing.expectEqual(@as(usize, 0), payload.tuple_fields.len);
+    try std.testing.expectEqual(@as(usize, 0), payload.named_fields.len);
+}
+
 test "expression macro captures retain whitespace before delimiters" {
     const alloc = std.testing.allocator;
     var definition = try expand.parseMacroRulesDefinition(alloc, "macro_rules! pick { ($buf:expr, $index:expr, $ty:ident) => { ($buf[$index] as $ty) }; }");

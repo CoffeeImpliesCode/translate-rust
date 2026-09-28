@@ -105,10 +105,31 @@ fn rejectWorkspaceValue(value: serde.toml.Value) !void {
     }
 }
 
+/// A `[target.*]` table only reaches a translated library through real
+/// dependencies or build scripts. Dev-dependencies never enter a generated
+/// package, so a target table whose sub-tables are all `dev-dependencies`
+/// carries nothing that affects the translation.
+fn targetTableIsDevOnly(targets: serde.toml.Table) bool {
+    var target_iterator = targets.iterator();
+    while (target_iterator.next()) |target| {
+        const sections = switch (target.value_ptr.*) {
+            .table => |table| table,
+            else => return false,
+        };
+        var section_iterator = sections.iterator();
+        while (section_iterator.next()) |section| {
+            if (!std.mem.eql(u8, section.key_ptr.*, "dev-dependencies")) return false;
+        }
+    }
+    return true;
+}
+
 fn rejectUnsupportedDependencySections(root: *const serde.toml.Table) !void {
-    for ([_][]const u8{ "build-dependencies", "target" }) |key| {
-        if (root.get(key)) |value| {
-            if (std.mem.eql(u8, key, "target")) _ = try tomlTable(value);
+    if (root.get("build-dependencies")) |_| {
+        return error.CargoManifestUnsupportedDependencySection;
+    }
+    if (root.get("target")) |value| {
+        if (!targetTableIsDevOnly(try tomlTable(value))) {
             return error.CargoManifestUnsupportedDependencySection;
         }
     }
@@ -372,6 +393,67 @@ fn parseFeatures(
     }
     if (list.items.len == 0) return &.{};
     return list.toOwnedSlice(allocator);
+}
+
+fn featureNamePresent(names: []const []const u8, name: []const u8) bool {
+    for (names) |entry| {
+        if (std.mem.eql(u8, entry, name)) return true;
+    }
+    return false;
+}
+
+/// Append the transitive closure of `root` to `out`, breadth-first in
+/// declaration order and without repeats. A separate seen list, seeded with
+/// the root's own name, makes a feature list that references itself or a
+/// sibling terminate instead of looping. A member naming a feature the
+/// manifest never declares is still selected — cargo would have enabled it
+/// too — but it expands to nothing.
+fn appendFeatureClosure(
+    allocator: std.mem.Allocator,
+    features: []const Feature,
+    root: Feature,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen.deinit(allocator);
+    var pending: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer pending.deinit(allocator);
+
+    try seen.append(allocator, root.name);
+    try pending.appendSlice(allocator, root.members);
+
+    var cursor: usize = 0;
+    while (cursor < pending.items.len) : (cursor += 1) {
+        const name = pending.items[cursor];
+        if (featureNamePresent(seen.items, name)) continue;
+        try seen.append(allocator, name);
+        if (!featureNamePresent(out.items, name)) try out.append(allocator, name);
+        for (features) |feature| {
+            if (!std.mem.eql(u8, feature.name, name)) continue;
+            try pending.appendSlice(allocator, feature.members);
+            break;
+        }
+    }
+}
+
+/// Resolve the manifest's `default` feature into the set a translation runs
+/// with. This is what `cargo build` enables with no `--features` flag, and
+/// without it every `#[cfg(feature = ...)]` item drops out of the crate.
+/// Returned names alias `features`; the caller owns the returned slice. A
+/// manifest with no `default` feature resolves to the empty set.
+pub fn defaultFeatureClosure(
+    allocator: std.mem.Allocator,
+    features: []const Feature,
+) ![]const []const u8 {
+    for (features) |feature| {
+        if (!std.mem.eql(u8, feature.name, "default")) continue;
+        var closure: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer closure.deinit(allocator);
+        try appendFeatureClosure(allocator, features, feature, &closure);
+        if (closure.items.len == 0) return &.{};
+        return closure.toOwnedSlice(allocator);
+    }
+    return &.{};
 }
 
 /// Parse Cargo.toml with serde.zig's TOML parser.
@@ -915,4 +997,128 @@ test "loadCrateManifest rejects a missing configured root" {
         error.CargoManifestConfiguredRootSourceNotFound,
         loadCrateManifest(allocator, io, root),
     );
+}
+
+test "parseManifestContent accepts a dev-only target table" {
+    const testing = std.testing;
+    const toml =
+        \\[package]
+        \\name = "consumer"
+        \\
+        \\[target.'cfg(unix)'.dev-dependencies]
+        \\unix_test_dep = "2"
+        \\
+        \\[target.'cfg(windows)'.dev-dependencies]
+        \\windows_test_dep = "3"
+    ;
+
+    const parsed = try parseManifestContent(testing.allocator, toml);
+    defer deinitParsedManifest(testing.allocator, parsed);
+
+    try testing.expectEqualStrings("consumer", parsed.name);
+    try testing.expectEqual(@as(usize, 0), parsed.dependencies.len);
+    try testing.expectEqual(@as(usize, 0), parsed.dev_dependencies.len);
+}
+
+test "parseManifestContent rejects a target table that carries real dependencies" {
+    const cases = [_][]const u8{
+        // A dev-dependency section is inert on its own, but the real
+        // dependency table beside it is not.
+        \\[package]
+        \\name = "consumer"
+        \\[target.'cfg(unix)'.dev-dependencies]
+        \\test_dep = "2"
+        \\[target.'cfg(unix)'.dependencies]
+        \\helper = "1"
+        ,
+        // Build scripts run for the host, so they are real everywhere.
+        \\[package]
+        \\name = "consumer"
+        \\[target.'cfg(unix)'.build-dependencies]
+        \\builder = "1"
+        ,
+        // A target sub-table with a non-section key is not a dev-only table.
+        \\[package]
+        \\name = "consumer"
+        \\[target.'cfg(unix)']
+        \\helper = "1"
+        ,
+    };
+
+    for (cases) |content| {
+        try std.testing.expectError(
+            error.CargoManifestUnsupportedDependencySection,
+            parseManifestContent(std.testing.allocator, content),
+        );
+    }
+}
+
+test "defaultFeatureClosure resolves the transitive default feature set" {
+    const testing = std.testing;
+    const toml =
+        \\[package]
+        \\name = "consumer"
+        \\
+        \\[features]
+        \\default = ["alloc", "serde"]
+        \\alloc = ["alloc_impl"]
+        \\alloc_impl = []
+        \\serde = ["alloc_impl", "alloc"]
+        \\unused = ["alloc_impl"]
+    ;
+
+    const parsed = try parseManifestContent(testing.allocator, toml);
+    defer deinitParsedManifest(testing.allocator, parsed);
+
+    const closure = try defaultFeatureClosure(testing.allocator, parsed.features);
+    defer testing.allocator.free(closure);
+
+    // Breadth-first in declaration order. `serde` re-listing `alloc` and
+    // `alloc_impl` must not duplicate them, and `unused` is unreachable.
+    try testing.expectEqual(@as(usize, 3), closure.len);
+    try testing.expectEqualStrings("alloc", closure[0]);
+    try testing.expectEqualStrings("serde", closure[1]);
+    try testing.expectEqualStrings("alloc_impl", closure[2]);
+}
+
+test "defaultFeatureClosure terminates on a mutually referencing feature list" {
+    const testing = std.testing;
+    const toml =
+        \\[package]
+        \\name = "consumer"
+        \\
+        \\[features]
+        \\default = ["alpha"]
+        \\alpha = ["beta"]
+        \\beta = ["alpha"]
+    ;
+
+    const parsed = try parseManifestContent(testing.allocator, toml);
+    defer deinitParsedManifest(testing.allocator, parsed);
+
+    const closure = try defaultFeatureClosure(testing.allocator, parsed.features);
+    defer testing.allocator.free(closure);
+
+    try testing.expectEqual(@as(usize, 2), closure.len);
+    try testing.expectEqualStrings("alpha", closure[0]);
+    try testing.expectEqualStrings("beta", closure[1]);
+}
+
+test "defaultFeatureClosure is empty without a default feature" {
+    const testing = std.testing;
+    const toml =
+        \\[package]
+        \\name = "consumer"
+        \\
+        \\[features]
+        \\alloc = ["alloc_impl"]
+        \\alloc_impl = []
+    ;
+
+    const parsed = try parseManifestContent(testing.allocator, toml);
+    defer deinitParsedManifest(testing.allocator, parsed);
+
+    const closure = try defaultFeatureClosure(testing.allocator, parsed.features);
+    defer testing.allocator.free(closure);
+    try testing.expectEqual(@as(usize, 0), closure.len);
 }

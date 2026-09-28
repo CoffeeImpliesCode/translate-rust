@@ -149,6 +149,49 @@ pub const std_types: []const TypeInfo = &.{
             "new", "pin", "leak", "into_raw", "from_raw",
         },
     },
+    .{
+        .name = "HashMap",
+        .kind = .struct_,
+        .variants = &.{},
+        .methods = &.{
+            "new",                      "with_capacity",
+            "with_capacity_and_hasher", "with_hasher",
+            "insert",                   "get",
+            "get_mut",                  "get_key_value",
+            "get_key_ptr",              "contains_key",
+            "contains_value",           "remove",
+            "remove_entry",             "len",
+            "is_empty",                 "clear",
+            "entry",                    "entry_or_default",
+            "keys",                     "values",
+            "values_mut",               "iter",
+            "iter_mut",                 "into_iter",
+            "extend",                   "reserve",
+            "retain",                   "capacity",
+            "shrink_to_fit",            "get_or_insert",
+        },
+    },
+    .{
+        .name = "HashSet",
+        .kind = .struct_,
+        .variants = &.{},
+        .methods = &.{
+            "new",                      "with_capacity",
+            "with_capacity_and_hasher", "with_hasher",
+            "insert",                   "contains",
+            "remove",                   "take",
+            "replace",                  "get_or_insert",
+            "len",                      "is_empty",
+            "clear",                    "iter",
+            "into_iter",                "extend",
+            "reserve",                  "retain",
+            "union",                    "intersection",
+            "difference",               "symmetric_difference",
+            "is_subset",                "is_superset",
+            "is_disjoint",              "capacity",
+            "shrink_to_fit",
+        },
+    },
 };
 
 const zero_span: spine.Span = .{
@@ -386,6 +429,25 @@ test "initStdModel populates standard types" {
     const box_ent = maybe_box.?;
     try std.testing.expectEqual(spine.EntityKind.struct_, box_ent.kind);
     try std.testing.expect(findMethod(&g, box_ent.id, "new") != null);
+
+    // Hash containers: registered so method resolution can see the
+    // `HashMap`/`HashSet` surface a translated crate calls. The lowering
+    // keeps the `BuildHasher` the source named, so `insert`/`get` must stay
+    // resolvable by name, not be erased as "unknown std type".
+    const maybe_map = findType(&g, "HashMap");
+    try std.testing.expect(maybe_map != null);
+    const map_ent = maybe_map.?;
+    try std.testing.expectEqual(spine.EntityKind.struct_, map_ent.kind);
+    try std.testing.expect(findMethod(&g, map_ent.id, "insert") != null);
+    try std.testing.expect(findMethod(&g, map_ent.id, "get") != null);
+    try std.testing.expect(findMethod(&g, map_ent.id, "entry") != null);
+
+    const maybe_set = findType(&g, "HashSet");
+    try std.testing.expect(maybe_set != null);
+    const set_ent = maybe_set.?;
+    try std.testing.expectEqual(spine.EntityKind.struct_, set_ent.kind);
+    try std.testing.expect(findMethod(&g, set_ent.id, "insert") != null);
+    try std.testing.expect(findMethod(&g, set_ent.id, "contains") != null);
 }
 
 test "findEntity returns null for nonexistent symbol" {

@@ -107,6 +107,10 @@ pub const ImplBody = struct {
 /// Body of a type alias definition.
 pub const TypeAliasBody = struct {
     target: types.Type,
+    /// Ordered Rust type parameter names declared by the alias, owned by the
+    /// frontend arena. The target may name them, so binding and validation
+    /// need the names alongside the type.
+    generic_params: []const []const u8 = &.{},
 };
 /// Per-entity body selector. Indexed by spine.EntityId.
 pub const BodyKind = union(enum) {

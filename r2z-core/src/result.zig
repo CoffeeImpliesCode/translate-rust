@@ -1,4 +1,5 @@
 const std = @import("std");
+const panic_probe = @import("panic_probe.zig");
 
 pub fn invokeMapper(
     comptime Input: type,
@@ -23,6 +24,59 @@ pub fn invokeMapper(
     };
 }
 
+/// True when dropping a value of `T` without an explicit release abandons
+/// storage the runtime owns.
+///
+/// A slice, or an aggregate holding one, is the only way a value can own
+/// storage: r2z threads every allocator explicitly, so a payload carries no
+/// allocator of its own. Everything else is a scalar or a borrowed view that
+/// dropping costs nothing.
+fn ownsStorage(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| if (pointer.size == .slice)
+            true
+        else
+            ownsStorage(pointer.child),
+        .array => |array| ownsStorage(array.child),
+        .optional => |optional| ownsStorage(optional.child),
+        .@"struct" => |structure| fields: {
+            for (structure.fields) |field| {
+                if (ownsStorage(field.type)) break :fields true;
+            }
+            break :fields false;
+        },
+        .@"union" => |union_type| fields: {
+            for (union_type.fields) |field| {
+                if (ownsStorage(field.type)) break :fields true;
+            }
+            break :fields false;
+        },
+        else => false,
+    };
+}
+
+/// True when `T` publishes the allocator-free release hook: a `deinit`
+/// taking nothing but the payload itself.
+fn hasSelfRelease(comptime T: type) bool {
+    if (!@hasDecl(T, "deinit")) return false;
+    return @typeInfo(@TypeOf(T.deinit)).@"fn".params.len == 1;
+}
+
+/// Release an `Err` payload that owns storage, the way Rust's `Result::unwrap`
+/// runs the `Err` destructor on its way into the panic.
+///
+/// Zig has no destructor, so a payload holding a slice would be abandoned by
+/// a bare `@panic`. A payload that publishes a no-argument `deinit` releases
+/// itself through that hook here. Both conditions are comptime: a payload
+/// that owns nothing never captures its value, and the release call is not
+/// analyzed at all, so the scalar case costs exactly what it cost before.
+fn releaseUnwrapPayload(comptime E: type, error_value: E) void {
+    if (comptime ownsStorage(E) and hasSelfRelease(E)) {
+        var owned = error_value;
+        owned.deinit();
+    }
+}
+
 pub fn Result(comptime T: type, comptime E: type) type {
     return union(enum) {
         Ok: T,
@@ -33,7 +87,10 @@ pub fn Result(comptime T: type, comptime E: type) type {
         pub fn unwrap(self: Self) T {
             return switch (self) {
                 .Ok => |value| value,
-                .Err => @panic("Result.unwrap called on Err"),
+                .Err => |error_value| {
+                    releaseUnwrapPayload(E, error_value);
+                    @panic("Result.unwrap called on Err");
+                },
             };
         }
 
@@ -119,6 +176,31 @@ const DecodeError = union(enum) {
         index: usize,
     },
 };
+
+/// Test-only error that owns a slice, in the shape `alloc.FromUtf8Error`
+/// takes: storage the payload is responsible for releasing.
+const OwnedError = struct {
+    bytes: []u8,
+
+    pub fn deinit(self: *@This()) void {
+        self.bytes = &.{};
+        std.debug.print(release_marker ++ "\n", .{});
+    }
+};
+
+/// Test-only error whose storage needs an allocator, the other shape an
+/// `Err` payload can take. `Result.unwrap` holds no allocator, so it cannot
+/// run this destructor; the runtime must still panic rather than pretend.
+const AllocatorError = struct {
+    bytes: []u8,
+
+    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        gpa.free(self.bytes);
+        self.bytes = &.{};
+    }
+};
+
+const release_marker = "r2z: Result.unwrap released the Err payload";
 
 fn unitToByte(_: void) u8 {
     return 7;
@@ -272,4 +354,55 @@ test "map_err invokes captured callable only for Err" {
     const success: Result(u8, DecodeError) = .{ .Ok = 31 };
     const trap: PanicErrorMapper = .{};
     try std.testing.expectEqual(@as(u8, 31), success.map_err(trap).unwrap());
+}
+
+test "unwrap releases an owned Err payload before it panics" {
+    // The release runs in a child: the panic that follows it is terminal, so
+    // the only way to observe the release is the line it prints.
+    try panic_probe.expectPanic(.{
+        .case_name = "unwrap-owned",
+        .expected = "Result.unwrap called on Err",
+        .required = &.{release_marker},
+        .body = struct {
+            fn body() void {
+                var storage: [5]u8 = "owned".*;
+                const failure: Result(u8, OwnedError) = .{ .Err = .{ .bytes = &storage } };
+                _ = failure.unwrap();
+            }
+        }.body,
+    });
+}
+
+test "unwrap panics for an allocator-owned Err payload it cannot release" {
+    // `Result.unwrap` holds no allocator, so the runtime cannot run this
+    // destructor. It must still panic on the same contract rather than
+    // report success with the storage dropped.
+    try panic_probe.expectPanic(.{
+        .case_name = "unwrap-allocator",
+        .expected = "Result.unwrap called on Err",
+        .forbidden = release_marker,
+        .body = struct {
+            fn body() void {
+                const bytes = std.testing.allocator.dupe(u8, "owned") catch unreachable;
+                const failure: Result(u8, AllocatorError) = .{ .Err = .{ .bytes = bytes } };
+                _ = failure.unwrap();
+            }
+        }.body,
+    });
+}
+
+test "unwrap never reaches a release for a payload that owns nothing" {
+    // `DecodeError` is all scalars, so the comptime gate drops the capture
+    // and the release call entirely: no marker, just the panic.
+    try panic_probe.expectPanic(.{
+        .case_name = "unwrap-scalar",
+        .expected = "Result.unwrap called on Err",
+        .forbidden = release_marker,
+        .body = struct {
+            fn body() void {
+                const failure: Result(u8, DecodeError) = .{ .Err = .odd_length };
+                _ = failure.unwrap();
+            }
+        }.body,
+    });
 }

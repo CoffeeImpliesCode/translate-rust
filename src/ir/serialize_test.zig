@@ -383,6 +383,139 @@ fn initCoreCallIr(allocator: std.mem.Allocator) !serialize.RustIr {
     };
 }
 
+/// A method-call fixture carrying one turbofish (`parse::<u32>()`) and one
+/// bare call (`len()`), so a round-trip proves the optional field both
+/// round-trips a populated list and leaves an absent one empty.
+fn initMethodCallIr(allocator: std.mem.Allocator) !serialize.RustIr {
+    const crate_graph = try initTestGraph(allocator, "method_call_fixture", &.{.fn_});
+    const expression_table = try allocator.dupe(exprs.Expr, &.{
+        .{
+            .id = 0,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{},
+                .tail = 1,
+                .labelled = null,
+            } },
+        },
+        .{
+            .id = 1,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 2,
+                .receiver_mode = .value,
+                .method = 1,
+                .generic_args = &.{.{ .prim = .u32 }},
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .unit = {} },
+        },
+        .{
+            .id = 3,
+            .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+            .ty = null,
+            .kind = .{ .method_call = .{
+                .receiver = 2,
+                .receiver_mode = .shared,
+                .method = 1,
+                .generic_args = &.{},
+                .args = &.{},
+            } },
+        },
+    });
+    const body_table = try allocator.alloc(bodies.BodyKind, 2);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } };
+    return .{
+        .crate_name = "method_call_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &.{},
+        .instantiations = &.{},
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = body_table,
+        },
+    };
+}
+
+test "method call turbofish round-trips and an absent key decodes as empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var ir = try initMethodCallIr(allocator);
+
+    const encoded = try serialize.encode(allocator, &ir);
+    // The field is always emitted, so a populated turbofish is on the wire and
+    // a call without one still carries an explicit empty list.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"method_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"generic_args\":[{\"kind\":\"prim\",\"value\":\"u32\"}]",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"generic_args\":[]") != null);
+
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    const turbofished = switch (decoded.bodies.exprs[1].kind) {
+        .method_call => |value| value,
+        else => return error.ExpectedMethodCallExpression,
+    };
+    try std.testing.expectEqual(@as(usize, 1), turbofished.generic_args.len);
+    try std.testing.expectEqual(types.Prim.u32, turbofished.generic_args[0].prim);
+    try std.testing.expectEqual(exprs.ReceiverMode.value, turbofished.receiver_mode);
+    const bare = switch (decoded.bodies.exprs[3].kind) {
+        .method_call => |value| value,
+        else => return error.ExpectedBareMethodCallExpression,
+    };
+    try std.testing.expectEqual(@as(usize, 0), bare.generic_args.len);
+
+    const reencoded = try serialize.encode(allocator, &decoded);
+    try std.testing.expectEqualStrings(encoded, reencoded);
+
+    // A `method_call` object with no `generic_args` key at all is what every
+    // pre-existing v6 fixture carries. Decoding must not need the key: the
+    // field is additive, so no wire version bump is required.
+    var legacy = try std.json.parseFromSlice(std.json.Value, allocator, encoded, .{});
+    defer legacy.deinit();
+    const exprs_root = legacy.value.object.getPtr("bodies").?.object.getPtr("exprs").?.array;
+    var stripped = false;
+    for (exprs_root.items) |*entry| {
+        const row = &entry.object;
+        if (!std.mem.eql(u8, row.get("kind").?.string, "method_call")) continue;
+        // The expression's own fields live under `value`, beside `kind`.
+        const fields = @constCast(&row.getPtr("value").?.object);
+        _ = fields.orderedRemove("generic_args");
+        stripped = true;
+    }
+    if (!stripped) return error.NoMethodCallRowInPayload;
+    const legacy_json = try std.json.Stringify.valueAlloc(allocator, legacy.value, .{});
+    var legacy_decoded = try serialize.decode(allocator, legacy_json);
+    defer legacy_decoded.graph.deinit();
+    for (legacy_decoded.bodies.exprs) |expression| {
+        const call = switch (expression.kind) {
+            .method_call => |value| value,
+            else => continue,
+        };
+        try std.testing.expectEqual(@as(usize, 0), call.generic_args.len);
+    }
+}
+
 fn initSemanticNodesIr(allocator: std.mem.Allocator) !serialize.RustIr {
     const crate_graph = try initTestGraph(allocator, "semantic_nodes_fixture", &.{.fn_});
     const owner: types.ExternalNominal = .{
@@ -2289,6 +2422,100 @@ test "serialize: rich bodies preserve all supported metadata" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "serialize: type alias generic parameters roundtrip and validate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const key_type = types.Type{ .path = .{ .segments = &.{
+        .{ .name = "K", .id = null },
+    } } };
+    const value_type = types.Type{ .path = .{ .segments = &.{
+        .{ .name = "V", .id = null },
+    } } };
+    const alias_target = types.Type{ .external_nominal = .{
+        .path = &.{ "std", "collections", "HashMap" },
+        .args = &.{ key_type, value_type },
+    } };
+    const ir = serialize.RustIr{
+        .crate_name = "alias_fixture",
+        .edition = "2021",
+        .graph = try initTestGraph(allocator, "alias_fixture", &.{.type_alias}),
+        .bodies = .{
+            .exprs = &.{},
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = &.{
+                .none,
+                .{ .type_alias = .{
+                    .target = alias_target,
+                    .generic_params = &.{ "K", "V" },
+                } },
+            },
+        },
+    };
+
+    const encoded = try serialize.encode(allocator, &ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    // The target's arguments are id-free path segments, so the parameter names
+    // are the only thing that makes them resolvable. They must cross the wire.
+    const alias_body = decoded.bodies.bodies[1].type_alias;
+    try std.testing.expectEqual(@as(usize, 2), alias_body.generic_params.len);
+    try std.testing.expectEqualStrings("K", alias_body.generic_params[0]);
+    try std.testing.expectEqualStrings("V", alias_body.generic_params[1]);
+    const external = switch (alias_body.target) {
+        .external_nominal => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), external.args.len);
+    try std.testing.expectEqualStrings("K", external.args[0].path.segments[0].name);
+    try std.testing.expectEqualStrings("V", external.args[1].path.segments[0].name);
+    try root.validateForTranslation(&decoded);
+}
+
+test "serialize: a type alias body without generic parameters still decodes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A payload written before the field existed omits it entirely. The
+    // decoder must read that as "no parameters" rather than fail, which is
+    // what keeps the additive field from needing a wire format version bump.
+    const payload =
+        \\{
+        \\  "format_version": 6,
+        \\  "crate_name": "legacy",
+        \\  "edition": "2021",
+        \\  "sidecar": null,
+        \\  "toolchain": null,
+        \\  "crates": [{
+        \\    "name": "legacy", "edition": 2021, "kind": "lib", "root": 0,
+        \\    "is_translated": true, "deps": [],
+        \\    "entities": [
+        \\      {"id":0,"kind":"module","name":"legacy","span":{"start_line":1,"start_col":1,"end_line":1,"end_col":1},"visibility":{"kind":"public"},"parent":null,"resolved":null,"renamed_to":null,"attributes":[]},
+        \\      {"id":1,"kind":"type_alias","name":"Alias","span":{"start_line":1,"start_col":1,"end_line":1,"end_col":1},"visibility":{"kind":"public"},"parent":0,"resolved":null,"renamed_to":null,"attributes":[]}
+        \\    ],
+        \\    "modules": [{"id":0,"kind":"root","name":"legacy","parent":null,"source_path":null,"is_crate":true,"is_extern":false,"span":{"start_line":1,"start_col":1,"end_line":1,"end_col":1},"items":[1],"attributes":[]}],
+        \\    "uses": []
+        \\  }],
+        \\  "types": [],
+        \\  "instantiations": [],
+        \\  "bodies": {
+        \\    "exprs": [], "stmts": [], "pats": [], "types": [],
+        \\    "bodies": [
+        \\      {"owner":0,"body":{"kind":"none"}},
+        \\      {"owner":1,"body":{"kind":"type_alias","value":{"target":{"kind":"prim","value":"u32"}}}}
+        \\    ]
+        \\  }
+        \\}
+    ;
+    var decoded = try serialize.decode(arena.allocator(), payload);
+    defer decoded.graph.deinit();
+    const alias_body = decoded.bodies.bodies[1].type_alias;
+    try std.testing.expectEqual(@as(usize, 0), alias_body.generic_params.len);
 }
 
 test "serialize: trait impl and generic metadata roundtrip" {

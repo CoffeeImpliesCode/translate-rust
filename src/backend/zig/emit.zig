@@ -375,36 +375,34 @@ fn emitFnDecl(
     try buf.appendSlice(allocator, ") ");
     try emitType(allocator, buf, fd.ret_type);
 
-    if (fd.body) |body| {
-        if (body.stmts.len == 0 and body.expr == null) {
-            try buf.appendSlice(allocator, " {}\n");
-            return;
-        }
-        try buf.appendSlice(allocator, " {\n");
-        for (body.stmts) |stmt| {
-            try emitStmt(allocator, buf, stmt, depth + 1);
-        }
-        if (body.expr) |tail_expr| {
-            try emitIndent(allocator, buf, depth + 1);
-            if (tail_expr.* == .return_expr or tail_expr.* == .panic_) {
-                try emitExpr(allocator, buf, tail_expr.*, depth + 1);
-                try buf.appendSlice(allocator, ";\n");
-            } else if (isStatementLike(tail_expr.*) and
-                (tail_expr.* != .block or !blockHasValue(tail_expr.block)))
-            {
-                try emitExpr(allocator, buf, tail_expr.*, depth + 1);
-                try buf.appendSlice(allocator, "\n");
-            } else {
-                try buf.appendSlice(allocator, "return ");
-                try emitExpr(allocator, buf, tail_expr.*, depth + 1);
-                try buf.appendSlice(allocator, ";\n");
-            }
-        }
-        try emitIndent(allocator, buf, depth);
-        try buf.appendSlice(allocator, "}\n");
-    } else {
-        try buf.appendSlice(allocator, " {}\n");
+    // `emitFile` validates before it emits, and `validateDecl` rejects a
+    // translated function that carries no body, so a dropped body can never
+    // reach here. Synthesising `{}` for one would emit a function that
+    // compiles and silently does nothing, which is the exact loss the
+    // validator exists to catch, so the invariant is unwrapped here.
+    const body = fd.body.?;
+    try buf.appendSlice(allocator, " {\n");
+    for (body.stmts) |stmt| {
+        try emitStmt(allocator, buf, stmt, depth + 1);
     }
+    if (body.expr) |tail_expr| {
+        try emitIndent(allocator, buf, depth + 1);
+        if (tail_expr.* == .return_expr or tail_expr.* == .panic_) {
+            try emitExpr(allocator, buf, tail_expr.*, depth + 1);
+            try buf.appendSlice(allocator, ";\n");
+        } else if (isStatementLike(tail_expr.*) and
+            (tail_expr.* != .block or !blockHasValue(tail_expr.block)))
+        {
+            try emitExpr(allocator, buf, tail_expr.*, depth + 1);
+            try buf.appendSlice(allocator, "\n");
+        } else {
+            try buf.appendSlice(allocator, "return ");
+            try emitExpr(allocator, buf, tail_expr.*, depth + 1);
+            try buf.appendSlice(allocator, ";\n");
+        }
+    }
+    try emitIndent(allocator, buf, depth);
+    try buf.appendSlice(allocator, "}\n");
 }
 
 fn emitStructDecl(
@@ -782,7 +780,7 @@ fn typeContainsGeneratedMatchName(ty: ast.Type, name: GeneratedMatchName) bool {
 
 fn patternContainsGeneratedMatchName(pattern: ast.Pattern, name: GeneratedMatchName) bool {
     return switch (pattern) {
-        .wildcard, .lit => false,
+        .wildcard, .lit, .range_pat => false,
         .binding, .enum_literal => |value| generatedMatchNameEquals(lexicalRoot(value), name),
         .tuple => |patterns| {
             for (patterns) |child| {
@@ -1113,7 +1111,7 @@ fn emitChunkLoop(
     try buf.appendSlice(allocator, "var __chunk_index: usize = 0;\n");
     try emitIndent(allocator, buf, depth);
     try buf.appendSlice(allocator, "while (");
-    try emitExprScoped(context, allocator, buf, chunks.target, depth);
+    try emitReceiver(context, allocator, buf, chunks.target, depth);
     try buf.appendSlice(allocator, ".len > __chunk_index) : (__chunk_index += ");
     try emitExprScoped(context, allocator, buf, size, depth);
     try buf.appendSlice(allocator, ") {\n");
@@ -1121,11 +1119,11 @@ fn emitChunkLoop(
     try buf.appendSlice(allocator, "const ");
     try emitIdent(allocator, buf, capture.name);
     try buf.appendSlice(allocator, " = ");
-    try emitExprScoped(context, allocator, buf, chunks.target, depth + 1);
+    try emitReceiver(context, allocator, buf, chunks.target, depth + 1);
     try buf.appendSlice(allocator, "[__chunk_index..@min(__chunk_index + ");
     try emitExprScoped(context, allocator, buf, size, depth + 1);
     try buf.appendSlice(allocator, ", ");
-    try emitExprScoped(context, allocator, buf, chunks.target, depth + 1);
+    try emitReceiver(context, allocator, buf, chunks.target, depth + 1);
     try buf.appendSlice(allocator, ".len)];\n");
     for (loop.body.stmts) |stmt| {
         try emitStmtScoped(context, allocator, buf, stmt, depth + 1);
@@ -1134,6 +1132,115 @@ fn emitChunkLoop(
     try buf.appendSlice(allocator, "}");
     return true;
 }
+
+/// True for expressions that bind tighter than `.` and `[`, so they can be
+/// used as a receiver without parentheses. A struct literal is the case that
+/// matters here: `Range{ .start = 0 }.step_by(2)` does not parse, so the
+/// receiver has to be written `(Range{ .start = 0 }).step_by(2)`.
+fn isAtomicExpr(expr: ast.Expr) bool {
+    return switch (expr) {
+        .lit, .ident, .field_access, .call, .unary_op, .cast, .builtin => true,
+        else => false,
+    };
+}
+
+/// Binding tightness of a binary operator, loosest first. Decides whether a
+/// nested bin_op needs parentheses at a given consumption site. The order
+/// mirrors Zig's own expression groups: `or` < `and` < the comparisons < `|`
+/// < `^` < `&` < the shifts < `+` < `*`. The wrapping and saturating
+/// variants share a group with their plain operator.
+fn binOpPrecedence(op: ast.BinOpKind) u8 {
+    return switch (op) {
+        .bool_or => 1,
+        .bool_and => 2,
+        .equal,
+        .not_equal,
+        .less_than,
+        .less_than_equal,
+        .greater_than,
+        .greater_than_equal,
+        => 3,
+        .bit_or => 4,
+        .bit_xor => 5,
+        .bit_and => 6,
+        .shl, .shr => 7,
+        .add, .sub, .add_wrap, .sub_wrap, .add_sat, .sub_sat => 8,
+        .mul, .div, .mod, .mul_wrap => 9,
+    };
+}
+
+/// Prefix operators bind tighter than every binary operator, and a range
+/// start must be a single primary expression, so both positions use this as
+/// the parent binding: every binary child below it needs its own group.
+const tight_precedence = 10;
+
+/// True when `child` must be wrapped to keep its own meaning in a slot whose
+/// surroundings bind at `parent_precedence`. A looser child would be pulled
+/// into the parent's group. An equally tight child does the same on the right
+/// of a left-associative operator, which is why `is_right` is only consulted
+/// for the equal case: `a - (b - c)` is not `a - b - c`, while `(a - b) - c`
+/// needs nothing.
+fn needsOperandParens(child: ast.Expr, parent_precedence: u8, is_right: bool) bool {
+    return switch (child) {
+        .bin_op => |bo| blk: {
+            const child_precedence = binOpPrecedence(bo.op);
+            break :blk child_precedence < parent_precedence or
+                (is_right and child_precedence == parent_precedence);
+        },
+        // Whole-expression forms, not operands: `if (c) x else y`, `{ ... }`
+        // and `S{ ... }` are not values an operator can apply to.
+        .if_expr, .block, .match_expr, .struct_init => true,
+        else => false,
+    };
+}
+
+/// Emits `child` in an operand slot under a parent that binds at
+/// `parent_precedence`, wrapping it only when precedence demands it.
+fn emitOperand(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    child: ast.Expr,
+    parent_precedence: u8,
+    is_right: bool,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    const parenthesize = needsOperandParens(child, parent_precedence, is_right);
+    if (parenthesize) try buf.append(allocator, '(');
+    try emitExprScoped(context, allocator, buf, child, depth);
+    if (parenthesize) try buf.append(allocator, ')');
+}
+
+/// Emits the operand of a prefix operator. Every prefix operator binds tighter
+/// than every binary one, so a binary operand always needs its own group:
+/// `&a + b` would take the address of `a`, and `try a + b` is `(try a) + b`.
+fn emitPrefixOperand(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    operand: ast.Expr,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    try emitOperand(context, allocator, buf, operand, tight_precedence, false, depth);
+}
+
+/// Emits `expr` where Zig wants a single atomic receiver: the target of a
+/// field access or an index. A struct literal is the case that needs it,
+/// `Range{ .start = 0 }.step_by(2)` does not parse, and neither does
+/// `a + b.len`.
+fn emitReceiver(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    expr: ast.Expr,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    const atomic = isAtomicExpr(expr);
+    if (!atomic) try buf.append(allocator, '(');
+    try emitExprScoped(context, allocator, buf, expr, depth);
+    if (!atomic) try buf.append(allocator, ')');
+}
+
 fn emitExprScoped(
     context: *const EmitContext,
     allocator: std.mem.Allocator,
@@ -1148,13 +1255,13 @@ fn emitExprScoped(
             if (fa.target.* == .ident and std.mem.eql(u8, fa.target.ident, "error")) {
                 try buf.appendSlice(allocator, "error");
             } else {
-                try emitExprScoped(context, allocator, buf, fa.target.*, depth);
+                try emitReceiver(context, allocator, buf, fa.target.*, depth);
             }
             try buf.appendSlice(allocator, ".");
             try emitIdent(allocator, buf, fa.field_name);
         },
         .call => |c| {
-            try emitExprScoped(context, allocator, buf, c.callee.*, depth);
+            try emitReceiver(context, allocator, buf, c.callee.*, depth);
             try buf.appendSlice(allocator, "(");
             var first_arg = true;
             for (c.generic_args) |generic_arg| {
@@ -1181,8 +1288,8 @@ fn emitExprScoped(
             try buf.appendSlice(allocator, ")");
         },
         .bin_op => |bo| {
-            try buf.appendSlice(allocator, "(");
-            try emitExprScoped(context, allocator, buf, bo.lhs.*, depth);
+            const precedence = binOpPrecedence(bo.op);
+            try emitOperand(context, allocator, buf, bo.lhs.*, precedence, false, depth);
             const op_sym = switch (bo.op) {
                 .add => " + ",
                 .sub => " - ",
@@ -1209,40 +1316,41 @@ fn emitExprScoped(
                 .sub_sat => " -| ",
             };
             try buf.appendSlice(allocator, op_sym);
-            try emitExprScoped(context, allocator, buf, bo.rhs.*, depth);
-            try buf.appendSlice(allocator, ")");
+            try emitOperand(context, allocator, buf, bo.rhs.*, precedence, true, depth);
         },
         .unary_op => |uo| {
             switch (uo.op) {
                 .negate => {
                     try buf.appendSlice(allocator, "-");
-                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
+                    try emitPrefixOperand(context, allocator, buf, uo.operand.*, depth);
                 },
                 .bit_not => {
                     try buf.appendSlice(allocator, "~");
-                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
+                    try emitPrefixOperand(context, allocator, buf, uo.operand.*, depth);
                 },
                 .bool_not => {
                     try buf.appendSlice(allocator, "!");
-                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
+                    try emitPrefixOperand(context, allocator, buf, uo.operand.*, depth);
                 },
                 .deref => {
-                    const needs_parentheses = switch (uo.operand.*) {
-                        .unary_op, .if_expr, .match_expr, .block => true,
-                        else => false,
+                    // A nested prefix operand loses its group without the
+                    // wrap: `&x.*` reads as `&(x.*)`, not `(&x).*`.
+                    const parenthesize = switch (uo.operand.*) {
+                        .unary_op => true,
+                        else => needsOperandParens(uo.operand.*, tight_precedence, false),
                     };
-                    if (needs_parentheses) try buf.append(allocator, '(');
+                    if (parenthesize) try buf.append(allocator, '(');
                     try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
-                    if (needs_parentheses) try buf.append(allocator, ')');
+                    if (parenthesize) try buf.append(allocator, ')');
                     try buf.appendSlice(allocator, ".*");
                 },
                 .addr_of => {
                     try buf.appendSlice(allocator, "&");
-                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
+                    try emitPrefixOperand(context, allocator, buf, uo.operand.*, depth);
                 },
                 .try_op => {
                     try buf.appendSlice(allocator, "try ");
-                    try emitExprScoped(context, allocator, buf, uo.operand.*, depth);
+                    try emitPrefixOperand(context, allocator, buf, uo.operand.*, depth);
                 },
             }
         },
@@ -1329,12 +1437,12 @@ fn emitExprScoped(
         },
         .builtin => |bi| {
             if (std.mem.eql(u8, bi.name, "index") and bi.args.len == 2) {
-                try emitExprScoped(context, allocator, buf, bi.args[0], depth);
+                try emitReceiver(context, allocator, buf, bi.args[0], depth);
                 try buf.appendSlice(allocator, "[");
                 try emitExprScoped(context, allocator, buf, bi.args[1], depth);
                 try buf.appendSlice(allocator, "]");
             } else if (std.mem.eql(u8, bi.name, "sliceChunks") and bi.args.len == 2) {
-                try emitExprScoped(context, allocator, buf, bi.args[0], depth);
+                try emitReceiver(context, allocator, buf, bi.args[0], depth);
                 try buf.appendSlice(allocator, ".chunks(");
                 try emitExprScoped(context, allocator, buf, bi.args[1], depth);
                 try buf.appendSlice(allocator, ")");
@@ -1432,7 +1540,9 @@ fn emitExprScoped(
             }
         },
         .range => |r| {
-            try emitExprScoped(context, allocator, buf, r.start.*, depth);
+            // A range start has to be one primary expression: `a + b..c` does
+            // not parse, the addition swallows the declaration.
+            try emitOperand(context, allocator, buf, r.start.*, tight_precedence, false, depth);
             try buf.appendSlice(allocator, "..");
             if (r.end) |en| try emitExprScoped(context, allocator, buf, en.*, depth);
         },
@@ -1838,6 +1948,25 @@ pub fn emitPattern(
             if (sp.name) |name| {
                 try buf.appendSlice(allocator, ".");
                 try emitIdent(allocator, buf, name);
+            } else {
+                try buf.appendSlice(allocator, "_");
+            }
+        },
+        // Zig 0.16 accepts only `lo...hi` in a switch prong: `lo..hi` and the
+        // open-ended `...hi` / `lo...` are all syntax errors, so an exclusive
+        // bound shifts to `hi - 1` and an unbounded side has no valid spelling
+        // and degrades to the wildcard rather than emitting uncompilable Zig.
+        .range_pat => |rp| {
+            if (rp.lo != null and rp.hi != null) {
+                try emitLiteral(allocator, buf, rp.lo.?);
+                try buf.appendSlice(allocator, "...");
+                if (rp.inclusive) {
+                    try emitLiteral(allocator, buf, rp.hi.?);
+                } else {
+                    try buf.appendSlice(allocator, "(");
+                    try emitLiteral(allocator, buf, rp.hi.?);
+                    try buf.appendSlice(allocator, " - 1)");
+                }
             } else {
                 try buf.appendSlice(allocator, "_");
             }

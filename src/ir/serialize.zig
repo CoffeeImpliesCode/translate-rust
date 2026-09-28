@@ -1958,11 +1958,22 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     }
     if (std.mem.eql(u8, tag, "method_call")) {
         const q = try getObj(val);
+        // Additive field: a `method_call` written before it existed carries no
+        // key, and an absent one decodes as the empty list. Required here
+        // would break every existing v6 fixture, so no version bump.
+        const generic_args: []const types.Type = if (q.get("generic_args")) |raw_args|
+            try decodeTypeList(allocator, raw_args)
+        else
+            &.{};
+        errdefer freeDecodedTypeSlice(allocator, generic_args);
+        const args = try decodeIdList(allocator, try req(q, "args"));
+        errdefer if (args.len > 0) allocator.free(args);
         return .{ .method_call = .{
             .receiver = try reqU32(q, "receiver"),
             .receiver_mode = try decodeReceiverMode(try reqStr(q, "receiver_mode")),
             .method = @intCast(try reqU32(q, "method")),
-            .args = try decodeIdList(allocator, try req(q, "args")),
+            .generic_args = generic_args,
+            .args = args,
         } };
     }
     if (std.mem.eql(u8, tag, "struct_lit")) {
@@ -2752,8 +2763,15 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
     }
     if (std.mem.eql(u8, kind_str, "type_alias")) {
         const ao = try getObj(try req(o, "value"));
+        const target = try decodeType(allocator, try req(ao, "target"));
+        errdefer freeDecodedType(allocator, target);
+        // Optional so payloads written before this field still decode; the
+        // additive field needs no wire format version bump.
+        const generic_params = try decodeOptionalStringList(allocator, ao, "generic_params");
+        errdefer freeDecodedStringList(allocator, generic_params);
         return .{ .type_alias = .{
-            .target = try decodeType(allocator, try req(ao, "target")),
+            .target = target,
+            .generic_params = generic_params,
         } };
     }
     return error.BadWireFormat;
@@ -2933,6 +2951,7 @@ fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void 
         },
         .core_function => |function| freeDecodedTypeSlice(allocator, function.generic_args),
         .method_call => |method_call| {
+            freeDecodedTypeSlice(allocator, method_call.generic_args);
             if (method_call.args.len > 0) allocator.free(method_call.args);
         },
         .struct_lit => |struct_lit| freeDecodedFieldInits(allocator, struct_lit.fields),
@@ -3090,7 +3109,10 @@ fn freeDecodedBodyKind(allocator: std.mem.Allocator, body: BodyKind) void {
             if (impl_body.generics) |generics| freeDecodedGenerics(allocator, generics);
             if (impl_body.assoc_items.len > 0) allocator.free(impl_body.assoc_items);
         },
-        .type_alias => |alias_body| freeDecodedType(allocator, alias_body.target),
+        .type_alias => |alias_body| {
+            freeDecodedType(allocator, alias_body.target);
+            freeDecodedStringList(allocator, alias_body.generic_params);
+        },
     }
 }
 
@@ -4336,6 +4358,9 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try vo.put(allocator, "receiver", mkInt(v.receiver));
             try vo.put(allocator, "receiver_mode", .{ .string = @tagName(v.receiver_mode) });
             try vo.put(allocator, "method", mkInt(v.method));
+            // Always emitted, like `core_call`: an empty list round-trips and
+            // the decoder still treats the key as optional.
+            try vo.put(allocator, "generic_args", try encodeTypeList(allocator, v.generic_args));
             try vo.put(allocator, "args", try encodeIdList(allocator, v.args));
             try o.put(allocator, "value", .{ .object = vo });
         },
@@ -4908,6 +4933,7 @@ fn encodeBodyKind(allocator: std.mem.Allocator, bk: BodyKind) !Json {
             try o.put(allocator, "kind", .{ .string = "type_alias" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "target", try encodeType(allocator, ab.target));
+            try vo.put(allocator, "generic_params", try encodeStringList(allocator, ab.generic_params));
             try o.put(allocator, "value", .{ .object = vo });
         },
     }
@@ -5721,7 +5747,13 @@ fn validateNominalBody(
                 }
             }
         },
-        .type_alias => |alias_body| try validateNominalType(environment, alias_body.target, &.{}),
+        // The alias's own parameters are in scope in its target, so its
+        // id-free path segments resolve against them here too.
+        .type_alias => |alias_body| try validateNominalType(
+            environment,
+            alias_body.target,
+            alias_body.generic_params,
+        ),
     }
 }
 

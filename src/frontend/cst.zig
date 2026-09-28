@@ -592,11 +592,16 @@ fn freePathSegments(e: *const Ctx, path: []const types.PathSegment) void {
     if (path.len > 0) e.alloc.free(path);
 }
 
-fn isKnownExternalCrate(g: *const graph.CrateGraph, name: []const u8) bool {
-    if (std.mem.eql(u8, name, "core") or
+/// `core`, `std`, and `alloc` are the only path roots whose types never exist
+/// as graph entities. A dependency root names real translated entities.
+fn isExternalNominalRoot(name: []const u8) bool {
+    return std.mem.eql(u8, name, "core") or
         std.mem.eql(u8, name, "std") or
-        std.mem.eql(u8, name, "alloc"))
-        return true;
+        std.mem.eql(u8, name, "alloc");
+}
+
+fn isKnownExternalCrate(g: *const graph.CrateGraph, name: []const u8) bool {
+    if (isExternalNominalRoot(name)) return true;
     for (g.crates.items) |crate_info| {
         for (crate_info.deps) |dep| {
             if (std.mem.eql(u8, dep.local_alias, name) or
@@ -710,36 +715,61 @@ fn preludePathSegments(allocator: std.mem.Allocator, name: []const u8) !?[]const
     return segments;
 }
 
-fn externalUsePath(e: *const Ctx, name: []const u8) !?[]const []const u8 {
-    const owner_id = e.declaration_owner orelse return null;
-    const module_id = owningModule(e.g, owner_id) orelse return null;
+/// The `alloc`/`core`/`std` path bound by the `extern crate` use alias `name`
+/// in the module that owns `owner_id`, or null when `name` is not one. The
+/// result borrows from the graph, which owns both the slice and its segments,
+/// so declaration binding can consult it without allocating. Two aliases
+/// binding the same name are ambiguous and resolve to null.
+fn externalUseAlias(
+    g: *const graph.CrateGraph,
+    owner_id: spine.EntityId,
+    name: []const u8,
+) ?[]const []const u8 {
+    const module_id = owningModule(g, owner_id) orelse return null;
     var found: ?[]const []const u8 = null;
-    for (e.g.symbol_table.entities.items) |entity| {
+    for (g.symbol_table.entities.items) |entity| {
         if (entity.parent != module_id or entity.kind != .use_) continue;
-        const use_decl = e.g.useById(entity.id) orelse continue;
+        const use_decl = g.useById(entity.id) orelse continue;
         if (!std.mem.eql(u8, use_decl.local_name, name)) continue;
         const external = switch (use_decl.kind) {
             .external => |value| value,
             else => continue,
         };
-        const path = try e.alloc.alloc([]const u8, external.path.len);
-        var copied: usize = 0;
-        errdefer {
-            for (path[0..copied]) |segment| e.alloc.free(segment);
-            e.alloc.free(path);
-        }
-        for (external.path, 0..) |segment, index| {
-            path[index] = try e.alloc.dupe(u8, segment);
-            copied += 1;
-        }
-        if (found) |old| {
-            freeExternalPath(e, old);
-            freeExternalPath(e, path);
-            return null;
-        }
-        found = path;
+        if (external.path.len == 0) return null;
+        if (found != null) return null;
+        found = external.path;
     }
     return found;
+}
+
+fn externalUsePath(e: *const Ctx, name: []const u8) !?[]const []const u8 {
+    const owner_id = e.declaration_owner orelse return null;
+    const alias = externalUseAlias(e.g, owner_id, name) orelse return null;
+    const path = try e.alloc.alloc([]const u8, alias.len);
+    var copied: usize = 0;
+    errdefer {
+        for (path[0..copied]) |segment| e.alloc.free(segment);
+        e.alloc.free(path);
+    }
+    for (alias, 0..) |segment, index| {
+        path[index] = try e.alloc.dupe(u8, segment);
+        copied += 1;
+    }
+    return path;
+}
+
+/// The external path named by an id-free bound path. The segment names are
+/// borrowed: an alias prefix comes from the graph, the rest from the source
+/// text, and both outlive every binder.
+fn externalPathFromSegments(
+    allocator: std.mem.Allocator,
+    path: types.Path,
+) ![]const []const u8 {
+    const segments = try allocator.alloc([]const u8, path.segments.len);
+    for (path.segments, 0..) |segment, index| {
+        segments[index] = segment.name;
+    }
+    return segments;
 }
 fn makePendingGeneric(
     e: *Ctx,
@@ -948,7 +978,7 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         defer if (path_owned) freePathSegments(e, path_segments);
         const owner_id = e.declaration_owner orelse return error.UnresolvedNominalType;
         var path: types.Path = .{ .segments = path_segments };
-        bindPath(e.g, e.bodies_list.items, owner_id, &.{}, &path) catch |err| switch (err) {
+        const bound = bindPathWithPrelude(e.g, e.bodies_list.items, owner_id, &.{}, &path) catch |err| switch (err) {
             error.UnresolvedNominalType => {
                 if (!had_scoped_segments) {
                     if (preludeExternalPath(nm)) |prelude_path| {
@@ -967,6 +997,13 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
             },
             else => return err,
         };
+        if (bound == .external) {
+            path_owned = false;
+            return .{ .external_nominal = .{
+                .path = try externalPathFromSegments(e.alloc, path),
+                .args = args,
+            } };
+        }
         if (path.segments.len == 0) return error.UnresolvedNominalType;
         const base_def = path.segments[path.segments.len - 1].id orelse
             return error.UnresolvedNominalType;
@@ -1141,6 +1178,11 @@ fn bodyHasGenericParam(body: bodies.BodyKind, name: []const u8) bool {
                     };
                     if (std.mem.eql(u8, param_name, name)) return true;
                 }
+            }
+        },
+        .type_alias => |alias_body| {
+            for (alias_body.generic_params) |param| {
+                if (std.mem.eql(u8, param, name)) return true;
             }
         },
         else => {},
@@ -1524,13 +1566,57 @@ fn bindProjectionPath(
     }
 }
 
+/// How a nominal path resolved.
+pub const BoundPath = enum {
+    /// Every segment names a graph entity and carries its id.
+    local,
+    /// The path names a type outside the graph. `path.segments` holds the full
+    /// external path with provenance-only, id-free segments.
+    external,
+};
+
+/// Rewrites `path` in place so it names an external type. Two forms reach this
+/// step: a path rooted at `core`/`std`/`alloc`, and a path whose segment at
+/// `index` is an `extern crate` use alias (`use core::slice;` then
+/// `slice::Iter`). External names are never graph entities, so the rewritten
+/// segments are provenance-only. The previous segment array is left to its
+/// owner, which may still reference it. Returns false when neither form
+/// applies.
+fn bindExternalNominalPath(
+    g: *const graph.CrateGraph,
+    owner_id: spine.EntityId,
+    path: *types.Path,
+    index: usize,
+) DeclarationTypeError!bool {
+    const root = path.segments[index].name;
+    const alias = externalUseAlias(g, owner_id, root) orelse {
+        // An absolute external root already spells the whole path; only the
+        // provenance-only ids need clearing. A bare `std` names the crate, not
+        // a type, so a root segment needs a nominal segment after it.
+        if (index != 0 or !isExternalNominalRoot(root)) return false;
+        if (index + 1 >= path.segments.len) return false;
+        for (@constCast(path.segments)) |*segment| segment.id = null;
+        return true;
+    };
+    const tail = path.segments[index + 1 ..];
+    const segments = try g.allocator.alloc(types.PathSegment, alias.len + tail.len);
+    for (segments[0..alias.len], 0..) |*segment, i| {
+        segment.* = .{ .name = alias[i], .id = null };
+    }
+    for (segments[alias.len..], 0..) |*segment, i| {
+        segment.* = .{ .name = tail[i].name, .id = null };
+    }
+    path.segments = segments;
+    return true;
+}
+
 fn bindPath(
     g: *const graph.CrateGraph,
     bodies_list: []const bodies.BodyKind,
     owner_id: spine.EntityId,
     extra_generic_params: []const []const u8,
     path: *types.Path,
-) DeclarationTypeError!void {
+) DeclarationTypeError!BoundPath {
     if (path.segments.len == 0) return error.UnresolvedNominalType;
     var index: usize = 0;
     const first_name = path.segments[0].name;
@@ -1540,21 +1626,21 @@ fn bindPath(
             const self_id = selfTypeEntity(g, owner_id);
             if (self_id) |id| {
                 @constCast(path.segments)[0].id = id;
-                return;
+                return .local;
             }
-            if (containingImpl(g, owner_id)) |_| return;
-            if (containingTrait(g, owner_id)) |_| return;
+            if (containingImpl(g, owner_id)) |_| return .local;
+            if (containingTrait(g, owner_id)) |_| return .local;
             return error.UnresolvedNominalType;
         }
         try bindProjectionPath(g, bodies_list, owner_id, extra_generic_params, path);
-        return;
+        return .local;
     }
     if (activeGenericParam(g, bodies_list, owner_id, extra_generic_params, first_name)) {
         @constCast(path.segments)[0].id = null;
         if (path.segments.len > 1) {
             try bindProjectionPath(g, bodies_list, owner_id, extra_generic_params, path);
         }
-        return;
+        return .local;
     }
     var current = owningModule(g, owner_id) orelse return error.UnresolvedNominalType;
     if (std.mem.eql(u8, first_name, "crate")) {
@@ -1584,16 +1670,24 @@ fn bindPath(
             } else if (!std.mem.eql(u8, entity.name, segment.name)) {
                 return error.UnresolvedNominalType;
             }
-            if (!is_terminal and entity.kind != .module and entity.kind != .extern_crate) {
-                return error.UnresolvedNominalType;
-            }
             if (is_terminal and !isNominalEntityKind(entity.kind)) {
                 return error.InvalidNominalType;
             }
             break :blk resolved_id;
-        } else scoped_id orelse return error.UnresolvedNominalType;
+        } else scoped_id orelse {
+            if (try bindExternalNominalPath(g, owner_id, path, index)) {
+                return .external;
+            }
+            return error.UnresolvedNominalType;
+        };
         if (!is_terminal) {
             const entity = g.symbol_table.get(found) orelse return error.UnresolvedNominalType;
+            if (entity.kind == .use_) {
+                // `use core::slice;` binds a namespace the graph has no entity
+                // for, so `slice::Iter` names an external nominal instead.
+                if (try bindExternalNominalPath(g, owner_id, path, index)) return .external;
+                return error.UnresolvedNominalType;
+            }
             if (entity.kind != .module and entity.kind != .extern_crate) {
                 return error.UnresolvedNominalType;
             }
@@ -1603,9 +1697,40 @@ fn bindPath(
             continue;
         }
         const entity = g.symbol_table.get(found) orelse return error.UnresolvedNominalType;
+        if (entity.kind == .use_) {
+            // `use alloc::vec::Vec;` binds a type name the graph has no entity
+            // for, so a terminal `Vec` names that external nominal instead.
+            if (try bindExternalNominalPath(g, owner_id, path, index)) return .external;
+            return error.UnresolvedNominalType;
+        }
         if (!isNominalEntityKind(entity.kind)) return error.InvalidNominalType;
         @constCast(path.segments)[index].id = entity.id;
     }
+    return .local;
+}
+
+/// Binds a nominal path and applies the prelude fallback shared by every
+/// declaration-level binder: a lone unresolved segment may still name a
+/// prelude trait or type, which the graph does not model as an entity.
+fn bindPathWithPrelude(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    path: *types.Path,
+) DeclarationTypeError!BoundPath {
+    return bindPath(g, bodies_list, owner_id, extra_generic_params, path) catch |err| switch (err) {
+        error.UnresolvedNominalType => {
+            if (path.segments.len == 1) {
+                if (preludePathSegments(g.allocator, path.segments[0].name) catch null) |segments| {
+                    path.segments = segments;
+                    return .external;
+                }
+            }
+            return err;
+        },
+        else => return err,
+    };
 }
 
 fn pendingGeneric(
@@ -1658,17 +1783,12 @@ fn bindType(
                     return;
                 }
             }
-            if (bindPath(g, bodies_list, owner_id, extra_generic_params, path)) {} else |err| switch (err) {
-                error.UnresolvedNominalType => {
-                    if (path.segments.len == 1) {
-                        if (preludePathSegments(g.allocator, path.segments[0].name) catch null) |prelude_segs| {
-                            path.segments = prelude_segs;
-                            return;
-                        }
-                    }
-                    return err;
-                },
-                else => return err,
+            const bound = try bindPathWithPrelude(g, bodies_list, owner_id, extra_generic_params, path);
+            if (bound == .external) {
+                ty.* = .{ .external_nominal = .{
+                    .path = try externalPathFromSegments(g.allocator, path.*),
+                } };
+                return;
             }
         },
         .reference => |reference| {
@@ -1749,13 +1869,21 @@ fn bindType(
         .generic_inst => |*generic| {
             if (pendingGeneric(pending, generic.decl)) |application| {
                 var path: types.Path = .{ .segments = application.path };
-                try bindPath(
+                const bound = try bindPathWithPrelude(
                     g,
                     bodies_list,
                     application.owner_id,
                     &.{},
                     &path,
                 );
+                if (bound == .external) {
+                    const args = generic.args.params;
+                    ty.* = .{ .external_nominal = .{
+                        .path = try externalPathFromSegments(g.allocator, path),
+                        .args = args,
+                    } };
+                    return;
+                }
                 if (path.segments.len == 0) return error.UnresolvedNominalType;
                 generic.decl = path.segments[path.segments.len - 1].id orelse
                     return error.UnresolvedNominalType;
@@ -1840,25 +1968,16 @@ fn bindBound(
     pending: []const PendingGenericApplication,
     bound: *types.Bound,
 ) DeclarationTypeError!void {
-    if (bindPath(
+    _ = bindPathWithPrelude(
         g,
         bodies_list,
         owner_id,
         extra_generic_params,
         &bound.path,
-    )) {} else |err| switch (err) {
-        error.UnresolvedNominalType => {
-            if (bound.path.segments.len == 1) {
-                if (preludePathSegments(
-                    g.allocator,
-                    bound.path.segments[0].name,
-                ) catch null) |prelude_segs| {
-                    bound.path.segments = prelude_segs;
-                }
-            }
-        },
+    ) catch |err| switch (err) {
+        error.UnresolvedNominalType => {},
         else => return err,
-    }
+    };
     for (@constCast(bound.args)) |*arg| {
         try bindType(g, bodies_list, owner_id, extra_generic_params, pending, arg);
     }
@@ -1933,7 +2052,7 @@ fn bindGenerics(
         }
     }
     for (@constCast(generics.where_clauses)) |*clause| {
-        bindPath(
+        _ = bindPathWithPrelude(
             g,
             bodies_list,
             owner_id,
@@ -2157,22 +2276,16 @@ pub fn bindDeclarationTypes(
                     else => return err,
                 };
                 if (impl_body.trait_path) |*trait_path| {
-                    if (bindPath(
+                    _ = bindPathWithPrelude(
                         g,
                         body_slice,
                         @intCast(owner_id),
                         &.{},
                         trait_path,
-                    )) {} else |err| switch (err) {
-                        error.UnresolvedNominalType => {
-                            if (trait_path.segments.len == 1) {
-                                if (preludePathSegments(g.allocator, trait_path.segments[0].name) catch null) |prelude_segs| {
-                                    trait_path.segments = prelude_segs;
-                                }
-                            }
-                        },
+                    ) catch |err| switch (err) {
+                        error.UnresolvedNominalType => {},
                         else => return err,
-                    }
+                    };
                     for (@constCast(impl_body.trait_args)) |*arg| {
                         try bindType(g, body_slice, @intCast(owner_id), &.{}, pending, arg);
                     }
@@ -3103,7 +3216,10 @@ fn typeAliasItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         }
     }
     const alias_target = target orelse return error.MalformedTypeAlias;
-    e.bodies_list.items[alias_id] = .{ .type_alias = .{ .target = alias_target } };
+    e.bodies_list.items[alias_id] = .{ .type_alias = .{
+        .target = alias_target,
+        .generic_params = try collectFunctionGenericParams(e, item),
+    } };
 }
 
 fn appendType(e: *Ctx, t: types.Type) !exprs.TypeId {
@@ -4570,7 +4686,7 @@ fn implTargetEntity(
         segments.append(e.alloc, .{ .name = name, .id = null }) catch return null;
     }
     var path: types.Path = .{ .segments = segments.items };
-    bindPath(e.g, e.bodies_list.items, mod_id, &.{}, &path) catch return null;
+    _ = bindPathWithPrelude(e.g, e.bodies_list.items, mod_id, &.{}, &path) catch return null;
     const target_id = path.segments[path.segments.len - 1].id orelse return null;
     const target = e.g.symbol_table.get(target_id) orelse return null;
     return switch (target.kind) {
@@ -5079,6 +5195,15 @@ fn cfgFeatureEnabled(e: *const Ctx, feature: []const u8) bool {
     return false;
 }
 
+/// cfg keys whose value depends on the configured translation target. They
+/// cannot be answered without an explicit target configuration, so they are
+/// rejected instead of guessed.
+///
+/// `debug_assertions`, `panic`, `proc_macro`, `miri`, and `sanitize` are
+/// deliberately absent: they are statically false for a host, non-proc-macro
+/// translation target, so cfg pruning resolves them as false. cfg only ever
+/// decides what to drop, and a key that is false for the actual target cannot
+/// keep live code alive or drop code the target needs.
 fn cfgBuiltinRequiresTarget(name: []const u8) bool {
     return std.mem.eql(u8, name, "unix") or
         std.mem.eql(u8, name, "windows") or
@@ -5086,12 +5211,7 @@ fn cfgBuiltinRequiresTarget(name: []const u8) bool {
         std.mem.eql(u8, name, "target_arch") or
         std.mem.eql(u8, name, "target_env") or
         std.mem.eql(u8, name, "target_family") or
-        std.mem.eql(u8, name, "target_vendor") or
-        std.mem.eql(u8, name, "debug_assertions") or
-        std.mem.eql(u8, name, "panic") or
-        std.mem.eql(u8, name, "proc_macro") or
-        std.mem.eql(u8, name, "miri") or
-        std.mem.eql(u8, name, "sanitize");
+        std.mem.eql(u8, name, "target_vendor");
 }
 
 const CfgAttributeKind = enum {
@@ -7106,12 +7226,15 @@ test "cst binds owner-scoped declaration nominal paths" {
         .{ .name = "Point", .id = point },
     };
     var pre_resolved_path: types.Path = .{ .segments = &pre_resolved_segments };
-    try bindPath(
-        &crate_graph,
-        bodies_list.items,
-        0,
-        &.{},
-        &pre_resolved_path,
+    try std.testing.expectEqual(
+        BoundPath.local,
+        try bindPath(
+            &crate_graph,
+            bodies_list.items,
+            0,
+            &.{},
+            &pre_resolved_path,
+        ),
     );
     try std.testing.expectEqual(@as(?spine.EntityId, null), pre_resolved_path.segments[0].id);
     try std.testing.expectEqual(point, pre_resolved_path.segments[1].id.?);
@@ -7633,4 +7756,336 @@ test "cst item macro expansion failure is atomic" {
     try std.testing.expectEqual(@as(usize, 0), result.type_count);
     try std.testing.expectEqual(@as(usize, 0), result.expression_count);
     try std.testing.expectEqual(@as(usize, 0), result.function_origin_count);
+}
+
+fn testGraphWithRootModule(allocator: std.mem.Allocator) !graph.CrateGraph {
+    var crate_graph = graph.CrateGraph.init(allocator);
+    errdefer crate_graph.deinit();
+    _ = try crate_graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try crate_graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    return crate_graph;
+}
+
+fn hasEntity(g: *const graph.CrateGraph, kind: spine.EntityKind, name: []const u8) bool {
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.kind == kind and std.mem.eql(u8, entity.name, name)) return true;
+    }
+    return false;
+}
+
+fn expectSegmentNames(path: types.Path, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, path.segments.len);
+    for (path.segments, expected) |segment, want| {
+        try std.testing.expectEqualStrings(want, segment.name);
+        try std.testing.expectEqual(@as(?spine.EntityId, null), segment.id);
+    }
+}
+
+fn typeParamNamed(generics: types.Generics, name: []const u8) ?types.TypeParam {
+    for (generics.params) |param| {
+        switch (param) {
+            .type_ => |type_param| {
+                if (std.mem.eql(u8, type_param.name, name)) return type_param;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "cst resolves cfg builtins that are false for a translation target" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\#[cfg_attr(miri, ignore)]
+        \\pub fn zero() {}
+        \\#[cfg(miri)]
+        \\pub fn miri_only() {}
+        \\#[cfg(any(miri, feature = "absent"))]
+        \\pub fn any_miri() {}
+        \\#[cfg(not(miri))]
+        \\pub fn not_miri() {}
+        \\#[cfg(debug_assertions)]
+        \\pub fn debug_only() {}
+        \\#[cfg(proc_macro)]
+        \\pub fn proc_macro_only() {}
+        \\#[cfg(sanitize)]
+        \\pub fn sanitized() {}
+        \\#[cfg(panic)]
+        \\pub fn panicking() {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // A statically false builtin must prune, and its negation must keep the
+    // item: cfg decides only what to drop, so `false` is the safe answer.
+    try std.testing.expect(hasEntity(&crate_graph, .fn_, "zero"));
+    try std.testing.expect(hasEntity(&crate_graph, .fn_, "not_miri"));
+    for ([_][]const u8{
+        "miri_only",
+        "any_miri",
+        "debug_only",
+        "proc_macro_only",
+        "sanitized",
+        "panicking",
+    }) |pruned| {
+        try std.testing.expect(!hasEntity(&crate_graph, .fn_, pruned));
+    }
+}
+
+test "cst still rejects cfg keys that need a target configuration" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    for ([_][]const u8{
+        "unix",
+        "windows",
+        "target_os",
+        "target_arch",
+        "target_env",
+        "target_family",
+        "target_vendor",
+    }) |key| {
+        var crate_graph = try testGraphWithRootModule(allocator);
+        defer crate_graph.deinit();
+
+        var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+        var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+        try bodies_list.append(allocator, .none);
+        var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+        const source = try std.fmt.allocPrint(
+            allocator,
+            "#[cfg({s})]\npub struct PlatformOnly;",
+            .{key},
+        );
+        var ctx: Ctx = .{
+            .alloc = allocator,
+            .g = &crate_graph,
+            .src = source,
+            .types_list = &types_list,
+            .bodies_list = &bodies_list,
+            .exprs_list = &exprs_list,
+        };
+        try std.testing.expectError(
+            error.UnsupportedCfgPredicate,
+            extractFile(&ctx),
+        );
+    }
+}
+
+test "cst binds a use alias in a type position to its external nominal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\use core::slice;
+        \\pub fn bounded<'a, T: slice::Iter<'a, u8>>() {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const fn_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "bounded")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[fn_id]) {
+        .fn_ => |fn_body| fn_body,
+        else => return error.TestUnexpectedResult,
+    };
+    const generics = body.generics orelse return error.TestUnexpectedResult;
+    const type_param = typeParamNamed(generics, "T") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), type_param.bounds.len);
+    // `slice::Iter` reaches the binder through the `use core::slice` alias; the
+    // bound must carry the full external path, not the bare local alias.
+    try expectSegmentNames(type_param.bounds[0].path, &.{ "core", "slice", "Iter" });
+}
+
+test "cst binds an absolute external root in a type position" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub fn bounded<'a, T: core::slice::Iter<'a, u8>>() {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const fn_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "bounded")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[fn_id]) {
+        .fn_ => |fn_body| fn_body,
+        else => return error.TestUnexpectedResult,
+    };
+    const generics = body.generics orelse return error.TestUnexpectedResult;
+    const type_param = typeParamNamed(generics, "T") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), type_param.bounds.len);
+    try expectSegmentNames(type_param.bounds[0].path, &.{ "core", "slice", "Iter" });
+}
+
+test "cst binds a terminal external use alias in a type position" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\use core::cell::Cell;
+        \\pub fn cell<T: Cell>() {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // `Cell` resolves to the `use core::cell::Cell` entity, whose kind the
+    // graph has no nominal for, so the bound must name the external nominal
+    // rather than reject the path.
+    const fn_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "cell")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[fn_id]) {
+        .fn_ => |fn_body| fn_body,
+        else => return error.TestUnexpectedResult,
+    };
+    const generics = body.generics orelse return error.TestUnexpectedResult;
+    const type_param = typeParamNamed(generics, "T") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), type_param.bounds.len);
+    try expectSegmentNames(type_param.bounds[0].path, &.{ "core", "cell", "Cell" });
+}
+
+test "cst records type alias generic parameters on the alias body" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\use std::collections::HashMap;
+        \\pub type FnvHashMap<K, V> = HashMap<K, V, u8>;
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const alias_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .type_alias and
+            std.mem.eql(u8, entity.name, "FnvHashMap")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[alias_id]) {
+        .type_alias => |alias| alias,
+        else => return error.TestUnexpectedResult,
+    };
+    // The alias declares its own parameters, and the target names them, so the
+    // names must survive on the body for binding and validation.
+    try std.testing.expectEqual(@as(usize, 2), body.generic_params.len);
+    try std.testing.expectEqualStrings("K", body.generic_params[0]);
+    try std.testing.expectEqualStrings("V", body.generic_params[1]);
+
+    const external = switch (body.target) {
+        .external_nominal => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const expected_path = [_][]const u8{ "std", "collections", "HashMap" };
+    try std.testing.expectEqual(expected_path.len, external.path.len);
+    for (expected_path, external.path) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expectEqual(@as(usize, 3), external.args.len);
+    try expectSegmentNames(switch (external.args[0]) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    }, &.{"K"});
+    try expectSegmentNames(switch (external.args[1]) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    }, &.{"V"});
 }

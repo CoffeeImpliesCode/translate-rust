@@ -3,7 +3,8 @@
 //! Implements the default `LoweringStrategy`: faithful primitive/slice/option
 //! mapping, error unions for unionable `Result`, and selected standard Rust
 //! collection mapping (`BTreeMap` → `std.AutoHashMap`, `Vec` →
-//! `std.ArrayListUnmanaged`, ...).
+//! `std.ArrayListUnmanaged`, `HashMap`/`HashSet` → the r2z `collections`
+//! containers, ...).
 //! Generics lower via comptime duck typing (bounds erased at emit).
 //!
 //! Boxed types owned by a returned `ast.Type` (`.opt`, `.err_union`,
@@ -28,6 +29,8 @@ threadlocal var box_cells: BoxCells = .{};
 pub const DefaultStrategy = struct {
     tuple_cells: [32][16]ast.Type = undefined,
     next_tuple_cell: usize = 0,
+    generic_cells: [8][4]ast.Type = undefined,
+    next_generic_cell: usize = 0,
     pub fn lowerType(ctx: *anyopaque, ty: ir.types.Type) anyerror!ast.Type {
         return switch (ty) {
             .prim => |p| ast.Type{ .prim = primToAst(p) },
@@ -76,6 +79,23 @@ pub const DefaultStrategy = struct {
         return true;
     }
 
+    /// `core::collections`, `std::collections`, or `alloc::collections`.
+    fn isCollectionsPath(path: []const []const u8) bool {
+        if (path.len != 3) return false;
+        if (!std.mem.eql(u8, path[0], "core") and
+            !std.mem.eql(u8, path[0], "std") and
+            !std.mem.eql(u8, path[0], "alloc")) return false;
+        return std.mem.eql(u8, path[1], "collections");
+    }
+
+    fn isCollectionsMapPath(path: []const []const u8) bool {
+        return isCollectionsPath(path) and std.mem.eql(u8, path[2], "HashMap");
+    }
+
+    fn isCollectionsSetPath(path: []const []const u8) bool {
+        return isCollectionsPath(path) and std.mem.eql(u8, path[2], "HashSet");
+    }
+
     fn lowerExternal(ctx: *anyopaque, external: ir.types.ExternalNominal) anyerror!ast.Type {
         if (externalPathEqual(external.path, &.{ "core", "option", "Option" }) or
             externalPathEqual(external.path, &.{ "std", "option", "Option" }))
@@ -97,6 +117,16 @@ pub const DefaultStrategy = struct {
             if (external.args.len != 0) return error.GenericArgumentArityMismatch;
             return .{ .named = "[]const u8" };
         }
+        if (isCollectionsMapPath(external.path)) {
+            if (external.args.len != 3) return error.GenericArgumentArityMismatch;
+            const self: *DefaultStrategy = @ptrCast(@alignCast(ctx));
+            return self.lowerExternalGeneric(ctx, "r2z.collections.HashMap", external.args);
+        }
+        if (isCollectionsSetPath(external.path)) {
+            if (external.args.len != 2) return error.GenericArgumentArityMismatch;
+            const self: *DefaultStrategy = @ptrCast(@alignCast(ctx));
+            return self.lowerExternalGeneric(ctx, "r2z.collections.HashSet", external.args);
+        }
         return error.UnsupportedExternalNominalType;
     }
 
@@ -106,12 +136,25 @@ pub const DefaultStrategy = struct {
         params: []const ir.types.Type,
     ) anyerror!?ast.Type {
         _ = ctx;
-        _ = params;
         if (std.mem.eql(u8, name, "Vec") or std.mem.eql(u8, name, "String")) {
             return .{ .named = "std.ArrayListUnmanaged" };
         }
         if (std.mem.eql(u8, name, "BTreeMap")) {
             return .{ .named = "std.AutoHashMap" };
+        }
+        // `HashMap`/`HashSet` name a *builder* as their last parameter, so
+        // they cannot become `std.AutoHashMap`: that would substitute Wyhash
+        // for whatever the Rust source asked for — for the `fnv` crate, the
+        // single reason it exists. The r2z containers keep the builder and
+        // build a `std.hash_map` context from it. The arity is part of the
+        // name: a two-parameter `HashMap<K, V>` means Rust's randomly seeded
+        // `RandomState`, which has no static Zig equivalent, so only the
+        // spelled-out three-parameter form maps.
+        if (std.mem.eql(u8, name, "HashMap") and params.len == 3) {
+            return .{ .named = "r2z.collections.HashMap" };
+        }
+        if (std.mem.eql(u8, name, "HashSet") and params.len == 2) {
+            return .{ .named = "r2z.collections.HashSet" };
         }
         return null;
     }
@@ -155,6 +198,23 @@ pub const DefaultStrategy = struct {
             cell[i] = try lowerTypeImpl(ctx, e);
         }
         return cell[0..n];
+    }
+
+    /// Lower generic arguments into caller-owned storage, mirroring
+    /// `lowerTuple`: a pointer into `self` outlives the next call on the same
+    /// owner, which is what the single-call lowering pattern needs.
+    fn lowerExternalGeneric(
+        self: *DefaultStrategy,
+        ctx: *anyopaque,
+        name: []const u8,
+        args: []const ir.types.Type,
+    ) anyerror!ast.Type {
+        const cell_index = self.next_generic_cell % self.generic_cells.len;
+        self.next_generic_cell += 1;
+        const cell = &self.generic_cells[cell_index];
+        const n = @min(args.len, cell.len);
+        for (args[0..n], 0..) |arg, i| cell[i] = try lowerTypeImpl(ctx, arg);
+        return .{ .generic = .{ .name = name, .params = cell[0..n] } };
     }
 
     fn resultToAst(ctx: *anyopaque, r: ir.types.Result) anyerror!ast.Type {
@@ -281,19 +341,40 @@ test "default: lower short and long tuples into caller storage" {
 }
 
 test "default: standard generic mapping" {
+    // `HashMap`/`HashSet` used to be asserted `null` here: r2z-core had no
+    // container at all. They now map to the r2z `collections` types, which
+    // keep the Rust `BuildHasher` the source named. `std.AutoHashMap` is
+    // deliberately NOT the answer — it would swap the crate's hasher for
+    // Wyhash, which is the one thing the `fnv` crate exists to prevent.
     const hash_set = try DefaultStrategy.lowerStdGeneric(
         undefined,
         "HashSet",
         &.{ ir.types.Type{ .prim = .u64 }, ir.types.Type{ .prim = .f32 } },
     );
-    try std.testing.expect(hash_set == null);
+    try std.testing.expect(hash_set != null);
+    try std.testing.expectEqualStrings("r2z.collections.HashSet", hash_set.?.named);
 
     const hash_map = try DefaultStrategy.lowerStdGeneric(
         undefined,
         "HashMap",
+        &.{
+            ir.types.Type{ .prim = .u64 },
+            ir.types.Type{ .prim = .f32 },
+            ir.types.Type{ .prim = .usize },
+        },
+    );
+    try std.testing.expect(hash_map != null);
+    try std.testing.expectEqualStrings("r2z.collections.HashMap", hash_map.?.named);
+
+    // A two-parameter `HashMap<K, V>` is Rust's randomly seeded
+    // `RandomState`. It has no static Zig equivalent, so the name mapping
+    // must not claim it.
+    const unseeded_map = try DefaultStrategy.lowerStdGeneric(
+        undefined,
+        "HashMap",
         &.{ ir.types.Type{ .prim = .u64 }, ir.types.Type{ .prim = .f32 } },
     );
-    try std.testing.expect(hash_map == null);
+    try std.testing.expect(unseeded_map == null);
 
     const vec = try DefaultStrategy.lowerStdGeneric(
         undefined,
@@ -323,6 +404,55 @@ test "default: external nominal mapping is explicit and fail-loud" {
             .external_nominal = .{
                 .path = &.{ "alloc", "collections", "VecDeque" },
                 .args = &.{.{ .prim = .u8 }},
+            },
+        }),
+    );
+}
+
+test "default: collections external nominals keep the source's BuildHasher" {
+    var strategy: DefaultStrategy = .{};
+
+    const map = try DefaultStrategy.lowerType(&strategy, .{
+        .external_nominal = .{
+            .path = &.{ "std", "collections", "HashMap" },
+            .args = &.{
+                .{ .prim = .u64 },
+                .{ .prim = .f32 },
+                .{ .prim = .usize },
+            },
+        },
+    });
+    try std.testing.expectEqualStrings("r2z.collections.HashMap", map.generic.name);
+    try std.testing.expectEqual(@as(usize, 3), map.generic.params.len);
+    try std.testing.expectEqual(ast.Prim.u64, map.generic.params[0].prim);
+    try std.testing.expectEqual(ast.Prim.f32, map.generic.params[1].prim);
+    try std.testing.expectEqual(ast.Prim.usize, map.generic.params[2].prim);
+
+    const set = try DefaultStrategy.lowerType(&strategy, .{
+        .external_nominal = .{
+            .path = &.{ "core", "collections", "HashSet" },
+            .args = &.{ .{ .prim = .u64 }, .{ .prim = .usize } },
+        },
+    });
+    try std.testing.expectEqualStrings("r2z.collections.HashSet", set.generic.name);
+    try std.testing.expectEqual(@as(usize, 2), set.generic.params.len);
+
+    // `alloc::collections` is the same Rust type by another path.
+    const from_alloc = try DefaultStrategy.lowerType(&strategy, .{
+        .external_nominal = .{
+            .path = &.{ "alloc", "collections", "HashMap" },
+            .args = &.{ .{ .prim = .u64 }, .{ .prim = .f32 }, .{ .prim = .usize } },
+        },
+    });
+    try std.testing.expectEqualStrings("r2z.collections.HashMap", from_alloc.generic.name);
+
+    // Dropping the builder parameter must not silently invent one.
+    try std.testing.expectError(
+        error.GenericArgumentArityMismatch,
+        DefaultStrategy.lowerType(&strategy, .{
+            .external_nominal = .{
+                .path = &.{ "std", "collections", "HashMap" },
+                .args = &.{ .{ .prim = .u64 }, .{ .prim = .f32 } },
             },
         }),
     );
