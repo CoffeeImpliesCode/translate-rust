@@ -11,11 +11,6 @@
           "local_name": "util",
           "module_or_path": "./util.zig",
           "is_pub": true
-        },
-        {
-          "local_name": "r2z",
-          "module_or_path": "r2z",
-          "is_pub": false
         }
       ],
       "decls": [
@@ -146,55 +141,27 @@
                     ],
                     "capture": null,
                     "body": {
-                      "kind": "call",
-                      "callee": {
-                        "kind": "ident",
-                        "name": "r2z.ops.binary"
-                      },
-                      "generic_args": [],
-                      "args": [
-                        {
+                      "kind": "bin_op",
+                      "op": "mul",
+                      "lhs": {
+                        "kind": "bin_op",
+                        "op": "mul",
+                        "lhs": {
                           "kind": "ident",
-                          "name": "r2z.ops.Operation.mul"
+                          "name": "r"
                         },
-                        {
+                        "rhs": {
                           "kind": "ident",
-                          "name": "r2z.ops.Overflow.wrapping"
-                        },
-                        {
-                          "kind": "call",
-                          "callee": {
-                            "kind": "ident",
-                            "name": "r2z.ops.binary"
-                          },
-                          "generic_args": [],
-                          "args": [
-                            {
-                              "kind": "ident",
-                              "name": "r2z.ops.Operation.mul"
-                            },
-                            {
-                              "kind": "ident",
-                              "name": "r2z.ops.Overflow.wrapping"
-                            },
-                            {
-                              "kind": "ident",
-                              "name": "r"
-                            },
-                            {
-                              "kind": "ident",
-                              "name": "r"
-                            }
-                          ]
-                        },
-                        {
-                          "kind": "lit",
-                          "value": {
-                            "kind": "float",
-                            "value": 3.14159
-                          }
+                          "name": "r"
                         }
-                      ]
+                      },
+                      "rhs": {
+                        "kind": "lit",
+                        "value": {
+                          "kind": "float",
+                          "value": 3.14159
+                        }
+                      }
                     }
                   },
                   {
@@ -222,30 +189,16 @@
                     ],
                     "capture": null,
                     "body": {
-                      "kind": "call",
-                      "callee": {
+                      "kind": "bin_op",
+                      "op": "mul",
+                      "lhs": {
                         "kind": "ident",
-                        "name": "r2z.ops.binary"
+                        "name": "width"
                       },
-                      "generic_args": [],
-                      "args": [
-                        {
-                          "kind": "ident",
-                          "name": "r2z.ops.Operation.mul"
-                        },
-                        {
-                          "kind": "ident",
-                          "name": "r2z.ops.Overflow.wrapping"
-                        },
-                        {
-                          "kind": "ident",
-                          "name": "width"
-                        },
-                        {
-                          "kind": "ident",
-                          "name": "height"
-                        }
-                      ]
+                      "rhs": {
+                        "kind": "ident",
+                        "name": "height"
+                      }
                     }
                   }
                 ]
