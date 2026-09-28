@@ -1094,6 +1094,24 @@ test "analyzeSourceWithOptions includes cfg test module and function body" {
     try std.testing.expectEqual(@as(i128, 1), rhs.kind.literal.int.value);
 }
 
+test "shift and arithmetic on a reference operand yield the pointee type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // Rust auto-derefs reference operands for `>>` and `-`, so both results are
+    // `u8`. Equating a result with `&u8` makes the following `as usize` cast
+    // record a `u8` source against a `&u8` operand, which IR validation rejects.
+    const source =
+        \\pub fn nibble(byte: &u8) -> usize {
+        \\    (byte >> 4) as usize + (byte - 1) as usize
+        \\}
+    ;
+
+    const rust_ir = try analyzeSourceWithOptions(allocator, "shift", "2021", source, .{});
+    try ir.validateForTranslation(&rust_ir);
+}
+
 test "analyzeSourceWithOptions selects configured feature-gated entity" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

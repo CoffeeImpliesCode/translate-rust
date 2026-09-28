@@ -2049,9 +2049,7 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
             if (b.exprs[cast.operand].ty) |source_id| {
                 try validateTypeRef(b, source_id);
                 const operand_type = b.types[source_id];
-                if (!sameType(cast.source_type, operand_type)) {
-                    return error.UnsupportedExpression;
-                }
+                if (!sameType(cast.source_type, operand_type)) return error.UnsupportedExpression;
             } else switch (target) {
                 .raw_ptr => return error.UnsupportedExpression,
                 else => {},

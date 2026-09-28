@@ -1031,7 +1031,16 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
             try pinKnownType(ctx, node, .{ .prim = .bool });
         },
         .shl, .shr => {
-            try addEq(ctx, bin.lhs, node);
+            // Rust auto-derefs reference operands, so a shift result is the
+            // pointee type. Equating it with `&u8` would make a following `as`
+            // cast record a scalar source against a reference operand.
+            if (getKnownType(ctx, bin.lhs)) |lhs_ty| {
+                if (lhs_ty != .reference) {
+                    try addEq(ctx, bin.lhs, node);
+                }
+            } else {
+                try addEq(ctx, bin.lhs, node);
+            }
         },
         .boolean_and, .boolean_or => {
             try pinKnownType(ctx, bin.lhs, .{ .prim = .bool });
@@ -4770,6 +4779,33 @@ fn getMethodName(ctx: *Ctx, def: exprs.DefId) ?[]const u8 {
     return null;
 }
 
+/// Rust method-call arguments exclude the receiver, while the declaration keeps
+/// it as the first parameter. Constrain each argument against the matching
+/// declared parameter so literals such as `&[0; 32]` receive their element type.
+fn constrainInherentMethodArguments(
+    ctx: *Ctx,
+    method_name: []const u8,
+    receiver_ty: ?types.Type,
+    args: []const exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    const cg = ctx.cg orelse return;
+    const known_receiver = receiver_ty orelse return;
+    const type_name = canonicalReceiverName(ctx, known_receiver) orelse return;
+    const method_def =
+        resolve_methods.lookupInherentMethod(cg, type_name, method_name) orelse return;
+    if (method_def >= ctx.b.bodies.len) return;
+    const function = switch (ctx.b.bodies[method_def]) {
+        .fn_ => |fn_body| fn_body,
+        else => return,
+    };
+    const params = function.params;
+    const offset: usize = if (params.len == args.len + 1) 1 else 0;
+    if (params.len != args.len + offset) return;
+    for (args, params[offset..]) |arg, param| {
+        try constrainExpectedType(ctx, arg, param.ty);
+    }
+}
+
 fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
     const m_name = getMethodName(ctx, m.method) orelse {
         try walkExpr(ctx, m.receiver, fn_body);
@@ -4789,6 +4825,7 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
         }
         try walkExpr(ctx, a, fn_body);
     }
+    try constrainInherentMethodArguments(ctx, m_name, receiver_ty, m.args);
     if (std.mem.eql(u8, m_name, "ok")) {
         if (receiver_ty) |known_receiver| {
             if (resultPayloadType(known_receiver, false)) |ok_payload| {
