@@ -1423,6 +1423,14 @@ fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?
     if (blk.tail) |t| {
         if (blk_node) |bn| try addEq(ctx, bn, t);
         try walkExpr(ctx, t, fn_body);
+        // The function body's own tail yields the declared return type, so pin
+        // it the same way a `return` statement is pinned. Nested blocks yield
+        // their own type and must stay unconstrained.
+        if (blk_node != null and blk_node.? == fn_body) {
+            if (findFnReturnType(ctx.b, fn_body)) |ret_ty| {
+                try constrainExpectedType(ctx, t, ret_ty);
+            }
+        }
     }
 }
 
@@ -4721,6 +4729,13 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
                 try walkExpr(ctx, v, fn_body);
                 try addRet(ctx, v, fn_body);
                 try addEq(ctx, node, v);
+                // A declared return type that is not already interned (such as
+                // `Option<u32>`) never reaches the solver's `ret` edge, so pin
+                // the value here instead. Without this, a bare `return None;`
+                // reaches the backend untyped.
+                if (findFnReturnType(ctx.b, fn_body)) |ret_ty| {
+                    try constrainExpectedType(ctx, v, ret_ty);
+                }
             }
         },
         .closure => |closure| try walkClosure(ctx, closure, fn_body),

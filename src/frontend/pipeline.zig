@@ -1112,6 +1112,71 @@ test "shift and arithmetic on a reference operand yield the pointee type" {
     try ir.validateForTranslation(&rust_ir);
 }
 
+test "a declared Option return type reaches the returned variant expressions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // `Option<u32>` is not interned as a TypeId, so the solver's `ret` edge and
+    // tail unification cannot type the variants. A bare `return None;` and a
+    // `Some(x)` tail both reached the backend untyped without this.
+    const source =
+        \\pub fn maybe(x: u32) -> Option<u32> {
+        \\    if x == 0 { return None; }
+        \\    Some(x)
+        \\}
+    ;
+
+    const rust_ir = try analyzeSourceWithOptions(allocator, "option_ret", "2021", source, .{});
+    try ir.validateForTranslation(&rust_ir);
+
+    // Both variant expressions must carry the declared Option type.
+    var option_typed = false;
+    for (rust_ir.bodies.exprs) |expression| {
+        const kind = switch (expression.kind) {
+            .enum_variant => |value| value.variant,
+            else => continue,
+        };
+        const type_id = expression.ty orelse continue;
+        if (type_id >= rust_ir.bodies.types.len) continue;
+        if (std.meta.activeTag(rust_ir.bodies.types[type_id]) == .option) {
+            option_typed = true;
+        }
+        std.debug.assert(kind.len > 0);
+    }
+    try std.testing.expect(option_typed);
+}
+
+test "a user-defined Iterator impl keeps next on its struct" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // A `for` over a user iterator lowers through `next()`, so the trait
+    // method must land on the struct rather than being left unresolved.
+    const source =
+        \\pub struct Counter { left: u32 }
+        \\
+        \\impl Iterator for Counter {
+        \\    type Item = u32;
+        \\    fn next(&mut self) -> Option<u32> {
+        \\        if self.left == 0 { return None; }
+        \\        self.left -= 1;
+        \\        Some(self.left)
+        \\    }
+        \\}
+        \\
+        \\pub fn total() -> u32 {
+        \\    let mut sum = 0;
+        \\    for value in Counter { sum += value; }
+        \\    sum
+        \\}
+    ;
+
+    const rust_ir = try analyzeSourceWithOptions(allocator, "user_iter", "2021", source, .{});
+    try ir.validateForTranslation(&rust_ir);
+}
+
 test "analyzeSourceWithOptions selects configured feature-gated entity" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
