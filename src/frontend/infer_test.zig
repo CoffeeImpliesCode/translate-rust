@@ -4032,3 +4032,613 @@ test "a slice receiver collects nothing, declared Item or not" {
     try std.testing.expect(infer.isInferPlaceholderType(bound.external_nominal.args[0]));
 }
 
+// ── The shape body lowering actually produces ────────────────────────────────
+
+/// A method call whose callee is the `.method_ref` body lowering synthesizes
+/// per call site, not the concrete `fn_` `TurbofishFixture` stands in for.
+///
+/// `pushMethodRef` parents the reference to the enclosing callable and gives it
+/// an empty body-table slot, so `bodies[callee]` is `.none` and
+/// `methodDeclaredReturnType` has no `fn_` to read and no trait to reach: its
+/// parent is a function. That is the whole point of the fixture — nothing on
+/// the callee answers a signature lookup, so only the rule under test can name
+/// the result. A second entry in `trait_methods` declares a same-named method on
+/// a second trait, which is what the ambiguity guard reads.
+const MethodRefTurbofishFixture = struct {
+    exprs_store: []exprs.Expr,
+    types_store: []types.Type,
+    bodies_store: []bodies.BodyKind,
+    method_sigs_store: []bodies.TraitMethodSig,
+    b: bodies.Bodies,
+    graph: crate_graph.CrateGraph,
+    call_node: exprs.NodeId,
+
+    fn deinit(self: *MethodRefTurbofishFixture, alloc: std.mem.Allocator) void {
+        self.graph.deinit();
+        alloc.free(self.method_sigs_store);
+        alloc.free(self.bodies_store);
+        alloc.free(self.types_store);
+        alloc.free(self.exprs_store);
+        self.* = undefined;
+    }
+};
+
+const method_ref_test_span: spine.Span = span;
+
+/// `xs.<method_name><turbofish>() == other`, lowered by hand into the shape the
+/// frontend records. Entity ids: 0 = module, 1 = struct `Bytes`, then one
+/// `.trait_` per entry in `trait_methods`, then the callable that owns the
+/// call, then the `.method_ref` callee.
+fn buildMethodRefTurbofishFixture(
+    alloc: std.mem.Allocator,
+    method_name: []const u8,
+    turbofish: []const types.Type,
+    receiver_type: types.Type,
+    expected_result: types.Type,
+    trait_methods: []const []const []const u8,
+) !MethodRefTurbofishFixture {
+    var graph = crate_graph.CrateGraph.init(alloc);
+    errdefer graph.deinit();
+
+    const trait_count = trait_methods.len;
+    const callable_id: exprs.DefId = 2 + @as(exprs.DefId, @intCast(trait_count));
+    const callee_id: exprs.DefId = callable_id + 1;
+
+    _ = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = method_ref_test_span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const receiver_def: exprs.DefId = 1;
+    _ = try graph.symbol_table.add(.{
+        .id = receiver_def,
+        .kind = .struct_,
+        .name = try alloc.dupe(u8, "Bytes"),
+        .span = method_ref_test_span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    // Every trait declares a method under the SAME name, differing only in the
+    // type parameter its return is spelled with. That is what makes the arity
+    // and the one-trait rule testable rather than incidental.
+    for (trait_methods, 0..) |_, index| {
+        _ = try graph.symbol_table.add(.{
+            .id = @intCast(receiver_def + 1 + index),
+            .kind = .trait_,
+            .name = try alloc.dupe(u8, if (index == 0) "ToHex" else "AlsoToHex"),
+            .span = method_ref_test_span,
+            .visibility = .public,
+            .parent = 0,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
+    }
+    _ = try graph.symbol_table.add(.{
+        .id = callable_id,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "describe"),
+        .span = method_ref_test_span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try graph.symbol_table.add(.{
+        .id = callee_id,
+        .kind = .method_ref,
+        .name = try alloc.dupe(u8, method_name),
+        .span = method_ref_test_span,
+        .visibility = .public,
+        .parent = callable_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = try alloc.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = method_ref_test_span,
+        .items = try alloc.dupe(spine.EntityId, &.{ receiver_def, callee_id }),
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = try alloc.dupe(u8, "method_ref_turbofish"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = 0,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    // Types: 0 = the receiver, 1 = the turbofish as written, 2 = the result the
+    // call must land on. Interning the expected result is what lets the solver
+    // record a PIN rather than a derived type; `solveWithGraph` does not
+    // materialize the derived list, which only the pipeline does.
+    const types_store = try alloc.alloc(types.Type, 3);
+    types_store[0] = receiver_type;
+    types_store[1] = turbofish[0];
+    types_store[2] = expected_result;
+
+    // Exprs: 0 = the receiver, 1 = the call, 2 = the other operand of `==`,
+    // 3 = the `==` the call is an operand of, 4 = the fn body block.
+    const exprs_store = try alloc.alloc(exprs.Expr, 5);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = method_ref_test_span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = receiver_def, .generic_args = &.{} } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = method_ref_test_span,
+        .ty = null,
+        .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = callee_id,
+            .generic_args = turbofish,
+            .args = &.{},
+        } },
+    };
+    // The other side of the `==`. An unsuffixed integer literal carries a
+    // literal CLASS, not a type, so `getKnownType` finds nothing on it and the
+    // equality edge cannot type the call from this side — which is what makes
+    // a `null` result in the negative tests mean "nothing named it".
+    exprs_store[2] = .{
+        .id = 2,
+        .span = method_ref_test_span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "0",
+            .value = 0,
+            .base = .dec,
+            .ty_suffix = null,
+        } } },
+    };
+    exprs_store[3] = .{
+        .id = 3,
+        .span = method_ref_test_span,
+        .ty = null,
+        .kind = .{ .binary = .{
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 1,
+            .rhs = 2,
+        } },
+    };
+    exprs_store[4] = .{
+        .id = 4,
+        .span = method_ref_test_span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{},
+            .tail = 3,
+            .labelled = null,
+        } },
+    };
+
+    // Each trait's method returns its own bare parameter, so a turbofish is the
+    // only thing that can resolve the return to anything concrete.
+    const method_sigs_store = try alloc.alloc(bodies.TraitMethodSig, trait_count);
+    for (trait_methods, 0..) |method_params, index| {
+        method_sigs_store[index] = .{
+            .name = try alloc.dupe(u8, method_name),
+            .ret = .{ .path = .{ .segments = try alloc.dupe(types.PathSegment, &.{
+                .{ .name = try alloc.dupe(u8, method_params[0]), .id = null },
+            }) } },
+            .generic_params = try alloc.dupe([]const u8, method_params),
+        };
+    }
+
+    // The body table is indexed by entity id, so each trait's `trait_` sits at
+    // its own entity id and the callee's slot is left `.none`.
+    const bodies_store = try alloc.alloc(bodies.BodyKind, callee_id + 1);
+    bodies_store[0] = .none;
+    bodies_store[1] = .{ .struct_ = .{} };
+    for (trait_methods, 0..) |_, index| {
+        bodies_store[2 + index] = .{ .trait_ = .{
+            .name = try alloc.dupe(u8, if (index == 0) "ToHex" else "AlsoToHex"),
+            .methods = method_sigs_store[index .. index + 1],
+        } };
+    }
+    bodies_store[callable_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(items.Param, &.{}),
+        .ret = .{ .prim = .bool },
+        .body = 4,
+    } };
+    bodies_store[callee_id] = .none;
+
+    return .{
+        .exprs_store = exprs_store,
+        .types_store = types_store,
+        .bodies_store = bodies_store,
+        .method_sigs_store = method_sigs_store,
+        .b = .{
+            .exprs = exprs_store,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = types_store,
+            .bodies = bodies_store,
+        },
+        .graph = graph,
+        .call_node = 1,
+    };
+}
+
+/// The container `Vec<(usize, usize)>` that `collect::<Vec<_>>()` over an
+/// `Iterator<Item = (usize, usize)>` hands back, written as the type table
+/// needs it so the call's PIN resolves to an interned entry.
+fn collectedPairVec(alloc: std.mem.Allocator) !types.Type {
+    const element = try alloc.alloc(types.Type, 2);
+    element[0] = .{ .prim = .usize };
+    element[1] = .{ .prim = .usize };
+    const args = try alloc.alloc(types.Type, 1);
+    args[0] = .{ .tuple = element };
+    return .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = args,
+    } };
+}
+
+test "a collect turbofish names the call's result on a bodiless call-site callee" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `generate_iter(5).collect::<Vec<_>>() == result`. The callee is the
+    // `.method_ref` body lowering synthesizes, so nothing on it names the
+    // result and `pinTurbofishResultType` cannot fire: the container comes
+    // from the call's own turbofish instead. That is what an operator over the
+    // call reads, and an operator over an untyped operand is the refusal this
+    // pins down — the call must come out NAMED.
+    const turbofish = try collectElementTurbofish(alloc);
+    const expected = try collectedPairVec(alloc);
+    var fixture = try buildMethodRefTurbofishFixture(
+        alloc,
+        "collect",
+        turbofish,
+        try iteratorItemBoundReceiver(alloc, true),
+        expected,
+        &.{},
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    const result_id = inferred.getType(fixture.call_node) orelse
+        return error.UntypedCollectedMethodCall;
+    try std.testing.expectEqual(@as(exprs.TypeId, 2), result_id);
+    try std.testing.expect(types.deepEqual(
+        expected,
+        fixture.b.types[result_id],
+    ));
+}
+
+/// `alloc::string::String` as a turbofish argument spells it. A comptime
+/// constant, because the path is a string literal and nothing is allocated.
+const string_turbofish: types.Type = .{
+    .external_nominal = .{ .path = &.{ "alloc", "string", "String" } },
+};
+
+test "a trait method turbofish names the call's result on a bodiless callee" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `[0x66, ..].encode_hex::<String>()`. `ToHex::encode_hex` declares
+    // `fn encode_hex<T: FromIterator<char>>(&self) -> T`, so the declared
+    // return is the bare parameter and the turbofish is the only thing that can
+    // resolve it. The callee is the `.method_ref` body lowering synthesizes,
+    // which carries no signature at all, so the trait's own signature is the
+    // only place the return type and the parameter names both come from.
+    const element = try alloc.create(types.Slice);
+    element.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const turbofish = [_]types.Type{string_turbofish};
+    var fixture = try buildMethodRefTurbofishFixture(
+        alloc,
+        "encode_hex",
+        &turbofish,
+        .{ .slice = element },
+        turbofish[0],
+        &.{&.{"T"}},
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    const result_id = inferred.getType(fixture.call_node) orelse
+        return error.UntypedTraitTurbofishMethodCall;
+    try std.testing.expectEqual(@as(exprs.TypeId, 1), result_id);
+    try std.testing.expect(types.deepEqual(
+        turbofish[0],
+        fixture.b.types[result_id],
+    ));
+}
+
+test "two traits declaring the same turbofish method leave the call untyped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Two traits, one method name, same arity: `xs.render::<String>()` names no
+    // one of them, and Rust would have rejected the call too. Neither trait's
+    // return wins here, so the call stays untyped and an operator over it keeps
+    // the general refusal.
+    const element = try alloc.create(types.Slice);
+    element.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const turbofish = [_]types.Type{string_turbofish};
+    var fixture = try buildMethodRefTurbofishFixture(
+        alloc,
+        "render",
+        &turbofish,
+        .{ .slice = element },
+        turbofish[0],
+        &.{ &.{"T"}, &.{"T"} },
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?exprs.TypeId, null), inferred.getType(fixture.call_node));
+}
+
+test "a trait method whose arity differs from the turbofish leaves the call untyped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `fn render<T, U>(&self) -> T` with a one-argument turbofish: the trait
+    // that declares the method is not the method this call names, and guessing
+    // which argument `String` is would be inventing a binding nobody wrote.
+    const element = try alloc.create(types.Slice);
+    element.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const turbofish = [_]types.Type{string_turbofish};
+    var fixture = try buildMethodRefTurbofishFixture(
+        alloc,
+        "render",
+        &turbofish,
+        .{ .slice = element },
+        turbofish[0],
+        &.{&.{ "T", "U" }},
+    );
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?exprs.TypeId, null), inferred.getType(fixture.call_node));
+}
+
+// ── Unconstrained literal defaults need their type interned ────────────────
+//
+// The Defaults Phase resolves an unconstrained integer class through
+// `primTypeId(b, .i32)`, and that lookup only SEARCHES the type list: it
+// never interns. A crate whose source never names `i32` therefore had no
+// TypeId to hand the class, the phase silently did nothing, and every
+// unconstrained integer expression kept `ty = null` — which the operator
+// pass then reads as a non-primitive operand. `materializeDerivedTypes` owns
+// the type list and runs immediately before the solver, so it is where the
+// default becomes reachable.
+
+/// The TypeId of `prim` in the type list, or a failure naming what is missing.
+///
+/// The Defaults Phase reaches its default through the type table, so "this
+/// unconstrained operand is an `i32`" is only answerable once the table names
+/// one. Asserting the operand rather than the table's length says what the
+/// solver owes, and says it the same way whichever entry ended up carrying it.
+fn defaultPrimTypeId(type_list: []const types.Type, prim: types.Prim) !exprs.TypeId {
+    for (type_list, 0..) |entry, index| {
+        if (entry == .prim and entry.prim == prim) return @intCast(index);
+    }
+    return error.DefaultLiteralTypeNotInterned;
+}
+
+test "an unconstrained integer comparison defaults to i32 the crate never named" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `pub fn f() -> bool { let n = 0; n < 3 }` with a type table that holds
+    // `bool` and nothing else. The comparison is the shape that has to work:
+    // nothing but the literal class says these operands are integers.
+    var pats_store = [_]exprs.Pattern{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = "n",
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } },
+    }};
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
+            .text = "0",
+            .value = 0,
+            .base = .dec,
+            .ty_suffix = null,
+        } } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .path = .{
+            .def = 0,
+            .generic_args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
+            .text = "3",
+            .value = 3,
+            .base = .dec,
+            .ty_suffix = null,
+        } } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .lt,
+            .overflow = .checked,
+            .lhs = 1,
+            .rhs = 2,
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = 3,
+            .labelled = null,
+        } } },
+    };
+    var stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .let = .{ .pattern = 0, .init = 0, .ty = null } },
+    }};
+    var bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .bool }, .body = 4 },
+    }};
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    try types_list.append(alloc, .{ .prim = .bool });
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &pats_store,
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &pats_store, &generated);
+    b.types = types_list.items;
+
+    // The default the class selects has to exist as a TypeId at all.
+    const i32_id = try defaultPrimTypeId(types_list.items, .i32);
+
+    var inferred = try infer.solveWithGen(alloc, &b, &generated);
+    defer inferred.deinit(alloc);
+
+    // The local and both literals read as `i32`; the comparison keeps the
+    // `bool` its own result is pinned to.
+    try std.testing.expectEqual(@as(?exprs.TypeId, i32_id), inferred.getType(0));
+    try std.testing.expectEqual(@as(?exprs.TypeId, i32_id), inferred.getType(1));
+    try std.testing.expectEqual(@as(?exprs.TypeId, i32_id), inferred.getType(2));
+    try std.testing.expectEqual(@as(?exprs.TypeId, 0), inferred.getType(3));
+
+    // Exactly one entry was added, and no `f64` rode along: this body has no
+    // unannotated float to default.
+    try std.testing.expectEqual(@as(usize, 2), types_list.items.len);
+}
+
+test "an unconstrained float defaults to f64 the crate never named" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `pub fn f() { 3.14; }` in a crate that names no float type. The literal
+    // is the crate's only evidence that a default is reachable at all.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .literal = .{ .float = .{
+            .text = "3.14",
+            .value = 3.14,
+        } } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = null,
+            .labelled = null,
+        } } },
+    };
+    var stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 0 } },
+    };
+    var bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 1 },
+    }};
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    try types_list.append(alloc, .{ .prim = .bool });
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &.{}, &generated);
+    b.types = types_list.items;
+
+    const f64_id = try defaultPrimTypeId(types_list.items, .f64);
+
+    var inferred = try infer.solveWithGen(alloc, &b, &generated);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(@as(?exprs.TypeId, f64_id), inferred.getType(0));
+
+    // Only the float default was added: no `i32` for a body that never has an
+    // unannotated integer.
+    try std.testing.expectEqual(@as(usize, 2), types_list.items.len);
+}
+
+test "a crate with no unannotated literal keeps the type table it had" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // A suffixed literal is pinned, never classed, so this body has nothing to
+    // default. Interning `i32` and `f64` unconditionally would still be
+    // harmless for the solver, but it would add two entries every crate's type
+    // table carries and nothing can select.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
+            .text = "5u8",
+            .value = 5,
+            .base = .dec,
+            .ty_suffix = "u8",
+        } } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = null,
+            .labelled = null,
+        } } },
+    };
+    var stmts_store = [_]exprs.Statement{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 0 } },
+    };
+    var bodies_store = [_]bodies.BodyKind{.{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 1 },
+    }};
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    try types_list.append(alloc, .{ .prim = .bool });
+    try types_list.append(alloc, .{ .prim = .u8 });
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = types_list.items,
+        .bodies = &bodies_store,
+    };
+    var generated = try infer.gen(alloc, &b);
+    defer generated.deinit(alloc);
+    try infer.materializeDerivedTypes(alloc, &types_list, &.{}, &generated);
+    b.types = types_list.items;
+
+    try std.testing.expectEqual(@as(usize, 2), types_list.items.len);
+
+    var inferred = try infer.solveWithGen(alloc, &b, &generated);
+    defer inferred.deinit(alloc);
+    try std.testing.expectEqual(@as(?exprs.TypeId, 1), inferred.getType(0));
+}

@@ -30,6 +30,7 @@ test {
     _ = @import("infer_test.zig");
     _ = @import("names_test.zig");
     _ = @import("resolve_methods_test.zig");
+    _ = @import("ts_ext_test.zig");
     _ = @import("monomorphize_test.zig");
     std.testing.refAllDecls(@This());
 }

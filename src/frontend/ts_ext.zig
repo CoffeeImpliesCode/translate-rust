@@ -761,6 +761,22 @@ fn qualifiedAssociatedPath(e: *const Ext, node: ts.Node) ?QualifiedAssociatedPat
     };
 }
 
+/// True when `trait_id` declares a method called `name` in its own body. A
+/// method a supertrait provides is not declared here, which is what makes the
+/// declaring trait — not the bound that was written — the owner of the
+/// reference `ensureTraitMethodRefEntity` mints.
+fn traitDeclaresMethod(e: *const Ext, trait_id: spine.EntityId, name: []const u8) bool {
+    if (trait_id >= e.ctx.bodies_list.items.len) return false;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.methods) |method| {
+        if (std.mem.eql(u8, method.name, name)) return true;
+    }
+    return false;
+}
+
 fn ensureTraitMethodRefEntity(
     e: *Ext,
     trait_id: spine.EntityId,
@@ -773,19 +789,7 @@ fn ensureTraitMethodRefEntity(
             return entity.id;
         }
     }
-    if (trait_id >= e.ctx.bodies_list.items.len) return null;
-    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
-        .trait_ => |body| body,
-        else => return null,
-    };
-    var declares_method = false;
-    for (trait_body.methods) |method| {
-        if (std.mem.eql(u8, method.name, name)) {
-            declares_method = true;
-            break;
-        }
-    }
-    if (!declares_method) return null;
+    if (!traitDeclaresMethod(e, trait_id, name)) return null;
     const id = try e.ctx.g.symbol_table.add(.{
         .id = 0,
         .kind = .method_ref,
@@ -1583,8 +1587,7 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
     // nominal segment after it. This is the same guard the declaration
     // binder applies, and it keeps a bare `std` from resolving.
     const ext_root = segs.items.len > 1 and isExternalCrateRoot(segs.items[0].name);
-    if (ext_root)
-    {
+    if (ext_root) {
         const external_path = try e.ctx.alloc.alloc([]const u8, segs.items.len);
         for (segs.items, 0..) |segment, index| {
             if (segment.name.len == 0) return error.InvalidType;
@@ -2056,31 +2059,15 @@ fn cstRange(e: *const Ext, node: ts.Node) CstRange {
 }
 
 /// Peel a range node (`a..b`, `a..=b`, `a..`) into its iterator classification.
-/// Only `0..b` / `0..=b` are lowered (start must be the literal `0`); `..=b`
-/// lowers to the inclusive bound `b+1` which the backend emits as `0..(b+1)`.
+/// The iterable is the whole `.range` node rather than its end bound: that is
+/// the shape a `.range` iter_kind is validated against, and the shape the
+/// backend's `for` input path lowers.
 fn lowerRangeIter(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
     const range = cstRange(e, node);
-    if (range.left) |left| {
-        const start = std.mem.trim(u8, text(e, left), " \t\r\n");
-        if (!std.mem.eql(u8, start, "0")) return unsupportedIter(e, "range start");
-    }
-    const right = range.right orelse return unsupportedIter(e, "range no end");
-    var end_eid = try lowerExpr(e, right);
-    if (range.inclusive) {
-        const one = try appendExpr(e, .{ .literal = .{ .int = .{
-            .text = "1",
-            .value = 1,
-            .base = .dec,
-            .ty_suffix = null,
-        } } });
-        end_eid = try appendExpr(e, .{ .binary = .{
-            .op = .add,
-            .overflow = .wrapping,
-            .lhs = end_eid,
-            .rhs = one,
-        } });
-    }
-    return .{ .kind = .{ .range = {} }, .eid = end_eid };
+    if (range.right == null) return unsupportedIter(e, "range no end");
+    const range_id = try lowerRangeExpression(e, node);
+    if (e.ctx.exprs.items[range_id].kind != .range) return unsupportedIter(e, "range");
+    return .{ .kind = .{ .slice = {} }, .eid = range_id };
 }
 
 /// Lower a source range while retaining an absent end for open-ended slices.
@@ -2419,6 +2406,35 @@ fn isSliceIteratorSourceType(ty: types.Type) bool {
     };
 }
 
+/// Slice methods that hand back a chunked-slice iterator. Each takes a single
+/// `usize` size argument and names its carrier in `infer.zig`, so a chain may
+/// ROOT at one: `src.chunks(2).enumerate().map(..)`. `windows` is absent
+/// because no method lowering exists for it — a receiver's `.windows(n)` is
+/// refused long before it could become a chain.
+const chunked_iterator_methods = [_][]const u8{ "chunks", "chunks_exact" };
+
+fn isChunkedIteratorMethod(name: []const u8) bool {
+    for (chunked_iterator_methods) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+/// True when `current` is `slice.chunks(n)` or `slice.chunks_exact(n)` over a
+/// plain slice or array. The chunk iterator itself is the chain's SOURCE, not
+/// an adapter: the backend walks it with the same chunk loop a `for` over the
+/// same call uses.
+fn isChunkedIteratorSource(e: *Ext, node: ts.Node) bool {
+    const current = peelParenthesized(node);
+    if (!std.mem.eql(u8, current.kind(), "call_expression")) return false;
+    const method = methodNameOf(e, current) orelse return false;
+    if (!isChunkedIteratorMethod(method)) return false;
+    const receiver = receiverOf(current) orelse return false;
+    const arguments = argumentsOf(current) orelse return false;
+    return iteratorSingleArgument(arguments) != null and
+        isStandardIteratorSource(e, receiver);
+}
+
 fn isStandardIteratorSource(e: *Ext, node: ts.Node) bool {
     var current = peelParenthesized(node);
     while (std.mem.eql(u8, current.kind(), "reference_expression")) {
@@ -2427,8 +2443,95 @@ fn isStandardIteratorSource(e: *Ext, node: ts.Node) bool {
     if (std.mem.eql(u8, current.kind(), "array_expression")) return true;
     if (!std.mem.eql(u8, current.kind(), "identifier")) return false;
     const definition = resolveName(e, text(e, current)) orelse return false;
-    const source_type = localType(e, definition) orelse return false;
+    const source_type = localType(e, definition) orelse
+        return isAsRefByteSequenceLocal(e, definition);
     return isSliceIteratorSourceType(source_type);
+}
+
+/// The expression a `let` bound to `def` was initialized from, or null when
+/// nothing lowered so far binds `def`. The enclosing fn's own body block is
+/// still being lowered when a chain is recognised, so its block id is not
+/// written down yet and the statement table is what there is to read. A name
+/// only resolves to `def` inside the function that declares it, so a `let` in
+/// another function never matches.
+fn localInitializer(e: *const Ext, def: spine.EntityId) ?exprs.Expr {
+    for (e.ctx.stmts.items) |statement| {
+        if (statement.kind != .let) continue;
+        const binding = statement.kind.let;
+        if (binding.pattern >= e.ctx.pats.items.len) continue;
+        const pattern = e.ctx.pats.items[binding.pattern];
+        const name = switch (pattern.kind) {
+            .binding => |value| value.name,
+            else => continue,
+        };
+        if (resolveName(e, name) orelse continue != def) continue;
+        const init = binding.init orelse return null;
+        if (init >= e.ctx.exprs.items.len) return null;
+        return e.ctx.exprs.items[init];
+    }
+    return null;
+}
+
+/// Whether the enclosing function declares a byte-sequence `AsRef` bound on
+/// `source_def`'s own type — `fn f<T: AsRef<[u8]>>(source: T)`. The bound is
+/// the only statement in the source that the borrow is a byte sequence, and
+/// nothing in this pass can turn it into a type for the new local: the
+/// inference pass that reads generic bounds runs after this lowering.
+fn isByteSequenceAsRefValue(e: *const Ext, source_def: spine.EntityId) bool {
+    if (e.fn_id >= e.ctx.bodies_list.items.len) return false;
+    const generics = switch (e.ctx.bodies_list.items[e.fn_id]) {
+        .fn_ => |fn_body| fn_body.generics,
+        else => null,
+    } orelse return false;
+    const source_ty = localType(e, source_def) orelse return false;
+    const type_path = switch (source_ty) {
+        .path => |path| path,
+        else => return false,
+    };
+    if (type_path.segments.len != 1) return false;
+    for (generics.params) |param| {
+        if (param != .type_) continue;
+        if (!std.mem.eql(u8, param.type_.name, type_path.segments[0].name)) continue;
+        for (param.type_.bounds) |bound| {
+            if (bound.optional or bound.args.len != 1) continue;
+            const segments = bound.path.segments;
+            if (segments.len == 0) continue;
+            const bound_name = segments[segments.len - 1].name;
+            if (!std.mem.eql(u8, bound_name, "AsRef") and
+                !std.mem.eql(u8, bound_name, "AsMut"))
+            {
+                continue;
+            }
+            switch (bound.args[0]) {
+                .slice, .array => return true,
+                else => continue,
+            }
+        }
+    }
+    return false;
+}
+
+/// `let bytes = source.as_ref();` names a byte sequence exactly when the
+/// `AsRef` bound on `source`'s type says so. The local itself stays untyped
+/// here, so a chain rooted at it is recognised from the bound instead.
+fn isAsRefByteSequenceLocal(e: *const Ext, def: spine.EntityId) bool {
+    const init = localInitializer(e, def) orelse return false;
+    const call = switch (init.kind) {
+        .method_call => |method| method,
+        else => return false,
+    };
+    if (call.args.len != 0) return false;
+    const method = e.ctx.g.symbol_table.get(call.method) orelse return false;
+    if (!std.mem.eql(u8, method.name, "as_ref") and
+        !std.mem.eql(u8, method.name, "as_mut") and
+        !std.mem.eql(u8, method.name, "borrow"))
+    {
+        return false;
+    }
+    if (call.receiver >= e.ctx.exprs.items.len) return false;
+    const receiver = e.ctx.exprs.items[call.receiver];
+    if (receiver.kind != .path) return false;
+    return isByteSequenceAsRefValue(e, receiver.kind.path.def);
 }
 
 /// A user `Iterator` is a chain source too, even though it is neither a slice
@@ -2442,6 +2545,7 @@ fn isSimpleIteratorSource(e: *Ext, node: ts.Node) bool {
     const current = peelParenthesized(node);
     if (std.mem.eql(u8, current.kind(), "range_expression")) return true;
     if (isIteratorSourceNode(e, current)) return true;
+    if (isChunkedIteratorSource(e, current)) return true;
     if (!std.mem.eql(u8, current.kind(), "call_expression")) return false;
 
     const method = methodNameOf(e, current) orelse return false;
@@ -2519,6 +2623,10 @@ fn lowerIteratorSource(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
         return lowerExpr(e, current);
     }
+    // `slice.chunks(n)` and `slice.chunks_exact(n)` ARE the chain's source.
+    // The call is lowered whole, so the backend drives it with the same chunk
+    // loop a `for` over the same call emits.
+    if (isChunkedIteratorSource(e, current)) return lowerExpr(e, current);
     if (!std.mem.eql(u8, method, "copied") or !iteratorArgumentsEmpty(arguments)) {
         return error.UnsupportedIteratorChain;
     }
@@ -2562,7 +2670,7 @@ fn lowerIteratorChainParts(
     const arguments = argumentsOf(current) orelse return error.UnsupportedIteratorChain;
 
     if (std.mem.eql(u8, method, "iter") or std.mem.eql(u8, method, "iter_mut") or
-        std.mem.eql(u8, method, "copied"))
+        std.mem.eql(u8, method, "copied") or isChunkedIteratorMethod(method))
     {
         source.* = try lowerIteratorSource(e, current);
         return;
@@ -2655,6 +2763,16 @@ fn unsupportedIter(e: *Ext, reason: []const u8) anyerror!UnwrappedIter {
     return .{ .kind = .{ .slice = {} }, .eid = eid };
 }
 
+/// True when a `.method(..)` call's receiver is spelled as a range
+/// expression. Rust's `rev` is the one adapter whose wire form differs by
+/// source: `range.rev()` lowers to a direction flag on a Zig range, while
+/// `slice.iter().rev()` is an ordinary `core::iter::Rev` carrier the runtime
+/// already has.
+fn isRangeReceiver(node: ts.Node) bool {
+    const receiver = receiverOf(node) orelse return false;
+    return std.mem.eql(u8, peelParenthesized(receiver).kind(), "range_expression");
+}
+
 /// Classify a `for` iterable expression, peeling `.iter()`, `.iter_mut()`,
 /// `.as_ref()` and detecting `.enumerate()` / `.zip()` / ranges.
 fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
@@ -2666,8 +2784,12 @@ fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
     if (std.mem.eql(u8, k, "call_expression")) {
         const mname = methodNameOf(e, node);
         if (mname) |name| {
+            // `.rev()` over a RANGE is a chain adapter; over any other
+            // iterator it is an ordinary method call the runtime already
+            // models as a `core::iter::Rev` carrier.
             if ((std.mem.eql(u8, name, "map") or std.mem.eql(u8, name, "filter") or
-                std.mem.eql(u8, name, "flat_map") or std.mem.eql(u8, name, "rev")) and
+                std.mem.eql(u8, name, "flat_map") or
+                (std.mem.eql(u8, name, "rev") and isRangeReceiver(node))) and
                 isStandardIteratorChain(e, node))
             {
                 const chain = lowerIteratorChainData(e, node, .iterator) catch |err| {
@@ -5566,6 +5688,88 @@ fn declaringAssociatedConstTrait(
     return found;
 }
 
+/// The trait in `trait_id`'s supertrait closure that declares `name` as a
+/// method. A method reaches a generic parameter through whichever bound in
+/// that closure provides it, so the declaring trait — not the bound that was
+/// written — is what a trait method reference has to hang from.
+fn declaringAssociatedMethodTrait(
+    e: *const Ext,
+    trait_id: spine.EntityId,
+    name: []const u8,
+    depth: usize,
+) ?spine.EntityId {
+    if (depth >= e.ctx.g.symbol_table.entities.items.len) return null;
+    if (traitDeclaresMethod(e, trait_id, name)) return trait_id;
+    if (trait_id >= e.ctx.bodies_list.items.len) return null;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return null,
+    };
+    var found: ?spine.EntityId = null;
+    for (trait_body.supertraits) |supertrait| {
+        var raw = std.mem.trim(u8, supertrait, " \t\r\n");
+        if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| raw = raw[0..generic_start];
+        const super_name = if (std.mem.lastIndexOf(u8, raw, "::")) |separator|
+            raw[separator + 2 ..]
+        else
+            raw;
+        const super_id = resolveName(e, super_name) orelse continue;
+        const candidate = declaringAssociatedMethodTrait(e, super_id, name, depth + 1) orelse continue;
+        if (found) |existing| {
+            if (existing != candidate) return null;
+        } else {
+            found = candidate;
+        }
+    }
+    return found;
+}
+
+/// The one trait reachable from the bounds of the type parameter
+/// `receiver_name` that declares `method_name`. Two bounds providing the same
+/// method from different traits leave the choice to the source, which this
+/// path does not spell, so that stays unresolved rather than guessed.
+fn boundAssociatedMethodTrait(
+    e: *const Ext,
+    receiver_name: []const u8,
+    method_name: []const u8,
+) ?spine.EntityId {
+    const view = bodyView(e);
+    var found: ?spine.EntityId = null;
+    var current: ?spine.EntityId = e.fn_id;
+    var remaining = e.ctx.g.symbol_table.entities.items.len;
+    while (current) |entity_id| {
+        if (remaining == 0) return null;
+        remaining -= 1;
+        if (genericBodyParams(&view, entity_id)) |generics| {
+            for (generics.params) |param| {
+                if (param != .type_ or !std.mem.eql(u8, param.type_.name, receiver_name)) continue;
+                for (param.type_.bounds) |bound| {
+                    if (bound.optional) continue;
+                    const trait_id = boundTraitEntity(e, bound) orelse continue;
+                    const declaring = declaringAssociatedMethodTrait(e, trait_id, method_name, 0) orelse continue;
+                    if (!mergeAssociatedConstTrait(&found, declaring)) return null;
+                }
+            }
+            for (generics.where_clauses) |clause| {
+                if (clause.self_ty.segments.len != 1 or
+                    !std.mem.eql(u8, clause.self_ty.segments[0].name, receiver_name))
+                {
+                    continue;
+                }
+                for (clause.bounds) |bound| {
+                    if (bound.optional) continue;
+                    const trait_id = boundTraitEntity(e, bound) orelse continue;
+                    const declaring = declaringAssociatedMethodTrait(e, trait_id, method_name, 0) orelse continue;
+                    if (!mergeAssociatedConstTrait(&found, declaring)) return null;
+                }
+            }
+        }
+        const entity = e.ctx.g.symbol_table.get(entity_id) orelse return null;
+        current = entity.parent;
+    }
+    return found;
+}
+
 fn mergeAssociatedConstTrait(
     destination: *?spine.EntityId,
     candidate: spine.EntityId,
@@ -5987,6 +6191,27 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 if (base_ent.kind == .type_alias) {
                     return unsupported(e, "unresolved associated call");
                 }
+            }
+        }
+        // `I::assoc(..)` where `I` is a type parameter of the enclosing fn or
+        // impl. Rust resolves it through the parameter's declared bounds, and
+        // `Self` in a bound is exactly that parameter, so the method hangs
+        // from whichever bound declares it. A bound this crate has no entity
+        // for — a trait from an external crate, say — resolves to nothing, and
+        // the path then keeps whatever refusal it had before this arm.
+        if ((try activeGenericReceiver(e, base_name)) != null) {
+            const trait_id = boundAssociatedMethodTrait(e, base_name, leaf);
+            const method_id = if (trait_id) |owner|
+                try ensureTraitMethodRefEntity(e, owner, leaf)
+            else
+                null;
+            if (method_id) |resolved| {
+                return appendGenericCall(
+                    e,
+                    .{ .associated = resolved },
+                    args,
+                    generic_args,
+                );
             }
         }
         if (std.mem.lastIndexOf(u8, t, "::")) |last_sep| {
@@ -7870,9 +8095,10 @@ test "lowerCall binds a trait method through an owner type that has no entity" {
     };
     // `Vec::from_hex("00").unwrap()` — the chain a real caller writes, and the
     // one whose receiver type decides whether `unwrap` resolves at all.
-    const unwrap = switch (tables.exprs_list.items[block.tail orelse
-        return error.MissingTailExpression].kind)
-    {
+    const unwrap = switch (tables.exprs_list.items[
+        block.tail orelse
+            return error.MissingTailExpression
+    ].kind) {
         .method_call => |value| value,
         else => return error.ExpectedMethodCall,
     };
@@ -7944,8 +8170,10 @@ test "lowerCall still rejects a trait method for a type no impl covers" {
         .block => |value| value,
         else => return error.ExpectedFunctionBlock,
     };
-    const lowered = tables.exprs_list.items[block.tail orelse
-        return error.MissingTailExpression];
+    const lowered = tables.exprs_list.items[
+        block.tail orelse
+            return error.MissingTailExpression
+    ];
     // No impl in this crate covers `String`, so the path still has to be
     // rejected — with the reason that says which construct failed.
     switch (lowered.kind) {
@@ -7990,8 +8218,10 @@ test "lowerCall rejects an owner type whose impls disagree on the method" {
         .block => |value| value,
         else => return error.ExpectedFunctionBlock,
     };
-    const lowered = tables.exprs_list.items[block.tail orelse
-        return error.MissingTailExpression];
+    const lowered = tables.exprs_list.items[
+        block.tail orelse
+            return error.MissingTailExpression
+    ];
     // Two impls both claim `from_hex` for `Vec<u8>`, so nothing in the path
     // chooses between them. Binding either one would emit a call into an
     // implementation the source never named.
@@ -9635,7 +9865,6 @@ test "body type paths accept a leading global separator" {
         else => return error.ExpectedOptionType,
     }
 }
-
 
 test "resolved parent glob exposes body-visible declarations and terminates cycles" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -20,11 +20,19 @@ pub const FnvHasher = struct {
     pub fn write(self: *FnvHasher, bytes: []const u8) void {
         var hash: u64 = self.@"0";
         for (bytes[0..]) |*byte| {
-            hash = (hash ^ @as(u64, byte.*));
-            hash = (hash *% 1099511628211);
+            hash = hash ^ @as(u64, byte.*);
+            hash = hash *% 1099511628211;
         }
         self.* = FnvHasher{ .@"0" = hash };
     }
 };
 
 pub const FnvBuildHasher = r2z.BuildHasherDefault(FnvHasher);
+
+pub fn FnvHashMap(comptime K: type, comptime V: type) type {
+    return r2z.collections.HashMap(K, V, FnvBuildHasher);
+}
+
+pub fn FnvHashSet(comptime T: type) type {
+    return r2z.collections.HashSet(T, FnvBuildHasher);
+}

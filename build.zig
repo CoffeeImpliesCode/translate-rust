@@ -177,6 +177,96 @@ pub fn build(b: *std.Build) void {
     const generate_hex_golden_cmd = b.addRunArtifact(hex_golden_generator);
     generate_hex_golden_step.dependOn(&generate_hex_golden_cmd.step);
 
+    const mini_golden_generator = b.addExecutable(.{
+        .name = "generate-mini-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_mini_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_mini_golden_step = b.step(
+        "generate-mini-golden",
+        "Regenerate mini source goldens from validated canonical IR",
+    );
+    const generate_mini_golden_cmd = b.addRunArtifact(mini_golden_generator);
+    generate_mini_golden_step.dependOn(&generate_mini_golden_cmd.step);
+
+    const compat_golden_generator = b.addExecutable(.{
+        .name = "generate-compat-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_compat_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_compat_golden_step = b.step(
+        "generate-compat-golden",
+        "Regenerate compat source goldens from validated canonical IR",
+    );
+    const generate_compat_golden_cmd = b.addRunArtifact(compat_golden_generator);
+    generate_compat_golden_step.dependOn(&generate_compat_golden_cmd.step);
+
+    const wyhash_golden_generator = b.addExecutable(.{
+        .name = "generate-wyhash-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_wyhash_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_wyhash_golden_step = b.step(
+        "generate-wyhash-golden",
+        "Regenerate wyhash source goldens from validated canonical IR",
+    );
+    const generate_wyhash_golden_cmd = b.addRunArtifact(wyhash_golden_generator);
+    generate_wyhash_golden_step.dependOn(&generate_wyhash_golden_cmd.step);
+
+    const adler_golden_generator = b.addExecutable(.{
+        .name = "generate-adler-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_adler_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_adler_golden_step = b.step(
+        "generate-adler-golden",
+        "Regenerate adler source goldens from validated canonical IR",
+    );
+    const generate_adler_golden_cmd = b.addRunArtifact(adler_golden_generator);
+    generate_adler_golden_step.dependOn(&generate_adler_golden_cmd.step);
+
+    const multimod_golden_generator = b.addExecutable(.{
+        .name = "generate-multimod-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_multimod_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_multimod_golden_step = b.step(
+        "generate-multimod-golden",
+        "Regenerate multimod source goldens from validated canonical IR",
+    );
+    const generate_multimod_golden_cmd = b.addRunArtifact(multimod_golden_generator);
+    generate_multimod_golden_step.dependOn(&generate_multimod_golden_cmd.step);
+
     // `zig build source` translates the complete mini source fixture and
     // checks that staged promotion publishes the generated package.
     const source_step = b.step("source", "Translate the complete mini source fixture");
@@ -217,7 +307,7 @@ pub fn build(b: *std.Build) void {
 
     // Mini is a complete positive wire fixture. Every other corpus fixture
     // remains rejection-only under the strict IR contract.
-    const test_crates_step = b.step("test-crates", "Translate mini and reject legacy wire fixtures");
+    const test_crates_step = b.step("test-crates", "Translate mini, reject legacy wire and unsupported source fixtures");
     {
         // r2z-core runtime library (standalone package, part of the pipeline).
         const tc = b.addSystemCommand(&.{ "sh", "-c", "cd r2z-core && zig build test --summary all" });
@@ -251,6 +341,45 @@ pub fn build(b: *std.Build) void {
             "sh",
             "-c",
             b.fmt("test ! -e zig-out/r2z-check/{s}; if ./zig-out/bin/translate-rust {s} -o zig-out/r2z-check/{s}; then echo 'expected incomplete fixture {s} to be rejected' >&2; exit 1; fi; test ! -e zig-out/r2z-check/{s}", .{ spec[1], spec[0], spec[1], spec[0], spec[1] }),
+        });
+        reject.step.dependOn(b.getInstallStep());
+        test_crates_step.dependOn(&reject.step);
+    }
+    // Source crates the translator must still refuse. The wire loop above only
+    // proves "exits non-zero", which stays green when a fixture starts failing
+    // with a *different* error, so these entries assert the typed error by
+    // name: the CLI reports it as `translate-rust failed: <Error>`. Each crate
+    // is a capability gap, not a defect; pinning the error makes the gap
+    // explicit and turns an accidental change in which error a crate fails
+    // with into a build failure.
+    const rejected_source_specs = [_][3][]const u8{
+        .{ "test/crates/siphasher", "siphasher", "UnresolvedTypePath" },
+        .{ "test/crates/itoa", "itoa", "InvalidCast" },
+        .{ "test/crates/atoi", "atoi", "UnsupportedExpression" },
+        .{ "test/crates/leb128", "leb128", "UnsupportedExpression" },
+        .{ "test/crates/seahash", "seahash", "InvalidCast" },
+        .{ "test/crates/percent-encoding", "percent-encoding", "UnsupportedExpression" },
+    };
+    for (rejected_source_specs) |spec| {
+        const reject = b.addSystemCommand(&.{
+            "sh",
+            "-c",
+            b.fmt(
+                \\set -eu
+                \\out=zig-out/r2z-check/source-{s}
+                \\test ! -e $out
+                \\trap 'rm -rf $out' EXIT
+                \\if log=$(./zig-out/bin/translate-rust {s} -o $out 2>&1); then
+                \\  echo "expected source crate {s} to be rejected" >&2
+                \\  exit 1
+                \\fi
+                \\printf '%s\n' "$log" | grep -q "translate-rust failed: {s}" || {{
+                \\  echo "expected source crate {s} to fail with {s}, got:" >&2
+                \\  printf '%s\n' "$log" >&2
+                \\  exit 1
+                \\}}
+                \\test ! -e $out
+            , .{ spec[1], spec[0], spec[1], spec[2], spec[1], spec[2] }),
         });
         reject.step.dependOn(b.getInstallStep());
         test_crates_step.dependOn(&reject.step);
@@ -405,6 +534,11 @@ const source_roots = [_][]const u8{
     "test/generate_mini_wire.zig",
     "test/generate_fnv_golden.zig",
     "test/generate_hex_golden.zig",
+    "test/generate_mini_golden.zig",
+    "test/generate_compat_golden.zig",
+    "test/generate_wyhash_golden.zig",
+    "test/generate_adler_golden.zig",
+    "test/generate_multimod_golden.zig",
     "test/e2e_test.zig",
     "test/golden_test.zig",
 };

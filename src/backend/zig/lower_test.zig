@@ -168,7 +168,6 @@ fn rootModuleBindingName(
     return null;
 }
 
-
 fn litChar(v: u32) ir.exprs.ExprKind {
     return .{ .literal = .{ .character = .{ .text = "", .value = v } } };
 }
@@ -2980,12 +2979,23 @@ test "lower: resolver-recognized Option method rejects incomplete fixture" {
 const ClosureCombinatorFixture = struct {
     method_name: []const u8,
     receiver_ty: ir.types.Type,
+    /// The parameter's own binding name, also the entity the body tail
+    /// resolves to when no capture is requested.
     param_name: []const u8,
     /// null → the body tail resolves to the parameter binding.
     capture_name: ?[]const u8 = null,
     capture_by_value: bool = false,
     /// false → the argument is a plain literal, exercising the runtime call.
     closure_argument: bool = true,
+    /// Element binding names for a destructured parameter (`|(a, b)| ..`).
+    /// Empty → the parameter is a plain binding.
+    tuple_names: []const []const u8 = &.{},
+    /// Build the destructured parameter as a slice pattern (`|[a, rest]|`)
+    /// instead of a tuple, which the lowerer has no Zig spelling for.
+    param_is_slice: bool = false,
+    /// Further parameter bindings, so the closure takes more than one argument.
+    /// The body tail still resolves to the first.
+    extra_param_names: []const []const u8 = &.{},
 };
 
 /// Lower `receiver.<method>(|param| ..)` into a package. `capture_name` names
@@ -3061,6 +3071,28 @@ fn lowerClosureCombinatorPackage(
         graph.symbol_table.entities.items[capture_id.?].parent = function_id;
     }
 
+    // A destructured parameter binds its element names, so the body tail reads
+    // the first of them — `|(a, b)| a` — not the parameter as a whole.
+    var element_ids: []const ir.spine.EntityId = &.{};
+    if (fixture.tuple_names.len > 0) {
+        const ids = try alloc.alloc(ir.spine.EntityId, fixture.tuple_names.len);
+        for (fixture.tuple_names, 0..) |name, index| {
+            ids[index] = try graph.symbol_table.add(.{
+                .id = 0,
+                .kind = .const_,
+                .name = name,
+                .span = span,
+                .visibility = .private,
+                .parent = null,
+                .resolved = null,
+                .renamed_to = null,
+                .attributes = &.{},
+            });
+            graph.symbol_table.entities.items[ids[index]].parent = function_id;
+        }
+        element_ids = ids;
+    }
+
     const types_store = try alloc.alloc(ir.types.Type, 1);
     types_store[0] = fixture.receiver_ty;
 
@@ -3072,18 +3104,33 @@ fn lowerClosureCombinatorPackage(
     // The body tail names the captured binding when one is requested, so a
     // by-value capture is visible as a renamed reference in the closure body.
     const tail_expr = try model.e(.{ .path = .{
-        .def = capture_id orelse param_id,
+        .def = capture_id orelse if (element_ids.len > 0) element_ids[0] else param_id,
         .generic_args = &.{},
     } });
     model.exprs.items[tail_expr].ty = 0;
 
-    const param_pattern = try model.pat(.{
-        .binding = .{
-            .name = fixture.param_name,
-            .mode = .{ .value = {} },
-            .mutable = false,
-        },
-    });
+    // A tuple-destructured parameter (`|(a, b)| ..`) is ONE parameter whose
+    // pattern is a tuple, matching how the frontend desugars `|(i, pair)|`.
+    const param_pattern: ir.exprs.NodeId = if (fixture.tuple_names.len == 0)
+        try model.pat(.{
+            .binding = .{
+                .name = fixture.param_name,
+                .mode = .{ .value = {} },
+                .mutable = false,
+            },
+        })
+    else blk: {
+        const elements = try alloc.alloc(ir.exprs.NodeId, fixture.tuple_names.len);
+        for (fixture.tuple_names, 0..) |name, index| {
+            elements[index] = try model.pat(.{
+                .binding = .{ .name = name, .mode = .{ .value = {} }, .mutable = false },
+            });
+        }
+        break :blk try model.pat(if (fixture.param_is_slice)
+            .{ .slice = .{ .elements = elements, .rest = null } }
+        else
+            .{ .tuple = .{ .elements = elements, .rest = false } });
+    };
     var captures: []const ir.exprs.Capture = &.{};
     if (fixture.capture_name) |capture_name| {
         const one = try alloc.alloc(ir.exprs.Capture, 1);
@@ -3094,8 +3141,14 @@ fn lowerClosureCombinatorPackage(
         };
         captures = one;
     }
-    const param_ids = try alloc.alloc(ir.exprs.NodeId, 1);
+    const param_count = 1 + fixture.extra_param_names.len;
+    const param_ids = try alloc.alloc(ir.exprs.NodeId, param_count);
     param_ids[0] = param_pattern;
+    for (fixture.extra_param_names, 0..) |name, index| {
+        param_ids[index + 1] = try model.pat(.{
+            .binding = .{ .name = name, .mode = .{ .value = {} }, .mutable = false },
+        });
+    }
     const closure_expr = try model.e(.{ .closure = .{
         .captures = captures,
         .params = param_ids,
@@ -3338,6 +3391,113 @@ test "lower: Result::map with an inline closure rewraps the untouched arm" {
     {
         return error.ExpectedErrFieldFromCapture;
     }
+}
+
+test "lower: Option::map with a tuple-destructured closure parameter binds the tuple and destructures it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const elem = try alloc.create(ir.types.Type);
+    elem.* = .{ .prim = .u8 };
+    const two = try alloc.alloc(ir.types.Type, 2);
+    @memset(two, elem.*);
+    const inner = try alloc.create(ir.types.Type);
+    inner.* = .{ .tuple = two };
+    const option_ty: ir.types.Type = .{ .option = inner };
+
+    const expr = try lowerClosureCombinatorExpr(alloc, .{
+        .method_name = "map",
+        .receiver_ty = option_ty,
+        .param_name = "pair",
+        // `|(a, b)| a` — one parameter whose pattern destructures a tuple.
+        .tuple_names = &.{ "a", "b" },
+    });
+    if (expr != .match_expr) return error.ExpectedOptionMapSwitch;
+    const arms = expr.match_expr.arms;
+    if (arms.len != 2) return error.ExpectedTwoSwitchArms;
+    const capture = arms[1].capture orelse return error.ExpectedPayloadCapture;
+    // A tuple pattern names no single value, so the payload is named for the
+    // shape and destructured inside the prong.
+    if (!std.mem.eql(u8, capture.name, "__r2z_in_tuple")) return error.ExpectedPayloadName;
+    if (arms[1].body != .block) return error.ExpectedMappedBlock;
+    const mapped = arms[1].body.block;
+    // `const __r2z_tuple = <payload>;` then one index binding per element.
+    if (mapped.stmts.len != 3) return error.ExpectedTupleDestructure;
+    const whole = mapped.stmts[0].let_stmt;
+    if (!std.mem.eql(u8, whole.name, "__r2z_tuple")) return error.ExpectedTupleBinding;
+    if (whole.init != .ident or !std.mem.eql(u8, whole.init.ident, capture.name)) {
+        return error.ExpectedTupleBoundToPayload;
+    }
+    const first = mapped.stmts[1].let_stmt;
+    if (!std.mem.eql(u8, first.name, "a")) return error.ExpectedFirstElementName;
+    if (first.init != .builtin or !std.mem.eql(u8, first.init.builtin.name, "index")) {
+        return error.ExpectedElementIndex;
+    }
+    if (first.init.builtin.args.len != 2 or first.init.builtin.args[0] != .ident or
+        !std.mem.eql(u8, first.init.builtin.args[0].ident, "__r2z_tuple"))
+    {
+        return error.ExpectedElementIndexedFromTuple;
+    }
+    const second = mapped.stmts[2].let_stmt;
+    if (!std.mem.eql(u8, second.name, "b")) return error.ExpectedSecondElementName;
+    if (second.init != .builtin or second.init.builtin.args.len != 2 or
+        second.init.builtin.args[1] != .lit or second.init.builtin.args[1].lit.int != 1)
+    {
+        return error.ExpectedSecondElementIndex;
+    }
+    // The body reads the destructured binding, not the payload.
+    const tail = mapped.expr orelse return error.ExpectedMappedTail;
+    if (tail.* != .ident or !std.mem.eql(u8, tail.ident, "a")) {
+        return error.ExpectedParameterBody;
+    }
+}
+
+test "lower: inline closure combinator still refuses a genuinely multi-parameter closure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const option_elem = try alloc.create(ir.types.Type);
+    option_elem.* = .{ .prim = .u8 };
+    const option_ty: ir.types.Type = .{ .option = option_elem };
+
+    // Two separate parameters is not a tuple destructuring: the payload is one
+    // value, so there is nothing to hand a second argument. This must stay
+    // refused rather than silently binding the first parameter alone.
+    try std.testing.expectError(
+        error.UnsupportedExpression,
+        lowerClosureCombinatorExpr(alloc, .{
+            .method_name = "map",
+            .receiver_ty = option_ty,
+            .param_name = "byte",
+            .extra_param_names = &.{"other"},
+        }),
+    );
+}
+
+test "lower: inline closure combinator still refuses an unsupported parameter shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const option_elem = try alloc.create(ir.types.Type);
+    option_elem.* = .{ .prim = .u8 };
+    const option_ty: ir.types.Type = .{ .option = option_elem };
+
+    // `|[first, rest]|` is a real Rust pattern the Zig AST cannot spell: it
+    // needs a slice view plus a sub-slice binding. Admitting tuple patterns
+    // must not admit this one.
+    try std.testing.expectError(
+        error.UnsupportedIteratorAdapter,
+        lowerClosureCombinatorExpr(alloc, .{
+            .method_name = "map",
+            .receiver_ty = option_ty,
+            .param_name = "pair",
+            .tuple_names = &.{ "first", "rest" },
+            .param_is_slice = true,
+        }),
+    );
 }
 
 test "lower: generic methods resolve Self and associated type qualifiers" {
@@ -7217,7 +7377,7 @@ test "lower: numeric pointer receiver autoderefs for wrapping arithmetic" {
     const package = try lower.lowerRustIr(alloc, &rust_ir, null);
     const source = try emit.emitFile(alloc, &package.files[0]);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "(seed.* +% 1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "seed.* +% 1") != null);
 }
 
 test "lower: integer unary logical_not lowers to bitwise not ~" {
@@ -7440,7 +7600,7 @@ test "lower: binary operation autoderefs pointer operands" {
     const package = try lower.lowerRustIr(alloc, &rust_ir, null);
     const source = try emit.emitFile(alloc, &package.files[0]);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "(seed.* +% 1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "seed.* +% 1") != null);
 }
 
 // ── Range patterns ───────────────────────────────────────────────────────────
@@ -9083,7 +9243,6 @@ test "lower: to_string renders a Display receiver into an owned runtime string" 
         .is_translated = true,
     });
 
-
     const rust_ir = ir.RustIr{
         .crate_name = "colors",
         .edition = "2021",
@@ -9734,6 +9893,114 @@ test "lower: a public root module is re-exported as a public declaration" {
     try std.testing.expect(std.mem.indexOf(u8, source, "pub const utils") == null);
 }
 
+// A `pub mod` is promoted to a `pub const name = @import("./name.zig")` decl
+// before the test-reachability pass runs, so a scan that reads only the import
+// list loses the one reference that made Zig analyze the submodule. Without
+// it a translated test module that nothing else uses compiles away and its
+// tests stop running — silently, because `zig build test` still succeeds over
+// zero assertions. This pins the reference for a PROMOTED import, next to the
+// re-export test above that pins the promotion itself.
+test "lower: a promoted public module import still gets a test reachability reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const support_mod_id = try addLowerEntity(&graph, .module, "support", null);
+    const support_test_id = try addLowerEntity(&graph, .fn_, "support_check", support_mod_id);
+    // The `#[test]` marker is what makes this a test block, and therefore what
+    // makes the submodule worth a reference to.
+    graph.symbol_table.entities.items[support_test_id].attributes = &.{
+        .{ .name = "test", .meta = "", .known = true },
+    };
+
+    const types_store = [_]ir.types.Type{.{ .prim = .unit }};
+    const unit_expr = try model.e(.{ .unit = {} });
+    model.exprs.items[unit_expr].ty = 0;
+    const unit_block = try model.e(.{ .block = .{
+        .statements = &.{},
+        .tail = unit_expr,
+        .labelled = null,
+    } });
+    model.exprs.items[unit_block].ty = 0;
+
+    while (model.bodies.items.len <= support_test_id) {
+        try model.bodies.append(model.a(), .{ .none = {} });
+    }
+    model.bodies.items[support_test_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = unit_block,
+        .is_allocating = false,
+    } };
+
+    const root_items = try alloc.dupe(ir.spine.EntityId, &[_]ir.spine.EntityId{
+        support_mod_id,
+    });
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    const support_items = try alloc.dupe(ir.spine.EntityId, &[_]ir.spine.EntityId{support_test_id});
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .file,
+        .name = "support",
+        .parent = null,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = false,
+        .span = span,
+        .items = support_items,
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = "reach",
+        .edition = 2021,
+        .kind = .lib,
+        .root = 0,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "reach",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types_store,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(model.a()),
+            .stmts = try model.stmts.toOwnedSlice(model.a()),
+            .pats = &.{},
+            .types = &types_store,
+            .bodies = try model.bodies.toOwnedSlice(model.a()),
+        },
+    };
+
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    const source = try emit.emitFile(alloc, &package.files[0]);
+    // The promotion moved the import into a decl, and the reachability
+    // reference has to follow it there.
+    try std.testing.expect(
+        std.mem.indexOf(u8, source, "pub const support = @import(\"./support.zig\");") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, source, "translated tests reachable through ./support.zig") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, source, "_ = support;") != null,
+    );
+}
+
 // The re-export must not widen the generated API. A Rust `mod utils;` is
 // private, so promoting it to `pub const` would publish a namespace the
 // source never exposed, and a consumer relying on the current surface would
@@ -9828,7 +10095,6 @@ test "lower: a private root module is never re-exported as public" {
     try std.testing.expect(std.mem.indexOf(u8, source, "pub const utils") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "pub const") == null);
 }
-
 
 // Rule case 1 of 3 — a *sized* pointee asserts alignment.
 // `&*p` where `p: *const u32` came from a raw pointer. The raw pointer made
@@ -10517,13 +10783,60 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
     const type_param_segments = [_]ir.types.PathSegment{.{ .name = "T", .id = null }};
     const type_param: ir.types.Type = .{ .path = .{ .segments = &type_param_segments } };
 
-    // The impl's parent is exactly what the topology guard inspects.
-    const impl_parent_id = switch (shape) {
-        .blanket, .non_crate_module => try addLowerEntity(&graph, .module, "hex", null),
-        .impl_parent_is_const => try addLowerEntity(&graph, .const_, "NOT_A_TYPE", null),
-    };
-    const impl_id = try addLowerEntity(&graph, .impl_, "ToHex", impl_parent_id);
+    const impl_id = try addLowerEntity(&graph, .impl_, "ToHex", null);
     graph.symbol_table.entities.items[method_id].parent = impl_id;
+
+    // The crate root is the target a blanket impl hoists onto, and only
+    // `addRootModule` creates the root module ENTITY as well as its row. With
+    // the row alone `moduleEntityId` resolves to nothing, the lookup key falls
+    // back to the dense row id, and the hoisted declaration is dropped.
+    const root_entity_id = try addRootModule(&graph, .{
+        .crate_name = "blanket_impl",
+        .edition = 2021,
+        // `addRootModule` parents a null-parent item to the root entity,
+        // which is the `.blanket` shape. The two negative shapes move the
+        // impl onto a parent of their own afterwards.
+        .items = &.{impl_id},
+    });
+
+    // The impl's parent is exactly what the topology guard inspects, so each
+    // shape has to name a genuinely different parent. One switch arm shared
+    // by two shapes would leave both tests asserting opposite outcomes for
+    // the same IR.
+    switch (shape) {
+        .blanket => {},
+        .impl_parent_is_const => {
+            // Neither a type declaration nor a crate module: the guard's
+            // `else` arm refuses it.
+            const const_id = try addLowerEntity(&graph, .const_, "NOT_A_TYPE", root_entity_id);
+            graph.symbol_table.entities.items[impl_id].parent = const_id;
+            // The impl stays a crate-root item; only its parent edge is wrong.
+            graph.modules.items[0].items = try alloc.dupe(
+                ir.spine.EntityId,
+                &.{ const_id, impl_id },
+            );
+        },
+        .non_crate_module => {
+            // A real nested module: the `.module` entity parented to the root
+            // plus the matching module row. `is_crate` is the only flag the
+            // guard reads, so the row has to exist and has to say false.
+            const child_id = try addLowerEntity(&graph, .module, "hex", root_entity_id);
+            _ = try graph.addModule(.{
+                .id = 0,
+                .kind = .@"inline",
+                .name = "hex",
+                .parent = root_entity_id,
+                .source_path = null,
+                .is_crate = false,
+                .is_extern = false,
+                .span = span,
+                .items = try alloc.dupe(ir.spine.EntityId, &.{impl_id}),
+                .attributes = &.{},
+            });
+            graph.symbol_table.entities.items[impl_id].parent = child_id;
+            graph.modules.items[0].items = try alloc.dupe(ir.spine.EntityId, &.{});
+        },
+    }
 
     const types = [_]ir.types.Type{ type_param, .{ .prim = .u8 } };
 
@@ -10536,8 +10849,9 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
     } });
     model.exprs.items[body].ty = 1;
 
-    // `impl_id` is created after `method_id`, so it is the largest entity.
-    while (model.bodies.items.len <= impl_id) {
+    // The body table is indexed by EntityId and the crate root the hoisted
+    // method lands on is itself an entity, so it spans the whole table.
+    while (model.bodies.items.len < graph.symbol_table.count()) {
         try model.bodies.append(model.a(), .{ .none = {} });
     }
     model.bodies.items[method_id] = .{ .fn_ = .{
@@ -10570,28 +10884,6 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
         .generics = generics,
     } };
 
-    const root_items = try alloc.dupe(ir.spine.EntityId, &[_]ir.spine.EntityId{impl_id});
-    _ = try graph.addModule(.{
-        .id = 0,
-        .kind = .root,
-        .name = "",
-        .parent = null,
-        .source_path = null,
-        .is_crate = true,
-        .is_extern = false,
-        .span = span,
-        .items = root_items,
-        .attributes = &.{},
-    });
-    try graph.addCrate(.{
-        .name = "blanket_impl",
-        .edition = 2021,
-        .kind = .lib,
-        .root = 0,
-        .deps = &.{},
-        .is_translated = true,
-    });
-
     const rust_ir = ir.RustIr{
         .crate_name = "blanket_impl",
         .edition = "2021",
@@ -10608,4 +10900,447 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
 
     const package = try lower.lowerRustIr(alloc, &rust_ir, null);
     return std.testing.allocator.dupe(u8, try emit.emitFile(alloc, &package.files[0]));
+}
+
+// ── Round-2 backend regressions ─────────────────────────────────────────────
+
+/// A crate root module row plus its crate entry, for fixtures that build
+/// their own symbol table rather than going through `addRootModule` (which
+/// needs the item ids up front, and these fixtures only learn them after the
+/// parameter entities exist).
+fn addBareCrate(
+    graph: *ir.graph.CrateGraph,
+    alloc: std.mem.Allocator,
+    crate_name: []const u8,
+    root_id: ir.spine.EntityId,
+    items: []const ir.spine.EntityId,
+) !void {
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = try alloc.dupe(ir.spine.EntityId, items),
+        .attributes = &.{},
+    });
+    try graph.addCrate(.{
+        .name = crate_name,
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+}
+
+/// Lower `rust_ir` and emit the crate root file, so a test can assert on the
+/// Zig source a fixture produces rather than on the AST that produced it.
+fn emitRootSource(alloc: std.mem.Allocator, rust_ir: *const ir.RustIr) ![]const u8 {
+    const package = try lower.lowerRustIr(alloc, rust_ir, null);
+    return emit.emitFile(alloc, &package.files[0]);
+}
+
+// ── FIX F: `alloc::string::ToString` is a runtime trait, not a declaration ──
+
+test "lower: a private alloc::string::ToString import lowers with no declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var bodies: ir.bodies.Bodies = undefined;
+    try buildSingleExternalUseModel(
+        alloc,
+        &graph,
+        &bodies,
+        &.{ "alloc", "string", "ToString" },
+        "ToString",
+        false,
+    );
+    const rust_ir = ir.RustIr{
+        .crate_name = "external_uses",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
+    // The trait is reached through a blanket impl on `Display`, never named as
+    // a Zig container, so it declares nothing and imports nothing.
+    try std.testing.expectEqual(@as(usize, 0), pkg.files[0].decls.len);
+    for (pkg.files[0].imports) |entry| {
+        try std.testing.expect(!std.mem.eql(u8, entry.local_name, "ToString"));
+    }
+}
+
+test "lower: an unknown alloc::string import is still refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var bodies: ir.bodies.Bodies = undefined;
+    try buildSingleExternalUseModel(
+        alloc,
+        &graph,
+        &bodies,
+        &.{ "alloc", "string", "ToStrng" },
+        "ToStrng",
+        false,
+    );
+    const rust_ir = ir.RustIr{
+        .crate_name = "external_uses",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    // Admitting `ToString` must not turn the arm into a blanket allow: an
+    // unrecognised `alloc::string` type still has no lowerable target.
+    try std.testing.expectError(
+        error.UnsupportedExternalUse,
+        lower.lowerRustIr(alloc, &rust_ir, null),
+    );
+}
+
+// ── FIX G: a shift amount is a `u5` in Zig ──────────────────────────────────
+
+test "lower: every shift spelling narrows its amount to the Zig shift type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const a_def = try addLowerEntity(&graph, .const_, "a", root_id);
+    const y_def = try addLowerEntity(&graph, .const_, "y", root_id);
+    const x_def = try addLowerEntity(&graph, .const_, "x", root_id);
+    const shl_id = try addLowerEntity(&graph, .fn_, "shl", root_id);
+    const shr_id = try addLowerEntity(&graph, .fn_, "shr", root_id);
+    const assign_id = try addLowerEntity(&graph, .fn_, "shift_assign", root_id);
+    try addBareCrate(&graph, alloc, "shift_amount", root_id, &.{ shl_id, shr_id, assign_id });
+
+    var model = Model.init(alloc);
+    const u32_ty: ir.types.Type = .{ .prim = .u32 };
+    const types = [_]ir.types.Type{u32_ty};
+
+    // `fn shl(a: u32, y: u32) -> u32 { a << y }`
+    const shl_lhs = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[shl_lhs].ty = 0;
+    const shl_rhs = try model.e(.{ .path = .{ .def = y_def, .generic_args = &.{} } });
+    model.exprs.items[shl_rhs].ty = 0;
+    const shl_tail = try model.e(.{ .binary = .{
+        .op = .shl,
+        .overflow = .checked,
+        .lhs = shl_lhs,
+        .rhs = shl_rhs,
+    } });
+    model.exprs.items[shl_tail].ty = 0;
+    const shl_body = try model.e(.{ .block = .{
+        .statements = &.{},
+        .tail = shl_tail,
+        .labelled = null,
+    } });
+
+    // `fn shr(a: u32, y: u32) -> u32 { a >> y }`
+    const shr_lhs = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[shr_lhs].ty = 0;
+    const shr_rhs = try model.e(.{ .path = .{ .def = y_def, .generic_args = &.{} } });
+    model.exprs.items[shr_rhs].ty = 0;
+    const shr_tail = try model.e(.{ .binary = .{
+        .op = .shr,
+        .overflow = .checked,
+        .lhs = shr_lhs,
+        .rhs = shr_rhs,
+    } });
+    model.exprs.items[shr_tail].ty = 0;
+    const shr_body = try model.e(.{ .block = .{
+        .statements = &.{},
+        .tail = shr_tail,
+        .labelled = null,
+    } });
+
+    // `fn shift_assign(a: u32, y: u32) -> u32 { let mut x = a; x <<= y; x }`
+    const bind_x = try model.pat(.{ .binding = .{
+        .name = "x",
+        .mode = .value,
+        .mutable = true,
+    } });
+    const init_x = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[init_x].ty = 0;
+    const let_stmt = try model.stmt(.{ .let = .{
+        .pattern = bind_x,
+        .init = init_x,
+        .ty = null,
+    } });
+    const assign_target = try model.e(.{ .path = .{ .def = x_def, .generic_args = &.{} } });
+    model.exprs.items[assign_target].ty = 0;
+    const assign_value = try model.e(.{ .path = .{ .def = y_def, .generic_args = &.{} } });
+    model.exprs.items[assign_value].ty = 0;
+    const shift_assign = try model.e(.{ .assign = .{
+        .target = assign_target,
+        .op = .shl,
+        .value = assign_value,
+        .overflow = .checked,
+    } });
+    model.exprs.items[shift_assign].ty = 0;
+    const assign_stmt = try model.stmt(.{ .expr = shift_assign });
+    const statements = try alloc.alloc(ir.exprs.NodeId, 2);
+    statements[0] = let_stmt;
+    statements[1] = assign_stmt;
+    const assign_tail = try model.e(.{ .path = .{ .def = x_def, .generic_args = &.{} } });
+    model.exprs.items[assign_tail].ty = 0;
+    const assign_body = try model.e(.{ .block = .{
+        .statements = statements,
+        .tail = assign_tail,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const params = try alloc.alloc(ir.items.Param, 2);
+    params[0] = .{ .name = "a", .ty = u32_ty, .span = span };
+    params[1] = .{ .name = "y", .ty = u32_ty, .span = span };
+    body_rows[shl_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = shl_body,
+        .is_allocating = false,
+    } };
+    body_rows[shr_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = shr_body,
+        .is_allocating = false,
+    } };
+    body_rows[assign_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = assign_body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "shift_amount",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // Zig takes the shift amount in `u5`. A bare `y: u32` is a compile error
+    // (`expected type 'u5', found 'u32'`), so all four spellings narrow it.
+    const source = try emitRootSource(alloc, &rust_ir);
+    try std.testing.expect(std.mem.indexOf(u8, source, "a << @intCast(y)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "a >> @intCast(y)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "x <<= @intCast(y)") != null);
+}
+
+// ── FIX H: a tuple-carrying variant is a value of its union ─────────────────
+
+test "lower: a tuple-carrying variant used as a value names its union" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const enum_id = try addLowerEntity(&graph, .enum_, "Kind", root_id);
+    const fn_id = try addLowerEntity(&graph, .fn_, "run", root_id);
+    try addBareCrate(&graph, alloc, "tuple_variant", root_id, &.{ enum_id, fn_id });
+
+    const u32_ty: ir.types.Type = .{ .prim = .u32 };
+    const segments = try alloc.alloc(ir.types.PathSegment, 1);
+    segments[0] = .{ .name = "Kind", .id = enum_id };
+    const kind_ty: ir.types.Type = .{ .path = .{ .segments = segments } };
+    const types = [_]ir.types.Type{ kind_ty, u32_ty };
+
+    var model = Model.init(alloc);
+    // `Kind::A(7)` — the variant carries a payload, so it is a union value
+    // rather than a bare name.
+    const payload = try model.e(litInt(7));
+    model.exprs.items[payload].ty = 2;
+    const tuple_fields = try alloc.alloc(ir.exprs.NodeId, 1);
+    tuple_fields[0] = payload;
+    const variant_expr = try model.e(.{ .enum_variant = .{
+        .def = enum_id,
+        .variant = "A",
+        .tuple_fields = tuple_fields,
+        .named_fields = &.{},
+    } });
+    model.exprs.items[variant_expr].ty = 1;
+    const ret_expr = try model.e(.{ .return_ = .{ .value = variant_expr } });
+    model.exprs.items[ret_expr].ty = 1;
+
+    const variant_rows = try alloc.alloc(ir.items.Variant, 1);
+    const variant_payload = try alloc.alloc(ir.types.Type, 1);
+    variant_payload[0] = u32_ty;
+    variant_rows[0] = .{
+        .name = "A",
+        .fields = .{ .tuple = variant_payload },
+        .discriminant = null,
+    };
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[enum_id] = .{ .enum_ = .{ .kind = .data, .variants = variant_rows } };
+    body_rows[fn_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = kind_ty,
+        .generic_params = &.{},
+        .body = ret_expr,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "tuple_variant",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // The union names the variant as its single field, so the value has to
+    // carry the payload into `Kind{ .A = ... }`. A bare `A` names nothing.
+    const source = try emitRootSource(alloc, &rust_ir);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return Kind{ .A = 7 };") != null);
+}
+
+// ── FIX I: indexing a lowered `Vec` reaches its storage ─────────────────────
+
+test "lower: indexing a Vec goes through the container storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const owned_def = try addLowerEntity(&graph, .const_, "v", root_id);
+    const borrowed_def = try addLowerEntity(&graph, .const_, "w", root_id);
+    const owned_fn = try addLowerEntity(&graph, .fn_, "first_owned", root_id);
+    const borrowed_fn = try addLowerEntity(&graph, .fn_, "third_borrowed", root_id);
+    try addBareCrate(&graph, alloc, "vec_index", root_id, &.{ owned_fn, borrowed_fn });
+
+    const u32_ty: ir.types.Type = .{ .prim = .u32 };
+    const vec_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = &.{u32_ty},
+    } };
+    const reference = try alloc.create(ir.types.Ref);
+    reference.* = .{ .mut = false, .pointee = vec_ty };
+    const ref_ty: ir.types.Type = .{ .reference = reference };
+    // 0 = `Vec<u32>`, 1 = `&Vec<u32>`, 2 = `u32`.
+    const types = [_]ir.types.Type{ vec_ty, ref_ty, u32_ty };
+
+    var model = Model.init(alloc);
+    // `fn first_owned(v: Vec<u32>) -> u32 { v[0] }`
+    const owned_base = try model.e(.{ .path = .{ .def = owned_def, .generic_args = &.{} } });
+    model.exprs.items[owned_base].ty = 0;
+    const owned_index = try model.e(litInt(0));
+    model.exprs.items[owned_index].ty = 2;
+    const owned_read = try model.e(.{ .index = .{ .base = owned_base, .index = owned_index } });
+    model.exprs.items[owned_read].ty = 2;
+    const owned_ret = try model.e(.{ .return_ = .{ .value = owned_read } });
+    model.exprs.items[owned_ret].ty = 2;
+
+    // `fn third_borrowed(w: &Vec<u32>) -> u32 { w[2] }`
+    const borrowed_base = try model.e(.{ .path = .{ .def = borrowed_def, .generic_args = &.{} } });
+    model.exprs.items[borrowed_base].ty = 1;
+    const borrowed_index = try model.e(litInt(2));
+    model.exprs.items[borrowed_index].ty = 2;
+    const borrowed_read = try model.e(.{ .index = .{
+        .base = borrowed_base,
+        .index = borrowed_index,
+    } });
+    model.exprs.items[borrowed_read].ty = 2;
+    const borrowed_ret = try model.e(.{ .return_ = .{ .value = borrowed_read } });
+    model.exprs.items[borrowed_ret].ty = 2;
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const owned_params = try alloc.alloc(ir.items.Param, 1);
+    owned_params[0] = .{ .name = "v", .ty = vec_ty, .span = span };
+    body_rows[owned_fn] = .{ .fn_ = .{
+        .params = owned_params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = owned_ret,
+        .is_allocating = false,
+    } };
+    const borrowed_params = try alloc.alloc(ir.items.Param, 1);
+    borrowed_params[0] = .{ .name = "w", .ty = ref_ty, .span = span };
+    body_rows[borrowed_fn] = .{ .fn_ = .{
+        .params = borrowed_params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = borrowed_ret,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "vec_index",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // `Vec<T>` lowers to `std.ArrayListUnmanaged`, which Zig does not index;
+    // its `items` slice does. Both the owned and the borrowed receiver read
+    // through the same storage.
+    const source = try emitRootSource(alloc, &rust_ir);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return v.items[0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return w.items[2];") != null);
 }

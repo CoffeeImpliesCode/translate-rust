@@ -6,13 +6,7 @@
   "files": [
     {
       "path": "src/root.zig",
-      "imports": [
-        {
-          "local_name": "util",
-          "module_or_path": "./util.zig",
-          "is_pub": true
-        }
-      ],
+      "imports": [],
       "decls": [
         {
           "kind": "struct_decl",
@@ -267,6 +261,27 @@
                 "name": "util"
               },
               "field_name": "helper"
+            }
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "util",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "builtin",
+              "name": "import",
+              "args": [
+                {
+                  "kind": "lit",
+                  "value": {
+                    "kind": "str",
+                    "value": "./util.zig"
+                  }
+                }
+              ]
             }
           }
         }

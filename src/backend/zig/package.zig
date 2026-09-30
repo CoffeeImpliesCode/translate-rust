@@ -203,32 +203,29 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
     );
 }
 
+/// Find the workspace `r2z-core` checkout by walking `anchor` and its parents.
+///
+/// `@src().file` cannot drive this walk. The compiler spells it relative to
+/// the directory it was invoked in, which is this module's root, not the
+/// process working directory or the executable: joining a runtime anchor to
+/// that relative path lands in a different tree, and the three-level climb
+/// that repairs an absolute path then overshoots by one. The anchor is the
+/// only runtime fact available here, so the search looks for `r2z-core`
+/// itself at each level instead.
 fn tryWorkspaceCoreFromAnchor(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source_file: []const u8,
     anchor: []const u8,
 ) !?[:0]u8 {
     var cursor = try allocator.dupe(u8, anchor);
     defer allocator.free(cursor);
-    var cwd = std.Io.Dir.cwd();
+    const cwd = std.Io.Dir.cwd();
     while (true) {
-        const source_path = std.fs.path.resolvePosix(allocator, &.{ cursor, source_file }) catch {
-            return error.DependencySourceUnavailable;
-        };
-        const package_dir = std.fs.path.dirname(source_path) orelse {
-            allocator.free(source_path);
-            return null;
-        };
         const core_path = std.fs.path.resolvePosix(
             allocator,
-            &.{ package_dir, "../../..", "r2z-core" },
-        ) catch {
-            allocator.free(source_path);
-            return error.DependencySourceUnavailable;
-        };
-        allocator.free(source_path);
-        if (cwd.access(io, core_path, .{})) |_| {
+            &.{ cursor, "r2z-core" },
+        ) catch return error.DependencySourceUnavailable;
+        if (std.Io.Dir.accessAbsolute(io, core_path, .{})) |_| {
             const result = cwd.realPathFileAlloc(io, core_path, allocator) catch {
                 allocator.free(core_path);
                 return error.DependencySourceUnavailable;
@@ -270,14 +267,14 @@ fn workspaceCoreAbsolute(allocator: std.mem.Allocator, io: std.Io) ![:0]u8 {
     const cwd_anchor = std.process.currentPathAlloc(io, allocator) catch
         return error.DependencySourceUnavailable;
     defer allocator.free(cwd_anchor);
-    if (try tryWorkspaceCoreFromAnchor(allocator, io, source_file, cwd_anchor)) |path| {
+    if (try tryWorkspaceCoreFromAnchor(allocator, io, cwd_anchor)) |path| {
         return path;
     }
 
     const exe_anchor = std.process.executableDirPathAlloc(io, allocator) catch
         return error.DependencySourceUnavailable;
     defer allocator.free(exe_anchor);
-    if (try tryWorkspaceCoreFromAnchor(allocator, io, source_file, exe_anchor)) |path| {
+    if (try tryWorkspaceCoreFromAnchor(allocator, io, exe_anchor)) |path| {
         return path;
     }
     return error.DependencySourceUnavailable;

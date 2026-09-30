@@ -115,8 +115,6 @@ const reason_operator_operands_unresolved = "operator operands unresolved";
 const reason_operator_operand_dispatched_call =
     "operator operand is a dispatched method call whose result type this pass does not name";
 const reason_operator_requires_primitives = "operator requires primitive operands";
-const reason_blanket_impl_receiver =
-    "blanket impl names no receiver type: backend validateMethodTopology has no parent to hoist onto";
 const reason_opaque_iterator_method =
     "opaque receiver: backend lookupRecognizedStdMethod has no arm for this iterator method";
 
@@ -1685,13 +1683,54 @@ fn operandRefused(
     };
 }
 
-fn isScalarOperandType(t: types.Type) bool {
+/// Whether an operator may read this type as one of its operands.
+///
+/// A `.path` that names a local `type` alias stands for the very value its
+/// alias body names, so `type Chunk = u32;` has to answer for `u32`: the CST
+/// layer records the alias path as the declared type wherever the alias is
+/// spelled, and refusing an operator on it refuses `u32` arithmetic written
+/// through a name. Everything else that is not a primitive once references
+/// are peeled is a nominal, an aggregate, or a type this pass could not
+/// name, and none of those is a scalar operand.
+fn isScalarOperandType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    t: types.Type,
+) bool {
     var current = t;
-    for (0..128) |_| {
-        if (current != .reference) return current == .prim;
-        current = current.reference.pointee;
+    var hops: usize = 0;
+    while (hops < 128) : (hops += 1) {
+        switch (current) {
+            .reference => current = current.reference.pointee,
+            .path => current = aliasBodyType(g, b, current.path) orelse return false,
+            .prim => return true,
+            else => return false,
+        }
     }
     return false;
+}
+
+/// The type a local `type` alias stands for, or null when the path names no
+/// alias body this pass can read.
+///
+/// The terminal segment carries the EntityId the path resolved to, and a
+/// `type_alias` body names its own target, so a chain of aliases resolves the
+/// same way the CST layer resolves a single one. A path that resolved to a
+/// nominal, or did not resolve at all, has no body to follow.
+fn aliasBodyType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    path: types.Path,
+) ?types.Type {
+    if (path.segments.len == 0) return null;
+    const alias_id = path.segments[path.segments.len - 1].id orelse return null;
+    const entity = g.symbol_table.get(alias_id) orelse return null;
+    if (entity.kind != .type_alias) return null;
+    if (alias_id >= b.bodies.len) return null;
+    return switch (b.bodies[alias_id]) {
+        .type_alias => |alias| alias.target,
+        else => null,
+    };
 }
 
 fn isRuntimeMemoryMethod(t: types.Type, name: []const u8) bool {
@@ -1722,14 +1761,20 @@ fn operandIsPrimitive(
     const operand = b.exprs[node];
     if (operand.ty) |type_id| {
         if (type_id >= b.types.len) return false;
-        return isScalarOperandType(b.types[type_id]);
+        return isScalarOperandType(g, b, b.types[type_id]);
     }
     return switch (operand.kind) {
         .literal => |literal| switch (literal) {
             .int, .float, .character, .boolean => true,
             .string, .byte_array => false,
         },
-        .path => |path| isScalarOperandType(pathDeclaredType(g, b, path) orelse return false),
+        .path => |path| isScalarOperandType(g, b, pathDeclaredType(g, b, path) orelse return false),
+        // A method call is primitive on the same rule `operandTypeResolved`
+        // already follows for it: a result type this pass names is a real
+        // value, and whether it is one an operator can read is that type's
+        // own question. Asking here is what keeps the two halves from
+        // disagreeing — a `len()` this pass names is `usize` to both.
+        .method_call => isScalarOperandType(g, b, stdMethodResultType(g, b, node, 0) orelse return false),
         .binary => |binary| operandIsPrimitive(g, b, binary.lhs) and operandIsPrimitive(g, b, binary.rhs),
         .cast => true,
         else => false,
@@ -1775,6 +1820,19 @@ fn isRetainedIteratorProjection(
         projection_node = method_call.receiver;
     }
     return false;
+}
+
+/// The method names the runtime drives over a retained slice iterator.
+///
+/// `cloned` erases the borrow the iterator hands out, and `rev` wraps it in
+/// the `core::iter::Rev` carrier the runtime already has as `r2z.Rev`. Both
+/// stay ordinary calls over the receiver this pass kept in the tree, so
+/// neither needs the backend to resolve a carrier of its own before it can
+/// lower them. Any other name over this receiver shape has no such arm, which
+/// is why the admission is this list and not the receiver's whole method set.
+fn isRetainedIteratorProjectionMethod(method_name: []const u8) bool {
+    return std.mem.eql(u8, method_name, "cloned") or
+        std.mem.eql(u8, method_name, "rev");
 }
 
 fn isRuntimeIoMethod(g: *const graph.CrateGraph, b: *const bodies.Bodies, method_id: exprs.DefId, receiver: types.Type, name: []const u8) bool {
@@ -1936,13 +1994,16 @@ fn ownedStringType(g: *const graph.CrateGraph) ?types.Type {
 /// Result type of a std method whose result the RUNTIME owns, read off the
 /// receiver rather than from a signature in the graph.
 ///
-/// Two methods reach this, and both name their own result exactly:
+/// Three methods reach this, and all three name their own result exactly:
 ///
 /// - `to_string` returns the owned `String` of Rust's blanket
 ///   `impl<T: Display> ToString for T`, which the backend lowers to
 ///   `r2z.alloc.String`.
 /// - `Result<T, E>::unwrap_err(&self) -> E` returns the error arm of the
 ///   receiver, and the receiver is the `Result` that arm sits in.
+/// - `len()` returns the element count of the sequence it is called on, and
+///   `usize` is that count's type in every Rust build. A slice and a
+///   `[T; N]` are both a count, and both lower to a Zig `.len`.
 ///
 /// Every other std method returns a primitive, an iterator, or something this
 /// pass cannot name, so it stays unresolved and an operator over it is still
@@ -1963,8 +2024,19 @@ fn stdMethodResultType(
     if (method.receiver >= b.exprs.len) return null;
     const entity = g.symbol_table.get(method.method) orelse return null;
     const is_to_string = std.mem.eql(u8, entity.name, "to_string");
-    if (!is_to_string and !std.mem.eql(u8, entity.name, "unwrap_err")) return null;
+    const is_len = std.mem.eql(u8, entity.name, "len");
+    if (!is_to_string and !is_len and !std.mem.eql(u8, entity.name, "unwrap_err")) return null;
     const receiver_ty = receiverDeclaredType(g, b, method.receiver) orelse return null;
+    if (is_len) {
+        // The evidence is the dispatch the resolver admits the call on, so
+        // this cannot name a `len` the resolver would refuse: only a receiver
+        // `lookupStdMethod` matches the slice `len` for is typed here. A
+        // `Vec`/`String` receiver, or an `ExactSizeIterator::len` on an
+        // iterator, keeps its own signature and stays unresolved.
+        const std_method = lookupStdMethod(receiver_ty, "len") orelse return null;
+        if (std_method != .slice_len) return null;
+        return .{ .prim = .usize };
+    }
     if (is_to_string) {
         // The call is admitted on exactly the two rules the resolver applies to
         // it: the graph-free `Display` set, or a crate-local `impl Display`.
@@ -2373,7 +2445,7 @@ pub fn resolveMethods(
             const receiver_ty = receiverDeclaredType(g, b, receiver_node);
             const iterator_projection = isRetainedIteratorProjection(g, b, receiver_node);
             if (iterator_projection) {
-                if (std.mem.eql(u8, method_name, "cloned")) {
+                if (isRetainedIteratorProjectionMethod(method_name)) {
                     stats.std_resolved += 1;
                 } else {
                     replaceWithUnsupported(e, reason_method_dispatch_unavailable);
@@ -2457,26 +2529,17 @@ pub fn resolveMethods(
                 }
             }
             // A blanket `impl<T: AsRef<[u8]>> Trait for T` provides its method
-            // for every type its bound admits, and it does admit an array
-            // literal — but it does not say WHICH type, and that is the whole
-            // of what a call needs here. The Zig backend hoists a method onto
-            // the type that implements it, and a blanket impl over a type
-            // parameter has no such type: `validateMethodTopology` refuses it
-            // outright with `GenericDefinitionMismatch`.
-            //
-            // The turbofish is no longer part of the reason. `MethodCall`
-            // carries `generic_args`, so `encode_hex::<String>()` now binds its
-            // result type in the IR and reaches this rule intact. What is
-            // still missing is the HOST type to hoist the method onto, which
-            // only a backend change can supply, so the call stays refused and
-            // the reason names the cause that remains. A receiver that HAS a
-            // type of its own still reaches the impl the ordinary way, through
-            // the name lookup above.
-            if (!resolved and receiver.kind == .array) {
-                if (lookupBlanketAsRefBytesMethod(g, b, method_name) != null) {
-                    replaceWithUnsupported(e, reason_blanket_impl_receiver);
-                    stats.unsupported_methods += 1;
-                    continue;
+            // for every type its bound admits, and an array receiver is one
+            // of them. The impl names no concrete self type, so nothing here
+            // can pick the call's method by receiver name; what it can do is
+            // name the TRAIT, which is how the backend reaches the impl it
+            // provides the method from.
+            if (!resolved and blanketArrayReceiver(b, receiver)) {
+                if (lookupBlanketAsRefBytesTrait(g, b, method_name)) |trait_id| {
+                    if (bindBlanketImplMethod(g, mc.method, trait_id)) {
+                        stats.trait_resolved += 1;
+                        resolved = true;
+                    }
                 }
             }
             if (!resolved) {
@@ -2517,6 +2580,109 @@ pub fn resolveMethods(
     }
 
     return stats;
+}
+
+/// Whether the call's receiver is an array, the one shape a blanket
+/// `AsRef<[u8]>` call can be emitted against.
+///
+/// The backend builds the self type from the bound's element and the
+/// receiver's own length (`blanketReceiverType`), so it needs either a
+/// receiver already typed as an array or an array literal to count. Anything
+/// else is not evidence that this blanket impl applies, and the call keeps
+/// whatever reason its own dispatch earns.
+fn blanketArrayReceiver(b: *const bodies.Bodies, receiver: exprs.Expr) bool {
+    if (receiver.kind == .array) return true;
+    const type_id = receiver.ty orelse return false;
+    if (type_id >= b.types.len) return false;
+    return b.types[type_id] == .array;
+}
+
+/// The trait a crate-local blanket `impl<T: AsRef<[u8]>> Trait for T`
+/// implements, when that impl declares `method_name`, or null when none does.
+///
+/// The answer is the TRAIT rather than the method because the trait is what
+/// the backend selects the impl from: it reads the trait off the call's
+/// `method_ref` (`methodRefTrait`) and finds the impl providing the method
+/// from it (`blanketImplFor`). The trait is taken from the impl body's own
+/// `trait_path`, the same linkage the backend reads, so the two cannot pick
+/// different traits. Two blanket impls providing the same method name the
+/// method ambiguously and stay refused.
+fn lookupBlanketAsRefBytesTrait(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    method_name: []const u8,
+) ?spine.EntityId {
+    if (method_name.len == 0) return null;
+    var candidate: ?spine.EntityId = null;
+    for (g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .impl_) continue;
+        const parts = parseTraitImplName(ent.name) orelse continue;
+        if (!isBlanketAsRefBytesImpl(b, ent.id, parts.type_name)) continue;
+        if (!implDeclaresMethod(g, ent.id, method_name)) continue;
+        const trait_id = implTraitEntity(b, ent.id) orelse continue;
+        if (candidate != null) return null;
+        candidate = trait_id;
+    }
+    return candidate;
+}
+
+fn implDeclaresMethod(
+    g: *const graph.CrateGraph,
+    impl_id: spine.EntityId,
+    method_name: []const u8,
+) bool {
+    for (g.symbol_table.entities.items) |child| {
+        if (child.kind != .fn_ or child.parent != impl_id) continue;
+        if (std.mem.eql(u8, child.name, method_name)) return true;
+    }
+    return false;
+}
+
+/// The trait entity an impl body implements, read off the body rather than
+/// off the impl's name. A macro-generated impl carries the name spelling
+/// (`ToHex for T`) and the body carries the resolved `trait_path`, and only
+/// the latter names an entity the backend can look the impl up by.
+fn implTraitEntity(b: *const bodies.Bodies, impl_id: spine.EntityId) ?spine.EntityId {
+    if (impl_id >= b.bodies.len) return null;
+    const implementation = switch (b.bodies[impl_id]) {
+        .impl_ => |value| value,
+        else => return null,
+    };
+    const path = implementation.trait_path orelse return null;
+    if (path.segments.len == 0) return null;
+    return path.segments[path.segments.len - 1].id;
+}
+
+/// Point a call at the trait whose blanket impl provides it, and report
+/// whether the call is now bound.
+///
+/// The backend hoists a blanket impl's method onto the crate module as a free
+/// function, and it finds that function through the trait the call names. The
+/// call's own `method_ref` is synthesized per call site and carries only the
+/// enclosing scope as its parent, so parenting it to the trait here is what
+/// puts the whole chain in reach — and it is the shape `Trait::method(..)`
+/// already arrives in, so nothing downstream meets a new one.
+///
+/// Only a `method_ref` that is still owned by a callable or a module is
+/// re-parented. One already owned by this trait is the same binding reached
+/// twice — two call sites can share one synthesized reference — and one owned
+/// by a DIFFERENT trait, an impl, or a type declaration was bound by a more
+/// specific rule, which overwriting would undo.
+fn bindBlanketImplMethod(
+    g: *const graph.CrateGraph,
+    method: exprs.DefId,
+    trait_id: spine.EntityId,
+) bool {
+    if (method >= g.symbol_table.entities.items.len) return false;
+    const entity = &@constCast(&g.symbol_table.entities).items[method];
+    if (entity.kind != .method_ref) return false;
+    if (entity.parent) |owner| {
+        if (owner == trait_id) return true;
+        const owner_entity = g.symbol_table.get(owner) orelse return false;
+        if (owner_entity.kind != .fn_ and owner_entity.kind != .module) return false;
+    }
+    entity.parent = trait_id;
+    return true;
 }
 
 /// The reason an operator over an untyped operand carries.

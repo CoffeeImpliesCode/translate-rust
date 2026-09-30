@@ -30,7 +30,22 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var rust_ir = try translate_rust.frontend.pipeline.analyzeCrate(allocator, init.io, crate_dir);
+    // The same pinned configuration the golden test analyses this fixture
+    // with. A snapshot regenerated under anything else cannot be compared
+    // against a golden produced under this, so the two must agree.
+    var rust_ir = try translate_rust.frontend.pipeline.analyzeCrateWithOptions(
+        allocator,
+        init.io,
+        crate_dir,
+        .{
+            .include_tests = false,
+            .cfg = .{
+                .features = &.{},
+                .target_pointer_width = 64,
+                .docsrs = false,
+            },
+        },
+    );
     defer rust_ir.deinitInstantiations(allocator);
     try translate_rust.ir.validateForTranslation(&rust_ir);
 

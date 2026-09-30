@@ -838,6 +838,18 @@ pub fn materializeDerivedTypes(
             try type_list.append(alloc, derived);
         }
     }
+
+    // The Defaults Phase in `solveWithGen` resolves an unconstrained integer
+    // class through `primTypeId(b, .i32)`, and that lookup only SEARCHES
+    // `b.types` — it never interns. A crate whose source never names `i32`
+    // therefore has no TypeId to hand the class, the phase silently does
+    // nothing, and every unconstrained integer expression keeps `ty = null`.
+    // Interning here makes the default reachable for exactly the crates that
+    // can use it, and leaves a crate with no unannotated integer or float
+    // literal with the type table it had before.
+    try internDefaultClassType(alloc, type_list, &g.classes, .integer, .i32);
+    try internDefaultClassType(alloc, type_list, &g.classes, .float, .f64);
+
     for (g.derived_pins.items) |derived_pin| {
         const type_id = findTypeIndexInSlice(type_list.items, derived_pin.ty) orelse
             return error.MissingDerivedType;
@@ -852,6 +864,34 @@ pub fn materializeDerivedTypes(
         };
         patterns[pin.node].ty = type_id;
     }
+}
+
+/// Append `.{ .prim = prim }` to `type_list` when a literal of class `class`
+/// exists and the list does not already name that primitive.
+///
+/// Interning is conditional on the class map so that a crate with no
+/// unannotated literal of this class keeps the type table it had, rather than
+/// carrying a default it can never select.
+fn internDefaultClassType(
+    alloc: std.mem.Allocator,
+    type_list: *std.ArrayListUnmanaged(types.Type),
+    classes: *const std.AutoHashMapUnmanaged(exprs.NodeId, Class),
+    class: Class,
+    prim: types.Prim,
+) !void {
+    var needed = false;
+    var it = classes.iterator();
+    while (it.next()) |entry| {
+        const candidate = entry.value_ptr.*;
+        if (candidate == class) {
+            needed = true;
+            break;
+        }
+    }
+    if (!needed) return;
+    const target: types.Type = .{ .prim = prim };
+    if (findTypeIndexInSlice(type_list.items, target) != null) return;
+    try type_list.append(alloc, target);
 }
 
 /// Locate the TypeId of a slice with the given primitive element type.
@@ -1016,7 +1056,16 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
                 if (rhs_ty != .reference) {
                     try addEq(ctx, bin.rhs, node);
                 }
-            } else {
+            } else if (lhs_known == null or lhs_known.? != .reference) {
+                // Rust auto-derefs a reference lhs, so the result takes the
+                // pointee type and the lhs edge above was deliberately not
+                // emitted. Folding the unconstrained rhs INTO the result
+                // would then contradict that: the literal's own default
+                // (i32, now that `materializeDerivedTypes` interns it) would
+                // become the result's type, where a cast around the whole
+                // expression records the pointee. The same guard the shift
+                // arm below already applies is the one that keeps
+                // `&u8 - 1` a `u8` result.
                 try addEq(ctx, bin.rhs, node);
             }
         },
@@ -2424,6 +2473,18 @@ fn iteratorItemType(ctx: *Ctx, ty: types.Type) ?types.Type {
             if (publicIteratorPath(external, "slice", "IterMut") and external.args.len == 1) {
                 return makeReferenceType(ctx, external.args[0], true);
             }
+            // `Chunks<T>` and `ChunksExact<T>` hand out the chunked slice
+            // itself — `&[T]`, never its element — so a chain rooted at
+            // `.chunks(n)` carries a slice item that indexes into it. The
+            // two carriers differ only in the tail `remainder()` keeps, which
+            // says nothing about what `next()` yields.
+            if (external.args.len == 1 and
+                (publicIteratorPath(external, "slice", "Chunks") or
+                    publicIteratorPath(external, "slice", "ChunksExact")))
+            {
+                const chunk = makeSliceType(ctx, external.args[0], false) orelse return null;
+                return makeReferenceType(ctx, chunk, false);
+            }
             if ((publicIteratorPath(external, "iter", "StepBy") or
                 publicIteratorPath(external, "iter", "Skip") or
                 publicIteratorPath(external, "iter", "Rev")) and
@@ -2493,6 +2554,34 @@ fn knownIteratorMethodType(
     }
 
     return null;
+}
+
+/// The container `collect::<B>()` hands back, or null when the call names none.
+///
+/// Rust's signature is `fn collect<B: FromIterator<Self::Item>>(self) -> B`,
+/// so the turbofish IS the result type and a fully written `B` needs nothing
+/// else to name it. `bindTurbofishCollectedElement` has already filled the one
+/// half a turbofish may leave open — `Vec<_>` takes its element from the
+/// receiver's `Item` — so the argument read here is the finished target. What
+/// is still standing is a placeholder no bound says anything about, and that
+/// is not a type: null leaves the call untyped and the operator over it
+/// refused rather than emitted against a guess.
+///
+/// The receiver has to be an `Iterator` this pass can read an `Item` off. A
+/// method called `collect` on anything else is a different method whose result
+/// this signature says nothing about, so it is left alone.
+fn knownCollectTargetType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
+    if (node >= ctx.b.exprs.len) return null;
+    const call = switch (ctx.b.exprs[node].kind) {
+        .method_call => |value| value,
+        else => return null,
+    };
+    if (call.generic_args.len != 1) return null;
+    const receiver_ty = getKnownType(ctx, call.receiver) orelse return null;
+    if (iteratorItemType(ctx, receiver_ty) == null) return null;
+    const target = call.generic_args[0];
+    if (containsInferPlaceholder(target)) return null;
+    return target;
 }
 fn knownIteratorChainType(ctx: *Ctx, chain: exprs.IteratorChainExpr) ?types.Type {
     if (chain.terminal == .sum) return iteratorChainElementType(ctx, chain);
@@ -2742,6 +2831,62 @@ fn methodDeclaredReturnType(ctx: *Ctx, def: exprs.DefId) ?types.Type {
         }
     }
     return traitAssociatedReturnType(ctx, def);
+}
+
+/// The trait method signature a turbofish binds against: the declared return
+/// and the ordered type parameters the call supplies arguments for.
+const TraitMethodSignature = struct {
+    ret: types.Type,
+    /// Borrowed from the body table, which the frontend arena owns.
+    generic_params: []const []const u8,
+};
+
+/// The signature of the trait method that provides `method_name`, or null
+/// when this crate declares no such trait.
+///
+/// This is the second half of what a method call's callee can carry, for the
+/// shape that carries nothing: body lowering synthesizes one `method_ref` per
+/// call site and parents it to the enclosing callable or module
+/// (`pushMethodRef`), leaving its body slot `.none`. There is no `fn_` to read
+/// a return type or a parameter list from, and `traitAssociatedReturnType`
+/// cannot reach one either, because it reads the trait off the parent and the
+/// parent is a function. A turbofish on such a call then binds to nothing, and
+/// `xs.encode_hex::<String>()` — whose `ToHex::encode_hex` declares
+/// `fn encode_hex<T>(&self) -> T`, the bare parameter — stays untyped however
+/// the rest of the tree is read.
+///
+/// The trait is found the way Rust finds the method: by the name the call
+/// spells, among the traits this crate declares, narrowed to those whose
+/// method takes as many type parameters as the turbofish supplies. The arity
+/// is what keeps `ToHex::encode_hex` from answering for a same-named method
+/// elsewhere, and two DIFFERENT traits answering means the call is ambiguous
+/// in Rust too — so neither of them wins here.
+fn traitDeclaredMethod(
+    ctx: *const Ctx,
+    method_name: []const u8,
+    arg_count: usize,
+) ?TraitMethodSignature {
+    if (arg_count == 0 or method_name.len == 0) return null;
+    const cg = ctx.cg orelse return null;
+    var found: ?TraitMethodSignature = null;
+    var owner: ?spine.EntityId = null;
+    for (cg.symbol_table.entities.items, 0..) |entity, index| {
+        if (entity.kind != .trait_ or index >= ctx.b.bodies.len) continue;
+        const trait_body = switch (ctx.b.bodies[index]) {
+            .trait_ => |body| body,
+            else => continue,
+        };
+        for (trait_body.methods) |declared| {
+            if (!std.mem.eql(u8, declared.name, method_name)) continue;
+            if (declared.generic_params.len != arg_count) continue;
+            if (owner) |first| {
+                if (first != index) return null;
+            }
+            owner = @intCast(index);
+            found = .{ .ret = declared.ret, .generic_params = declared.generic_params };
+        }
+    }
+    return found;
 }
 
 fn knownCallReturnType(ctx: *Ctx, node: exprs.NodeId, call: exprs.Call) ?types.Type {
@@ -3262,6 +3407,19 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                     }
                     if (knownIteratorMethodType(ctx, method_name, receiver_ty, method.args)) |iterator_ty| {
                         return iterator_ty;
+                    }
+                    // `collect` is the one iterator method whose result the
+                    // turbofish names, so it is asked of the node rather than
+                    // of the receiver: the receiver types what the container
+                    // is FILLED with, and the call's own argument is what it
+                    // IS. Read from the table, because
+                    // `bindTurbofishCollectedElement` rewrites that argument
+                    // in place before the value copied out of the table here
+                    // is ever used.
+                    if (std.mem.eql(u8, method_name, "collect")) {
+                        if (knownCollectTargetType(ctx, node)) |collect_target| {
+                            return collect_target;
+                        }
                     }
                     if (std.mem.eql(u8, method_name, "ok")) {
                         if (resultPayloadType(receiver_ty, false)) |ok_payload| {
@@ -5087,11 +5245,41 @@ fn constrainInherentMethodArguments(
 /// receiver-shaped rule, because that is what Rust does. Returns false when
 /// there is no turbofish, or when substitution cannot produce a concrete
 /// type, leaving the ordinary inference rules to run.
-fn pinTurbofishResultType(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall) std.mem.Allocator.Error!bool {
+///
+/// The call is read from the expression table, not from the copy the walker
+/// holds: `bindTurbofishCollectedElement` rewrites a `collect` turbofish in
+/// place, and a copy taken before that rewrite would substitute a placeholder
+/// the walk has already replaced with the element the receiver's `Item` names.
+fn pinTurbofishResultType(ctx: *Ctx, node: exprs.NodeId) std.mem.Allocator.Error!bool {
+    if (node >= ctx.b.exprs.len) return false;
+    const m = switch (ctx.b.exprs[node].kind) {
+        .method_call => |value| value,
+        else => return false,
+    };
     if (m.generic_args.len == 0) return false;
-    const declared = methodDeclaredReturnType(ctx, m.method) orelse return false;
-    const param_names = getGenericParamNames(ctx, m.method) catch return false;
-    defer ctx.alloc.free(param_names);
+    // The signature the substitution runs on, and the names it binds. A
+    // concrete `fn_` carries both; a bodiless call-site `method_ref` carries
+    // neither, and the trait that declares the method carries both from its
+    // own signature. `getGenericParamNames` hands back a caller-freed
+    // duplicate while a trait signature is read straight out of the body
+    // table, so only the first is owned here.
+    var declared: types.Type = undefined;
+    var owned_names: []const []const u8 = &.{};
+    var param_names: []const []const u8 = &.{};
+    if (methodDeclaredReturnType(ctx, m.method)) |fn_return| {
+        declared = fn_return;
+        param_names = getGenericParamNames(ctx, m.method) catch return false;
+        owned_names = param_names;
+    } else if (getMethodName(ctx, m.method)) |method_name| {
+        const signature = traitDeclaredMethod(
+            ctx,
+            method_name,
+            m.generic_args.len,
+        ) orelse return false;
+        declared = signature.ret;
+        param_names = signature.generic_params;
+    } else return false;
+    defer ctx.alloc.free(owned_names);
     if (param_names.len == 0 or param_names.len != m.generic_args.len) return false;
     // The declared return has to actually mention a parameter: a turbofish on
     // a method that returns something concrete says nothing new, and the
@@ -5227,6 +5415,12 @@ fn bindCollectedElementPlaceholder(
 /// `impl Iterator<Item = (usize, usize)>` and that bound says what it yields.
 /// A receiver that declares no Item binds nothing, and the placeholder is
 /// left standing for the resolver to refuse — this never guesses.
+///
+/// The receiver has to be WALKED before this runs. A receiver this pass has
+/// not descended into has no type of its own yet, so the `Item` this reads
+/// off it is not there to read; the placeholder would survive a walk that
+/// could have completed it, and the call would stay untyped for the rest of
+/// the frontend. Every caller therefore walks the receiver first.
 fn bindTurbofishCollectedElement(ctx: *Ctx, node: exprs.NodeId, receiver: exprs.NodeId) void {
     if (node >= ctx.b.exprs.len or receiver >= ctx.b.exprs.len) return;
     const call = &@constCast(ctx.b.exprs)[node].kind.method_call;
@@ -5240,14 +5434,18 @@ fn bindTurbofishCollectedElement(ctx: *Ctx, node: exprs.NodeId, receiver: exprs.
 }
 
 fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
-    bindTurbofishCollectedElement(ctx, node, m.receiver);
     const m_name = getMethodName(ctx, m.method) orelse {
         try walkExpr(ctx, m.receiver, fn_body);
         for (m.args) |a| try walkExpr(ctx, a, fn_body);
-        _ = try pinTurbofishResultType(ctx, node, m);
+        bindTurbofishCollectedElement(ctx, node, m.receiver);
+        _ = try pinTurbofishResultType(ctx, node);
         return;
     };
     try walkExpr(ctx, m.receiver, fn_body);
+    // The receiver is walked FIRST: the `Item` an open `collect` turbofish is
+    // completed from is that receiver's own bound, and a receiver this pass
+    // has not descended into has no type to read it off.
+    bindTurbofishCollectedElement(ctx, node, m.receiver);
     const receiver_ty = getKnownType(ctx, m.receiver);
     for (m.args) |a| {
         if (receiver_ty) |known_receiver| {
@@ -5266,7 +5464,7 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
     // receiver-shaped rule below, exactly as `recv.m::<u32>()` wins over what
     // `recv` alone would imply. With no turbofish this is a no-op and the
     // existing rules run unchanged.
-    if (try pinTurbofishResultType(ctx, node, m)) return;
+    if (try pinTurbofishResultType(ctx, node)) return;
     if (std.mem.eql(u8, m_name, "ok")) {
         if (receiver_ty) |known_receiver| {
             if (resultPayloadType(known_receiver, false)) |ok_payload| {
@@ -5304,6 +5502,17 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
     if (receiver_ty) |known_receiver| {
         if (knownIteratorMethodType(ctx, m_name, known_receiver, m.args)) |iterator_ty| {
             try pinKnownType(ctx, node, iterator_ty);
+            return;
+        }
+    }
+    // The terminal `collect` is typed from the call's own turbofish, which
+    // `bindTurbofishCollectedElement` has already completed from the
+    // receiver's `Item`. It runs after the adapter rules because a receiver
+    // that is not an `Iterator` has no `Item` to fill the turbofish with, and
+    // those rules are what decide that.
+    if (std.mem.eql(u8, m_name, "collect")) {
+        if (knownCollectTargetType(ctx, node)) |collect_target| {
+            try pinKnownType(ctx, node, collect_target);
             return;
         }
     }

@@ -427,6 +427,16 @@ const ModuleImportKey = struct {
     importing: ir.spine.EntityId,
     target: ir.spine.EntityId,
 };
+
+/// A relative `@import` a generated file names, under whichever spelling it
+/// ended up with. A private `mod` keeps an `ast.Import`; a `pub mod` is
+/// promoted to a `pub const name = @import("./name.zig")` decl before any
+/// later pass sees the file, so both name the same edge and both have to be
+/// readable.
+const ReachableModuleRef = struct {
+    local_name: []const u8,
+    module_or_path: []const u8,
+};
 const StdImportDemand = struct {
     fn isQualifiedStdName(name: []const u8) bool {
         return name.len > "std.".len and std.mem.startsWith(u8, name, "std.");
@@ -1411,6 +1421,21 @@ const Lowerer = struct {
             try path_index.put(self.alloc, file.path, index);
         }
 
+        // One list of relative imports per file, collected before anything is
+        // derived from it so the edge graph and the emitted references cannot
+        // disagree about what a file imports.
+        var module_refs = try self.alloc.alloc([]ReachableModuleRef, files.items.len);
+        defer {
+            for (module_refs) |refs| self.alloc.free(refs);
+            self.alloc.free(module_refs);
+        }
+        for (files.items, 0..) |file, index| {
+            var refs: std.ArrayListUnmanaged(ReachableModuleRef) = .empty;
+            defer refs.deinit(self.alloc);
+            try self.appendReachableModuleRefs(file, &refs);
+            module_refs[index] = try refs.toOwnedSlice(self.alloc);
+        }
+
         // Resolve each file's relative imports to package file indices.
         var edges = try self.alloc.alloc([]usize, files.items.len);
         defer {
@@ -1420,12 +1445,12 @@ const Lowerer = struct {
         for (files.items, 0..) |file, index| {
             var targets: std.ArrayListUnmanaged(usize) = .empty;
             defer targets.deinit(self.alloc);
-            for (file.imports) |import| {
-                if (!std.mem.endsWith(u8, import.module_or_path, ".zig")) continue;
+            for (module_refs[index]) |ref| {
+                if (!std.mem.endsWith(u8, ref.module_or_path, ".zig")) continue;
                 const dir = std.fs.path.dirname(file.path) orelse continue;
                 const resolved = try std.fs.path.resolve(
                     self.alloc,
-                    &.{ dir, import.module_or_path },
+                    &.{ dir, ref.module_or_path },
                 );
                 defer self.alloc.free(resolved);
                 const target = path_index.get(resolved) orelse continue;
@@ -1464,17 +1489,17 @@ const Lowerer = struct {
             }
         }
 
-        for (files.items) |*file| {
+        for (files.items, 0..) |*file, index| {
             var refs: std.ArrayListUnmanaged(ast.TestDecl) = .empty;
             defer refs.deinit(self.alloc);
             var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
             defer seen.deinit(self.alloc);
-            for (file.imports) |import| {
-                if (!std.mem.endsWith(u8, import.module_or_path, ".zig")) continue;
+            for (module_refs[index]) |ref| {
+                if (!std.mem.endsWith(u8, ref.module_or_path, ".zig")) continue;
                 const dir = std.fs.path.dirname(file.path) orelse continue;
                 const resolved = try std.fs.path.resolve(
                     self.alloc,
-                    &.{ dir, import.module_or_path },
+                    &.{ dir, ref.module_or_path },
                 );
                 defer self.alloc.free(resolved);
                 const target = path_index.get(resolved) orelse continue;
@@ -1487,10 +1512,10 @@ const Lowerer = struct {
                 const name = try std.fmt.allocPrint(
                     self.alloc,
                     "translated tests reachable through {s}",
-                    .{import.module_or_path},
+                    .{ref.module_or_path},
                 );
                 const operand = try self.alloc.create(ast.Expr);
-                operand.* = .{ .ident = import.local_name };
+                operand.* = .{ .ident = ref.local_name };
                 const discard = try self.alloc.create(ast.Expr);
                 discard.* = .{ .ident = "_" };
                 const stmts = try self.alloc.alloc(ast.Stmt, 1);
@@ -1531,6 +1556,53 @@ const Lowerer = struct {
             @memcpy(combined[0..file.tests.len], file.tests);
             @memcpy(combined[file.tests.len..], refs.items);
             file.tests = combined;
+        }
+    }
+
+    /// Collect every relative `@import` a generated file names, whether it
+    /// ended up in the import list or as a promoted re-export decl.
+    ///
+    /// `promotePublicModuleImportsToReExports` runs while the file is being
+    /// lowered, which is before `appendTestReachabilityRefs`, and it moves
+    /// every `pub mod` out of `file.imports` and into a `pub const name =
+    /// @import("./name.zig")` decl. Reading the import list alone therefore
+    /// loses exactly the public submodules, and with them the one reference
+    /// that made Zig analyze those files: a top-level `const` is not analyzed
+    /// until something uses it, so a submodule that no other file names would
+    /// compile away and take its tests with it.
+    fn appendReachableModuleRefs(
+        self: *Lowerer,
+        file: ast.File,
+        out: *std.ArrayListUnmanaged(ReachableModuleRef),
+    ) !void {
+        for (file.imports) |import| {
+            try out.append(self.alloc, .{
+                .local_name = import.local_name,
+                .module_or_path = import.module_or_path,
+            });
+        }
+        for (file.decls) |decl| {
+            const binding = switch (decl) {
+                .const_decl => |value| value,
+                else => continue,
+            };
+            const call = switch (binding.init) {
+                .builtin => |value| value,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, call.name, "import")) continue;
+            if (call.args.len != 1) continue;
+            const path = switch (call.args[0]) {
+                .lit => |lit| switch (lit) {
+                    .str => |value| value,
+                    else => continue,
+                },
+                else => continue,
+            };
+            try out.append(self.alloc, .{
+                .local_name = binding.name,
+                .module_or_path = path,
+            });
         }
     }
 
@@ -1610,6 +1682,15 @@ const Lowerer = struct {
                 };
                 if (target_id) |tid| {
                     _ = self.ir.graph.symbol_table.get(tid) orelse return error.MissingDefinition;
+                    // `target_id` is non-null, so the parent really is a
+                    // type declaration or an `impl`: only a hoist decision
+                    // needs a real self type behind it. Checked here rather
+                    // than at the top of the loop, because a free function in
+                    // a nested module is parented to that `.module` entity and
+                    // never reaches this block. Without the check an impl
+                    // whose own parent is neither a type declaration nor a
+                    // crate module hoists a stray free function.
+                    try self.validateMethodTopology(ent);
                     // A method already registered on the target's StructBody
                     // is rendered directly from `StructBody.methods` by
                     // `lowerEntityDecl`; skip re-hoisting its `.fn_` entity to
@@ -3136,7 +3217,8 @@ const Lowerer = struct {
         }
         if (is_alloc and path.len == 3) {
             if (std.mem.eql(u8, path[1], "string") and
-                (std.mem.eql(u8, path[2], "String") or std.mem.eql(u8, path[2], "FromUtf8Error"))) return true;
+                (std.mem.eql(u8, path[2], "String") or std.mem.eql(u8, path[2], "FromUtf8Error") or
+                    std.mem.eql(u8, path[2], "ToString"))) return true;
             if (std.mem.eql(u8, path[1], "borrow") and std.mem.eql(u8, path[2], "ToOwned")) return true;
         }
         return false;
@@ -6478,6 +6560,40 @@ const Lowerer = struct {
         return null;
     }
 
+    /// Zig's shift operators take the amount in `u5`, so a Rust shift by a
+    /// wider integer needs a narrowing cast. `@intCast` takes its result type
+    /// from context, so the surrounding `<<` / `>>` / `<<=` / `>>=` supplies
+    /// the `u5` and the emitted amount is well typed. Callers must not hand
+    /// this a float amount, nor an amount the runtime operator path owns —
+    /// `r2z.ops` casts for itself.
+    fn lowerShiftAmount(self: *Lowerer, amount: ast.Expr) !ast.Expr {
+        const args = try self.alloc.alloc(ast.Expr, 1);
+        errdefer self.alloc.free(args);
+        args[0] = amount;
+        return ast.Expr{ .builtin = .{
+            .name = "intCast",
+            .args = args,
+        } };
+    }
+
+    /// True when indexing `ty` has to go through the container's storage.
+    /// `Vec<T>` lowers to `std.ArrayListUnmanaged`, and Zig indexes the `items`
+    /// slice, not the list value: `list[i]` is a compile error, `list.items[i]`
+    /// is the element. A reference or raw pointer in front of the vector is
+    /// transparent, so the walk stops at the nominal.
+    fn needsContainerStorageProjection(ty: ?ir.types.Type) bool {
+        var current = ty orelse return false;
+        for (0..128) |_| {
+            switch (current) {
+                .reference => |reference| current = reference.pointee,
+                .raw_ptr => |raw_ptr| current = raw_ptr.pointee,
+                .external_nominal => |external| return isAllocVecPath(external.path),
+                else => return false,
+            }
+        }
+        return false;
+    }
+
     fn binaryOperandNeedsDeref(
         ty: ?ir.types.Type,
         op: ir.exprs.BinaryOp,
@@ -9656,7 +9772,8 @@ const Lowerer = struct {
             null;
         if (bin_kind) |bk| {
             if (args.len < 1) return null;
-            const is_pointer_receiver = if (try self.exprType(receiver_node)) |ty|
+            const receiver_ty = try self.exprType(receiver_node);
+            const is_pointer_receiver = if (receiver_ty) |ty|
                 ty == .reference or ty == .raw_ptr
             else
                 false;
@@ -9665,7 +9782,14 @@ const Lowerer = struct {
             else
                 receiver;
             const lhs = num_receiver;
-            const rhs = try self.allocExpr(args[0]);
+            // A `.shl()` / `.shr()` receiver reaches the same `u5` rule the
+            // operator form does, by value or behind a pointer alike.
+            const rhs = if ((bk == .shl or bk == .shr) and
+                !isFloatType(receiver_ty) and
+                !requiresRuntimeOperator(receiver_ty))
+                try self.allocExpr(try self.lowerShiftAmount(args[0]))
+            else
+                try self.allocExpr(args[0]);
             const result = try self.allocExpr(ast.Expr{
                 .bin_op = .{ .op = bk, .lhs = lhs, .rhs = rhs },
             });
@@ -10467,7 +10591,7 @@ const Lowerer = struct {
         }
 
         const body = try self.lowerIteratorClosureBody(closure);
-        const param_name = try self.patternName(closure.params[0]);
+        const param_name = try self.closurePayloadName(closure.params[0]);
         const payload_name = try self.iteratorTemporaryName(try std.fmt.allocPrint(
             self.alloc,
             "__r2z_in_{s}",
@@ -11607,14 +11731,38 @@ const Lowerer = struct {
                     };
                 }
                 // A field-less variant is a value of the union, so it names
-                // that union first. A variant carrying a tuple payload keeps
-                // the bare-identifier spelling below.
+                // that union first. A variant carrying a tuple payload is a
+                // value too, so it names the union the same way and carries
+                // the payload as the one field it initializes; a bare variant
+                // name would name nothing at the use site.
                 if (ev.tuple_fields.len == 0) {
                     break :blk ast.Expr{
                         .ident = try self.unitVariantName(ev.def, variant_name),
                     };
                 }
-                break :blk ast.Expr{ .ident = variant_name };
+                const tuple_payload = try self.alloc.alloc(ast.Expr, ev.tuple_fields.len);
+                errdefer self.alloc.free(tuple_payload);
+                for (ev.tuple_fields, 0..) |field_id, index| {
+                    tuple_payload[index] = try self.lowerExpr(field_id);
+                }
+                // One element is the field type itself; several form the
+                // anonymous tuple struct the union field declares.
+                const payload: ast.Expr = if (tuple_payload.len == 1)
+                    tuple_payload[0]
+                else
+                    .{ .tuple = tuple_payload };
+                const tuple_fields_list = try self.alloc.alloc(ast.StructInitField, 1);
+                errdefer self.alloc.free(tuple_fields_list);
+                tuple_fields_list[0] = .{
+                    .name = variant_name,
+                    .expr = payload,
+                };
+                break :blk ast.Expr{
+                    .struct_init = .{
+                        .type_name = ast.Type{ .named = try self.enumOwnerName(ev.def) },
+                        .fields = tuple_fields_list,
+                    },
+                };
             },
             .field => |fe| blk: {
                 const base = try self.allocExpr(try self.lowerExpr(fe.base));
@@ -11641,7 +11789,15 @@ const Lowerer = struct {
                 if (ie.index >= self.ir.bodies.exprs.len) {
                     return error.MissingExpressionNode;
                 }
-                const base = try self.allocExpr(try self.lowerExpr(ie.base));
+                var base = try self.allocExpr(try self.lowerExpr(ie.base));
+                // A lowered `Vec` is an `ArrayListUnmanaged`; Zig indexes the
+                // storage it holds, so read through `.items` before indexing.
+                if (needsContainerStorageProjection(try self.exprType(ie.base))) {
+                    base = try self.allocExpr(.{ .field_access = .{
+                        .target = base,
+                        .field_name = "items",
+                    } });
+                }
                 const idx = try self.allocExpr(switch (self.ir.bodies.exprs[ie.index].kind) {
                     // A slice index is a statement position: `s[0..n]`.
                     .range => |range| try self.lowerRangeSliceExpr(range, true),
@@ -11756,14 +11912,10 @@ const Lowerer = struct {
                     break :blk try self.lowerRuntimeOperator("binary", @tagName(be.op), be.overflow, lhs.*, lowered_rhs.*);
                 }
 
-                const rhs = if (!uses_float and (be.op == .shl or be.op == .shr)) shift: {
-                    const args = try self.alloc.alloc(ast.Expr, 1);
-                    args[0] = lowered_rhs.*;
-                    break :shift try self.allocExpr(.{ .builtin = .{
-                        .name = "intCast",
-                        .args = args,
-                    } });
-                } else lowered_rhs;
+                const rhs = if (!uses_float and (be.op == .shl or be.op == .shr))
+                    try self.allocExpr(try self.lowerShiftAmount(lowered_rhs.*))
+                else
+                    lowered_rhs;
                 const op_kind: ast.BinOpKind = switch (be.op) {
                     .add => if (uses_float) .add else switch (be.overflow) {
                         .checked => .add,
@@ -11959,8 +12111,6 @@ const Lowerer = struct {
     /// over the two tags. A differing error type needs a conversion the
     /// backend has no faithful spelling for, and dropping it would silently
     /// change the program, so it is reported instead.
-
-
     /// Emit a call to a blanket impl's method as a direct call to the hoisted
     /// free function.
     ///
@@ -12345,6 +12495,12 @@ const Lowerer = struct {
                 value,
             )) };
         }
+        // `<<=` and `>>=` share the `u5` amount rule with the plain shifts, and
+        // the runtime operator path above has already taken its own cast.
+        const shift_value = if (assignment.op == .shl or assignment.op == .shr)
+            try self.lowerShiftAmount(value)
+        else
+            value;
         const wrapping = assignment.overflow == .wrapping;
         const op: ast.AssignOp = switch (assignment.op) {
             .plain => .assign,
@@ -12361,7 +12517,7 @@ const Lowerer = struct {
         };
         return .{ .assign = .{
             .target = target,
-            .val = value,
+            .val = shift_value,
             .op = op,
         } };
     }
@@ -12719,6 +12875,23 @@ const Lowerer = struct {
             .wildcard => try self.alloc.dupe(u8, "_"),
             else => return error.UnsupportedPattern,
         };
+    }
+
+    /// The base name for the temporary that carries a closure parameter's
+    /// payload.
+    ///
+    /// A closure parameter is usually a binding or a wildcard, which
+    /// `patternName` names directly. A tuple destructuring names no single
+    /// value — `|(i, pair)|` binds two — so the temporary is named after the
+    /// shape and `appendIteratorClosureBindings` destructures it in place,
+    /// exactly as it does for an iterator-chain source. Every other shape still
+    /// goes through `patternName` and keeps its existing name and claim.
+    fn closurePayloadName(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror![]const u8 {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        switch (self.ir.bodies.pats[pat_id].kind) {
+            .tuple => return "tuple",
+            else => return self.patternName(pat_id),
+        }
     }
 
     /// Capture for one zip (`multi`) input. A plain binding/reference yields a

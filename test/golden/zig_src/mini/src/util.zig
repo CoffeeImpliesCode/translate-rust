@@ -1,3 +1,3 @@
 pub fn helper(v: u8) u8 {
-    return (v +% 1);
+    return v +% 1;
 }

@@ -5,8 +5,8 @@
 //! run as normal processes. Zig's test runner (`--listen=-` protocol) cannot
 //! reliably spawn grandchildren, so this is intentionally an executable.
 //!
-//! The mini, fnv, compat, wyhash, adler, hex and multimod source fixtures are
-//! complete positive cases. Compat also runs through Rust IR and Zig AST
+//! The mini, fnv, compat, wyhash, adler, hex, multimod and xxhash-rust source
+//! fixtures are complete positive cases. Compat also runs through Rust IR and Zig AST
 //! serialization. Multimod covers the three-file, two-level module→file
 //! mapping (`foo.rs`→`foo.zig`, `foo/bar.rs`→`foo/bar.zig`,
 //! `custom.rs`→`custom_pub.zig`) that no other fixture exercises. A staged
@@ -14,9 +14,11 @@
 //! merely when the files exist. The legacy fnv and fletcher wire fixtures, and
 //! the source fixtures whose analysis, lowering or package shape is
 //! incomplete, must reject translation with a typed frontend, IR, or driver
-//! error and no package output. The test also exercises the fingerprint
-//! boundary with both failing and valid probes, and drives
-//! `driver.translateWithOptions` to a published package with non-default
+//! error and no package output. Each such source rejection is pinned to its
+//! exact typed error, so a change in which error a crate fails with fails the
+//! test instead of hiding behind a generic rejection. The test also
+//! exercises the fingerprint boundary with both failing and valid probes, and
+//! drives `driver.translateWithOptions` to a published package with non-default
 //! analysis options.
 
 const std = @import("std");
@@ -701,7 +703,6 @@ fn expectAnalysisOptionsReachStagedPackage(
     );
 }
 
-
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const stdout = std.Io.File.stdout();
@@ -774,6 +775,33 @@ pub fn main(init: std.process.Init) !void {
             .{ .path = "src/custom_pub.zig", .minimum_items = 1 },
         },
     );
+
+    // `xxhash-rust` translates on the current tree: it is a promotion candidate,
+    // not a rejection. The fixture is a vendored v1-dialect copy whose manifest
+    // sets `default = ["xxh32"]`, so three modules survive cfg evaluation and
+    // the emitted `src/root.zig` carries their re-exports instead of nothing.
+    // The staged package holds exactly the four files below, measured at 3, 6,
+    // 9 and 9 top-level items; the floors are this file's usual ones, and the
+    // root floor is the positive form of the `EmptyRootFile` check this
+    // replaces. The earlier apparent failure was a pre-existing output
+    // directory (`DirNotEmpty`), not a translation failure. Do not confuse the
+    // fixture with the upstream 0.8.19 crate the wide corpus measured: that
+    // manifest declares no `default` feature, so cfg evaluation drops every
+    // module and the crate really does reduce to an empty root. That corpus
+    // row stands.
+    try expectSourceCrateTranslated(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/xxhash-rust",
+        "zig-out/e2e-translated-source-xxhash-rust",
+        &.{
+            .{ .path = "src/root.zig", .minimum_items = 2 },
+            .{ .path = "src/utils.zig", .minimum_items = 1 },
+            .{ .path = "src/xxh32_common.zig", .minimum_items = 1 },
+            .{ .path = "src/xxh32.zig", .minimum_items = 1 },
+        },
+    );
     try expectWireCrateTranslated(
         init.gpa,
         io,
@@ -824,22 +852,98 @@ pub fn main(init: std.process.Init) !void {
         "zig-out/e2e-rejected-wire-mini-rustdoc",
         error.UnsupportedWireVersion,
     );
-    // `xxhash-rust` analyses and lowers, but its `src/root.zig` carries no
-    // declaration, so the package would publish a 0-byte root. Promotion must
-    // reject it with the typed AST error instead of reporting success.
+    // The source fixtures below are capability gaps, not defects: each one
+    // exercises a construct the frontend or the IR validator does not model
+    // yet, so the crate must reject rather than publish a wrong package. The
+    // contract pins the *exact* typed error, so a change in which error a
+    // crate fails with fails here instead of hiding inside a generic
+    // "it rejected" claim.
+    //
+    // `siphasher`: validation resolves every nominal type path against a
+    // declared entity, and one path in this crate does not resolve, so the
+    // crate stops with `UnresolvedTypePath` before lowering runs.
     try expectSourceCrateRejectedWithError(
         init.gpa,
         io,
         stdout,
-        "test/crates/xxhash-rust",
-        "zig-out/e2e-rejected-source-xxhash-rust",
-        error.EmptyRootFile,
+        "test/crates/siphasher",
+        "zig-out/e2e-rejected-source-siphasher",
+        error.UnresolvedTypePath,
+    );
+    // `itoa`: `infer.solve` returns `InvalidCast` when a recorded cast cannot
+    // be made valid, so no IR is built at all. Which cast inference rejects
+    // is not part of this contract; the stage and the typed error are.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/itoa",
+        "zig-out/e2e-rejected-source-itoa",
+        error.InvalidCast,
+    );
+    // `atoi`: the frontend marks a call target it cannot resolve as
+    // `unsupported("unresolved call")`, and validation turns that marker into
+    // `UnsupportedExpression` while keeping the reason for the CLI to print.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/atoi",
+        "zig-out/e2e-rejected-source-atoi",
+        error.UnsupportedExpression,
+    );
+    // `leb128`: an inference-defaults defect, and not the one behind
+    // `percent-encoding` below despite the identical reason string. An
+    // unsuffixed integer literal joins a class that stays unconstrained until
+    // the Defaults phase, and that phase resolves the default type by search
+    // rather than interning it, so a crate that never names an integer type
+    // leaves the class null-typed and the operand check answers false.
+    // Measured: one unrelated `-> i32` line clears all ten markers in this
+    // crate, while a `-> f64` line clears none.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/leb128",
+        "zig-out/e2e-rejected-source-leb128",
+        error.UnsupportedExpression,
+    );
+    // `seahash`: two independent defects, not `itoa`'s repeated. It calls
+    // `.rev()` on a slice iterator at `src/reference.rs:46`, and the frontend
+    // admits `.rev()` only over a bare range expression, so that call is
+    // refused outright. Separately, its raw-pointer casts — over `buffer.rs`,
+    // `helper.rs` and `stream.rs` — include one that inference rejects, and
+    // that rejection is what stops the crate at `InvalidCast`. The cast
+    // escalates first, so the `.rev()` refusal still sits behind it. Which
+    // cast is rejected is not part of this contract; the stage and the typed
+    // error are.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/seahash",
+        "zig-out/e2e-rejected-source-seahash",
+        error.InvalidCast,
+    );
+    // `percent-encoding`: a different defect from `leb128`, even though both
+    // land on `operator requires primitive operands`. Its `type Chunk = u32;`
+    // reaches the operand check as a nominal path, and the check counts a type
+    // as scalar only when it is primitive, so the alias is never scalar.
+    // Measured: spelling the field `[Chunk; N]` as `[u32; N]` clears all five
+    // markers; seeding an integer type in the crate clears none.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/percent-encoding",
+        "zig-out/e2e-rejected-source-percent-encoding",
+        error.UnsupportedExpression,
     );
     try expectAnalysisOptionsReachStagedPackage(init.gpa, io, stdout);
     try writeMsg(
         io,
         stdout,
-        "e2e: mini/fnv/wyhash/adler/compat/hex/multimod translated; fletcher/crc16/xxhash-rust reject; fnv/fletcher wire rejected; translateWithOptions honoured",
+        "e2e: mini/fnv/wyhash/adler/compat/hex/multimod/xxhash-rust translated; source siphasher/itoa/atoi/leb128/seahash/percent-encoding/fletcher/crc16 rejected with pinned typed errors; fnv/fletcher wire rejected; translateWithOptions honoured",
         .{},
     );
 }
