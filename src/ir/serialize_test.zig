@@ -2518,6 +2518,170 @@ test "serialize: a type alias body without generic parameters still decodes" {
     try std.testing.expectEqual(@as(usize, 0), alias_body.generic_params.len);
 }
 
+/// A struct whose method and associated type both arrive from one `impl` — the
+/// shape `finalizePendingImpls` produces. The struct's `StructBody.methods`
+/// holds the method, the impl keeps the generics, and nothing on the struct
+/// records that either was written inside the impl.
+///
+/// The struct declares no parameters of its own, so `method_param_ty` and
+/// `assoc_target` can name an impl parameter (`I`, `T`) or a name no scope
+/// binds (`Absent`) — and nothing else decides which.
+fn initImplOwnedItemIr(
+    allocator: std.mem.Allocator,
+    method_param_ty: types.Type,
+    assoc_target: types.Type,
+) !serialize.RustIr {
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 8,
+    };
+    var crate_graph = try initTestGraph(
+        allocator,
+        "impl_owned",
+        &.{ .struct_, .impl_, .fn_, .type_alias },
+    );
+    // Only the struct is a module item. The impl and its two associated items
+    // hang off the struct, so the module list must not claim them.
+    crate_graph.modules.items[0].items = try allocator.dupe(spine.EntityId, &.{1});
+    crate_graph.symbol_table.entities.items[1].name = "DropGuard";
+    crate_graph.symbol_table.entities.items[2].name = "Deref for DropGuard";
+    crate_graph.symbol_table.entities.items[2].parent = 1;
+    crate_graph.symbol_table.entities.items[3].name = "from";
+    crate_graph.symbol_table.entities.items[3].parent = 2;
+    crate_graph.symbol_table.entities.items[4].name = "Target";
+    crate_graph.symbol_table.entities.items[4].parent = 2;
+
+    const self_type: types.Type = .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } };
+    const param_rows = try allocator.dupe(items.Param, &.{.{
+        .name = "into",
+        .ty = method_param_ty,
+        .span = span,
+    }});
+    const method_rows = try allocator.dupe(bodies.StructMethod, &.{.{
+        .name = "from",
+        .params = param_rows,
+        .ret = self_type,
+        .body = 0,
+        .receiver = .owned,
+    }});
+    const expression_rows = try allocator.dupe(exprs.Expr, &.{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 0, .labelled = null } },
+    }});
+    const body_rows = try allocator.dupe(bodies.BodyKind, &.{
+        .none,
+        .{ .struct_ = .{ .layout = .unit, .methods = method_rows } },
+        .{ .impl_ = .{
+            .self_ty = .{ .path = .{ .segments = &.{.{ .name = "DropGuard", .id = 1 }} } },
+            .trait_path = .{ .segments = &.{
+                .{ .name = "core", .id = null },
+                .{ .name = "ops", .id = null },
+                .{ .name = "Deref", .id = null },
+            } },
+            .generics = .{ .params = &.{
+                .{ .type_ = .{ .name = "I", .bounds = &.{} } },
+                .{ .type_ = .{ .name = "T", .bounds = &.{} } },
+            }, .where_clauses = &.{} },
+            .assoc_items = try allocator.dupe(spine.EntityId, &.{ 3, 4 }),
+        } },
+        .{ .fn_ = .{ .params = &.{}, .ret = self_type, .body = 0 } },
+        .{ .type_alias = .{ .target = assoc_target } },
+    });
+    return serialize.RustIr{
+        .crate_name = "impl_owned",
+        .edition = "2021",
+        .graph = crate_graph,
+        .bodies = .{
+            .exprs = expression_rows,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = body_rows,
+        },
+    };
+}
+
+// The `wrapping` shape: `impl<I, T> From<I> for DropGuard { fn from(into: I)
+// -> Self }`, re-parented onto the struct. `I` is bound by the impl and by
+// nothing the struct records, so the struct's copy of the method encodes only
+// if the owning impl's scope is read.
+test "serialize: a reparented struct method may name the impl's parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initImplOwnedItemIr(
+        allocator,
+        .{ .path = .{ .segments = &.{.{ .name = "I", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    defer fixture_ir.graph.deinit();
+
+    _ = try serialize.encode(allocator, &fixture_ir);
+}
+
+// The `drop_guard` shape: `impl Deref for DropGuard<T, F> { type Target = T;
+// }`. The method's parameter is `Self` so the struct body cannot reject it,
+// leaving the associated type as the only thing the impl's scope can save.
+test "serialize: an associated type may name the impl's parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initImplOwnedItemIr(
+        allocator,
+        .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    defer fixture_ir.graph.deinit();
+
+    _ = try serialize.encode(allocator, &fixture_ir);
+}
+
+// Reading the owning impl must not become a blanket admission: a method
+// parameter that no scope declares is still an unresolved path.
+test "serialize: a reparented struct method naming an undeclared type is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initImplOwnedItemIr(
+        allocator,
+        .{ .path = .{ .segments = &.{.{ .name = "Absent", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.UnresolvedTypePath,
+        serialize.encode(allocator, &fixture_ir),
+    );
+}
+
+// The same, for the associated type: the impl's parameters do not make every
+// name resolvable in its target.
+test "serialize: an associated type naming an undeclared type is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initImplOwnedItemIr(
+        allocator,
+        .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "Absent", .id = null }} } },
+    );
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.UnresolvedTypePath,
+        serialize.encode(allocator, &fixture_ir),
+    );
+}
+
 test "serialize: trait impl and generic metadata roundtrip" {
     // This fixture keeps associated items as child entities.
     // It exercises every new metadata field through encode, decode, and validation.

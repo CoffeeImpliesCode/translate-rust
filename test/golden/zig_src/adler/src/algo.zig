@@ -9,7 +9,7 @@ pub const U32X4 = struct {
 
     pub fn add_assign(self: *U32X4, other: U32X4) void {
         for (self.@"0"[0..], other.@"0"[0..]) |*s, *o| {
-            s.* += o.*;
+            s.* +%= o.*;
         }
     }
 
@@ -21,7 +21,7 @@ pub const U32X4 = struct {
 
     pub fn mul_assign(self: *U32X4, rhs: u32) void {
         for (self.@"0"[0..]) |*s| {
-            s.* *= rhs;
+            s.* *%= rhs;
         }
     }
 };

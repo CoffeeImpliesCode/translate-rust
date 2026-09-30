@@ -3411,3 +3411,162 @@ test "a rev on a retained slice iterator dispatches and an unknown one does not"
     // says which half of the rule the call could not meet.
     try expectUnsupportedReason(&b.exprs[3], "method dispatch unavailable");
 }
+
+test "a len and a clone on a bare slice iterator dispatch, and a mutating member does not" {
+    // `xs.iter()` is a receiver the Zig backend lowers to the runtime's own
+    // `r2z.SliceIter(T)`, and `len` and `clone` are members of that struct a
+    // method call reaches on it, so the resolver no longer refuses them here.
+    // `next` is refused for the opposite reason: it takes `self: *Self`, which
+    // does not compile on the temporary the receiver lowers to, and `render`
+    // names no member of it at all.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const iter_ident = try addEntity(&g, a, .fn_, "iter", root);
+    const len_ident = try addEntity(&g, a, .fn_, "len", root);
+    const clone_ident = try addEntity(&g, a, .fn_, "clone", root);
+    const next_ident = try addEntity(&g, a, .fn_, "next", root);
+    const render_ident = try addEntity(&g, a, .fn_, "render", root);
+
+    var slice_payload: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_payload }};
+
+    // 0: the `&[u8]` receiver, 1: `xs.iter()`, 2: `xs.iter().len()`,
+    // 3: `xs.iter().clone()`, 4: `xs.iter().next()`, 5: `xs.iter().render()`.
+    // Every call reads the SAME retained iterator, so the method name is the
+    // only thing that separates the two admitted calls from the two refused.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = iter_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = len_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = clone_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = next_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = render_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // `iter` is the std method the typed receiver earns on its own; `len` and
+    // `clone` join it over the iterator it leaves in the tree.
+    try std.testing.expectEqual(@as(usize, 3), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 2), stats.unsupported_methods);
+    try std.testing.expect(b.exprs[2].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, len_ident), b.exprs[2].kind.method_call.method);
+    try std.testing.expect(b.exprs[3].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, clone_ident), b.exprs[3].kind.method_call.method);
+
+    // The member that mutates through `self` and the one the runtime does not
+    // declare both stay refused, each with the reason that says why.
+    try expectUnsupportedReason(&b.exprs[4], "method dispatch unavailable");
+    try expectUnsupportedReason(&b.exprs[5], "method dispatch unavailable");
+}
+
+test "a len over a cloned projection stays refused while cloned itself dispatches" {
+    // The bare iterator is a runtime value the backend can call into; the
+    // `cloned` projection is not, so the names the bare iterator admits must
+    // NOT leak onto it. Admitting them there would emit a method call on the
+    // `r2z.SliceIter` that has no `cloned` member, which is the trap this arm
+    // exists to keep shut.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const iter_ident = try addEntity(&g, a, .fn_, "iter", root);
+    const cloned_ident = try addEntity(&g, a, .fn_, "cloned", root);
+    const len_ident = try addEntity(&g, a, .fn_, "len", root);
+    const clone_ident = try addEntity(&g, a, .fn_, "clone", root);
+
+    var slice_payload: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_payload }};
+
+    // 0: the `&[u8]` receiver, 1: `xs.iter()`, 2: `xs.iter().cloned()`,
+    // 3: `xs.iter().cloned().len()`, 4: `xs.iter().cloned().clone()`. The
+    // last two are the names the bare iterator admits, over the projection.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = iter_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = cloned_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .value,
+            .method = len_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .value,
+            .method = clone_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // `iter` and `cloned` resolve; the two member names do not, because the
+    // receiver they would land on is the projection and not the iterator.
+    try std.testing.expectEqual(@as(usize, 2), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 2), stats.unsupported_methods);
+    try std.testing.expect(b.exprs[2].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, cloned_ident), b.exprs[2].kind.method_call.method);
+
+    try expectUnsupportedReason(&b.exprs[3], "method dispatch unavailable");
+    try expectUnsupportedReason(&b.exprs[4], "method dispatch unavailable");
+}

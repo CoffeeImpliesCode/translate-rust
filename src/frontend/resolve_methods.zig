@@ -1788,24 +1788,39 @@ fn replaceWithUnsupported(e: *exprs.Expr, reason: []const u8) void {
     } };
 }
 
-fn isRetainedIteratorProjection(
+/// The retained slice-iterator shape a method call's receiver has.
+///
+/// `slice.iter()` is a receiver the Zig backend lowers to the runtime's own
+/// `r2z.SliceIter`, so a method over it lands on a real runtime iterator.
+/// `slice.iter().cloned()` keeps the borrow-erasing call itself in the tree
+/// instead, and that call has no runtime value: the backend reaches no
+/// `cloned` member on the iterator it would hand back, so a method over
+/// THIS shape is a call it cannot satisfy whatever the name is. The two
+/// shapes therefore admit different names.
+const RetainedIteratorProjection = enum {
+    slice_iterator,
+    cloned_projection,
+};
+
+fn retainedIteratorProjection(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
     receiver_node: exprs.NodeId,
-) bool {
+) ?RetainedIteratorProjection {
     var projection_node = receiver_node;
+    var crossed_cloned = false;
     var depth: usize = 0;
     while (depth < b.exprs.len) : (depth += 1) {
-        if (projection_node >= b.exprs.len) return false;
+        if (projection_node >= b.exprs.len) return null;
         const method_call = switch (b.exprs[projection_node].kind) {
             .method_call => |value| value,
-            else => return false,
+            else => return null,
         };
-        const method = g.symbol_table.get(method_call.method) orelse return false;
+        const method = g.symbol_table.get(method_call.method) orelse return null;
         if (std.mem.eql(u8, method.name, "iter") or
             std.mem.eql(u8, method.name, "iter_mut"))
         {
-            if (method_call.receiver >= b.exprs.len) return false;
+            if (method_call.receiver >= b.exprs.len) return null;
             const receiver = b.exprs[method_call.receiver];
             const receiver_ty = if (receiver.ty) |type_id|
                 if (type_id < b.types.len) b.types[type_id] else null
@@ -1813,13 +1828,15 @@ fn isRetainedIteratorProjection(
                 pathDeclaredType(g, b, receiver.kind.path)
             else
                 null;
-            const std_method = lookupStdMethod(receiver_ty orelse return false, method.name) orelse return false;
-            return std_method == .slice_iter or std_method == .slice_iter_mut;
+            const std_method = lookupStdMethod(receiver_ty orelse return null, method.name) orelse return null;
+            if (std_method != .slice_iter and std_method != .slice_iter_mut) return null;
+            return if (crossed_cloned) .cloned_projection else .slice_iterator;
         }
-        if (!std.mem.eql(u8, method.name, "cloned")) return false;
+        if (!std.mem.eql(u8, method.name, "cloned")) return null;
+        crossed_cloned = true;
         projection_node = method_call.receiver;
     }
-    return false;
+    return null;
 }
 
 /// The method names the runtime drives over a retained slice iterator.
@@ -1830,9 +1847,34 @@ fn isRetainedIteratorProjection(
 /// neither needs the backend to resolve a carrier of its own before it can
 /// lower them. Any other name over this receiver shape has no such arm, which
 /// is why the admission is this list and not the receiver's whole method set.
-fn isRetainedIteratorProjectionMethod(method_name: []const u8) bool {
-    return std.mem.eql(u8, method_name, "cloned") or
-        std.mem.eql(u8, method_name, "rev");
+fn isRetainedIteratorProjectionMethod(
+    projection: RetainedIteratorProjection,
+    method_name: []const u8,
+) bool {
+    if (std.mem.eql(u8, method_name, "cloned") or
+        std.mem.eql(u8, method_name, "rev"))
+    {
+        return true;
+    }
+    return projection == .slice_iterator and
+        isRetainedSliceIteratorMemberMethod(method_name);
+}
+
+/// The names a BARE `slice.iter()` receiver adds to that list.
+///
+/// Such a receiver lowers to `r2z.sliceIter(T, xs)`, and `len` and `clone`
+/// are the two members of `r2z.SliceIter`/`r2z.SliceIterMut` that a method
+/// call on that value reaches: both take `self: *const Self`, and Zig binds
+/// a `*const` receiver from a temporary. `next`, `next_back` and `nth` take
+/// `self: *Self` and do not compile on one — the backend has to bind the
+/// iterator to a local first, exactly as its `for` hoisting does — so they
+/// stay refused. Nothing else belongs here either: `count`, `last`,
+/// `position` and `rev` name no member at all, the backend answers
+/// `as_slice` with the receiver itself rather than a call to it, and
+/// `size_hint` returns a two-field struct where Rust has a `Range`.
+fn isRetainedSliceIteratorMemberMethod(method_name: []const u8) bool {
+    return std.mem.eql(u8, method_name, "len") or
+        std.mem.eql(u8, method_name, "clone");
 }
 
 fn isRuntimeIoMethod(g: *const graph.CrateGraph, b: *const bodies.Bodies, method_id: exprs.DefId, receiver: types.Type, name: []const u8) bool {
@@ -2443,9 +2485,8 @@ pub fn resolveMethods(
 
             const receiver = b.exprs[receiver_node];
             const receiver_ty = receiverDeclaredType(g, b, receiver_node);
-            const iterator_projection = isRetainedIteratorProjection(g, b, receiver_node);
-            if (iterator_projection) {
-                if (isRetainedIteratorProjectionMethod(method_name)) {
+            if (retainedIteratorProjection(g, b, receiver_node)) |projection| {
+                if (isRetainedIteratorProjectionMethod(projection, method_name)) {
                     stats.std_resolved += 1;
                 } else {
                     replaceWithUnsupported(e, reason_method_dispatch_unavailable);

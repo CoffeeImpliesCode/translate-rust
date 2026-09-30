@@ -517,11 +517,19 @@ pub const ResolveFingerprint = *const fn (
     result: *const BuildTestResult,
 ) anyerror!?u64;
 
+/// Sink for the output of a staged build that did not pass. Split out of
+/// `promoteWithHooks` so a test can read the diagnostics a user sees.
+pub const ReportBuildFailure = *const fn (
+    context: ?*anyopaque,
+    result: *const BuildTestResult,
+) void;
+
 pub const PromotionHooks = struct {
     context: ?*anyopaque = null,
     fill_nonce: FillPromotionNonce = fillPromotionNonce,
     run_build_test: RunBuildTest = runGeneratedBuildTest,
     resolve_fingerprint: ResolveFingerprint = resolveFingerprint,
+    report_build_failure: ReportBuildFailure = printBuildFailure,
 };
 
 /// Return a unique sibling path for the package staging directory.
@@ -822,6 +830,30 @@ fn releaseBuildTestResult(allocator: std.mem.Allocator, result: BuildTestResult)
     allocator.free(result.stderr);
 }
 
+/// Report a staged build that did not pass. The compiler's own output is the
+/// only diagnostic a promotion failure carries, and it is reported on every
+/// failing pass: the retry pass always did, the first pass dropped it, so a
+/// one-pass compile error surfaced as a bare error with no message at all.
+fn printBuildFailure(_: ?*anyopaque, result: *const BuildTestResult) void {
+    var reported = false;
+    if (hasCapturedOutput(result.stdout)) {
+        std.debug.print("generated package build failed (stdout):\n{s}\n", .{result.stdout});
+        reported = true;
+    }
+    if (hasCapturedOutput(result.stderr)) {
+        std.debug.print("generated package build failed:\n{s}\n", .{result.stderr});
+        reported = true;
+    }
+    if (!reported) {
+        std.debug.print("generated package build failed: no compiler output captured\n", .{});
+    }
+}
+
+/// True when a captured stream carries anything but whitespace.
+fn hasCapturedOutput(bytes: []const u8) bool {
+    return std.mem.trim(u8, bytes, " \t\r\n").len != 0;
+}
+
 fn cleanupPromotion(
     io: std.Io,
     staging_dir: []const u8,
@@ -876,6 +908,7 @@ pub fn promoteWithHooks(
                 if (code == 0) break;
             },
             else => {
+                hooks.report_build_failure(hooks.context, &build_result);
                 releaseBuildTestResult(allocator, build_result);
                 return cleanupPromotion(
                     io,
@@ -885,7 +918,7 @@ pub fn promoteWithHooks(
             },
         }
         if (fingerprint_patched) {
-            std.debug.print("generated package build failed:\n{s}\n", .{build_result.stderr});
+            hooks.report_build_failure(hooks.context, &build_result);
             releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(
                 io,
@@ -901,12 +934,16 @@ pub fn promoteWithHooks(
             staging_dir,
             &build_result,
         ) catch |err| {
+            hooks.report_build_failure(hooks.context, &build_result);
             releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(io, staging_dir, err);
         };
-        releaseBuildTestResult(allocator, build_result);
-        const resolved_fingerprint = fingerprint orelse
+        const resolved_fingerprint = fingerprint orelse {
+            hooks.report_build_failure(hooks.context, &build_result);
+            releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(io, staging_dir, error.GeneratedPackageBuildFailed);
+        };
+        releaseBuildTestResult(allocator, build_result);
         patchManifestFingerprint(
             allocator,
             io,
@@ -1462,10 +1499,14 @@ test "writeToDisk: rejects dependency names that collide after ZON sanitization"
 
 const PromotionTestMode = enum {
     compile_failure,
+    compile_failure_on_stdout,
     fingerprint_then_success,
+    fingerprint_then_failure,
     resolver_failure,
     success_without_fingerprint,
 };
+
+const reported_output_capacity = 256;
 
 const PromotionTestContext = struct {
     final_path: []const u8,
@@ -1474,6 +1515,11 @@ const PromotionTestContext = struct {
     resolver_calls: u32 = 0,
     resolver_saw_missing_fingerprint: bool = false,
     destination_visible_during_build: bool = false,
+    report_calls: u32 = 0,
+    reported_stdout: [reported_output_capacity]u8 = undefined,
+    reported_stdout_len: usize = 0,
+    reported_stderr: [reported_output_capacity]u8 = undefined,
+    reported_stderr_len: usize = 0,
 };
 
 fn fixedPromotionNonce(
@@ -1502,18 +1548,28 @@ fn fakePromotionBuildTest(
     context.build_calls += 1;
     const stderr = switch (context.mode) {
         .compile_failure => "generated source does not compile",
+        .compile_failure_on_stdout => "",
         .fingerprint_then_success, .resolver_failure => if (context.build_calls == 1)
             "fingerprint: 0x81677af28f9d3b4e"
         else
             "",
+        .fingerprint_then_failure => if (context.build_calls == 1)
+            "fingerprint: 0x81677af28f9d3b4e"
+        else
+            "optimized build still rejects the generated source",
         .success_without_fingerprint => "",
     };
+    const stdout_text = switch (context.mode) {
+        .compile_failure_on_stdout => "error: use of undeclared identifier 'undefined_value'",
+        else => "",
+    };
     const exit_code: u8 = switch (context.mode) {
-        .compile_failure, .resolver_failure => 1,
+        .compile_failure, .compile_failure_on_stdout, .resolver_failure => 1,
         .fingerprint_then_success => if (context.build_calls == 1) 1 else 0,
+        .fingerprint_then_failure => 1,
         .success_without_fingerprint => 0,
     };
-    const stdout = try allocator.dupe(u8, "");
+    const stdout = try allocator.dupe(u8, stdout_text);
     errdefer allocator.free(stdout);
     const stderr_copy = try allocator.dupe(u8, stderr);
     return .{
@@ -1541,11 +1597,29 @@ fn fakePromotionFingerprint(
         std.mem.indexOf(u8, zon, ".fingerprint") == null;
 
     return switch (context.mode) {
-        .compile_failure => null,
-        .fingerprint_then_success => 0x81677af28f9d3b4e,
+        .compile_failure, .compile_failure_on_stdout => null,
+        .fingerprint_then_success, .fingerprint_then_failure => 0x81677af28f9d3b4e,
         .resolver_failure => error.FingerprintResolverFailed,
         .success_without_fingerprint => null,
     };
+}
+
+fn copyReportedOutput(destination: []u8, source: []const u8) usize {
+    const kept = @min(destination.len, source.len);
+    @memcpy(destination[0..kept], source[0..kept]);
+    return kept;
+}
+
+/// Stand in for `printBuildFailure`, which writes to the process stderr a
+/// test cannot read back.
+fn recordBuildFailure(
+    opaque_context: ?*anyopaque,
+    result: *const BuildTestResult,
+) void {
+    const context: *PromotionTestContext = @ptrCast(@alignCast(opaque_context.?));
+    context.report_calls += 1;
+    context.reported_stdout_len = copyReportedOutput(&context.reported_stdout, result.stdout);
+    context.reported_stderr_len = copyReportedOutput(&context.reported_stderr, result.stderr);
 }
 
 const GateModeTestContext = struct {
@@ -1809,5 +1883,174 @@ test "promotion rejects a final package without a fingerprint" {
     try std.testing.expectEqual(@as(u32, 1), context.build_calls);
     try std.testing.expectEqual(@as(u32, 0), context.resolver_calls);
     try expectDirectoryAbsent(test_io, out_dir);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports the compiler output when the first build fails" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    const pkg = buildTestPackage();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .compile_failure,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // The first pass is the real build, and it is the pass a one-pass compile
+    // error dies on. It used to return a bare error with the compiler's
+    // output discarded, so a silent emission defect was only findable by
+    // hand-compiling the generated package. The error value is unchanged.
+    try std.testing.expectEqual(@as(u32, 1), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqualStrings(
+        "generated source does not compile",
+        context.reported_stderr[0..context.reported_stderr_len],
+    );
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports compiler output that arrives on stdout" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    const pkg = buildTestPackage();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .compile_failure_on_stdout,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // `resolveFingerprint` reads both streams for its hint, so a hint can
+    // arrive on either one. A failing build that writes nothing to stderr
+    // still has to say something.
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqualStrings(
+        "error: use of undeclared identifier 'undefined_value'",
+        context.reported_stdout[0..context.reported_stdout_len],
+    );
+    try std.testing.expectEqual(@as(usize, 0), context.reported_stderr_len);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports the compiler output of a retried build once" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var pkg = buildTestPackage();
+    pkg.fingerprint = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .fingerprint_then_failure,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // The manifest patch pass is not a defect: it is a fingerprint hint the
+    // resolver consumes. The retried build is, so its output is reported
+    // once, and the hint pass stays quiet.
+    try std.testing.expectEqual(@as(u32, 2), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqualStrings(
+        "optimized build still rejects the generated source",
+        context.reported_stderr[0..context.reported_stderr_len],
+    );
+    try expectDirectoryAbsent(test_io, out_dir);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports nothing when the build passes" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var pkg = buildTestPackage();
+    pkg.fingerprint = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .fingerprint_then_success,
+    };
+    try promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+        .context = &context,
+        .fill_nonce = fixedPromotionNonce,
+        .run_build_test = fakePromotionBuildTest,
+        .resolve_fingerprint = fakePromotionFingerprint,
+        .report_build_failure = recordBuildFailure,
+    });
+
+    // A first pass that fails only to hand the resolver a fingerprint hint is
+    // part of a successful promotion, so it must not print a build failure.
+    try std.testing.expectEqual(@as(u32, 2), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.resolver_calls);
+    try std.testing.expectEqual(@as(u32, 0), context.report_calls);
     try expectDirectoryAbsent(test_io, staging_dir);
 }

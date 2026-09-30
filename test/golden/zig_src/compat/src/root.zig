@@ -78,7 +78,7 @@ pub fn generic_narrow(comptime T: type, value: T) ?u8 {
 pub fn byte_sum(input: []const u8) u32 {
     var sum_1: u32 = 0;
     for (input) |byte| {
-        sum_1 += @as(u32, byte);
+        sum_1 +%= @as(u32, byte);
     }
     return sum_1;
 }
@@ -155,7 +155,7 @@ pub fn stateful_flattened(allocator: std.mem.Allocator) !std.ArrayListUnmanaged(
         }) {
             {
                 const x = __r2z_range_cursor;
-                __r2z_capture_iter_0_end += 1;
+                __r2z_capture_iter_0_end +%= 1;
                 const __r2z_range_start_1: u32 = x;
                 const __r2z_range_end_1: u32 = __r2z_capture_iter_0_end;
                 var __r2z_range_cursor_1: u32 = __r2z_range_start_1;
@@ -281,7 +281,7 @@ pub fn continued_range_sum(end: u8) u32 {
                 if (value == end) {
                     continue;
                 }
-                result += @as(u32, value);
+                result +%= @as(u32, value);
             }
         }
     }
@@ -349,14 +349,14 @@ pub fn apply_mut_capture(base: u32, value: u32) u32 {
     _ = __r2z_value_block_1: {
         const x = value;
         break :__r2z_value_block_1 __r2z_value_block_2: {
-            total_1 += x;
+            total_1 +%= x;
             break :__r2z_value_block_2 total_1;
         };
     };
     return __r2z_value_block_1: {
         const x = value;
         break :__r2z_value_block_1 __r2z_value_block_2: {
-            total_1 += x;
+            total_1 +%= x;
             break :__r2z_value_block_2 total_1;
         };
     };
@@ -368,14 +368,14 @@ pub fn apply_mut_move_capture(base: u32, value: u32) u32 {
     _ = __r2z_value_block_1: {
         const x = value;
         break :__r2z_value_block_1 __r2z_value_block_2: {
-            __r2z_capture_add_captured += x;
+            __r2z_capture_add_captured +%= x;
             break :__r2z_value_block_2 __r2z_capture_add_captured;
         };
     };
     return __r2z_value_block_1: {
         const x = value;
         break :__r2z_value_block_1 __r2z_value_block_2: {
-            __r2z_capture_add_captured += x;
+            __r2z_capture_add_captured +%= x;
             break :__r2z_value_block_2 __r2z_capture_add_captured;
         };
     };
@@ -399,7 +399,7 @@ pub fn increment_sum(input: []u32) u32 {
         {
             const x = __r2z_item;
             const __r2z_item_value = __r2z_value_block_3: {
-                x.* += 1;
+                x.* +%= 1;
                 break :__r2z_value_block_3 x.*;
             };
             __r2z_sum += __r2z_item_value;
@@ -468,7 +468,7 @@ pub fn for_adapter_sum(input: []const u32, offset: u32) u32 {
                     const x_1 = &__r2z_item_value;
                     if (x_1.* > 4) {
                         const value = __r2z_item_value;
-                        total_1 += value;
+                        total_1 +%= value;
                     }
                 }
             }
@@ -486,7 +486,7 @@ pub fn moved_adapter_sum(input: []const u32, base: u32) u32 {
             {
                 const x = __r2z_item;
                 const __r2z_item_value = __r2z_value_block_4: {
-                    __r2z_capture_iter_0_running += x;
+                    __r2z_capture_iter_0_running +%= x;
                     break :__r2z_value_block_4 __r2z_capture_iter_0_running;
                 };
                 __r2z_sum += __r2z_item_value;
@@ -505,7 +505,7 @@ pub fn counted_filter_sum(input: []const u32) u32 {
             {
                 const x = __r2z_item;
                 const __r2z_item_value = __r2z_value_block_4: {
-                    calls += 1;
+                    calls +%= 1;
                     break :__r2z_value_block_4 x;
                 };
                 {

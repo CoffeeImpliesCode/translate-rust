@@ -26,11 +26,16 @@ Current positive end-to-end paths are:
 - The `multimod` source fixture maps each discovered module onto its own emitted file (`foo.rs` to `foo.zig`, a nested `foo/bar.rs` to `foo/bar.zig`, and a `#[path = "..."]` module to `custom_pub.zig`).
 - The `xxhash-rust` source fixture translates into a four-file package (`src/root.zig`, `src/utils.zig`, `src/xxh32_common.zig`, `src/xxh32.zig`). It was pinned as rejecting with `EmptyRootFile`; that pin was stale for this tree.
 
+Counting distinct crates, seven translate end to end today — `mini`, `fnv`, `compat`, `wyhash`,
+`adler`, `multimod` and `xxhash-rust` — plus the canonical v6 `mini` wire fixture. The
+end-to-end matrix in `test/e2e_test.zig` requires eight source fixtures: those seven plus
+`hex`. So the e2e executable and the gate are red on `hex` alone.
+
 Current rejection coverage is:
 
 - The `fletcher` fixture rejects the external `quickcheck!` macro with `ExternalMacroSourceUnavailable`.
 - The `crc16` fixture rejects the generated `tables.rs` include with `BuildScriptArtifactUnavailable`; build scripts are not executed.
-- The `hex` source fixture does not translate yet. It fails IR validation with `UnsupportedExpression`; the frontend cannot name a trait method's result type from its signature combined with a call-site turbofish. Note the feature model: an empty `--features` selection applies the manifest's `default` closure, and hex's `default = ["std"]` pulls in `alloc` transitively, so its `alloc`-gated code *is* analysed. `hex` goldens cannot be regenerated until this is fixed.
+- The `hex` source fixture does not translate yet. As of the last measurement, 2026-09-30, it stops in the lowerer with `UnsupportedExpression` on a `vec![]` literal inside a `#[test]` entity. The causes named here previously — the `alloc::string::ToString` import, and a trait method's result type unreachable from its signature plus a call-site turbofish — were both fixed and are no longer the blocker; the chain is recorded in `HANDOFF.md`. Note the feature model: an empty `--features` selection applies the manifest's `default` closure, and hex's `default = ["std"]` pulls in `alloc` transitively, so its `alloc`-gated code *is* analysed. `hex` goldens cannot be regenerated until this is fixed.
 - The legacy wire corpus rejects `fnv`, `fletcher`, `hex`, `wyhash`, `adler`, `xxhash-rust`, and `seahash`.
 - It also rejects `crc16`, `atoi`, `leb128`, `itoa`, `siphasher`, `percent-encoding`, and `syn`.
 
@@ -62,10 +67,10 @@ Standalone source trait declarations remain unsupported.
 
 ## Measured coverage, and what the fixtures do not show
 
-The positive list above is a list of fixtures, not a coverage rate. A measurement pass ran
-the translator over a corpus of dependency-free crates and recorded the exact first typed
+The positive list above is a list of fixtures, not a coverage rate. The first measurement pass
+ran the translator over a corpus of dependency-free crates and recorded the exact first typed
 error for each, twice: once on the default feature closure (57 crates) and once library-only
-(55).
+(55). Two further rounds grew the corpus; their totals close this section.
 
 - **2 of 57 crates translate at all** on the default pass — `fnv` and `utf8-width`. On the
   library-only pass 1 of 55 does: `utf8-width`. Every other crate stops at a typed error.
@@ -86,9 +91,20 @@ error for each, twice: once on the default feature closure (57 crates) and once 
   - `xxhash-rust` is a vendored v1-dialect copy whose manifest sets `default = ["xxh32"]`.
     The upstream 0.8.19 crate the corpus measured declares no `default` feature at all, so
     cfg evaluation drops every module and that crate still reduces to an empty root.
+- **Three rounds of layer-peeling have cleared no crate.** Round 3 added a third batch of 26
+  dependency-free crates, chosen as the smallest available on the theory that crate size is the
+  cost driver: **146 crates, 112 unique, 2 translating**. The hypothesis failed — see the
+  rejection table in `FIXING-ROUND-3.md`.
+- **The defects that cost the most time were not refusals.** A `match` on an `Option` emitted a
+  package that could not build (`use of undeclared identifier 'r2z'`) for *every* occurrence,
+  because the payload path named the runtime without marking its import. Translation reported
+  success on each one. That class is why the probe sweeps, not the crate net, are what pays:
+  rounds 1 and 2 fixed eleven real wrong-output bugs there and none in the crate net.
+  `FIXING-ROUND-3.md` has the reproducer and the fix.
 
 Read "translates" as "this fixture translates", never as "this shape of Rust translates".
-`FIXING-ROUND.md` carries the full measurement and the ranked fix list it produced.
+`FIXING-ROUND.md`, `FIXING-ROUND-2.md` and `FIXING-ROUND-3.md` carry the measurements and the
+ranked fix lists they produced.
 
 ## Modules
 

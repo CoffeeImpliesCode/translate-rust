@@ -11460,7 +11460,7 @@ test "lower: a let-else refuses rather than dropping its else block" {
     );
 }
 
-test "lower: a compound assignment emits the checked operator even when the IR says wrapping" {
+test "lower: a compound assignment agrees with the binary spelling of one operation on overflow mode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -11477,97 +11477,253 @@ test "lower: a compound assignment emits the checked operator even when the IR s
         .renamed_to = null,
         .attributes = &.{},
     });
-    const a_def = try addLowerEntity(&graph, .const_, "a", root_id);
-    const x_def = try addLowerEntity(&graph, .const_, "x", root_id);
-    const assign_id = try addLowerEntity(&graph, .fn_, "bump", root_id);
-    const wrap_id = try addLowerEntity(&graph, .fn_, "wrap_add", root_id);
-    try addBareCrate(&graph, alloc, "compound_assign", root_id, &.{ assign_id, wrap_id });
 
-    const u32_ty: ir.types.Type = .{ .prim = .u32 };
-    const types = [_]ir.types.Type{u32_ty};
+    // `fn <fn_name>() -> u8 { let mut x = <start>; x <op>= <operand>; x }`.
+    // `ts_ext.zig` writes `.wrapping` on every `AssignExpr`, so a plain `+=`
+    // really does reach the backend carrying the same overflow mode the
+    // binary path reads, and the two spellings have to land on one operator.
+    const compound_probes = [_]struct {
+        fn_name: []const u8,
+        start: i128,
+        op: ir.exprs.AssignOp,
+        operand: i128,
+        zig: []const u8,
+        trapping: []const u8,
+    }{
+        // Round 2 emitted the trapping operator for all three: `x += 1;` on a
+        // `u8` holding 255 panicked in both gate modes where the `255 + 1`
+        // probe below wrapped to 0, so one Rust operation had two answers.
+        .{ .fn_name = "bump", .start = 255, .op = .add, .operand = 1, .zig = "x +%= 1;", .trapping = "x += 1;" },
+        .{ .fn_name = "drop_one", .start = 0, .op = .sub, .operand = 1, .zig = "x -%= 1;", .trapping = "x -= 1;" },
+        .{ .fn_name = "grow", .start = 100, .op = .mul, .operand = 4, .zig = "x *%= 4;", .trapping = "x *= 4;" },
+    };
+    // The binary spellings of those same three operations.
+    const binary_probes = [_]struct {
+        fn_name: []const u8,
+        op: ir.exprs.BinaryOp,
+        lhs: i128,
+        rhs: i128,
+        zig: []const u8,
+    }{
+        .{ .fn_name = "binary_add", .op = .add, .lhs = 255, .rhs = 1, .zig = "return 255 +% 1;" },
+        .{ .fn_name = "binary_sub", .op = .sub, .lhs = 0, .rhs = 1, .zig = "return 0 -% 1;" },
+        .{ .fn_name = "binary_mul", .op = .mul, .lhs = 100, .rhs = 4, .zig = "return 100 *% 4;" },
+        // `wrapping_add`, `wrapping_sub` and `wrapping_mul` wrap under BOTH
+        // Rust profiles, so they must keep the wrapping operator after any
+        // change to the compound path. `ts_ext.zig` lowers all three to the
+        // node the plain operator produces — a `BinaryExpr` with `.overflow =
+        // .wrapping` — so these rows are the one shape they all arrive as.
+        .{ .fn_name = "wrapping_add_method", .op = .add, .lhs = 7, .rhs = 3, .zig = "return 7 +% 3;" },
+        .{ .fn_name = "wrapping_sub_method", .op = .sub, .lhs = 7, .rhs = 3, .zig = "return 7 -% 3;" },
+        .{ .fn_name = "wrapping_mul_method", .op = .mul, .lhs = 7, .rhs = 3, .zig = "return 7 *% 3;" },
+    };
+
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const types = [_]ir.types.Type{u8_ty};
     var model = Model.init(alloc);
 
-    // `fn bump(a: u32) -> u32 { let mut x = a; x += a; x }`. `ts_ext.zig`
-    // writes `.wrapping` on every `AssignExpr`, so the IR here is what the
-    // sidecar really produces for a plain `+=`.
-    const bind_x = try model.pat(.{ .binding = .{
+    // One `BodyKind` per graph entity, so each probe's function lands on its
+    // own index and the local it binds stays bodyless.
+    var bodies: std.ArrayListUnmanaged(ir.bodies.BodyKind) = .empty;
+    var crate_items: std.ArrayListUnmanaged(ir.spine.EntityId) = .empty;
+    try bodies.append(alloc, .none); // the root module entity
+
+    for (compound_probes) |probe| {
+        const fn_id = try addLowerEntity(&graph, .fn_, probe.fn_name, root_id);
+        const local_id = try addLowerEntity(&graph, .const_, "x", root_id);
+        try crate_items.append(alloc, fn_id);
+
+        const binding = try model.pat(.{ .binding = .{
+            .name = "x",
+            .mode = .value,
+            .mutable = true,
+        } });
+        const start_literal = try model.e(litInt(probe.start));
+        model.exprs.items[start_literal].ty = 0;
+        const let_stmt = try model.stmt(.{ .let = .{
+            .pattern = binding,
+            .init = start_literal,
+            .ty = null,
+        } });
+        const target = try model.e(.{ .path = .{ .def = local_id, .generic_args = &.{} } });
+        model.exprs.items[target].ty = 0;
+        const operand_literal = try model.e(litInt(probe.operand));
+        model.exprs.items[operand_literal].ty = 0;
+        const compound = try model.e(.{ .assign = .{
+            .target = target,
+            .op = probe.op,
+            .value = operand_literal,
+            .overflow = .wrapping,
+        } });
+        model.exprs.items[compound].ty = null;
+        const compound_stmt = try model.stmt(.{ .expr = compound });
+        const tail = try model.e(.{ .path = .{ .def = local_id, .generic_args = &.{} } });
+        model.exprs.items[tail].ty = 0;
+        const statements = try alloc.alloc(ir.exprs.NodeId, 2);
+        statements[0] = let_stmt;
+        statements[1] = compound_stmt;
+        const body = try model.e(.{ .block = .{
+            .statements = statements,
+            .tail = tail,
+            .labelled = null,
+        } });
+
+        try bodies.append(alloc, .{ .fn_ = .{
+            .params = &.{},
+            .ret = u8_ty,
+            .generic_params = &.{},
+            .body = body,
+            .is_allocating = false,
+        } });
+        try bodies.append(alloc, .none); // the bound local
+    }
+
+    for (binary_probes) |probe| {
+        const fn_id = try addLowerEntity(&graph, .fn_, probe.fn_name, root_id);
+        try crate_items.append(alloc, fn_id);
+
+        const lhs = try model.e(litInt(probe.lhs));
+        model.exprs.items[lhs].ty = 0;
+        const rhs = try model.e(litInt(probe.rhs));
+        model.exprs.items[rhs].ty = 0;
+        const sum = try model.e(.{ .binary = .{
+            .op = probe.op,
+            .overflow = .wrapping,
+            .lhs = lhs,
+            .rhs = rhs,
+        } });
+        model.exprs.items[sum].ty = 0;
+        const body = try model.e(.{ .block = .{
+            .statements = &.{},
+            .tail = sum,
+            .labelled = null,
+        } });
+
+        try bodies.append(alloc, .{ .fn_ = .{
+            .params = &.{},
+            .ret = u8_ty,
+            .generic_params = &.{},
+            .body = body,
+            .is_allocating = false,
+        } });
+    }
+
+    try addBareCrate(&graph, alloc, "overflow_agreement", root_id, crate_items.items);
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "overflow_agreement",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = bodies.items,
+        },
+    };
+
+    const source = try emitRootSource(alloc, &rust_ir);
+    for (compound_probes) |probe| {
+        std.testing.expect(std.mem.indexOf(u8, source, probe.zig) != null) catch |err| {
+            std.debug.print("missing compound assignment: {s}\n", .{probe.zig});
+            return err;
+        };
+        // The trapping spelling must be gone: it is what turned `255u8 + 1`
+        // and `x += 1` into two different answers.
+        std.testing.expect(std.mem.indexOf(u8, source, probe.trapping) == null) catch |err| {
+            std.debug.print("trapping compound assignment survived: {s}\n", .{probe.trapping});
+            return err;
+        };
+    }
+    for (binary_probes) |probe| {
+        std.testing.expect(std.mem.indexOf(u8, source, probe.zig) != null) catch |err| {
+            std.debug.print("missing binary expression: {s}\n", .{probe.zig});
+            return err;
+        };
+    }
+}
+
+test "lower: a float compound assignment keeps the plain operator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // Zig spells the wrapping compound form for integers only — `f64 +%= f64`
+    // does not compile — so a float target must keep the plain operator even
+    // though its `AssignExpr` carries the same `.wrapping` an integer one has.
+    const fn_id = try addLowerEntity(&graph, .fn_, "drift", root_id);
+    const local_id = try addLowerEntity(&graph, .const_, "x", root_id);
+    try addBareCrate(&graph, alloc, "float_compound", root_id, &.{fn_id});
+
+    const f64_ty: ir.types.Type = .{ .prim = .f64 };
+    const types = [_]ir.types.Type{f64_ty};
+    var model = Model.init(alloc);
+
+    const binding = try model.pat(.{ .binding = .{
         .name = "x",
         .mode = .value,
         .mutable = true,
     } });
-    const init_x = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
-    model.exprs.items[init_x].ty = 0;
+    const start_literal = try model.e(.{ .literal = .{ .float = .{ .text = "", .value = 1.5 } } });
+    model.exprs.items[start_literal].ty = 0;
     const let_stmt = try model.stmt(.{ .let = .{
-        .pattern = bind_x,
-        .init = init_x,
+        .pattern = binding,
+        .init = start_literal,
         .ty = null,
     } });
-    const assign_target = try model.e(.{ .path = .{ .def = x_def, .generic_args = &.{} } });
-    model.exprs.items[assign_target].ty = 0;
-    const assign_value = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
-    model.exprs.items[assign_value].ty = 0;
+    const target = try model.e(.{ .path = .{ .def = local_id, .generic_args = &.{} } });
+    model.exprs.items[target].ty = 0;
+    const operand_literal = try model.e(.{ .literal = .{ .float = .{ .text = "", .value = 0.25 } } });
+    model.exprs.items[operand_literal].ty = 0;
     const compound = try model.e(.{ .assign = .{
-        .target = assign_target,
+        .target = target,
         .op = .add,
-        .value = assign_value,
+        .value = operand_literal,
         .overflow = .wrapping,
     } });
     model.exprs.items[compound].ty = null;
     const compound_stmt = try model.stmt(.{ .expr = compound });
-    const bump_tail = try model.e(.{ .path = .{ .def = x_def, .generic_args = &.{} } });
-    model.exprs.items[bump_tail].ty = 0;
-    const bump_statements = try alloc.alloc(ir.exprs.NodeId, 2);
-    bump_statements[0] = let_stmt;
-    bump_statements[1] = compound_stmt;
-    const bump_body = try model.e(.{ .block = .{
-        .statements = bump_statements,
-        .tail = bump_tail,
-        .labelled = null,
-    } });
-
-    // `fn wrap_add(a: u32) -> u32 { a + a }` — a `wrapping_add` lowers here,
-    // and it must keep its wrapping operator.
-    const wrap_lhs = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
-    model.exprs.items[wrap_lhs].ty = 0;
-    const wrap_rhs = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
-    model.exprs.items[wrap_rhs].ty = 0;
-    const wrap_binary = try model.e(.{ .binary = .{
-        .op = .add,
-        .overflow = .wrapping,
-        .lhs = wrap_lhs,
-        .rhs = wrap_rhs,
-    } });
-    model.exprs.items[wrap_binary].ty = 0;
-    const wrap_body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = wrap_binary,
+    const tail = try model.e(.{ .path = .{ .def = local_id, .generic_args = &.{} } });
+    model.exprs.items[tail].ty = 0;
+    const statements = try alloc.alloc(ir.exprs.NodeId, 2);
+    statements[0] = let_stmt;
+    statements[1] = compound_stmt;
+    const body = try model.e(.{ .block = .{
+        .statements = statements,
+        .tail = tail,
         .labelled = null,
     } });
 
     const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
     for (body_rows) |*row| row.* = .none;
-    const params = try alloc.alloc(ir.items.Param, 1);
-    params[0] = .{ .name = "a", .ty = u32_ty, .span = span };
-    body_rows[assign_id] = .{ .fn_ = .{
-        .params = params,
-        .ret = u32_ty,
+    body_rows[fn_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = f64_ty,
         .generic_params = &.{},
-        .body = bump_body,
-        .is_allocating = false,
-    } };
-    body_rows[wrap_id] = .{ .fn_ = .{
-        .params = params,
-        .ret = u32_ty,
-        .generic_params = &.{},
-        .body = wrap_body,
+        .body = body,
         .is_allocating = false,
     } };
 
     const rust_ir = ir.RustIr{
-        .crate_name = "compound_assign",
+        .crate_name = "float_compound",
         .edition = "2021",
         .graph = graph,
-        .types = &.{},
+        .types = &types,
         .bodies = .{
             .exprs = try model.exprs.toOwnedSlice(alloc),
             .stmts = try model.stmts.toOwnedSlice(alloc),
@@ -11577,13 +11733,10 @@ test "lower: a compound assignment emits the checked operator even when the IR s
         },
     };
 
-    // A Rust debug build panics on `t += 4294967295; t += 2;`; `+%=` returned
-    // 1 in both gate modes instead.
     const source = try emitRootSource(alloc, &rust_ir);
-    try std.testing.expect(std.mem.indexOf(u8, source, "x += a;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "x +%= a;") == null);
-    // `wrapping_add` is a binary expression, not an assignment, and keeps `%`.
-    try std.testing.expect(std.mem.indexOf(u8, source, "return a +% a;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "var x: f64 = 1.5;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "x += 0.25;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "x +%= 0.25;") == null);
 }
 
 test "lower: a sum over .iter() dereferences the by-pointer item" {
@@ -12033,4 +12186,537 @@ test "lower: indexing a Vec returned by an unpropagated call refuses" {
         error.UnsupportedExpression,
         lower.lowerRustIr(alloc, &rust_ir, null),
     );
+}
+
+// ── Match and the r2z runtime import ─────────────────────────────────────────
+
+/// The three `match` shapes the runtime-import tests pin. They differ only in
+/// whether the emitted file has to name the `r2z` runtime.
+const MatchRuntimeFixture = enum {
+    /// `match x { Some(v) => 1, None => 0 }` over `Option<u8>`. Zig cannot
+    /// destructure an optional, so the `Some` payload is read back through
+    /// `r2z.option.unwrap` and the file has to import the runtime with it.
+    option_payload,
+    /// `match x { Some(_) => 1, None => 0 }` over `Option<u8>`. The optional
+    /// lowering runs, but no arm reads a payload, so nothing names the
+    /// runtime and the import must stay absent.
+    option_wildcard,
+    /// `match x { 0 => 1, _ => 0 }` over `u8`. The scrutinee is not an
+    /// optional, so the optional lowering never runs at all.
+    plain_int,
+};
+
+/// The `r2z` runtime import exactly as the emitter writes it. A file that
+/// names `r2z.` and lacks this line is what `zig build` rejects with `use of
+/// undeclared identifier 'r2z'`.
+const runtime_import_line = "const r2z = @import(\"r2z\");";
+
+fn runtimeImportCount(file: ast.File) usize {
+    var count: usize = 0;
+    for (file.imports) |entry| {
+        if (std.mem.eql(u8, entry.local_name, "r2z") and
+            std.mem.eql(u8, entry.module_or_path, "r2z")) count += 1;
+    }
+    return count;
+}
+
+/// Lower a one-function crate whose body is a single `match` and return the
+/// whole package, so the test can read both the emitted source and the
+/// import list the compiler is handed.
+///
+/// The `Option` fixtures reproduce what the frontend hands the lowerer for
+/// `Some(v)`: a `struct_pat` on the `Some` variant with a single `"0"` field,
+/// and a `path` pattern naming `None` — see `ts_ext`'s
+/// `tuple_struct_pattern` arm.
+fn lowerMatchRuntimeFixture(
+    alloc: std.mem.Allocator,
+    fixture: MatchRuntimeFixture,
+) !ast.Package {
+    const is_option = fixture != .plain_int;
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const fn_id = try addLowerEntity(&graph, .fn_, "classify", null);
+    const param_id = try addLowerEntity(&graph, .field, "x", fn_id);
+    const some_id = try addLowerEntity(&graph, .variant, "Some", null);
+    const none_id = try addLowerEntity(&graph, .variant, "None", null);
+    _ = try addRootModule(&graph, .{
+        .crate_name = "match_runtime_fixture",
+        .edition = 2021,
+        .items = &.{fn_id},
+    });
+
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    // `.option` holds a pointer, so the payload type has to outlive this
+    // frame; a stack cell would dangle as soon as the package is returned.
+    const u8_cell = try alloc.create(ir.types.Type);
+    u8_cell.* = u8_ty;
+    const option_u8_ty: ir.types.Type = .{ .option = u8_cell };
+    // 0 = u8, 1 = Option<u8>
+    const types = [_]ir.types.Type{ u8_ty, option_u8_ty };
+
+    var model = Model.init(alloc);
+    const scrutinee = try model.e(.{ .path = .{ .def = param_id, .generic_args = &.{} } });
+    const scrutinee_ty: ir.spine.TypeId = if (is_option) 1 else 0;
+    model.exprs.items[scrutinee].ty = scrutinee_ty;
+
+    const some_payload = if (fixture == .option_payload)
+        try model.pat(.{ .binding = .{
+            .name = "v",
+            .mode = .{ .value = {} },
+            .mutable = false,
+        } })
+    else
+        try model.pat(.wildcard);
+    const some_fields = try alloc.alloc(ir.exprs.FieldPat, 1);
+    some_fields[0] = .{ .field = "0", .pat = some_payload, .shorthand = true };
+    const some_pat = if (is_option)
+        try model.pat(.{ .struct_pat = .{
+            .def = some_id,
+            .fields = some_fields,
+            .rest = false,
+        } })
+    else
+        try model.pat(.{ .literal = .{
+            .int = .{ .text = "", .value = 0, .base = .dec, .ty_suffix = null },
+        } });
+    const none_pat = if (is_option)
+        try model.pat(.{ .path = .{ .def = none_id, .variant = "None" } })
+    else
+        try model.pat(.wildcard);
+
+    const some_selectors = try alloc.alloc(ir.exprs.NodeId, 1);
+    some_selectors[0] = some_pat;
+    const none_selectors = try alloc.alloc(ir.exprs.NodeId, 1);
+    none_selectors[0] = none_pat;
+    const ir_arms = try alloc.alloc(ir.exprs.MatchArm, 2);
+    ir_arms[0] = .{
+        .patterns = some_selectors,
+        .guard = null,
+        .body = try model.e(litInt(1)),
+    };
+    ir_arms[1] = .{
+        .patterns = none_selectors,
+        .guard = null,
+        .body = try model.e(litInt(0)),
+    };
+    const match_expr = try model.e(.{ .match = .{
+        .scrutinee = scrutinee,
+        .arms = ir_arms,
+        .option_scrutinee = false,
+    } });
+    const body = try model.e(.{
+        .block = .{ .statements = &.{}, .tail = match_expr, .labelled = null },
+    });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const params = try alloc.alloc(ir.items.Param, 1);
+    params[0] = .{
+        .name = "x",
+        .ty = if (is_option) option_u8_ty else u8_ty,
+        .span = span,
+    };
+    body_rows[fn_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u8_ty,
+        .generic_params = &.{},
+        .body = body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "match_runtime_fixture",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+test "lower: a match on an Option imports the runtime its payload read-back names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try lowerMatchRuntimeFixture(alloc, .option_payload);
+    try std.testing.expectEqual(@as(usize, 1), pkg.files.len);
+    const file = pkg.files[0];
+    const source = try emit.emitFile(alloc, &file);
+
+    // The `Some` arm reads the payload back through the runtime ...
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.option.unwrap") != null);
+    // ... so the file has to bind that module. Naming `r2z.` without this
+    // import is exactly the `use of undeclared identifier 'r2z'` that made
+    // a correct nine-line crate fail to build.
+    try std.testing.expectEqual(@as(usize, 1), runtimeImportCount(file));
+    try std.testing.expect(std.mem.indexOf(u8, source, runtime_import_line) != null);
+}
+
+test "lower: a wildcard Some arm on an Option does not import the r2z runtime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `Some(_)` reads no payload, so the optional branch runs without ever
+    // naming the runtime. The mark belongs to the payload read-back, not to
+    // the `Some`/`None` desugaring as a whole.
+    const pkg = try lowerMatchRuntimeFixture(alloc, .option_wildcard);
+    try std.testing.expectEqual(@as(usize, 1), pkg.files.len);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.") == null);
+    try std.testing.expectEqual(@as(usize, 0), runtimeImportCount(pkg.files[0]));
+}
+
+test "lower: a match on a plain integer does not import the r2z runtime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The scrutinee is `u8`, so `option_name` stays null and the whole
+    // optional lowering — including the payload read-back that carries the
+    // import — is skipped.
+    const pkg = try lowerMatchRuntimeFixture(alloc, .plain_int);
+    try std.testing.expectEqual(@as(usize, 1), pkg.files.len);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.") == null);
+    try std.testing.expectEqual(@as(usize, 0), runtimeImportCount(pkg.files[0]));
+}
+
+// ── Match guards ──────────────────────────────────────────────────────────────
+
+/// Which `match` shape the guard fixtures lower.
+const GuardMatchFixture = enum {
+    /// `match x { Some(v) if v <= n => v, _ => n }` over `Option<u8>`. The
+    /// guard reads the payload its own arm binds, so the `r2z` read-back has
+    /// to sit outside the test for `v` to be in scope when it runs.
+    option_payload,
+    /// `match x { 0 if x == 0 => 1, _ => 2 }` over `u8`. Not an optional, so
+    /// the optional lowering is not involved at all.
+    plain,
+};
+
+/// Lower a one-function crate whose body is a single guarded `match` and
+/// return the package.
+fn lowerGuardMatchFixture(
+    alloc: std.mem.Allocator,
+    fixture: GuardMatchFixture,
+) !ast.Package {
+    const is_option = fixture == .option_payload;
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const fn_id = try addLowerEntity(&graph, .fn_, "classify", null);
+    const x_id = try addLowerEntity(&graph, .field, "x", fn_id);
+    const n_id = try addLowerEntity(&graph, .field, "n", fn_id);
+    // The payload binding reaches the guard and the body as an ordinary path,
+    // the same way `if let Some(v) = x` hands `v` to its then-branch.
+    const v_id = try addLowerEntity(&graph, .const_, "v", null);
+    const some_id = try addLowerEntity(&graph, .variant, "Some", null);
+    _ = try addRootModule(&graph, .{
+        .crate_name = "match_guard_fixture",
+        .edition = 2021,
+        .items = &.{fn_id},
+    });
+
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const u8_cell = try alloc.create(ir.types.Type);
+    u8_cell.* = u8_ty;
+    const option_u8_ty: ir.types.Type = .{ .option = u8_cell };
+    // 0 = u8, 1 = Option<u8>, 2 = bool
+    const bool_ty: ir.types.Type = .{ .prim = .bool };
+    const types = [_]ir.types.Type{ u8_ty, option_u8_ty, bool_ty };
+
+    var model = Model.init(alloc);
+
+    const scrutinee = try model.e(.{ .path = .{ .def = x_id, .generic_args = &.{} } });
+    const scrutinee_ty: ir.spine.TypeId = if (is_option) 1 else 0;
+    model.exprs.items[scrutinee].ty = scrutinee_ty;
+
+    // The guard: `v <= n` on the optional, `x == 0` on the plain match.
+    const guard_operand = if (is_option) v_id else x_id;
+    const guard_lhs = try model.e(.{ .path = .{ .def = guard_operand, .generic_args = &.{} } });
+    model.exprs.items[guard_lhs].ty = 0;
+    const guard_rhs = if (is_option)
+        try model.e(.{ .path = .{ .def = n_id, .generic_args = &.{} } })
+    else
+        try model.e(litInt(0));
+    model.exprs.items[guard_rhs].ty = 0;
+    const guard = try model.e(.{ .binary = .{
+        .op = if (is_option) .le else .eq,
+        .lhs = guard_lhs,
+        .rhs = guard_rhs,
+        .overflow = .checked,
+    } });
+    model.exprs.items[guard].ty = 2;
+
+    const payload = try model.pat(.{ .binding = .{
+        .name = "v",
+        .mode = .{ .value = {} },
+        .mutable = false,
+    } });
+    const some_fields = try alloc.alloc(ir.exprs.FieldPat, 1);
+    some_fields[0] = .{ .field = "0", .pat = payload, .shorthand = true };
+    const guarded_pat = if (is_option)
+        try model.pat(.{ .struct_pat = .{
+            .def = some_id,
+            .fields = some_fields,
+            .rest = false,
+        } })
+    else
+        try model.pat(.{ .literal = .{
+            .int = .{ .text = "", .value = 0, .base = .dec, .ty_suffix = null },
+        } });
+    const fallback_pat = try model.pat(.wildcard);
+
+    const guarded_selectors = try alloc.alloc(ir.exprs.NodeId, 1);
+    guarded_selectors[0] = guarded_pat;
+    const fallback_selectors = try alloc.alloc(ir.exprs.NodeId, 1);
+    fallback_selectors[0] = fallback_pat;
+
+    const guarded_value = if (is_option)
+        try model.e(.{ .path = .{ .def = v_id, .generic_args = &.{} } })
+    else
+        try model.e(litInt(1));
+    model.exprs.items[guarded_value].ty = 0;
+    const fallback_value = try model.e(litInt(if (is_option) 7 else 2));
+    model.exprs.items[fallback_value].ty = 0;
+
+    const ir_arms = try alloc.alloc(ir.exprs.MatchArm, 2);
+    ir_arms[0] = .{
+        .patterns = guarded_selectors,
+        .guard = guard,
+        .body = guarded_value,
+    };
+    ir_arms[1] = .{
+        .patterns = fallback_selectors,
+        .guard = null,
+        .body = fallback_value,
+    };
+    const match_expr = try model.e(.{ .match = .{
+        .scrutinee = scrutinee,
+        .arms = ir_arms,
+        .option_scrutinee = false,
+    } });
+    model.exprs.items[match_expr].ty = 0;
+    const body = try model.e(.{
+        .block = .{ .statements = &.{}, .tail = match_expr, .labelled = null },
+    });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const params = try alloc.alloc(ir.items.Param, 2);
+    params[0] = .{
+        .name = "x",
+        .ty = if (is_option) option_u8_ty else u8_ty,
+        .span = span,
+    };
+    params[1] = .{ .name = "n", .ty = u8_ty, .span = span };
+    body_rows[fn_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u8_ty,
+        .generic_params = &.{},
+        .body = body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "match_guard_fixture",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The single `match` a fixture lowers, with the `Option` wrapper peeled off
+/// so a test can read the switch itself.
+fn fixtureMatchExpr(file: ast.File) !ast.Match {
+    for (file.decls) |decl| {
+        if (decl != .fn_decl) continue;
+        const fn_body = decl.fn_decl.body orelse return error.ExpectedFunctionBody;
+        const tail = (fn_body.expr orelse return error.ExpectedFunctionTail).*;
+        return switch (tail) {
+            .match_expr => |value| value,
+            // The `Option` fixtures wrap the switch in the block that binds
+            // the optional subject.
+            .block => |block| switch ((block.expr orelse return error.ExpectedFunctionTail).*) {
+                .match_expr => |value| value,
+                else => return error.ExpectedMatchBody,
+            },
+            else => return error.ExpectedMatchBody,
+        };
+    }
+    return error.ExpectedMatchFunction;
+}
+
+/// The integer a lowered arm body or branch evaluates to. Switch captures
+/// take the payload by value, so no field access has to guess at
+/// pointer-versus-value on a union.
+fn expectIntBody(body: ast.Expr) !i128 {
+    const literal = switch (body) {
+        .lit => |value| value,
+        else => return error.ExpectedIntBody,
+    };
+    return switch (literal) {
+        .int => |value| value,
+        else => return error.ExpectedIntBody,
+    };
+}
+
+fn expectIdent(body: ast.Expr) ![]const u8 {
+    return switch (body) {
+        .ident => |name| name,
+        else => return error.ExpectedIdent,
+    };
+}
+
+fn expectBlock(body: ast.Expr) !ast.Block {
+    return switch (body) {
+        .block => |value| value,
+        else => return error.ExpectedPayloadBlock,
+    };
+}
+
+fn expectMatch(body: ast.Expr) !ast.Match {
+    return switch (body) {
+        .match_expr => |value| value,
+        else => return error.ExpectedMatchBody,
+    };
+}
+
+fn expectBinOp(body: ast.Expr) !ast.BinOp {
+    return switch (body) {
+        .bin_op => |value| value,
+        else => return error.ExpectedGuardCondition,
+    };
+}
+
+/// The `if (guard) .. else ..` a guarded arm's value becomes.
+fn expectGuardedValue(body: ast.Expr) !ast.IfExpr {
+    return switch (body) {
+        .if_expr => |value| value,
+        else => return error.ExpectedGuardedValue,
+    };
+}
+
+test "lower: a true match guard takes the guarded arm" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try lowerGuardMatchFixture(alloc, .option_payload);
+    const match_expr = try fixtureMatchExpr(pkg.files[0]);
+    try std.testing.expectEqual(@as(usize, 2), match_expr.arms.len);
+
+    // `Some(v)` still lowers to the `true` prong of the optional test.
+    const some_literal = switch (match_expr.arms[0].patterns[0]) {
+        .lit => |value| value,
+        else => return error.ExpectedSomeProng,
+    };
+    try std.testing.expect(switch (some_literal) {
+        .bool_lit => |value| value,
+        else => return error.ExpectedSomeProng,
+    });
+
+    // The payload read-back wraps the guarded value, so `v` is already bound
+    // when the condition runs.
+    const payload_block = try expectBlock(match_expr.arms[0].body);
+    try std.testing.expectEqual(@as(usize, 1), payload_block.stmts.len);
+    const readback = switch (payload_block.stmts[0].let_stmt.init) {
+        .call => |value| value,
+        else => return error.ExpectedPayloadReadBack,
+    };
+    try std.testing.expectEqualStrings("r2z.option.unwrap", try expectIdent(readback.callee.*));
+
+    const guarded = try expectGuardedValue(payload_block.expr.?.*);
+    const condition = try expectBinOp(guarded.cond.*);
+    try std.testing.expectEqual(ast.BinOpKind.less_than_equal, condition.op);
+    try std.testing.expectEqualStrings("v", try expectIdent(condition.lhs.*));
+    // The true branch is the guarded arm's own body, and nothing else.
+    try std.testing.expectEqualStrings("v", try expectIdent(guarded.then_body.*));
+}
+
+test "lower: a false match guard falls through to the next arm" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try lowerGuardMatchFixture(alloc, .option_payload);
+    const match_expr = try fixtureMatchExpr(pkg.files[0]);
+    const payload_block = try expectBlock(match_expr.arms[0].body);
+    const guarded = try expectGuardedValue(payload_block.expr.?.*);
+
+    // A false guard re-runs the match over the arms that are left, so the
+    // next candidate is reached instead of the arm being refused.
+    const else_expr = guarded.else_body orelse return error.ExpectedGuardFallThrough;
+    const tail = try expectMatch(else_expr.*);
+    try std.testing.expectEqual(@as(usize, 1), tail.arms.len);
+    if (tail.arms[0].patterns[0] != .wildcard) return error.ExpectedFallbackProng;
+    try std.testing.expectEqual(@as(i128, 7), try expectIntBody(tail.arms[0].body));
+
+    // The tail re-tests the same optional binding, so the fall-through sees
+    // the value the outer switch saw rather than a fresh subject.
+    const outer = try expectBinOp(match_expr.target.*);
+    const inner = try expectBinOp(tail.target.*);
+    try std.testing.expectEqualStrings(
+        try expectIdent(outer.lhs.*),
+        try expectIdent(inner.lhs.*),
+    );
+}
+
+test "lower: a match guard on a plain integer falls through to the next arm" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The scrutinee is `u8`, so no optional lowering wraps the prong and the
+    // guarded value is the `if` itself.
+    const pkg = try lowerGuardMatchFixture(alloc, .plain);
+    const match_expr = try fixtureMatchExpr(pkg.files[0]);
+    try std.testing.expectEqual(@as(usize, 2), match_expr.arms.len);
+    try std.testing.expectEqualStrings("x", try expectIdent(match_expr.target.*));
+
+    const guarded = try expectGuardedValue(match_expr.arms[0].body);
+    const condition = try expectBinOp(guarded.cond.*);
+    try std.testing.expectEqual(ast.BinOpKind.equal, condition.op);
+    try std.testing.expectEqual(@as(i128, 1), try expectIntBody(guarded.then_body.*));
+
+    const else_expr = guarded.else_body orelse return error.ExpectedGuardFallThrough;
+    const tail = try expectMatch(else_expr.*);
+    try std.testing.expectEqual(@as(usize, 1), tail.arms.len);
+    if (tail.arms[0].patterns[0] != .wildcard) return error.ExpectedFallbackProng;
+    try std.testing.expectEqual(@as(i128, 2), try expectIntBody(tail.arms[0].body));
+}
+
+test "lower: a match without a guard keeps its plain switch shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The recursive arm lowering must not put an `if` around an arm that
+    // carries no guard: the common case has to come out exactly as it did
+    // before the guards were implemented.
+    const pkg = try lowerMatchRuntimeFixture(alloc, .plain_int);
+    const match_expr = try fixtureMatchExpr(pkg.files[0]);
+    try std.testing.expectEqual(@as(usize, 2), match_expr.arms.len);
+    try std.testing.expectEqualStrings("x", try expectIdent(match_expr.target.*));
+    if (match_expr.arms[0].patterns[0] != .lit) return error.ExpectedLiteralProng;
+    try std.testing.expectEqual(@as(i128, 1), try expectIntBody(match_expr.arms[0].body));
+    if (match_expr.arms[1].patterns[0] != .wildcard) return error.ExpectedFallbackProng;
+    try std.testing.expectEqual(@as(i128, 0), try expectIntBody(match_expr.arms[1].body));
 }

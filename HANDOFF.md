@@ -28,6 +28,11 @@ Older sidecar JSON is diagnostic inventory for `--dump model` only, never transl
 | `tools/zig-pinned.sh test-e2e` | blocked by the `hex` fixture, see item 2 |
 | `gate` (devenv shell) | not run — `test-e2e` is red while `hex` is incomplete |
 
+The counts above were measured before the round 2 work. `FIXING-ROUND-2.md` carries the latest
+measured suite: **695/704 passing**, 9 failing — the same 8 toolchain miscompilations plus
+`hex` — with `test-crates` green at 86/86. Anything measured after that date lives in
+`FIXING-ROUND-2.md` or `FIXING-ROUND-3.md`, not here.
+
 ### Triage: 23 failures down to 9, and all 9 are accounted for
 
 The tree is **not** green, but what is left is now almost entirely *not ours*.
@@ -119,15 +124,19 @@ the anyzig shim on this host regardless — see **Working notes**.
 
 ### Coverage
 
-Translate end to end: `mini`, `fnv`, `compat`, `wyhash`, `adler`, `multimod`, `xxhash-rust`.
-`hex` is **not** on that list today — see the open blocker above.
+Translate end to end today: `mini`, `fnv`, `compat`, `wyhash`, `adler`, `multimod`,
+`xxhash-rust`, plus the canonical v6 `mini` wire fixture. The end-to-end matrix in
+`test/e2e_test.zig` requires **eight** source fixtures — those seven plus `hex` — and as of the
+last measurement (`FIXING-ROUND-2.md`, 2026-09-30) `hex` still refuses, so `test-e2e` and the
+gate are red on `hex` alone.
 
 `wyhash` (2 vectors / 9 assertions), `adler` (5 vectors), `fnv` (203 assertions) all execute their
 translated tests under the generated package's own `zig build test`.
 
-`multimod` is source-analysis coverage only: `src/frontend/pipeline.zig` asserts its module tree
-(`mod foo;`, two-level `mod bar;` inside `foo.rs`, and `#[path = "..."]` resolution). It is not in
-the end-to-end matrix.
+`multimod` is in the end-to-end matrix: `test/e2e_test.zig` requires it to translate into four
+files (`src/root.zig`, `src/foo.zig`, `src/foo/bar.zig`, `src/custom_pub.zig`) and
+`src/frontend/pipeline.zig` asserts its module tree (`mod foo;`, two-level `mod bar;` inside
+`foo.rs`, and `#[path = "..."]` resolution). Nothing else in the suite lowers or emits it.
 
 Reject by macro source: `fletcher` (`ExternalMacroSourceUnavailable`), `crc16`
 (`BuildScriptArtifactUnavailable`). Reject by wire: the legacy `fnv.json` and
@@ -174,10 +183,11 @@ translation fixtures (plus `missing` as a declared rejection) and compares byte 
 printing the actual payload on mismatch. There is **no** auto-update mode, so a fixture with
 no generator is hand-updated from the dumped output.
 
-Regenerators that exist: `zig build generate-mini-wire`, `zig build generate-fnv-golden`,
-`zig build generate-hex-golden`. The stale-golden pass described under **Open** above is adding
-one per remaining fixture, because hand-editing those snapshots is exactly what this file
-warns against.
+Regenerators that exist, one per fixture plus the wire file: `zig build generate-mini-wire`,
+`generate-mini-golden`, `generate-fnv-golden`, `generate-compat-golden`,
+`generate-wyhash-golden`, `generate-adler-golden`, `generate-multimod-golden` and
+`generate-hex-golden`. This file used to list three of them and call the rest "being added";
+they are all in `build.zig` now. Hand-editing those snapshots is what this file warns against.
 
 ## Recent work (committed as `xpwlyywn` and its ancestors)
 
@@ -251,6 +261,78 @@ precedence demands it, via `needsOperandParens`. Snapshots taken before that pol
 landed show `return (seed ^ P0);` where the current emitter produces `return seed ^ P0;`.
 Again: regenerate, never hand-edit a snapshot to match.
 
+## Round 3, measured 2026-09-30 — wrong output, not depth
+
+Read this beside the list under **Next step**, which describes capability gaps at the
+*first* error. The crate metric has not moved once in three rounds: 146 crates catalogued
+across three batches, **zero cleared**. The other metric has. `FIXING-ROUND-3.md` counts
+**eleven real wrong-output bugs** found and fixed by the round 1–2 probe sweeps, against none in
+the crate net — round 2's 197-probe sweep alone re-ran round 1's four and added one silent
+wrong value plus ten accepted shapes that emit Zig which cannot compile. Round 3's headline
+find, below, is one more of the same class. The measurements live in `FIXING-ROUND.md`,
+`FIXING-ROUND-2.md` and `FIXING-ROUND-3.md`; what follows is only what the tree looks like
+afterwards. All of it is uncommitted in the working copy as of this date.
+
+**1. `match` on an `Option` emitted a package that could not build.** This is the widest reach
+of anything found in three rounds, because `match` on an `Option` is one of the most common
+shapes in Rust and every occurrence produced broken output:
+
+```rust
+pub fn f(x: Option<u8>) -> u8 { match x { Some(v) => v, None => 0 } }
+```
+
+`lowerOptionalMatchArm` (`lower.zig:10809`) emits `r2z.option.unwrap` (`lower.zig:10858`), and
+the `.match` arm of `lowerExpr` (`lower.zig:11206`) never called `markRuntimeImport()`, while
+the sibling `.if_let` arm did (`lower.zig:11180`). **The asymmetry is the bug:** the emitted
+file named `r2z.` with an empty import list, and `zig build` answered `use of undeclared
+identifier 'r2z'`. Three rounds of layer-peeling missed it because it is not a refusal —
+translation *succeeded*. It was found only by hand-compiling the emitted output. Fixed on the
+payload path alone (`lower.zig:10854`), because a `Some(_)` arm and an irrefutable binding emit
+no runtime call; pinned by the `Match and the r2z runtime import` group in `lower_test.zig`
+(from `lower_test.zig:12038`).
+
+**2. `match` arm guards were refused outright.** `error.UnsupportedMatchGuard` fired on any
+guarded arm (`lower.zig:11084` when it was measured) even though the frontend lowers the guard
+faithfully — `lowerMatch` in `src/frontend/ts_ext.zig` reads the `condition` field of
+`match_pattern` — and the IR carries `MatchArm.guard` through five layers: `exprs.zig:251`,
+`validate.zig:2164`, `serialize.zig:4274`, `monomorphize.zig:615`, `infer.zig:1151`. The
+identifier is gone from the tree. A guarded arm now lowers to
+`pat => if (guard) { body } else { <the remaining arms, one shorter> }`, which Rust's
+exhaustiveness rule makes a legal switch on its own (`lowerMatchArms`, `lower.zig:10904`;
+`expandGuardedMatchArm`, `lower.zig:10981`); pinned by the four guard tests from
+`lower_test.zig:12464`. **Do not desugar guards in the frontend**: it would leave
+`MatchArm.guard` dead in the IR and contradict the four other layers that carry it.
+
+**3. A first-pass build failure printed nothing.** `promoteWithHooks` reported the captured
+compiler output only on the second pass (`package.zig:920`); the first pass fell out through
+`resolveFingerprint` returning null (`package.zig:941`) and reached the user as a bare
+`GeneratedPackageBuildFailed` with no message. Every failure path now calls the report hook,
+and the hook prints stdout, then stderr, then a named line when neither stream carried anything
+(`printBuildFailure`, `package.zig:837`). No error value changed — callers still match
+`error.GeneratedPackageBuildFailed`. Pinned by four tests from `package.zig:1889`, including one
+that a passing build reports nothing.
+
+This one cost real time, and it is worth more than the fix. A whole class of defect in this
+project is *silent*: the translator reports success and emits Zig that does not compile. Probe
+cycles went into reconstructing messages that existed and were thrown away. A silent-emission
+bug now costs one cycle instead of five.
+
+**4. Smallness is not reachability.** Round 3 fetched 26 of the smallest dependency-free crates
+available on the theory that crate size is the cost driver, and every finalist that looked ideal
+by size was a deep chain wearing a short first error: `defer` at 60 lines needs `$crate`,
+`impl Drop`, `ManuallyDrop` and a struct declared inside a generic fn; `fnvhash` at 87 is built
+on `std::collections::hash_state`, an API removed from Rust; `unreachable` at 77 needs an
+unresolvable dependency plus four more links; `wrapping` at 82 has zero tests, so a translated
+package would be a weak regression test. The full table is in `FIXING-ROUND-3.md`.
+
+**5. The raise SITES are few even though the crates are many.** About twenty sites account for
+every rejection across the corpus, and the smallest crate at several of them is under 200 lines.
+That is why the size hypothesis was worth testing at all, even though it failed.
+
+The round's target crate, `const-fnv1a-hash` (101 lines), had not landed when this was written —
+there is no such fixture under `test/crates/`. The crate metric is therefore still **2 of 112**
+unique crates, and nothing above should be read as a crate having cleared.
+
 ## Next step
 
 **The backlog below is re-derived from a measurement, not from memory.** Every error was
@@ -298,8 +380,8 @@ these is a defect; all are capability gaps, and the last is a decision rather th
 
    Four crates, four fixes: no single predicate clears two of them. `syn` is deliberately
    not pinned — it is ~64k lines of Rust and was not measured. Note that this measurement
-   was only possible after the `package.zig` fix below; before it, the driver failed with
-   `DependencySourceUnavailable` for every crate.
+   was only possible after the `package.zig` `workspaceCoreAbsolute` fix in **Triage** above;
+   before it, the driver failed with `DependencySourceUnavailable` for every crate.
 3. **Nested `fn` declared inside a `#[test] fn` is still unsupported.** adler's `bufread` test
    relies on it and is also `cfg(feature = "std")`-gated, so it never surfaced. The missing piece
    is where a nested item lives in the emitted module, not the lowering itself.

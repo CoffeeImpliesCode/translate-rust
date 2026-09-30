@@ -3399,8 +3399,29 @@ fn knownCastOperandType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
             }
             break :blk null;
         },
+        // A core call's result is fixed by the function and its type
+        // arguments, not by the values it is applied to, so the frontend can
+        // answer this before inference runs. Without it a local bound to a
+        // core call has no type here, and everything downstream of an index
+        // into it — an array literal above all, which the Zig AST can only
+        // emit with a named element type — is left untyped.
+        .core_call => |call| coreCallResultType(call),
         else => null,
     };
+}
+
+/// The type a core call yields where its function and type arguments alone
+/// decide it. These are the same rules `infer.knownCoreCallType` applies, so
+/// the two passes cannot disagree; the remaining core functions depend on
+/// value arguments only inference can see, and stay unknown here.
+fn coreCallResultType(call: exprs.CoreCall) ?types.Type {
+    const result: ?types.Type = switch (call.function) {
+        .mem_transmute => if (call.generic_args.len == 2) call.generic_args[1] else null,
+        .default_value, .convert_from => if (call.generic_args.len == 1) call.generic_args[0] else null,
+        .mem_size_of, .mem_size_of_val => .{ .prim = .usize },
+        else => null,
+    };
+    return result;
 }
 
 fn pendingCastSourceType() types.Type {
@@ -3439,6 +3460,104 @@ fn appendPrimitiveFrom(
     } });
     e.ctx.exprs.items[cast].ty = target;
     return cast;
+}
+
+/// The byte width of an integer's native-endian byte image, or null for a
+/// type that has no fixed one. `usize` / `isize` are excluded on purpose:
+/// their image is as wide as the target pointer, which no IR type can name
+/// until monomorphization has picked one.
+fn nativeEndianByteWidth(primitive: types.Prim) ?u64 {
+    return switch (primitive) {
+        .i8, .u8 => 1,
+        .i16, .u16 => 2,
+        .i32, .u32 => 4,
+        .i64, .u64 => 8,
+        .i128, .u128 => 16,
+        else => null,
+    };
+}
+
+/// `[u8; N]`, the array an integer's native-endian byte image is written as.
+fn nativeEndianByteArray(e: *Ext, primitive: types.Prim) ?types.Type {
+    const width = nativeEndianByteWidth(primitive) orelse return null;
+    const array = e.ctx.alloc.create(types.Array) catch return null;
+    array.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = width } };
+    return .{ .array = array };
+}
+
+/// `core::mem::transmute` between an integer and the same value's bytes.
+/// `generic_args[0]` is the parameter and `generic_args[1]` the result, the
+/// order the runtime reads them in — which is the order Rust's own
+/// `transmute::<Src, Dst>` already spells, so no reordering happens here.
+fn appendNativeEndianTransmute(
+    e: *Ext,
+    parameter: types.Type,
+    result: types.Type,
+    operand: exprs.NodeId,
+) anyerror!exprs.NodeId {
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 2);
+    generic_args[0] = parameter;
+    generic_args[1] = result;
+    const args = try e.ctx.alloc.alloc(exprs.NodeId, 1);
+    args[0] = operand;
+    return appendExpr(e, .{ .core_call = .{
+        .function = .mem_transmute,
+        .generic_args = generic_args,
+        .args = args,
+    } });
+}
+
+/// The integer a receiver expression holds, looking through one reference
+/// layer because Rust's method call auto-derefs its receiver.
+fn integerReceiverType(ty: types.Type) ?types.Prim {
+    return switch (ty) {
+        .prim => |primitive| primitive,
+        .reference => |reference| switch (reference.pointee) {
+            .prim => |primitive| primitive,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// `receiver.to_ne_bytes()`, or null when this call is anything else.
+///
+/// The method is settled here rather than left to method dispatch because its
+/// result is an ARRAY, not a number: no numeric method names it, and the
+/// dispatch table keys on the receiver's primitive, so the spelling reaches
+/// the backend as an unresolvable call. The runtime's `memory.transmute` is
+/// already the operation — it copies the value's own bytes with `@memcpy`,
+/// which is native-endian by construction — so `to_ne_bytes` and its inverse
+/// are one core call each rather than a new runtime entry.
+fn appendToNeBytes(e: *Ext, receiver: exprs.NodeId) anyerror!?exprs.NodeId {
+    const declared = knownCastOperandType(e, receiver) orelse return null;
+    const primitive = integerReceiverType(declared) orelse return null;
+    const bytes = nativeEndianByteArray(e, primitive) orelse return null;
+    const operand = if (declared == .reference)
+        try appendExpr(e, .{ .unary = .{ .op = .deref, .operand = receiver } })
+    else
+        receiver;
+    return try appendNativeEndianTransmute(e, .{ .prim = primitive }, bytes, operand);
+}
+
+/// `u16::from_ne_bytes`, the associated-function spelling of the same bytes.
+fn primitiveFromNeBytesTarget(raw: []const u8) ?types.Prim {
+    const suffix = "::from_ne_bytes";
+    if (!std.mem.endsWith(u8, raw, suffix)) return null;
+    const primitive = mapPrim(raw[0 .. raw.len - suffix.len]) orelse return null;
+    return if (nativeEndianByteWidth(primitive) != null) primitive else null;
+}
+
+fn appendPrimitiveFromNeBytes(
+    e: *Ext,
+    target_primitive: types.Prim,
+    args: []const exprs.NodeId,
+) anyerror!exprs.NodeId {
+    defer e.ctx.alloc.free(args);
+    if (args.len != 1) return unsupported(e, "primitive from_ne_bytes call");
+    const bytes = nativeEndianByteArray(e, target_primitive) orelse
+        return unsupported(e, "primitive from_ne_bytes call");
+    return appendNativeEndianTransmute(e, bytes, .{ .prim = target_primitive }, args[0]);
 }
 fn primitiveTryFromTarget(raw: []const u8) ?types.Prim {
     const suffix = "::try_from";
@@ -6031,6 +6150,14 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 .rhs = rhs,
             } });
         }
+
+        // Rust `x.to_ne_bytes()` → the runtime's native-endian transmute.
+        if (std.mem.eql(u8, mname, "to_ne_bytes") and generic_args.len == 0 and
+            iteratorArgumentsEmpty(call_args))
+        {
+            if (try appendToNeBytes(e, try lowerExpr(e, recv))) |bytes| return bytes;
+        }
+
         const method_def = try pushMethodRef(e, mname);
         const args = try lowerArgs(e, call_args);
         // The turbofish on `recv.method::<T>(..)` is the callee's own, so it is
@@ -6089,6 +6216,13 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 return unsupported(e, "primitive from call");
             }
             return appendPrimitiveFrom(e, target_primitive, args);
+        }
+        if (primitiveFromNeBytesTarget(t)) |target_primitive| {
+            if (generic_args.len != 0) {
+                e.ctx.alloc.free(args);
+                return unsupported(e, "primitive from_ne_bytes call");
+            }
+            return appendPrimitiveFromNeBytes(e, target_primitive, args);
         }
         if (try traitMethodForPath(e, callee_base)) |method| {
             return appendGenericCall(e, .{ .associated = method }, args, generic_args);

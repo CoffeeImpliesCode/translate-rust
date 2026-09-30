@@ -5029,6 +5029,12 @@ const NominalContext = struct {
     params: []const types.GenericParam = &.{},
     outer_names: []const []const u8 = &.{},
     outer_params: []const types.GenericParam = &.{},
+    /// Third scope, for a signature written inside two owners. A method that
+    /// `finalizePendingImpls` re-parents onto a struct is written inside the
+    /// struct and inside the `impl` it came from, so both bind names there.
+    /// Kept apart from `outer_*` so neither scope has to displace the other.
+    impl_names: []const []const u8 = &.{},
+    impl_params: []const types.GenericParam = &.{},
     implicit_self: bool = false,
     self_entity: ?spine.EntityId = null,
 };
@@ -5123,6 +5129,41 @@ fn nominalOwnerContext(
     }
     return error.InvalidParent;
 }
+
+/// The generic context an owning `impl` lends to a method re-parented onto
+/// its target's `StructBody.methods`.
+///
+/// `finalizePendingImpls` copies an impl's method onto the target struct
+/// without carrying the impl's generics across, so `impl<'a, T, I> From<I>
+/// for Wrapping<'a, T>` leaves `from`'s parameter `I` with no in-scope name
+/// even though the frontend bound it. The method's own `fn_` entity still has
+/// the impl as its parent, so the impl is recovered by matching that entity's
+/// name against the `fn_` children of the impls parented to `owner` — the
+/// same name `finalizePendingImpls` itself matches on when it appends.
+///
+/// Two impls on one struct declaring a method of the same name is ambiguous,
+/// and yields an empty context: taking either impl's parameters would admit a
+/// name the method does not bind.
+fn nominalImplMethodGenericContext(
+    environment: NominalEnvironment,
+    owner: spine.EntityId,
+    method_name: []const u8,
+) !NominalContext {
+    const entities = environment.entities;
+    var method_entity: ?spine.EntityId = null;
+    for (entities, 0..) |candidate, index| {
+        if (candidate.kind != .fn_) continue;
+        if (!std.mem.eql(u8, candidate.name, method_name)) continue;
+        const impl_id = candidate.parent orelse continue;
+        if (@as(usize, impl_id) >= entities.len) continue;
+        if (entities[impl_id].kind != .impl_) continue;
+        if (entities[impl_id].parent == null or entities[impl_id].parent.? != owner) continue;
+        if (method_entity != null) return .{ .names = &.{} };
+        method_entity = @intCast(index);
+    }
+    const fn_entity = method_entity orelse return .{ .names = &.{} };
+    return nominalOwnerContext(environment, fn_entity);
+}
 fn nominalGenericCountForEntity(
     environment: NominalEnvironment,
     id: spine.EntityId,
@@ -5154,7 +5195,9 @@ fn nominalNameKnown(context: NominalContext, name: []const u8) bool {
         genericNameKnown(context.names, name) or
         nominalParamNameKnown(context.params, name) or
         genericNameKnown(context.outer_names, name) or
-        nominalParamNameKnown(context.outer_params, name);
+        nominalParamNameKnown(context.outer_params, name) or
+        genericNameKnown(context.impl_names, name) or
+        nominalParamNameKnown(context.impl_params, name);
 }
 fn nominalConcreteSelfEntity(environment: NominalEnvironment, ty: types.Type) ?spine.EntityId {
     const candidate: ?spine.EntityId = switch (ty) {
@@ -5527,11 +5570,16 @@ fn validateNominalGenericsContext(
     generics: types.Generics,
     outer: NominalContext,
 ) !void {
+    // Every scope the outer binds is carried in, so a bound or where clause
+    // resolves against the same owners the declaration's signature is written
+    // in — a re-parented method's bounds reach the impl it came from.
     const context: NominalContext = .{
         .names = &.{},
         .params = generics.params,
         .outer_names = outer.names,
         .outer_params = outer.params,
+        .impl_names = outer.impl_names,
+        .impl_params = outer.impl_params,
         .implicit_self = outer.implicit_self,
         .self_entity = outer.self_entity,
     };
@@ -5610,11 +5658,18 @@ fn validateNominalBody(
                     generics.params
                 else
                     &.{};
+                // A method re-parented onto the struct from an `impl` is
+                // written inside that impl as well, so the impl's parameters
+                // bind names in the signature the way the struct's own do.
+                const impl_context =
+                    try nominalImplMethodGenericContext(environment, owner, method.name);
                 const method_scope: NominalContext = .{
                     .names = method.generic_params,
                     .params = method_params,
                     .outer_names = struct_scope.names,
                     .outer_params = struct_scope.params,
+                    .impl_names = impl_context.names,
+                    .impl_params = impl_context.params,
                     .implicit_self = true,
                     .self_entity = owner,
                 };
@@ -5622,8 +5677,18 @@ fn validateNominalBody(
                     try validateNominalTypeContext(environment, param.ty, method_scope);
                 }
                 try validateNominalTypeContext(environment, method.ret, method_scope);
+                // A bound or where clause on the method is written in the same
+                // two owners as its signature, so it reads both scopes too.
+                const method_outer: NominalContext = .{
+                    .names = struct_scope.names,
+                    .params = struct_scope.params,
+                    .impl_names = impl_context.names,
+                    .impl_params = impl_context.params,
+                    .implicit_self = true,
+                    .self_entity = owner,
+                };
                 if (method.generics) |generics| {
-                    try validateNominalGenericsContext(environment, generics, struct_scope);
+                    try validateNominalGenericsContext(environment, generics, method_outer);
                 }
             }
         },
@@ -5748,12 +5813,20 @@ fn validateNominalBody(
             }
         },
         // The alias's own parameters are in scope in its target, so its
-        // id-free path segments resolve against them here too.
-        .type_alias => |alias_body| try validateNominalType(
-            environment,
-            alias_body.target,
-            alias_body.generic_params,
-        ),
+        // id-free path segments resolve against them here too. An associated
+        // type is an alias whose owner is an `impl`, and the impl binds the
+        // rest: `impl Deref for DropGuard<T, F> { type Target = T; }` declares
+        // no parameter of its own to name `T` with, so the owning scope is
+        // resolved alongside the alias's.
+        .type_alias => |alias_body| {
+            const owner_context = try nominalOwnerContext(environment, owner);
+            const alias_scope: NominalContext = .{
+                .names = alias_body.generic_params,
+                .outer_names = owner_context.names,
+                .outer_params = owner_context.params,
+            };
+            try validateNominalTypeContext(environment, alias_body.target, alias_scope);
+        },
     }
 }
 
@@ -6152,11 +6225,18 @@ fn validateNominalCoreCallsInBody(
                     generics.params
                 else
                     &.{};
+                const impl_context =
+                    try nominalImplMethodGenericContext(environment, owner, method.name);
                 const method_scope: NominalContext = .{
                     .names = method.generic_params,
                     .params = method_params,
                     .outer_names = struct_scope.names,
                     .outer_params = struct_scope.params,
+                    // The body of a method re-parented from an `impl` was
+                    // written inside that impl, so its core call generics read
+                    // that scope too.
+                    .impl_names = impl_context.names,
+                    .impl_params = impl_context.params,
                     .implicit_self = true,
                     .self_entity = owner,
                 };

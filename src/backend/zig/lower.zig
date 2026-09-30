@@ -6565,6 +6565,22 @@ const Lowerer = struct {
         return if (t) |ty| ty == .prim and (ty.prim == .f32 or ty.prim == .f64) else false;
     }
 
+    /// The type behind any run of references and raw pointers. An lvalue's
+    /// IR type is the pointer it is reached through, so an operator that has
+    /// to know the arithmetic type underneath it walks them off first.
+    fn peelPointers(t: ?ir.types.Type) ?ir.types.Type {
+        var current = t orelse return null;
+        for (0..128) |_| {
+            const next = switch (current) {
+                .reference => |reference| reference.pointee,
+                .raw_ptr => |raw_ptr| raw_ptr.pointee,
+                else => return current,
+            };
+            current = next;
+        }
+        return current;
+    }
+
     /// True for a resolved integer primitive type.
     fn isIntegerType(t: ?ir.types.Type) bool {
         const ty = t orelse return false;
@@ -8025,6 +8041,29 @@ const Lowerer = struct {
         } };
     }
 
+    /// Mark the runtime import when `ty` is a type name the strategy resolved
+    /// into the `r2z` namespace.
+    ///
+    /// `lowerRuntimeGenericExternalType` does this for the names lower.zig
+    /// builds itself, but a strategy can return an `r2z.` name on its own
+    /// (`DefaultStrategy.lowerStdGeneric` maps a type called `HashMap` with
+    /// three parameters to `r2z.collections.HashMap`) and it has no route to
+    /// the module bookkeeping — it only receives the `LoweringStrategy`
+    /// vtable, not the `Lowerer`. The mark therefore belongs at the call
+    /// site, on the same prefix test the two other name-to-runtime paths use.
+    ///
+    /// Only `.named` is checked: that is the form a strategy-built runtime
+    /// type takes. A `.generic` name still has to be marked by whoever built
+    /// it, since the parameters are where that lowering happens.
+    fn markRuntimeTypeImport(self: *Lowerer, ty: ast.Type) !void {
+        switch (ty) {
+            .named => |name| {
+                if (std.mem.startsWith(u8, name, "r2z.")) try self.markRuntimeImport();
+            },
+            else => {},
+        }
+    }
+
     fn lowerExternalNominal(
         self: *Lowerer,
         external: ir.types.ExternalNominal,
@@ -8392,6 +8431,7 @@ const Lowerer = struct {
                     return error.InvalidTypePath;
                 };
                 if (try self.strat.lowerStdGeneric(last_segment.name, &.{})) |std_ty| {
+                    try self.markRuntimeTypeImport(std_ty);
                     break :blk std_ty;
                 }
                 if (last_segment.id) |def| {
@@ -8423,6 +8463,7 @@ const Lowerer = struct {
                     return error.GenericArgumentArityMismatch;
                 }
                 if (try self.strat.lowerStdGeneric(decl_name, gi.args.params)) |std_ty| {
+                    try self.markRuntimeTypeImport(std_ty);
                     break :blk std_ty;
                 }
                 var params = try self.alloc.alloc(ast.Type, gi.args.params.len);
@@ -10844,6 +10885,14 @@ const Lowerer = struct {
         const initializer: ast.Expr = if (binds_whole_value)
             .{ .ident = target_name }
         else blk: {
+            // Zig has no optional destructuring, so the `Some(v)` payload is
+            // read back through the runtime. Without this the emitted file
+            // names `r2z.option.unwrap` while `imports` is empty, and the
+            // package fails to compile on `use of undeclared identifier
+            // 'r2z'`. Only the payload path emits the runtime call — a
+            // `Some(_)` arm and an irrefutable binding do not — so the mark
+            // belongs here and not at the top of the function.
+            try self.markRuntimeImport();
             const args = try self.alloc.alloc(ast.Expr, 1);
             args[0] = .{ .ident = target_name };
             break :blk .{ .call = .{
@@ -10858,6 +10907,140 @@ const Lowerer = struct {
             .is_mut = try astMutatesBinding(body, name, 0),
         } };
         return .{ .block = .{ .stmts = statements, .expr = try self.allocExpr(body) } };
+    }
+
+    /// The Zig switch subject a `match` lowers to.
+    ///
+    /// A guarded arm nests the remaining arms as a second switch, and each of
+    /// those needs its own subject node. The AST is a tree of arena pointers,
+    /// so sharing one would make it a DAG for no gain; a shallow copy is
+    /// enough because nothing rewrites a lowered expression in place.
+    fn matchSubject(
+        self: *Lowerer,
+        option_name: ?[]const u8,
+        scrutinee: *const ast.Expr,
+    ) anyerror!*const ast.Expr {
+        if (option_name) |name| return self.allocExpr(.{ .bin_op = .{
+            .op = .not_equal,
+            .lhs = try self.allocExpr(.{ .ident = name }),
+            .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+        } });
+        return self.allocExpr(scrutinee.*);
+    }
+
+    /// Lower `arms[from_index..]` as a self-contained Zig switch.
+    ///
+    /// A Zig prong has no guard form, so a guarded arm becomes
+    /// `pat => if (guard) { body } else { <this same switch, one arm shorter> }`.
+    /// Rust's exhaustiveness rule is what makes that tail a legal switch on
+    /// its own: a guarded arm contributes nothing to coverage, so dropping it
+    /// from the front leaves the covering set unchanged and the arms left
+    /// still cover every subject that can reach the tail. It also shows a
+    /// guard on the *last* arm is dead — the unguarded arms before it already
+    /// covered everything, so the switch never selects it — and such an arm
+    /// keeps its body rather than wrapping it around an empty switch.
+    ///
+    /// Recursion is bounded by the arm count: `from_index` only ever grows,
+    /// one step per guarded arm.
+    fn lowerMatchArms(
+        self: *Lowerer,
+        scrutinee: *const ast.Expr,
+        option_name: ?[]const u8,
+        arms: []const ir.exprs.MatchArm,
+        from_index: usize,
+    ) anyerror![]ast.MatchArm {
+        if (from_index >= arms.len) return self.alloc.alloc(ast.MatchArm, 0);
+        const lowered = try self.alloc.alloc(ast.MatchArm, arms.len - from_index);
+        for (arms[from_index..], 0..) |arm, index| {
+            if (arm.patterns.len == 0) return error.MissingMatchPattern;
+            if (arm.patterns.len > self.ir.bodies.pats.len) {
+                return error.MissingPatternNode;
+            }
+            const lowered_patterns = try self.lowerArmPatterns(arm.patterns);
+            const capture = try self.referenceMatchCapture(arm.patterns);
+            if (option_name != null and capture != null) return error.UnsupportedPattern;
+            if (capture != null) {
+                const selector = switch (lowered_patterns[0]) {
+                    .struct_pat => |pattern| pattern.name orelse return error.MissingPatternName,
+                    else => return error.UnsupportedPattern,
+                };
+                lowered_patterns[0] = .{ .enum_literal = selector };
+            }
+            var arm_shadow_names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer arm_shadow_names.deinit(self.alloc);
+            for (arm.patterns) |p_id| {
+                try self.appendPatternBindingName(p_id, &arm_shadow_names);
+            }
+            // A guard reads the bindings its own pattern introduces, so it is
+            // lowered under the same shadow scope as the body and lands inside
+            // the same prong, where those names are in scope.
+            const lowered_arm = arm_result: {
+                const previous_shadow_scope = self.current_shadow_scope;
+                var arm_shadow_scope: ShadowScope = .{
+                    .names = arm_shadow_names.items,
+                    .parent = previous_shadow_scope,
+                };
+                self.current_shadow_scope = &arm_shadow_scope;
+                defer self.current_shadow_scope = previous_shadow_scope;
+                break :arm_result .{
+                    .body = try self.lowerExpr(arm.body),
+                    .guard = if (arm.guard) |guard_id|
+                        try self.allocExpr(try self.lowerExpr(guard_id))
+                    else
+                        null,
+                };
+            };
+            // The guard wraps the body *before* `lowerOptionalMatchArm`, so the
+            // `Some(v)` payload read-back stays outside the test and `v` is
+            // already bound when the condition runs.
+            const guarded_body = if (lowered_arm.guard) |guard_condition|
+                try self.expandGuardedMatchArm(
+                    scrutinee,
+                    option_name,
+                    arms,
+                    from_index + index + 1,
+                    guard_condition,
+                    lowered_arm.body,
+                )
+            else
+                lowered_arm.body;
+            lowered[index] = .{
+                .patterns = lowered_patterns,
+                .body = if (option_name) |name|
+                    try self.lowerOptionalMatchArm(lowered_patterns, guarded_body, name)
+                else
+                    guarded_body,
+                .capture = capture,
+            };
+        }
+        return lowered;
+    }
+
+    /// Turn a guarded arm's value into `if (guard) body else <the arms after
+    /// it>`, so a false guard falls through to the next candidate instead of
+    /// being refused.
+    fn expandGuardedMatchArm(
+        self: *Lowerer,
+        scrutinee: *const ast.Expr,
+        option_name: ?[]const u8,
+        arms: []const ir.exprs.MatchArm,
+        from_index: usize,
+        guard_condition: *const ast.Expr,
+        body: ast.Expr,
+    ) anyerror!ast.Expr {
+        const tail = try self.lowerMatchArms(scrutinee, option_name, arms, from_index);
+        // Nothing left to try, so the guard can never be observed false.
+        // Wrapping the body anyway would nest an empty switch, which Zig
+        // rejects. See `lowerMatchArms`.
+        if (tail.len == 0) return body;
+        return .{ .if_expr = .{
+            .cond = guard_condition,
+            .then_body = try self.allocExpr(body),
+            .else_body = try self.allocExpr(.{ .match_expr = .{
+                .target = try self.matchSubject(option_name, scrutinee),
+                .arms = tail,
+            } }),
+        } };
     }
 
     /// The name an `if let P = ..` binds inside its then-branch.
@@ -11071,54 +11254,9 @@ const Lowerer = struct {
                 else
                     null;
                 if (me.arms.len == 0) return error.MissingMatchArm;
-                var arms = try self.alloc.alloc(ast.MatchArm, me.arms.len);
-                for (me.arms, 0..) |arm, i| {
-                    if (arm.guard != null) return error.UnsupportedMatchGuard;
-                    if (arm.patterns.len == 0) return error.MissingMatchPattern;
-                    if (arm.patterns.len > self.ir.bodies.pats.len) {
-                        return error.MissingPatternNode;
-                    }
-                    const lowered_patterns = try self.lowerArmPatterns(arm.patterns);
-                    const capture = try self.referenceMatchCapture(arm.patterns);
-                    if (option_name != null and capture != null) return error.UnsupportedPattern;
-                    if (capture != null) {
-                        const selector = switch (lowered_patterns[0]) {
-                            .struct_pat => |pattern| pattern.name orelse return error.MissingPatternName,
-                            else => return error.UnsupportedPattern,
-                        };
-                        lowered_patterns[0] = .{ .enum_literal = selector };
-                    }
-                    var arm_shadow_names: std.ArrayListUnmanaged([]const u8) = .empty;
-                    defer arm_shadow_names.deinit(self.alloc);
-                    for (arm.patterns) |p_id| {
-                        try self.appendPatternBindingName(p_id, &arm_shadow_names);
-                    }
-                    const body_expr = arm_body: {
-                        const previous_shadow_scope = self.current_shadow_scope;
-                        var arm_shadow_scope: ShadowScope = .{
-                            .names = arm_shadow_names.items,
-                            .parent = previous_shadow_scope,
-                        };
-                        self.current_shadow_scope = &arm_shadow_scope;
-                        defer self.current_shadow_scope = previous_shadow_scope;
-                        break :arm_body try self.lowerExpr(arm.body);
-                    };
-                    arms[i] = .{
-                        .patterns = lowered_patterns,
-                        .body = if (option_name) |name|
-                            try self.lowerOptionalMatchArm(lowered_patterns, body_expr, name)
-                        else
-                            body_expr,
-                        .capture = capture,
-                    };
-                }
                 const lowered_match: ast.Expr = .{ .match_expr = .{
-                    .target = if (option_name) |name| try self.allocExpr(.{ .bin_op = .{
-                        .op = .not_equal,
-                        .lhs = try self.allocExpr(.{ .ident = name }),
-                        .rhs = try self.allocExpr(.{ .lit = .null_lit }),
-                    } }) else target,
-                    .arms = arms,
+                    .target = try self.matchSubject(option_name, target),
+                    .arms = try self.lowerMatchArms(target, option_name, me.arms, 0),
                 } };
                 if (option_name) |name| {
                     const statements = try self.alloc.alloc(ast.Stmt, 1);
@@ -12680,17 +12818,29 @@ const Lowerer = struct {
                 } else return error.InvalidTypeTraversal;
             }
         }
-        // Rust has no wrapping compound-assignment operator — `t +%= x` does
-        // not parse — so a compound assignment has exactly one overflow mode:
-        // the checked one, which panics in a debug build. `ts_ext.zig` records
-        // `.wrapping` on every `AssignExpr` regardless, and keying the Zig
-        // operator off that field emitted `+%=`/`-%=`/`*%=` for every `+=` in
-        // every crate: `t += 4294967295; t += 2;` panics in a Rust debug build
-        // and returns 1 here, undetected in either gate mode. Clamp once, so
-        // the native operator and `r2z.ops.assign` agree.
-        // `wrapping_add` and friends are method calls, so they keep their `+%`
-        // on the binary path and are untouched by this clamp.
-        const overflow: ir.exprs.Overflow = .checked;
+        // DECISION — this package implements the Rust RELEASE profile, and
+        // the choice is not derivable from Rust's grammar. Rust has two
+        // overflow profiles and one spelling: under the default release
+        // profile `overflow-checks` is off, so `a + b`, `a += b`, `-` and
+        // `-=` all wrap; under debug all four panic. The binary path keys its
+        // Zig operator off `BinaryExpr.overflow`, which `ts_ext.zig` fills in
+        // as `.wrapping`, and `wrapping_add` and friends — which wrap under
+        // BOTH profiles, so they pin the choice to release — reach the backend
+        // as the same `.binary` node with the same `.wrapping`. Reading the
+        // field here therefore agrees with `a + b` by construction.
+        //
+        // Round 2 clamped this to `.checked` on the strength of Rust having
+        // no wrapping compound-assignment SPELLING (`t +%= x` does not parse).
+        // That is true and irrelevant: the absence of a spelling is not the
+        // absence of wrapping semantics, and the clamp left one Rust operation
+        // with two behaviours — `255u8 + 1` wrapped to 0 while `x += 1` on the
+        // same `u8` panicked — so the package matched neither profile.
+        // Clamping the binary path instead is not available here either:
+        // `ts_ext.zig` writes `.wrapping` on every `AssignExpr` and on every
+        // `BinaryExpr`, so nothing in the IR distinguishes `a + b` from
+        // `a.wrapping_add(b)` except the fact that only the former may be
+        // re-clamped.
+        const overflow = assignment.overflow;
         if (assignment.op != .plain and requiresRuntimeOperator(try self.exprType(assignment.target))) {
             const address: ast.Expr = .{ .unary_op = .{ .op = .addr_of, .operand = try self.allocExpr(target) } };
             return .{ .expr_stmt = try self.allocExpr(try self.lowerRuntimeOperator(
@@ -12707,11 +12857,22 @@ const Lowerer = struct {
             try self.lowerShiftAmount(value)
         else
             value;
+        // Zig spells the wrapping compound form for integers only — `f64 +%= f64`
+        // does not compile — so a float target keeps the plain operator, the
+        // same way `uses_float` keeps `a + b` on `.add`. Nothing else consults
+        // `wraps`: `.saturating` is the one IR mode Zig cannot spell as a
+        // compound assignment, `ts_ext.zig` never writes one onto an
+        // `AssignExpr`, and the trapping operator is its safe fallback.
+        const wraps = switch (assignment.op) {
+            .add, .sub, .mul => overflow == .wrapping and
+                !isFloatType(peelPointers(try self.exprType(assignment.target))),
+            else => false,
+        };
         const op: ast.AssignOp = switch (assignment.op) {
             .plain => .assign,
-            .add => .add_assign,
-            .sub => .sub_assign,
-            .mul => .mul_assign,
+            .add => if (wraps) .add_assign_wrap else .add_assign,
+            .sub => if (wraps) .sub_assign_wrap else .sub_assign,
+            .mul => if (wraps) .mul_assign_wrap else .mul_assign,
             .div => .div_assign,
             .rem => .mod_assign,
             .bit_and => .bit_and_assign,

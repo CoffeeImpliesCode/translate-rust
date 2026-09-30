@@ -615,3 +615,122 @@ test "`.rev()` over a range is still the chain direction adapter" {
         else => return error.ChainSourceIsNotARange,
     }
 }
+
+// ── native-endian integer byte images ──────────────────────────────────────
+
+/// The snippet's one core call, or null. Null for none and for more than one,
+/// so a snippet that fragments cannot pass by accident.
+fn onlyCoreCall(model: *const ir.RustIr) ?exprs.CoreCall {
+    var found: ?exprs.CoreCall = null;
+    for (model.bodies.exprs) |expression| {
+        switch (expression.kind) {
+            .core_call => |call| {
+                if (found != null) return null;
+                found = call;
+            },
+            else => {},
+        }
+    }
+    return found;
+}
+
+/// The snippet's one array-literal expression node, or null.
+fn onlyArrayLiteral(model: *const ir.RustIr) ?exprs.NodeId {
+    var found: ?exprs.NodeId = null;
+    for (model.bodies.exprs, 0..) |expression, index| {
+        if (expression.kind != .array) continue;
+        if (found != null) return null;
+        found = @intCast(index);
+    }
+    return found;
+}
+
+fn expectPrim(ty: types.Type, primitive: types.Prim) !void {
+    if (ty != .prim) return error.NotAPrim;
+    if (ty.prim != primitive) return error.WrongPrim;
+}
+
+/// `[u8; length]` — the shape an integer's native-endian byte image takes.
+fn expectByteArray(ty: types.Type, length: u64) !void {
+    const array = switch (ty) {
+        .array => |value| value,
+        else => return error.NotAnArray,
+    };
+    try expectPrim(array.elem, .u8);
+    switch (array.len) {
+        .literal => |len| if (len != length) return error.WrongArrayLength,
+        else => return error.ArrayLengthIsNotALiteral,
+    }
+}
+
+test "`x.to_ne_bytes()` is the runtime transmute, not a method with nothing to dispatch to" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const model = try analyze(alloc,
+        \\pub fn f(x: u32) -> [u8; 4] {
+        \\    x.to_ne_bytes()
+        \\}
+    );
+
+    // The byte image of an integer is an ARRAY, so no entry in the numeric
+    // dispatch table names it and the call used to reach the backend as an
+    // `.unsupported` marker. Validation is where that refusal surfaces, so
+    // this assertion is the one that fails without the fix.
+    try ir.validateForTranslation(&model);
+
+    const call = onlyCoreCall(&model) orelse return error.NoCoreCall;
+    if (call.function != .mem_transmute) return error.NotANativeEndianTransmute;
+    if (call.args.len != 1) return error.WrongTransmuteArity;
+    try expectPrim(call.generic_args[0], .u32);
+    try expectByteArray(call.generic_args[1], 4);
+}
+
+test "`u16::from_ne_bytes(..)` is the same transmute read back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const model = try analyze(alloc,
+        \\pub fn f(bytes: [u8; 2]) -> u16 {
+        \\    u16::from_ne_bytes(bytes)
+        \\}
+    );
+
+    try ir.validateForTranslation(&model);
+
+    // The bytes are the parameter and the integer the result: the inverse of
+    // `to_ne_bytes`, and the order the runtime reads them in.
+    const call = onlyCoreCall(&model) orelse return error.NoCoreCall;
+    if (call.function != .mem_transmute) return error.NotANativeEndianTransmute;
+    if (call.args.len != 1) return error.WrongTransmuteArity;
+    try expectByteArray(call.generic_args[0], 2);
+    try expectPrim(call.generic_args[1], .u16);
+}
+
+test "a local bound to a core call types the array literal indexed out of it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Spelled with `core::mem::transmute` rather than `to_ne_bytes`, so this
+    // pins the core-call result type on its own and not through the method
+    // above. A local bound to a call has no annotation to read, and the array
+    // literal is an argument rather than a `let` initialiser precisely so
+    // that no annotation reaches it either: without the core-call answer
+    // `[b[0], b[1]]` has no element type, and the Zig AST can only emit a
+    // multi-element array literal with a named one.
+    const model = try analyze(alloc,
+        \\pub fn f(x: u32) -> u16 {
+        \\    let b = core::mem::transmute::<u32, [u8; 4]>(x);
+        \\    core::mem::transmute::<[u8; 2], u16>([b[0], b[1]])
+        \\}
+    );
+
+    const literal = onlyArrayLiteral(&model) orelse return error.NoArrayLiteral;
+    const literal_type = model.bodies.exprs[literal].ty orelse
+        return error.ArrayLiteralHasNoType;
+    if (literal_type >= model.bodies.types.len) return error.MissingTypeId;
+    try expectByteArray(typeAt(&model, literal_type), 2);
+}
