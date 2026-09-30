@@ -144,17 +144,25 @@ does not compile.
   would either fail to compile or — worse — `as_slice` would emit a silently
   wrong value.
 
-## Two things the round could not settle
-
-There is **no borrow checker anywhere in the pipeline**. Two simultaneous `&mut`
- borrows, and a borrow held across a call that mutates, both translate and
- produce compiling Zig with a meaningless value. Zig's aliasing rules do not
- catch these shapes. That is a real soundness gap and it is a much larger piece
- of work than anything else in this round.
+## One host caveat, and one scope decision
 
 `/tmp` on this host is at 98% and `/var` at 90%. A round-2 probe run was
- silently corrupted by a full `/var` — 94 probes had to be re-run. Any future
- measurement should be told to use `/home/tmp`, which has room.
+silently corrupted by a full `/var` — 94 probes had to be re-run. Any future
+measurement should use `/home/tmp`, which has room.
+
+**Input is assumed to be valid Rust. There is no borrow checker, by decision.**
+A probe round found that two simultaneous `&mut` borrows, and a borrow held
+across a call that mutates, both translate and produce compiling Zig with a
+meaningless value. That was recorded here as a soundness gap. It is not one.
+Rust's borrow checker is a compile-time guarantee, so any program that reaches
+this translator has already had it; Zig and C are equally permissive about
+aliasing, and the generated package is memory-unsafe in exactly the way its
+source was. Adding a borrow checker would be building a Rust front-end feature
+the target languages do not have.
+
+So: the contract is *valid input in, faithful code out*, and borrow-rule
+violations are out of scope by the same reasoning that build scripts and
+external macro sources are. Do not re-open this as a finding.
 
 ## Also in the round
 

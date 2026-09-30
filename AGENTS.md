@@ -9,6 +9,15 @@ Zig 0.16.0 research project for translating Rust crates into correct, idiomatic 
 - For design-only work, consult `notes/README.md` to locate design records. Do not assume an indexed record is present in this checkout; `README.md` describes current implementation and coverage.
 - Research notes should use dated, cited primary sources and record contradictions.
 - For future non-Zig formats such as TOML, use `serde.zig`, not a hand-written parser.
+- **Assume the input crate compiles.** The contract is valid Rust in, faithful
+  Zig out. There is no borrow checker and none is planned: Rust's is a
+  compile-time guarantee, so anything reaching this translator has already had
+  it, and Zig and C are equally permissive about aliasing. A probe round found
+  that two simultaneous `&mut` borrows translate to compiling Zig with a
+  meaningless value — that is out of scope by decision, not an open gap. Do not
+  report borrow-rule violations, or the same class of input a target language
+  would also accept, as findings. What does count is wrong output for code that
+  is valid, especially when it compiles and computes the wrong value.
 
 ## Build and verification
 
