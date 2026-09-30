@@ -71,18 +71,32 @@ short first error, which is exactly the trap round 2 warned about.
 Suite **704/713**, the 9 failures being the 8 known toolchain miscompilations
 plus hex. `test-crates` green at 86/86. Sources formatted.
 
-**A crate cleared for the first time in four rounds.** `const-fnv1a-hash`
-(101 lines) translates, the generated package builds, and its output is
-*correct*: the digests match the published FNV-1a vectors for 32- and 64-bit,
-including the empty-slice case, checked against a driver crate rather than
-against a re-derivation of the same code. Three frontend links were needed —
-`to_ne_bytes` / `from_ne_bytes` as the native-endian `core::mem::transmute`
-they name, and the result type of a core call. Corpus `fnv` is byte-identical
-afterwards, so this extends a known-good path rather than bending it.
+**A crate cleared for the first time in four rounds — its library.**
+`const-fnv1a-hash` (101 lines) analyses, lowers, and its generated package
+builds, and its output is *correct*: the digests match the published FNV-1a
+vectors for 32- and 64-bit including the empty-slice case, checked with a
+driver crate rather than a re-derivation of the same code. Three frontend links
+were needed — `to_ne_bytes` / `from_ne_bytes` as the native-endian
+`core::mem::transmute` they name, and the result type of a core call. Corpus
+`fnv` is byte-identical afterwards, so this extends a known-good path rather
+than bending it.
 
-That number — 3 of 112 — is worth stating plainly rather than dressing up. One
-crate is not a strategy. But it is the first evidence in four rounds that the
-chain has a bottom, and it came from refusing to accept a crate by size alone.
+**Its `#[cfg(test)]` module does not yet translate**, so the honest count
+depends on what is being asked, and the two must not be conflated:
+
+| question | before round 3 | after round 3 |
+|---|---|---|
+| library only | 2 of 112 | **3 of 112** |
+| library + tests (the net default) | 2 of 112 | 2 of 112 |
+
+The remaining failure is `UnresolvedTypePath` in the test module, from two
+links the frontend owner reported and did not fix because they were not in
+its two files. That is the next target, and it is a good one precisely because
+the library is already proven correct.
+
+That number is worth stating plainly rather than dressing up. One crate is not
+a strategy. But it is the first evidence in four rounds that the chain has a
+bottom, and it came from refusing to accept a crate by size alone.
 
 ## The round's most valuable finding was not the crate
 
