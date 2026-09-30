@@ -3676,6 +3676,124 @@ test "two wildcard casts sharing one placeholder slot both reach their field typ
     }
 }
 
+// ── Untyped cast operand: named refusal, not an opaque abort ───────────────
+
+/// Expr-table layout shared by the untyped-cast-operand fixture, modelling the
+/// seahash shape `tail.to_le_bytes()[..n].len() as u64`: the cast reads an
+/// operand the frontend never typed, and the cast's recorded source type is
+/// the frontend's own "still pending" placeholder rather than a real type.
+///   0 = the operand — a path naming no entity, so nothing can type it
+///   1 = the cast
+///   2 = the body block
+/// Types:
+///   0 = u64, the cast's destination
+///   1 = unit, the function return
+const untyped_cast_operand_node: exprs.NodeId = 0;
+const untyped_cast_node: exprs.NodeId = 1;
+
+/// The name the frontend publishes for this refusal. `ir.validate` carries it
+/// out of `error.UnsupportedExpression`, so it is what a caller actually reads
+/// — which is the whole point: the old path reported `error.InvalidCast` and
+/// said nothing about which expression was at fault.
+const untyped_cast_operand_reason = "unresolved cast operand type";
+
+test "a cast over an untyped operand is named, not an opaque InvalidCast" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `operand as u64` where the operand's type is unknown to the frontend.
+    // There is no source type to check the destination against, so this is an
+    // unresolved construct rather than a wrong one. It must be reported by
+    // name, and the surrounding crate must keep going: an untyped operand
+    // aborting the whole solve was the defect, not the ambiguity.
+    var types_store = [_]types.Type{
+        .{ .prim = .u64 },
+        .{ .prim = .unit },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{
+            .id = 0,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+        },
+        .{
+            .id = 1,
+            .span = span,
+            .ty = null,
+            .kind = .{ .cast = .{
+                .kind = .as_,
+                .operand = untyped_cast_operand_node,
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = 0,
+            } },
+        },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } },
+        },
+    };
+    var stmts_store = [_]exprs.Statement{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = untyped_cast_node },
+    }};
+    var bodies_store = [_]bodies.BodyKind{
+        .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 2 } },
+    };
+    const b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &stmts_store,
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    // Without the escalation this is `error.InvalidCast`, and the test fails
+    // here rather than ever reaching the marker below.
+    var inferred = try infer.solve(alloc, &b);
+    defer inferred.deinit(alloc);
+
+    const marker = switch (exprs_store[untyped_cast_node].kind) {
+        .unsupported => |unsupported| unsupported,
+        else => return error.ExpectedUntypedCastMarker,
+    };
+    try std.testing.expectEqualStrings(untyped_cast_operand_reason, marker.reason);
+    try std.testing.expect(marker.suggested_version == .v1);
+}
+
+test "a wrong cast whose operand IS typed still raises InvalidCast" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // The counterweight, and the one that matters: the untyped-operand escape
+    // hatch must not become a hole for wrong casts. `Buf<T> { off: n as _ }`
+    // with `off: &u64` and `n: u8` — the operand IS typed, the solver resolves
+    // the source to `u8`, and `u8 as &u64` is a conversion this translator
+    // does not admit. Generation does not record it either, because a wildcard
+    // target is only resolved in this pass, so `isValidCast` is the sole gate
+    // and it sits immediately after the branch the new marker precedes.
+    const reference = try alloc.create(types.Ref);
+    reference.* = .{ .mut = false, .pointee = .{ .prim = .u64 } };
+    try std.testing.expectError(
+        error.InvalidCast,
+        buildWildcardFieldFixture(alloc, .{ .reference = reference }, .u8),
+    );
+}
+
 /// A method call on a nominal receiver whose declared method return type is
 /// the bare type parameter `T`. Nothing but a turbofish can name `T`, so any
 /// concrete result the solver reaches for this call came from the turbofish.

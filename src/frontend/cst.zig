@@ -742,6 +742,47 @@ fn externalUseAlias(
     return found;
 }
 
+/// The external path a glob import makes visible under `name` in the module
+/// that owns `owner_id`, or null when no single glob source binds it. A glob
+/// publishes only what its source module exports, so only a `pub use` of an
+/// external path counts. Two glob sources binding the same name are ambiguous
+/// and resolve to null, matching `externalUseAlias`.
+fn globExternalUseAlias(
+    g: *const graph.CrateGraph,
+    owner_id: spine.EntityId,
+    name: []const u8,
+) ?[]const []const u8 {
+    const module_id = owningModule(g, owner_id) orelse return null;
+    var found: ?[]const []const u8 = null;
+    for (g.uses.items) |use_decl| {
+        if (use_decl.kind != .glob) continue;
+        const glob_entity = g.symbol_table.get(use_decl.id) orelse continue;
+        if (glob_entity.parent != module_id) continue;
+        const source_id = use_decl.target;
+        const source = g.symbol_table.get(source_id) orelse continue;
+        if (source.kind != .module) continue;
+        var source_found: ?[]const []const u8 = null;
+        for (g.uses.items) |exported| {
+            const exported_entity = g.symbol_table.get(exported.id) orelse continue;
+            if (exported_entity.kind != .use_) continue;
+            if (exported_entity.parent != source_id) continue;
+            if (!exported.is_pub_export) continue;
+            if (!std.mem.eql(u8, exported.local_name, name)) continue;
+            const external = switch (exported.kind) {
+                .external => |value| value,
+                else => continue,
+            };
+            if (external.path.len == 0) continue;
+            if (source_found != null) return null;
+            source_found = external.path;
+        }
+        if (source_found == null) continue;
+        if (found != null) return null;
+        found = source_found;
+    }
+    return found;
+}
+
 fn externalUsePath(e: *const Ctx, name: []const u8) !?[]const []const u8 {
     const owner_id = e.declaration_owner orelse return null;
     const alias = externalUseAlias(e.g, owner_id, name) orelse return null;
@@ -1180,6 +1221,11 @@ fn bodyHasGenericParam(body: bodies.BodyKind, name: []const u8) bool {
                 }
             }
         },
+        .enum_ => |enum_body| {
+            for (enum_body.generic_params) |param| {
+                if (std.mem.eql(u8, param, name)) return true;
+            }
+        },
         .type_alias => |alias_body| {
             for (alias_body.generic_params) |param| {
                 if (std.mem.eql(u8, param, name)) return true;
@@ -1575,13 +1621,14 @@ pub const BoundPath = enum {
     external,
 };
 
-/// Rewrites `path` in place so it names an external type. Two forms reach this
-/// step: a path rooted at `core`/`std`/`alloc`, and a path whose segment at
+/// Rewrites `path` in place so it names an external type. Three forms reach
+/// this step: a path rooted at `core`/`std`/`alloc`, a path whose segment at
 /// `index` is an `extern crate` use alias (`use core::slice;` then
-/// `slice::Iter`). External names are never graph entities, so the rewritten
-/// segments are provenance-only. The previous segment array is left to its
-/// owner, which may still reference it. Returns false when neither form
-/// applies.
+/// `slice::Iter`), and a path whose segment a glob import publishes
+/// (`mod m { pub use core::fmt; }` then `use m::*;` and `fmt::Formatter`).
+/// External names are never graph entities, so the rewritten segments are
+/// provenance-only. The previous segment array is left to its owner, which
+/// may still reference it. Returns false when none of the forms applies.
 fn bindExternalNominalPath(
     g: *const graph.CrateGraph,
     owner_id: spine.EntityId,
@@ -1589,7 +1636,8 @@ fn bindExternalNominalPath(
     index: usize,
 ) DeclarationTypeError!bool {
     const root = path.segments[index].name;
-    const alias = externalUseAlias(g, owner_id, root) orelse {
+    const alias = externalUseAlias(g, owner_id, root) orelse
+        globExternalUseAlias(g, owner_id, root) orelse {
         // An absolute external root already spells the whole path; only the
         // provenance-only ids need clearing. A bare `std` names the crate, not
         // a type, so a root segment needs a nominal segment after it.
@@ -2677,6 +2725,35 @@ fn nominalItemId(e: *const Ctx) ?spine.EntityId {
     return @intCast(e.bodies_list.items.len - 1);
 }
 
+/// Type parameter names a nominal declaration introduces, in source order. A
+/// bare parameter is a `type_identifier` child of `type_parameters`; one that
+/// carries bounds or a default arrives wrapped in `type_parameter`.
+fn collectTypeParameterNames(e: *Ctx, item: ts.Node) ![]const []const u8 {
+    var params: std.ArrayListUnmanaged([]const u8) = .empty;
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (!std.mem.eql(u8, child.kind(), "type_parameters")) continue;
+
+        var j: u32 = 0;
+        while (child.namedChild(j)) |parameter| : (j += 1) {
+            const parameter_kind = parameter.kind();
+            if (std.mem.eql(u8, parameter_kind, "type_identifier")) {
+                try params.append(e.alloc, try e.alloc.dupe(u8, text(e, parameter)));
+                continue;
+            }
+            if (!std.mem.eql(u8, parameter_kind, "type_parameter") and
+                !std.mem.eql(u8, parameter_kind, "const_parameter")) continue;
+            var k: u32 = 0;
+            while (parameter.namedChild(k)) |parameter_child| : (k += 1) {
+                if (!std.mem.eql(u8, parameter_child.kind(), "type_identifier")) continue;
+                try params.append(e.alloc, try e.alloc.dupe(u8, text(e, parameter_child)));
+                break;
+            }
+        }
+    }
+    return params.toOwnedSlice(e.alloc);
+}
+
 fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     var name: []const u8 = "";
     var fields_node: ?ts.Node = null;
@@ -2779,12 +2856,17 @@ fn enumItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         }
     }
     const variants_slice: []const items.Variant = try variants.toOwnedSlice(e.alloc);
-    e.bodies_list.items[eid] = .{ .enum_ = .{
-        .kind = kind,
-        .variants = variants_slice,
-        .repr_int = null,
-        .non_exhaustive = false,
-    } };
+    e.bodies_list.items[eid] = .{
+        .enum_ = .{
+            .kind = kind,
+            // A variant field type names the enum's own parameter, so the names
+            // must survive on the body for binding and validation.
+            .generic_params = try collectTypeParameterNames(e, item),
+            .variants = variants_slice,
+            .repr_int = null,
+            .non_exhaustive = false,
+        },
+    };
 }
 
 fn unionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
@@ -2801,6 +2883,7 @@ fn unionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     const union_fields: []const items.Field = if (fields_node) |fn_| try mapFields(e, fn_) else &.{};
     e.bodies_list.items[eid] = .{ .struct_ = .{
         .layout = .named,
+        .generic_params = try collectTypeParameterNames(e, item),
         .fields = union_fields,
     } };
 }
@@ -8088,4 +8171,232 @@ test "cst records type alias generic parameters on the alias body" {
         .path => |path| path,
         else => return error.TestUnexpectedResult,
     }, &.{"V"});
+}
+
+test "cst binds an enum parameter named in a variant field type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub enum Error<E> {
+        \\    Other(E),
+        \\    WouldBlock,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const enum_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .enum_ and std.mem.eql(u8, entity.name, "Error")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[enum_id]) {
+        .enum_ => |enum_body| enum_body,
+        else => return error.TestUnexpectedResult,
+    };
+    // The variant field names the enum's own parameter, so the name must
+    // survive on the body for binding and for validation's generic context.
+    try std.testing.expectEqual(@as(usize, 1), body.generic_params.len);
+    try std.testing.expectEqualStrings("E", body.generic_params[0]);
+    const variant_fields = switch (body.variants[0].fields) {
+        .tuple => |fields| fields,
+        else => return error.TestUnexpectedResult,
+    };
+    try expectSegmentNames(switch (variant_fields[0]) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    }, &.{"E"});
+}
+
+test "cst rejects an unresolvable enum variant field type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        // Recording the enum's parameters must not make any name bindable.
+        .src = "pub enum Error<E> { Other(Missing) }",
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
+}
+
+test "cst binds a union parameter named in a field type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src = "pub union Either<T> { left: T, right: u8 }",
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // A union shares the struct body shape, so its parameters must be
+    // recorded on the same field the binder reads them from.
+    const union_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .union_ and std.mem.eql(u8, entity.name, "Either")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[union_id]) {
+        .struct_ => |struct_body| struct_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), body.generic_params.len);
+    try std.testing.expectEqualStrings("T", body.generic_params[0]);
+    try expectSegmentNames(switch (body.fields[0].ty) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    }, &.{"T"});
+}
+
+test "cst binds a glob re-exported external name in a type position" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\mod coreprovider {
+        \\    pub use core::fmt;
+        \\}
+        \\use coreprovider::*;
+        \\pub fn format(_: &mut fmt::Formatter) {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // The glob publishes `fmt`, so the parameter must bind to the full
+    // external path rather than reject the path.
+    const fn_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "format")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[fn_id]) {
+        .fn_ => |fn_body| fn_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), body.params.len);
+    const pointee = switch (body.params[0].ty) {
+        .reference => |reference| reference.pointee,
+        else => return error.TestUnexpectedResult,
+    };
+    const external = switch (pointee) {
+        .external_nominal => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const expected_path = [_][]const u8{ "core", "fmt", "Formatter" };
+    try std.testing.expectEqual(expected_path.len, external.path.len);
+    for (expected_path, external.path) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "cst rejects a glob name that its source module does not export" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        // A private `use` is not re-exported, so the glob must not publish it.
+        .src =
+        \\mod coreprovider {
+        \\    use core::fmt;
+        \\}
+        \\use coreprovider::*;
+        \\pub fn format(_: &mut fmt::Formatter) {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
+}
+
+test "cst rejects a glob name two glob sources both publish" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        // Two globs binding the same name is ambiguous, as in Rust.
+        .src =
+        \\mod a {
+        \\    pub use core::cell::Cell;
+        \\}
+        \\mod b {
+        \\    pub use core::cell::Cell;
+        \\}
+        \\use a::*;
+        \\use b::*;
+        \\pub fn take(_: Cell) {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
 }

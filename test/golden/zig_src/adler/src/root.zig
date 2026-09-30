@@ -58,7 +58,7 @@ pub const Adler32 = struct {
                 a_vec.add_assign(val);
                 b_vec.add_assign(a_vec);
             }
-            b +%= @as(u32, @truncate(CHUNK_SIZE)) *% a;
+            b += @as(u32, @truncate(CHUNK_SIZE)) *% a;
             a_vec.rem_assign(MOD);
             b_vec.rem_assign(MOD);
             b %= MOD;
@@ -69,23 +69,23 @@ pub const Adler32 = struct {
             a_vec.add_assign(val_1);
             b_vec.add_assign(a_vec);
         }
-        b +%= @as(u32, @truncate(remainder_chunk.len)) *% a;
+        b += @as(u32, @truncate(remainder_chunk.len)) *% a;
         a_vec.rem_assign(MOD);
         b_vec.rem_assign(MOD);
         b %= MOD;
         b_vec.mul_assign(4);
-        b_vec.@"0"[1] +%= MOD -% a_vec.@"0"[1];
-        b_vec.@"0"[2] +%= (MOD -% a_vec.@"0"[2]) *% 2;
-        b_vec.@"0"[3] +%= (MOD -% a_vec.@"0"[3]) *% 3;
+        b_vec.@"0"[1] += MOD -% a_vec.@"0"[1];
+        b_vec.@"0"[2] += (MOD -% a_vec.@"0"[2]) *% 2;
+        b_vec.@"0"[3] += (MOD -% a_vec.@"0"[3]) *% 3;
         for (a_vec.@"0") |av| {
-            a +%= av;
+            a += av;
         }
         for (b_vec.@"0") |bv| {
-            b +%= bv;
+            b += bv;
         }
         for (remainder) |byte| {
-            a +%= @as(u32, byte);
-            b +%= a;
+            a += @as(u32, byte);
+            b += a;
         }
         self.a = @as(u16, @truncate(a % MOD));
         self.b = @as(u16, @truncate(b % MOD));

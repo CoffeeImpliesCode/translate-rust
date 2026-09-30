@@ -474,8 +474,18 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                 };
                 try validateGenericNames(alias_body.generic_params);
                 // The alias's own parameters are in scope in its target, so the
-                // target's null-id path segments must resolve against them.
-                try validateType(ir, b, alias_body.target, alias_body.generic_params);
+                // target's null-id path segments must resolve against them. An
+                // associated type is an alias whose owner is an `impl`, and the
+                // impl binds the rest: `impl Deref for DropGuard<T, F> { type
+                // Target = T; }` declares no parameter of its own to name `T`
+                // with, so the owning scope is resolved alongside the alias's.
+                const owner_context = try ownerGenericContext(ir, b, @intCast(entity_id));
+                const alias_context: GenericContext = .{
+                    .names = alias_body.generic_params,
+                    .outer_names = owner_context.names,
+                    .outer_params = owner_context.params,
+                };
+                try validateTypeContext(ir, b, alias_body.target, alias_context);
             },
             .impl_ => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
@@ -677,11 +687,33 @@ fn validateStructBody(
         if (method.name.len == 0) return error.IncompleteGenericMetadata;
         try validateGenericNames(method.generic_params);
         const method_params = if (method.generics) |generics| generics.params else &.{};
+        // A method re-parented onto the struct from an `impl` is written inside
+        // that impl as well, so the impl's parameters bind names in the
+        // signature the way the struct's own do.
+        const impl_context = try implMethodGenericContext(ir, b, owner, method.name);
         const method_context: GenericContext = .{
             .names = method.generic_params,
             .params = method_params,
             .outer_names = struct_context.names,
             .outer_params = struct_context.params,
+            .impl_names = impl_context.names,
+            .impl_params = impl_context.params,
+            .implicit_self = true,
+            .self_entity = owner,
+        };
+        // The signature is written in those two scopes, so it is resolved
+        // against them: a null-id root must be a name the method binds, the
+        // struct binds, or the owning `impl` binds. A name no scope declares is
+        // still `UnresolvedTypePath`.
+        for (method.params) |param| try validateTypeContext(ir, b, param.ty, method_context);
+        try validateTypeContext(ir, b, method.ret, method_context);
+        // A bound or where clause on the method is written in the same two
+        // owners as its signature, so it reads both scopes too.
+        const method_outer: GenericContext = .{
+            .names = struct_context.names,
+            .params = struct_context.params,
+            .impl_names = impl_context.names,
+            .impl_params = impl_context.params,
             .implicit_self = true,
             .self_entity = owner,
         };
@@ -691,11 +723,9 @@ fn validateStructBody(
                 b,
                 generics,
                 method.generic_params,
-                struct_context,
+                method_outer,
             );
         }
-        for (method.params) |param| try validateTypeContext(ir, b, param.ty, method_context);
-        try validateTypeContext(ir, b, method.ret, method_context);
         try validateExprRef(b, method.body);
         if (b.exprs[method.body].kind != .block) return error.InvalidFunctionBody;
         try validateCoreCallsInRoot(
@@ -1050,11 +1080,16 @@ fn validateGenericsContext(
     generic_names: GenericNames,
     outer: GenericContext,
 ) ValidationError!void {
+    // Every scope the outer binds is carried in, so a bound or where clause
+    // resolves against the same owners the declaration's signature is written
+    // in — a re-parented method's bounds reach the impl it came from.
     const context: GenericContext = .{
         .names = generic_names,
         .params = generics.params,
         .outer_names = outer.names,
         .outer_params = outer.params,
+        .impl_names = outer.impl_names,
+        .impl_params = outer.impl_params,
         .implicit_self = outer.implicit_self,
         .self_entity = outer.self_entity,
     };
@@ -1199,6 +1234,12 @@ const GenericContext = struct {
     params: []const types_mod.GenericParam = &.{},
     outer_names: GenericNames = &.{},
     outer_params: []const types_mod.GenericParam = &.{},
+    /// Third scope, for a signature written inside two owners. A method that
+    /// `finalizePendingImpls` re-parents onto a struct is written inside the
+    /// struct and inside the `impl` it came from, so both bind names there.
+    /// Kept apart from `outer_*` so neither scope has to displace the other.
+    impl_names: GenericNames = &.{},
+    impl_params: []const types_mod.GenericParam = &.{},
     implicit_self: bool = false,
     self_entity: ?spine.EntityId = null,
 };
@@ -1261,6 +1302,42 @@ fn ownerGenericContext(
     return error.InvalidParent;
 }
 
+/// The generic context an owning `impl` lends to a method re-parented onto
+/// its target's `StructBody.methods`.
+///
+/// `finalizePendingImpls` copies an impl's method onto the target struct
+/// without carrying the impl's generics across, so `impl<'a, T, I> From<I>
+/// for Wrapping<'a, T>` leaves `from`'s parameter `I` with no in-scope name
+/// even though the frontend bound it. The method's own `fn_` entity still has
+/// the impl as its parent, so the impl is recovered by matching that entity's
+/// name against the `fn_` children of the impls parented to `owner` — the
+/// same name `finalizePendingImpls` itself matches on when it appends.
+///
+/// Two impls on one struct declaring a method of the same name is ambiguous,
+/// and yields an empty context: taking either impl's parameters would admit a
+/// name the method does not bind.
+fn implMethodGenericContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+    method_name: []const u8,
+) ValidationError!GenericContext {
+    const entities = ir.graph.symbol_table.entities.items;
+    var method_entity: ?spine.EntityId = null;
+    for (entities, 0..) |candidate, index| {
+        if (candidate.kind != .fn_) continue;
+        if (!std.mem.eql(u8, candidate.name, method_name)) continue;
+        const impl_id = candidate.parent orelse continue;
+        if (@as(usize, impl_id) >= entities.len) continue;
+        if (entities[impl_id].kind != .impl_) continue;
+        if (entities[impl_id].parent == null or entities[impl_id].parent.? != owner) continue;
+        if (method_entity != null) return .{ .names = &.{} };
+        method_entity = @intCast(index);
+    }
+    const fn_entity = method_entity orelse return .{ .names = &.{} };
+    return ownerGenericContext(ir, b, fn_entity);
+}
+
 fn genericParamNameKnown(params: []const types_mod.GenericParam, name: []const u8) bool {
     for (params) |param| {
         const candidate = switch (param) {
@@ -1277,7 +1354,9 @@ fn contextGenericNameKnown(context: GenericContext, name: []const u8) bool {
         genericNameKnown(context.names, name) or
         genericParamNameKnown(context.params, name) or
         genericNameKnown(context.outer_names, name) or
-        genericParamNameKnown(context.outer_params, name);
+        genericParamNameKnown(context.outer_params, name) or
+        genericNameKnown(context.impl_names, name) or
+        genericParamNameKnown(context.impl_params, name);
 }
 
 fn concreteSelfEntity(ir: *const RustIr, ty: Type) ?spine.EntityId {
@@ -3230,6 +3309,161 @@ test "validation rejects a type alias with empty or duplicate generic names" {
         error.IncompleteGenericMetadata,
         validateForTranslation(&duplicate),
     );
+}
+
+/// A struct whose method and associated type both arrive from one `impl` — the
+/// shape `finalizePendingImpls` produces. The struct's `StructBody.methods`
+/// holds the method, the impl keeps the generics, and nothing on the struct
+/// records that either was written inside the impl.
+///
+/// The struct declares no parameters of its own, so `method_param_ty` and
+/// `assoc_target` can name an impl parameter (`I`, `T`) or a name no scope
+/// binds (`Absent`) — and nothing else decides which.
+fn implOwnedItemIr(
+    allocator: std.mem.Allocator,
+    method_param_ty: Type,
+    assoc_target: Type,
+) !RustIr {
+    var ir = try validReducedIr(allocator);
+    const struct_id: spine.EntityId = 2;
+    // Entities 7, 8 and 9 are the impl, its method, and its associated type.
+    // The first hangs off the struct and the other two off the impl, so none
+    // of the three is a module item.
+    const impl_id: spine.EntityId = 7;
+    const method_id: spine.EntityId = 8;
+    const assoc_id: spine.EntityId = 9;
+
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = "From for EmptyStruct",
+        .span = test_span,
+        .visibility = .public,
+        .parent = struct_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "from",
+        .span = test_span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .type_alias,
+        .name = "Target",
+        .span = test_span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const self_type: Type = .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } };
+    const old_bodies = ir.bodies.bodies;
+    const body_table = try allocator.alloc(bodies_mod.BodyKind, old_bodies.len + 3);
+    @memcpy(body_table[0..old_bodies.len], old_bodies);
+    body_table[impl_id] = .{ .impl_ = .{
+        .self_ty = .{ .path = .{ .segments = &.{.{ .name = "EmptyStruct", .id = struct_id }} } },
+        .trait_path = .{ .segments = &.{
+            .{ .name = "core", .id = null },
+            .{ .name = "ops", .id = null },
+            .{ .name = "Deref", .id = null },
+        } },
+        .generics = .{ .params = &.{
+            .{ .type_ = .{ .name = "I", .bounds = &.{} } },
+            .{ .type_ = .{ .name = "T", .bounds = &.{} } },
+        }, .where_clauses = &.{} },
+        .assoc_items = &.{ method_id, assoc_id },
+    } };
+    body_table[method_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = self_type,
+        .body = 0,
+    } };
+    // The associated type declares no parameter of its own, exactly as
+    // `type Target = T;` does.
+    body_table[assoc_id] = .{ .type_alias = .{ .target = assoc_target } };
+    ir.bodies.bodies = body_table;
+
+    const method: bodies_mod.StructMethod = .{
+        .name = "from",
+        .params = &.{.{ .name = "into", .ty = method_param_ty, .span = test_span }},
+        .ret = self_type,
+        .body = 0,
+        .receiver = .owned,
+    };
+    var struct_body = ir.bodies.bodies[struct_id].struct_;
+    struct_body.methods = &.{method};
+    @constCast(ir.bodies.bodies)[struct_id] = .{ .struct_ = struct_body };
+    return ir;
+}
+
+// The `wrapping` shape: `impl<I, T> From<I> for EmptyStruct { fn from(into:
+// I) -> Self }`, re-parented onto the struct. `I` is bound by the impl and by
+// nothing the struct records, so the struct's copy of the method can only
+// validate it if the owning impl's scope is read.
+test "validation accepts a reparented struct method naming the impl's parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "I", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    try validateForTranslation(&ir);
+}
+
+// The `drop_guard` shape: `impl Deref for DropGuard<T, F> { type Target = T;
+// }`. The method's parameter is `Self` so the struct body cannot reject it,
+// leaving the associated type as the only thing the impl's scope can save.
+test "validation accepts an associated type naming the impl's parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    try validateForTranslation(&ir);
+}
+
+// Reading the owning impl must not become a blanket admission: a method
+// parameter that no scope declares is still an unresolved path.
+test "validation still rejects a reparented struct method naming an undeclared type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "Absent", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
+}
+
+// The same, for the associated type: the impl's parameters do not make every
+// name resolvable in its target.
+test "validation still rejects an associated type naming an undeclared type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "Absent", .id = null }} } },
+    );
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
 }
 
 test "validation accepts alloc external nominal and rejects unknown root" {

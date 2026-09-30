@@ -3227,7 +3227,7 @@ fn lowerClosureCombinatorExpr(
     return expr.*;
 }
 
-test "lower: Option::map with an inline closure expands to a switch, not a runtime call" {
+test "lower: Option::map with an inline closure expands to an optional if, not a switch" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3242,37 +3242,42 @@ test "lower: Option::map with an inline closure expands to a switch, not a runti
         .param_name = "byte",
     });
 
-    if (expr != .match_expr) return error.ExpectedOptionMapSwitch;
-    const arms = expr.match_expr.arms;
-    if (arms.len != 2) return error.ExpectedTwoSwitchArms;
-    // `null => null`.
-    if (arms[0].patterns.len != 1 or arms[0].patterns[0] != .lit or
-        arms[0].patterns[0].lit != .null_lit)
+    // Zig cannot `switch` an optional, so the two cases ride on `if (opt !=
+    // null)`: a `match_expr` here emitted `switch (value)` over a `?u8` and
+    // never compiled.
+    if (expr != .if_expr) return error.ExpectedOptionMapIf;
+    if (expr.if_expr.cond != .bin_op or expr.if_expr.cond.bin_op.op != .not_equal) {
+        return error.ExpectedNullTest;
+    }
+    if (expr.if_expr.cond.bin_op.rhs.* != .lit or
+        expr.if_expr.cond.bin_op.rhs.lit != .null_lit)
     {
-        return error.ExpectedNullProng;
+        return error.ExpectedNullComparison;
     }
-    if (arms[0].capture != null) return error.ExpectedUncapturedNullProng;
-    if (arms[0].body != .lit or arms[0].body.lit != .null_lit) {
-        return error.ExpectedNullArmBody;
+    const else_body = expr.if_expr.else_body orelse return error.ExpectedElseBranch;
+    if (else_body.* != .lit or else_body.lit != .null_lit) return error.ExpectedNullElse;
+    const then_body = expr.if_expr.then_body.*;
+    if (then_body != .block) return error.ExpectedMappedBlock;
+    // `const __r2z_in_byte = r2z.option.unwrap(..); const byte = __r2z_in_byte;`
+    const stmts = then_body.block.stmts;
+    if (stmts.len != 2) return error.ExpectedUnwrapThenBinding;
+    if (stmts[0] != .let_stmt or stmts[1] != .let_stmt) {
+        return error.ExpectedTwoBindingStatements;
     }
-    // `else => |__r2z_in_byte| { const byte = __r2z_in_byte; byte }`.
-    if (arms[1].patterns.len != 1 or arms[1].patterns[0] != .wildcard) {
-        return error.ExpectedWildcardProng;
+    const unwrap = stmts[0].let_stmt.init;
+    if (unwrap != .call or unwrap.call.callee.* != .ident or
+        !std.mem.eql(u8, unwrap.call.callee.ident, "r2z.option.unwrap"))
+    {
+        return error.ExpectedOptionUnwrap;
     }
-    const capture = arms[1].capture orelse return error.ExpectedPayloadCapture;
-    if (!std.mem.eql(u8, capture.name, "__r2z_in_byte")) return error.ExpectedPayloadName;
-    if (capture.by_ref) return error.ExpectedByValuePayload;
-    if (arms[1].body != .block) return error.ExpectedMappedBlock;
-    const mapped = arms[1].body.block;
-    if (mapped.stmts.len != 1 or mapped.stmts[0] != .let_stmt) {
-        return error.ExpectedSingleBindingStatement;
+    if (unwrap.call.args.len != 1) return error.ExpectedSingleUnwrapArgument;
+    if (!std.mem.eql(u8, stmts[1].let_stmt.name, "byte")) return error.ExpectedParameterBinding;
+    if (stmts[1].let_stmt.init != .ident or
+        !std.mem.eql(u8, stmts[1].let_stmt.init.ident, stmts[0].let_stmt.name))
+    {
+        return error.ExpectedBindingFromUnwrap;
     }
-    const binding = mapped.stmts[0].let_stmt;
-    if (!std.mem.eql(u8, binding.name, "byte")) return error.ExpectedParameterBinding;
-    if (binding.init != .ident or !std.mem.eql(u8, binding.init.ident, capture.name)) {
-        return error.ExpectedBindingFromCapture;
-    }
-    const tail = mapped.expr orelse return error.ExpectedMappedTail;
+    const tail = then_body.block.expr orelse return error.ExpectedMappedTail;
     if (tail.* != .ident or !std.mem.eql(u8, tail.ident, "byte")) {
         return error.ExpectedParameterBody;
     }
@@ -3329,10 +3334,10 @@ test "lower: inline closure combinator snapshots a by-value capture" {
         return error.ExpectedSnapshotOfCapturedBinding;
     }
     const expanded = expr.block.expr orelse return error.ExpectedExpandedCombinator;
-    if (expanded.* != .match_expr) return error.ExpectedOptionMapSwitch;
-    const arms = expanded.match_expr.arms;
-    if (arms[1].body != .block) return error.ExpectedMappedBlock;
-    const tail = arms[1].body.block.expr orelse return error.ExpectedMappedTail;
+    if (expanded.* != .if_expr) return error.ExpectedOptionMapIf;
+    const then_body = expanded.if_expr.then_body.*;
+    if (then_body != .block) return error.ExpectedMappedBlock;
+    const tail = then_body.block.expr orelse return error.ExpectedMappedTail;
     // The body reads the snapshot, not the outer `bias` binding.
     if (tail.* != .ident or !std.mem.eql(u8, tail.ident, snapshot.name)) {
         return error.ExpectedBodyReadsSnapshot;
@@ -11343,4 +11348,689 @@ test "lower: indexing a Vec goes through the container storage" {
     const source = try emitRootSource(alloc, &rust_ir);
     try std.testing.expect(std.mem.indexOf(u8, source, "return v.items[0];") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "return w.items[2];") != null);
+}
+
+// ── Round 2: accepted-and-wrong constructs ─────────────────────────────────
+
+test "lower: a labelled continue refuses instead of targeting the innermost loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `fn body() { loop { continue 'outer; } }`. The IR carries the label and
+    // `ForExpr` has no field for one, so there is nothing to emit `:outer`
+    // from; dropping it silently restarts the inner loop and returns a
+    // different answer.
+    try expectSingleFunctionLoweringError(
+        alloc,
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 1,
+        } },
+        &.{
+            strictExpr(0, .{ .continue_ = .{ .label = "outer" } }),
+            strictExpr(1, .{ .block = .{
+                .statements = &.{},
+                .tail = 0,
+                .labelled = null,
+            } }),
+        },
+        &.{},
+        &.{},
+        &.{},
+        error.UnsupportedLabelledControlFlow,
+    );
+}
+
+test "lower: a tuple pattern in a match arm refuses instead of emitting a tuple prong" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `match t { (0, y) => y, .. }`. `.{0, y}` is a `const` destructuring
+    // pattern, not a switch prong, and it declares none of its names.
+    const arms = [_]ir.exprs.MatchArm{.{
+        .patterns = &.{0},
+        .guard = null,
+        .body = 2,
+    }};
+    try expectSingleFunctionLoweringError(
+        alloc,
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .u32 },
+            .body = 0,
+        } },
+        &.{
+            strictExpr(0, .{ .match = .{ .scrutinee = 1, .arms = &arms } }),
+            strictExpr(1, litInt(5)),
+            strictExpr(2, .unit),
+        },
+        &.{},
+        &.{
+            .{ .id = 0, .span = span, .ty = null, .kind = .{ .tuple = .{
+                .elements = &.{ 1, 2 },
+                .rest = false,
+            } } },
+            .{ .id = 1, .span = span, .ty = null, .kind = .wildcard },
+            .{ .id = 2, .span = span, .ty = null, .kind = .{ .binding = .{
+                .name = "y",
+                .mode = .value,
+                .mutable = false,
+            } } },
+        },
+        &.{},
+        error.UnsupportedPattern,
+    );
+}
+
+test "lower: a let-else refuses rather than dropping its else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try expectSingleFunctionLoweringError(
+        alloc,
+        .{ .fn_ = .{
+            .params = &.{},
+            .ret = .{ .prim = .unit },
+            .body = 1,
+        } },
+        &.{
+            strictExpr(0, litInt(1)),
+            strictExpr(1, .{ .block = .{
+                .statements = &.{0},
+                .tail = null,
+                .labelled = null,
+            } }),
+        },
+        &.{.{ .id = 0, .span = span, .ty = null, .kind = .{ .let_else = .{
+            .pattern = 0,
+            .init = 0,
+            .else_block = .{ .statements = &.{}, .tail = null, .labelled = null },
+        } } }},
+        &.{.{ .id = 0, .span = span, .ty = null, .kind = .{ .binding = .{
+            .name = "v",
+            .mode = .value,
+            .mutable = false,
+        } } }},
+        &.{},
+        error.UnsupportedStatement,
+    );
+}
+
+test "lower: a compound assignment emits the checked operator even when the IR says wrapping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const a_def = try addLowerEntity(&graph, .const_, "a", root_id);
+    const x_def = try addLowerEntity(&graph, .const_, "x", root_id);
+    const assign_id = try addLowerEntity(&graph, .fn_, "bump", root_id);
+    const wrap_id = try addLowerEntity(&graph, .fn_, "wrap_add", root_id);
+    try addBareCrate(&graph, alloc, "compound_assign", root_id, &.{ assign_id, wrap_id });
+
+    const u32_ty: ir.types.Type = .{ .prim = .u32 };
+    const types = [_]ir.types.Type{u32_ty};
+    var model = Model.init(alloc);
+
+    // `fn bump(a: u32) -> u32 { let mut x = a; x += a; x }`. `ts_ext.zig`
+    // writes `.wrapping` on every `AssignExpr`, so the IR here is what the
+    // sidecar really produces for a plain `+=`.
+    const bind_x = try model.pat(.{ .binding = .{
+        .name = "x",
+        .mode = .value,
+        .mutable = true,
+    } });
+    const init_x = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[init_x].ty = 0;
+    const let_stmt = try model.stmt(.{ .let = .{
+        .pattern = bind_x,
+        .init = init_x,
+        .ty = null,
+    } });
+    const assign_target = try model.e(.{ .path = .{ .def = x_def, .generic_args = &.{} } });
+    model.exprs.items[assign_target].ty = 0;
+    const assign_value = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[assign_value].ty = 0;
+    const compound = try model.e(.{ .assign = .{
+        .target = assign_target,
+        .op = .add,
+        .value = assign_value,
+        .overflow = .wrapping,
+    } });
+    model.exprs.items[compound].ty = null;
+    const compound_stmt = try model.stmt(.{ .expr = compound });
+    const bump_tail = try model.e(.{ .path = .{ .def = x_def, .generic_args = &.{} } });
+    model.exprs.items[bump_tail].ty = 0;
+    const bump_statements = try alloc.alloc(ir.exprs.NodeId, 2);
+    bump_statements[0] = let_stmt;
+    bump_statements[1] = compound_stmt;
+    const bump_body = try model.e(.{ .block = .{
+        .statements = bump_statements,
+        .tail = bump_tail,
+        .labelled = null,
+    } });
+
+    // `fn wrap_add(a: u32) -> u32 { a + a }` — a `wrapping_add` lowers here,
+    // and it must keep its wrapping operator.
+    const wrap_lhs = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[wrap_lhs].ty = 0;
+    const wrap_rhs = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[wrap_rhs].ty = 0;
+    const wrap_binary = try model.e(.{ .binary = .{
+        .op = .add,
+        .overflow = .wrapping,
+        .lhs = wrap_lhs,
+        .rhs = wrap_rhs,
+    } });
+    model.exprs.items[wrap_binary].ty = 0;
+    const wrap_body = try model.e(.{ .block = .{
+        .statements = &.{},
+        .tail = wrap_binary,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const params = try alloc.alloc(ir.items.Param, 1);
+    params[0] = .{ .name = "a", .ty = u32_ty, .span = span };
+    body_rows[assign_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = bump_body,
+        .is_allocating = false,
+    } };
+    body_rows[wrap_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = wrap_body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "compound_assign",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // A Rust debug build panics on `t += 4294967295; t += 2;`; `+%=` returned
+    // 1 in both gate modes instead.
+    const source = try emitRootSource(alloc, &rust_ir);
+    try std.testing.expect(std.mem.indexOf(u8, source, "x += a;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "x +%= a;") == null);
+    // `wrapping_add` is a binary expression, not an assignment, and keeps `%`.
+    try std.testing.expect(std.mem.indexOf(u8, source, "return a +% a;") != null);
+}
+
+test "lower: a sum over .iter() dereferences the by-pointer item" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const input_def = try addLowerEntity(&graph, .const_, "input", root_id);
+    const iter_def = try addLowerEntity(&graph, .method_ref, "iter", root_id);
+    const sum_fn = try addLowerEntity(&graph, .fn_, "byte_sum", root_id);
+    try addBareCrate(&graph, alloc, "iter_sum", root_id, &.{sum_fn});
+
+    const elem_ty: ir.types.Type = .{ .prim = .u8 };
+    const slice_info = try alloc.create(ir.types.Slice);
+    slice_info.* = .{ .const_ = true, .elem = elem_ty };
+    const slice_ty: ir.types.Type = .{ .slice = slice_info };
+    const sum_ty: ir.types.Type = .{ .prim = .u32 };
+    // 0 = u8, 1 = &[u8], 2 = u32
+    const types = [_]ir.types.Type{ elem_ty, slice_ty, sum_ty };
+
+    var model = Model.init(alloc);
+    const receiver = try model.e(.{ .path = .{ .def = input_def, .generic_args = &.{} } });
+    model.exprs.items[receiver].ty = 1;
+    const iter_call = try model.e(.{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .shared,
+        .method = iter_def,
+        .args = &.{},
+    } });
+    model.exprs.items[iter_call].ty = 1;
+    const chain = try model.e(.{ .iterator_chain = .{
+        .source = iter_call,
+        .adapters = &.{},
+        .terminal = .sum,
+    } });
+    model.exprs.items[chain].ty = 2;
+    const ret = try model.e(.{ .return_ = .{ .value = chain } });
+    model.exprs.items[ret].ty = 2;
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const params = try alloc.alloc(ir.items.Param, 1);
+    params[0] = .{ .name = "input", .ty = slice_ty, .span = span };
+    body_rows[sum_fn] = .{ .fn_ = .{
+        .params = params,
+        .ret = sum_ty,
+        .generic_params = &.{},
+        .body = ret,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "iter_sum",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // `input.iter()` walks `for (input[0..]) |*__r2z_item|`, so the item is a
+    // `*const u8` and `__r2z_sum: u32 += __r2z_item` was a type error — and a
+    // pointer-shaped sink would have silently summed addresses.
+    const source = try emitRootSource(alloc, &rust_ir);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__r2z_sum += __r2z_item.*;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__r2z_sum += __r2z_item;") == null);
+}
+
+test "lower: if let binds the subject and reads the payload back through r2z" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const x_def = try addLowerEntity(&graph, .const_, "x", root_id);
+    const v_def = try addLowerEntity(&graph, .const_, "v", root_id);
+    const some_def = try addLowerEntity(&graph, .enum_, "Option", root_id);
+    const pick_fn = try addLowerEntity(&graph, .fn_, "pick", root_id);
+    try addBareCrate(&graph, alloc, "if_let", root_id, &.{pick_fn});
+
+    const elem_ty: ir.types.Type = .{ .prim = .u8 };
+    const option_info = try alloc.create(ir.types.Type);
+    option_info.* = elem_ty;
+    const option_ty: ir.types.Type = .{ .option = option_info };
+    const types = [_]ir.types.Type{ elem_ty, option_ty };
+
+    var model = Model.init(alloc);
+    const bind_v = try model.pat(.{ .binding = .{
+        .name = "v",
+        .mode = .value,
+        .mutable = false,
+    } });
+    const some_fields = [_]ir.exprs.FieldPat{.{
+        .field = "0",
+        .pat = bind_v,
+        .shorthand = false,
+    }};
+    const some_pat = try model.pat(.{ .struct_pat = .{
+        .def = some_def,
+        .fields = &some_fields,
+        .rest = false,
+    } });
+    const scrutinee = try model.e(.{ .path = .{ .def = x_def, .generic_args = &.{} } });
+    model.exprs.items[scrutinee].ty = 1;
+    const then_tail = try model.e(.{ .path = .{ .def = v_def, .generic_args = &.{} } });
+    model.exprs.items[then_tail].ty = 0;
+    const then_body = try model.e(.{ .block = .{
+        .statements = &.{},
+        .tail = then_tail,
+        .labelled = null,
+    } });
+    const else_tail = try model.e(litInt(0));
+    model.exprs.items[else_tail].ty = 0;
+    const else_block = try model.e(.{ .block = .{
+        .statements = &.{},
+        .tail = else_tail,
+        .labelled = null,
+    } });
+    const pick = try model.e(.{ .if_let = .{
+        .pattern = some_pat,
+        .scrutinee = scrutinee,
+        .then_ = .{ .statements = &.{}, .tail = then_body, .labelled = null },
+        .@"else" = .{ .block = .{ .statements = &.{}, .tail = else_block, .labelled = null } },
+    } });
+    model.exprs.items[pick].ty = 0;
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const params = try alloc.alloc(ir.items.Param, 1);
+    params[0] = .{ .name = "x", .ty = option_ty, .span = span };
+    body_rows[pick_fn] = .{ .fn_ = .{
+        .params = params,
+        .ret = elem_ty,
+        .generic_params = &.{},
+        .body = pick,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "if_let",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // The subject was the scrutinee itself, so `if (x)` asked Zig for a `bool`
+    // over a `?u8` and `v` was never declared.
+    const source = try emitRootSource(alloc, &rust_ir);
+    try std.testing.expect(std.mem.indexOf(u8, source, "__r2z_if_let != null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.option.unwrap(__r2z_if_let)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const v = ") != null);
+}
+
+test "lower: a binding a local closure captures stays a var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const a_def = try addLowerEntity(&graph, .const_, "a", root_id);
+    const t_def = try addLowerEntity(&graph, .const_, "t", root_id);
+    const outer_fn = try addLowerEntity(&graph, .fn_, "outer", root_id);
+    try addBareCrate(&graph, alloc, "closure_capture", root_id, &.{outer_fn});
+
+    const u32_ty: ir.types.Type = .{ .prim = .u32 };
+    const types = [_]ir.types.Type{u32_ty};
+    var model = Model.init(alloc);
+
+    // `let mut t = a; let f = |x| { t += x; t }; ..`. The closure body is
+    // emitted at its call site, so the block's own statement list cannot show
+    // the assignment and the downgrade turned `t` into a `const`.
+    const closure_captures = [_]ir.exprs.Capture{.{
+        .name = "t",
+        .mode = .by_value,
+        .ty = 0,
+    }};
+    const closure = try model.e(.{ .closure = .{
+        .captures = &closure_captures,
+        .params = &.{},
+        .return_ty = null,
+        .body = .{ .statements = &.{}, .tail = null, .labelled = null },
+        .trait = .@"fn",
+    } });
+    const bind_t = try model.pat(.{ .binding = .{
+        .name = "t",
+        .mode = .value,
+        .mutable = true,
+    } });
+    const init_t = try model.e(.{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    model.exprs.items[init_t].ty = 0;
+    const let_t = try model.stmt(.{ .let = .{ .pattern = bind_t, .init = init_t, .ty = null } });
+    const bind_f = try model.pat(.{ .binding = .{
+        .name = "f",
+        .mode = .value,
+        .mutable = false,
+    } });
+    const let_f = try model.stmt(.{ .let = .{ .pattern = bind_f, .init = closure, .ty = null } });
+    const tail = try model.e(.{ .path = .{ .def = t_def, .generic_args = &.{} } });
+    model.exprs.items[tail].ty = 0;
+    const outer_statements = try alloc.alloc(ir.exprs.NodeId, 2);
+    outer_statements[0] = let_t;
+    outer_statements[1] = let_f;
+    const body = try model.e(.{ .block = .{
+        .statements = outer_statements,
+        .tail = tail,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const params = try alloc.alloc(ir.items.Param, 1);
+    params[0] = .{ .name = "a", .ty = u32_ty, .span = span };
+    body_rows[outer_fn] = .{ .fn_ = .{
+        .params = params,
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "closure_capture",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    const source = try emitRootSource(alloc, &rust_ir);
+    try std.testing.expect(std.mem.indexOf(u8, source, "var t: u32 = a;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const t: u32 = a;") == null);
+}
+
+test "lower: rev and count on a range refuse instead of calling a method Zig lacks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const count_def = try addLowerEntity(&graph, .method_ref, "count", root_id);
+    const count_fn = try addLowerEntity(&graph, .fn_, "counted", root_id);
+    try addBareCrate(&graph, alloc, "range_count", root_id, &.{count_fn});
+
+    const u32_ty: ir.types.Type = .{ .prim = .u32 };
+    const types = [_]ir.types.Type{u32_ty};
+    var model = Model.init(alloc);
+    const start = try model.e(litInt(0));
+    model.exprs.items[start].ty = 0;
+    const end = try model.e(litInt(10));
+    model.exprs.items[end].ty = 0;
+    const range = try model.e(.{ .range = .{
+        .start = start,
+        .end = end,
+        .inclusive = false,
+    } });
+    model.exprs.items[range].ty = 0;
+    const counted = try model.e(.{ .method_call = .{
+        .receiver = range,
+        .receiver_mode = .value,
+        .method = count_def,
+        .args = &.{},
+    } });
+    model.exprs.items[counted].ty = 0;
+    const ret = try model.e(.{ .return_ = .{ .value = counted } });
+    model.exprs.items[ret].ty = 0;
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[count_fn] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = u32_ty,
+        .generic_params = &.{},
+        .body = ret,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "range_count",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // `return (0..10).count();` has no Zig member behind it.
+    try std.testing.expectError(
+        error.UnsupportedStandardMethod,
+        lower.lowerRustIr(alloc, &rust_ir, null),
+    );
+}
+
+test "lower: indexing a Vec returned by an unpropagated call refuses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    const root_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const seed_def = try addLowerEntity(&graph, .const_, "seed", root_id);
+    const make_def = try addLowerEntity(&graph, .fn_, "make", root_id);
+    const head_fn = try addLowerEntity(&graph, .fn_, "head", root_id);
+    try addBareCrate(&graph, alloc, "vec_producer", root_id, &.{ make_def, head_fn });
+
+    const elem_ty: ir.types.Type = .{ .prim = .u32 };
+    const vec_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = &.{elem_ty},
+    } };
+    // 0 = u32, 1 = Vec<u32>
+    const types = [_]ir.types.Type{ elem_ty, vec_ty };
+    var model = Model.init(alloc);
+
+    // `fn make(seed: Vec<u32>) -> Vec<u32> { seed }`
+    const seed_path = try model.e(.{ .path = .{ .def = seed_def, .generic_args = &.{} } });
+    model.exprs.items[seed_path].ty = 1;
+    const make_ret = try model.e(.{ .return_ = .{ .value = seed_path } });
+    model.exprs.items[make_ret].ty = 1;
+
+    // `fn head() -> u32 { make(Vec::new())[0] }`
+    const producer = try model.e(.{ .call = .{
+        .call_kind = .{ .free = make_def },
+        .args = &.{},
+    } });
+    model.exprs.items[producer].ty = 1;
+    const index = try model.e(litInt(0));
+    model.exprs.items[index].ty = 0;
+    const read = try model.e(.{ .index = .{ .base = producer, .index = index } });
+    model.exprs.items[read].ty = 0;
+    const head_ret = try model.e(.{ .return_ = .{ .value = read } });
+    model.exprs.items[head_ret].ty = 0;
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const make_params = try alloc.alloc(ir.items.Param, 1);
+    make_params[0] = .{ .name = "seed", .ty = vec_ty, .span = span };
+    body_rows[make_def] = .{ .fn_ = .{
+        .params = make_params,
+        .ret = vec_ty,
+        .generic_params = &.{},
+        .body = make_ret,
+        .is_allocating = true,
+    } };
+    body_rows[head_fn] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = elem_ty,
+        .generic_params = &.{},
+        .body = head_ret,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "vec_producer",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+
+    // `make()[0]` projected `.items` onto a call whose Zig type is still the
+    // error union, so the member did not exist.
+    try std.testing.expectError(
+        error.UnsupportedExpression,
+        lower.lowerRustIr(alloc, &rust_ir, null),
+    );
 }

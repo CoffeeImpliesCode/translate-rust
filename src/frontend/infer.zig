@@ -5941,6 +5941,26 @@ fn finalizeCoreCallTypeArguments(
     }
 }
 
+/// Reason published for a cast whose operand carries no type at all, so the
+/// solver has no source type to check the destination against. `ir.validate`
+/// carries this text out to the caller, which is what turns an opaque
+/// `error.InvalidCast` into a diagnosis naming the construct.
+const unresolved_cast_operand_reason = "unresolved cast operand type";
+
+/// Replace a cast with a named refusal on the non-fatal channel.
+///
+/// The cast is not a wrong cast, it is an unresolved one: the frontend never
+/// typed the operand and never recorded a source type, so `isValidCast` has
+/// nothing to rule on and any verdict it returned would be a guess. Naming the
+/// expression is both safer than guessing and more useful than aborting the
+/// whole crate with an error that does not say which expression was at fault.
+fn markUntypedCastOperand(e: *exprs.Expr) void {
+    e.kind = .{ .unsupported = .{
+        .reason = unresolved_cast_operand_reason,
+        .suggested_version = .v1,
+    } };
+}
+
 /// Run unification solver on pre-computed constraint Gen over `b`.
 pub fn solveWithGen(
     alloc: std.mem.Allocator,
@@ -6095,16 +6115,28 @@ pub fn solveWithGen(
         const target_is_placeholder = isInferPlaceholderType(b.types[cast.target]);
         const target_is_resolved_wildcard = !target_is_placeholder and
             resolved_wildcards[cast.target];
-        if (std.meta.activeTag(cast.source_type) != .unsupported and
+        const source_type_is_unsupported = std.meta.activeTag(cast.source_type) == .unsupported;
+        if (!source_type_is_unsupported and
             !target_is_placeholder and !target_is_resolved_wildcard)
         {
             continue;
         }
 
-        const source_type_id: ?exprs.TypeId = if (std.meta.activeTag(cast.source_type) == .unsupported)
+        const source_type_id: ?exprs.TypeId = if (source_type_is_unsupported)
             if (cast.operand < result_types.len) result_types[cast.operand] else null
         else
             findTypeIndex(b, cast.source_type);
+        if (source_type_is_unsupported and source_type_id == null and
+            cast.operand < b.exprs.len and b.exprs[cast.operand].ty == null)
+        {
+            // Recorded source type still pending, nothing the solver produced
+            // for the operand, and no type ever interned on it. There is no
+            // source type here, so this cast is unresolved rather than wrong.
+            // Say so by name instead of aborting the crate with an error that
+            // does not identify the expression.
+            markUntypedCastOperand(&@constCast(b.exprs)[node]);
+            continue;
+        }
         const resolved_source_id = source_type_id orelse blk: {
             if (cast.operand < b.exprs.len) {
                 const operand_type = b.exprs[cast.operand].ty orelse return error.InvalidCast;
@@ -6145,7 +6177,7 @@ pub fn solveWithGen(
         if (resolved_source_id >= b.types.len or final_target_id >= b.types.len) {
             return error.InvalidCast;
         }
-        const source_type = if (std.meta.activeTag(cast.source_type) == .unsupported)
+        const source_type = if (source_type_is_unsupported)
             b.types[resolved_source_id]
         else
             cast.source_type;

@@ -4405,6 +4405,30 @@ const Lowerer = struct {
         try statements.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .block = block }) });
     }
 
+    /// Whether the item reaching the `sum` sink is still the by-pointer
+    /// capture of an `.iter()`/`.iter_mut()` chain.
+    ///
+    /// Such a chain lowers to `for (xs[0..]) |*item|`, so `item` is a
+    /// `*const T` while the accumulator is a `T`. `.map`, `.flat_map`,
+    /// `enumerate` and `zip` each replace the item with a value of their own,
+    /// so the sink derefs only while nothing upstream has already produced
+    /// one — which is why `.copied().map(..).filter().sum()` (a by-value
+    /// source) needs no deref and a bare `.iter().sum()` does.
+    fn iteratorSumItemIsReference(
+        self: *Lowerer,
+        chain: ir.exprs.IteratorChainExpr,
+        adapter_index: usize,
+    ) anyerror!bool {
+        if (!try self.iteratorSourceByReference(chain.source)) return false;
+        for (chain.adapters[0..adapter_index]) |adapter| switch (adapter) {
+            .map, .flat_map, .enumerate, .zip => return false,
+            // An unsupported adapter refuses before it reaches here, so the
+            // deref decision for one is never actually taken.
+            .filter, .range_rev, .other => {},
+        };
+        return true;
+    }
+
     fn appendIteratorSumTail(
         self: *Lowerer,
         chain: ir.exprs.IteratorChainExpr,
@@ -4415,9 +4439,13 @@ const Lowerer = struct {
         statements: *std.ArrayListUnmanaged(ast.Stmt),
     ) anyerror!void {
         if (adapter_index == chain.adapters.len) {
+            const sink_item: ast.Expr = if (try self.iteratorSumItemIsReference(chain, adapter_index))
+                .{ .unary_op = .{ .op = .deref, .operand = try self.allocExpr(item) } }
+            else
+                item;
             try statements.append(self.alloc, .{ .assign = .{
                 .target = .{ .ident = accumulator_name },
-                .val = item,
+                .val = sink_item,
                 .op = .add_assign,
             } });
             return;
@@ -6592,6 +6620,20 @@ const Lowerer = struct {
             }
         }
         return false;
+    }
+
+    /// Whether a lowered expression is a call whose error has not been
+    /// propagated, so its Zig type is still an error union.
+    fn isUnpropagatedErrorUnionExpr(expression: ast.Expr) bool {
+        return switch (expression) {
+            .call => true,
+            // `try f()` still carries the error union in its operand, and an
+            // `.items` after it applies the projection to that operand, so
+            // the walk follows both operators.
+            .unary_op => |unary| isUnpropagatedErrorUnionExpr(unary.operand.*),
+            .field_access => |field| isUnpropagatedErrorUnionExpr(field.target.*),
+            else => false,
+        };
     }
 
     fn binaryOperandNeedsDeref(
@@ -9074,6 +9116,24 @@ const Lowerer = struct {
         return error.UnsupportedStandardMethod;
     }
 
+    /// Iterator and range methods with no Zig counterpart. They must refuse
+    /// instead of falling through to a `receiver.method()` call Zig rejects.
+    fn isMissingIteratorMethod(method_name: []const u8) bool {
+        const names = [_][]const u8{ "rev", "count", "nth", "last", "position" };
+        for (names) |name| {
+            if (std.mem.eql(u8, method_name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Whether a method receiver is a bare range or an `r2z` iterator — the
+    /// two shapes with no Zig member surface for `rev`, `count` and friends.
+    fn isRangeOrRuntimeIteratorReceiver(self: *Lowerer, receiver_id: ir.exprs.NodeId) anyerror!bool {
+        if (receiver_id < self.ir.bodies.exprs.len and
+            self.ir.bodies.exprs[receiver_id].kind == .range) return true;
+        return self.isRuntimeIteratorInput(receiver_id);
+    }
+
     fn receiverIsPointerLike(self: *Lowerer, receiver_node: ir.exprs.NodeId) !bool {
         const receiver_type = try self.exprType(receiver_node) orelse return false;
         return switch (receiver_type) {
@@ -10599,22 +10659,35 @@ const Lowerer = struct {
         ));
 
         const expanded: ast.Expr = switch (method) {
+            // Zig cannot `switch` an optional, so the old `null => null,
+            // else => |p|` expansion emitted `switch (value)` over a `?T`
+            // and never compiled. The optional `if` carries the same two
+            // cases, and `r2z.option.unwrap` is the payload read-back the
+            // `match` path already uses.
             .option_map, .option_and_then => blk: {
-                const mapped = try self.lowerInlineClosureBody(closure.params[0], payload_name, body);
-                const arms = try self.alloc.alloc(ast.MatchArm, 2);
-                const null_pattern: ast.Pattern = .{ .lit = .null_lit };
-                arms[0] = .{
-                    .patterns = &.{null_pattern},
-                    .body = .{ .lit = .null_lit },
-                };
-                arms[1] = .{
-                    .patterns = &.{.wildcard},
-                    .capture = .{ .name = payload_name },
-                    .body = mapped,
-                };
-                break :blk .{ .match_expr = .{
-                    .target = value,
-                    .arms = arms,
+                var mapped = try self.lowerInlineClosureBody(closure.params[0], payload_name, body);
+                if (mapped != .block) return error.UnsupportedExpression;
+                try self.markRuntimeImport();
+                const unwrap_args = try self.alloc.alloc(ast.Expr, 1);
+                unwrap_args[0] = (try self.allocExpr(value.*)).*;
+                const rebind = try self.alloc.alloc(ast.Stmt, mapped.block.stmts.len + 1);
+                rebind[0] = .{ .let_stmt = .{
+                    .name = try self.alloc.dupe(u8, payload_name),
+                    .init = (try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .ident = "r2z.option.unwrap" }),
+                        .args = unwrap_args,
+                    } })).*,
+                } };
+                @memcpy(rebind[1..], mapped.block.stmts);
+                mapped.block.stmts = rebind;
+                break :blk .{ .if_expr = .{
+                    .cond = try self.allocExpr(.{ .bin_op = .{
+                        .op = .not_equal,
+                        .lhs = try self.allocExpr(value.*),
+                        .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+                    } }),
+                    .then_body = try self.allocExpr(mapped),
+                    .else_body = try self.allocExpr(.{ .lit = .null_lit }),
                 } };
             },
             .result_map, .result_map_err => blk: {
@@ -10787,6 +10860,55 @@ const Lowerer = struct {
         return .{ .block = .{ .stmts = statements, .expr = try self.allocExpr(body) } };
     }
 
+    /// The name an `if let P = ..` binds inside its then-branch.
+    ///
+    /// Only `Some(v)` / `Ok(v)` and their `_` forms name something the Zig
+    /// lowering can read back. A tuple, literal or or-pattern has no such
+    /// form, and an irrefutable `if let v = x` binds the whole subject rather
+    /// than a payload, which the read-back would get wrong — both refuse.
+    fn ifLetBindingName(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror![]const u8 {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        const inner: ir.exprs.NodeId = switch (self.ir.bodies.pats[pat_id].kind) {
+            .struct_pat => |sp| if (sp.fields.len != 1)
+                return error.UnsupportedPattern
+            else
+                sp.fields[0].pat orelse return error.UnsupportedPattern,
+            .external_variant => |variant| if (variant.fields.len != 1)
+                return error.UnsupportedPattern
+            else
+                variant.fields[0].pat orelse return error.UnsupportedPattern,
+            else => return error.UnsupportedPattern,
+        };
+        return switch (self.ir.bodies.pats[inner].kind) {
+            .binding => |binding| if (binding.name.len == 0)
+                error.MissingBindingName
+            else
+                binding.name,
+            .wildcard => "_",
+            else => error.UnsupportedPattern,
+        };
+    }
+
+    /// An `if let` subject, ready to bind: a reference is dereferenced so the
+    /// binding holds the optional rather than a pointer to it.
+    ///
+    /// Only an `Option` lowers here. A `Result` needs Zig's
+    /// `if (error_union) |payload|` capture, and `ast.IfExpr` has no capture
+    /// field, so it refuses instead of emitting a subject the `if` cannot
+    /// test.
+    fn lowerIfLetSubject(self: *Lowerer, scrutinee_id: ir.exprs.NodeId) anyerror!ast.Expr {
+        const scrutinee = try self.lowerExpr(scrutinee_id);
+        const subject_type = try self.exprType(scrutinee_id) orelse
+            return error.MissingExpressionType;
+        if (subject_type != .option and
+            self.canonicalExternalMethodType(subject_type) != .option)
+        {
+            return error.UnsupportedPattern;
+        }
+        if (subject_type != .reference) return scrutinee;
+        return .{ .unary_op = .{ .op = .deref, .operand = try self.allocExpr(scrutinee) } };
+    }
+
     pub fn lowerExpr(self: *Lowerer, expr_id: ir.exprs.NodeId) anyerror!ast.Expr {
         if (expr_id >= self.ir.bodies.exprs.len) {
             return error.MissingExpressionNode;
@@ -10885,21 +11007,59 @@ const Lowerer = struct {
                     },
                 };
             },
+            // `if let Some(v) = x` — Zig's `if` takes a `bool`, an optional or
+            // an error union, never a pattern, so the subject is bound once
+            // and the payload read back through the same `r2z.option.unwrap`
+            // the `match` path uses. `ast.IfExpr` has no capture field, which
+            // is why the pattern's name arrives as an ordinary `let`.
             .if_let => |il| blk: {
-                const cond = try self.allocExpr(try self.lowerExpr(il.scrutinee));
-                const then_expr = try self.allocExpr(ast.Expr{ .block = try self.lowerBlock(il.then_) });
+                const binding_name = try self.ifLetBindingName(il.pattern);
+                const subject_name = try self.iteratorTemporaryName("__r2z_if_let");
+                const subject = try self.lowerIfLetSubject(il.scrutinee);
+                var then_bindings: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer then_bindings.deinit(self.alloc);
+                try self.appendBlockBindingNames(il.then_.statements, &then_bindings);
+                for (then_bindings.items) |name| {
+                    if (std.mem.eql(u8, name, binding_name)) return error.UnsupportedPattern;
+                }
+                var then_block = try self.lowerBlock(il.then_);
+                const rebind = try self.alloc.alloc(ast.Stmt, then_block.stmts.len + 1);
+                const unwrap_args = try self.alloc.alloc(ast.Expr, 1);
+                unwrap_args[0] = .{ .ident = subject_name };
+                rebind[0] = .{ .let_stmt = .{
+                    .name = try self.alloc.dupe(u8, binding_name),
+                    .init = (try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .ident = "r2z.option.unwrap" }),
+                        .args = unwrap_args,
+                    } })).*,
+                } };
+                @memcpy(rebind[1..], then_block.stmts);
+                then_block.stmts = rebind;
+                try self.markRuntimeImport();
+                const cond = try self.allocExpr(.{ .bin_op = .{
+                    .op = .not_equal,
+                    .lhs = try self.allocExpr(.{ .ident = subject_name }),
+                    .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+                } });
                 const else_expr: ?*const ast.Expr = switch (il.@"else") {
                     .none => null,
-                    .block => |eb| try self.allocExpr(ast.Expr{ .block = try self.lowerBlock(eb) }),
+                    .block => |eb| try self.allocExpr(.{ .block = try self.lowerBlock(eb) }),
                     .chain => |chain_id| try self.allocExpr(try self.lowerExpr(chain_id)),
                 };
-                break :blk ast.Expr{
-                    .if_expr = .{
+                const statements = try self.alloc.alloc(ast.Stmt, 1);
+                statements[0] = .{ .let_stmt = .{
+                    .name = try self.alloc.dupe(u8, subject_name),
+                    .init = subject,
+                    .is_mut = false,
+                } };
+                break :blk (try self.allocExpr(.{ .block = .{
+                    .stmts = statements,
+                    .expr = try self.allocExpr(.{ .if_expr = .{
                         .cond = cond,
-                        .then_body = then_expr,
+                        .then_body = try self.allocExpr(.{ .block = then_block }),
                         .else_body = else_expr,
-                    },
-                };
+                    } }),
+                } })).*;
             },
             .match => |me| blk: {
                 const target = try self.allocExpr(try self.lowerExpr(me.scrutinee));
@@ -11244,7 +11404,18 @@ const Lowerer = struct {
                 const val = if (be.value) |v| try self.allocExpr(try self.lowerExpr(v)) else null;
                 break :blk ast.Expr{ .break_expr = val };
             },
-            .continue_ => ast.Expr{ .continue_expr = {} },
+            // Rust's `continue 'label` restarts an *outer* loop. Zig's
+            // `continue` always restarts the innermost one, so dropping the
+            // label silently targets the wrong loop and returns a different
+            // answer with no diagnostic. Emitting `:label` is not available
+            // here either: `ast.Expr.continue_expr` carries no label, and the
+            // IR only records a label for `loop` (via `BlockExpr.labelled`) —
+            // `ForExpr`/`WhileExpr` have no label field at all, so a labelled
+            // `for` has nowhere to put one. Refuse instead of guessing.
+            .continue_ => |continue_expr| blk: {
+                if (continue_expr.label != null) return error.UnsupportedLabelledControlFlow;
+                break :blk ast.Expr{ .continue_expr = {} };
+            },
             .core_call => |call| try self.lowerCoreCall(call),
             .core_function => |function| try self.lowerCoreFunction(function),
             .external_variant => |variant| try self.lowerExternalVariant(expr_id, variant),
@@ -11476,6 +11647,18 @@ const Lowerer = struct {
                 else if (blanket_call) |lowered|
                     try self.lowerDirectCallResult(expr_id, lowered, allocates)
                 else blk_call: {
+                    // `rev`/`count` and their siblings have no Zig member on
+                    // a range or an `r2z` iterator, so the fall-through below
+                    // emitted `range.count()` and Zig rejected the call with
+                    // "no field or member function named 'count'". A user
+                    // type's own method of the same name still goes through,
+                    // so the refusal is scoped to these two receivers.
+                    if (method_entity.kind == .method_ref and
+                        isMissingIteratorMethod(method_name) and
+                        try self.isRangeOrRuntimeIteratorReceiver(mc.receiver))
+                    {
+                        return error.UnsupportedStandardMethod;
+                    }
                     const call_args = if (allocates) alloc_args: {
                         const result = try self.alloc.alloc(ast.Expr, args.len + 1);
                         result[0] = .{ .ident = "allocator" };
@@ -11792,7 +11975,19 @@ const Lowerer = struct {
                 var base = try self.allocExpr(try self.lowerExpr(ie.base));
                 // A lowered `Vec` is an `ArrayListUnmanaged`; Zig indexes the
                 // storage it holds, so read through `.items` before indexing.
-                if (needsContainerStorageProjection(try self.exprType(ie.base))) {
+                const base_type = try self.exprType(ie.base);
+                if (needsContainerStorageProjection(base_type)) {
+                    // A `Vec` produced by a call is still an error union here:
+                    // `f()[0]` is lowered as a bare `f()` because Rust's `?`
+                    // already propagated, and `f().items` projects a member
+                    // the error union does not have. Hoisting the producer into
+                    // an owned temporary needs the `try` and `defer deinit`
+                    // that only statement position has, so refuse.
+                    if (base_type != null and self.resultUsesErrorUnion(base_type.?) or
+                        isUnpropagatedErrorUnionExpr(base.*))
+                    {
+                        return error.UnsupportedExpression;
+                    }
                     base = try self.allocExpr(.{ .field_access = .{
                         .target = base,
                         .field_name = "items",
@@ -12485,12 +12680,23 @@ const Lowerer = struct {
                 } else return error.InvalidTypeTraversal;
             }
         }
+        // Rust has no wrapping compound-assignment operator — `t +%= x` does
+        // not parse — so a compound assignment has exactly one overflow mode:
+        // the checked one, which panics in a debug build. `ts_ext.zig` records
+        // `.wrapping` on every `AssignExpr` regardless, and keying the Zig
+        // operator off that field emitted `+%=`/`-%=`/`*%=` for every `+=` in
+        // every crate: `t += 4294967295; t += 2;` panics in a Rust debug build
+        // and returns 1 here, undetected in either gate mode. Clamp once, so
+        // the native operator and `r2z.ops.assign` agree.
+        // `wrapping_add` and friends are method calls, so they keep their `+%`
+        // on the binary path and are untouched by this clamp.
+        const overflow: ir.exprs.Overflow = .checked;
         if (assignment.op != .plain and requiresRuntimeOperator(try self.exprType(assignment.target))) {
             const address: ast.Expr = .{ .unary_op = .{ .op = .addr_of, .operand = try self.allocExpr(target) } };
             return .{ .expr_stmt = try self.allocExpr(try self.lowerRuntimeOperator(
                 "assign",
                 @tagName(assignment.op),
-                assignment.overflow,
+                overflow,
                 address,
                 value,
             )) };
@@ -12501,12 +12707,11 @@ const Lowerer = struct {
             try self.lowerShiftAmount(value)
         else
             value;
-        const wrapping = assignment.overflow == .wrapping;
         const op: ast.AssignOp = switch (assignment.op) {
             .plain => .assign,
-            .add => if (wrapping) .add_assign_wrap else .add_assign,
-            .sub => if (wrapping) .sub_assign_wrap else .sub_assign,
-            .mul => if (wrapping) .mul_assign_wrap else .mul_assign,
+            .add => .add_assign,
+            .sub => .sub_assign,
+            .mul => .mul_assign,
             .div => .div_assign,
             .rem => .mod_assign,
             .bit_and => .bit_and_assign,
@@ -12601,37 +12806,15 @@ const Lowerer = struct {
                     },
                 };
             },
-            .let_else => |le| blk: {
-                if (le.pattern >= self.ir.bodies.pats.len) return error.MissingPatternNode;
-                const pat = self.ir.bodies.pats[le.pattern];
-                var pattern_target_id: ir.exprs.NodeId = le.pattern;
-                const binding = switch (pat.kind) {
-                    .binding => |b| b,
-                    .reference => |reference| blk_ref: {
-                        if (reference.inner >= self.ir.bodies.pats.len) {
-                            return error.MissingPatternNode;
-                        }
-                        pattern_target_id = reference.inner;
-                        break :blk_ref switch (self.ir.bodies.pats[reference.inner].kind) {
-                            .binding => |b| b,
-                            else => return error.UnsupportedPattern,
-                        };
-                    },
-                    else => return error.UnsupportedPattern,
-                };
-                if (binding.name.len == 0) return error.MissingBindingName;
-                const binding_name = if (self.current_local_binding_names) |names|
-                    try names.claimPatternName(self.alloc, &self.ir.graph.symbol_table, pattern_target_id, binding.name)
-                else
-                    binding.name;
-                const init_expr = try self.lowerExpr(le.init);
-                break :blk ast.Stmt{
-                    .let_stmt = .{
-                        .name = try self.alloc.dupe(u8, binding_name),
-                        .init = init_expr,
-                        .is_mut = false,
-                    },
-                };
+            // `let PAT = EXPR else { .. }` only ever has a refutable pattern,
+            // and none of those has the `ast.Stmt` form this branch could
+            // build: the only patterns it accepts below are irrefutable, and
+            // emitting one kept the binding and silently discarded
+            // `else_block`, so a `let .. else { return }` would fall through
+            // instead of diverging. Refuse until the else arm can be lowered.
+            .let_else => |le| {
+                _ = le;
+                return error.UnsupportedStatement;
             },
             .expr => |e_id| blk: {
                 if (e_id >= self.ir.bodies.exprs.len) return error.MissingExpressionNode;
@@ -13222,6 +13405,30 @@ const Lowerer = struct {
         };
     }
 
+    /// Whether a match-arm pattern contains a tuple pattern.
+    ///
+    /// A Zig switch prong has no tuple form. `.{a, b}` is only a `const`
+    /// destructuring pattern, so a tuple pattern in an arm emitted an invalid
+    /// prong and declared none of the names it mentioned — round 1's fix H in
+    /// pattern position rather than value position. Zig destructures a tuple
+    /// through a value capture on the switch *subject*, which the arm
+    /// lowering does not build, so the honest move is to refuse.
+    fn patternHasTupleElement(self: *Lowerer, pat_id: ir.exprs.NodeId, depth: usize) anyerror!bool {
+        if (depth >= 64) return error.UnsupportedPattern;
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        const fields: []const ir.exprs.FieldPat = switch (self.ir.bodies.pats[pat_id].kind) {
+            .tuple => return true,
+            .struct_pat => |sp| sp.fields,
+            .external_variant => |variant| variant.fields,
+            else => return false,
+        };
+        for (fields) |field| {
+            const inner = field.pat orelse continue;
+            if (try self.patternHasTupleElement(inner, depth + 1)) return true;
+        }
+        return false;
+    }
+
     /// Lower one match arm's pattern list. `ast.Pattern` has no or-pattern
     /// tag, so a top-level `a | b` becomes one `ast.Pattern` per alternative;
     /// `MatchArm.patterns` is a slice and the emitter prints those entries
@@ -13229,7 +13436,10 @@ const Lowerer = struct {
     fn lowerArmPatterns(self: *Lowerer, pat_ids: []const ir.exprs.NodeId) anyerror![]ast.Pattern {
         var lowered: std.ArrayListUnmanaged(ast.Pattern) = .empty;
         errdefer lowered.deinit(self.alloc);
-        for (pat_ids) |pat_id| try self.appendLoweredArmPattern(pat_id, &lowered);
+        for (pat_ids) |pat_id| {
+            if (try self.patternHasTupleElement(pat_id, 0)) return error.UnsupportedPattern;
+            try self.appendLoweredArmPattern(pat_id, &lowered);
+        }
         return lowered.toOwnedSlice(self.alloc);
     }
 
@@ -13443,11 +13653,49 @@ const Lowerer = struct {
         return true;
     }
 
+    /// Whether a local closure defined in this block captures `name`.
+    ///
+    /// A closure body is not part of the block's statement list — it is
+    /// emitted at the closure's call site — so `astMutatesBinding` cannot see
+    /// an assignment inside one, and the downgrade turned a `var` the closure
+    /// writes into a `const`. Keeping the `var` is always legal Zig, so an
+    /// over-broad answer here only costs a redundant keyword.
+    fn blockCapturesNameInClosure(
+        self: *Lowerer,
+        statements: []const ir.exprs.NodeId,
+        name: []const u8,
+    ) anyerror!bool {
+        for (statements) |stmt_id| {
+            if (stmt_id >= self.ir.bodies.stmts.len) return error.MissingStatementNode;
+            const let_stmt = switch (self.ir.bodies.stmts[stmt_id].kind) {
+                .let => |value| value,
+                else => continue,
+            };
+            const init_id = let_stmt.init orelse continue;
+            if (init_id >= self.ir.bodies.exprs.len) return error.MissingExpressionNode;
+            const closure = switch (self.ir.bodies.exprs[init_id].kind) {
+                .closure => |value| value,
+                else => continue,
+            };
+            for (closure.captures) |capture| {
+                if (std.mem.eql(u8, capture.name, name)) return true;
+            }
+        }
+        return false;
+    }
+
     fn astMutationTarget(expression: ast.Expr, name: []const u8, depth: usize) error{InvalidAstTraversal}!bool {
         if (depth >= 256) return error.InvalidAstTraversal;
         return switch (expression) {
             .ident => |identifier| std.mem.eql(u8, identifier, name),
             .field_access => |field| astMutationTarget(field.target.*, name, depth + 1),
+            .unary_op => |unary| if (unary.op == .addr_of or unary.op == .deref)
+                // `r2z.ops.assign(&t, v)` reaches the target through an
+                // address-of, which the old walk did not follow, so a
+                // big-integer `t += v` looked unmutated.
+                astMutationTarget(unary.operand.*, name, depth + 1)
+            else
+                false,
             .builtin => |builtin| if (std.mem.eql(u8, builtin.name, "index") and builtin.args.len > 0)
                 astMutationTarget(builtin.args[0], name, depth + 1)
             else
@@ -13695,7 +13943,9 @@ const Lowerer = struct {
         const label = if (be.labelled) |l| try self.alloc.dupe(u8, l) else null;
         const block: ast.Block = .{ .label = label, .stmts = stmts, .expr = tail_expr };
         for (stmts) |*statement| {
-            if (statement.* == .let_stmt and statement.let_stmt.is_mut) {
+            if (statement.* == .let_stmt and statement.let_stmt.is_mut and
+                !try self.blockCapturesNameInClosure(be.statements, statement.let_stmt.name))
+            {
                 statement.let_stmt.is_mut = try astMutatesBinding(block, statement.let_stmt.name, 0);
             }
         }
