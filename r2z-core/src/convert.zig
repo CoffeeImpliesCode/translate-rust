@@ -169,13 +169,13 @@ pub fn try_from(comptime Target: type, value: anytype) Result(Target, Error(@Typ
 }
 
 test "fallible integer conversion preserves Rust range boundaries" {
-    try std.testing.expectEqual(@as(u8, 255), try_from(u8, @as(u16, 255)).unwrap());
+    try std.testing.expectEqual(@as(u8, 255), try_from(u8, @as(u16, 255)).unwrap(std.testing.allocator));
     try std.testing.expect(try_from(u8, @as(u16, 256)).is_err());
     try std.testing.expect(try_from(u64, @as(i64, -1)).is_err());
-    try std.testing.expectEqual(@as(i8, -128), try_from(i8, @as(i16, -128)).unwrap());
+    try std.testing.expectEqual(@as(i8, -128), try_from(i8, @as(i16, -128)).unwrap(std.testing.allocator));
     try std.testing.expect(try_from(i8, @as(i16, -129)).is_err());
-    try std.testing.expectEqual(@as(u16, 255), try_from(u16, @as(u8, 255)).unwrap());
-    try std.testing.expectEqual(@as(i32, 17), try_from(i32, @as(i32, 17)).unwrap());
+    try std.testing.expectEqual(@as(u16, 255), try_from(u16, @as(u8, 255)).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(i32, 17), try_from(i32, @as(i32, 17)).unwrap(std.testing.allocator));
 }
 
 test "default_value matches Rust primitive defaults" {

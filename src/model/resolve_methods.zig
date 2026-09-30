@@ -1,7 +1,5 @@
 //! resolve_methods — Method, Trait, Operator and Constructor resolution (P4).
 //!
-//! See notes/design/source-model-type-inference.md §3.3 + §5 (P4).
-//!
 //! After type inference gives concrete receiver types (P3), this pass
 //! resolves method calls (`r.m(args)`), constructors (`T::new(...)`),
 //! operators (`+`, `*`, `^`, ...), and trait implementations against:

@@ -43,6 +43,88 @@ const ShadowScope = struct {
     names: []const []const u8,
     parent: ?*const ShadowScope,
 };
+/// One `match` arm's lowered body and guard, both lowered under the shadow
+/// scope of the bindings its own pattern introduces.
+const LoweredMatchArm = struct {
+    value: ast.Expr,
+    guard: ?*const ast.Expr,
+};
+/// One `match` arm's lowered selectors plus the reference capture it needs.
+const LoweredMatchSelectors = struct {
+    patterns: []ast.Pattern,
+    capture: ?ast.Capture,
+};
+/// The mutable alias a `match` arm's owned payload is released through.
+///
+/// The emitter writes a by-value payload capture as `|name|`, so Zig makes that
+/// binding `const` and nothing this lowering emits can make it mutable. The
+/// alias is the arm's own mutable owner of the same storage, and the arm body
+/// is lowered to read the alias: a helper that transfers the payload in place
+/// then receives the `*T` it needs, and the release finds an alias the
+/// transfer already emptied.
+const OwnedCaptureAlias = struct {
+    /// The source name of the payload binding, which is the key
+    /// `activeClosureCaptureOverride` resolves.
+    source_name: []const u8,
+    /// The name the emitter gives the capture, which the alias is built from.
+    capture_name: []const u8,
+    /// The mutable alias the arm body reads and the release frees.
+    alias_name: []const u8,
+    /// The payload's own Rust type, which is what the runtime transfer is
+    /// instantiated with.
+    payload_type: ir.types.Type,
+};
+/// An owned payload alias together with the reads of it that hand the
+/// payload on rather than borrow it.
+const OwnedCaptureMove = struct {
+    alias: OwnedCaptureAlias,
+    /// Expression ids whose VALUE IS the payload, so reading one transfers
+    /// the owner and has to empty the alias to do it.
+    sites: std.AutoHashMapUnmanaged(ir.exprs.NodeId, void),
+};
+/// One arm of the ordered chain a guarded `match` lowers to.
+///
+/// The arm is lowered before the chain's label exists, because whether any arm
+/// carries a result is what says whether the chain needs a label at all, and
+/// that cannot be known until every arm is in hand.
+const GuardChainArm = struct {
+    patterns: []ast.Pattern,
+    capture: ?ast.Capture,
+    /// Field bindings, and the optional payload read-back, that must run
+    /// before the guard reads a name the arm's own pattern introduced.
+    prelude: []const ast.Stmt,
+    guard: ?*const ast.Expr,
+    value: ast.Expr,
+    /// A refutable payload pattern nested inside this arm's selector, which
+    /// becomes one more ordered dispatch instead of one unconditional read.
+    nested: ?*const NestedPayloadDispatch,
+};
+
+/// Bound recursive payload-pattern traversal before building dispatch nodes.
+const nested_pattern_depth_limit: usize = 32;
+
+/// A payload pattern the arm's OWN dispatch cannot express.
+///
+/// Zig's switch prong writes the tag of a struct pattern and drops its fields,
+/// and the emitter has no place to put a second test. `Err(IoError(e))` names
+/// a variant INSIDE the payload of `Err`, so the arm needs the outer tag and
+/// then the inner one — and the binding is only valid once the inner tag
+/// matches, because reading a union field that is not active is what Zig
+/// refuses.
+///
+/// It becomes one more ordered dispatch rather than one unconditional read: a
+/// payload of another variant falls out of the prong and reaches the arms Rust
+/// lists after this one, exactly as an arm whose guard failed does.
+const NestedPayloadDispatch = struct {
+    /// The selected payload from the enclosing prong.
+    subject: *const ast.Expr,
+    /// Selectors for the nested payload — the inner tag and its own binding.
+    selectors: []ast.Pattern,
+    /// The nested pattern's OWN field bindings, read out of its payload.
+    bindings: []const ast.Stmt,
+    /// A deeper dispatch, when this payload's pattern names a payload too.
+    inner: ?*const NestedPayloadDispatch,
+};
 const LocalClosureCaptureSnapshot = struct {
     source_name: []const u8,
     snapshot_name: []const u8,
@@ -176,14 +258,28 @@ const LocalBindingNames = struct {
         pat_id: ir.exprs.NodeId,
         name: []const u8,
     ) ![]const u8 {
+        return self.claimPatternAlias(allocator, symbol_table, pat_id, name, null);
+    }
+
+    fn claimPatternAlias(
+        self: *LocalBindingNames,
+        allocator: std.mem.Allocator,
+        symbol_table: *const ir.spine.SymbolTable,
+        pat_id: ir.exprs.NodeId,
+        name: []const u8,
+        canonical: ?[]const u8,
+    ) ![]const u8 {
         if (self.emitted_by_pattern.get(pat_id)) |existing| {
             return existing;
         }
         const def = self.claimLocal(symbol_table, name);
-        const emitted = if (def) |d|
+        const emitted = canonical orelse if (def) |d|
             self.emitted_by_entity.get(d) orelse name
         else
             name;
+        if (canonical != null) {
+            if (def) |d| try self.emitted_by_entity.put(allocator, d, emitted);
+        }
         try self.emitted_by_pattern.put(allocator, pat_id, emitted);
         return emitted;
     }
@@ -193,6 +289,42 @@ const TraitDescriptorRequest = struct {
     owner_module_id: ir.spine.EntityId,
     name: []const u8,
 };
+
+/// Moves a loop's source label off its body block and onto the loop.
+///
+/// The IR records the label where the parser puts it, on the block that holds
+/// the loop's body, but a label belongs to the loop: Zig can only label a loop
+/// from outside it, and a labelled exit names the loop rather than any block
+/// inside it. Leaving the label on the body would make the emitter label the
+/// body, which stops `continue 'label` from reaching the loop at all.
+fn takeLoopLabel(body: *ast.Block) ?[]const u8 {
+    const label = body.label;
+    body.label = null;
+    return label;
+}
+
+/// Move a loop body's tail expression into its statement list.
+///
+/// A Rust `for`, `while` and `loop` body is `()`: whatever its last
+/// expression evaluates to, the iteration performs it and throws the value
+/// away. Zig would instead read that tail as the loop BODY BLOCK's value,
+/// which is a different thing — it makes the body a labelled block whose
+/// `break` carries an expression no one asked for — and every loop shape that
+/// rebuilds the body as a statement list (the runtime-iterator `while`, the
+/// typed range loop, the iterator adapter sink) drops it entirely. The
+/// statement is what the source means, so it is made once here, on the one
+/// path every loop lowering takes, and it runs exactly once per iteration.
+fn takeLoopTailAsStatement(
+    allocator: std.mem.Allocator,
+    body: *ast.Block,
+) std.mem.Allocator.Error!void {
+    const tail = body.expr orelse return;
+    body.expr = null;
+    const statements = try allocator.alloc(ast.Stmt, body.stmts.len + 1);
+    @memcpy(statements[0..body.stmts.len], body.stmts);
+    statements[body.stmts.len] = .{ .expr_stmt = tail };
+    body.stmts = statements;
+}
 
 fn allocationAssertionCondition(
     reason: []const u8,
@@ -211,6 +343,271 @@ fn allocationAssertionCondition(
     return condition;
 }
 
+/// Whether an external nominal path is the one a second path names, however
+/// the source spelled either of them (`std` versus `core`, and so on).
+fn externalPathEqual(path: []const []const u8, expected: []const []const u8) bool {
+    if (path.len != expected.len) return false;
+    for (path, expected) |actual, wanted| {
+        if (!std.mem.eql(u8, actual, wanted)) return false;
+    }
+    return true;
+}
+
+/// The Zig error set a standard error type lowers to, or null when it lowers
+/// to an ordinary runtime type.
+///
+/// This is the one answer to "is this error a set", shared by the type
+/// lowering that spells the union and by every constructor, `?` and match that
+/// has to decide whether the error lives bare or in a tagged `Result`.
+fn externalErrorSetName(ty: ir.types.Type) ?[]const u8 {
+    const external = switch (ty) {
+        .external_nominal => |value| value,
+        else => return null,
+    };
+    if (external.args.len != 0) return null;
+    if (!externalPathEqual(external.path, &.{ "core", "fmt", "Error" }) and
+        !externalPathEqual(external.path, &.{ "std", "fmt", "Error" }))
+    {
+        return null;
+    }
+    return "std.Io.Writer.Error";
+}
+
+/// The `Result` shape a type names, whatever carrier the IR used to spell it.
+///
+/// `std::fmt::Result` IS `Result<(), std::fmt::Error>`; the type lowering
+/// writes that alias straight to an error union instead of through a
+/// descriptor, so a caller that wants the ok/err pair `Ok`/`Err` and `?` read
+/// has to be told the same thing here. Everything else is the descriptor the
+/// frontend recorded.
+fn resultDescriptorOf(ty: ir.types.Type) ?ir.types.Result {
+    return switch (ty) {
+        .result => |descriptor| descriptor.*,
+        .external_nominal => |external| blk: {
+            if (external.args.len != 0) break :blk null;
+            if (!externalPathEqual(external.path, &.{ "core", "fmt", "Result" }) and
+                !externalPathEqual(external.path, &.{ "std", "fmt", "Result" }))
+            {
+                break :blk null;
+            }
+            break :blk .{
+                .ok = .{ .tuple = &.{} },
+                .err = .{ .external_nominal = .{
+                    .path = &.{ "std", "fmt", "Error" },
+                    .args = &.{},
+                } },
+                .is_error_unionable = true,
+            };
+        },
+        else => null,
+    };
+}
+
+/// The type declaration an entity's `impl` methods belong to, or null when its
+/// parent names no type.
+///
+/// An inherent `impl Target` and a trait `impl Trait for Target` are both
+/// parented to `Target`, so `collectHoistedMethods` and the struct-body
+/// question answer through this one rule. Any other parent — a block-local
+/// helper, whose parent is a function — hoists nothing, and an `impl` with no
+/// parent at all is the one shape that is not "no target": it is refused by
+/// the caller rather than skipped.
+fn hoistTargetFor(parent_ent: ir.spine.Entity) ?ir.spine.EntityId {
+    return switch (parent_ent.kind) {
+        .struct_, .enum_, .union_ => parent_ent.id,
+        .impl_ => parent_ent.parent,
+        else => null,
+    };
+}
+
+/// Whether a hoist target is a type this crate DECLARES, so its methods can
+/// live inside it as Zig struct members.
+///
+/// `hoistTargetFor` answers with the impl's own parent, which for a top-level
+/// `impl Trait for ForeignType` is the enclosing MODULE. A module is not a
+/// type, so the declarations collected under it are module-scope free
+/// functions, and a call site has to name them rather than reach for a member
+/// the receiver's own type never had.
+fn isDeclaredTypeTarget(ent: ir.spine.Entity) bool {
+    return switch (ent.kind) {
+        .struct_, .enum_, .union_ => true,
+        else => false,
+    };
+}
+
+/// The declaration id of a method that was hoisted to MODULE scope, or null
+/// when it stayed a member of a type this crate declares.
+///
+/// `impl From<PercentDecode> for Cow<[u8]>` has no struct to collect its
+/// `from` into: the self type is an external type, so the function is emitted
+/// at module scope under a name of its own and takes the converted value as
+/// its first declared parameter. The same is true of any two impl blocks that
+/// declare the same method name for different self types — the later one is a
+/// different function and gets its own name — so this is a property of the
+/// hoist, never of the spelling.
+fn moduleHoistedImplMethod(
+    self: *const Lowerer,
+    method: ir.spine.EntityId,
+) ?ir.spine.EntityId {
+    const entity = self.ir.graph.symbol_table.get(method) orelse return null;
+    if (entity.kind != .fn_) return null;
+    const impl_id = entity.parent orelse return null;
+    const impl_entity = self.ir.graph.symbol_table.get(impl_id) orelse return null;
+    if (impl_entity.kind != .impl_) return null;
+    const target_id = hoistTargetFor(impl_entity) orelse return null;
+    const target = self.ir.graph.symbol_table.get(target_id) orelse return null;
+    if (isDeclaredTypeTarget(target)) return null;
+    if (self.hoisted_method_names.get(method) == null) return null;
+    return method;
+}
+
+/// Whether a hoisted module-scope function takes its self value by address.
+///
+/// A `fn method(&self, ..)` declares a pointer parameter, so a free-function
+/// call site has to hand over the address a member call would have taken
+/// implicitly; a `fn method(self, ..)` declares the value itself and is handed
+/// it as is. Only the impl's own self type answers, so an ordinary first
+/// parameter is never mistaken for the receiver.
+fn hoistedSelfParameterIsBorrow(
+    self: *const Lowerer,
+    method: ir.spine.EntityId,
+) bool {
+    if (method >= self.ir.bodies.bodies.len) return false;
+    const function = switch (self.ir.bodies.bodies[method]) {
+        .fn_ => |body| body,
+        else => return false,
+    };
+    if (function.params.len == 0) return false;
+    const entity = self.ir.graph.symbol_table.get(method) orelse return false;
+    const impl_id = entity.parent orelse return false;
+    const impl_entity = self.ir.graph.symbol_table.get(impl_id) orelse return false;
+    const impl_body = implBodyFor(self.ir.bodies.bodies, impl_entity) orelse return false;
+    return switch (function.params[0].ty) {
+        .reference => |reference| Lowerer.typeEquals(reference.pointee, impl_body.self_ty),
+        .raw_ptr => |pointer| Lowerer.typeEquals(pointer.pointee, impl_body.self_ty),
+        else => false,
+    };
+}
+
+/// The body of an `impl` block, or null when `ent` is not one.
+fn implBodyFor(bodies: []const ir.bodies.BodyKind, ent: ir.spine.Entity) ?ir.bodies.ImplBody {
+    if (ent.kind != .impl_) return null;
+    if (ent.id >= bodies.len) return null;
+    return switch (bodies[ent.id]) {
+        .impl_ => |body| body,
+        else => null,
+    };
+}
+
+/// Whether `ty` is the runtime's OWNED `String` — the one conversion target
+/// whose construction takes the enclosing callable's allocator, because it
+/// copies the bytes it borrows. `str`, `&str` and every non-allocation type
+/// are not it, and a `From` into one of those allocates nothing at all.
+fn isOwnedStringType(ty: ir.types.Type) bool {
+    return switch (ty) {
+        .external_nominal => |external| external.args.len == 0 and
+            (externalPathEqual(external.path, &.{ "alloc", "string", "String" }) or
+                externalPathEqual(external.path, &.{ "std", "string", "String" })),
+        else => false,
+    };
+}
+
+/// Whether `ty` is Rust's `str` primitive or a BORROW of it.
+///
+/// `&str` reaches the backend as `.reference{ .pointee = str_type }`: the
+/// frontend preserves the borrow rather than erasing it to the pointee, and
+/// only `lowerType` collapses the pair back into one `[]const u8`. Every
+/// reader that asks "is this the `str` primitive?" has to answer for the
+/// borrow too, or a method the source called on a `&str` is refused for
+/// wanting a type it does have. `&[u8]` is a DIFFERENT IR type that happens
+/// to share the Zig ABI, and `&mut str` is still `str`, so neither is
+/// confused with the other here.
+fn canonicalBorrowedStr(ty: ir.types.Type) bool {
+    if (ir.types.isStr(ty)) return true;
+    return switch (ty) {
+        .reference => |reference| ir.types.isStr(reference.pointee),
+        else => false,
+    };
+}
+
+/// Whether `lowerType` renders a borrow of `pointee` AS the borrow itself.
+///
+/// Rust's `&str` and `&[T]` borrow a fat pointer, and Zig spells both as a
+/// slice, so there is no pointee behind them to read out of. A `&T` for a
+/// sized `T` lowers to `*const T` and does have one.
+fn isSliceShapedBorrow(pointee: ir.types.Type) bool {
+    return switch (pointee) {
+        .external_nominal => ir.types.isStr(pointee),
+        .slice => true,
+        else => false,
+    };
+}
+
+/// Whether `ty` is a BORROW of an array, so the array itself is reached
+/// through an address rather than held.
+///
+/// `&[T; N]` is a thin pointer to sized storage, so `lowerType` keeps it as
+/// `*const [N] T` — the address the source's `&'static` promised, and the
+/// only way a hoisted `static` still names the same bytes every time. An
+/// index into it therefore reads through the pointer rather than out of the
+/// pointer. A raw pointer is left alone: Zig already indexes a `[*] T` by
+/// itself, and it is a different carrier with its own rules.
+fn borrowPointsAtArray(ty: ?ir.types.Type) bool {
+    const concrete = ty orelse return false;
+    return switch (concrete) {
+        .reference => |reference| reference.pointee == .array,
+        else => false,
+    };
+}
+
+/// Whether `path` is a fully written-out EXTERNAL path for exactly the trait
+/// at `wanted`.
+///
+/// Every segment must carry no entity id, and that is the whole proof: the
+/// frontend resolves every name this crate declares to an entity, so a path
+/// with no ids at all reaches outside the crate and its spelling is its
+/// identity. A crate's own `Read` is written `Read` and resolves, so it can
+/// never answer here, and no comparison is made on a bare leaf name. The
+/// root segment answers for `std` and `core` alike because std re-exports
+/// core, which is the substitution `boundPathMatches` makes at index zero.
+fn externalBoundPathIs(path: ir.types.Path, wanted: []const []const u8) bool {
+    if (path.segments.len != wanted.len) return false;
+    for (path.segments, wanted, 0..) |segment, expected, index| {
+        if (segment.id != null) return false;
+        if (index == 0 and
+            (std.mem.eql(u8, expected, "std") or std.mem.eql(u8, expected, "core")) and
+            (std.mem.eql(u8, segment.name, "std") or std.mem.eql(u8, segment.name, "core")))
+        {
+            continue;
+        }
+        if (!std.mem.eql(u8, segment.name, expected)) return false;
+    }
+    return true;
+}
+
+/// Whether a core call allocates.
+///
+/// `String::from(..)` and `Vec::from(..)` both arrive as `convert_from` with an
+/// owned container target, and the backend builds each with the matching
+/// runtime copy helper and the call site's allocator. An effect scan that
+/// misses either declares no allocator where the body asks for one, and every
+/// call to that function is then emitted one argument short — with no `try` for
+/// an error union the declaration does not have either. So the scan and the
+/// lowering have to agree on the same set of targets, or the scan widens.
+fn coreCallAllocates(call: ir.exprs.CoreCall) bool {
+    if (call.function == .string_from_utf8_lossy) return true;
+    if (call.function != .convert_from) return false;
+    if (call.generic_args.len != 1) return false;
+    const target = call.generic_args[0];
+    if (isOwnedStringType(target)) return true;
+    const external = switch (target) {
+        .external_nominal => |value| value,
+        else => return false,
+    };
+    return external.args.len == 1 and
+        externalPathEqual(external.path, &.{ "alloc", "vec", "Vec" });
+}
+
 /// Analyze allocation effects in the source body graph without lowering it.
 /// The call graph is resolved in the IR, so direct free, associated, and
 /// method calls can be followed before declaration order becomes observable.
@@ -218,13 +615,27 @@ const AllocationEffectScanner = struct {
     exprs: []const ir.exprs.Expr,
     stmts: []const ir.exprs.Statement,
     effects: []const bool,
+    /// Comparisons that bind an owned operand, indexed by `ir.exprs.NodeId`.
+    /// `bindComparisonOperand` releases each one through
+    /// `r2z.alloc.dropTemporary(allocator, ..)`, which names the enclosing
+    /// allocator. Nothing in the call graph records that, and it is decided
+    /// while the declaration is lowered — long after every call site has
+    /// already been settled from `effects`. Empty when not computed.
+    comparison_temporaries: []const bool,
 
     fn exprAllocates(self: *const AllocationEffectScanner, node_id: ir.exprs.NodeId) bool {
         if (@as(usize, node_id) >= self.exprs.len) return false;
         return switch (self.exprs[node_id].kind) {
             .literal, .path, .unit, .continue_, .panic_ => false,
             .array => |array| self.nodeListAllocates(array.elements),
-            .vec_lit => |vec| self.nodeListAllocates(vec.elements),
+            // A `vec!` literal always allocates: it appends into a fresh
+            // `ArrayListUnmanaged` and hands the buffer back through
+            // `deinit(allocator)`, so the enclosing callable needs the
+            // allocator threaded in even when every element is a literal.
+            // Scanning only the elements, as an array literal is scanned,
+            // let `vec![1, 2, 3]` emit `append(allocator, ..)` into a
+            // function that had no allocator binding at all.
+            .vec_lit => true,
             .range => |range| self.exprAllocates(range.start) or
                 (if (range.end) |end| self.exprAllocates(end) else false),
             .block => |block| self.blockAllocates(block),
@@ -247,7 +658,7 @@ const AllocationEffectScanner = struct {
                 false,
             .call => |call| self.callTargetAllocates(call.call_kind) or
                 self.nodeListAllocates(call.args),
-            .core_call => |call| call.function == .string_from_utf8_lossy or self.nodeListAllocates(call.args),
+            .core_call => |call| coreCallAllocates(call) or self.nodeListAllocates(call.args),
             .core_function => false,
             .external_variant => |variant| blk: {
                 if (self.nodeListAllocates(variant.tuple_fields)) break :blk true;
@@ -266,7 +677,13 @@ const AllocationEffectScanner = struct {
             .field => |field| self.exprAllocates(field.base),
             .index => |index| self.exprAllocates(index.base) or self.exprAllocates(index.index),
             .cast => |cast| self.exprAllocates(cast.operand),
-            .binary => |binary| self.exprAllocates(binary.lhs) or self.exprAllocates(binary.rhs),
+            // An `==`/`!=` between owned rvalues binds each operand and
+            // releases it with `r2z.alloc.dropTemporary`, which names the
+            // enclosing allocator. The call graph records nothing about
+            // that, so the scan reads the verdict the lowering itself
+            // reaches rather than deciding ownership a second time.
+            .binary => |binary| self.comparisonOwnsTemporary(node_id) or
+                self.exprAllocates(binary.lhs) or self.exprAllocates(binary.rhs),
             .unary => |unary| self.exprAllocates(unary.operand),
             .assign => |assign| self.exprAllocates(assign.target) or self.exprAllocates(assign.value),
             .try_ => |try_expr| self.exprAllocates(try_expr.inner),
@@ -421,11 +838,32 @@ const AllocationEffectScanner = struct {
         if (@as(usize, target) >= self.effects.len) return false;
         return self.effects[target];
     }
+
+    /// Whether the comparison at `node_id` binds an owned operand, so
+    /// lowering it releases that operand with `dropTemporary` and names the
+    /// allocator the enclosing callable therefore declares.
+    fn comparisonOwnsTemporary(
+        self: *const AllocationEffectScanner,
+        node_id: ir.exprs.NodeId,
+    ) bool {
+        if (@as(usize, node_id) >= self.comparison_temporaries.len) return false;
+        return self.comparison_temporaries[node_id];
+    }
 };
 
 const ModuleImportKey = struct {
     importing: ir.spine.EntityId,
     target: ir.spine.EntityId,
+};
+
+/// A relative `@import` a generated file names, under whichever spelling it
+/// ended up with. A private `mod` keeps an `ast.Import`; a `pub mod` is
+/// promoted to a `pub const name = @import("./name.zig")` decl before any
+/// later pass sees the file, so both name the same edge and both have to be
+/// readable.
+const ReachableModuleRef = struct {
+    local_name: []const u8,
+    module_or_path: []const u8,
 };
 const StdImportDemand = struct {
     fn isQualifiedStdName(name: []const u8) bool {
@@ -521,7 +959,7 @@ const StdImportDemand = struct {
 
     fn exprRequiresStd(expr: ast.Expr) bool {
         return switch (expr) {
-            .lit, .unit, .unsupported, .panic_, .continue_expr => false,
+            .lit, .unit, .unsupported, .panic_, .continue_expr, .unreachable_ => false,
             .ident => |name| isQualifiedStdName(name),
             .field_access => |field_access| startsStdNamespace(expr) or
                 exprRequiresStd(field_access.target.*),
@@ -586,7 +1024,10 @@ const StdImportDemand = struct {
             .range => |range| exprRequiresStd(range.start.*) or
                 (if (range.end) |end| exprRequiresStd(end.*) else false),
             .return_expr => |value| if (value) |expr_value| exprRequiresStd(expr_value.*) else false,
-            .break_expr => |value| if (value) |expr_value| exprRequiresStd(expr_value.*) else false,
+            .break_expr => |break_expr| if (break_expr.value) |expr_value|
+                exprRequiresStd(expr_value.*)
+            else
+                false,
         };
     }
 
@@ -727,13 +1168,30 @@ const Lowerer = struct {
     current_return_type: ?ir.types.Type = null,
     /// Stable allocation effects computed before any declaration is lowered.
     allocation_effects: ?[]bool = null,
+    /// Comparisons that bind an owned operand, indexed by `ir.exprs.NodeId`.
+    /// Decided from the same `comparisonTemporaryType` the lowering asks, so
+    /// a callable the scan called allocating and the caller that threads the
+    /// allocator to it cannot disagree.
+    comparison_temporaries: ?[]const bool = null,
     /// Allocation effect accumulated while lowering the current callable.
     current_callable_is_allocating: bool = false,
+    /// How deep the current chain of "what type does this name hold" answers
+    /// runs. Valid Rust cannot build a cycle here — a binding is never read
+    /// before its own `let` — but the walk follows initialisers, so the depth
+    /// is bounded rather than trusted.
+    value_entity_depth: usize = 0,
     /// Type parameters an enclosing `impl` binds that a module-hoisted method
     /// has to declare itself. A blanket `impl<T: Bound> Trait for T` has no
     /// declaration body for its self type, so its methods land at module scope
     /// where nothing else binds `T` — yet the receiver still spells `&T`.
     hoisted_impl_generic_params: []const []const u8 = &.{},
+    /// Module-scope entities a DIFFERENT module names. Rust's `private` means
+    /// "this module and its descendants", and every Rust `mod` becomes its own
+    /// Zig file, so a private item a descendant uses has to be `pub` in the
+    /// emitted file or the child cannot reach it. Collected before any
+    /// declaration is lowered, because the reference is recorded while the
+    /// referring module is lowered and a root declaration is already built.
+    cross_module_refs: std.AutoHashMapUnmanaged(ir.spine.EntityId, void) = .empty,
     /// Direct call expression currently lowered by an explicit source `try`.
     explicit_try_expr: ?ir.exprs.NodeId = null,
     /// An explicit floating-point function result supplies the expected type
@@ -743,12 +1201,36 @@ const Lowerer = struct {
     expected_argument_type: ?ir.types.Type = null,
     /// Source expression node receiving the active expected argument type.
     expected_argument_expr_id: ?ir.exprs.NodeId = null,
+    /// Rust type the surrounding expression requires of the value currently
+    /// being lowered, for a node the frontend left untyped. Zig spells a
+    /// literal with its type name (`[_]u8{...}`, `.{ a, b }`) and a Rust
+    /// array or tuple literal the frontend did not annotate has no way to
+    /// supply one on its own. Wherever the lowerer has already worked out
+    /// what a value is — the element type of a `Vec<T>` it is building, the
+    /// arm of a `Result` it is filling, the self type of a blanket impl it
+    /// is about to call — that answer is recorded here and read back by
+    /// `nodeType`, which prefers the node's own annotation and falls back
+    /// here.
+    expected_value_type: ?ir.types.Type = null,
+    /// The `collect` whose adapter chain is being lowered, when that collect
+    /// builds a `Result`. A `?` inside an adapter body — inside the `map`
+    /// closure Rust inlines into the loop — is an ordinary Rust error the
+    /// collection reports, so it has to leave the collection rather than
+    /// return from the enclosing function: a `collect` in let or argument
+    /// position has no function to leave, and a `return` there would take the
+    /// wrong one. Set only while the adapters are lowered, because a `?` in
+    /// the source expression is a function-level propagation in Rust too.
+    current_collector: ?Collector = null,
     /// Statement-local owner acquisitions emitted before the current statement.
     current_owner_prelude: ?*std.ArrayListUnmanaged(ast.Stmt) = null,
     /// Names reserved while lowering the current statement.
     current_owner_reserved: ?*std.ArrayListUnmanaged([]const u8) = null,
     /// Parameter bindings visible while lowering the current callable body.
     current_parameter_names: []const ast.FnParam = &.{},
+    /// Parameters the current callable passed as an immutable copy, beside
+    /// the body bindings those copies feed. Empty unless the callable's body
+    /// needed mutable storage for one of its parameters.
+    current_mutable_copies: []const MutableCopyBinding = &.{},
     /// Declaration name visible while lowering the current callable body.
     current_callable_name: ?[]const u8 = null,
     /// EntityId of the function or method currently being lowered.
@@ -771,6 +1253,9 @@ const Lowerer = struct {
     next_iterator_capture_id: usize = 0,
     /// Capture names currently resolved to a local closure snapshot.
     active_closure_capture_overrides: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// The owned payload alias the arm being lowered reads, and the reads of
+    /// it that transfer ownership. Null outside an arm that binds one.
+    active_owned_capture_move: ?OwnedCaptureMove = null,
     /// Stable module-level names for function-local `static` items.
     local_static_names: std.AutoHashMapUnmanaged(ir.spine.EntityId, []const u8) = .empty,
 
@@ -783,10 +1268,12 @@ const Lowerer = struct {
     /// output under a name that is not always its source name, so a call site
     /// resolves through this map rather than through `renamed_to`.
     hoisted_method_names: std.AutoHashMapUnmanaged(ir.spine.EntityId, []const u8) = .empty,
-    /// Target EntityId → source method name → self-type key of the impl that
-    /// already claimed the name on that target. It is what separates a second
-    /// impl block for the SAME self type, which collapses, from an impl for a
-    /// different one, which must be emitted beside it.
+    /// Target EntityId → emitted method name → the identity of the impl that
+    /// claimed it there. Two impl blocks that declare the SAME function — the
+    /// same self type and the same trait instantiation — collapse onto one
+    /// declaration; two that declare the same method name for DIFFERENT
+    /// reasons are different functions, and each is emitted under a name of
+    /// its own.
     hoisted_self_type_keys: std.AutoHashMapUnmanaged(ir.spine.EntityId, std.StringHashMapUnmanaged([]const u8)) = .empty,
     /// Struct EntityId → source field name → emitted field name. Only a field
     /// that collides with a method on the same struct appears; Zig has one
@@ -857,6 +1344,54 @@ const Lowerer = struct {
         return fallback;
     }
 
+    /// Comparisons that bind an owned operand, indexed by `ir.exprs.NodeId`.
+    ///
+    /// `bindComparisonOperand` releases a comparison's temporaries with
+    /// `r2z.alloc.dropTemporary(allocator, ..)` while the declaration is
+    /// lowered, but every call site was settled from `allocation_effects`
+    /// before that happened. A callee whose declaration takes an allocator
+    /// its callers never pass is emitted one argument short, with no `try`
+    /// for the error union the declaration does have: the body compiles to
+    /// `temporary_user_error_equal(allocator) !bool` and its `#[test]` calls
+    /// `temporary_user_error_equal()`.
+    ///
+    /// Only `==` and `!=` are considered. `lowerBorrowedComparison` hands
+    /// every other operator straight to the runtime without binding an
+    /// operand, and an operand that needs a temporary drop is a container —
+    /// never a primitive — so `requiresRuntimeComparison` is already true
+    /// wherever one is owned. A borrowed named owner and a scalar answer
+    /// `null` in `comparisonTemporaryType` and ask for nothing here.
+    ///
+    /// The expression table is flat and dense, so every comparison is
+    /// reachable by walking it once; no body needs traversing twice.
+    ///
+    /// This runs once, over the flat table, with no callable in scope:
+    /// `current_callable_id`, `expected_value_type` and every other ambient
+    /// input `lowerBorrowedComparison` will have is still null. The verdict
+    /// therefore has to come out of the expression graph alone, or the mask
+    /// and the declaration disagree and the allocator the declaration
+    /// declares reaches no call site. `declaredBindingType` is what keeps it
+    /// honest — a parameter is read from the body that declares it, not from
+    /// whichever callable happens to be lowering.
+    fn computeComparisonTemporaries(self: *Lowerer) ![]const bool {
+        const owned = try self.alloc.alloc(bool, self.ir.bodies.exprs.len);
+        errdefer self.alloc.free(owned);
+        @memset(owned, false);
+        for (self.ir.bodies.exprs, 0..) |expr, node_id| {
+            const binary = switch (expr.kind) {
+                .binary => |value| value,
+                else => continue,
+            };
+            if (binary.op != .eq and binary.op != .ne) continue;
+            if ((try self.comparisonTemporaryType(binary.lhs)) != null or
+                (try self.comparisonTemporaryType(binary.rhs)) != null)
+            {
+                owned[node_id] = true;
+            }
+        }
+        return owned;
+    }
+
     fn computeAllocationEffects(self: *Lowerer) !void {
         if (self.allocation_effects != null) return;
 
@@ -864,14 +1399,36 @@ const Lowerer = struct {
             self.ir.graph.symbol_table.count(),
             self.ir.bodies.bodies.len,
         );
+        const comparison_temporaries = try self.computeComparisonTemporaries();
+        errdefer self.alloc.free(comparison_temporaries);
+
         const effects = try self.alloc.alloc(bool, effect_count);
         errdefer self.alloc.free(effects);
         for (effects) |*effect| effect.* = false;
+
+        // A recognised standard method has no declaration body to scan, so the
+        // fixed point below can never discover it: both its seeding loop and
+        // its propagation loop only ever SET effects for `.fn_` entities, while
+        // `methodTargetAllocates` reads `effects[target]` for whatever a call
+        // names. `String::push` may reallocate the buffer it appends to, so its
+        // method reference is marked here — which is what every call site of it
+        // reads when it decides whether the callee takes an allocator.
+        for (self.ir.bodies.exprs) |expression| {
+            const method_call = switch (expression.kind) {
+                .method_call => |value| value,
+                else => continue,
+            };
+            if (method_call.method >= effects.len) continue;
+            if (try self.stdMethodCallAllocates(method_call)) {
+                effects[method_call.method] = true;
+            }
+        }
 
         const direct_scanner: AllocationEffectScanner = .{
             .exprs = self.ir.bodies.exprs,
             .stmts = self.ir.bodies.stmts,
             .effects = &.{},
+            .comparison_temporaries = comparison_temporaries,
         };
 
         for (self.ir.graph.symbol_table.entities.items) |entity| {
@@ -902,7 +1459,13 @@ const Lowerer = struct {
                 else => continue,
             };
             for (structure.methods) |method| {
-                if (!method.is_allocating and !direct_scanner.exprAllocates(method.body)) {
+                if (!method.is_allocating and !direct_scanner.exprAllocates(method.body) and
+                    !try self.bodyConvertsErrorThroughAllocatingFrom(
+                        method.body,
+                        method.ret,
+                        effects,
+                    ))
+                {
                     continue;
                 }
                 if (self.methodEntityForDefinition(owner.id, method)) |method_id| {
@@ -915,6 +1478,7 @@ const Lowerer = struct {
             .exprs = self.ir.bodies.exprs,
             .stmts = self.ir.bodies.stmts,
             .effects = effects,
+            .comparison_temporaries = comparison_temporaries,
         };
 
         // Each round can turn at least one callable from false to true. The
@@ -930,7 +1494,9 @@ const Lowerer = struct {
                     else => continue,
                 };
                 if (effects[entity.id]) continue;
-                if (scanner.exprAllocates(body.body)) {
+                if (scanner.exprAllocates(body.body) or
+                    try self.bodyConvertsErrorThroughAllocatingFrom(body.body, body.ret, effects))
+                {
                     effects[entity.id] = true;
                     changed = true;
                 }
@@ -939,6 +1505,104 @@ const Lowerer = struct {
         }
 
         self.allocation_effects = effects;
+        self.comparison_temporaries = comparison_temporaries;
+    }
+
+    /// Whether a recognised standard method lowers to a runtime helper that
+    /// takes the enclosing allocator.
+    ///
+    /// These are exactly the `lowerStdMethodCall` arms that hand an
+    /// `allocator` on: each may grow or build owned storage, so a callable
+    /// that reaches one declares an allocator and every callable that calls
+    /// it passes one. `clone` is the one receiver-dependent name, and
+    /// `stdMethodCallAllocates` is what asks the receiver-dependent question.
+    fn takesAllocator(method: RecognizedStdMethod) bool {
+        return switch (method) {
+            .borrowed_to_owned,
+            .cow_to_owned,
+            .string_push,
+            .string_push_str,
+            .vec_push,
+            .vec_extend,
+            .io_write_all,
+            .iterator_collect,
+            .error_union_expect_err,
+            .to_string,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Whether this method call reaches an allocating standard helper.
+    ///
+    /// `Clone` is in the canonical set for the receiver that owns storage
+    /// and for no other: the runtime's deep copy allocates, while a plain
+    /// copy of a value that owns nothing duplicates no allocation.
+    fn stdMethodCallAllocates(self: *Lowerer, method_call: ir.exprs.MethodCall) !bool {
+        const method = self.ir.graph.symbol_table.get(method_call.method) orelse return false;
+        const recognized = try self.lookupRecognizedStdMethod(method_call.receiver, method.name) orelse
+            return false;
+        if (recognized == .clone) return self.isCowReceiver(method_call.receiver);
+        return takesAllocator(recognized);
+    }
+
+    /// Whether a callable's `?` reaches a `From` conversion that allocates.
+    ///
+    /// The conversion is a call this backend invents, not one the IR carries:
+    /// Rust wrote `?` and the crate wrote the `impl From<..> for ..`, and
+    /// nothing in the expression tree names the `fn from`. So the effect pass
+    /// asks the question the source asks — which conversion would this `?`
+    /// run, and does that declaration allocate — because a callable's header
+    /// decides its allocator parameter from this table, before any body is
+    /// lowered. Without it the emitted conversion would name an `allocator`
+    /// the declaration never took.
+    ///
+    /// `effects` is the table as it stands, so the question is asked again in
+    /// every round: a `from` that only becomes allocating later still reaches
+    /// its caller once the fixed point gets there.
+    fn bodyConvertsErrorThroughAllocatingFrom(
+        self: *Lowerer,
+        body: ir.exprs.NodeId,
+        ret: ir.types.Type,
+        effects: []const bool,
+    ) anyerror!bool {
+        const ret_result = switch (ret) {
+            .result => |value| value.*,
+            else => return false,
+        };
+        var walker = try ir.exprs.NodeWalker.init(
+            self.alloc,
+            self.ir.bodies.exprs,
+            self.ir.bodies.stmts,
+            self.ir.bodies.pats,
+            self.ir.bodies.types,
+        );
+        defer walker.deinit();
+        walker.reset(body) catch return false;
+        while (walker.next() catch null) |node| {
+            const expr_id = switch (node) {
+                .expression => |id| id,
+                else => continue,
+            };
+            if (expr_id >= self.ir.bodies.exprs.len) continue;
+            const inner = switch (self.ir.bodies.exprs[expr_id].kind) {
+                .try_ => |value| value.inner,
+                else => continue,
+            };
+            const operand_type = (try self.exprType(inner)) orelse continue;
+            const operand_result = switch (operand_type) {
+                .result => |value| value.*,
+                else => continue,
+            };
+            // The same error type is Rust's identity conversion: no call runs,
+            // so no allocator is needed.
+            if (typeEquals(operand_result.err, ret_result.err)) continue;
+            const from_id = self.userFromConversion(operand_result.err, ret_result.err) orelse
+                continue;
+            if (from_id < effects.len and effects[from_id]) return true;
+            if (self.directCallAllocates(from_id)) return true;
+        }
+        return false;
     }
 
     fn allocType(self: *Lowerer, t: ast.Type) !*const ast.Type {
@@ -1411,6 +2075,21 @@ const Lowerer = struct {
             try path_index.put(self.alloc, file.path, index);
         }
 
+        // One list of relative imports per file, collected before anything is
+        // derived from it so the edge graph and the emitted references cannot
+        // disagree about what a file imports.
+        var module_refs = try self.alloc.alloc([]ReachableModuleRef, files.items.len);
+        defer {
+            for (module_refs) |refs| self.alloc.free(refs);
+            self.alloc.free(module_refs);
+        }
+        for (files.items, 0..) |file, index| {
+            var refs: std.ArrayListUnmanaged(ReachableModuleRef) = .empty;
+            defer refs.deinit(self.alloc);
+            try self.appendReachableModuleRefs(file, &refs);
+            module_refs[index] = try refs.toOwnedSlice(self.alloc);
+        }
+
         // Resolve each file's relative imports to package file indices.
         var edges = try self.alloc.alloc([]usize, files.items.len);
         defer {
@@ -1420,12 +2099,12 @@ const Lowerer = struct {
         for (files.items, 0..) |file, index| {
             var targets: std.ArrayListUnmanaged(usize) = .empty;
             defer targets.deinit(self.alloc);
-            for (file.imports) |import| {
-                if (!std.mem.endsWith(u8, import.module_or_path, ".zig")) continue;
+            for (module_refs[index]) |ref| {
+                if (!std.mem.endsWith(u8, ref.module_or_path, ".zig")) continue;
                 const dir = std.fs.path.dirname(file.path) orelse continue;
                 const resolved = try std.fs.path.resolve(
                     self.alloc,
-                    &.{ dir, import.module_or_path },
+                    &.{ dir, ref.module_or_path },
                 );
                 defer self.alloc.free(resolved);
                 const target = path_index.get(resolved) orelse continue;
@@ -1464,17 +2143,17 @@ const Lowerer = struct {
             }
         }
 
-        for (files.items) |*file| {
+        for (files.items, 0..) |*file, index| {
             var refs: std.ArrayListUnmanaged(ast.TestDecl) = .empty;
             defer refs.deinit(self.alloc);
             var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
             defer seen.deinit(self.alloc);
-            for (file.imports) |import| {
-                if (!std.mem.endsWith(u8, import.module_or_path, ".zig")) continue;
+            for (module_refs[index]) |ref| {
+                if (!std.mem.endsWith(u8, ref.module_or_path, ".zig")) continue;
                 const dir = std.fs.path.dirname(file.path) orelse continue;
                 const resolved = try std.fs.path.resolve(
                     self.alloc,
-                    &.{ dir, import.module_or_path },
+                    &.{ dir, ref.module_or_path },
                 );
                 defer self.alloc.free(resolved);
                 const target = path_index.get(resolved) orelse continue;
@@ -1487,10 +2166,10 @@ const Lowerer = struct {
                 const name = try std.fmt.allocPrint(
                     self.alloc,
                     "translated tests reachable through {s}",
-                    .{import.module_or_path},
+                    .{ref.module_or_path},
                 );
                 const operand = try self.alloc.create(ast.Expr);
-                operand.* = .{ .ident = import.local_name };
+                operand.* = .{ .ident = ref.local_name };
                 const discard = try self.alloc.create(ast.Expr);
                 discard.* = .{ .ident = "_" };
                 const stmts = try self.alloc.alloc(ast.Stmt, 1);
@@ -1534,6 +2213,53 @@ const Lowerer = struct {
         }
     }
 
+    /// Collect every relative `@import` a generated file names, whether it
+    /// ended up in the import list or as a promoted re-export decl.
+    ///
+    /// `promotePublicModuleImportsToReExports` runs while the file is being
+    /// lowered, which is before `appendTestReachabilityRefs`, and it moves
+    /// every `pub mod` out of `file.imports` and into a `pub const name =
+    /// @import("./name.zig")` decl. Reading the import list alone therefore
+    /// loses exactly the public submodules, and with them the one reference
+    /// that made Zig analyze those files: a top-level `const` is not analyzed
+    /// until something uses it, so a submodule that no other file names would
+    /// compile away and take its tests with it.
+    fn appendReachableModuleRefs(
+        self: *Lowerer,
+        file: ast.File,
+        out: *std.ArrayListUnmanaged(ReachableModuleRef),
+    ) !void {
+        for (file.imports) |import| {
+            try out.append(self.alloc, .{
+                .local_name = import.local_name,
+                .module_or_path = import.module_or_path,
+            });
+        }
+        for (file.decls) |decl| {
+            const binding = switch (decl) {
+                .const_decl => |value| value,
+                else => continue,
+            };
+            const call = switch (binding.init) {
+                .builtin => |value| value,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, call.name, "import")) continue;
+            if (call.args.len != 1) continue;
+            const path = switch (call.args[0]) {
+                .lit => |lit| switch (lit) {
+                    .str => |value| value,
+                    else => continue,
+                },
+                else => continue,
+            };
+            try out.append(self.alloc, .{
+                .local_name = binding.name,
+                .module_or_path = path,
+            });
+        }
+    }
+
     pub fn lowerPackage(self: *Lowerer) !ast.Package {
         defer self.local_static_names.deinit(self.alloc);
         try self.prepareLocalStaticNames();
@@ -1545,6 +2271,8 @@ const Lowerer = struct {
         defer self.pending_module_imports.deinit(self.alloc);
         try self.computeAllocationEffects();
         defer if (self.allocation_effects) |effects| self.alloc.free(effects);
+        defer if (self.comparison_temporaries) |owned| self.alloc.free(owned);
+        try self.collectCrossModuleRefs();
         try self.collectHoistedMethods();
         // Hoisting decides which method names land on each struct, so the
         // field/method collision pass has to read the finished lists.
@@ -1583,6 +2311,7 @@ const Lowerer = struct {
     }
 
     fn collectHoistedMethods(self: *Lowerer) !void {
+        try self.claimStructRenderedMethodNames();
         const count = self.ir.graph.symbol_table.count();
         for (0..count) |idx| {
             const entity_id: ir.spine.EntityId = @intCast(idx);
@@ -1596,30 +2325,47 @@ const Lowerer = struct {
                     return error.MissingParentId;
                 };
 
-                const target_id: ?ir.spine.EntityId = blk: {
-                    if (parent_ent.kind == .struct_ or
-                        parent_ent.kind == .enum_ or
-                        parent_ent.kind == .union_)
-                    {
-                        break :blk parent_id;
-                    }
-                    if (parent_ent.kind == .impl_) {
-                        break :blk parent_ent.parent orelse return error.MissingParentId;
-                    }
-                    break :blk null;
-                };
+                if (parent_ent.kind == .impl_ and parent_ent.parent == null) {
+                    return error.MissingParentId;
+                }
+                const target_id: ?ir.spine.EntityId = hoistTargetFor(parent_ent);
                 if (target_id) |tid| {
                     _ = self.ir.graph.symbol_table.get(tid) orelse return error.MissingDefinition;
-                    // A method already registered on the target's StructBody
-                    // is rendered directly from `StructBody.methods` by
-                    // `lowerEntityDecl`; skip re-hoisting its `.fn_` entity to
-                    // avoid a duplicate declaration in the emitted struct.
-                    if (try self.isStructMethodRegistered(tid, ent.name)) continue;
+                    // `target_id` is non-null, so the parent really is a
+                    // type declaration or an `impl`: only a hoist decision
+                    // needs a real self type behind it. Checked here rather
+                    // than at the top of the loop, because a free function in
+                    // a nested module is parented to that `.module` entity and
+                    // never reaches this block. Without the check an impl
+                    // whose own parent is neither a type declaration nor a
+                    // crate module hoists a stray free function.
+                    try self.validateMethodTopology(ent);
+                    // A method the target's `StructBody` renders itself is
+                    // emitted inside the struct straight from
+                    // `StructBody.methods`, so re-hoisting that same `.fn_`
+                    // entity would declare the function twice. `StructBody`
+                    // keeps ONE method per name, so only the declaration that
+                    // entry records is that one: any other impl block declaring
+                    // the same name is a different function and is emitted
+                    // beside it under a name of its own.
+                    if (self.structBodyRendersMethod(tid, entity_id, ent.name)) {
+                        // The source name is this declaration's. It is normally
+                        // already claimed, by `claimStructRenderedMethodNames`
+                        // before anything was hoisted; this covers the one case
+                        // that cannot be claimed up front, an entry whose
+                        // recorded body names no declaration at all. The
+                        // declaration kept there is the FIRST one for this
+                        // name, so this claim still lands before any other impl
+                        // block reaches the name.
+                        _ = try self.claimHoistedName(tid, ent.name, parent_ent);
+                        continue;
+                    }
                     // Both inherent (`impl Target`) and trait (`impl Trait for
                     // Target`) blocks collect methods onto the target here.
-                    // Two impl blocks that name the same self type contribute
-                    // the same function, so they collapse; two that name
-                    // different self types are distinct functions and the
+                    // Two impl blocks that declare the SAME function — the
+                    // same self type AND the same trait instantiation —
+                    // collapse onto one; two that declare the same method name
+                    // for different reasons are distinct functions and the
                     // later one is emitted under a name of its own.
                     const emitted_name = try self.hoistedMethodName(tid, parent_ent, ent.name);
                     if (self.isHoistedMethodRegistered(tid, emitted_name)) continue;
@@ -1644,34 +2390,389 @@ const Lowerer = struct {
         }
     }
 
-    /// The name a method called `name` is emitted under on `tid`.
+    /// Claim the source name of every method a struct body renders, before any
+    /// impl method is hoisted.
+    ///
+    /// `collectHoistedMethods` visits entities in symbol-table order, and the
+    /// declaration a struct renders is the one its entry RECORDS — which is
+    /// whichever impl block had its body extracted last, not the first to
+    /// declare the name. Claiming on the visit instead would let an earlier
+    /// impl block take the plain source name for itself, and the struct's own
+    /// method would then be emitted beside a hoisted one under the same name.
+    /// Claiming up front means every impl method that is not the recorded owner
+    /// already sees the name as taken and takes a name of its own.
+    fn claimStructRenderedMethodNames(self: *Lowerer) !void {
+        const entity_count = self.ir.graph.symbol_table.count();
+        for (0..self.ir.bodies.bodies.len) |index| {
+            if (index >= entity_count) break;
+            const target_id: ir.spine.EntityId = @intCast(index);
+            const struct_body = switch (self.ir.bodies.bodies[target_id]) {
+                .struct_ => |sb| sb,
+                else => continue,
+            };
+            for (struct_body.methods) |method| {
+                const owner = self.recordedMethodOwner(target_id, method.name, method.body) orelse
+                    continue;
+                const owner_entity = self.ir.graph.symbol_table.get(owner) orelse continue;
+                const impl_id = owner_entity.parent orelse continue;
+                const impl_entity = self.ir.graph.symbol_table.get(impl_id) orelse continue;
+                _ = try self.claimHoistedName(target_id, method.name, impl_entity);
+            }
+        }
+    }
+
+    /// Errors the cross-module scan can raise: allocation, plus the two IR
+    /// lookups `owningModuleEntity` performs. Spelled out because the walker
+    /// is mutually recursive, and two inferred error sets that call each other
+    /// are a dependency loop the compiler cannot resolve.
+    const CrossModuleScanError = error{
+        OutOfMemory,
+        ModuleHierarchyCycle,
+        MissingEntityId,
+    };
+    /// Record every entity a module names that belongs to a DIFFERENT module.
+    ///
+    /// Rust visibility is a property of the module tree, not of the file: a
+    /// `private` item is reachable from its module and every descendant. The
+    /// emitter gives each `mod` its own file, and a Zig file is a hard module
+    /// boundary, so a `mod test` calling a private `fn generate_iter` in the
+    /// crate root is legal Rust and an illegal `root.generate_iter(5)` unless
+    /// that declaration is `pub`.
+    ///
+    /// The scan runs over the whole expression table once, keyed by the module
+    /// that owns each node, and it must run before ANY declaration is lowered:
+    /// the reference is only seen while the referring module is lowered, and
+    /// the crate root — which owns the item — is lowered first.
+    fn collectCrossModuleRefs(self: *Lowerer) CrossModuleScanError!void {
+        const visited = try self.alloc.alloc(bool, self.ir.bodies.exprs.len);
+        defer self.alloc.free(visited);
+        @memset(visited, false);
+        const count = self.ir.graph.symbol_table.count();
+        for (0..count) |idx| {
+            const entity_id: ir.spine.EntityId = @intCast(idx);
+            if (entity_id >= self.ir.bodies.bodies.len) continue;
+            const owner = (try self.owningModuleEntity(entity_id)) orelse continue;
+            switch (self.ir.bodies.bodies[entity_id]) {
+                .fn_ => |fn_body| try self.recordCrossModuleRefs(fn_body.body, owner, visited),
+                .const_ => |const_body| try self.recordCrossModuleRefs(const_body.init, owner, visited),
+                else => {},
+            }
+        }
+    }
+
+    fn isCrossModuleRef(self: *const Lowerer, entity_id: ir.spine.EntityId) bool {
+        return self.cross_module_refs.contains(entity_id);
+    }
+
+    /// Whether a Rust-`private` module-scope item has to be `pub` in Zig.
+    ///
+    /// Rust's `private` means "this module and its descendants", and every
+    /// Rust `mod` becomes its own Zig file, so a descendant cannot see a
+    /// non-`pub` declaration. Outside the crate root the emitter already
+    /// publishes everything, since a child file may reach for any of it. At
+    /// the root that is only true of an item another module actually names,
+    /// which `cross_module_refs` records: `mod test` calling a private
+    /// `generate_iter` makes it `pub`, while a private helper nothing else
+    /// mentions stays private and does not widen the generated package's API.
+    fn privateItemIsPublished(self: *const Lowerer, entity_id: ir.spine.EntityId) bool {
+        return !self.current_file_is_root or self.isCrossModuleRef(entity_id);
+    }
+
+    /// Note `def` when it names something in another module, then walk the
+    /// node's children. A statement node is a node in a different table, so it
+    /// is followed here too rather than at the call site.
+    fn recordCrossModuleRefs(
+        self: *Lowerer,
+        node: ir.exprs.NodeId,
+        owner: ir.spine.EntityId,
+        visited: []bool,
+    ) CrossModuleScanError!void {
+        if (node >= self.ir.bodies.exprs.len) return;
+        if (visited[node]) return;
+        visited[node] = true;
+        try self.noteCrossModuleRef(node, owner);
+        switch (self.ir.bodies.exprs[node].kind) {
+            .array => |array| try self.recordRefList(array.elements, owner, visited),
+            .vec_lit => |vec| try self.recordRefList(vec.elements, owner, visited),
+            .range => |range| {
+                try self.recordCrossModuleRefs(range.start, owner, visited);
+                if (range.end) |end| try self.recordCrossModuleRefs(end, owner, visited);
+            },
+            .block => |block| try self.recordBlockRefs(block, owner, visited),
+            .if_else => |if_else| {
+                try self.recordCrossModuleRefs(if_else.cond, owner, visited);
+                try self.recordBlockRefs(if_else.then_, owner, visited);
+                switch (if_else.@"else") {
+                    .none, .block => {},
+                    .chain => |chain| try self.recordCrossModuleRefs(chain, owner, visited),
+                }
+            },
+            .if_let => |if_let| {
+                try self.recordCrossModuleRefs(if_let.scrutinee, owner, visited);
+                try self.recordBlockRefs(if_let.then_, owner, visited);
+                switch (if_let.@"else") {
+                    .none, .block => {},
+                    .chain => |chain| try self.recordCrossModuleRefs(chain, owner, visited),
+                }
+            },
+            .match => |match| {
+                try self.recordCrossModuleRefs(match.scrutinee, owner, visited);
+                for (match.arms) |arm| {
+                    if (arm.guard) |guard| try self.recordCrossModuleRefs(guard, owner, visited);
+                    try self.recordCrossModuleRefs(arm.body, owner, visited);
+                }
+            },
+            .loop_ => |loop_expr| try self.recordBlockRefs(loop_expr.body, owner, visited),
+            .while_ => |while_expr| {
+                try self.recordCrossModuleRefs(while_expr.cond, owner, visited);
+                try self.recordBlockRefs(while_expr.body, owner, visited);
+            },
+            .for_ => |for_expr| {
+                try self.recordCrossModuleRefs(for_expr.iterable, owner, visited);
+                try self.recordBlockRefs(for_expr.body, owner, visited);
+            },
+            .break_ => |break_expr| {
+                if (break_expr.value) |value| try self.recordCrossModuleRefs(value, owner, visited);
+            },
+            .call => |call| try self.recordRefList(call.args, owner, visited),
+            .core_call => |call| try self.recordRefList(call.args, owner, visited),
+            .method_call => |method| {
+                try self.recordCrossModuleRefs(method.receiver, owner, visited);
+                try self.recordRefList(method.args, owner, visited);
+            },
+            .struct_lit => |literal| {
+                for (literal.fields) |field| {
+                    try self.recordCrossModuleRefs(field.value, owner, visited);
+                }
+                if (literal.base) |base| try self.recordCrossModuleRefs(base, owner, visited);
+            },
+            .enum_variant => |variant| {
+                try self.recordRefList(variant.tuple_fields, owner, visited);
+                for (variant.named_fields) |field| {
+                    try self.recordCrossModuleRefs(field.value, owner, visited);
+                }
+            },
+            .format_write => |format| {
+                try self.recordCrossModuleRefs(format.writer, owner, visited);
+                try self.recordRefList(format.args, owner, visited);
+            },
+            .field => |field| try self.recordCrossModuleRefs(field.base, owner, visited),
+            .index => |index| {
+                try self.recordCrossModuleRefs(index.base, owner, visited);
+                try self.recordCrossModuleRefs(index.index, owner, visited);
+            },
+            .cast => |cast| try self.recordCrossModuleRefs(cast.operand, owner, visited),
+            .binary => |binary| {
+                try self.recordCrossModuleRefs(binary.lhs, owner, visited);
+                try self.recordCrossModuleRefs(binary.rhs, owner, visited);
+            },
+            .unary => |unary| try self.recordCrossModuleRefs(unary.operand, owner, visited),
+            .assign => |assign| {
+                try self.recordCrossModuleRefs(assign.target, owner, visited);
+                try self.recordCrossModuleRefs(assign.value, owner, visited);
+            },
+            .try_ => |try_expr| try self.recordCrossModuleRefs(try_expr.inner, owner, visited),
+            .return_ => |return_expr| {
+                if (return_expr.value) |value| try self.recordCrossModuleRefs(value, owner, visited);
+            },
+            .closure => |closure| try self.recordBlockRefs(closure.body, owner, visited),
+            .iterator_chain => |chain| {
+                try self.recordCrossModuleRefs(chain.source, owner, visited);
+                for (chain.adapters) |adapter| switch (adapter) {
+                    .map => |map| try self.recordBlockRefs(map.closure.body, owner, visited),
+                    .filter => |filter| try self.recordBlockRefs(filter.closure.body, owner, visited),
+                    .flat_map => |flat| try self.recordBlockRefs(flat.body, owner, visited),
+                    .zip => |zip| try self.recordCrossModuleRefs(zip.other, owner, visited),
+                    .enumerate, .range_rev, .other => {},
+                };
+            },
+            // An assertion marker stands for a real condition elsewhere in
+            // the graph: `assert_eq!` expands to one node that names its
+            // condition as `assertion:<id>`. Treating it as a leaf hid every
+            // name the condition reaches — a `mod test` asserting on a
+            // private crate-root helper left that helper private, and the
+            // generated package then refused the call from the child file.
+            .unsupported => |unsupported| {
+                if (allocationAssertionCondition(
+                    unsupported.reason,
+                    node,
+                    self.ir.bodies.exprs.len,
+                )) |condition| {
+                    try self.recordCrossModuleRefs(condition, owner, visited);
+                }
+            },
+            // A `continue` names no value and a panic carries only text.
+            .path,
+            .literal,
+            .unit,
+            .core_function,
+            .external_variant,
+            .continue_,
+            .panic_,
+            => {},
+        }
+    }
+
+    fn recordRefList(
+        self: *Lowerer,
+        nodes: []const ir.exprs.NodeId,
+        owner: ir.spine.EntityId,
+        visited: []bool,
+    ) CrossModuleScanError!void {
+        for (nodes) |node| try self.recordCrossModuleRefs(node, owner, visited);
+    }
+
+    fn recordBlockRefs(
+        self: *Lowerer,
+        block: ir.exprs.BlockExpr,
+        owner: ir.spine.EntityId,
+        visited: []bool,
+    ) CrossModuleScanError!void {
+        for (block.statements) |statement| {
+            if (statement >= self.ir.bodies.stmts.len) continue;
+            switch (self.ir.bodies.stmts[statement].kind) {
+                .expr => |expr| try self.recordCrossModuleRefs(expr, owner, visited),
+                .let => |let_stmt| {
+                    if (let_stmt.init) |initialiser| {
+                        try self.recordCrossModuleRefs(initialiser, owner, visited);
+                    }
+                },
+                .let_else => |let_else| {
+                    try self.recordCrossModuleRefs(let_else.init, owner, visited);
+                    try self.recordBlockRefs(let_else.else_block, owner, visited);
+                },
+                .item => {},
+            }
+        }
+        if (block.tail) |tail| try self.recordCrossModuleRefs(tail, owner, visited);
+    }
+
+    /// Record the entity a node names when it does not belong to `owner`. A
+    /// `use` alias resolves to its target first, so a re-export names the
+    /// declaration rather than the import that introduced it.
+    fn noteCrossModuleRef(
+        self: *Lowerer,
+        node: ir.exprs.NodeId,
+        owner: ir.spine.EntityId,
+    ) CrossModuleScanError!void {
+        var target: ?ir.spine.EntityId = null;
+        switch (self.ir.bodies.exprs[node].kind) {
+            .path => |path| target = path.def,
+            .field => |field| target = field.resolved,
+            .struct_lit => |literal| target = literal.def,
+            .enum_variant => |variant| target = variant.def,
+            .call => |call| target = switch (call.call_kind) {
+                .free => |def| def,
+                .associated => |def| def,
+                .constructor => |def| def,
+            },
+            .method_call => |method| target = method.method,
+            else => {},
+        }
+        const def = target orelse return;
+        const entity = self.ir.graph.symbol_table.get(def) orelse return;
+        const resolved = entity.resolved orelse def;
+        const declared_in = (try self.owningModuleEntity(resolved)) orelse return;
+        if (declared_in == owner) return;
+        try self.cross_module_refs.put(self.alloc, resolved, {});
+    }
+
+    /// The name a method called `name` is emitted under on `target`.
     ///
     /// The first impl block to claim a name on a target keeps it. A later
-    /// block for the same self type resolves to the same name, which is what
-    /// collapses the redeclaration. A later block for a DIFFERENT self type
-    /// gets `name__<self type>`, because the target holds one Zig namespace
-    /// and the two functions are genuinely different: `impl FromHex for [u8; 6]`
-    /// and `impl FromHex for [u8; 5]` declare the same Rust method name and
-    /// two different return types, and each call site must reach its own.
+    /// block that declares the SAME function — the same self type and the same
+    /// trait instantiation — resolves to the same name, which is what
+    /// collapses the redeclaration. A later block that declares the same
+    /// method name for a different reason is a different function and gets a
+    /// name of its own, because the target holds one Zig namespace: `impl
+    /// FromHex for [u8; 6]` and `impl FromHex for [u8; 5]` declare the same
+    /// Rust method name and two different return types, and each call site
+    /// must reach its own.
+    ///
+    /// Two blocks that share a SELF type as well — `impl From<Inner> for
+    /// Outer` beside `impl From<TaggedInner> for Outer` — leave nothing for
+    /// the self type to separate, so the trait instantiation joins the
+    /// discriminator for those. Each is what a different call site asked for:
+    /// the pair `(Inner, Outer)` and the pair `(TaggedInner, Outer)` are two
+    /// conversions, and a `hoisted_method_names` entry that cannot tell them
+    /// apart sends every call to whichever was emitted first.
     fn hoistedMethodName(
         self: *Lowerer,
-        tid: ir.spine.EntityId,
+        target: ir.spine.EntityId,
         parent_ent: ir.spine.Entity,
         name: []const u8,
     ) ![]const u8 {
-        const entry = try self.hoisted_self_type_keys.getOrPut(self.alloc, tid);
+        const entry = try self.hoisted_self_type_keys.getOrPut(self.alloc, target);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
-        const keys = &entry.value_ptr.*;
-        const key = try self.implSelfTypeKey(parent_ent);
-        if (keys.get(name)) |claimed_key| {
-            if (std.mem.eql(u8, claimed_key, key)) return name;
-            const mangled = try std.fmt.allocPrint(self.alloc, "{s}__{s}", .{ name, key });
-            if (self.isHoistedMethodRegistered(tid, mangled)) return mangled;
-            try keys.put(self.alloc, mangled, key);
+        const claimed = &entry.value_ptr.*;
+        const identity = try self.implMethodIdentity(parent_ent);
+        const previous = claimed.get(name) orelse
+            return self.claimHoistedName(target, name, parent_ent);
+        if (std.mem.eql(u8, previous, identity)) return name;
+        const self_key = try self.implSelfTypeKey(parent_ent);
+        defer self.alloc.free(self_key);
+        const mangled = try std.fmt.allocPrint(self.alloc, "{s}__{s}", .{ name, self_key });
+        const previous_mangled = claimed.get(mangled) orelse {
+            try claimed.put(self.alloc, mangled, identity);
             return mangled;
-        }
-        try keys.put(self.alloc, name, key);
+        };
+        if (std.mem.eql(u8, previous_mangled, identity)) return mangled;
+        const trait_key = try self.implTraitKey(parent_ent);
+        defer self.alloc.free(trait_key);
+        const qualified = try std.fmt.allocPrint(self.alloc, "{s}_{s}", .{ mangled, trait_key });
+        try claimed.put(self.alloc, qualified, identity);
+        return qualified;
+    }
+
+    /// Record `name` on `target` as belonging to this impl block, and hand the
+    /// name back.
+    ///
+    /// A name a target's `StructBody` renders is claimed here too, even though
+    /// nothing is hoisted for it: the claim is what tells a later impl block
+    /// declaring the same method name that the source name is taken and that
+    /// it has to take a name of its own. An existing claim is never
+    /// overwritten — the first impl block to name it is the one that holds it.
+    fn claimHoistedName(
+        self: *Lowerer,
+        target: ir.spine.EntityId,
+        name: []const u8,
+        parent_ent: ir.spine.Entity,
+    ) ![]const u8 {
+        const entry = try self.hoisted_self_type_keys.getOrPut(self.alloc, target);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        const identity = try self.implMethodIdentity(parent_ent);
+        const slot = try entry.value_ptr.getOrPut(self.alloc, name);
+        if (!slot.found_existing) slot.value_ptr.* = identity;
         return name;
+    }
+
+    /// The identity of the FUNCTION an `impl` block contributes: the self type
+    /// it names together with the trait instantiation it implements.
+    ///
+    /// A trait's arguments are part of which function this is, exactly as much
+    /// as the self type is: `impl From<Inner> for Outer` and `impl
+    /// From<TaggedInner> for Outer` declare the same method on the same target
+    /// and convert two different sources. The rendering is a pure function of
+    /// the IR, so it neither moves between runs nor depends on the order
+    /// entities are visited in, and it is spelled rather than numbered so a
+    /// renamed trait stays as stable as the graph is. Only `[A-Za-z0-9_]` is
+    /// produced, so a mangled name stays a plain Zig identifier instead of
+    /// reaching for `@"..."` escaping.
+    fn implMethodIdentity(self: *Lowerer, parent_ent: ir.spine.Entity) ![]const u8 {
+        const impl_body = implBodyFor(self.ir.bodies.bodies, parent_ent) orelse
+            return self.alloc.dupe(u8, "none");
+        var key: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer key.deinit(self.alloc);
+        try self.writeTypeKey(impl_body.self_ty, &key, 0);
+        if (impl_body.trait_path) |trait_path| {
+            try key.append(self.alloc, '_');
+            try self.writePathKey(trait_path, &key, 0);
+            for (impl_body.trait_args) |arg| {
+                try key.append(self.alloc, '_');
+                try self.writeTypeKey(arg, &key, 1);
+            }
+        }
+        return key.toOwnedSlice(self.alloc);
     }
 
     /// A stable discriminator for the self type an `impl` block names.
@@ -1681,16 +2782,46 @@ const Lowerer = struct {
     /// `[A-Za-z0-9_]` is produced, so a mangled name stays a plain Zig
     /// identifier instead of reaching for `@"..."` escaping.
     fn implSelfTypeKey(self: *Lowerer, parent_ent: ir.spine.Entity) ![]const u8 {
-        if (parent_ent.kind != .impl_) return self.alloc.dupe(u8, "none");
-        if (parent_ent.id >= self.ir.bodies.bodies.len) return self.alloc.dupe(u8, "none");
-        const impl_body = switch (self.ir.bodies.bodies[parent_ent.id]) {
-            .impl_ => |body| body,
-            else => return self.alloc.dupe(u8, "none"),
-        };
+        const impl_body = implBodyFor(self.ir.bodies.bodies, parent_ent) orelse
+            return self.alloc.dupe(u8, "none");
         var key: std.ArrayListUnmanaged(u8) = .empty;
         errdefer key.deinit(self.alloc);
         try self.writeTypeKey(impl_body.self_ty, &key, 0);
         return key.toOwnedSlice(self.alloc);
+    }
+
+    /// The trait instantiation an `impl` block implements, as one
+    /// identifier-safe key: the trait's own path and each of its arguments.
+    ///
+    /// This is the part of `implMethodIdentity` that survives a self-type
+    /// collision, so it is what tells two conversions that share a target
+    /// apart when neither the name nor the self type can.
+    fn implTraitKey(self: *Lowerer, parent_ent: ir.spine.Entity) ![]const u8 {
+        var key: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer key.deinit(self.alloc);
+        const impl_body = implBodyFor(self.ir.bodies.bodies, parent_ent) orelse
+            return key.toOwnedSlice(self.alloc);
+        if (impl_body.trait_path) |trait_path| try self.writePathKey(trait_path, &key, 0);
+        for (impl_body.trait_args) |arg| {
+            try key.append(self.alloc, '_');
+            try self.writeTypeKey(arg, &key, 1);
+        }
+        return key.toOwnedSlice(self.alloc);
+    }
+
+    /// Append a path's own spelling to `key`, one identifier-safe segment at a
+    /// time.
+    fn writePathKey(
+        self: *Lowerer,
+        path: ir.types.Path,
+        key: *std.ArrayListUnmanaged(u8),
+        depth: usize,
+    ) !void {
+        if (depth >= ir.types.traversal_depth_max) return key.append(self.alloc, '_');
+        for (path.segments, 0..) |segment, index| {
+            if (index != 0) try key.append(self.alloc, '_');
+            try self.writeIdentifierKey(segment.name, key);
+        }
     }
 
     fn writeTypeKey(
@@ -1925,21 +3056,23 @@ const Lowerer = struct {
         return self.lowerResolvedEntityName(owner_id);
     }
 
-    /// Emitted name of a field-less variant: the owning enum exactly as
-    /// `enumOwnerName` spells it — module alias included — then the variant.
-    /// A bare variant name names nothing once the enum lives in another
-    /// module, so the qualification the type reference needs is the
-    /// qualification this value needs.
-    fn unitVariantName(
-        self: *Lowerer,
-        def: ir.spine.EntityId,
-        variant_name: []const u8,
-    ) ![]const u8 {
-        return std.fmt.allocPrint(
-            self.alloc,
-            "{s}.{s}",
-            .{ try self.enumOwnerName(def), variant_name },
-        );
+    /// True when the enum owning `def` declares as a tagged `union(enum)`,
+    /// which the declaration lowering picks only for a data-carrying Rust
+    /// enum (`enum_kind == .data`). A purely field-free enum declares as a
+    /// plain Zig `enum`, whose members are bare tags with no field to
+    /// initialize.
+    fn enumDeclaresTagFields(self: *const Lowerer, def: ir.spine.EntityId) bool {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return false;
+        const owner = if (entity.kind == .variant)
+            entity.parent orelse return false
+        else
+            def;
+        if (owner >= self.ir.bodies.bodies.len) return false;
+        const enum_body = switch (self.ir.bodies.bodies[owner]) {
+            .enum_ => |body| body,
+            else => return false,
+        };
+        return enum_body.kind == .data;
     }
 
     /// Emitted name of a struct field, applying any collision rename.
@@ -1973,24 +3106,107 @@ const Lowerer = struct {
         return id;
     }
 
-    /// True when the target entity carries a `.struct_` body whose
-    /// `StructBody.methods` already registers a method named `name`.
+    /// Whether the `.struct_` body of `target` renders `entity_id` itself.
     ///
-    /// Only a struct has that list, so an enum or union target is never
-    /// "already registered" there: its impl methods are hoisted and rendered
-    /// by `lowerEntityDecl` from the hoisted list instead.
-    fn isStructMethodRegistered(
-        self: *Lowerer,
-        tid: ir.spine.EntityId,
+    /// `StructBody.methods` keeps ONE entry per method NAME, so the question
+    /// is not "does the struct have a method with this name" but "is this
+    /// declaration the one it kept". Answering it by name alone is what let two
+    /// impl blocks for one target collapse onto a single declaration: the
+    /// second was emitted nowhere, so every call that pair asked for silently
+    /// reached the first. The signature cannot answer it either — two
+    /// instantiations of one trait for one target may declare the same
+    /// signature, as `impl Marker<u8> for Outer` and `impl Marker<u16> for
+    /// Outer` both declaring `fn marker() -> u8` do, and those are two
+    /// functions.
+    ///
+    /// The entry's recorded body root is the answer: `extractFunction` writes
+    /// each method's own body node into the struct's entry, and that node is
+    /// the very one the method's `FnBody` carries, so it names one actual
+    /// declaration rather than a resemblance to one.
+    fn structBodyRendersMethod(
+        self: *const Lowerer,
+        target: ir.spine.EntityId,
+        entity_id: ir.spine.EntityId,
         name: []const u8,
-    ) !bool {
-        if (tid >= self.ir.bodies.bodies.len) return error.MissingBodyId;
-        const struct_body = switch (self.ir.bodies.bodies[tid]) {
+    ) bool {
+        if (target >= self.ir.bodies.bodies.len) return false;
+        const struct_body = switch (self.ir.bodies.bodies[target]) {
             .struct_ => |sb| sb,
             else => return false,
         };
+        var attributed = false;
         for (struct_body.methods) |method| {
-            if (std.mem.eql(u8, method.name, name)) return true;
+            if (!std.mem.eql(u8, method.name, name)) continue;
+            const owner = self.recordedMethodOwner(target, name, method.body) orelse continue;
+            attributed = true;
+            if (owner == entity_id) return true;
+        }
+        // An entry that names no single method is the one shape left, and then
+        // the first impl block to declare the name is the one the struct
+        // renders — the rule `StructBody` itself follows. An entry that DOES
+        // name one is never overridden by this: that is a different
+        // declaration, and answering the question about it anyway is what
+        // dropped a conversion the source asked for.
+        if (attributed) return false;
+        return self.firstImplMethodFor(target, entity_id, name);
+    }
+
+    /// The method on `target` whose body root IS `recorded`, or null when that
+    /// node names no single method.
+    ///
+    /// Node zero is what an entry carries before any body is extracted, and it
+    /// is not an identity — every such entry shares it. Two methods sharing one
+    /// real body node would name the declaration just as little, so that is
+    /// reported as no answer rather than picked from.
+    fn recordedMethodOwner(
+        self: *const Lowerer,
+        target: ir.spine.EntityId,
+        name: []const u8,
+        recorded: ir.exprs.NodeId,
+    ) ?ir.spine.EntityId {
+        if (recorded == 0) return null;
+        var owner: ?ir.spine.EntityId = null;
+        const count = self.ir.graph.symbol_table.count();
+        for (0..count) |index| {
+            const candidate_id: ir.spine.EntityId = @intCast(index);
+            const candidate = self.ir.graph.symbol_table.get(candidate_id) orelse continue;
+            if (candidate.kind != .fn_ or candidate.parent == null) continue;
+            if (!std.mem.eql(u8, candidate.name, name)) continue;
+            if (candidate_id >= self.ir.bodies.bodies.len) continue;
+            const candidate_body = switch (self.ir.bodies.bodies[candidate_id]) {
+                .fn_ => |body| body,
+                else => continue,
+            };
+            if (candidate_body.body != recorded) continue;
+            const impl_entity = self.ir.graph.symbol_table.get(candidate.parent.?) orelse
+                continue;
+            const impl_target = hoistTargetFor(impl_entity) orelse continue;
+            if (impl_target != target) continue;
+            if (owner != null) return null;
+            owner = candidate_id;
+        }
+        return owner;
+    }
+
+    /// Whether `entity_id` is the first impl-declared method called `name` on
+    /// `target`.
+    fn firstImplMethodFor(
+        self: *const Lowerer,
+        target: ir.spine.EntityId,
+        entity_id: ir.spine.EntityId,
+        name: []const u8,
+    ) bool {
+        const count = self.ir.graph.symbol_table.count();
+        for (0..count) |index| {
+            const candidate_id: ir.spine.EntityId = @intCast(index);
+            const candidate = self.ir.graph.symbol_table.get(candidate_id) orelse continue;
+            if (candidate.kind != .fn_ or candidate.parent == null) continue;
+            if (!std.mem.eql(u8, candidate.name, name)) continue;
+            const impl_entity = self.ir.graph.symbol_table.get(candidate.parent.?) orelse
+                continue;
+            const impl_target = hoistTargetFor(impl_entity) orelse continue;
+            if (impl_target != target) continue;
+            return candidate_id == entity_id;
         }
         return false;
     }
@@ -2487,10 +3703,13 @@ const Lowerer = struct {
     fn resolvedEntityModuleAlias(
         self: *Lowerer,
         owner_id: ?ir.spine.EntityId,
+        declaration_parent: ?ir.spine.EntityId,
     ) !?[]const u8 {
         const owner = owner_id orelse return null;
         const current_module = self.current_module_id orelse return null;
-        if (current_module == owner) return null;
+        if (current_module == owner) {
+            if (self.current_struct_id == null or declaration_parent != owner) return null;
+        }
         const module_alias = try self.ensureModuleImport(owner);
         return module_alias;
     }
@@ -2546,7 +3765,6 @@ const Lowerer = struct {
         for ([_][]const u8{ "std", "r2z", "Self" }) |reserved| {
             try names.used_names.put(self.alloc, reserved, {});
         }
-
         for (defs) |def| {
             const entity = self.ir.graph.symbol_table.get(def) orelse continue;
             const src_name = entity.renamed_to orelse entity.name;
@@ -2617,14 +3835,13 @@ const Lowerer = struct {
         if (name.len == 0) return error.MissingDefinitionName;
         const owner = try self.owningModuleEntity(def);
         if (owner == null and entity.parent != null) return error.MissingModuleOwner;
-        if (try self.resolvedEntityModuleAlias(owner)) |module_alias| {
+        if (try self.resolvedEntityModuleAlias(owner, entity.parent)) |module_alias| {
             return std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ module_alias, name });
         }
         return self.alloc.dupe(u8, name);
     }
 
-    /// Emit a resolved entity as a bare name in its module, or as
-    /// `module.name` when the target belongs to another translated module.
+    /// Qualify declarations across modules and from nested container scopes.
     fn lowerResolvedEntity(self: *Lowerer, def: ir.spine.EntityId) !ast.Expr {
         if (self.local_static_names.get(def)) |emitted_name| {
             return .{ .ident = try self.alloc.dupe(u8, emitted_name) };
@@ -2650,7 +3867,7 @@ const Lowerer = struct {
             if (entity.parent != null) return error.MissingModuleOwner;
             return .{ .ident = try self.alloc.dupe(u8, name) };
         }
-        if (try self.resolvedEntityModuleAlias(owner)) |module_alias| {
+        if (try self.resolvedEntityModuleAlias(owner, entity.parent)) |module_alias| {
             const target = try self.allocExpr(.{
                 .ident = try self.alloc.dupe(u8, module_alias),
             });
@@ -2776,6 +3993,32 @@ const Lowerer = struct {
         }
     }
 
+    /// Hoist the `fn` items a block declares to the module that contains them.
+    ///
+    /// Zig has no nested functions, so a helper written inside another
+    /// function's body is a module-scope declaration or nothing at all. Its
+    /// entity name is already the collision-safe identity — two tests that
+    /// each declare `read` cannot collide — and the declaration emits that
+    /// same name, so no name map is needed here: the call sites already spell
+    /// what this declaration answers to. The parent must be a FUNCTION, which
+    /// is what separates a block-local helper from an impl method.
+    fn appendBlockLocalFunctions(
+        self: *Lowerer,
+        decls: *std.ArrayListUnmanaged(ast.Decl),
+        module_id: ir.spine.EntityId,
+    ) !void {
+        for (self.ir.graph.symbol_table.entities.items) |entity| {
+            if (entity.kind != .fn_ or entity.parent == null) continue;
+            const parent = self.ir.graph.symbol_table.get(entity.parent.?) orelse continue;
+            if (parent.kind != .fn_) continue;
+            const owner = try self.owningModuleEntity(entity.id) orelse continue;
+            if (owner != module_id) continue;
+            if (try self.lowerEntityDecl(entity.id, entity, module_id)) |decl| {
+                try decls.append(self.alloc, decl);
+            }
+        }
+    }
+
     fn prepareLocalStaticNames(self: *Lowerer) !void {
         for (self.ir.graph.symbol_table.entities.items) |entity| {
             if (entity.kind != .static_ or entity.parent == null) continue;
@@ -2810,6 +4053,7 @@ const Lowerer = struct {
         defer self.current_imports = previous_imports;
         try self.appendPendingModuleImports(&imports_list, mod, current_mod_id);
         try self.appendFunctionLocalStatics(&decls_list, current_mod_id);
+        try self.appendBlockLocalFunctions(&decls_list, current_mod_id);
 
         for (mod.items) |item_id| {
             const ent = self.ir.graph.symbol_table.get(item_id) orelse {
@@ -2938,6 +4182,7 @@ const Lowerer = struct {
             try self.appendPendingModuleImports(&imports_list, root_module, 0);
         }
         try self.appendFunctionLocalStatics(&decls_list, 0);
+        try self.appendBlockLocalFunctions(&decls_list, 0);
 
         const count = self.ir.graph.symbol_table.count();
         for (0..count) |idx| {
@@ -3078,6 +4323,19 @@ const Lowerer = struct {
             std.mem.eql(u8, path[2], "Vec");
     }
 
+    /// Whether an external path names Rust's own growable `String`.
+    ///
+    /// `std::string::String` is a re-export of `alloc::string::String`, so
+    /// both spellings name the one type — the same equivalence
+    /// `isOwnedStringType` already allows. A crate's own `String` is a
+    /// different declaration and is never reached here.
+    fn isAllocStringPath(path: []const []const u8) bool {
+        if (path.len != 3) return false;
+        return (std.mem.eql(u8, path[0], "alloc") or std.mem.eql(u8, path[0], "std")) and
+            std.mem.eql(u8, path[1], "string") and
+            std.mem.eql(u8, path[2], "String");
+    }
+
     /// `core::collections`, `std::collections`, and `alloc::collections` are
     /// the same Rust module; only `HashMap` and `HashSet` have a lowering.
     fn isCollectionsPath(path: []const []const u8) bool {
@@ -3136,7 +4394,8 @@ const Lowerer = struct {
         }
         if (is_alloc and path.len == 3) {
             if (std.mem.eql(u8, path[1], "string") and
-                (std.mem.eql(u8, path[2], "String") or std.mem.eql(u8, path[2], "FromUtf8Error"))) return true;
+                (std.mem.eql(u8, path[2], "String") or std.mem.eql(u8, path[2], "FromUtf8Error") or
+                    std.mem.eql(u8, path[2], "ToString"))) return true;
             if (std.mem.eql(u8, path[1], "borrow") and std.mem.eql(u8, path[2], "ToOwned")) return true;
         }
         return false;
@@ -3230,14 +4489,18 @@ const Lowerer = struct {
         return true;
     }
 
-    /// Return true for a Rust `#[test]` function. The name fallback preserves
-    /// compatibility with older in-memory fixtures that predate attributes.
+    /// Return true for a Rust `#[test]` function.
+    ///
+    /// Only the attribute decides. A `#[cfg(test)] mod tests` module is full of
+    /// helpers no test ever calls, and `fn test_hash` is one of them: reading
+    /// its name as the attribute turns a generic helper into a Zig `test`
+    /// block, which drops its signature and leaves every call to it naming a
+    /// declaration the package never declared.
     fn isTestEntity(ent: ir.spine.Entity) bool {
         for (ent.attributes) |attribute| {
             if (std.mem.eql(u8, attribute.name, "test")) return true;
         }
-        return std.mem.startsWith(u8, ent.name, "test_") or
-            std.mem.eql(u8, ent.name, "test");
+        return false;
     }
 
     fn lowerEntityDecl(
@@ -3254,10 +4517,8 @@ const Lowerer = struct {
             .public, .crate_restricted, .super_restricted, .in_path => true,
             // Rust `private` means "this module and its descendants". Zig files
             // are hard module boundaries, so a descendant Rust module becomes a
-            // sibling file that cannot see a non-`pub` item. Emit module-level
-            // items as `pub` outside the crate root; `src/root.zig` re-exports
-            // still define the crate's public surface.
-            .private => !self.current_file_is_root,
+            // sibling file that cannot see a non-`pub` item.
+            .private => self.privateItemIsPublished(entity_id),
         };
         if (ent.kind == .extern_crate) {
             return switch (ent.visibility) {
@@ -3476,6 +4737,8 @@ const Lowerer = struct {
                 }
 
                 const emitted_name = self.local_static_names.get(entity_id) orelse ent.name;
+                // Static bodies do not encode binding mutability. Keep writable
+                // storage for `static mut`; shared borrows retain const pointees.
                 return ast.Decl{
                     .var_decl = .{
                         .name = try self.alloc.dupe(u8, emitted_name),
@@ -3918,6 +5181,7 @@ const Lowerer = struct {
         loop: IteratorRangeLoop,
         body: []const ast.Stmt,
         statements: *std.ArrayListUnmanaged(ast.Stmt),
+        label: ?[]const u8,
     ) anyerror!void {
         const endpoint = if (loop.direction == .forward)
             loop.end_name
@@ -3990,6 +5254,7 @@ const Lowerer = struct {
             .cond = try self.allocExpr(condition),
             .continue_expr = continue_expr,
             .body = .{ .stmts = loop_body },
+            .label = label,
         } }) });
     }
 
@@ -4084,9 +5349,8 @@ const Lowerer = struct {
         for (self.ir.graph.symbol_table.entities.items) |entity| {
             try reserved.append(self.alloc, entity.name);
         }
-        for (self.current_parameter_names) |param| {
-            try reserved.append(self.alloc, param.name);
-        }
+        try self.appendParameterNames(&reserved);
+        try self.appendDeclaredLabelNames(&reserved);
         if (self.current_local_binding_names) |names| {
             var used = names.used_names.keyIterator();
             while (used.next()) |name| try reserved.append(self.alloc, name.*);
@@ -4095,6 +5359,35 @@ const Lowerer = struct {
             return generated;
         }
         return self.collectorBindingName(base_name, reserved.items);
+    }
+
+    /// Every label the source names, appended to the names a generated
+    /// identifier has to dodge.
+    ///
+    /// A label occupies the same namespace a binding does. A program that
+    /// spells `'__r2z_match_block: loop { .. }` has claimed the spelling as
+    /// firmly as `let __r2z_match_block = ..` does, and a guarded match that
+    /// minted the same one emitted two blocks carrying one label, which Zig
+    /// refuses as a redefinition.
+    fn appendDeclaredLabelNames(
+        self: *const Lowerer,
+        reserved: *std.ArrayListUnmanaged([]const u8),
+    ) !void {
+        for (self.ir.bodies.exprs) |expr| {
+            switch (expr.kind) {
+                // A loop's label is recorded on the block its body is.
+                .block => |block| {
+                    if (block.labelled) |label| try reserved.append(self.alloc, label);
+                },
+                .break_ => |break_expr| {
+                    if (break_expr.label) |label| try reserved.append(self.alloc, label);
+                },
+                .continue_ => |continue_expr| {
+                    if (continue_expr.label) |label| try reserved.append(self.alloc, label);
+                },
+                else => {},
+            }
+        }
     }
 
     fn iteratorSourceByReference(self: *Lowerer, source_id: ir.exprs.NodeId) !bool {
@@ -4113,15 +5406,22 @@ const Lowerer = struct {
         return self.lowerForInput(source_id, try self.iteratorSourceByReference(source_id));
     }
 
+    /// Bind one item to a local so an expression used more than once is
+    /// lowered once. `ty` names the type when the surrounding expression has
+    /// already worked it out: a `Result` collect unwraps its item through the
+    /// collection's own methods, and an anonymous `.{ .Ok = v }` has no peer
+    /// type to find them with.
     fn materializeIteratorItem(
         self: *Lowerer,
         value: ast.Expr,
         mutable: bool,
         statements: *std.ArrayListUnmanaged(ast.Stmt),
+        ty: ?ast.Type,
     ) anyerror!ast.Expr {
         const name = try self.iteratorTemporaryName("__r2z_item_value");
         try statements.append(self.alloc, .{ .let_stmt = .{
             .name = name,
+            .ty = ty,
             .is_mut = mutable,
             .init = value,
         } });
@@ -4139,7 +5439,7 @@ const Lowerer = struct {
             .binding => |binding| {
                 if (binding.name.len == 0) return error.MissingBindingName;
                 const binding_value = if (binding.mode == .mut_ref)
-                    try self.materializeIteratorItem(value, true, statements)
+                    try self.materializeIteratorItem(value, true, statements, null)
                 else
                     value;
                 try statements.append(self.alloc, .{ .let_stmt = .{
@@ -4249,7 +5549,7 @@ const Lowerer = struct {
             .rhs = try self.allocExpr(.{ .lit = .null_lit }),
         } });
         const break_stmts = try self.alloc.alloc(ast.Stmt, 1);
-        break_stmts[0] = .{ .expr_stmt = try self.allocExpr(.{ .break_expr = null }) };
+        break_stmts[0] = .{ .expr_stmt = try self.allocExpr(.{ .break_expr = .{} }) };
         try items.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .if_expr = .{
             .cond = is_null,
             .then_body = try self.allocExpr(.{ .block = .{ .stmts = break_stmts } }),
@@ -4274,6 +5574,7 @@ const Lowerer = struct {
         plain_inputs: []const ast.Expr,
         plain_captures: []const ast.Capture,
         body: ast.Block,
+        label: ?[]const u8,
     ) anyerror!ast.Expr {
         // Exactly one input drives the loop: the first runtime iterator when
         // there is no plain input to walk, and otherwise the Zig `for`.
@@ -4288,6 +5589,7 @@ const Lowerer = struct {
                 .cond = runtime_inputs[0].step,
                 .captures = captures,
                 .body = body,
+                .label = label,
             } };
         }
         for (runtime_inputs) |other| {
@@ -4298,6 +5600,7 @@ const Lowerer = struct {
             .inputs = plain_inputs,
             .captures = plain_captures,
             .body = body,
+            .label = label,
         } };
     }
 
@@ -4323,6 +5626,30 @@ const Lowerer = struct {
         try statements.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .block = block }) });
     }
 
+    /// Whether the item reaching the `sum` sink is still the by-pointer
+    /// capture of an `.iter()`/`.iter_mut()` chain.
+    ///
+    /// Such a chain lowers to `for (xs[0..]) |*item|`, so `item` is a
+    /// `*const T` while the accumulator is a `T`. `.map`, `.flat_map`,
+    /// `enumerate` and `zip` each replace the item with a value of their own,
+    /// so the sink derefs only while nothing upstream has already produced
+    /// one — which is why `.copied().map(..).filter().sum()` (a by-value
+    /// source) needs no deref and a bare `.iter().sum()` does.
+    fn iteratorSumItemIsReference(
+        self: *Lowerer,
+        chain: ir.exprs.IteratorChainExpr,
+        adapter_index: usize,
+    ) anyerror!bool {
+        if (!try self.iteratorSourceByReference(chain.source)) return false;
+        for (chain.adapters[0..adapter_index]) |adapter| switch (adapter) {
+            .map, .flat_map, .enumerate, .zip => return false,
+            // An unsupported adapter refuses before it reaches here, so the
+            // deref decision for one is never actually taken.
+            .filter, .range_rev, .other => {},
+        };
+        return true;
+    }
+
     fn appendIteratorSumTail(
         self: *Lowerer,
         chain: ir.exprs.IteratorChainExpr,
@@ -4333,9 +5660,13 @@ const Lowerer = struct {
         statements: *std.ArrayListUnmanaged(ast.Stmt),
     ) anyerror!void {
         if (adapter_index == chain.adapters.len) {
+            const sink_item: ast.Expr = if (try self.iteratorSumItemIsReference(chain, adapter_index))
+                .{ .unary_op = .{ .op = .deref, .operand = try self.allocExpr(item) } }
+            else
+                item;
             try statements.append(self.alloc, .{ .assign = .{
                 .target = .{ .ident = accumulator_name },
-                .val = item,
+                .val = sink_item,
                 .op = .add_assign,
             } });
             return;
@@ -4346,7 +5677,7 @@ const Lowerer = struct {
                 const mapped = try self.lowerIteratorClosureBodyWithSnapshots(map.closure);
                 var nested: std.ArrayListUnmanaged(ast.Stmt) = .empty;
                 defer nested.deinit(self.alloc);
-                const mapped_value = try self.materializeIteratorItem(mapped, false, &nested);
+                const mapped_value = try self.materializeIteratorItem(mapped, false, &nested, null);
                 try self.appendIteratorSumTail(
                     chain,
                     adapter_index + 1,
@@ -4417,6 +5748,7 @@ const Lowerer = struct {
                         range_loop,
                         inner_stmts.items,
                         &range_stmts,
+                        null,
                     );
                     try self.appendIteratorClosureScope(
                         closure,
@@ -4672,7 +6004,7 @@ const Lowerer = struct {
                 state,
                 &loop_stmts,
             );
-            try self.appendIteratorRangeLoop(range_loop, loop_stmts.items, &prefix);
+            try self.appendIteratorRangeLoop(range_loop, loop_stmts.items, &prefix, null);
         } else {
             if (reverse) return error.UnsupportedIteratorAdapter;
             const item_name = try self.iteratorTemporaryName("__r2z_item");
@@ -4713,27 +6045,23 @@ const Lowerer = struct {
         chain: ir.exprs.IteratorChainExpr,
         adapter_index: usize,
         item: ast.Expr,
-        sink: CollectorSink,
+        collector: Collector,
         owner_name: []const u8,
         state: IteratorStructuralState,
         statements: *std.ArrayListUnmanaged(ast.Stmt),
     ) anyerror!void {
+        // A `?` inside an adapter body is a Rust error value the collection
+        // reports, not a Zig allocation failure the function propagates, so
+        // the rest of the lowering has to know which collection is open. The
+        // item type is the context an adapter body assembles its value in.
+        const previous_collector = self.current_collector;
+        self.current_collector = collector;
+        defer self.current_collector = previous_collector;
+        const previous_item_type = self.expected_value_type;
+        if (collector.result != null) self.expected_value_type = collector.item;
+        defer self.expected_value_type = previous_item_type;
         if (adapter_index == chain.adapters.len) {
-            const callee = try self.allocExpr(.{ .field_access = .{
-                .target = try self.allocExpr(.{ .ident = owner_name }),
-                .field_name = if (sink == .string) "push" else "append",
-            } });
-            const args = try self.alloc.alloc(ast.Expr, 2);
-            args[0] = .{ .ident = "allocator" };
-            args[1] = item;
-            const append = try self.allocExpr(.{ .call = .{
-                .callee = callee,
-                .args = args,
-            } });
-            try statements.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .unary_op = .{
-                .op = .try_op,
-                .operand = append,
-            } }) });
+            try self.appendCollectorItem(collector, owner_name, item, statements);
             return;
         }
         switch (chain.adapters[adapter_index]) {
@@ -4741,12 +6069,32 @@ const Lowerer = struct {
                 const mapped = try self.lowerIteratorClosureBodyWithSnapshots(map.closure);
                 var nested: std.ArrayListUnmanaged(ast.Stmt) = .empty;
                 defer nested.deinit(self.alloc);
-                const mapped_value = try self.materializeIteratorItem(mapped, false, &nested);
+                // A `Result` collect's item is a `Result`, and the closure
+                // assembles it from an `Ok(..)` node the frontend left
+                // untyped. The local has to name the union, or the anonymous
+                // struct that node produces is a type of its own and nothing
+                // downstream can unwrap it.
+                //
+                // Only an adapter with a stage still to run needs that local
+                // here: whatever follows reads this value more than once, once
+                // per stage. A `map` at the END of the chain hands its value to
+                // the deposit, which binds it once itself — under the same
+                // type — and binding it twice would leave a second local that
+                // names nothing the first one does not.
+                const mapped_value = if (adapter_index + 1 == chain.adapters.len)
+                    mapped
+                else
+                    try self.materializeIteratorItem(
+                        mapped,
+                        false,
+                        &nested,
+                        if (collector.result != null) try self.lowerType(collector.item) else null,
+                    );
                 try self.appendIteratorCollectionTail(
                     chain,
                     adapter_index + 1,
                     mapped_value,
-                    sink,
+                    collector,
                     owner_name,
                     state,
                     &nested,
@@ -4761,7 +6109,7 @@ const Lowerer = struct {
                     chain,
                     adapter_index + 1,
                     item,
-                    sink,
+                    collector,
                     owner_name,
                     state,
                     &then_stmts,
@@ -4799,7 +6147,7 @@ const Lowerer = struct {
                         chain,
                         adapter_index + 1,
                         range_loop.item,
-                        sink,
+                        collector,
                         owner_name,
                         state,
                         &inner_stmts,
@@ -4808,6 +6156,7 @@ const Lowerer = struct {
                         range_loop,
                         inner_stmts.items,
                         &range_stmts,
+                        null,
                     );
                     try self.appendIteratorClosureScope(
                         closure,
@@ -4824,7 +6173,7 @@ const Lowerer = struct {
                         chain,
                         adapter_index + 1,
                         .{ .ident = inner_name },
-                        sink,
+                        collector,
                         owner_name,
                         state,
                         &inner_stmts,
@@ -4838,8 +6187,15 @@ const Lowerer = struct {
                         .captures = captures,
                         .body = .{ .stmts = try inner_stmts.toOwnedSlice(self.alloc) },
                     } });
-                    const inner_stmt = [_]ast.Stmt{.{ .expr_stmt = inner_loop }};
-                    try self.appendIteratorClosureScope(closure, item, &inner_stmt, statements);
+                    var scope_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+                    defer scope_stmts.deinit(self.alloc);
+                    try scope_stmts.append(self.alloc, .{ .expr_stmt = inner_loop });
+                    try self.appendIteratorClosureScope(
+                        closure,
+                        item,
+                        try scope_stmts.toOwnedSlice(self.alloc),
+                        statements,
+                    );
                 }
             },
             .enumerate => {
@@ -4864,7 +6220,7 @@ const Lowerer = struct {
                     chain,
                     adapter_index + 1,
                     .{ .ident = stage_name },
-                    sink,
+                    collector,
                     owner_name,
                     state,
                     &nested,
@@ -4920,7 +6276,7 @@ const Lowerer = struct {
                     chain,
                     adapter_index + 1,
                     .{ .ident = stage_name },
-                    sink,
+                    collector,
                     owner_name,
                     state,
                     &nested,
@@ -4937,12 +6293,55 @@ const Lowerer = struct {
         }
     }
 
-    /// Where a `collect` terminal deposits each item.
-    const CollectorSink = enum {
-        /// Append to an owned `Vec` (`Vec<T>` maps to `ArrayList`).
+    /// The Zig container a `collect` target lowers to.
+    ///
+    /// The target type alone decides this. `Vec<T>` becomes an
+    /// `ArrayListUnmanaged` and takes `append`; `String` becomes
+    /// `r2z.alloc.String` and takes `push` of a codepoint. What a collection
+    /// HOLDS is the item type, a separate question, and it never picks the
+    /// container: `Vec<char>` and `String` hold the same elements and are
+    /// built by different calls.
+    const CollectorTarget = enum {
+        /// `Vec<T>` lowers to `std.ArrayListUnmanaged(T)`.
         vec,
-        /// Push a codepoint onto an owned `String`.
+        /// `String` lowers to `r2z.alloc.String`.
         string,
+        /// A bare type parameter. The Zig instantiation is the only thing
+        /// that knows which container it is, and that is a comptime value,
+        /// so the emitted deposit picks the operation with a comptime branch
+        /// instead of guessing one from the item type.
+        comptime_param,
+    };
+
+    /// A `collect` terminal resolved against the collection it actually builds.
+    const Collector = struct {
+        /// Which container the loop fills.
+        target: CollectorTarget,
+        /// The Rust type the loop fills. A `Result` collect fills the `Ok`
+        /// arm's collection and wraps it once the loop is done, so this is
+        /// that inner type and never the `Result` itself.
+        owner: ir.types.Type,
+        /// The type of one item: the `Result` a `Result` collect unwraps, the
+        /// element otherwise. Context, so an adapter body that assembles its
+        /// value from literals names the type those literals have to match.
+        item: ir.types.Type,
+        /// The `Result<owner, err>` the `collect` expression itself produces,
+        /// or null for a plain collection. Set means the first item error ends
+        /// the collection instead of the enclosing function, and it is the
+        /// type a `?` inside an adapter body reports in.
+        result: ?ir.types.Type,
+        /// Local that holds that error while the loop runs.
+        error_name: []const u8,
+        /// Label on the block that wraps the collect's own loop, and so the
+        /// target every item error and every adapter propagation breaks to.
+        /// Empty for a plain collection, which records nothing to leave with.
+        ///
+        /// The block carries no value: a Zig block's type comes from its
+        /// `break` payloads, and an exit raised halfway through the loop has
+        /// no `Result` to hand over yet. The error itself rides out in
+        /// `error_name`, and the block's own tail is what turns it into the
+        /// collection's `Err`.
+        exit_label: []const u8,
     };
 
     /// True when a `collect` result is a `String` rather than a `Vec`.
@@ -4955,14 +6354,495 @@ const Lowerer = struct {
             externalPathEqual(external.path, &.{ "std", "string", "String" });
     }
 
+    /// Element type a collection target accepts, or null when the target is
+    /// not one of the collections the translator emits. This is the ITEM type
+    /// only: it never chooses the container (see `collectorTargetFor`).
+    fn collectionElementType(self: *Lowerer, ty: ir.types.Type) anyerror!?ir.types.Type {
+        if (isStringCollectionType(ty)) return .{ .prim = .char };
+        if (isTypeParameterPath(ty)) return self.boundCollectionItemType(ty);
+        return vecElementOfContext(ty);
+    }
+
+    /// The `Item` the enclosing callable's own `FromIterator` bound declares
+    /// for a type parameter.
+    ///
+    /// `T: FromIterator<char>` says what the collection HOLDS, which is the
+    /// one thing a bare type parameter target leaves unstated: the element
+    /// type the loop's item is assembled in, so `Vec<char>` and `String` both
+    /// agree on `char`. It says nothing about WHICH collection `T` is — the
+    /// same bound serves a `String` and a `Vec<char>` — so the container is
+    /// never read from here. Null when the bound is absent or names no
+    /// `FromIterator`, and the caller refuses instead of guessing.
+    fn boundCollectionItemType(self: *Lowerer, ty: ir.types.Type) ?ir.types.Type {
+        const path = switch (ty) {
+            .path => |value| value,
+            else => return null,
+        };
+        const param_name = lastPathSegment(path.segments) orelse return null;
+        const callable_id = self.current_callable_id orelse return null;
+        if (callable_id >= self.ir.bodies.bodies.len) return null;
+        const fn_body = switch (self.ir.bodies.bodies[callable_id]) {
+            .fn_ => |body| body,
+            else => return null,
+        };
+        const generics = fn_body.generics orelse return null;
+        for (generics.params) |param| {
+            const type_param = switch (param) {
+                .type_ => |value| value,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, type_param.name, param_name.name)) continue;
+            for (type_param.bounds) |bound| {
+                const bound_name = lastPathSegment(bound.path.segments) orelse continue;
+                if (!std.mem.eql(u8, bound_name.name, "FromIterator")) continue;
+                if (bound.args.len != 1) continue;
+                return bound.args[0];
+            }
+        }
+        return null;
+    }
+
+    /// The container a `collect` target lowers to, from the target type the
+    /// source wrote and nothing else.
+    ///
+    /// A bare type parameter is the one target whose container the body
+    /// cannot name: `fn collect<T: FromIterator<char>>() -> T` is emitted
+    /// once and instantiated as `String` by one caller and as `Vec<char>` by
+    /// the next. Its `FromIterator` bound says what the collection holds,
+    /// never which collection it is, so that answer waits for the
+    /// instantiation.
+    fn collectorTargetFor(owner: ir.types.Type) CollectorTarget {
+        if (isStringCollectionType(owner)) return .string;
+        if (isTypeParameterPath(owner)) return .comptime_param;
+        return .vec;
+    }
+
+    /// Resolve the collection a `collect` terminal builds, unwrapping a
+    /// `Result` target so the loop fills the `Ok` arm's collection and the
+    /// first item error becomes the `Err` arm.
+    fn resolveCollector(self: *Lowerer, return_type: ir.types.Type) anyerror!Collector {
+        const target: struct { owner: ir.types.Type, result: ?ir.types.Type } =
+            switch (return_type) {
+                .result => |arms| result_target: {
+                    // A `Result` that lowers to a Zig error union carries no
+                    // tagged arms to unwrap and no `Err` value to hand back,
+                    // so there is nothing faithful to emit for one.
+                    if (self.resultUsesErrorUnion(return_type)) {
+                        return error.UnsupportedCollectionType;
+                    }
+                    break :result_target .{ .owner = arms.ok, .result = return_type };
+                },
+                else => .{ .owner = return_type, .result = null },
+            };
+        const element = (try self.collectionElementType(target.owner)) orelse
+            return error.UnsupportedCollectionType;
+        const item: ir.types.Type = if (target.result) |result_type| item_result: {
+            const arms = try self.alloc.create(ir.types.Result);
+            arms.* = .{
+                .ok = element,
+                .err = result_type.result.err,
+                .is_error_unionable = false,
+            };
+            break :item_result .{ .result = arms };
+        } else element;
+        return .{
+            .target = collectorTargetFor(target.owner),
+            .owner = target.owner,
+            .item = item,
+            .result = target.result,
+            // Both names are only read on the error path, so a plain
+            // collection does not pay a temporary for either.
+            .error_name = if (target.result != null)
+                try self.iteratorTemporaryName("__r2z_collect_error")
+            else
+                &.{},
+            .exit_label = if (target.result != null)
+                try self.iteratorTemporaryName("__r2z_collect_exit")
+            else
+                &.{},
+        };
+    }
+
+    /// `try <owner>.<method>(allocator, <item>);` — the one statement a
+    /// collection emits per item.
+    ///
+    /// `method` is the container's own. The argument list is arena-allocated
+    /// because it carries an item expression built per item, and a slice
+    /// literal over a runtime value would dangle the moment this frame
+    /// returned.
+    fn collectorAppendStatement(
+        self: *Lowerer,
+        owner_name: []const u8,
+        method: []const u8,
+        item: ast.Expr,
+    ) anyerror!ast.Stmt {
+        const args = try self.alloc.alloc(ast.Expr, 2);
+        args[0] = .{ .ident = "allocator" };
+        args[1] = item;
+        return .{ .expr_stmt = try self.allocExpr(.{ .unary_op = .{
+            .op = .try_op,
+            .operand = try self.allocExpr(.{ .call = .{
+                .callee = try self.collectorOwnerMethod(owner_name, method),
+                .args = args,
+            } }),
+        } }) };
+    }
+
+    /// The statements one item deposits, in the order the collect's target
+    /// needs them.
+    fn collectorDeposit(
+        self: *Lowerer,
+        collector: Collector,
+        owner_name: []const u8,
+        item: ast.Expr,
+        statements: *std.ArrayListUnmanaged(ast.Stmt),
+    ) anyerror!void {
+        switch (collector.target) {
+            .vec => try statements.append(
+                self.alloc,
+                try self.collectorAppendStatement(owner_name, "append", item),
+            ),
+            .string => try statements.append(
+                self.alloc,
+                try self.collectorAppendStatement(owner_name, "push", item),
+            ),
+            .comptime_param => {
+                // One name for the item, so the branch that wins prints that
+                // name: a single `ast.Expr` shared by two call sites is one
+                // node emitted twice, and the emitter renames generated
+                // labels per nesting depth.
+                const bound = try self.materializeIteratorItem(item, false, statements, null);
+                try statements.append(
+                    self.alloc,
+                    try self.collectorComptimeDispatchStatement(owner_name, bound),
+                );
+            },
+        }
+    }
+
+    /// The comptime branch that picks the deposit the container has.
+    ///
+    /// The comparison is comptime — the owner is a `comptime T: type`
+    /// parameter — so Zig analyzes the branch that matches and leaves the
+    /// other one alone. That is what lets one emitted body serve both a
+    /// `String`, whose `push` takes a codepoint, and a `Vec<Item>`, whose
+    /// `append` takes an element: neither container grows the other's
+    /// method, and no `String.append` alias is invented to paper over the
+    /// overlap.
+    fn collectorComptimeDispatchStatement(
+        self: *Lowerer,
+        owner_name: []const u8,
+        item: ast.Expr,
+    ) anyerror!ast.Stmt {
+        const owner_args = try self.alloc.alloc(ast.Expr, 1);
+        owner_args[0] = .{ .ident = owner_name };
+        const push_stmts = try self.alloc.alloc(ast.Stmt, 1);
+        push_stmts[0] = try self.collectorAppendStatement(owner_name, "push", item);
+        const append_stmts = try self.alloc.alloc(ast.Stmt, 1);
+        append_stmts[0] = try self.collectorAppendStatement(owner_name, "append", item);
+        return .{ .expr_stmt = try self.allocExpr(.{ .if_expr = .{
+            .cond = try self.allocExpr(.{ .bin_op = .{
+                .op = .equal,
+                .lhs = try self.allocExpr(.{ .builtin = .{
+                    .name = "TypeOf",
+                    .args = owner_args,
+                } }),
+                .rhs = try self.allocExpr(try self.ownedStringTypeExpr()),
+            } }),
+            .then_body = try self.allocExpr(.{ .block = .{ .stmts = push_stmts } }),
+            .else_body = try self.allocExpr(.{ .block = .{ .stmts = append_stmts } }),
+        } }) };
+    }
+
+    /// `r2z.alloc.String` as a Zig type expression, taken from the mapping
+    /// for `String` itself so the comptime dispatch cannot compare against a
+    /// name the type mapping no longer emits. Lowering the type is also what
+    /// records the runtime import the emitted name needs.
+    fn ownedStringTypeExpr(self: *Lowerer) anyerror!ast.Expr {
+        const string_type: ir.types.Type = .{ .external_nominal = .{
+            .path = &.{ "alloc", "string", "String" },
+            .args = &.{},
+        } };
+        return switch (try self.lowerType(string_type)) {
+            .named => |name| .{ .ident = name },
+            .generic => |generic| .{ .call = .{
+                .callee = try self.allocExpr(.{ .ident = generic.name }),
+                .generic_args = generic.params,
+                .args = &.{},
+            } },
+            else => return error.UnsupportedCollectionType,
+        };
+    }
+
+    /// A method call on the collection being built, e.g. `__r2z_owner.append`.
+    fn collectorOwnerMethod(
+        self: *Lowerer,
+        owner_name: []const u8,
+        method_name: []const u8,
+    ) anyerror!*const ast.Expr {
+        return self.allocExpr(.{ .field_access = .{
+            .target = try self.allocExpr(.{ .ident = owner_name }),
+            .field_name = method_name,
+        } });
+    }
+
+    /// `<owner>.deinit(allocator)` — releasing what the loop accumulated.
+    /// The argument list is arena-allocated with every other call list here.
+    fn collectorDeinit(self: *Lowerer, owner_name: []const u8) anyerror!ast.Expr {
+        const args = try self.alloc.alloc(ast.Expr, 1);
+        args[0] = .{ .ident = "allocator" };
+        return .{ .call = .{
+            .callee = try self.collectorOwnerMethod(owner_name, "deinit"),
+            .args = args,
+        } };
+    }
+
+    /// Deposit one item into the collection.
+    ///
+    /// A `Result` collect unwraps the item instead of appending it whole: Rust
+    /// collects `Result<A, E>` items into `Result<V, E>` by stopping at the
+    /// first `Err` and handing it back, and the value the `Ok` arm carried is
+    /// the only thing that belongs in the collection. `is_ok`, `unwrap` and
+    /// `unwrap_err` are the runtime's own arms, so the two branches cannot
+    /// disagree about which tag they are looking at.
+    ///
+    /// The exit names the collect's own exit block, so it leaves the whole
+    /// collection however deeply the chain is nested. An adapter that walks a
+    /// second iterable, and a Rust loop written inside an adapter body, each
+    /// put a loop between this deposit and the block the collect owns; a bare
+    /// `break` would stop the nearest of them and carry on with an answer the
+    /// collection never finished building, so the label is what makes the exit
+    /// total rather than a cascade of guards. A source `break` or `continue`
+    /// names its own target and is never caught here, and nothing after this
+    /// deposit runs on the way out, so no later item is evaluated. The
+    /// enclosing function keeps running: a `return` could not, in let or
+    /// argument position.
+    fn appendCollectorItem(
+        self: *Lowerer,
+        collector: Collector,
+        owner_name: []const u8,
+        item: ast.Expr,
+        statements: *std.ArrayListUnmanaged(ast.Stmt),
+    ) anyerror!void {
+        if (collector.result == null) {
+            try self.collectorDeposit(collector, owner_name, item, statements);
+            return;
+        }
+        // The item is bound to a local of the `Result` type: the collection
+        // names its own unwrap, and a bare `.{ .Ok = v }` has no peer type to
+        // find it with.
+        const item_name = try self.materializeIteratorItem(
+            item,
+            false,
+            statements,
+            try self.lowerType(collector.item),
+        );
+        const name = switch (item_name) {
+            .ident => |ident| ident,
+            else => return error.UnsupportedCollectionType,
+        };
+        var then_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer then_stmts.deinit(self.alloc);
+        try self.collectorDeposit(
+            collector,
+            owner_name,
+            try self.collectorUnwrap(name, "unwrap"),
+            &then_stmts,
+        );
+        var exit_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer exit_stmts.deinit(self.alloc);
+        try exit_stmts.append(self.alloc, .{ .assign = .{
+            .target = .{ .ident = collector.error_name },
+            .val = try self.collectorUnwrap(name, "unwrap_err"),
+        } });
+        try exit_stmts.append(self.alloc, .{
+            .expr_stmt = try self.allocExpr(.{ .break_expr = .{
+                .label = collector.exit_label,
+            } }),
+        });
+        const exit_body = try self.allocExpr(.{ .block = .{
+            .stmts = try exit_stmts.toOwnedSlice(self.alloc),
+        } });
+        try statements.append(self.alloc, .{
+            .expr_stmt = try self.allocExpr(.{
+                .if_expr = .{
+                    // The condition is an arena-allocated expression of its own, like
+                    // every other `ast.IfExpr` the lowering builds: the AST keeps
+                    // conditions by pointer, and the call it wraps is built by value.
+                    .cond = try self.allocExpr(try self.collectorUnwrap(name, "is_ok")),
+                    .then_body = try self.allocExpr(.{ .block = .{
+                        .stmts = try then_stmts.toOwnedSlice(self.alloc),
+                    } }),
+                    .else_body = exit_body,
+                },
+            }),
+        });
+    }
+
+    /// Tagged Result projections. Only `unwrap` takes the allocator needed
+    /// to release an abandoned error payload; the tag and error projections
+    /// have no arguments.
+    fn collectorUnwrap(
+        self: *Lowerer,
+        item_name: []const u8,
+        method: []const u8,
+    ) anyerror!ast.Expr {
+        const args: []const ast.Expr = if (std.mem.eql(u8, method, "unwrap"))
+            try self.alloc.dupe(ast.Expr, &.{.{ .ident = "allocator" }})
+        else
+            &.{};
+        return .{ .call = .{
+            .callee = try self.collectorOwnerMethod(item_name, method),
+            .args = args,
+        } };
+    }
+
+    /// `{ <error> = <error_value>; break :<exit>; }` — how a `?` inside an
+    /// adapter body leaves a `Result` collect.
+    ///
+    /// The `?` sits in a `switch` whose other arm yields the unwrapped payload,
+    /// so this arm has to be a value of that payload's type or no value at all.
+    /// It is no value at all: the labeled exit is the block's own result, so the
+    /// block diverges, which is what lets Zig read the `?` as a type that never
+    /// produced a payload rather than as one that produced the wrong type. A
+    /// trailing `unreachable` would say the same thing and cost the emitted
+    /// crate a `unreachable code` error, because Zig rejects a statement that
+    /// follows an unconditional exit.
+    ///
+    /// The exit names the collect's own exit block, which is what makes a `?`
+    /// in a body that also runs a loop work: the label is resolved against the
+    /// block that carries it, so the nested loop the body opens is stepped
+    /// over rather than stopped, and the enclosing function keeps running.
+    fn collectorErrorExit(
+        self: *Lowerer,
+        collector: Collector,
+        err_expr: ast.Expr,
+    ) anyerror!ast.Expr {
+        var stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer stmts.deinit(self.alloc);
+        try stmts.append(self.alloc, .{ .assign = .{
+            .target = .{ .ident = collector.error_name },
+            .val = err_expr,
+        } });
+        return .{ .block = .{
+            .stmts = try stmts.toOwnedSlice(self.alloc),
+            .expr = try self.allocExpr(.{ .break_expr = .{
+                .label = collector.exit_label,
+            } }),
+        } };
+    }
+
+    /// The value a `Result` collect hands back, which is the whole of Rust's
+    /// `collect::<Result<V, E>>()`: an empty source and a source that ran to
+    /// completion both report `Ok` with the collection they built, and the
+    /// first `Err` item reports that error with the prefix released.
+    ///
+    /// The release is explicit because the `errdefer` above the loop cannot do
+    /// it: this is an ordinary Rust result, so the block returns normally and
+    /// no error return runs. `deinit` leaves the collection empty, so the
+    /// `errdefer` is a no-op if the enclosing function does return an error
+    /// after this value has moved on, and the `Ok` arm moves the buffer on
+    /// without releasing it.
+    ///
+    /// The condition is the error local, so the value is decided by whether
+    /// anything recorded an error and never by what the loop happened to
+    /// iterate: iteration stopped at the first `Err`, and the `Ok` payload it
+    /// would have carried is not in the collection either way. Recording and
+    /// leaving are two statements at the exit site; this is where the value
+    /// they carry out is finally built, and the `Err` arm is the one place the
+    /// accumulated prefix is released.
+    fn collectorResultTail(
+        self: *Lowerer,
+        collector: Collector,
+        owner_name: []const u8,
+    ) anyerror!ast.Expr {
+        const arms = collector.result orelse return error.UnsupportedCollectionType;
+        try self.markRuntimeImport();
+        const result_type = try self.allocType(try self.lowerTaggedResult(
+            arms.result.ok,
+            arms.result.err,
+        ));
+        const err_fields = try self.alloc.alloc(ast.StructInitField, 1);
+        const unwrap_args = try self.alloc.alloc(ast.Expr, 1);
+        unwrap_args[0] = .{ .ident = collector.error_name };
+        err_fields[0] = .{
+            .name = try self.alloc.dupe(u8, "Err"),
+            .expr = .{ .call = .{
+                .callee = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, "r2z.option.unwrap") }),
+                .args = unwrap_args,
+            } },
+        };
+        const exit_stmts = try self.alloc.alloc(ast.Stmt, 1);
+        exit_stmts[0] = .{ .expr_stmt = try self.allocExpr(try self.collectorDeinit(owner_name)) };
+        const ok_fields = try self.alloc.alloc(ast.StructInitField, 1);
+        ok_fields[0] = .{
+            .name = try self.alloc.dupe(u8, "Ok"),
+            .expr = .{ .ident = owner_name },
+        };
+        return .{ .if_expr = .{
+            .cond = try self.allocExpr(.{ .bin_op = .{
+                .op = .not_equal,
+                .lhs = try self.allocExpr(.{ .ident = collector.error_name }),
+                .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+            } }),
+            .then_body = try self.allocExpr(.{ .block = .{
+                .label = try self.iteratorTemporaryName("__r2z_collect_err"),
+                .stmts = exit_stmts,
+                .expr = try self.allocExpr(.{ .struct_init = .{
+                    .type_name = result_type.*,
+                    .fields = err_fields,
+                } }),
+            } }),
+            .else_body = try self.allocExpr(.{ .struct_init = .{
+                .type_name = result_type.*,
+                .fields = ok_fields,
+            } }),
+        } };
+    }
+
+    /// The collect's own loop, inside the block its exits leave through.
+    ///
+    /// The label is what makes an exit total. A bare `break` reaches the
+    /// nearest enclosing loop, and an adapter that walks a second iterable or
+    /// a Rust loop written inside an adapter body each put one between that
+    /// exit and the loop the collect owns; naming this block instead steps
+    /// over every one of them, so no guard has to guess how deep the chain
+    /// went. A source `break` or `continue` names its own target and is never
+    /// claimed here.
+    ///
+    /// The block carries no value, which is what every `break` into it has to
+    /// match: the error it is leaving with is still in `error_name` at that
+    /// point, and `collectorResultTail` is what turns it into the collection's
+    /// `Err` once the loop is behind. A plain collection records nothing, so
+    /// its loop goes in unwrapped rather than behind a label nothing names.
+    fn appendCollectLoopStatement(
+        self: *Lowerer,
+        collector: Collector,
+        loop_scope: []const ast.Stmt,
+        prefix: *std.ArrayListUnmanaged(ast.Stmt),
+    ) anyerror!void {
+        if (collector.exit_label.len == 0) {
+            try prefix.appendSlice(self.alloc, loop_scope);
+            return;
+        }
+        // One statement: the labelled block carries the loop with it, so the
+        // loop is emitted inside the block and nowhere else.
+        const statements = try self.alloc.alloc(ast.Stmt, 1);
+        statements[0] = .{ .expr_stmt = try self.allocExpr(.{ .block = .{
+            .label = collector.exit_label,
+            .stmts = loop_scope,
+        } }) };
+        try prefix.appendSlice(self.alloc, statements);
+    }
+
     fn lowerIteratorCollectionBlock(
         self: *Lowerer,
         chain: ir.exprs.IteratorChainExpr,
         return_type: ir.types.Type,
     ) anyerror!ast.Block {
         if (chain.terminal != .collect_vec) return error.UnsupportedIteratorTerminal;
-        const sink: CollectorSink = if (isStringCollectionType(return_type)) .string else .vec;
-        const owner_type = try self.lowerType(return_type);
+        const collector = try self.resolveCollector(return_type);
+        const owner_type = try self.lowerType(collector.owner);
         const owner_name = try self.iteratorTemporaryName("__r2z_owner");
         const owner_type_expr: ast.Expr = switch (owner_type) {
             .named => |name| .{ .ident = name },
@@ -5078,6 +6958,11 @@ const Lowerer = struct {
         defer self.current_iterator_capture_prelude = previous_iterator_prelude;
         var loop_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
         defer loop_stmts.deinit(self.alloc);
+        // The loop itself goes inside the labelled block every exit names, so
+        // it is built apart from the adapter bindings that have to stay outside
+        // that block and in scope for the tail below.
+        var loop_scope: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer loop_scope.deinit(self.alloc);
         if (source_is_range) {
             const lowered_range = try self.lowerIteratorRange(chain.source);
             const direction: IteratorRangeDirection = if (reverse) .reverse else .forward;
@@ -5090,12 +6975,12 @@ const Lowerer = struct {
                 chain,
                 if (reverse) 1 else 0,
                 range_loop.item,
-                sink,
+                collector,
                 owner_name,
                 state,
                 &loop_stmts,
             );
-            try self.appendIteratorRangeLoop(range_loop, loop_stmts.items, &prefix);
+            try self.appendIteratorRangeLoop(range_loop, loop_stmts.items, &loop_scope, null);
         } else {
             if (reverse) return error.UnsupportedIteratorAdapter;
             const item_name = try self.iteratorTemporaryName("__r2z_item");
@@ -5103,7 +6988,7 @@ const Lowerer = struct {
                 chain,
                 0,
                 .{ .ident = item_name },
-                sink,
+                collector,
                 owner_name,
                 state,
                 &loop_stmts,
@@ -5127,34 +7012,59 @@ const Lowerer = struct {
             }
             const captures = try self.alloc.alloc(ast.Capture, 1);
             captures[0] = .{ .name = item_name, .by_ref = source_by_ref };
-            try prefix.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .for_expr = .{
+            try loop_scope.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .for_expr = .{
                 .inputs = inputs,
                 .captures = captures,
                 .body = .{ .stmts = try loop_stmts.toOwnedSlice(self.alloc) },
             } }) });
         }
+        try self.appendCollectLoopStatement(
+            collector,
+            try loop_scope.toOwnedSlice(self.alloc),
+            &prefix,
+        );
 
-        const statements = try self.alloc.alloc(ast.Stmt, prefix.items.len + 2);
+        // The error local comes before the loop, so the loop can record an
+        // item error and leave, and the block's own value reports it.
+        //
+        // The owner is released exactly once on every path out: `errdefer`
+        // covers an allocation failure while the loop runs, the `Err` arm
+        // below releases what the prefix accumulated, and the `Ok` arm hands
+        // the buffer to the caller instead of dropping it. An empty collect
+        // and a full one both reach the `Ok` arm with nothing released.
+        const error_local: usize = if (collector.result != null) 1 else 0;
+        const statements = try self.alloc.alloc(ast.Stmt, prefix.items.len + 2 + error_local);
         statements[0] = .{ .let_stmt = .{
             .name = owner_name,
             .ty = owner_type,
             .init = owner_init,
             .is_mut = true,
         } };
+        // `errdefer`, not `defer`: on the way out the block hands the
+        // collection to its caller, which owns it from then on. Only an
+        // allocation failure while building it still has to release what was
+        // appended so far.
         statements[1] = .{ .defer_stmt = .{
-            .expr = .{ .call = .{
-                .callee = try self.allocExpr(.{ .field_access = .{
-                    .target = try self.allocExpr(.{ .ident = owner_name }),
-                    .field_name = "deinit",
-                } }),
-                .args = &.{.{ .ident = "allocator" }},
-            } },
+            .expr = try self.collectorDeinit(owner_name),
             .is_errdefer = true,
         } };
-        @memcpy(statements[2..], prefix.items);
+        var at: usize = 2;
+        if (collector.result) |arms| {
+            statements[at] = .{ .let_stmt = .{
+                .name = collector.error_name,
+                .ty = .{ .opt = try self.allocType(try self.lowerType(arms.result.err)) },
+                .init = .{ .lit = .null_lit },
+                .is_mut = true,
+            } };
+            at += 1;
+        }
+        @memcpy(statements[at..], prefix.items);
         return .{
             .stmts = statements,
-            .expr = try self.allocExpr(.{ .ident = owner_name }),
+            .expr = try self.allocExpr(if (collector.result != null)
+                try self.collectorResultTail(collector, owner_name)
+            else
+                .{ .ident = owner_name }),
         };
     }
 
@@ -5185,7 +7095,7 @@ const Lowerer = struct {
                 const mapped = try self.lowerIteratorClosureBodyWithSnapshots(map.closure);
                 var nested: std.ArrayListUnmanaged(ast.Stmt) = .empty;
                 defer nested.deinit(self.alloc);
-                const mapped_value = try self.materializeIteratorItem(mapped, false, &nested);
+                const mapped_value = try self.materializeIteratorItem(mapped, false, &nested, null);
                 try self.appendIteratorForTail(
                     chain,
                     adapter_index + 1,
@@ -5249,6 +7159,7 @@ const Lowerer = struct {
                         range_loop,
                         inner_stmts.items,
                         &range_stmts,
+                        null,
                     );
                     try self.appendIteratorClosureScope(
                         closure,
@@ -5534,7 +7445,7 @@ const Lowerer = struct {
                 state,
                 &loop_stmts,
             );
-            try self.appendIteratorRangeLoop(range_loop, loop_stmts.items, &prefix);
+            try self.appendIteratorRangeLoop(range_loop, loop_stmts.items, &prefix, null);
         } else {
             if (reverse) return error.UnsupportedIteratorAdapter;
             try self.appendIteratorForTail(
@@ -5788,7 +7699,7 @@ const Lowerer = struct {
         reserved: *std.ArrayListUnmanaged([]const u8),
     ) std.mem.Allocator.Error!void {
         switch (expr) {
-            .lit, .unit, .unsupported, .panic_, .continue_expr => {},
+            .lit, .unit, .unsupported, .panic_ => {},
             .ident => |name| try reserved.append(self.alloc, name),
             .field_access => |field_access| {
                 try self.appendCollectorExprIdentifiers(field_access.target.*, reserved);
@@ -5878,11 +7789,14 @@ const Lowerer = struct {
                     try self.appendCollectorExprIdentifiers(expr_ptr.*, reserved);
                 }
             },
-            .break_expr => |value| {
-                if (value) |expr_ptr| {
+            .break_expr => |break_expr| {
+                if (break_expr.value) |expr_ptr| {
                     try self.appendCollectorExprIdentifiers(expr_ptr.*, reserved);
                 }
             },
+            // A labelled `continue` names a loop that already exists, so the
+            // label binds nothing to reserve and there is no value to visit.
+            .continue_expr, .unreachable_ => {},
         }
     }
 
@@ -6010,7 +7924,7 @@ const Lowerer = struct {
             &statements,
         );
         const outer_body = [_]ast.Stmt{.{ .expr_stmt = inner_loop }};
-        try self.appendIteratorRangeLoop(range_loop, &outer_body, &statements);
+        try self.appendIteratorRangeLoop(range_loop, &outer_body, &statements, null);
         return .{
             .stmts = try statements.toOwnedSlice(self.alloc),
             .expr = try self.allocExpr(.{ .ident = owner_name }),
@@ -6037,10 +7951,8 @@ const Lowerer = struct {
             .public, .crate_restricted, .super_restricted, .in_path => true,
             // Rust `private` means "this module and its descendants". Zig files
             // are hard module boundaries, so a descendant Rust module becomes a
-            // sibling file that cannot see a non-`pub` item. Emit module-level
-            // items as `pub` outside the crate root; `src/root.zig` re-exports
-            // still define the crate's public surface.
-            .private => !self.current_file_is_root,
+            // sibling file that cannot see a non-`pub` item.
+            .private => self.privateItemIsPublished(entity_id),
         };
 
         if (entity_id >= self.ir.bodies.bodies.len) {
@@ -6088,21 +8000,28 @@ const Lowerer = struct {
 
                 var mutable_param_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
                 defer mutable_param_stmts.deinit(self.alloc);
+                var mutable_copies: std.ArrayListUnmanaged(MutableCopyBinding) = .empty;
+                defer mutable_copies.deinit(self.alloc);
 
                 for (fb.params) |p| {
-                    const p_ty = try self.lowerType(p.ty);
+                    const callable_ty = try self.lowerCallableParamType(p.ty);
+                    const p_ty = callable_ty orelse try self.lowerType(p.ty);
                     const param_def = local_binding_names.claimLocal(&self.ir.graph.symbol_table, p.name);
                     const param_name = if (param_def) |d|
                         local_binding_names.emitted_by_entity.get(d) orelse p.name
                     else
                         p.name;
                     const is_mut_assigned = if (param_def) |d|
-                        self.isParameterAssigned(d)
+                        try self.isParameterAssigned(d)
                     else
                         false;
 
                     if (is_mut_assigned) {
-                        const sig_name = try std.fmt.allocPrint(self.alloc, "_{s}", .{param_name});
+                        const sig_name = try self.mutableCopyParamName(
+                            &local_binding_names,
+                            &mutable_copies,
+                            param_name,
+                        );
                         try params_list.append(self.alloc, .{
                             .name = sig_name,
                             .ty = p_ty,
@@ -6152,6 +8071,9 @@ const Lowerer = struct {
                 const previous_parameter_names = self.current_parameter_names;
                 self.current_parameter_names = params_list.items;
                 defer self.current_parameter_names = previous_parameter_names;
+                const previous_mutable_copies = self.current_mutable_copies;
+                self.current_mutable_copies = mutable_copies.items;
+                defer self.current_mutable_copies = previous_mutable_copies;
 
                 self.current_return_type = effective_ret;
                 defer self.current_return_type = previous_return_type;
@@ -6201,6 +8123,20 @@ const Lowerer = struct {
                     fn_block.?.stmts = merged;
                 }
                 callable_is_allocating = self.current_callable_is_allocating;
+                // Rust drops what a callable made when its scope ends, so an
+                // owned local it never hands on is released here. A binding
+                // the source returns, passes on or consumes is excluded by
+                // `escapedBindingNames`, so nothing is released twice.
+                if (callable_is_allocating and fn_block != null and
+                    fb.body < self.ir.bodies.exprs.len and
+                    self.ir.bodies.exprs[fb.body].kind == .block)
+                {
+                    try self.appendOwnedScopeDrops(
+                        self.ir.bodies.exprs[fb.body].kind.block,
+                        &local_binding_names,
+                        &fn_block.?,
+                    );
+                }
             },
             else => return error.DeclarationBodyMismatch,
         }
@@ -6238,10 +8174,31 @@ const Lowerer = struct {
             .expr_stmt => |expr| expr,
             else => return,
         };
-        if (tail.* != .match_expr and tail.* != .if_expr) return;
+        // A guarded match lowers to a labeled value block, which carries its
+        // result out through the `break`s that name it and so has no tail
+        // expression of its own. A plain block is a statement and stays one,
+        // and a loop is one too: only the block ends in a labelled exit.
+        if (tail.* != .match_expr and tail.* != .if_expr and !isGuardChainBlock(tail.*)) return;
 
         block.stmts = block.stmts[0 .. block.stmts.len - 1];
         block.expr = tail;
+    }
+
+    /// Whether this expression is the labeled value block a guarded `match`
+    /// lowers to.
+    ///
+    /// A label alone does not tell it apart — a source block can carry one
+    /// too. What no other block has is the `unreachable` that closes the
+    /// ordered chain.
+    fn isGuardChainBlock(value: ast.Expr) bool {
+        const block = switch (value) {
+            .block => |inner| inner,
+            else => return false,
+        };
+        if (block.label == null or block.expr != null) return false;
+        if (block.stmts.len == 0) return false;
+        const last = block.stmts[block.stmts.len - 1];
+        return last == .expr_stmt and last.expr_stmt.* == .unreachable_;
     }
 
     /// Infer a concrete return type from a function body's tail expression when
@@ -6319,14 +8276,14 @@ const Lowerer = struct {
                 .byte_array => .{ .slice = (try self.sliceU8Alloc()) orelse return null },
             },
             .struct_lit => |sl| try self.namedFromDef(sl.def),
-            .enum_variant => |ev| try self.namedFromDef(ev.def),
+            .enum_variant => |ev| try self.valueEntityType(ev.def),
             .external_variant => |variant| .{ .external_nominal = variant.owner },
             .call => |c| switch (c.call_kind) {
                 .free => |def_id| try self.namedFromDef(def_id),
                 .associated => |def_id| try self.namedFromDef(def_id),
                 .constructor => |def_id| try self.namedFromDef(def_id),
             },
-            .path => |pe| try self.namedFromDef(pe.def),
+            .path => |pe| try self.valueEntityType(pe.def),
             .binary => |b| try self.binopResultType(b),
             .unary => |u| switch (u.op) {
                 .negate, .deref => try self.exprType(u.operand),
@@ -6355,6 +8312,105 @@ const Lowerer = struct {
         const segments = try self.alloc.alloc(ir.types.PathSegment, 1);
         segments[0] = .{ .name = nm, .id = def };
         return .{ .path = .{ .segments = segments } };
+    }
+
+    /// The type of the value a `const` declares, or null when the entity has
+    /// no constant body. A path to a constant is a *use* of that value, not a
+    /// type: naming the declaration back produced a path whose entity is a
+    /// `const_`, which every type-lowering path refuses because a constant is
+    /// not a type definition. `test_hash(fnv1a_hash_str_32, FOOBAR,
+    /// FOOBAR_HASH_32)` binds the callee's `T` from its third argument, so
+    /// the constant's own type is exactly the evidence the call needs.
+    fn valueDefType(self: *Lowerer, def: ir.spine.EntityId) ?ir.types.Type {
+        if (def >= self.ir.bodies.bodies.len) return null;
+        return switch (self.ir.bodies.bodies[def]) {
+            .const_ => |body| body.ty,
+            else => null,
+        };
+    }
+
+    /// The declared type of the binding a `.field` entity names, read from
+    /// the body that declares it rather than from the callable being
+    /// lowered.
+    ///
+    /// A parameter is a `.field` entity parented to its own function or
+    /// method — an `impl` method keeps the method entity as its parent — so
+    /// free functions, inherent and trait methods, and a closure reading a
+    /// captured parameter all resolve through the same static hop, and the
+    /// answer is the same row before any callable is lowered and while its
+    /// own declaration is.
+    ///
+    /// `paramTypeByName` answers the same question from the AMBIENT callable,
+    /// which is null while `computeComparisonTemporaries` walks the flat
+    /// expression table. An unannotated `r: Result<String, u8>` then read as
+    /// unowned there and owned while `r.unwrap() == "same"` was lowered, so
+    /// the declaration took an allocator no call site had been told to pass.
+    /// What the name match cannot do is separate a parameter from a local
+    /// that shadows it: `pushLocal` registers both as a `.field` entity
+    /// parented to the function, and `Param` carries only name, type and
+    /// span, so the two are one row here. A local that no parameter shares
+    /// its name with is answered by `localBindingType`, which reads the
+    /// `let` that declares it. A struct or enum field is the same question
+    /// against a different owner: its declared type is the owner's field
+    /// list, so the same name match answers it.
+    fn declaredBindingType(self: *const Lowerer, def: ir.spine.EntityId) ?ir.types.Type {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return null;
+        if (entity.kind != .field) return null;
+        const owner = entity.parent orelse return null;
+        if (owner >= self.ir.bodies.bodies.len) return null;
+        return switch (self.ir.bodies.bodies[owner]) {
+            .fn_ => |body| blk: {
+                for (body.params) |param| {
+                    if (std.mem.eql(u8, param.name, entity.name)) break :blk param.ty;
+                }
+                break :blk null;
+            },
+            .struct_ => |body| declaredFieldType(body.fields, entity.name),
+            .enum_ => |body| declaredVariantFieldType(body.variants, entity.name),
+            else => null,
+        };
+    }
+
+    /// Declared type of the named field in a field list, or null when the
+    /// owner declares no field by that name.
+    fn declaredFieldType(fields: []const ir.items.Field, name: []const u8) ?ir.types.Type {
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, name)) return field.ty;
+        }
+        return null;
+    }
+
+    /// Declared type of the named variant field. A tuple variant carries no
+    /// names to match, so only a struct-like variant can answer.
+    fn declaredVariantFieldType(
+        variants: []const ir.items.Variant,
+        name: []const u8,
+    ) ?ir.types.Type {
+        for (variants) |variant| {
+            switch (variant.fields) {
+                .named => |fields| {
+                    if (declaredFieldType(fields, name)) |ty| return ty;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// The Rust type of a node, falling back to the type the surrounding
+    /// expression has already established (`expected_value_type`) when the
+    /// frontend left the node unannotated. `exprType` answers the same
+    /// question but ends in a per-kind guess, which an array or tuple literal
+    /// does not have: Zig writes both with a type name, and nothing about the
+    /// node's own contents says whether it is one or the other.
+    fn nodeType(self: *Lowerer, id: ir.exprs.NodeId) anyerror!?ir.types.Type {
+        if (id < self.ir.bodies.exprs.len) {
+            if (self.ir.bodies.exprs[id].ty) |ty_id| {
+                if (ty_id < self.ir.types.len) return self.ir.types[ty_id];
+                if (ty_id < self.ir.bodies.types.len) return self.ir.bodies.types[ty_id];
+            }
+        }
+        return self.expected_value_type;
     }
 
     /// Best-effort concrete type of a sub-expression (used by binary/unary/if
@@ -6396,29 +8452,78 @@ const Lowerer = struct {
                 },
             },
             .struct_lit => |sl| try self.namedFromDef(sl.def),
-            .path => |pe| blk: {
-                if (self.ir.graph.symbol_table.get(pe.def)) |entity| {
-                    if (entity.kind == .field) {
-                        if (self.paramTypeByName(entity.name)) |pty| {
-                            break :blk pty;
-                        }
-                    }
-                }
-                break :blk try self.namedFromDef(pe.def);
+            .path => |pe| try self.valueEntityType(pe.def),
+            .unary => |unary| switch (unary.op) {
+                // `&e` borrows whatever `e` is. The frontend pins most of
+                // these, but a borrow written on an argument the inference
+                // pass did not reach is left untyped — and then a generic
+                // callee's type parameter cannot be bound from that argument
+                // at all, so the call is refused outright instead of emitted.
+                // The borrow's shape is not a guess: it is the operand's own
+                // type under one more reference, which is exactly what the
+                // source wrote.
+                .ref => |mode| blk: {
+                    if (mode == .value) break :blk null;
+                    const borrowed = (try self.exprType(unary.operand)) orelse break :blk null;
+                    const reference = try self.alloc.create(ir.types.Ref);
+                    reference.* = .{ .mut = mode == .mutable, .pointee = borrowed };
+                    break :blk .{ .reference = reference };
+                },
+                else => null,
             },
             .field => |fe| blk: {
                 if (std.mem.eql(u8, fe.field, "len")) {
                     break :blk ir.types.Type{ .prim = .usize };
                 }
-                break :blk null;
+                // The field's own declaration is the source's answer: the
+                // resolved entity names the row, and the base's nominal
+                // names the same row when the graph did not link one.
+                if (self.declaredBindingType(fe.resolved)) |declared| break :blk declared;
+                break :blk self.fieldSlotType(try self.exprType(fe.base), fe.field);
             },
+            .index => |index_expr| try self.indexExprType(index_expr),
+            .array => |array_expr| try self.arrayExprType(array_expr),
             .method_call => |mc| blk: {
                 const method = self.ir.graph.symbol_table.get(mc.method) orelse break :blk null;
                 if (std.mem.eql(u8, method.name, "len")) {
                     break :blk ir.types.Type{ .prim = .usize };
                 }
+                if (try self.lookupRecognizedStdMethod(mc.receiver, method.name)) |recognized| {
+                    switch (recognized) {
+                        .to_string => break :blk .{ .external_nominal = .{
+                            .path = &.{ "alloc", "string", "String" },
+                            .args = &.{},
+                        } },
+                        // `Iterator::any` answers `bool` whatever the
+                        // predicate accepts; no closure return type is
+                        // needed to know it, because the trait declares it.
+                        .iterator_any => break :blk ir.types.Type{ .prim = .bool },
+                        // `expect` hands back the `Ok` payload and `expect_err`
+                        // the `E`; both name which half they keep, so the
+                        // receiver's own `Result` says which one this is.
+                        .result_unwrap,
+                        .result_unwrap_err,
+                        .result_expect,
+                        .result_expect_err,
+                        => {
+                            const result = try self.taggedResultType(mc.receiver) orelse break :blk null;
+                            const keeps_ok = recognized == .result_unwrap or
+                                recognized == .result_expect;
+                            break :blk if (keeps_ok) result.ok else result.err;
+                        },
+                        else => {},
+                    }
+                }
                 break :blk null;
             },
+            // `E::Variant` is a value of `E`. A variant carries no type of
+            // its own, so the enum that declares it is the only type a method
+            // call on the value can mean. Without this arm the receiver type
+            // was unknown, which silently disabled every type-driven decision
+            // downstream: `FromHexError::OddLength.to_string()` lost its
+            // `Display` recognition and emitted `recv.to_string()`, a method
+            // no Zig value has.
+            .enum_variant => |variant| try self.valueEntityType(variant.def),
             .binary => |binary| try self.binopResultType(binary),
             .match => |match| try self.matchResultType(match),
             else => null,
@@ -6430,6 +8535,380 @@ const Lowerer = struct {
             if (try self.exprType(arm.body)) |result_type| return result_type;
         }
         return null;
+    }
+
+    /// The type of the VALUE a path names.
+    ///
+    /// A path expression is a use, so the answer is whatever the declaration
+    /// says the name holds: a parameter's declared type, a constant's own
+    /// type, a local's annotation or initialiser, or the type itself when the
+    /// name declares one. Answering with the NAME instead, for anything that
+    /// is not a type definition, produced a type path that names no type at
+    /// all — `writable` is a binding, not a type — and made generic inference
+    /// bind a callee's parameter to it: `write::unsigned(&mut writable, 128)`
+    /// inferred `W = writable`, and lowering that argument was refused
+    /// outright. A value entity that declares no type is not evidence of
+    /// anything, so this answers null rather than inventing one.
+    fn valueEntityType(self: *Lowerer, def: ir.spine.EntityId) anyerror!?ir.types.Type {
+        if (self.value_entity_depth >= 32) return null;
+        self.value_entity_depth += 1;
+        defer self.value_entity_depth -= 1;
+        if (self.declaredBindingType(def)) |declared| return declared;
+        if (self.valueDefType(def)) |declared| return declared;
+        if (try self.localBindingType(def)) |declared| return declared;
+        return self.namedTypeDef(def);
+    }
+
+    /// The type a def declares, when the def IS a type definition. A
+    /// variant is a value of the enum that owns it, so a variant names its
+    /// owner; everything else that is not a type definition is a value, and
+    /// naming one back produces a path no type-checker accepts.
+    fn namedTypeDef(self: *Lowerer, def: ir.spine.EntityId) ?ir.types.Type {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return null;
+        const owner = if (entity.kind == .variant)
+            entity.parent orelse return null
+        else
+            def;
+        const owner_entity = self.ir.graph.symbol_table.get(owner) orelse return null;
+        if (!isTypeDefinition(owner_entity.kind)) return null;
+        return self.namedFromDef(owner) catch null;
+    }
+
+    /// Type of `base[index]`.
+    ///
+    /// A range index slices — `buf[..]` is `&[T]`, not the element — so the
+    /// index expression, not the base, decides whether the result is one
+    /// value or a view of the sequence. Any other index reads the element
+    /// the sequence's own type already names. A base that is neither an
+    /// array nor a slice (a map, a `Vec` behind a trait) has no element type
+    /// this way, and says so.
+    fn indexExprType(self: *Lowerer, index_expr: ir.exprs.IndexExpr) anyerror!?ir.types.Type {
+        const base = try self.exprType(index_expr.base) orelse return null;
+        const element: ir.types.Type = switch (base) {
+            .slice => |slice| slice.elem,
+            .array => |array| array.elem,
+            else => return null,
+        };
+        if (index_expr.index >= self.ir.bodies.exprs.len) return null;
+        if (self.ir.bodies.exprs[index_expr.index].kind != .range) return element;
+        const slice = try self.alloc.create(ir.types.Slice);
+        slice.* = .{ .const_ = true, .elem = element };
+        return .{ .slice = slice };
+    }
+
+    /// Type of an array literal: `[T; N]` where `T` is its first element's
+    /// type and `N` its repeated or written length.
+    fn arrayExprType(self: *Lowerer, array_expr: ir.exprs.ArrayExpr) anyerror!?ir.types.Type {
+        if (array_expr.elements.len == 0) return null;
+        const element = try self.exprType(array_expr.elements[0]) orelse return null;
+        const array = try self.alloc.create(ir.types.Array);
+        array.* = .{
+            .elem = element,
+            .len = .{ .literal = @intCast(array_expr.repeat orelse array_expr.elements.len) },
+        };
+        return .{ .array = array };
+    }
+
+    /// The type of a local binding, read from the `let` that declares it.
+    ///
+    /// `pushLocal` registers a local exactly as it registers a parameter — a
+    /// `.field` entity parented to the callable — so the parameter list is
+    /// not the only place a local's type is written down. The `let` is: an
+    /// annotation or the pattern's own recorded type is the source's
+    /// declaration, and an initialiser states the same thing by inference.
+    /// `let mut writable = &mut buf[..]` is `&mut [T]`, and typing that
+    /// initialiser is what resolves the chain of `let`s behind it.
+    fn localBindingType(self: *Lowerer, def: ir.spine.EntityId) anyerror!?ir.types.Type {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return null;
+        if (entity.kind != .field) return null;
+        const owner = entity.parent orelse return null;
+        if (owner >= self.ir.bodies.bodies.len) return null;
+        const fn_body = switch (self.ir.bodies.bodies[owner]) {
+            .fn_ => |body| body,
+            else => return null,
+        };
+        if (fn_body.body >= self.ir.bodies.exprs.len) return null;
+        const block = switch (self.ir.bodies.exprs[fn_body.body].kind) {
+            .block => |value| value,
+            else => return null,
+        };
+        return self.bindingTypeInBlock(block, entity.name, 0);
+    }
+
+    /// The type the first `let` in `block` that binds `name` gives it. A
+    /// nested scope is read too: Rust lets a name be shadowed by an inner
+    /// block, so the inner declaration is a real answer to the question.
+    fn bindingTypeInBlock(
+        self: *Lowerer,
+        block: ir.exprs.BlockExpr,
+        name: []const u8,
+        depth: usize,
+    ) anyerror!?ir.types.Type {
+        if (depth > 32) return null;
+        for (block.statements) |statement_id| {
+            if (statement_id >= self.ir.bodies.stmts.len) continue;
+            switch (self.ir.bodies.stmts[statement_id].kind) {
+                .let => |let_stmt| {
+                    if (try self.letBindingType(let_stmt, name, depth)) |ty| return ty;
+                },
+                .let_else => |let_else| {
+                    if (try self.patternDeclaredType(
+                        let_else.pattern,
+                        name,
+                        try self.exprType(let_else.init),
+                        depth,
+                    )) |ty| {
+                        return ty;
+                    }
+                    if (try self.bindingTypeInBlock(let_else.else_block, name, depth + 1)) |ty| {
+                        return ty;
+                    }
+                },
+                .expr => |expr_id| {
+                    if (try self.bindingTypeInScope(expr_id, name, depth + 1)) |ty| return ty;
+                },
+                .item => {},
+            }
+        }
+        return null;
+    }
+
+    /// The same search through any expression that opens a scope of its own.
+    fn bindingTypeInScope(
+        self: *Lowerer,
+        node: ir.exprs.NodeId,
+        name: []const u8,
+        depth: usize,
+    ) anyerror!?ir.types.Type {
+        if (depth > 32 or node >= self.ir.bodies.exprs.len) return null;
+        switch (self.ir.bodies.exprs[node].kind) {
+            .block => |block| return self.bindingTypeInBlock(block, name, depth),
+            .if_else => |if_expr| {
+                if (try self.bindingTypeInBlock(if_expr.then_, name, depth + 1)) |ty| return ty;
+                return self.bindingTypeInElse(if_expr.@"else", name, depth + 1);
+            },
+            .if_let => |if_let| {
+                if (try self.bindingTypeInBlock(if_let.then_, name, depth + 1)) |ty| return ty;
+                return self.bindingTypeInElse(if_let.@"else", name, depth + 1);
+            },
+            .loop_ => |loop_expr| return self.bindingTypeInBlock(loop_expr.body, name, depth + 1),
+            .while_ => |while_expr| return self.bindingTypeInBlock(while_expr.body, name, depth + 1),
+            .for_ => |for_expr| return self.bindingTypeInBlock(for_expr.body, name, depth + 1),
+            .match => |match_expr| {
+                for (match_expr.arms) |arm| {
+                    if (try self.bindingTypeInScope(arm.body, name, depth + 1)) |ty| return ty;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    fn bindingTypeInElse(
+        self: *Lowerer,
+        branch: ir.exprs.ElseBranch,
+        name: []const u8,
+        depth: usize,
+    ) anyerror!?ir.types.Type {
+        return switch (branch) {
+            .none => null,
+            .block => |block| try self.bindingTypeInBlock(block, name, depth),
+            .chain => |node| try self.bindingTypeInScope(node, name, depth),
+        };
+    }
+
+    /// The type a `let` gives `name`. A `let` whose pattern does not bind the
+    /// name says nothing about it, so it is skipped rather than answered
+    /// with its initialiser's type.
+    fn letBindingType(
+        self: *Lowerer,
+        let_stmt: ir.exprs.LetStmt,
+        name: []const u8,
+        depth: usize,
+    ) anyerror!?ir.types.Type {
+        if (!self.patternBindsName(let_stmt.pattern, name, depth)) return null;
+        if (let_stmt.ty) |ty_id| {
+            if (self.typeById(ty_id) catch null) |declared| return declared;
+        }
+        // The initialiser is what the pattern destructures, so it is the
+        // container each part is read out of: `let (a, b) = pair` gives `a`
+        // the pair's first element, not the pair.
+        const initialiser = try self.exprType(let_stmt.init orelse return null);
+        return self.patternDeclaredType(let_stmt.pattern, name, initialiser, depth);
+    }
+
+    /// Whether `pattern` binds `name` anywhere inside it.
+    fn patternBindsName(
+        self: *const Lowerer,
+        pattern_id: ir.exprs.NodeId,
+        name: []const u8,
+        depth: usize,
+    ) bool {
+        if (depth > 32 or pattern_id >= self.ir.bodies.pats.len) return false;
+        return switch (self.ir.bodies.pats[pattern_id].kind) {
+            .binding => |binding| std.mem.eql(u8, binding.name, name),
+            .tuple => |tuple| patternListBindsName(self, tuple.elements, name, depth),
+            .slice => |slice| blk: {
+                if (patternListBindsName(self, slice.elements, name, depth)) break :blk true;
+                if (slice.rest) |rest| break :blk self.patternBindsName(rest, name, depth + 1);
+                break :blk false;
+            },
+            .reference => |reference| self.patternBindsName(reference.inner, name, depth + 1),
+            .@"or" => |or_pattern| patternListBindsName(self, or_pattern.alternatives, name, depth),
+            .struct_pat => |structure| patternFieldsBindName(self, structure.fields, name, depth),
+            .external_variant => |variant| patternFieldsBindName(self, variant.fields, name, depth),
+            else => false,
+        };
+    }
+
+    /// The type a pattern gives the name it binds: its own recorded type when
+    /// the frontend pinned one, else the matching part of `container`, the
+    /// type the value being destructured already has. Destructuring is how
+    /// most bindings are written — `Some((&first, rest))`, `Err(e)` — and the
+    /// container is the only place their types are written down.
+    fn patternDeclaredType(
+        self: *Lowerer,
+        pattern_id: ir.exprs.NodeId,
+        name: []const u8,
+        container: ?ir.types.Type,
+        depth: usize,
+    ) anyerror!?ir.types.Type {
+        if (depth > 32 or pattern_id >= self.ir.bodies.pats.len) return null;
+        const pattern = self.ir.bodies.pats[pattern_id];
+        switch (pattern.kind) {
+            .binding => |binding| {
+                if (!std.mem.eql(u8, binding.name, name)) return null;
+                if (pattern.ty) |ty_id| {
+                    if (self.typeById(ty_id) catch null) |declared| return declared;
+                }
+                return container;
+            },
+            .reference => |reference| {
+                const pointee: ?ir.types.Type = switch (container orelse return null) {
+                    .reference => |borrowed| borrowed.pointee,
+                    else => null,
+                };
+                return self.patternDeclaredType(reference.inner, name, pointee, depth + 1);
+            },
+            .tuple => |tuple| {
+                const parts: []const ir.types.Type = switch (container orelse return null) {
+                    .tuple => |elements| elements,
+                    else => return null,
+                };
+                for (tuple.elements, 0..) |element, index| {
+                    const part: ?ir.types.Type = if (index < parts.len) parts[index] else null;
+                    if (try self.patternDeclaredType(element, name, part, depth + 1)) |ty| {
+                        return ty;
+                    }
+                }
+                return null;
+            },
+            .slice => |slice| {
+                const element: ?ir.types.Type = switch (container orelse return null) {
+                    .slice => |parts| parts.elem,
+                    .array => |parts| parts.elem,
+                    else => return null,
+                };
+                for (slice.elements) |element_pattern| {
+                    if (try self.patternDeclaredType(element_pattern, name, element, depth + 1)) |ty| {
+                        return ty;
+                    }
+                }
+                if (slice.rest) |rest| {
+                    return self.patternDeclaredType(rest, name, element, depth + 1);
+                }
+                return null;
+            },
+            .@"or" => |or_pattern| {
+                for (or_pattern.alternatives) |alternative| {
+                    if (try self.patternDeclaredType(alternative, name, container, depth + 1)) |ty| {
+                        return ty;
+                    }
+                }
+                return null;
+            },
+            .struct_pat => |structure| return self.patternFieldsDeclaredType(
+                structure.fields,
+                name,
+                container,
+                depth,
+            ),
+            .external_variant => |variant| return self.patternFieldsDeclaredType(
+                variant.fields,
+                name,
+                container,
+                depth,
+            ),
+            else => return null,
+        }
+    }
+
+    fn patternFieldsDeclaredType(
+        self: *Lowerer,
+        fields: []const ir.exprs.FieldPat,
+        name: []const u8,
+        container: ?ir.types.Type,
+        depth: usize,
+    ) anyerror!?ir.types.Type {
+        for (fields) |field| {
+            if (field.pat) |pattern| {
+                if (try self.patternDeclaredType(
+                    pattern,
+                    name,
+                    self.fieldSlotType(container, field.field),
+                    depth + 1,
+                )) |ty| return ty;
+            } else if (field.shorthand and std.mem.eql(u8, field.field, name)) {
+                return self.fieldSlotType(container, field.field);
+            }
+        }
+        return null;
+    }
+
+    /// The declared type of one named field of a value already typed. A
+    /// struct is a `.path` (or a `.generic_inst` of one) whose terminal
+    /// segment resolves to the declaring entity, so the field list is read
+    /// from that declaration and not from the name.
+    fn fieldSlotType(
+        self: *const Lowerer,
+        container: ?ir.types.Type,
+        field: []const u8,
+    ) ?ir.types.Type {
+        const owner = nominalOwnerId(container orelse return null) orelse return null;
+        if (owner >= self.ir.bodies.bodies.len) return null;
+        return switch (self.ir.bodies.bodies[owner]) {
+            .struct_ => |body| declaredFieldType(body.fields, field),
+            .enum_ => |body| declaredVariantFieldType(body.variants, field),
+            else => null,
+        };
+    }
+
+    fn patternListBindsName(
+        self: *const Lowerer,
+        patterns: []const ir.exprs.NodeId,
+        name: []const u8,
+        depth: usize,
+    ) bool {
+        for (patterns) |pattern| {
+            if (self.patternBindsName(pattern, name, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    fn patternFieldsBindName(
+        self: *const Lowerer,
+        fields: []const ir.exprs.FieldPat,
+        name: []const u8,
+        depth: usize,
+    ) bool {
+        for (fields) |field| {
+            if (field.pat) |pattern| {
+                if (self.patternBindsName(pattern, name, depth + 1)) return true;
+            } else if (field.shorthand and std.mem.eql(u8, field.field, name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Result type of a binary expression: comparisons/boolean ops are bool;
@@ -6455,6 +8934,33 @@ const Lowerer = struct {
         return if (t) |ty| ty == .prim and (ty.prim == .f32 or ty.prim == .f64) else false;
     }
 
+    /// Entity that declares the nominal a type names, or null when the type
+    /// is not a nominal of this crate. A generic application is the same
+    /// declaration as its owner: `Wrapper<u8>` is `Wrapper`.
+    fn nominalOwnerId(ty: ir.types.Type) ?ir.spine.EntityId {
+        return switch (ty) {
+            .path => |path| if (path.segments.len == 0) null else path.segments[path.segments.len - 1].id,
+            .generic_inst => |instance| instance.decl,
+            else => null,
+        };
+    }
+
+    /// The type behind any run of references and raw pointers. An lvalue's
+    /// IR type is the pointer it is reached through, so an operator that has
+    /// to know the arithmetic type underneath it walks them off first.
+    fn peelPointers(t: ?ir.types.Type) ?ir.types.Type {
+        var current = t orelse return null;
+        for (0..128) |_| {
+            const next = switch (current) {
+                .reference => |reference| reference.pointee,
+                .raw_ptr => |raw_ptr| raw_ptr.pointee,
+                else => return current,
+            };
+            current = next;
+        }
+        return current;
+    }
+
     /// True for a resolved integer primitive type.
     fn isIntegerType(t: ?ir.types.Type) bool {
         const ty = t orelse return false;
@@ -6476,6 +8982,181 @@ const Lowerer = struct {
             }
         }
         return null;
+    }
+
+    /// The primitive an IR type really names, following a local type ALIAS to
+    /// the declaration it stands for.
+    ///
+    /// `type Chunk = u32;` reaches the backend as a `path`, and every width
+    /// decision has to see the `u32` through it. It matters most for a
+    /// literal: Rust types `1` in `let mask: Chunk = 1 << n` as a `u32`, while
+    /// Zig lowers the same literal to a `comptime_int` and `r2z.ops.binary`
+    /// cannot shift or combine one at a runtime width. A path that names a
+    /// struct, an enum, or a foreign type answers null, which is the only
+    /// thing a caller may do with a width it does not have.
+    fn canonicalPrimType(self: *Lowerer, ty: ?ir.types.Type) ?ir.types.Prim {
+        var current = ty orelse return null;
+        for (0..128) |_| {
+            switch (current) {
+                .prim => |primitive| return primitive,
+                .path => |path| {
+                    const target = lastPathSegment(path.segments) orelse return null;
+                    const def = target.id orelse return null;
+                    const entity = self.ir.graph.symbol_table.get(def) orelse return null;
+                    if (entity.kind != .type_alias) return null;
+                    if (def >= self.ir.bodies.bodies.len) return null;
+                    const alias = switch (self.ir.bodies.bodies[def]) {
+                        .type_alias => |body| body,
+                        else => return null,
+                    };
+                    if (typeEquals(alias.target, current)) return null;
+                    current = alias.target;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Whether `ty` is a primitive that only an ALIAS stands between the
+    /// expression and its width.
+    ///
+    /// A literal the IR typed as a bare primitive already reaches Zig as
+    /// `@as(T, ..)` and needs nothing added; one it typed as `Chunk` reaches
+    /// it as a `comptime_int` and does. That difference is the whole test.
+    fn aliasedIntegerWidth(self: *Lowerer, ty: ?ir.types.Type) ?ir.types.Prim {
+        const concrete = ty orelse return null;
+        if (concrete == .prim) return null;
+        const primitive = self.canonicalPrimType(concrete) orelse return null;
+        return if (isIntegerType(.{ .prim = primitive })) primitive else null;
+    }
+
+    /// Whether `ty` names an integer, directly or through a local primitive
+    /// ALIAS.
+    ///
+    /// `type Chunk = u32;` is a `path` in the IR, and a `!` or a `~` over it
+    /// is a bit operation on a `u32` — not the boolean one. Every decision
+    /// that turns a type into "is this arithmetic" has to look through the
+    /// alias for the same reason the width decisions do.
+    fn isIntegerOperand(self: *Lowerer, ty: ?ir.types.Type) bool {
+        if (isIntegerType(ty)) return true;
+        const primitive = self.canonicalPrimType(ty) orelse return false;
+        return isIntegerType(.{ .prim = primitive });
+    }
+
+    /// The width a bare integer literal reaches a runtime operator at.
+    ///
+    /// `lowerShiftOperand`'s job, reached through an alias as well: a shift
+    /// whose left side is `1u32` behind `Chunk` shifts inside `u32`, and one
+    /// whose left side is already `u32` is left alone.
+    fn lowerAliasedLiteralOperand(
+        self: *Lowerer,
+        operand: ir.exprs.NodeId,
+        lowered: *const ast.Expr,
+        operand_ty: ?ir.types.Type,
+    ) !*const ast.Expr {
+        if (!self.isComptimeIntExpr(operand)) return lowered;
+        const primitive = self.aliasedIntegerWidth(operand_ty) orelse return lowered;
+        return self.allocExpr(ast.Expr{ .cast = .{
+            .target = try self.lowerType(.{ .prim = primitive }),
+            .operand = lowered,
+        } });
+    }
+
+    /// Zig's shift operators take the amount in `u5`, so a Rust shift by a
+    /// wider integer needs a narrowing cast. `@intCast` takes its result type
+    /// from context, so the surrounding `<<` / `>>` / `<<=` / `>>=` supplies
+    /// the `u5` and the emitted amount is well typed. Callers must not hand
+    /// this a float amount, nor an amount the runtime operator path owns —
+    /// `r2z.ops` casts for itself.
+    fn lowerShiftAmount(self: *Lowerer, amount: ast.Expr) !ast.Expr {
+        const args = try self.alloc.alloc(ast.Expr, 1);
+        errdefer self.alloc.free(args);
+        args[0] = amount;
+        return .{ .builtin = .{
+            .name = "intCast",
+            .args = args,
+        } };
+    }
+
+    /// True when a Rust expression reaches Zig as a `comptime_int`: a bare
+    /// integer literal, or such a literal under unary `-`. A binding, a call,
+    /// a field, and a Rust `as` cast all carry a type of their own, a nested
+    /// shift is typed by the left operand this one types, and unary `!` types
+    /// its own literal from the expected type, so nothing else reaches a
+    /// shift as a bare comptime value.
+    fn isComptimeIntExpr(self: *const Lowerer, id: ir.exprs.NodeId) bool {
+        if (id >= self.ir.bodies.exprs.len) return false;
+        return switch (self.ir.bodies.exprs[id].kind) {
+            .literal => |lit| lit == .int,
+            .unary => |unary| switch (unary.op) {
+                .negate => self.isComptimeIntExpr(unary.operand),
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Zig gives `<<` and `>>` the type of their left operand, and a Rust
+    /// integer literal lowers to a `comptime_int`. So `1 << 7` shifts at
+    /// arbitrary precision and hands an enclosing `i8` the value `128`, which
+    /// Zig rejects. Rust types the literal from its context and shifts inside
+    /// that type, so `1i8 << 7` is `-128` and `-8i8 >> 2` is `-2`. Casting the
+    /// left operand to the Rust operand type before the shift restores both
+    /// the truncating left shift and the arithmetic right shift, and the
+    /// result then carries that type to every enclosing expression. A left
+    /// operand that already reaches Zig typed is handed back as is, so no
+    /// runtime conversion is added. The amount is `lowerShiftAmount`'s job.
+    fn lowerShiftOperand(
+        self: *Lowerer,
+        operand: ir.exprs.NodeId,
+        lowered: *const ast.Expr,
+        operand_ty: ?ir.types.Type,
+    ) !*const ast.Expr {
+        if (!self.isComptimeIntExpr(operand)) return lowered;
+        if (integerOperandType(operand_ty)) |int_ty| {
+            return self.allocExpr(ast.Expr{ .cast = .{
+                .target = try self.lowerType(int_ty),
+                .operand = lowered,
+            } });
+        }
+        // `integerOperandType` sees only a resolved primitive, and a literal
+        // the source typed as `Chunk` is a `path`. The width is the one the
+        // alias stands for, so the shift happens inside it rather than at
+        // `comptime_int` width.
+        return self.lowerAliasedLiteralOperand(operand, lowered, operand_ty);
+    }
+
+    /// True when indexing `ty` has to go through the container's storage.
+    /// `Vec<T>` lowers to `std.ArrayListUnmanaged`, and Zig indexes the `items`
+    /// slice, not the list value: `list[i]` is a compile error, `list.items[i]`
+    /// is the element. A reference or raw pointer in front of the vector is
+    /// transparent, so the walk stops at the nominal.
+    fn needsContainerStorageProjection(ty: ?ir.types.Type) bool {
+        var current = ty orelse return false;
+        for (0..128) |_| {
+            switch (current) {
+                .reference => |reference| current = reference.pointee,
+                .raw_ptr => |raw_ptr| current = raw_ptr.pointee,
+                .external_nominal => |external| return isAllocVecPath(external.path),
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// Whether a lowered expression is a call whose error has not been
+    /// propagated, so its Zig type is still an error union.
+    fn isUnpropagatedErrorUnionExpr(expression: ast.Expr) bool {
+        return switch (expression) {
+            .call => true,
+            // `try f()` still carries the error union in its operand, and an
+            // `.items` after it applies the projection to that operand, so
+            // the walk follows both operators.
+            .unary_op => |unary| isUnpropagatedErrorUnionExpr(unary.operand.*),
+            .field_access => |field| isUnpropagatedErrorUnionExpr(field.target.*),
+            else => false,
+        };
     }
 
     fn binaryOperandNeedsDeref(
@@ -6505,6 +9186,30 @@ const Lowerer = struct {
         return false;
     }
 
+    /// Whether a binary operator has to go through the runtime helper.
+    ///
+    /// Zig's `==` is a primitive operator: a slice, an array, a struct, a
+    /// tagged union, or an enum has no native `==` at all, and naming one is
+    /// a compile error rather than a value comparison. The runtime helper
+    /// walks those structurally, so it is the only spelling that compiles.
+    ///
+    /// Both operands are consulted for `==` and `!=` because the frontend
+    /// leaves plenty of values untyped, and an unknown LEFT operand is exactly
+    /// the case that used to reach a native `==`: a `String` built by
+    /// `ToString::to_string` compared against a string literal, and
+    /// `E::Variant` — a tagged-union value — compared against an unwrapped
+    /// `Result`, both on the right of a left side the frontend never typed. An
+    /// unknown operand still falls back to the native operator, which is what
+    /// an untyped `x == 0` needs.
+    fn requiresRuntimeComparison(
+        op: ir.exprs.BinaryOp,
+        lhs: ?ir.types.Type,
+        rhs: ?ir.types.Type,
+    ) bool {
+        if (op != .eq and op != .ne) return requiresRuntimeOperator(lhs);
+        return requiresRuntimeOperator(lhs) or requiresRuntimeOperator(rhs);
+    }
+
     fn lowerRuntimeOperator(
         self: *Lowerer,
         name: []const u8,
@@ -6525,22 +9230,342 @@ const Lowerer = struct {
         } };
     }
 
-    fn isParameterAssigned(self: *const Lowerer, entity_id: ir.spine.EntityId) bool {
+    /// Comparison operands are borrowed, not moved. Own only rvalues; a path,
+    /// field, index or dereference still belongs to its existing owner.
+    fn comparisonTemporaryType(self: *Lowerer, node: ir.exprs.NodeId) anyerror!?ir.types.Type {
+        switch (self.ir.bodies.exprs[node].kind) {
+            .literal, .path, .field, .index, .unary => return null,
+            else => {},
+        }
+        const ty = try self.exprType(node) orelse return null;
+        return if (typeNeedsTemporaryDrop(ty)) ty else null;
+    }
+
+    fn typeNeedsTemporaryDrop(ty: ir.types.Type) bool {
+        return switch (ty) {
+            .option => |payload| typeNeedsTemporaryDrop(payload.*),
+            .result => |result| typeNeedsTemporaryDrop(result.ok) or typeNeedsTemporaryDrop(result.err),
+            .@"opaque" => |opaque_type| if (opaque_type.concrete) |concrete|
+                typeNeedsTemporaryDrop(concrete.*)
+            else
+                false,
+            else => ownedRuntimeContainerType(ty),
+        };
+    }
+
+    fn bindComparisonOperand(
+        self: *Lowerer,
+        statements: *std.ArrayListUnmanaged(ast.Stmt),
+        value: ast.Expr,
+        owner_type: ?ir.types.Type,
+    ) anyerror!ast.Expr {
+        const name = try self.iteratorTemporaryName("__r2z_compare");
+        // Borrow existing places without copying their storage. Other
+        // operands are evaluated once, in source order.
+        const borrow_place = owner_type == null and exprIsAddressable(value);
+        const operand_init = if (borrow_place)
+            ast.Expr{ .unary_op = .{ .op = .addr_of, .operand = try self.allocExpr(value) } }
+        else
+            value;
+        try statements.append(self.alloc, .{ .let_stmt = .{
+            .name = name,
+            .ty = if (owner_type) |ty| try self.lowerType(ty) else null,
+            .init = operand_init,
+            .is_mut = owner_type != null,
+        } });
+        const held: ast.Expr = .{ .ident = name };
+        if (owner_type != null) {
+            self.current_callable_is_allocating = true;
+            try statements.append(self.alloc, .{ .defer_stmt = .{
+                .expr = .{ .call = .{
+                    .callee = try self.allocExpr(.{ .ident = "r2z.alloc.dropTemporary" }),
+                    .args = try self.alloc.dupe(ast.Expr, &.{
+                        .{ .ident = "allocator" },
+                        .{ .unary_op = .{ .op = .addr_of, .operand = try self.allocExpr(held) } },
+                    }),
+                } },
+            } });
+        }
+        return if (borrow_place)
+            .{ .unary_op = .{ .op = .deref, .operand = try self.allocExpr(held) } }
+        else
+            held;
+    }
+
+    fn lowerBorrowedComparison(
+        self: *Lowerer,
+        binary: ir.exprs.BinaryExpr,
+        lhs: ast.Expr,
+        rhs: ast.Expr,
+    ) anyerror!ast.Expr {
+        if (binary.op != .eq and binary.op != .ne) {
+            return self.lowerRuntimeOperator("binary", @tagName(binary.op), binary.overflow, lhs, rhs);
+        }
+        const lhs_owner = try self.comparisonTemporaryType(binary.lhs);
+        const rhs_owner = try self.comparisonTemporaryType(binary.rhs);
+        if (lhs_owner == null and rhs_owner == null) {
+            return self.lowerRuntimeOperator("binary", @tagName(binary.op), binary.overflow, lhs, rhs);
+        }
+        var statements: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer statements.deinit(self.alloc);
+        const left = try self.bindComparisonOperand(&statements, lhs, lhs_owner);
+        const right = try self.bindComparisonOperand(&statements, rhs, rhs_owner);
+        return .{ .block = .{
+            .stmts = try statements.toOwnedSlice(self.alloc),
+            .expr = try self.allocExpr(try self.lowerRuntimeOperator(
+                "binary",
+                @tagName(binary.op),
+                binary.overflow,
+                left,
+                right,
+            )),
+        } };
+    }
+
+    /// How an assignment target reaches the local binding it writes.
+    ///
+    /// Rebinding and addressing a descriptor need mutable local storage.
+    /// Writing an owned place needs it only for a non-handle value; writing
+    /// through a pointer leaves the pointer binding unchanged.
+    const BindingWrite = enum {
+        /// No assignment target reaches this binding.
+        none,
+        /// `x = v`: the binding itself is replaced.
+        rebind,
+        /// The lowered descriptor is passed by mutable address.
+        addressed,
+        /// `x.f = v` / `x[i] = v`: a place the binding owns is written.
+        owned_place,
+        /// `*p = v`: the pointee is written, so the binding is untouched.
+        pointee,
+    };
+
+    /// One parameter the prologue passed as an immutable copy, beside the
+    /// body binding the copy was made for.
+    ///
+    /// Zig parameters are const, so a parameter the body writes is declared
+    /// as `_{name}` and copied into a `var {name}` the body reads. The two
+    /// names differ, and a body binding already spelled `_{name}` pushes the
+    /// signature spelling to `_{name}_N`. Nothing recovers one name from the
+    /// other — `isCurrentParameterPath` recognizes the copy through this
+    /// pair, which is recorded where the copy is decided.
+    const MutableCopyBinding = struct {
+        /// The name the emitted signature declares.
+        signature_name: []const u8,
+        /// The name the body binds and reads.
+        body_name: []const u8,
+    };
+
+    /// How far an assignment target is followed down its base chain before
+    /// the walk gives up. `a.b.c[i].d = v` is four steps; the bound keeps the
+    /// walk finite on a table this function does not own.
+    const binding_write_depth_limit: usize = 32;
+
+    fn targetWriteReach(
+        self: *const Lowerer,
+        target: ir.exprs.NodeId,
+        entity_id: ir.spine.EntityId,
+        depth: usize,
+    ) BindingWrite {
+        if (depth >= binding_write_depth_limit) return .none;
+        if (target >= self.ir.bodies.exprs.len) return .none;
+        return switch (self.ir.bodies.exprs[target].kind) {
+            .path => |pe| blk: {
+                if (pe.def != entity_id) break :blk .none;
+                if (depth == 0) break :blk .rebind;
+                break :blk .owned_place;
+            },
+            .field => |fe| self.targetWriteReach(fe.base, entity_id, depth + 1),
+            .index => |ie| self.targetWriteReach(ie.base, entity_id, depth + 1),
+            // A dereference writes the pointee. The binding it was read from
+            // keeps whatever mutability it already had.
+            .unary => |ue| switch (ue.op) {
+                .deref => .pointee,
+                else => .none,
+            },
+            else => .none,
+        };
+    }
+
+    /// How a `receiver.method(..)` call writes through the storage the
+    /// receiver names.
+    ///
+    /// `r2z.alloc.String` spells `into_bytes`, `push`, `reserve` and the rest
+    /// with a `self: *String` receiver, so the call reaches the string through
+    /// a mutable pointer. An owned `String` the binding holds is exactly the
+    /// storage that pointer needs: it has to be a `var`, and an immutable Zig
+    /// parameter cannot be one. A receiver reached through a field or an index
+    /// is a place the binding owns too.
+    ///
+    /// Both other answers are deliberate refusals. A receiver behind a
+    /// dereference is a pointee the binding does not own, and a receiver of
+    /// any other type is not this method at all — a `Vec` has a `push`, and
+    /// the resolved receiver type is what keeps the two apart.
+    fn methodReceiverWrite(
+        self: *Lowerer,
+        call: ir.exprs.MethodCall,
+        entity_id: ir.spine.EntityId,
+    ) anyerror!BindingWrite {
+        const method = self.ir.graph.symbol_table.get(call.method) orelse return .none;
+        if (!stringMethodNeedsMutableReceiver(method.name)) return .none;
+        const reach = self.targetWriteReach(call.receiver, entity_id, 0);
+        if (reach == .none or reach == .pointee) return .none;
+        const receiver_type = (try self.exprType(call.receiver)) orelse return .none;
+        if (ownedStringType(receiver_type) == null) return .none;
+        return reach;
+    }
+
+    /// The strongest write any expression in this callable performs on one
+    /// local binding — an assignment target, a receiver that reaches its
+    /// string's storage, or a call argument handed over by address. A rebind
+    /// outranks a written place and a written place outranks a written
+    /// pointee, so the answer does not depend on where in the expression
+    /// table each write happens to sit.
+    fn bindingWrite(self: *Lowerer, entity_id: ir.spine.EntityId) anyerror!BindingWrite {
+        var strongest: BindingWrite = .none;
         for (self.ir.bodies.exprs) |e| {
-            switch (e.kind) {
-                .assign => |assignment| {
-                    if (assignment.target < self.ir.bodies.exprs.len) {
-                        switch (self.ir.bodies.exprs[assignment.target].kind) {
-                            .path => |pe| if (pe.def == entity_id) return true,
-                            else => {},
-                        }
-                    }
+            const reach: BindingWrite = switch (e.kind) {
+                .assign => |value| self.targetWriteReach(value.target, entity_id, 0),
+                .method_call => |call| try self.methodReceiverWrite(call, entity_id),
+                .call => |call| try self.callArgumentWrite(call, entity_id),
+                else => continue,
+            };
+            switch (reach) {
+                .rebind => strongest = .rebind,
+                .addressed => {
+                    if (strongest == .none or strongest == .owned_place) strongest = .addressed;
                 },
-                else => {},
+                .owned_place => {
+                    if (strongest == .none) strongest = .owned_place;
+                },
+                .none, .pointee => {},
             }
         }
-        return false;
+        return strongest;
     }
+
+    /// How a call argument writes through the storage a local binding owns.
+    ///
+    /// A generic `&mut R` parameter lowers to the Zig pointer `*R`: a bare
+    /// type parameter is the pointee, and the callee writes through it. An
+    /// argument whose OWN type lowers to a fat value — `&str`, `&[T]`,
+    /// `&dyn Trait` — is not that pointer, so the call hands over its ADDRESS
+    /// and the binding is a value it has to own as a mutable local. An
+    /// argument that is already a pointer is the pointer the parameter wants
+    /// and leaves the binding exactly as it was.
+    fn callArgumentWrite(
+        self: *Lowerer,
+        call: ir.exprs.Call,
+        entity_id: ir.spine.EntityId,
+    ) anyerror!BindingWrite {
+        var strongest: BindingWrite = .none;
+        for (call.args, 0..) |arg_id, index| {
+            if (!try self.argumentTakesGenericBorrowAddress(call, index, arg_id)) continue;
+            const reach = self.targetWriteReach(arg_id, entity_id, 1);
+            switch (reach) {
+                .rebind => strongest = .rebind,
+                .owned_place, .addressed => strongest = .addressed,
+                .none, .pointee => {},
+            }
+        }
+        return strongest;
+    }
+
+    /// Whether a binding of this type already reaches the place it names
+    /// through a pointer it holds. A reference, raw pointer, slice, and
+    /// function pointer do, and Zig writes through one from an immutable
+    /// binding. Every other type — a struct, an array, a tuple, a scalar —
+    /// is a value the binding owns, so writing part of it writes the binding.
+    fn typeIsHandle(ty: ir.types.Type) bool {
+        return switch (ty) {
+            .reference, .raw_ptr, .slice, .fn_ptr => true,
+            else => false,
+        };
+    }
+
+    /// Whether this borrow lowers to the fat VALUE rather than to a Zig
+    /// pointer, which is what `lowerType` does for every fat borrow Rust has:
+    /// `&str`, `&[T]` and `&dyn Trait` are all the value itself, because the
+    /// fat pointer already carries everything the borrow names.
+    fn borrowLowersToFatValue(pointee: ir.types.Type) bool {
+        return isSliceShapedBorrow(pointee) or pointee == .dyn_trait;
+    }
+
+    /// Whether a write to `entity_id` needs a mutable local in the emitted
+    /// Zig: an immutable `_x` signature parameter plus a `var x` copy.
+    fn bindingNeedsMutableLocal(
+        self: *Lowerer,
+        entity_id: ir.spine.EntityId,
+        handle_type: bool,
+    ) anyerror!bool {
+        return switch (try self.bindingWrite(entity_id)) {
+            .rebind, .addressed => true,
+            .owned_place => !handle_type,
+            .none, .pointee => false,
+        };
+    }
+
+    /// The binding-entity spelling, for a caller that holds no declared type
+    /// of its own. The type decides whether a written place belongs to the
+    /// binding or to a pointee behind it; a binding whose type cannot be read
+    /// is taken as a value, which is the shape a mutable copy exists for.
+    fn isParameterAssigned(self: *Lowerer, entity_id: ir.spine.EntityId) anyerror!bool {
+        const entity = self.ir.graph.symbol_table.get(entity_id) orelse return false;
+        const handle_type = if (self.paramTypeByName(entity.name)) |pty|
+            typeIsHandle(pty)
+        else
+            false;
+        return self.bindingNeedsMutableLocal(entity_id, handle_type);
+    }
+
+    /// The signature name an immutable copy is bound to before the mutable
+    /// local takes over. `_{name}` is the established spelling, and the
+    /// numbered spelling exists because a body may already bind that name:
+    /// one identifier cannot be both.
+    ///
+    /// The body name and the signature name are one decision, so the pair is
+    /// recorded here for whoever has to tell the copy from a binding of the
+    /// same name later. A spelling rule cannot do it: `_{name}_N` is the same
+    /// copy, and `isCurrentParameterPath` would have to guess which suffix
+    /// belongs to a parameter and which to the body's own binding.
+    fn mutableCopyParamName(
+        self: *Lowerer,
+        names: *LocalBindingNames,
+        copies: *std.ArrayListUnmanaged(MutableCopyBinding),
+        local_name: []const u8,
+    ) ![]const u8 {
+        var candidate = try std.fmt.allocPrint(self.alloc, "_{s}", .{local_name});
+        var suffix: usize = 1;
+        while (names.used_names.contains(candidate)) {
+            candidate = try std.fmt.allocPrint(self.alloc, "_{s}_{d}", .{ local_name, suffix });
+            suffix += 1;
+        }
+        try names.used_names.put(self.alloc, candidate, {});
+        try copies.append(self.alloc, .{
+            .signature_name = candidate,
+            .body_name = local_name,
+        });
+        return candidate;
+    }
+
+    /// Reserve every spelling a parameter of the current callable is emitted
+    /// under: the signature name, and — for a parameter the prologue copied —
+    /// the body binding the copy feeds. A generated name that collides with
+    /// either is a redeclaration, and the body spelling is the one a
+    /// signature-only list misses.
+    fn appendParameterNames(
+        self: *Lowerer,
+        reserved: *std.ArrayListUnmanaged([]const u8),
+    ) !void {
+        for (self.current_parameter_names) |param| {
+            try reserved.append(self.alloc, param.name);
+        }
+        for (self.current_mutable_copies) |copy| {
+            try reserved.append(self.alloc, copy.signature_name);
+            try reserved.append(self.alloc, copy.body_name);
+        }
+    }
+
     fn paramTypeByName(self: *const Lowerer, name: []const u8) ?ir.types.Type {
         const cid = self.current_callable_id orelse return null;
         if (cid >= self.ir.bodies.bodies.len) return null;
@@ -6609,6 +9634,11 @@ const Lowerer = struct {
         else
             ast.Type{ .named = try self.alloc.dupe(u8, struct_name) };
 
+        var mutable_param_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer mutable_param_stmts.deinit(self.alloc);
+        var mutable_copies: std.ArrayListUnmanaged(MutableCopyBinding) = .empty;
+        defer mutable_copies.deinit(self.alloc);
+
         if (m.receiver) |rec| {
             // A generic struct is emitted as a comptime type function. Keep the
             // receiver tied to that type so its AST matches the method return.
@@ -6632,11 +9662,45 @@ const Lowerer = struct {
                 .owned => self_type,
             };
 
-            try params_list.append(self.alloc, .{
-                .name = "self",
-                .ty = rec_ty,
-            });
-            _ = local_binding_names.claimLocalName(&self.ir.graph.symbol_table, "self");
+            const receiver_def = local_binding_names.claimLocal(&self.ir.graph.symbol_table, "self");
+            const receiver_name = if (receiver_def) |d|
+                local_binding_names.emitted_by_entity.get(d) orelse "self"
+            else
+                "self";
+            // A by-value receiver IS a Zig value: a write to it, or to a field
+            // or element it owns, needs a mutable local, so the signature
+            // keeps an immutable copy of it and the body copies that. A
+            // borrowed receiver already points at the caller's value, and Zig
+            // writes through the pointer without a local of its own.
+            const receiver_is_written = if (receiver_def) |d| blk: {
+                if (rec != .owned) break :blk false;
+                break :blk try self.bindingNeedsMutableLocal(d, false);
+            } else false;
+
+            if (receiver_is_written) {
+                const signature_name = try self.mutableCopyParamName(
+                    &local_binding_names,
+                    &mutable_copies,
+                    receiver_name,
+                );
+                try params_list.append(self.alloc, .{
+                    .name = signature_name,
+                    .ty = rec_ty,
+                });
+                try mutable_param_stmts.append(self.alloc, .{
+                    .let_stmt = .{
+                        .name = try self.alloc.dupe(u8, receiver_name),
+                        .ty = rec_ty,
+                        .init = .{ .ident = try self.alloc.dupe(u8, signature_name) },
+                        .is_mut = true,
+                    },
+                });
+            } else {
+                try params_list.append(self.alloc, .{
+                    .name = try self.alloc.dupe(u8, receiver_name),
+                    .ty = rec_ty,
+                });
+            }
         }
         try self.appendFunctionGenericParams(m.generic_params, &params_list);
         if (method_is_allocating) {
@@ -6646,9 +9710,6 @@ const Lowerer = struct {
             });
         }
 
-        var mutable_param_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
-        defer mutable_param_stmts.deinit(self.alloc);
-
         for (m.params) |p| {
             const p_ty = try self.lowerType(p.ty);
             const param_def = local_binding_names.claimLocal(&self.ir.graph.symbol_table, p.name);
@@ -6657,12 +9718,16 @@ const Lowerer = struct {
             else
                 p.name;
             const is_mut_assigned = if (param_def) |d|
-                self.isParameterAssigned(d)
+                try self.bindingNeedsMutableLocal(d, typeIsHandle(p.ty))
             else
                 false;
 
             if (is_mut_assigned) {
-                const sig_name = try std.fmt.allocPrint(self.alloc, "_{s}", .{param_name});
+                const sig_name = try self.mutableCopyParamName(
+                    &local_binding_names,
+                    &mutable_copies,
+                    param_name,
+                );
                 try params_list.append(self.alloc, .{
                     .name = sig_name,
                     .ty = p_ty,
@@ -6685,6 +9750,9 @@ const Lowerer = struct {
         const previous_parameter_names = self.current_parameter_names;
         self.current_parameter_names = params_list.items;
         defer self.current_parameter_names = previous_parameter_names;
+        const previous_mutable_copies = self.current_mutable_copies;
+        self.current_mutable_copies = mutable_copies.items;
+        defer self.current_mutable_copies = previous_mutable_copies;
 
         const owned_collection = self.matchOwnedCollection(m.body, m.ret, method_is_allocating);
         var ret_type = if (owned_collection != null)
@@ -6742,7 +9810,8 @@ const Lowerer = struct {
             .name = try self.alloc.dupe(u8, m.name),
             .is_pub = switch (m.visibility) {
                 .public, .crate_restricted, .super_restricted, .in_path => true,
-                .private => !self.current_file_is_root,
+                .private => method_entity_id == null or
+                    self.privateItemIsPublished(method_entity_id.?),
             },
             .params = final_params,
             .ret_type = ret_type,
@@ -6877,10 +9946,193 @@ const Lowerer = struct {
             test_block.stmts = stmts;
         }
 
+        // A test body cannot hand a binding back: the only thing that leaves a
+        // test is the result. Rust drops what it made when the scope ends, so
+        // the runtime storage an owned binding holds is released here too.
+        if (test_is_allocating and expr_node.kind == .block) {
+            try self.appendOwnedScopeDrops(expr_node.kind.block, &local_binding_names, &test_block);
+        }
+
         return .{
             .name = try self.alloc.dupe(u8, ent.name),
             .body = test_block,
         };
+    }
+
+    /// Whether a runtime container owns heap storage the runtime releases with
+    /// `deinit(gpa)`. A borrowed view of one is not: the value it reads
+    /// belongs to somebody else.
+    ///
+    /// `FromUtf8Error` belongs here for the same reason `String` does: it RETAINS
+    /// the bytes that failed validation, so an arm binding one owns those bytes
+    /// and has to release them. Reading the character-level detail out of it is a
+    /// borrow — the runtime's accessor takes `self: *const` — so the wrapper is
+    /// still full afterwards and its release still has work to do.
+    fn ownedRuntimeContainerType(ty: ir.types.Type) bool {
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return false,
+        };
+        return externalPathEqual(external.path, &.{ "alloc", "vec", "Vec" }) or
+            externalPathEqual(external.path, &.{ "alloc", "string", "String" }) or
+            externalPathEqual(external.path, &.{ "std", "string", "String" }) or
+            externalPathEqual(external.path, &.{ "alloc", "string", "FromUtf8Error" }) or
+            externalPathEqual(external.path, &.{ "std", "string", "FromUtf8Error" }) or
+            isCowPath(external.path);
+    }
+
+    /// The source name a path expression reads.
+    fn pathBindingName(self: *const Lowerer, node: ir.exprs.NodeId) ?[]const u8 {
+        if (node >= self.ir.bodies.exprs.len) return null;
+        const path = switch (self.ir.bodies.exprs[node].kind) {
+            .path => |value| value,
+            else => return null,
+        };
+        const entity = self.ir.graph.symbol_table.get(path.def) orelse return null;
+        return entity.name;
+    }
+
+    /// Record every binding a path expression hands to a call, a return, or
+    /// an assignment target.
+    fn markPassedBindings(
+        self: *Lowerer,
+        escaped: *std.StringHashMapUnmanaged(void),
+        nodes: []const ir.exprs.NodeId,
+    ) !void {
+        for (nodes) |node| {
+            if (self.pathBindingName(node)) |name| try escaped.put(self.alloc, name, {});
+        }
+    }
+
+    /// The bindings a callable hands on: passed to a call, rebound, returned,
+    /// or emptied by a method that takes its storage.
+    ///
+    /// A binding on this list is not the callable's to release — it belongs to
+    /// whoever took it — so it gets no release of its own. The rule is stated
+    /// as a refusal rather than a proof: a binding the analysis cannot account
+    /// for stays unreleased rather than risking a second free.
+    ///
+    /// `returned_tail` is the callable's own block tail. A function whose body
+    /// ends in a binding returns it without an IR `return` node — the emitter
+    /// writes that `return` — so the tail is the one hand-off this scan would
+    /// otherwise never see.
+    fn escapedBindingNames(
+        self: *Lowerer,
+        returned_tail: ?ir.exprs.NodeId,
+    ) !std.StringHashMapUnmanaged(void) {
+        var escaped: std.StringHashMapUnmanaged(void) = .empty;
+        if (returned_tail) |tail| {
+            if (self.pathBindingName(tail)) |name| try escaped.put(self.alloc, name, {});
+        }
+        for (self.ir.bodies.exprs) |expr| {
+            switch (expr.kind) {
+                .call => |call| try self.markPassedBindings(&escaped, call.args),
+                .method_call => |method_call| {
+                    try self.markPassedBindings(&escaped, method_call.args);
+                    const method = self.ir.graph.symbol_table.get(method_call.method);
+                    if (method != null and
+                        stringMethodNeedsMutableReceiver(method.?.name))
+                    {
+                        if (self.pathBindingName(method_call.receiver)) |name| {
+                            try escaped.put(self.alloc, name, {});
+                        }
+                    }
+                },
+                .return_ => |return_expr| {
+                    if (return_expr.value) |value| {
+                        if (self.pathBindingName(value)) |name| {
+                            try escaped.put(self.alloc, name, {});
+                        }
+                    }
+                },
+                .assign => |assignment| {
+                    if (self.pathBindingName(assignment.target)) |name| {
+                        try escaped.put(self.alloc, name, {});
+                    }
+                },
+                else => {},
+            }
+        }
+        return escaped;
+    }
+
+    /// `defer <name>.deinit(allocator);` for every owned binding the callable
+    /// creates and never hands on.
+    ///
+    /// Rust drops a local when its scope ends, and an owned runtime container
+    /// holds heap storage that nothing else releases. Without it the value
+    /// leaks, and `std.testing.allocator` fails the run on the leak rather
+    /// than on the behaviour the test was written to check.
+    ///
+    /// A binding that is passed on, returned, rebound or emptied by a
+    /// consuming method belongs to whoever took it and is left alone.
+    fn appendOwnedScopeDrops(
+        self: *Lowerer,
+        body: ir.exprs.BlockExpr,
+        names: *const LocalBindingNames,
+        block: *ast.Block,
+    ) anyerror!void {
+        var escaped = try self.escapedBindingNames(body.tail);
+        defer escaped.deinit(self.alloc);
+        var releases: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer releases.deinit(self.alloc);
+        for (body.statements) |statement_id| {
+            if (statement_id >= self.ir.bodies.stmts.len) continue;
+            const let_statement = switch (self.ir.bodies.stmts[statement_id].kind) {
+                .let => |value| value,
+                else => continue,
+            };
+            const pat_id = let_statement.pattern;
+            if (pat_id >= self.ir.bodies.pats.len) continue;
+            const pattern = self.ir.bodies.pats[pat_id];
+            const binding = switch (pattern.kind) {
+                .binding => |value| value,
+                else => continue,
+            };
+            if (escaped.contains(binding.name)) continue;
+            // A release runs on whatever the slot holds when the scope ends.
+            // This pass reads the SOURCE statements, so it can meet a binding
+            // whose initializer is absent — Rust's late initialization — on
+            // IR that reached this point without going through `lowerStmt`.
+            // `undefined` is not an allocation, so `deinit` on it frees bytes
+            // nobody handed out. Skipping is the whole answer here: whether
+            // such a binding OWES a release is decided where the declaration is
+            // written, and a late-initialized container is refused there rather
+            // than decided by guesswork from the pattern type.
+            const init_id = let_statement.init orelse continue;
+            if (init_id >= self.ir.bodies.exprs.len) continue;
+            const type_id = pattern.ty orelse self.ir.bodies.exprs[init_id].ty orelse continue;
+            if (!ownedRuntimeContainerType(try self.typeById(type_id))) continue;
+            const emitted = names.emitted_by_pattern.get(pat_id) orelse binding.name;
+            // `deinit` takes a mutable pointer and the binding is immutable in
+            // the source, so the release runs on an alias. The copy shares the
+            // storage, which is the point: the binding is never read again.
+            const alias_name = try self.iteratorTemporaryName("__r2z_release");
+            const owner = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, emitted) });
+            const alias = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, alias_name) });
+            const release = try self.allocExpr(.{ .call = .{
+                .callee = try self.allocExpr(.{ .field_access = .{
+                    .target = alias,
+                    .field_name = "deinit",
+                } }),
+                .args = &.{.{ .ident = "allocator" }},
+            } });
+            const release_stmts = try self.alloc.alloc(ast.Stmt, 2);
+            release_stmts[0] = .{ .let_stmt = .{
+                .name = alias_name,
+                .init = owner.*,
+                .is_mut = true,
+            } };
+            release_stmts[1] = .{ .defer_stmt = .{ .expr = release.* } };
+            try releases.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{
+                .block = .{ .stmts = release_stmts },
+            }) });
+        }
+        if (releases.items.len == 0) return;
+        const stmts = try self.alloc.alloc(ast.Stmt, block.stmts.len + releases.items.len);
+        @memcpy(stmts[0..block.stmts.len], block.stmts);
+        @memcpy(stmts[block.stmts.len..], releases.items);
+        block.stmts = stmts;
     }
 
     // -------------------------------------------------------------------------
@@ -7500,6 +10752,7 @@ const Lowerer = struct {
             .exprs = self.ir.bodies.exprs,
             .stmts = self.ir.bodies.stmts,
             .effects = effects,
+            .comparison_temporaries = self.comparison_temporaries orelse &.{},
         };
         return scanner.exprAllocates(method.body);
     }
@@ -7533,6 +10786,103 @@ const Lowerer = struct {
         };
         if (arg_index >= params.len) return null;
         return params[arg_index].ty;
+    }
+
+    /// Whether `call` hands argument `arg_index` over as the ADDRESS a
+    /// declared `&mut R` parameter needs.
+    ///
+    /// `lowerType` spells a borrow of a fat value AS that value — `&str` is
+    /// `[]const u8`, `&[T]` is `[]const T`, `&dyn Trait` is the erased handle
+    /// — because the fat pointer already carries everything the borrow names.
+    /// A borrow of a type PARAMETER is not fat: it lowers to the Zig pointer
+    /// `*R`, since a bare parameter is the pointee and the callee writes
+    /// through it. So an argument whose own type lowers to a fat value reaches
+    /// that pointer only once it is addressed.
+    ///
+    /// The question is asked of the declared parameter and the argument's own
+    /// recorded type, never of a name: every translated generic whose
+    /// parameter is `&mut T` is answered the same way, and an argument that is
+    /// already a pointer — `&readable`, a dereference — is the pointer the
+    /// parameter wants, so it is never addressed a second time.
+    fn argumentTakesGenericBorrowAddress(
+        self: *Lowerer,
+        call: ir.exprs.Call,
+        arg_index: usize,
+        arg_id: ir.exprs.NodeId,
+    ) anyerror!bool {
+        const declared = self.directCallParameterType(call, arg_index) orelse return false;
+        const reference = switch (declared) {
+            .reference => |value| value,
+            else => return false,
+        };
+        const generic_names = self.genericParamsForDef(self.directCallDef(call) orelse return false) orelse
+            return false;
+        if (!typeNamesGenericParam(reference.pointee, generic_names)) return false;
+        const argument_type = (try self.exprType(arg_id)) orelse return false;
+        return lowersToFatValue(argument_type);
+    }
+
+    /// The definition a direct call names, or null when it is not one.
+    fn directCallDef(_: *const Lowerer, call: ir.exprs.Call) ?ir.spine.EntityId {
+        return switch (call.call_kind) {
+            .free => |def_id| def_id,
+            .associated => |def_id| def_id,
+            .constructor => null,
+        };
+    }
+
+    /// The declared type of one direct call argument.
+    ///
+    /// `directFreeCallArgumentType` is this for the free calls alone, which is
+    /// all the expected-type context asks for; an associated call declares the
+    /// same list and the borrow bridge needs it too.
+    fn directCallParameterType(
+        self: *const Lowerer,
+        call: ir.exprs.Call,
+        arg_index: usize,
+    ) ?ir.types.Type {
+        const def = self.directCallDef(call) orelse return null;
+        if (def >= self.ir.bodies.bodies.len) return null;
+        const params = switch (self.ir.bodies.bodies[def]) {
+            .fn_ => |function| function.params,
+            else => return null,
+        };
+        if (arg_index >= params.len) return null;
+        return params[arg_index].ty;
+    }
+
+    /// Whether this type is one of the callee's own type parameters, spelled
+    /// the way the IR spells one: a single-segment path with no graph entity,
+    /// because a declared type always resolves to one.
+    fn typeNamesGenericParam(ty: ir.types.Type, generic_names: []const []const u8) bool {
+        const path = switch (ty) {
+            .path => |value| value,
+            else => return false,
+        };
+        if (path.segments.len != 1) return false;
+        if (path.segments[0].id != null) return false;
+        for (generic_names) |generic_name| {
+            if (std.mem.eql(u8, generic_name, path.segments[0].name)) return true;
+        }
+        return false;
+    }
+
+    /// Whether this value LOWERS to a fat Zig value — a slice descriptor or a
+    /// borrowed dyn handle — rather than to a pointer.
+    ///
+    /// `dynErasedValueNeedsAddress` asks the same question for a handle that
+    /// has to point AT the value; there the answer defaults to "address it",
+    /// because anything that is not already a pointer has to be given one.
+    /// Here the default is the opposite: only a fat value is something a `*R`
+    /// parameter cannot take as it stands.
+    fn lowersToFatValue(ty: ir.types.Type) bool {
+        return switch (ty) {
+            .reference => |reference| borrowLowersToFatValue(reference.pointee),
+            .raw_ptr => |pointer| isSliceShapedBorrow(pointer.pointee),
+            .slice => true,
+            .dyn_trait => true,
+            else => false,
+        };
     }
     fn methodCallArgumentType(
         self: *Lowerer,
@@ -7654,17 +11004,38 @@ const Lowerer = struct {
         return result;
     }
 
+    /// Generic arguments for one call site, preferring what the source
+    /// pinned over what inference can recover.
+    ///
+    /// `explicit` is the call's own turbofish, empty for a call that wrote
+    /// none. A turbofish is the source stating which instantiation it wants,
+    /// so it outranks every inferred door below: `x.encode_hex::<String>()`
+    /// names its result type outright, and neither the (empty) argument list
+    /// nor the caller's own return position says anything an inference pass
+    /// could read the type back out of.
     fn lowerCallGenericArgs(
         self: *Lowerer,
         expr_id: ir.exprs.NodeId,
         def: ir.spine.EntityId,
         arg_ids: []const ir.exprs.NodeId,
+        explicit: []const ir.types.Type,
     ) ![]const ast.Type {
+        if (explicit.len != 0) return self.lowerGenericArgs(def, explicit);
         if (self.concreteExprType(expr_id)) |actual| {
             switch (actual) {
                 .generic_inst => |inst| {
                     if (inst.decl == def) {
                         return self.lowerGenericArgs(def, inst.args.params);
+                    }
+                },
+                // `Cursor::new(buf)` yields `Cursor<[u8; 1]>`, an EXTERNAL
+                // nominal rather than a `generic_inst` of the callee: the
+                // callee returns that nominal and its argument is the very
+                // type parameter the call instantiated, so the call's own
+                // result type carries the argument.
+                .external_nominal => |actual_nominal| {
+                    if (try self.bindExternalReturnArgs(def, actual_nominal)) |bound| {
+                        return self.lowerGenericArgs(def, bound);
                     }
                 },
                 else => {},
@@ -7683,6 +11054,61 @@ const Lowerer = struct {
         }
         return self.lowerGenericArgs(def, null);
     }
+
+    /// Generic arguments recovered by unifying a callee's declared return
+    /// type against the concrete type THIS call produced.
+    ///
+    /// `Cursor::new(buf)` yields `Cursor<[u8; 1]>`. The callee returns an
+    /// external nominal whose argument is the very type parameter the call
+    /// instantiated, so the two types say the same thing about that argument
+    /// and unifying them binds it. Argument unification cannot: the callee's
+    /// `inner: T` is one slot the call fills with a VALUE, not a type, so
+    /// nothing in the argument list names `T`.
+    ///
+    /// This reads the call node in front of it and never a global
+    /// instantiation table. Several call sites share this one callee id and
+    /// each names a different instantiation — leb128 reads
+    /// `Cursor<[u8; 1]>`, `Cursor<[u8; 1024]>` and `Cursor<Vec<u8>>` through
+    /// the same `Cursor::new` — so only the type at this call can say which.
+    /// A table scanned by callee would hand all three whichever it found
+    /// first: a wrong answer for at least two of them, not a missing one.
+    fn bindExternalReturnArgs(
+        self: *Lowerer,
+        def: ir.spine.EntityId,
+        actual: ir.types.ExternalNominal,
+    ) !?[]const ir.types.Type {
+        const names = self.genericParamsForDef(def) orelse return null;
+        if (names.len == 0 or actual.args.len == 0) return null;
+        if (def >= self.ir.bodies.bodies.len) return null;
+        const fn_body = switch (self.ir.bodies.bodies[def]) {
+            .fn_ => |fb| fb,
+            else => return null,
+        };
+        const declared = switch (fn_body.ret) {
+            .external_nominal => |nominal| nominal,
+            else => return null,
+        };
+        if (declared.args.len != actual.args.len) return null;
+        const slots = try self.alloc.alloc(?ir.types.Type, names.len);
+        defer self.alloc.free(slots);
+        for (slots) |*slot| slot.* = null;
+        // `matchGenericType` already compares the owner path, refuses a
+        // different nominal, and recurses into the arguments — which is the
+        // whole shape of this unification.
+        matchGenericType(
+            .{ .external_nominal = declared },
+            .{ .external_nominal = actual },
+            names,
+            slots,
+        );
+        for (slots) |slot| {
+            if (slot == null) return null;
+        }
+        const result = try self.alloc.alloc(ir.types.Type, names.len);
+        for (slots, 0..) |slot, index| result[index] = slot.?;
+        return result;
+    }
+
     /// Lower a tuple-struct constructor as a typed struct literal. A
     /// constructor's generic arguments belong to the type application
     /// (`Foo(T)`), while its source arguments initialize tuple fields.
@@ -7729,12 +11155,21 @@ const Lowerer = struct {
         };
     }
 
-    fn externalPathEqual(path: []const []const u8, expected: []const []const u8) bool {
-        if (path.len != expected.len) return false;
-        for (path, expected) |actual, wanted| {
-            if (!std.mem.eql(u8, actual, wanted)) return false;
-        }
-        return true;
+    /// One `Ok`/`Err` arm of the tagged `r2z.Result` union. `type_name` is
+    /// null when no surrounding context names the union, which is the only
+    /// case the anonymous `.{}` form can still coerce in.
+    fn taggedResultArm(
+        self: *Lowerer,
+        variant: []const u8,
+        payload: ast.Expr,
+        type_name: ?ast.Type,
+    ) !ast.Expr {
+        const fields = try self.alloc.alloc(ast.StructInitField, 1);
+        errdefer self.alloc.free(fields);
+        const name = try self.alloc.dupe(u8, variant);
+        errdefer self.alloc.free(name);
+        fields[0] = .{ .name = name, .expr = payload };
+        return .{ .struct_init = .{ .type_name = type_name, .fields = fields } };
     }
     fn lowerTaggedResult(self: *Lowerer, ok: ir.types.Type, err: ir.types.Type) !ast.Type {
         try self.markRuntimeImport();
@@ -7755,6 +11190,11 @@ const Lowerer = struct {
     /// frontend was asked to treat the error as a set, not that the shape
     /// permits one.
     fn errorTypeIsZigErrorSet(self: *const Lowerer, ty: ir.types.Type) bool {
+        // A standard error whose Zig spelling IS an error set is one however
+        // the source named it, so the classification is read from the same
+        // answer `lowerExternalNominal` builds the type from rather than from
+        // the entity graph alone.
+        if (externalErrorSetName(ty) != null) return true;
         const id = self.nominalEntityForType(ty) orelse return false;
         if (id >= self.ir.bodies.bodies.len) return false;
         const enum_body = switch (self.ir.bodies.bodies[id]) {
@@ -7792,11 +11232,116 @@ const Lowerer = struct {
     /// True when a `Result` type lowers to a Zig error union, which is the
     /// representation `Ok`/`Err` constructors and `.unwrap()` must match.
     fn resultUsesErrorUnion(self: *const Lowerer, ty: ir.types.Type) bool {
-        const result = switch (ty) {
-            .result => |r| r,
-            else => return false,
-        };
+        const result = resultDescriptorOf(ty) orelse return false;
+        return self.resultFieldsUseErrorUnion(result);
+    }
+
+    /// The same question asked of a `Result` whose fields are already in hand,
+    /// so a caller that has unwrapped one asks exactly what a caller holding
+    /// the type asks.
+    fn resultFieldsUseErrorUnion(self: *const Lowerer, result: ir.types.Result) bool {
         return result.is_error_unionable and self.errorTypeIsZigErrorSet(result.err);
+    }
+
+    /// The source error type of a `Result` receiver, read through the same
+    /// indirections `resultUsesErrorUnion` peels before it looks for one.
+    fn resultErrorTypeOf(self: *const Lowerer, ty: ir.types.Type) ?ir.types.Type {
+        _ = self;
+        var current = ty;
+        for (0..128) |_| {
+            switch (current) {
+                .reference => |reference| current = reference.pointee,
+                .boxed => |boxed| current = boxed.*,
+                .@"opaque" => |opaque_type| current = (opaque_type.concrete orelse return null).*,
+                else => break,
+            }
+        }
+        return switch (current) {
+            .result => |result| result.err,
+            else => null,
+        };
+    }
+
+    /// The variant name an `Err` payload is already an error tag by: a
+    /// payload-free variant of the error enum, which is `error.Name` in the
+    /// error slot. Only meaningful under `resultUsesErrorUnion`, which is
+    /// what makes every variant of that enum payload-free. The name is
+    /// borrowed from the IR; the caller owns the copy it emits.
+    fn errorTagConstant(
+        self: *const Lowerer,
+        payload_node: ir.exprs.NodeId,
+        err_ty: ir.types.Type,
+    ) ?[]const u8 {
+        const err_enum = self.nominalEntityForType(err_ty) orelse return null;
+        if (err_enum >= self.ir.bodies.bodies.len) return null;
+        if (payload_node >= self.ir.bodies.exprs.len) return null;
+        const variant = switch (self.ir.bodies.exprs[payload_node].kind) {
+            .enum_variant => |ev| ev,
+            else => return null,
+        };
+        if (variant.variant.len == 0) return null;
+        if (variant.tuple_fields.len != 0 or variant.named_fields.len != 0) return null;
+        // `def` names the variant when the graph linked one and the owning
+        // enum otherwise, so the owner is one level up in the first case —
+        // the same resolution `enumOwnerName` reads. A name the error enum
+        // does not declare is not a tag it could carry.
+        const entity = self.ir.graph.symbol_table.get(variant.def) orelse return null;
+        const owner = switch (entity.kind) {
+            .variant => entity.parent orelse return null,
+            .enum_ => variant.def,
+            else => return null,
+        };
+        if (owner != err_enum) return null;
+        const enum_body = switch (self.ir.bodies.bodies[err_enum]) {
+            .enum_ => |body| body,
+            else => return null,
+        };
+        for (enum_body.variants) |declared| {
+            if (std.mem.eql(u8, declared.name, variant.variant)) return variant.variant;
+        }
+        return null;
+    }
+
+    /// The error value an `Err` payload carries into a Zig error union.
+    ///
+    /// An ordinary value is mapped tag by tag here — after it was lowered, so
+    /// every node under it stays the value it is — because the Zig enum a
+    /// Rust error enum lowers to is a different type from the `error.Name` the
+    /// union holds. The mapping is exhaustive: one arm per declared variant.
+    fn errorTagMapping(
+        self: *Lowerer,
+        payload: ast.Expr,
+        err_ty: ir.types.Type,
+    ) !ast.Expr {
+        // A refusal marker stays where the refusal plumbing put it.
+        if (payload == .unsupported) return payload;
+        const err_enum = self.nominalEntityForType(err_ty) orelse
+            return error.MissingTypeDefinition;
+        if (err_enum >= self.ir.bodies.bodies.len) return error.MissingTypeDefinition;
+        const variants = switch (self.ir.bodies.bodies[err_enum]) {
+            .enum_ => |body| body.variants,
+            else => return error.DeclarationBodyMismatch,
+        };
+        if (variants.len == 0) return error.MissingVariantDefinition;
+        const arms = try self.alloc.alloc(ast.MatchArm, variants.len);
+        errdefer self.alloc.free(arms);
+        for (variants, 0..) |variant, index| {
+            const selector = try self.alloc.alloc(ast.Pattern, 1);
+            errdefer self.alloc.free(selector);
+            const selector_name = try self.alloc.dupe(u8, variant.name);
+            errdefer self.alloc.free(selector_name);
+            selector[0] = .{ .enum_literal = selector_name };
+            const tag = try self.alloc.dupe(u8, variant.name);
+            errdefer self.alloc.free(tag);
+            arms[index] = .{
+                .patterns = selector,
+                .body = .{ .lit = .{ .error_tag = tag } },
+            };
+        }
+        return .{ .match_expr = .{
+            .target = try self.allocExpr(payload),
+            .arms = arms,
+        } };
     }
 
     const SyntheticExternalType = enum {
@@ -7867,6 +11412,29 @@ const Lowerer = struct {
         } };
     }
 
+    /// Mark the runtime import when `ty` is a type name the strategy resolved
+    /// into the `r2z` namespace.
+    ///
+    /// `lowerRuntimeGenericExternalType` does this for the names lower.zig
+    /// builds itself, but a strategy can return an `r2z.` name on its own
+    /// (`DefaultStrategy.lowerStdGeneric` maps a type called `HashMap` with
+    /// three parameters to `r2z.collections.HashMap`) and it has no route to
+    /// the module bookkeeping — it only receives the `LoweringStrategy`
+    /// vtable, not the `Lowerer`. The mark therefore belongs at the call
+    /// site, on the same prefix test the two other name-to-runtime paths use.
+    ///
+    /// Only `.named` is checked: that is the form a strategy-built runtime
+    /// type takes. A `.generic` name still has to be marked by whoever built
+    /// it, since the parameters are where that lowering happens.
+    fn markRuntimeTypeImport(self: *Lowerer, ty: ast.Type) !void {
+        switch (ty) {
+            .named => |name| {
+                if (std.mem.startsWith(u8, name, "r2z.")) try self.markRuntimeImport();
+            },
+            else => {},
+        }
+    }
+
     fn lowerExternalNominal(
         self: *Lowerer,
         external: ir.types.ExternalNominal,
@@ -7913,6 +11481,14 @@ const Lowerer = struct {
                 "r2z.io.Error"
             else
                 "r2z.io.ErrorKind" };
+        }
+
+        // `Cursor<T>` reads and writes through a read position kept beside
+        // the source it owns or borrows, and the runtime cursor is generic
+        // over exactly that source. A cursor over an owned array allocates
+        // nothing, and a cursor over a borrowed slice leaves the borrow alone.
+        if (externalPathEqual(external.path, &.{ "std", "io", "Cursor" })) {
+            return self.lowerRuntimeGenericExternalType("r2z.io.Cursor", external.args, 1);
         }
 
         if (externalPathEqual(external.path, &.{ "core", "option", "Option" }) or
@@ -8127,6 +11703,360 @@ const Lowerer = struct {
         }
     }
 
+    /// The borrowed handle a trait object lowers to.
+    const DynTraitHandle = enum {
+        read,
+        write,
+        error_handle,
+    };
+
+    /// True when `bounds` declares the trait named at `wanted`.
+    ///
+    /// The identity is the BOUND PATH, resolved the way Rust resolves a name
+    /// in the scope that declares it — `ir.bodies`' own generic-bound proof,
+    /// the same question `fn f<T: Read>` is answered with — so a crate's own
+    /// `Read` is never `std::io::Read`, and a `dyn Read` in a module that
+    /// never imported the standard trait does not match on spelling alone.
+    ///
+    /// That scope walk reads the module's `use` declarations, and a `use std;`
+    /// that names a graph entity answers for every path spelled `std::…` from
+    /// there down. A bound the source wrote out in full (`dyn std::io::Read`)
+    /// therefore has a second, independent answer: a path whose EVERY segment
+    /// carries no entity id names nothing this crate declares, because a local
+    /// name always resolves to one, so for exactly that shape the written path
+    /// IS the trait. It is compared segment by segment under the same
+    /// `std`/`core` rule `boundPathMatches` applies at the root, so both
+    /// answers accept the same trait and neither compares a bare leaf name.
+    fn dynTraitBoundIs(
+        self: *const Lowerer,
+        bounds: []const ir.types.Bound,
+        wanted: []const []const u8,
+    ) bool {
+        if (self.traitBoundOwner()) |owner| {
+            const object: ir.types.Type = .{ .dyn_trait = bounds };
+            if (ir.bodies.genericBound(&self.ir.graph, &self.ir.bodies, owner, object, wanted) != null) {
+                return true;
+            }
+        }
+        for (bounds) |bound| {
+            if (externalBoundPathIs(bound.path, wanted)) return true;
+        }
+        return false;
+    }
+
+    /// The entity a bound in the declaration being lowered resolves from: the
+    /// callable whose signature or body carries it, or the module that owns
+    /// that callable when there is none in scope yet. Both reach the enclosing
+    /// scope through their parent edges, which is the chain the bound walk
+    /// follows, and both are real declarations — unlike the bound's own first
+    /// segment, which is exactly null for a path written out in full.
+    fn traitBoundOwner(self: *const Lowerer) ?ir.spine.EntityId {
+        return self.current_callable_id orelse self.current_module_id;
+    }
+
+    fn dynTraitHandleFor(
+        self: *const Lowerer,
+        bounds: []const ir.types.Bound,
+    ) ?DynTraitHandle {
+        if (self.dynTraitBoundIs(bounds, &.{ "std", "io", "Read" })) return .read;
+        if (self.dynTraitBoundIs(bounds, &.{ "std", "io", "Write" })) return .write;
+        // `std::error::Error` re-exports `core::error::Error`, and either
+        // spelling in the source names the same trait, so both are asked.
+        if (self.dynTraitBoundIs(bounds, &.{ "core", "error", "Error" }) or
+            self.dynTraitBoundIs(bounds, &.{ "std", "error", "Error" }))
+        {
+            return .error_handle;
+        }
+        return null;
+    }
+
+    /// The borrowed handle for a supported trait object.
+    ///
+    /// `dyn Trait + 'a` may also carry marker traits (`Send`, `Sync`,
+    /// `Unpin`), which the runtime represents by neither adding nor removing
+    /// anything: a handle borrows, so it is as shareable as the value it
+    /// points at. Any OTHER bound names a trait with no runtime handle, and
+    /// erasing it would mean inventing a vtable entry no runtime declares, so
+    /// it is refused rather than approximated.
+    fn lowerDynTraitType(self: *Lowerer, bounds: []const ir.types.Bound) !ast.Type {
+        const handle = self.dynTraitHandleFor(bounds) orelse
+            return error.UnsupportedDynamicTrait;
+        try self.markRuntimeImport();
+        return .{ .named = switch (handle) {
+            .read => "r2z.io.DynRead",
+            .write => "r2z.io.DynWrite",
+            .error_handle => "r2z.io.DynError",
+        } };
+    }
+
+    /// The handle a context is asking this expression to become, when the
+    /// context names one by trait.
+    ///
+    /// Only a BORROW erases: `&dyn Trait` is the fat pointer the source means
+    /// by a trait-object borrow, and it is what the handles are borrowed
+    /// spellings of. An owned `Box<dyn Trait>` has no faithful handle here —
+    /// the runtime handle owns nothing — so it is left to refuse.
+    fn dynCoercionTarget(
+        self: *const Lowerer,
+        expected: ir.types.Type,
+    ) ?DynTraitHandle {
+        const pointee = switch (expected) {
+            .reference => |reference| reference.pointee,
+            else => return null,
+        };
+        const bounds = switch (pointee) {
+            .dyn_trait => |declared| declared,
+            else => return null,
+        };
+        return self.dynTraitHandleFor(bounds);
+    }
+
+    /// True when the receiver IS a trait object rather than a concrete value.
+    ///
+    /// A trait object has no other lowering, so its methods must be answered
+    /// from the standard-method table even when the resolver recorded the call
+    /// against something other than a trait method reference — a standard
+    /// trait has no graph entity of its own to point at.
+    fn dynTraitMethodReceiver(self: *Lowerer, receiver_node: ir.exprs.NodeId) anyerror!bool {
+        const owned = (try self.receiverValueType(receiver_node)) orelse return false;
+        return owned == .dyn_trait;
+    }
+
+    /// Whether `method_name` on `ty` is one of the runtime's OWN methods that
+    /// grows storage, so the allocator belongs in its argument list.
+    ///
+    /// `r2z.alloc.String` spells `push`, `push_str` and `extend` exactly as
+    /// Rust's `String` does and takes the allocator first, so the only thing
+    /// missing is the argument itself — the mutable-receiver binding those
+    /// calls need is already in place. `Vec` is excluded on purpose: its
+    /// runtime names are `append` and `appendSlice`, so it is answered by its
+    /// own arms rather than by borrowing these.
+    fn stdMethodTakesAllocatorArg(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+        method_name: []const u8,
+    ) anyerror!bool {
+        if (!std.mem.eql(u8, method_name, "push") and
+            !std.mem.eql(u8, method_name, "push_str") and
+            !std.mem.eql(u8, method_name, "extend")) return false;
+        const receiver_type = (try self.exprType(receiver_node)) orelse return false;
+        return ownedStringType(receiver_type) != null;
+    }
+
+    /// True when the expression already carries the trait-object type the
+    /// context asks for, so there is nothing left to erase.
+    fn exprAlreadyDynTrait(
+        self: *Lowerer,
+        expr_id: ir.exprs.NodeId,
+        handle: DynTraitHandle,
+    ) anyerror!bool {
+        const receiver_type = (try self.exprType(expr_id)) orelse return false;
+        const pointee = switch (receiver_type) {
+            .reference => |reference| reference.pointee,
+            else => return false,
+        };
+        if (pointee != .dyn_trait) return false;
+        return self.dynTraitHandleFor(pointee.dyn_trait) == handle;
+    }
+
+    /// Whether this `&`/`&mut` node is a borrow whose own value IS the trait
+    /// object, so the address-of reifies nothing.
+    ///
+    /// `lowerType` spells a borrow of a trait object AS that object: `&dyn
+    /// Trait` and `&mut dyn Trait` are the borrowed handle, because the
+    /// handle already carries the erased pointer to the caller's own value
+    /// and a `*r2z.io.DynRead` would be a second indirection the source never
+    /// wrote. The address-of has to follow that identity instead of
+    /// contradicting it.
+    ///
+    /// The shape is reached when the source's `&mut concrete` is recorded
+    /// against the `&mut dyn Trait` its coercion produces — which is exactly
+    /// `read_byte(&mut reader)`. There the coercion belongs to the OPERAND,
+    /// so the borrow must hand the operand straight through and let the
+    /// operand become the handle; addressing the borrow instead wrapped the
+    /// finished handle in a pointer, and a parameter declared by value cannot
+    /// take one.
+    ///
+    /// The question is asked of the borrow's own recorded type, so it holds
+    /// for every receiver the coercion can produce — a slice descriptor, a
+    /// cursor, a vector — and never for a borrow of a concrete type, which
+    /// really is an address.
+    fn borrowIsTraitObjectItself(self: *Lowerer, expr_id: ir.exprs.NodeId) anyerror!bool {
+        const node_type = (try self.exprType(expr_id)) orelse return false;
+        const pointee = switch (node_type) {
+            .reference => |reference| reference.pointee,
+            else => return false,
+        };
+        if (pointee != .dyn_trait) return false;
+        return self.dynTraitHandleFor(pointee.dyn_trait) != null;
+    }
+
+    /// Whether the value `expr_id` lowers to has to be ADDRESSED before it can
+    /// be the pointer a dyn handle erases a concrete borrow into.
+    ///
+    /// `lowerType` spells a borrow of a fat value AS that value: `&str` is
+    /// `[]const u8`, `&[T]` is `[]const T`, and `&dyn Trait` is the handle
+    /// itself. Those three lower to VALUES, so a receiver that is one of them
+    /// is the descriptor the handle has to point AT — handing the value on
+    /// instead would let the read position the runtime advances die with the
+    /// copy, which is exactly the `reader` of `read_byte(&mut reader)` behind
+    /// a `&[u8]`: the caller's own slice would never move. Every other borrow
+    /// lowers to `*T`, and `*T` already IS the address.
+    ///
+    /// The question is asked of the LOWERED type, never of the node that
+    /// wrote the borrow or of the borrow's own spelling, so `&mut cursor`,
+    /// `&mut vec` and a `&mut Concrete` binding moved into a call all answer
+    /// the one way their value really is.
+    fn dynErasedValueNeedsAddress(self: *Lowerer, expr_id: ir.exprs.NodeId) anyerror!bool {
+        var current = (try self.exprType(expr_id)) orelse return true;
+        for (0..128) |_| {
+            switch (current) {
+                // A borrow of a fat value lowers to that VALUE, so it is the
+                // descriptor the handle points at and has to be addressed. A
+                // borrow of a sized value lowers to `*T`, which already IS the
+                // address — addressing that again would hand the runtime a
+                // pointer to a pointer with no `read` behind it.
+                .reference => |reference| return isSliceShapedBorrow(reference.pointee) or
+                    reference.pointee == .dyn_trait,
+                .raw_ptr => return isSliceShapedBorrow(current.raw_ptr.pointee),
+                .boxed => |boxed| current = boxed.*,
+                .@"opaque" => |opaque_type| {
+                    current = (opaque_type.concrete orelse return true).*;
+                },
+                else => return true,
+            }
+        }
+        return true;
+    }
+
+    /// The handle the context around this expression asks it to become.
+    ///
+    /// A declared parameter, a declared binding, and a value an enclosing
+    /// expression already typed all reach this one answer, so erasing a
+    /// concrete borrow into a trait object needs no new IR tag and no second
+    /// call site.
+    fn dynCoercionContext(self: *const Lowerer) ?DynTraitHandle {
+        const expected = self.expected_value_type orelse
+            self.expected_argument_type orelse return null;
+        return self.dynCoercionTarget(expected);
+    }
+
+    /// Lower a `let` initializer under the binding's own DECLARED type when
+    /// that type names a trait object.
+    ///
+    /// A declared type is normally a hint the initializer already carries, and
+    /// the existing shapes lower without it. A trait-object binding is
+    /// different: the declaration is the only place the source states that
+    /// the value is to be erased, so it is what the initializer is lowered
+    /// against, and every other declared type is left exactly as it was.
+    fn lowerLetInitializer(
+        self: *Lowerer,
+        init_id: ir.exprs.NodeId,
+        declared_type: ?ir.types.Type,
+    ) !ast.Expr {
+        if (declared_type) |declared| {
+            if (self.dynCoercionTarget(declared) != null) {
+                const previous_value_type = self.expected_value_type;
+                self.expected_value_type = declared;
+                defer self.expected_value_type = previous_value_type;
+                return self.lowerExpr(init_id);
+            }
+        }
+        return self.lowerExpr(init_id);
+    }
+
+    /// Bind a handle to the caller's own value, so nothing is copied.
+    ///
+    /// The erased pointer is the ADDRESS of the value the source borrowed — the
+    /// caller's own slice descriptor, vector, cursor, or error — so read
+    /// position, written length, and error fields keep living where the caller
+    /// left them. `dynErasedValueNeedsAddress` decides what still has to be
+    /// addressed to reach that address: a borrow of a fat value lowers to the
+    /// value itself, so it is addressed, and a borrow of a sized value already
+    /// lowers to a pointer and is passed through. `DynWrite` carries the
+    /// allocator its appends need, so building one takes the caller's allocator
+    /// and makes the enclosing callable declare one, exactly as every other
+    /// allocating runtime call does.
+    fn buildDynTraitHandle(
+        self: *Lowerer,
+        handle: DynTraitHandle,
+        expr_id: ir.exprs.NodeId,
+        lowered: ast.Expr,
+    ) !ast.Expr {
+        try self.markRuntimeImport();
+        if (handle == .write) self.current_callable_is_allocating = true;
+        const source = try self.allocExpr(lowered);
+        const target = if (try self.dynErasedValueNeedsAddress(expr_id))
+            try self.allocExpr(.{ .unary_op = .{
+                .op = .addr_of,
+                .operand = source,
+            } })
+        else
+            source;
+        const takes_allocator = handle == .write;
+        const call_args = try self.alloc.alloc(ast.Expr, if (takes_allocator) 2 else 1);
+        call_args[0] = target.*;
+        if (takes_allocator) call_args[1] = .{ .ident = "allocator" };
+        return (try self.allocExpr(.{ .call = .{
+            .callee = try self.allocExpr(.{ .ident = switch (handle) {
+                .read => "r2z.io.DynRead.init",
+                .write => "r2z.io.DynWrite.init",
+                .error_handle => "r2z.io.DynError.init",
+            } }),
+            .args = call_args,
+        } })).*;
+    }
+
+    /// True when `def` is `std::io::Cursor::new`.
+    ///
+    /// The identity is the declaration's own place in the graph: it must live
+    /// in an EXTERNAL `io` module whose own root is `std` or `core`, so a
+    /// crate that defines its own `Cursor::new` keeps its own constructor and
+    /// this never claims it.
+    fn isIoCursorNew(self: *const Lowerer, def: ir.spine.EntityId) bool {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return false;
+        if (!std.mem.eql(u8, entity.name, "new")) return false;
+        if (entity.renamed_to) |renamed| {
+            if (!std.mem.eql(u8, renamed, "new")) return false;
+        }
+        const module_id = entity.parent orelse return false;
+        const module = self.moduleForEntity(module_id) orelse return false;
+        if (!module.is_extern or !std.mem.eql(u8, module.name, "io")) return false;
+        const root_id = module.parent orelse return false;
+        const root = self.moduleForEntity(root_id) orelse return false;
+        if (!root.is_extern) return false;
+        return std.mem.eql(u8, root.name, "std") or std.mem.eql(u8, root.name, "core");
+    }
+
+    /// True when `def` names a variant of `std::io::ErrorKind`.
+    ///
+    /// The identity is the declaration's own place in the graph, exactly as
+    /// `isIoCursorNew` decides the same question for `Cursor::new`: the owning
+    /// enum must live in an EXTERNAL `io` module whose own root is `std` or
+    /// `core`, so a crate that declares its own `ErrorKind` keeps its own
+    /// variants and this never claims them. An `enum_variant` node names the
+    /// VARIANT entity when the graph linked one — one level below its enum —
+    /// and the enum itself when it did not, so both are resolved here.
+    fn isIoErrorKindVariant(self: *const Lowerer, def: ir.spine.EntityId) bool {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return false;
+        const owner_id = switch (entity.kind) {
+            .variant => entity.parent orelse return false,
+            else => def,
+        };
+        const owner = self.ir.graph.symbol_table.get(owner_id) orelse return false;
+        if (!std.mem.eql(u8, owner.name, "ErrorKind")) return false;
+        if (owner.renamed_to) |renamed| {
+            if (!std.mem.eql(u8, renamed, "ErrorKind")) return false;
+        }
+        const module_id = owner.parent orelse return false;
+        const module = self.moduleForEntity(module_id) orelse return false;
+        if (!module.is_extern or !std.mem.eql(u8, module.name, "io")) return false;
+        const root_id = module.parent orelse return false;
+        const root = self.moduleForEntity(root_id) orelse return false;
+        if (!root.is_extern) return false;
+        return std.mem.eql(u8, root.name, "std") or std.mem.eql(u8, root.name, "core");
+    }
+
     pub fn lowerType(self: *Lowerer, ir_ty: ir.types.Type) anyerror!ast.Type {
         // Structural lowering is arena-backed and always safe to retain. The
         // pluggable strategy is consulted only for standard generic name
@@ -8136,7 +12066,7 @@ const Lowerer = struct {
             .@"opaque" => |opaque_type| self.lowerType(
                 (opaque_type.concrete orelse return error.UnresolvedOpaqueType).*,
             ),
-            .dyn_trait => return error.UnsupportedDynamicTrait,
+            .dyn_trait => |bounds| try self.lowerDynTraitType(bounds),
             .slice => |s| ast.Type{
                 .slice = .{
                     .elem = try self.allocType(try self.lowerType(s.elem)),
@@ -8161,6 +12091,14 @@ const Lowerer = struct {
                         .is_const = !r.mut,
                     },
                 },
+                // `&dyn Trait` is already the fat pointer Rust means by a
+                // trait-object borrow, so it lowers to the borrowed handle
+                // ITSELF rather than to a pointer *to* that handle: the handle
+                // already carries the erased pointer to the caller's own
+                // value, and a `*r2z.io.DynRead` would add a second
+                // indirection the source never had. Borrowed either way —
+                // `&dyn Trait` and `&mut dyn Trait` are both handles by value.
+                .dyn_trait => |bounds| try self.lowerDynTraitType(bounds),
                 else => ast.Type{
                     .ptr = .{
                         .elem = try self.allocType(try self.lowerType(r.pointee)),
@@ -8169,7 +12107,17 @@ const Lowerer = struct {
                     },
                 },
             },
-            .raw_ptr => |r| ast.Type{
+            // A raw pointer to an UNSIZED pointee is the fat pointer itself:
+            // `*const [u8]` carries the element AND the length, and Zig spells
+            // that `[]const u8`. A pointer *to* the slice would be a thin
+            // pointer to a fat value — a different type, a different width,
+            // and `@ptrCast` to or from it is a width change Zig refuses.
+            .raw_ptr => |r| if (r.pointee == .slice) ast.Type{
+                .slice = .{
+                    .elem = try self.allocType(try self.lowerType(r.pointee.slice.elem)),
+                    .is_const = !r.mut,
+                },
+            } else ast.Type{
                 .ptr = .{
                     .elem = try self.allocType(try self.lowerType(r.pointee)),
                     .is_const = !r.mut,
@@ -8207,10 +12155,13 @@ const Lowerer = struct {
             },
             .result => |r| blk: {
                 if (r.is_error_unionable and self.errorTypeIsZigErrorSet(r.err)) {
+                    // Rust Result is a reusable value type, not an inferred
+                    // function-return error set. Its error set must also be
+                    // valid in locals and nested Option/container types.
                     const payload_ty = try self.allocType(try self.lowerType(r.ok));
                     break :blk ast.Type{
                         .err_union = .{
-                            .err_set = null,
+                            .err_set = "anyerror",
                             .payload = payload_ty,
                         },
                     };
@@ -8234,6 +12185,7 @@ const Lowerer = struct {
                     return error.InvalidTypePath;
                 };
                 if (try self.strat.lowerStdGeneric(last_segment.name, &.{})) |std_ty| {
+                    try self.markRuntimeTypeImport(std_ty);
                     break :blk std_ty;
                 }
                 if (last_segment.id) |def| {
@@ -8265,6 +12217,7 @@ const Lowerer = struct {
                     return error.GenericArgumentArityMismatch;
                 }
                 if (try self.strat.lowerStdGeneric(decl_name, gi.args.params)) |std_ty| {
+                    try self.markRuntimeTypeImport(std_ty);
                     break :blk std_ty;
                 }
                 var params = try self.alloc.alloc(ast.Type, gi.args.params.len);
@@ -8371,19 +12324,108 @@ const Lowerer = struct {
         return receiver;
     }
 
-    /// Slice-coercion helper: cite `receiver[0..]` for array receivers, else the
-    /// receiver expression itself (slices/references are already slice-compatible).
+    /// The borrowed view an `AsRef`-shaped method call names: an array receiver
+    /// is cited as `receiver[0..]`, and a receiver whose pointee is a type
+    /// parameter is read through, because `AsRef` borrows the value the
+    /// receiver points at rather than the pointer the receiver already is.
+    /// Everything else — a slice, an array behind a reference, a concrete
+    /// reference — is already the shape the caller wants.
     fn lowerAsRef(self: *Lowerer, receiver_node: ir.exprs.NodeId, receiver: *const ast.Expr) anyerror!*const ast.Expr {
-        if (self.receiverIsArray(receiver_node)) {
+        const borrowed = if (try self.borrowReadsThroughGenericPointee(receiver_node))
+            try self.allocExpr(.{ .unary_op = .{ .op = .deref, .operand = receiver } })
+        else
+            receiver;
+        // `self.as_ref()` inside a blanket impl is emitted once and
+        // instantiated for every type that reaches it, so the form written
+        // here has to be the one that works for a slice and for the array it
+        // may also be. Both take a view of the borrowed place; the array is
+        // the one that needs it, since a `[N]u8` value does not coerce to
+        // `[]const u8` on its own.
+        if (self.receiverIsArray(receiver_node) or
+            try self.borrowReadsThroughGenericPointee(receiver_node))
+        {
             const zero = try self.allocExpr(ast.Expr{ .lit = .{ .int = 0 } });
             const open = try self.allocExpr(ast.Expr{ .range = .{ .start = zero, .end = null } });
             var args = try self.alloc.alloc(ast.Expr, 2);
-            args[0] = receiver.*;
+            args[0] = borrowed.*;
             args[1] = open.*;
             const result = try self.allocExpr(ast.Expr{ .builtin = .{ .name = "index", .args = args } });
             return result;
         }
-        return receiver;
+        return borrowed;
+    }
+
+    /// The `&[T]` a call that only READS a sequence is handed.
+    ///
+    /// A borrow the source wrote is read through unchanged — except when its
+    /// pointee is a runtime CONTAINER whose storage is not the value itself.
+    /// `&Vec<u8>` is Rust's way of naming `&[u8]`, and a lowered `Vec` is an
+    /// `ArrayListUnmanaged` whose elements live in `items`, so the borrow names
+    /// that slice. Nothing is copied and no owner changes hands: the argument is
+    /// still the caller's own storage, reached the way Rust reaches it.
+    fn lowerBorrowedSequence(
+        self: *Lowerer,
+        node: ir.exprs.NodeId,
+        lowered: *const ast.Expr,
+    ) anyerror!ast.Expr {
+        if (!needsContainerStorageProjection(try self.exprType(node))) return lowered.*;
+        if (lowered.* == .unary_op and lowered.unary_op.op == .addr_of) {
+            return (try self.allocExpr(.{ .field_access = .{
+                .target = lowered.unary_op.operand,
+                .field_name = "items",
+            } })).*;
+        }
+        return lowered.*;
+    }
+
+    /// Whether a borrow's operand is a dereference of a runtime CONTAINER, so
+    /// the borrow names the sequence that container derefs to.
+    ///
+    /// `&*bytes` over a `Vec<u8>` is `&[u8]`, and a lowered `Vec` keeps its
+    /// elements in `items`, so the borrow is that slice. Spelling it as the
+    /// address of the descriptor would hand the callee a pointer to a list
+    /// where it asked for bytes — and would then `@ptrCast` a thin pointer into
+    /// a fat one, which Zig refuses.
+    fn borrowOfContainerStorage(self: *Lowerer, operand: ir.exprs.NodeId) anyerror!bool {
+        if (operand >= self.ir.bodies.exprs.len) return false;
+        const deref = switch (self.ir.bodies.exprs[operand].kind) {
+            .unary => |value| value,
+            else => return false,
+        };
+        if (deref.op != .deref) return false;
+        return needsContainerStorageProjection(try self.exprType(deref.operand));
+    }
+
+    /// The type a BORROWED receiver points at, or null when the receiver is
+    /// not reached through a pointer.
+    ///
+    /// The node type alone cannot answer it. A `.path` node carries the type
+    /// inference settled on, which for a `&mut slice::Iter` parameter is the
+    /// POINTEED cursor — that is what `.clone()` and `.next()` are called on —
+    /// while the Zig binding is the pointer the source's borrow lowered to, and
+    /// that pointer is what a member call auto-derefs. Reading the DECLARED
+    /// type of the entity the path names recovers the borrow the node type left
+    /// behind; a receiver that already holds the value has neither and stays
+    /// null.
+    fn borrowedReceiverPointee(self: *Lowerer, receiver_node: ir.exprs.NodeId) anyerror!?ir.types.Type {
+        if (try self.exprType(receiver_node)) |known| {
+            switch (known) {
+                .reference => |reference| return reference.pointee,
+                .raw_ptr => |pointer| return pointer.pointee,
+                else => {},
+            }
+        }
+        if (receiver_node >= self.ir.bodies.exprs.len) return null;
+        const path = switch (self.ir.bodies.exprs[receiver_node].kind) {
+            .path => |value| value,
+            else => return null,
+        };
+        const declared = self.declaredBindingType(path.def) orelse return null;
+        return switch (declared) {
+            .reference => |reference| reference.pointee,
+            .raw_ptr => |pointer| pointer.pointee,
+            else => null,
+        };
     }
 
     fn validateMethodTopology(
@@ -8494,6 +12536,79 @@ const Lowerer = struct {
         };
     }
 
+    /// True when `ty` is a Rust iterator carrier the backend can WALK, which
+    /// is the whole of what `Iterator::any` needs: it lowers to an `r2z` (or
+    /// user) struct that publishes `next`, and every element reaches the
+    /// predicate as that `next` hands it over.
+    ///
+    /// This is `isRuntimeIteratorCarrier`'s set plus the slice-owned
+    /// iterators, and it is asked of the canonical receiver type for the same
+    /// reason the `step_by`/`skip`/`zip`/`collect` arms are: a crate's own
+    /// `any` is answered by its own declaration, and a `method_ref` on any
+    /// other receiver is not this operation.
+    ///
+    /// `Chunks`/`ChunksExact` stay out. Their Rust `Item` is a BORROW of a
+    /// sub-slice while the runtime's `next` hands back the slice value itself,
+    /// so the `|&chunk|` pattern the source writes would dereference a value
+    /// rather than a pointer. `Iter`/`IterMut` are the pair whose `next`
+    /// yields `*const T`/`*T`, matching the `&T`/`&mut T` those two promise.
+    fn isNextDrivenIteratorCarrier(ty: ir.types.Type) bool {
+        if (isRuntimeIteratorCarrier(ty)) return true;
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return false,
+        };
+        if (external.path.len != 3 or external.args.len != 1) return false;
+        if (!std.mem.eql(u8, external.path[0], "core") and
+            !std.mem.eql(u8, external.path[0], "std")) return false;
+        if (!std.mem.eql(u8, external.path[1], "slice")) return false;
+        return std.mem.eql(u8, external.path[2], "Iter") or
+            std.mem.eql(u8, external.path[2], "IterMut");
+    }
+
+    /// True when the runtime's Zig struct for `ty` publishes the by-value
+    /// `clone` a Rust `Clone` on it promises.
+    ///
+    /// `SliceIter`, `Range` and every `core::iter` adapter copy their cursor
+    /// by reading `*self`, which is exactly what `iter.clone()` on `&mut Iter`
+    /// asks for: a second cursor over the same bytes, moved back into the
+    /// original with `*iter = cloned`. `IterMut` is not one of them — the
+    /// runtime's mutable cursor is not `Clone` — and neither is a local
+    /// struct, whose `Clone` is a copy the backend has no member to call.
+    fn runtimeCarrierCopiesByClone(ty: ir.types.Type) bool {
+        if (isRuntimeIteratorCarrier(ty)) return true;
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return false,
+        };
+        if (external.path.len != 3 or external.args.len != 1) return false;
+        if (!std.mem.eql(u8, external.path[0], "core") and
+            !std.mem.eql(u8, external.path[0], "std")) return false;
+        if (!std.mem.eql(u8, external.path[1], "slice")) return false;
+        return std.mem.eql(u8, external.path[2], "Iter");
+    }
+
+    /// True when the receiver is a Rust CURSOR — a slice iterator — whose
+    /// `as_slice` is the remaining sequence rather than the cursor itself.
+    ///
+    /// `slice::Iter` is a (pointer, front, back) triple and `as_slice` is what
+    /// makes it readable as the rest of the input. The runtime publishes that
+    /// method, so the call has to survive the borrow shortcut a plain `&T`
+    /// receiver would take; dropping it would hand back the cursor where the
+    /// source asked for the bytes still in it.
+    fn isCursorCarrierWithAsSlice(ty: ir.types.Type) bool {
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return false,
+        };
+        if (external.path.len != 3 or external.args.len != 1) return false;
+        if (!std.mem.eql(u8, external.path[0], "core") and
+            !std.mem.eql(u8, external.path[0], "std")) return false;
+        if (!std.mem.eql(u8, external.path[1], "slice")) return false;
+        return std.mem.eql(u8, external.path[2], "Iter") or
+            std.mem.eql(u8, external.path[2], "IterMut");
+    }
+
     /// True when `ty` names a local struct that carries a `next` method, which
     /// is how a user-defined Rust `Iterator` is consumed in Zig: the value is
     /// iterated with `while (iter.next())`, not with a Zig `for`.
@@ -8551,6 +12666,8 @@ const Lowerer = struct {
         result_unwrap,
         result_unwrap_err,
         result_unwrap_or,
+        result_expect,
+        result_expect_err,
         result_ok,
         result_err,
         result_map,
@@ -8559,6 +12676,12 @@ const Lowerer = struct {
         result_as_mut,
         /// `Result::unwrap` on a value already lowered to a Zig error union.
         error_union_unwrap,
+        /// `Result::expect` on a value already lowered to a Zig error union,
+        /// which has no runtime `Result` to carry a method.
+        error_union_expect,
+        /// `Result::expect_err` on a value already lowered to a Zig error
+        /// union, whose failure survives as the error tag it became.
+        error_union_expect_err,
         memory_ptr_add,
         memory_ptr_sub,
         memory_ptr_offset,
@@ -8584,6 +12707,10 @@ const Lowerer = struct {
         iterator_skip,
         iterator_zip,
         iterator_collect,
+        /// `Iterator::any`: does the predicate hold for at least one element,
+        /// with the receiver's own cursor consumed up to and including the
+        /// element that answered `true`.
+        iterator_any,
         num_wrapping_add,
         num_wrapping_sub,
         num_wrapping_mul,
@@ -8604,6 +12731,38 @@ const Lowerer = struct {
         byte_is_ascii,
         format_write_str,
         to_string,
+
+        /// `ToOwned::to_owned` on a borrowed byte sequence: an OWNED COPY of
+        /// exactly the bytes the receiver borrows. `&str` becomes
+        /// `r2z.alloc.String`; `&[T]` becomes `r2z.alloc.Vec(T)`.
+        borrowed_to_owned,
+        /// `Cow::as_bytes`: the borrowed bytes the cow is holding, whichever
+        /// arm it happens to be holding them in.
+        cow_as_bytes,
+        /// `Cow::into_owned`: the owned payload the cow was guarding, handed
+        /// back by the very same allocation when it already owns one and by a
+        /// fresh copy when it borrowed. `Cow::to_owned` is NOT this half — a
+        /// `Cow` is `Clone`, so that name answers with a copy of the same cow
+        /// taken through `&self` and is lowered as `.clone`.
+        cow_to_owned,
+        /// `alloc::vec::Vec::push`: append one element to the caller's vector,
+        /// which is `ArrayList.append` under its own name.
+        vec_push,
+        /// `alloc::vec::Vec::extend`: append everything the argument yields
+        /// to the caller's vector. Rust accepts any `IntoIterator` here, so the
+        /// runtime helper covers a sequence it can copy in whole and an
+        /// iterator it can drain item by item.
+        vec_extend,
+        /// `alloc::string::String::push`: append one `char`. The receiver is
+        /// the `&mut String` the source borrowed, so it arrives as a
+        /// reference to the owned string, and the bytes it gains may grow the
+        /// buffer — which is why the call names the enclosing allocator.
+        string_push,
+        /// `alloc::string::String::push_str`: append the borrowed text.
+        string_push_str,
+        /// `FromUtf8Error::utf8_error`: the character-level failure this error
+        /// wraps, handed back unchanged.
+        utf8_error,
 
         default,
         clone,
@@ -8667,6 +12826,11 @@ const Lowerer = struct {
                 else => break,
             }
         }
+        if (ir.types.isStr(cur_t)) {
+            if (std.mem.eql(u8, method_name, "len")) return .slice_len;
+            if (std.mem.eql(u8, method_name, "is_empty")) return .slice_is_empty;
+            if (std.mem.eql(u8, method_name, "as_bytes")) return .slice_as_bytes;
+        }
 
         // `ToString::to_string` is blanket-implemented for `T: Display`. The
         // frontend proved the bound; re-deriving it here keeps the backend
@@ -8702,6 +12866,8 @@ const Lowerer = struct {
                     if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
                     if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
                     if (std.mem.eql(u8, method_name, "unwrap_err")) return .result_unwrap_err;
+                    if (std.mem.eql(u8, method_name, "expect")) return .result_expect;
+                    if (std.mem.eql(u8, method_name, "expect_err")) return .result_expect_err;
                     if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
                     if (std.mem.eql(u8, method_name, "ok")) return .result_ok;
                     if (std.mem.eql(u8, method_name, "err")) return .result_err;
@@ -8709,12 +12875,21 @@ const Lowerer = struct {
                     if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
                     if (std.mem.eql(u8, method_name, "as_ref")) return .result_as_ref;
                     if (std.mem.eql(u8, method_name, "as_mut")) return .result_as_mut;
-                } else if (self.errorTypeIsZigErrorSet(result.err) and
-                    std.mem.eql(u8, method_name, "unwrap"))
-                {
+                } else if (self.errorTypeIsZigErrorSet(result.err)) {
                     // The receiver lowered to a Zig error union, so unwrapping
                     // is propagating its error.
-                    return .error_union_unwrap;
+                    if (std.mem.eql(u8, method_name, "unwrap")) return .error_union_unwrap;
+                    // The union holds the `Ok` payload and the failure as a
+                    // tag, and carries no runtime `Result` for a method to
+                    // live on, so both expectations are runtime helpers that
+                    // read the union out whole.
+                    if (std.mem.eql(u8, method_name, "expect")) return .error_union_expect;
+                    // A fieldless error enum kept its variants when it became
+                    // an error set, so there IS a failure here for
+                    // `expect_err` to hand back: the tag.
+                    if (std.mem.eql(u8, method_name, "expect_err")) {
+                        return .error_union_expect_err;
+                    }
                 }
             },
             .slice, .array => {
@@ -8735,6 +12910,14 @@ const Lowerer = struct {
                 }
                 if (std.mem.eql(u8, method_name, "get_unchecked_mut")) {
                     return .memory_slice_get_unchecked_mut;
+                }
+                // `to_owned` on a SLICE is the owned copy of exactly the bytes
+                // it borrows. An ARRAY receiver is deliberately left out: the
+                // runtime copy takes a sequence, and reading one out of an
+                // array would have to build that slice first, which is a
+                // conversion the source never performed.
+                if (cur_t == .slice and std.mem.eql(u8, method_name, "to_owned")) {
+                    return .borrowed_to_owned;
                 }
             },
             .raw_ptr => {
@@ -8790,6 +12973,8 @@ const Lowerer = struct {
                             if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
                             if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
                             if (std.mem.eql(u8, method_name, "unwrap_err")) return .result_unwrap_err;
+                            if (std.mem.eql(u8, method_name, "expect")) return .result_expect;
+                            if (std.mem.eql(u8, method_name, "expect_err")) return .result_expect_err;
                             if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
                             if (std.mem.eql(u8, method_name, "ok")) return .result_ok;
                             if (std.mem.eql(u8, method_name, "err")) return .result_err;
@@ -8803,12 +12988,69 @@ const Lowerer = struct {
                 if (isChunksExactType(cur_t) and std.mem.eql(u8, method_name, "remainder")) {
                     return .chunks_exact_remainder;
                 }
+                // `ToOwned::to_owned` on `&str` is the owned copy of the very
+                // bytes the borrow names, and `FromUtf8Error::utf8_error` is
+                // the character-level failure this error already wraps. Both
+                // receivers are named by their FULL standard-library path, so
+                // a crate's own `String` or `FromUtf8Error` cannot claim them.
+                if (ir.types.isStr(cur_t) and std.mem.eql(u8, method_name, "to_owned")) {
+                    return .borrowed_to_owned;
+                }
+                if ((externalPathEqual(external.path, &.{ "alloc", "string", "FromUtf8Error" }) or
+                    externalPathEqual(external.path, &.{ "std", "string", "FromUtf8Error" })) and
+                    std.mem.eql(u8, method_name, "utf8_error"))
+                {
+                    return .utf8_error;
+                }
+                // `Cow` is a borrow-or-own pair: asking it for bytes reads the
+                // arm it is holding, asking it to CONSUME the pair trades the
+                // borrow for the owned payload it was guarding, and asking it
+                // for its own owned form COPIES it.
+                //
+                // `to_owned` is that copy, not the consuming conversion. A
+                // `Cow` is `Clone`, so `impl<T: Clone> ToOwned for T { type
+                // Owned = T }` answers the name with a copy of the SAME cow
+                // taken through `&self`, and the receiver is still usable
+                // afterwards. Naming `into_owned` for it would move a value
+                // Rust only read, and answering it with the receiver itself
+                // would hand two owners the same allocation the moment both are
+                // released. `.clone` is the only faithful answer, and it is the
+                // deep copy the runtime publishes for an owned arm.
+                if (isCowPath(external.path) and external.args.len == 1) {
+                    if (std.mem.eql(u8, method_name, "as_bytes")) return .cow_as_bytes;
+                    if (std.mem.eql(u8, method_name, "into_owned")) return .cow_to_owned;
+                    if (std.mem.eql(u8, method_name, "to_owned")) return .clone;
+                }
+                // A `Vec` grows through the runtime vector's own `append` and
+                // `appendSlice`, and through the one helper that covers both a
+                // sequence and an iterator under a single name. All three take
+                // the allocator ahead of the value they touch.
+                if (isAllocVecPath(external.path)) {
+                    if (std.mem.eql(u8, method_name, "push")) return .vec_push;
+                    if (std.mem.eql(u8, method_name, "extend")) return .vec_extend;
+                }
+                // `&mut String` reaches this point already peeled to the owned
+                // nominal by the deref loop above, which is the same peel
+                // `resolve_methods.unpeelReceiverType` performs before its own
+                // `string_push` arm — so both halves of the pipeline classify
+                // the receiver at the same place in the borrow chain.
+                if (isAllocStringPath(external.path) and external.args.len == 0) {
+                    if (std.mem.eql(u8, method_name, "push")) return .string_push;
+                    if (std.mem.eql(u8, method_name, "push_str")) return .string_push_str;
+                }
                 if (isRuntimeIteratorCarrier(cur_t)) {
                     if (std.mem.eql(u8, method_name, "step_by")) return .iterator_step_by;
                     if (std.mem.eql(u8, method_name, "skip")) return .iterator_skip;
                     if (std.mem.eql(u8, method_name, "zip")) return .iterator_zip;
                     if (std.mem.eql(u8, method_name, "collect")) return .iterator_collect;
                 }
+                // `any` takes `&mut self` and a closure, and it is the
+                // closure that decides it — no Zig member spells it, so it
+                // is expanded into an explicit walk at the call site. The
+                // receiver is the wider `next`-driven set, which also covers
+                // the slice-owned iterators the arms above do not model.
+                if (std.mem.eql(u8, method_name, "any") and
+                    isNextDrivenIteratorCarrier(cur_t)) return .iterator_any;
             },
             .generic_inst => {
                 if (canonicalExternalMethodType(self, cur_t)) |synthetic_kind| {
@@ -8828,6 +13070,8 @@ const Lowerer = struct {
                             if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
                             if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
                             if (std.mem.eql(u8, method_name, "unwrap_err")) return .result_unwrap_err;
+                            if (std.mem.eql(u8, method_name, "expect")) return .result_expect;
+                            if (std.mem.eql(u8, method_name, "expect_err")) return .result_expect_err;
                             if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
                             if (std.mem.eql(u8, method_name, "ok")) return .result_ok;
                             if (std.mem.eql(u8, method_name, "err")) return .result_err;
@@ -8896,6 +13140,14 @@ const Lowerer = struct {
                 .unit, .never, .f32, .f64 => false,
                 else => true,
             },
+            // A Rust `&str` reaches the backend as a byte slice, and it is
+            // the one sequence type with a `Display` impl: `"x".to_string()`
+            // writes the bytes and nothing else. `r2z.format.writeValue`
+            // renders a `[]const u8` receiver exactly that way, so the
+            // runtime already has the arm. A `&[u8]` cannot reach this
+            // line: Rust has no `Display` for it, so the resolver never
+            // hands the backend the call.
+            .slice => |slice| sameIrType(slice.elem, .{ .prim = .u8 }),
             .external_nominal => |external| {
                 if (ir.types.isStr(t)) return true;
                 if (external.args.len == 0 and externalPathEqual(
@@ -8958,6 +13210,24 @@ const Lowerer = struct {
         return error.UnsupportedStandardMethod;
     }
 
+    /// Iterator and range methods with no Zig counterpart. They must refuse
+    /// instead of falling through to a `receiver.method()` call Zig rejects.
+    fn isMissingIteratorMethod(method_name: []const u8) bool {
+        const names = [_][]const u8{ "rev", "count", "nth", "last", "position" };
+        for (names) |name| {
+            if (std.mem.eql(u8, method_name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Whether a method receiver is a bare range or an `r2z` iterator — the
+    /// two shapes with no Zig member surface for `rev`, `count` and friends.
+    fn isRangeOrRuntimeIteratorReceiver(self: *Lowerer, receiver_id: ir.exprs.NodeId) anyerror!bool {
+        if (receiver_id < self.ir.bodies.exprs.len and
+            self.ir.bodies.exprs[receiver_id].kind == .range) return true;
+        return self.isRuntimeIteratorInput(receiver_id);
+    }
+
     fn receiverIsPointerLike(self: *Lowerer, receiver_node: ir.exprs.NodeId) !bool {
         const receiver_type = try self.exprType(receiver_node) orelse return false;
         return switch (receiver_type) {
@@ -8989,13 +13259,32 @@ const Lowerer = struct {
         else
             receiver;
 
+        // `unwrap`, `expect` and `expect_err` abandon a payload on their
+        // panicking arm, and the runtime releases that through
+        // `alloc.dropTemporary`, which needs the allocator the caller owns. It
+        // leads the argument list, and its presence makes the enclosing
+        // callable declare one — exactly as every other allocating runtime call
+        // does. The other accessors hand their payload back rather than
+        // dropping it, so they take no allocator and stay unchanged.
+        const takes_allocator = std.mem.eql(u8, method_name, "unwrap") or
+            std.mem.eql(u8, method_name, "expect") or
+            std.mem.eql(u8, method_name, "expect_err");
         const callee = try self.allocExpr(.{ .field_access = .{
             .target = method_receiver,
             .field_name = try self.alloc.dupe(u8, method_name),
         } });
-        return self.allocExpr(.{ .call = .{
+        if (!takes_allocator) return self.allocExpr(.{ .call = .{
             .callee = callee,
             .args = args,
+        } });
+        try self.markRuntimeImport();
+        self.current_callable_is_allocating = true;
+        const call_args = try self.alloc.alloc(ast.Expr, args.len + 1);
+        call_args[0] = .{ .ident = "allocator" };
+        @memcpy(call_args[1..], args);
+        return self.allocExpr(.{ .call = .{
+            .callee = callee,
+            .args = call_args,
         } });
     }
 
@@ -9030,6 +13319,13 @@ const Lowerer = struct {
         for (0..128) |_| {
             switch (current_type) {
                 .reference => |reference| {
+                    // `lowerType` spells the borrow of a FAT pointer AS that
+                    // pointer: `&str` is `[]const u8` and `&[T]` is `[]const T`,
+                    // with no pointee behind them to read out of. A `*` here
+                    // would read the slice back as one element rather than as
+                    // the slice, so the receiver already is the borrowed
+                    // value and there is nothing to dereference.
+                    if (isSliceShapedBorrow(reference.pointee)) return result;
                     result = if (result.* == .unary_op and result.unary_op.op == .addr_of)
                         result.unary_op.operand
                     else
@@ -9208,11 +13504,183 @@ const Lowerer = struct {
         } });
     }
 
+    /// The `Cow<..>` nominal a conversion is heading for, or null when the
+    /// target is some other type entirely.
+    fn cowConversionNominal(ty: ir.types.Type) ?ir.types.ExternalNominal {
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return null,
+        };
+        if (external.args.len != 1) return null;
+        return if (isCowPath(external.path)) external else null;
+    }
+
+    /// `into()` a concrete borrow or an owned value into a `Cow`.
+    ///
+    /// A BORROW keeps the caller's own bytes and owns nothing, so the cow
+    /// points at what it already pointed at. An owned value hands its
+    /// allocation over and is left empty, so nothing is copied and nothing
+    /// leaks. Each is one constructor on the runtime cow, and the generic
+    /// argument belongs to the TYPE rather than to the call: these are
+    /// declarations inside the type its parameter list instantiates.
+    ///
+    /// `from_owned` transfers IN PLACE, so it is handed a pointer to the
+    /// storage the source named: a place directly, and an rvalue — the shape
+    /// every conversion receiver has, `String::from_utf8(bytes).into()` —
+    /// materialized once first. Either way the transfer empties what it was
+    /// handed, so the source ends the call holding no storage of its own and
+    /// is never released a second time.
+    fn lowerCowConversion(
+        self: *Lowerer,
+        cow: ir.types.ExternalNominal,
+        receiver_node: ir.exprs.NodeId,
+        receiver: *const ast.Expr,
+    ) !ast.Expr {
+        try self.markRuntimeImport();
+        const source_type = try self.exprType(receiver_node) orelse
+            return error.MissingExpressionType;
+        const borrowed = switch (source_type) {
+            .reference => true,
+            else => false,
+        };
+        const is_str = ir.types.isStr(cow.args[0]);
+        const generic_args: []const ast.Type = if (is_str) &.{} else blk: {
+            const borrowed_slice = switch (cow.args[0]) {
+                .slice => |value| value,
+                else => return error.UnsupportedExternalNominalType,
+            };
+            const params = try self.alloc.alloc(ast.Type, 1);
+            params[0] = try self.lowerType(borrowed_slice.elem);
+            break :blk params;
+        };
+        const cow_type = try self.runtimeCowType(is_str, generic_args);
+        const call_args = try self.alloc.alloc(ast.Expr, 1);
+        call_args[0] = if (borrowed)
+            receiver.*
+        else
+            try self.lowerOwnedReceiverPointer(receiver_node, receiver);
+        return (try self.allocExpr(.{ .call = .{
+            .callee = try self.allocExpr(.{ .field_access = .{
+                .target = try self.allocExpr(cow_type),
+                .field_name = if (borrowed) "from_borrowed" else "from_owned",
+            } }),
+            .args = call_args,
+        } })).*;
+    }
+
+    /// The receiver's own type, with the indirections that do not change which
+    /// Rust carrier it names stripped: what decides which runtime shape the
+    /// VALUE has. A `&Cow<str>` and a `Cow<str>` name the same runtime type,
+    /// so both answer `CowStr` here.
+    fn receiverValueType(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+    ) anyerror!?ir.types.Type {
+        return peelReceiverType(try self.exprType(receiver_node) orelse return null);
+    }
+
+    /// Whether a receiver is one of the runtime `Cow` types.
+    ///
+    /// A cow is the one clone receiver whose copy constructor cannot be the
+    /// receiver itself: its `Owned` arm owns storage, so copying the union
+    /// would leave two owners releasing the same bytes.
+    fn isCowReceiver(self: *Lowerer, receiver_node: ir.exprs.NodeId) anyerror!bool {
+        const owned = (try self.receiverValueType(receiver_node)) orelse return false;
+        return switch (owned) {
+            .external_nominal => |external| external.args.len == 1 and isCowPath(external.path),
+            else => false,
+        };
+    }
+
+    /// The element type a `Vec<T>` receiver names, or null when the receiver
+    /// is not a vector.
+    fn vecElementOfReceiver(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+    ) anyerror!?ir.types.Type {
+        const owned = (try self.receiverValueType(receiver_node)) orelse return null;
+        return try vecElementOfContext(owned);
+    }
+
+    /// The pointer a runtime helper needs in order to read, consume or grow the
+    /// caller's OWN storage rather than a copy of it.
+    ///
+    /// A place — a binding, a field, an index, a dereference — has an address
+    /// already, so it is handed over directly and the helper empties or grows
+    /// exactly the storage the caller declared. An rvalue, which is what a
+    /// conversion receiver usually is (`String::from_utf8(bytes).into()`), has
+    /// no place at all and Zig cannot take the address of a temporary, so it is
+    /// materialized exactly once into a local — what a Rust `let` binding
+    /// would have done — and the helper reads that.
+    ///
+    /// Nothing is copied a second time and nothing is freed twice: the value is
+    /// evaluated once into the local, and every helper this feeds either empties
+    /// the local it was handed (`from_owned` transfers the allocation and
+    /// leaves an empty owner behind) or grows the very vector the local owns.
+    /// Either way the local is left holding no storage of its own, so there is
+    /// nothing for a later release to free a second time.
+    fn lowerOwnedReceiverPointer(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+        receiver: *const ast.Expr,
+    ) anyerror!ast.Expr {
+        if (exprIsAddressable(receiver.*)) {
+            return (try self.allocExpr(.{ .unary_op = .{
+                .op = .addr_of,
+                .operand = try self.allocExpr(receiver.*),
+            } })).*;
+        }
+        const name = try std.fmt.allocPrint(
+            self.alloc,
+            "__r2z_owned_receiver_{d}",
+            .{receiver_node},
+        );
+        const statements = try self.alloc.alloc(ast.Stmt, 1);
+        statements[0] = .{ .let_stmt = .{
+            .name = name,
+            .ty = null,
+            .init = (try self.allocExpr(receiver.*)).*,
+            .is_mut = true,
+        } };
+        return (try self.allocExpr(.{ .block = .{
+            .label = null,
+            .stmts = statements,
+            .expr = try self.allocExpr(.{ .unary_op = .{
+                .op = .addr_of,
+                .operand = try self.allocExpr(.{ .ident = name }),
+            } }),
+        } })).*;
+    }
+
+    /// The `*String` a growing helper reads and appends through.
+    ///
+    /// Rust borrows the receiver mutably, so the helper needs the address of
+    /// the owned string whether or not the call site wrote the borrow:
+    /// `s.push(c)` on an owned `s` and `text.push(c)` on a `&mut String`
+    /// binding are the same call. The second already holds that pointer and
+    /// is handed on as it stands; the first is a place, and handing the
+    /// place itself on would pass a copy of the descriptor — the appended
+    /// bytes would land in that copy and the caller's string would be
+    /// unchanged.
+    fn lowerStringReceiverPointer(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+        receiver: *const ast.Expr,
+    ) anyerror!ast.Expr {
+        const receiver_type = try self.exprType(receiver_node) orelse
+            return self.lowerOwnedReceiverPointer(receiver_node, receiver);
+        return switch (receiver_type) {
+            .reference, .raw_ptr => receiver.*,
+            else => try self.lowerOwnedReceiverPointer(receiver_node, receiver),
+        };
+    }
+
     fn lowerBoundConversion(
         self: *Lowerer,
         expression: ir.exprs.NodeId,
         method: ir.spine.Entity,
         receiver: *const ast.Expr,
+        receiver_node: ir.exprs.NodeId,
     ) !?ast.Expr {
         const fallible = std.mem.eql(u8, method.name, "try_into");
         if (!fallible and !std.mem.eql(u8, method.name, "into")) return null;
@@ -9228,6 +13696,15 @@ const Lowerer = struct {
                 return error.UnsupportedStandardMethod,
             else => return error.UnsupportedStandardMethod,
         } else result;
+        // `Cow<..>` is a borrow-or-own pair, and the `From` impls a crate
+        // writes for it are exactly its two constructors: borrowing copies
+        // nothing and owns nothing, while moving hands the allocation over and
+        // leaves the source empty. Nothing generic can express that, so it is
+        // spelled here rather than routed through `r2z.convert.from` — the
+        // runtime cow publishes no `from` for it to find.
+        if (cowConversionNominal(target)) |cow| {
+            return try self.lowerCowConversion(cow, receiver_node, receiver);
+        }
         const generic_args = try self.alloc.alloc(ast.Type, 1);
         generic_args[0] = try self.lowerType(target);
         const args = try self.alloc.alloc(ast.Expr, 1);
@@ -9282,17 +13759,106 @@ const Lowerer = struct {
                 } });
             }
         }
+        if (std.mem.eql(u8, method_name, "as_bytes")) {
+            // `String::as_bytes` hands back a borrow of the string's own
+            // bytes, and the identity `lowerAsRef` returns is the string
+            // itself. A `&[u8]` method reached through it then reads a field
+            // the runtime `String` does not have, so the view has to be
+            // asked for by name.
+            const receiver_type = try self.exprType(receiver_node);
+            if (receiver_type != null and ownedStringType(receiver_type.?) != null) {
+                try self.markRuntimeImport();
+                return self.allocExpr(.{ .call = .{
+                    .callee = try self.allocExpr(.{ .field_access = .{
+                        .target = receiver,
+                        .field_name = try self.alloc.dupe(u8, "as_bytes"),
+                    } }),
+                    .args = &.{},
+                } });
+            }
+        }
+        // A `Cow` is excluded from the `as_bytes` half of this group: its bytes
+        // are a borrow of whichever arm it holds, not the identity
+        // `lowerAsRef` would hand back, so the cow's own accessor answers it
+        // further down.
+        // A cursor's `as_slice` is the sequence still in it, not a borrow of
+        // the cursor: `self.bytes.as_slice()` on a `slice::Iter` reads out the
+        // bytes between its front and back indices. `lowerAsRef` would answer
+        // the receiver itself — the cursor — which is a different value of a
+        // different type, and the runtime publishes the real accessor.
+        if (std.mem.eql(u8, method_name, "as_slice")) {
+            if (try self.receiverValueType(receiver_node)) |cursor_type| {
+                if (isCursorCarrierWithAsSlice(peelReceiverType(cursor_type))) {
+                    return self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .field_access = .{
+                            .target = receiver,
+                            .field_name = try self.alloc.dupe(u8, "as_slice"),
+                        } }),
+                        .args = &.{},
+                    } });
+                }
+            }
+        }
         if ((std.mem.eql(u8, method_name, "as_ref") and
             !is_option_as_ref and !is_result_as_ref) or
-            std.mem.eql(u8, method_name, "as_bytes") or
+            (std.mem.eql(u8, method_name, "as_bytes") and
+                !try self.isCowReceiver(receiver_node)) or
             std.mem.eql(u8, method_name, "borrow") or
             std.mem.eql(u8, method_name, "as_slice"))
         {
             const result = try self.lowerAsRef(receiver_node, receiver);
             return result;
         }
-        if (std.mem.eql(u8, method_name, "clone")) {
-            return self.lowerMemoryReceiver(receiver_node, receiver);
+        // The RECOGNIZED method decides, not the spelling: `Clone::clone` and a
+        // `Cow`'s `to_owned` are the same operation and both answer `.clone`.
+        if (recognized_std_method == .clone) {
+            // A `Clone` receiver whose copy constructor is the value itself
+            // stands in for the result. A `Cow` is the one receiver that
+            // cannot: its `Owned` arm owns storage, so a copy of the union
+            // would leave two owners releasing the same bytes. The runtime
+            // publishes the deep copy the source's `Clone` bound asks for —
+            // a borrowed arm stays borrowed, an owned arm is copied into
+            // fresh storage — and that copy allocates, so the allocator
+            // leads its argument list and the enclosing callable declares one.
+            if (try self.isCowReceiver(receiver_node)) {
+                try self.markRuntimeImport();
+                self.current_callable_is_allocating = true;
+                const clone_args = try self.alloc.alloc(ast.Expr, 1);
+                clone_args[0] = .{ .ident = "allocator" };
+                return try self.allocExpr(.{ .unary_op = .{
+                    .op = .try_op,
+                    .operand = try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .field_access = .{
+                            .target = try self.allocExpr(receiver.*),
+                            .field_name = "clone",
+                        } }),
+                        .args = clone_args,
+                    } }),
+                } });
+            }
+            // A borrow of a cursor is not the cursor: `iter.clone()` on a
+            // `&mut slice::Iter` is `(*iter).clone()`, a second cursor over the
+            // same bytes that the source then writes back with `*iter =
+            // cloned`. Standing in for the result with the receiver would
+            // assign the caller's own cursor to a binding of the same type and
+            // leave `iter` already advanced, so the body would read from
+            // storage the source never copied. The runtime publishes the copy
+            // for exactly these carriers, so it is spelled; a receiver that
+            // already IS the value keeps the identity that is right for it,
+            // and one with no runtime `clone` is left as it was.
+            const cloned_receiver = try self.lowerMemoryReceiver(receiver_node, receiver);
+            const pointee = (try self.borrowedReceiverPointee(receiver_node)) orelse
+                return cloned_receiver;
+            if (!runtimeCarrierCopiesByClone(peelReceiverType(pointee))) {
+                return cloned_receiver;
+            }
+            return try self.allocExpr(.{ .call = .{
+                .callee = try self.allocExpr(.{ .field_access = .{
+                    .target = try self.allocExpr(cloned_receiver.*),
+                    .field_name = "clone",
+                } }),
+                .args = &.{},
+            } });
         }
         if (recognized_std_method == .slice_len) {
             const result = try self.allocExpr(ast.Expr{
@@ -9346,6 +13912,171 @@ const Lowerer = struct {
                         .rhs = try self.allocExpr(.{ .lit = .{ .int = 127 } }),
                     } });
                 },
+                .borrowed_to_owned => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    try self.markRuntimeImport();
+                    // The copy is owned storage, so the allocator leads the
+                    // argument list and its presence makes the enclosing
+                    // callable declare one. The bytes are COPIED, so the
+                    // result outlives the borrow it came from.
+                    self.current_callable_is_allocating = true;
+                    const call_args = try self.alloc.alloc(ast.Expr, 2);
+                    call_args[0] = .{ .ident = "allocator" };
+                    call_args[1] = (try self.lowerMemoryReceiver(receiver_node, receiver)).*;
+                    const receiver_type = try self.exprType(receiver_node) orelse
+                        return error.MissingExpressionType;
+                    // `str` and `&str` are the same text; only the borrow is
+                    // spelled differently in the IR. A `&[u8]` is a different
+                    // type that shares the Zig ABI, so the decision is the
+                    // Rust type and never the lowered one.
+                    const call = if (canonicalBorrowedStr(receiver_type))
+                        try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{ .ident = "r2z.alloc.String.from_str" }),
+                            .args = call_args,
+                        } })
+                    else blk_vec: {
+                        const element = try self.memoryElementType(receiver_node) orelse
+                            return try self.lowerUnsupportedStdMethod(method_name);
+                        const generic_args = try self.alloc.alloc(ast.Type, 1);
+                        generic_args[0] = try self.lowerType(element);
+                        break :blk_vec try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{ .ident = "r2z.alloc.vec_from_slice" }),
+                            .generic_args = generic_args,
+                            .args = call_args,
+                        } });
+                    };
+                    return try self.allocExpr(.{ .unary_op = .{
+                        .op = .try_op,
+                        .operand = call,
+                    } });
+                },
+                .cow_as_bytes => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    // The cow already holds the borrowed bytes; reading them
+                    // is reading whichever arm it is holding, which is what
+                    // the runtime's own accessor does.
+                    return try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .field_access = .{
+                            .target = receiver,
+                            .field_name = "as_ref",
+                        } }),
+                        .args = &.{},
+                    } });
+                },
+                .cow_to_owned => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    try self.markRuntimeImport();
+                    self.current_callable_is_allocating = true;
+                    const call_args = try self.alloc.alloc(ast.Expr, 1);
+                    call_args[0] = .{ .ident = "allocator" };
+                    return try self.allocExpr(.{ .unary_op = .{
+                        .op = .try_op,
+                        .operand = try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{ .field_access = .{
+                                .target = try self.allocExpr(receiver.*),
+                                .field_name = "into_owned",
+                            } }),
+                            .args = call_args,
+                        } }),
+                    } });
+                },
+                .string_push, .string_push_str => {
+                    if (args.len != 1) return try self.lowerUnsupportedStdMethod(method_name);
+                    try self.markRuntimeImport();
+                    // Growing the string may reallocate its buffer, so the
+                    // call declares the enclosing allocator exactly as the
+                    // vector's own append does.
+                    self.current_callable_is_allocating = true;
+                    // The runtime reads and grows the string through a
+                    // `*String`. A receiver the source already reached
+                    // through `&mut String` IS that pointer and is handed on
+                    // as it stands; a bare place is given its address, so the
+                    // growth lands in the caller's own string rather than in
+                    // a copy of its descriptor.
+                    const call_args = try self.alloc.alloc(ast.Expr, 3);
+                    call_args[0] = try self.lowerStringReceiverPointer(receiver_node, receiver);
+                    call_args[1] = .{ .ident = "allocator" };
+                    call_args[2] = args[0];
+                    return try self.allocExpr(.{ .unary_op = .{
+                        .op = .try_op,
+                        .operand = try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{ .ident = if (std_method == .string_push)
+                                "r2z.alloc.String.push"
+                            else
+                                "r2z.alloc.String.push_str" }),
+                            .args = call_args,
+                        } }),
+                    } });
+                },
+                .vec_push, .vec_extend => {
+                    if (args.len != 1) return try self.lowerUnsupportedStdMethod(method_name);
+                    try self.markRuntimeImport();
+                    self.current_callable_is_allocating = true;
+                    if (std_method == .vec_extend) {
+                        // Rust's `extend` takes any `IntoIterator`, and the
+                        // runtime helper is the one call that covers both
+                        // shapes: a sequence is copied in whole, and an
+                        // iterator is drained item by item straight into the
+                        // caller's own vector, with no intermediate container
+                        // and no prefix rewrite. Deciding here would be a
+                        // second, weaker copy of that rule, and refusing
+                        // anything the helper accepts would drop calls the
+                        // source compiles.
+                        //
+                        // The vector's own element type is what the helper
+                        // checks each drained item against, so it is named as
+                        // the generic argument.
+                        const element = (try self.vecElementOfReceiver(receiver_node)) orelse
+                            return try self.lowerUnsupportedStdMethod(method_name);
+                        const generic_args = try self.alloc.alloc(ast.Type, 1);
+                        generic_args[0] = try self.lowerType(element);
+                        const extend_args = try self.alloc.alloc(ast.Expr, 3);
+                        extend_args[0] = .{ .ident = "allocator" };
+                        extend_args[1] = try self.lowerOwnedReceiverPointer(receiver_node, receiver);
+                        extend_args[2] = args[0];
+                        return try self.allocExpr(.{ .unary_op = .{
+                            .op = .try_op,
+                            .operand = try self.allocExpr(.{ .call = .{
+                                .callee = try self.allocExpr(.{ .ident = "r2z.alloc.vec_extend" }),
+                                .generic_args = generic_args,
+                                .args = extend_args,
+                            } }),
+                        } });
+                    }
+                    const call_args = try self.alloc.alloc(ast.Expr, 2);
+                    call_args[0] = .{ .ident = "allocator" };
+                    call_args[1] = args[0];
+                    return try self.allocExpr(.{ .unary_op = .{
+                        .op = .try_op,
+                        .operand = try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{ .field_access = .{
+                                .target = try self.allocExpr(receiver.*),
+                                .field_name = "append",
+                            } }),
+                            .args = call_args,
+                        } }),
+                    } });
+                },
+                .utf8_error => {
+                    if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
+                    // The error ALREADY carries the character-level failure:
+                    // the wrapper exists to name where a string conversion gave
+                    // up, not to hold a second, different one. What the source's
+                    // `Err` arm binds is that failure, not the wrapper, so the
+                    // runtime's own accessor is what reads it out — it takes
+                    // `self: *const` and no allocator, because reading the
+                    // detail allocates nothing and the wrapper keeps the bytes
+                    // it came with for the arm to release. Forwarding the
+                    // receiver here would hand back the wrapper itself, which is
+                    // a different type than the `Utf8Error` the source expects.
+                    return try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .field_access = .{
+                            .target = receiver,
+                            .field_name = try self.alloc.dupe(u8, "utf8_error"),
+                        } }),
+                        .args = &.{},
+                    } });
+                },
                 .format_write_str => {
                     if (args.len != 1) return error.UnsupportedStandardMethod;
                     return try self.allocExpr(.{ .call = .{
@@ -9367,14 +14098,40 @@ const Lowerer = struct {
                 .io_read_exact, .io_write_all => {
                     if (args.len != 1) return error.UnsupportedStandardMethod;
                     try self.markRuntimeImport();
+                    if (std_method == .io_write_all) {
+                        // Only a caller-owned VECTOR grows, and it grows
+                        // through the allocator threaded in here, so that
+                        // allocator leads the argument list exactly as it
+                        // does for every other allocating runtime call and
+                        // its presence forces the enclosing callable to
+                        // declare one. A vector that cannot grow is a
+                        // genuine allocation failure: it propagates as
+                        // `error.OutOfMemory` beside the I/O result through
+                        // `try`, and never as a fabricated category inside
+                        // it. Every other receiver writes into storage the
+                        // caller already owns, so a successful run allocates
+                        // nothing even though the call takes an allocator.
+                        self.current_callable_is_allocating = true;
+                        const alloc_args = try self.alloc.alloc(ast.Expr, 3);
+                        alloc_args[0] = .{ .ident = "allocator" };
+                        alloc_args[1] = receiver.*;
+                        alloc_args[2] = args[0];
+                        return try self.allocExpr(.{ .unary_op = .{
+                            .op = .try_op,
+                            .operand = try self.allocExpr(.{ .call = .{
+                                .callee = try self.allocExpr(.{ .ident = "r2z.io.write_all" }),
+                                .args = alloc_args,
+                            } }),
+                        } });
+                    }
+                    // `read_exact` moves bytes out of storage the caller
+                    // already owns and never grows anything, so it takes no
+                    // allocator at all.
                     const call_args = try self.alloc.alloc(ast.Expr, 2);
                     call_args[0] = receiver.*;
                     call_args[1] = args[0];
                     return try self.allocExpr(.{ .call = .{
-                        .callee = try self.allocExpr(.{ .ident = if (std_method == .io_read_exact)
-                            "r2z.io.read_exact"
-                        else
-                            "r2z.io.write_all" }),
+                        .callee = try self.allocExpr(.{ .ident = "r2z.io.read_exact" }),
                         .args = call_args,
                     } });
                 },
@@ -9482,6 +14239,13 @@ const Lowerer = struct {
                         } }),
                     } });
                 },
+                // `Iterator::any` is decided by an inline predicate, and the
+                // call-site expansion above is the only lowering that can
+                // spell one. Reaching here means the argument was not that,
+                // and no `r2z` member carries the operation, so this refuses
+                // instead of emitting `receiver.any(..)` against a struct
+                // that has no such member.
+                .iterator_any => return try self.lowerUnsupportedStdMethod(method_name),
                 .option_is_some => {
                     if (args.len != 0) return try self.lowerUnsupportedStdMethod(method_name);
                     const null_value = try self.allocExpr(ast.Expr{ .lit = .null_lit });
@@ -9509,6 +14273,8 @@ const Lowerer = struct {
                 .result_is_err,
                 .result_unwrap,
                 .result_unwrap_err,
+                .result_expect,
+                .result_expect_err,
                 .result_ok,
                 .result_err,
                 .result_map,
@@ -9519,6 +14285,7 @@ const Lowerer = struct {
                     const expected_args: usize = switch (std_method) {
                         .result_is_ok, .result_is_err, .result_unwrap, .result_unwrap_err, .result_ok, .result_err => 0,
                         .result_map, .result_map_err => 1,
+                        .result_expect, .result_expect_err => 1,
                         .result_as_ref, .result_as_mut => 0,
                         else => unreachable,
                     };
@@ -9552,6 +14319,63 @@ const Lowerer = struct {
                     return try self.allocExpr(.{ .unary_op = .{
                         .op = .try_op,
                         .operand = receiver,
+                    } });
+                },
+                .error_union_expect, .error_union_expect_err => {
+                    if (args.len != 1) return try self.lowerUnsupportedStdMethod(method_name);
+                    // The union is handed to the helper whole: a borrow of one
+                    // is read out first, because the helper takes the union by
+                    // value the way Rust's `Result::expect` takes `self`.
+                    const consumed = if (try self.receiverIsPointerLike(receiver_node))
+                        (try self.allocExpr(.{ .unary_op = .{
+                            .op = .deref,
+                            .operand = receiver,
+                        } })).*
+                    else
+                        receiver.*;
+                    // The message is an argument of THIS call, so it is
+                    // evaluated before the helper looks at the union. Rust
+                    // evaluates the `expect` argument on every path, so
+                    // nothing about it may be deferred into the failure.
+                    // `expect_err` abandons the `Ok` payload on its panicking
+                    // arm and the runtime releases it through
+                    // `alloc.dropTemporary`, so its helper takes the caller's
+                    // allocator first and the enclosing callable has to declare
+                    // one. `expect` hands its payload back instead, so it keeps
+                    // the plain two-argument shape.
+                    const helper_args = if (std_method == .error_union_expect_err)
+                        try self.alloc.alloc(ast.Expr, 3)
+                    else
+                        try self.alloc.alloc(ast.Expr, 2);
+                    if (std_method == .error_union_expect_err) helper_args[0] = .{ .ident = "allocator" };
+                    helper_args[if (std_method == .error_union_expect_err) 1 else 0] = consumed;
+                    helper_args[if (std_method == .error_union_expect_err) 2 else 1] = args[0];
+                    // `expect_err` owes the caller the Rust `E`, not the tag the
+                    // union happens to spell it with, so the call names the
+                    // error type the `Result` declared. The runtime pairs each
+                    // error-set member with that enum's own variant while the
+                    // program is compiled, so the value that comes back is a
+                    // `Fault` where the source wrote `Fault`.
+                    const generic_args = if (std_method == .error_union_expect_err) err_args: {
+                        const receiver_type = try self.exprType(receiver_node) orelse
+                            return try self.lowerUnsupportedStdMethod(method_name);
+                        const err_type = self.resultErrorTypeOf(receiver_type) orelse
+                            return try self.lowerUnsupportedStdMethod(method_name);
+                        const params = try self.alloc.alloc(ast.Type, 1);
+                        params[0] = try self.lowerType(err_type);
+                        break :err_args params;
+                    } else &.{};
+                    try self.markRuntimeImport();
+                    if (std_method == .error_union_expect_err) {
+                        self.current_callable_is_allocating = true;
+                    }
+                    return try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .ident = if (std_method == .error_union_expect)
+                            "r2z.expect_error_union"
+                        else
+                            "r2z.expect_error_union_err" }),
+                        .generic_args = generic_args,
+                        .args = helper_args,
                     } });
                 },
                 .num_rotate_left,
@@ -9656,7 +14480,8 @@ const Lowerer = struct {
             null;
         if (bin_kind) |bk| {
             if (args.len < 1) return null;
-            const is_pointer_receiver = if (try self.exprType(receiver_node)) |ty|
+            const receiver_ty = try self.exprType(receiver_node);
+            const is_pointer_receiver = if (receiver_ty) |ty|
                 ty == .reference or ty == .raw_ptr
             else
                 false;
@@ -9665,7 +14490,14 @@ const Lowerer = struct {
             else
                 receiver;
             const lhs = num_receiver;
-            const rhs = try self.allocExpr(args[0]);
+            // A `.shl()` / `.shr()` receiver reaches the same `u5` rule the
+            // operator form does, by value or behind a pointer alike.
+            const rhs = if ((bk == .shl or bk == .shr) and
+                !isFloatType(receiver_ty) and
+                !requiresRuntimeOperator(receiver_ty))
+                try self.allocExpr(try self.lowerShiftAmount(args[0]))
+            else
+                try self.allocExpr(args[0]);
             const result = try self.allocExpr(ast.Expr{
                 .bin_op = .{ .op = bk, .lhs = lhs, .rhs = rhs },
             });
@@ -9818,6 +14650,19 @@ const Lowerer = struct {
             else => false,
         };
     }
+
+    /// Whether `ty` may be the SOURCE of a scalar `as` conversion.
+    ///
+    /// The same rule `ir.validate.isValidCastType` states for a scalar
+    /// destination: any scalar, and a `bool` as well. `true as usize` is
+    /// ordinary Rust and the validator admits it, so refusing it here made the
+    /// backend narrower than the IR it is handed. `bool` is deliberately not a
+    /// legal DESTINATION there, so this widens the source side only.
+    fn isScalarCastSource(ty: ir.types.Type) bool {
+        if (isScalarCastType(ty)) return true;
+        return ty == .prim and ty.prim == .bool;
+    }
+
     /// A raw-pointer cast reinterprets one address under a different pointee;
     /// it never allocates or narrows. Every raw pointer lowers to
     /// `[*]align(1) T` (see `lowerType`), so neither side can raise alignment
@@ -9839,6 +14684,100 @@ const Lowerer = struct {
     fn pointerPointeesCompatible(source: ir.types.Type, target: ir.types.Type) bool {
         return pointerPointeeIsSized(source) and pointerPointeeIsSized(target);
     }
+
+    /// The slice behind a fat-borrow type, or null when the type is not one.
+    ///
+    /// Rust's `&[T]`, `&mut [T]` and `*const [T]` / `*mut [T]` all borrow an
+    /// unsized slice, and `lowerType` spells every one of them `[]const T` or
+    /// `[]T`. A borrow of a sized pointee is not fat and is not one of these.
+    fn fatBorrowSlice(ty: ir.types.Type) ?*const ir.types.Slice {
+        return switch (ty) {
+            .slice => |slice| slice,
+            .reference => |reference| switch (reference.pointee) {
+                .slice => |slice| slice,
+                else => null,
+            },
+            .raw_ptr => |pointer| switch (pointer.pointee) {
+                .slice => |slice| slice,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// Whether `target` can stand for `source` in a fat-borrow cast.
+    ///
+    /// The rule, as the frontend and the validator state it: the element types
+    /// have to be the same, and a shared borrow cannot become a mutable
+    /// pointer. That the destination is fat at all is settled by the caller,
+    /// which only offers a `.raw_ptr` holding a slice.
+    fn fatBorrowCastCompatible(
+        source: *const ir.types.Slice,
+        target: *const ir.types.Slice,
+        target_mut: bool,
+    ) bool {
+        if (target_mut and source.const_) return false;
+        return sameIrType(source.elem, target.elem);
+    }
+
+    /// Whether a fat borrow of this type lowers to a `[]const` rather than a
+    /// `[]`.
+    fn fatBorrowIsShared(ty: ir.types.Type) bool {
+        return switch (ty) {
+            .slice => |slice| slice.const_,
+            .reference => |reference| switch (reference.pointee) {
+                .slice => !reference.mut,
+                else => true,
+            },
+            .raw_ptr => |pointer| switch (pointer.pointee) {
+                .slice => !pointer.mut,
+                else => true,
+            },
+            else => true,
+        };
+    }
+
+    /// The cast that re-labels one fat borrow as another.
+    ///
+    /// Both sides lower to a slice, so nothing is thinned to a bare address and
+    /// nothing is dropped: `@constCast` for the one direction a shared borrow
+    /// may go, then `@ptrCast` between two slices of the same element.
+    fn fatBorrowCast(
+        self: *Lowerer,
+        source_ir: ir.types.Type,
+        target_ir: ir.types.Type,
+        operand: ir.exprs.NodeId,
+    ) anyerror!ast.Expr {
+        const target = try self.lowerType(target_ir);
+        const source = try self.lowerType(source_ir);
+        var cast_operand = try self.allocExpr(try self.lowerExpr(operand));
+        if (fatBorrowIsShared(source_ir) and !fatBorrowIsShared(target_ir)) {
+            const const_cast_args = try self.alloc.alloc(ast.Expr, 1);
+            const_cast_args[0] = cast_operand.*;
+            cast_operand = try self.allocExpr(.{ .builtin = .{
+                .name = "constCast",
+                .args = const_cast_args,
+            } });
+        }
+        const ptr_cast_args = try self.alloc.alloc(ast.Expr, 1);
+        ptr_cast_args[0] = cast_operand.*;
+        const pointer_cast = try self.allocExpr(.{ .builtin = .{
+            .name = "ptrCast",
+            .args = ptr_cast_args,
+        } });
+        return .{ .cast = .{
+            .target = target,
+            .operand = pointer_cast,
+            .source = source,
+        } };
+    }
+
+    /// The width a `From` conversion is measured against. `.char` carries the
+    /// same 32 `ir.validate.unsignedPrimitiveWidth` and `infer`'s own table give
+    /// it, and it has to: `char::from(byte)` is an ordinary `From` conversion
+    /// the frontend lowers to a `primitive_from` cast and already accepts, so a
+    /// backend that gave `char` no width would refuse a cast the frontend had
+    /// decided was well formed — and `u8` to `char` is valid Rust.
     fn unsignedPrimitiveWidth(primitive: ir.types.Prim) ?u16 {
         return switch (primitive) {
             .u8 => 8,
@@ -9847,6 +14786,7 @@ const Lowerer = struct {
             .u64 => 64,
             .u128 => 128,
             .usize => 64,
+            .char => 32,
             else => null,
         };
     }
@@ -9907,6 +14847,18 @@ const Lowerer = struct {
         };
     }
 
+    fn unsignedCounterpart(primitive: ir.types.Prim) ?ir.types.Prim {
+        return switch (primitive) {
+            .i8 => .u8,
+            .i16 => .u16,
+            .i32 => .u32,
+            .i64 => .u64,
+            .i128 => .u128,
+            .isize => .usize,
+            else => null,
+        };
+    }
+
     fn scalarBuiltin(self: *Lowerer, name: []const u8, operand: ast.Expr) !ast.Expr {
         const args = try self.alloc.alloc(ast.Expr, 1);
         args[0] = operand;
@@ -9922,6 +14874,25 @@ const Lowerer = struct {
         const source = scalarPrimitive(source_type) orelse return error.UnsupportedExpression;
         const target = scalarPrimitive(target_type) orelse return error.UnsupportedExpression;
         const target_ast = try self.lowerType(target_type);
+
+        // `true as usize` is 1 and `false as usize` is 0, which is exactly
+        // `@intFromBool`; the cast that follows widens its `u1` to the
+        // destination. There is no boolean-to-FLOAT conversion in Rust, so a
+        // float destination is a conversion the source never wrote and is
+        // refused rather than approximated: Zig has no `@floatFromBool` to
+        // name it with, and inventing one would emit a builtin that does not
+        // exist. The destination is never `bool` either, since `ir.validate`
+        // does not admit one, so this cannot become a bool-to-bool cast. It
+        // comes before the integer-width and signedness arms below, which have
+        // no width for a boolean.
+        if (source == .bool) {
+            if (isFloatPrimitive(target)) return error.UnsupportedExpression;
+            const converted = try self.scalarBuiltin("intFromBool", operand);
+            return .{ .cast = .{
+                .target = target_ast,
+                .operand = try self.allocExpr(converted),
+            } };
+        }
 
         if (isFloatPrimitive(source)) {
             if (isFloatPrimitive(target)) {
@@ -10022,9 +14993,31 @@ const Lowerer = struct {
         const target_width = integerWidth(target) orelse return error.UnsupportedExpression;
         if (source_width > target_width) {
             const truncated = try self.scalarBuiltin("truncate", operand);
+            // `@truncate` KEEPS the operand's signedness — it cannot even be
+            // spelled for a destination of the other one — while a Rust `as`
+            // keeps the low bits and says nothing about the sign. So a
+            // narrowing cast across signedness narrows into a type of the
+            // SOURCE's sign and reinterprets those same bits into the
+            // destination, which is the pair the same-width case below
+            // already uses and the one Zig will accept.
+            if (isSignedPrimitive(source) == isSignedPrimitive(target)) {
+                return .{ .cast = .{
+                    .target = target_ast,
+                    .operand = try self.allocExpr(truncated),
+                } };
+            }
+            const narrow = if (isSignedPrimitive(source))
+                signedCounterpart(target) orelse return error.UnsupportedExpression
+            else
+                unsignedCounterpart(target) orelse return error.UnsupportedExpression;
+            const narrowed: ast.Expr = .{ .cast = .{
+                .target = try self.lowerType(.{ .prim = narrow }),
+                .operand = try self.allocExpr(truncated),
+            } };
+            const reinterpreted = try self.scalarBuiltin("bitCast", narrowed);
             return .{ .cast = .{
                 .target = target_ast,
-                .operand = try self.allocExpr(truncated),
+                .operand = try self.allocExpr(reinterpreted),
             } };
         }
         if (source_width == target_width and isSignedPrimitive(source) != isSignedPrimitive(target)) {
@@ -10123,6 +15116,88 @@ const Lowerer = struct {
         return self.ir.bodies.exprs[index.index].kind == .range;
     }
 
+    /// `base[index]`, the one shape a slice index and a range index share.
+    fn indexSliceExpr(
+        self: *Lowerer,
+        base: *const ast.Expr,
+        index_expr: *const ast.Expr,
+    ) anyerror!ast.Expr {
+        const args = try self.alloc.alloc(ast.Expr, 2);
+        args[0] = base.*;
+        args[1] = index_expr.*;
+        return ast.Expr{ .builtin = .{
+            .name = "index",
+            .args = args,
+        } };
+    }
+
+    /// Whether `&mut place[..]` writes an OWNED ARRAY a binding holds.
+    ///
+    /// `&mut buf[..]` and `&buf[..]` lower to the same slice `buf[0..]` — the
+    /// borrow IS the descriptor — but only the mutable one writes the array.
+    /// The array's mutability is the whole reason the slice is `[]T` rather
+    /// than `[]const T`, so the address has to survive the elision: it is the
+    /// one trace the emitted block carries that the binding is written
+    /// through, and without it the mutability post-pass puts `const` on a
+    /// binding the source declared `mut`, and the slice it yields is a
+    /// `const` slice the call cannot take.
+    ///
+    /// The gate is the source's own `&mut` and an array PLACE the caller's
+    /// storage owns. A slice descriptor already carries the pointer and its own
+    /// element mutability, a pointer to an array is already an address, and a
+    /// shared borrow writes nothing at all — so those keep the plain slice.
+    fn mutableBorrowWritesOwnedArray(self: *Lowerer, operand_id: ir.exprs.NodeId) bool {
+        if (operand_id >= self.ir.bodies.exprs.len) return false;
+        const index = switch (self.ir.bodies.exprs[operand_id].kind) {
+            .index => |value| value,
+            else => return false,
+        };
+        if (index.index >= self.ir.bodies.exprs.len) return false;
+        if (self.ir.bodies.exprs[index.index].kind != .range) return false;
+        // The base has to be a PLACE the caller owns storage in. A binding is
+        // one, and so is a field or an indexed element reached through one:
+        // `&mut state.data[..]` and `&mut rows[1][..]` write exactly the array
+        // those name, and the mutability that proves it is the binding's, so
+        // dropping the address drops the `var` too. An array LITERAL is a
+        // temporary with no mutability of its own to restore, and any other
+        // expression base is a value rather than storage this lowering can
+        // keep addressable.
+        if (index.base >= self.ir.bodies.exprs.len) return false;
+        switch (self.ir.bodies.exprs[index.base].kind) {
+            .path, .field, .index => {},
+            .unary => |unary| if (unary.op != .deref) return false,
+            else => return false,
+        }
+        const base_type = self.concreteExprType(index.base) orelse return false;
+        return switch (base_type) {
+            // A `[T; N]` whose length is the type parameter lowers to a Zig
+            // slice, which is already a descriptor.
+            .array => |array| array.len != .generic,
+            else => false,
+        };
+    }
+
+    /// The elided slice for `&mut buf[..]`, with the array's address kept.
+    ///
+    /// This is `(&buf)[0..]`: the same sequence `buf[0..]` names, reached
+    /// through the array's own address. Zig takes the address of a `var` array
+    /// and slices through the pointer, so the slice is `[]T`, and the
+    /// address is what keeps the binding a `var`.
+    fn lowerAddressedSliceBorrow(self: *Lowerer, operand_id: ir.exprs.NodeId) anyerror!ast.Expr {
+        const index = self.ir.bodies.exprs[operand_id].kind.index;
+        const base = try self.allocExpr(.{
+            .unary_op = .{
+                .op = .addr_of,
+                .operand = try self.allocExpr(try self.lowerExpr(index.base)),
+            },
+        });
+        const bounds = try self.allocExpr(switch (self.ir.bodies.exprs[index.index].kind) {
+            .range => |range| try self.lowerRangeSliceExpr(range, true),
+            else => try self.lowerExpr(index.index),
+        });
+        return self.indexSliceExpr(base, bounds);
+    }
+
     fn isCowPath(path: []const []const u8) bool {
         return externalPathEqual(path, &.{ "alloc", "borrow", "Cow" }) or
             externalPathEqual(path, &.{ "std", "borrow", "Cow" });
@@ -10145,20 +15220,97 @@ const Lowerer = struct {
         if (!std.mem.eql(u8, variant.variant, "Borrowed") and
             !std.mem.eql(u8, variant.variant, "Owned")) return error.MissingVariantName;
         if (variant.tuple_fields.len != 1 or variant.named_fields.len != 0) return error.VariantArityMismatch;
+        const value_type = try self.exprType(node) orelse return error.MissingTypeId;
+        const payload = try self.lowerExpr(variant.tuple_fields[0]);
+        // `Cow::Owned(value)` MOVES the payload: the value leaves the arm, so
+        // whatever owned it before must end the call owning nothing. A struct
+        // literal cannot do that — it copies and leaves the source full — so an
+        // owned runtime container goes through the runtime's own `from_owned`,
+        // which transfers the allocation AND empties the owner it is handed.
+        // That is a pointer transfer like every other one, so an arm that moves
+        // on one branch and keeps on another is correct on both: the moved
+        // branch empties the alias and the release frees nothing, the kept
+        // branch leaves it full and the release frees it.
+        if (std.mem.eql(u8, variant.variant, "Owned")) {
+            if (try self.cowOwnedTransfer(value_type, variant.tuple_fields[0], payload)) |transfer| {
+                return transfer;
+            }
+        }
         const fields = try self.alloc.alloc(ast.StructInitField, 1);
         errdefer self.alloc.free(fields);
         const name = try self.alloc.dupe(u8, variant.variant);
         errdefer self.alloc.free(name);
-        const expr = try self.lowerExpr(variant.tuple_fields[0]);
-        fields[0] = .{
-            .name = name,
-            .expr = expr,
-        };
-        const value_type = try self.exprType(node) orelse return error.MissingTypeId;
+        fields[0] = .{ .name = name, .expr = payload };
         return .{ .struct_init = .{
             .type_name = try self.lowerType(value_type),
             .fields = fields,
         } };
+    }
+
+    /// `CowType.from_owned(&payload)` when `payload` is an owned runtime
+    /// container this cow can take over, or null when the struct literal is the
+    /// honest lowering.
+    ///
+    /// A borrowed payload has nothing to transfer and keeps its literal. An
+    /// owned container is exactly what `from_owned` exists for, and reaching it
+    /// here rather than through a conversion keeps this a MOVE instead of a
+    /// copy — which is what lets the arm's own release stay in place.
+    fn cowOwnedTransfer(
+        self: *Lowerer,
+        cow_type: ir.types.Type,
+        payload_node: ir.exprs.NodeId,
+        payload: ast.Expr,
+    ) anyerror!?ast.Expr {
+        const cow = switch (cow_type) {
+            .external_nominal => |external| external,
+            else => return null,
+        };
+        if (!isCowPath(cow.path) or cow.args.len != 1) return null;
+        const payload_type = try self.exprType(payload_node) orelse return null;
+        if (!ownedRuntimeContainerType(payload_type)) return null;
+        const generic_args: []const ast.Type = if (ir.types.isStr(cow.args[0])) &.{} else blk: {
+            const borrowed_slice = switch (cow.args[0]) {
+                .slice => |value| value,
+                else => return null,
+            };
+            const params = try self.alloc.alloc(ast.Type, 1);
+            params[0] = try self.lowerType(borrowed_slice.elem);
+            break :blk params;
+        };
+        try self.markRuntimeImport();
+        const cow_constructor = try self.runtimeCowType(
+            ir.types.isStr(cow.args[0]),
+            generic_args,
+        );
+        const args = try self.alloc.alloc(ast.Expr, 1);
+        args[0] = try self.lowerOwnedReceiverPointer(payload_node, try self.allocExpr(payload));
+        return (try self.allocExpr(.{ .call = .{
+            .callee = try self.allocExpr(.{ .field_access = .{
+                .target = try self.allocExpr(cow_constructor),
+                .field_name = "from_owned",
+            } }),
+            .args = args,
+        } })).*;
+    }
+
+    /// The runtime cow TYPE a constructor hangs off, as the receiver a member
+    /// access is written on.
+    ///
+    /// `CowSlice` is generic, so its type is a call that instantiates it.
+    /// `CowStr` is a concrete union, and `CowStr()` would be calling one — the
+    /// declaration is named directly instead, which reaches the same members
+    /// without spelling a call that does not exist.
+    fn runtimeCowType(
+        self: *Lowerer,
+        is_str: bool,
+        generic_args: []const ast.Type,
+    ) !ast.Expr {
+        if (is_str) return (try self.allocExpr(.{ .ident = "r2z.alloc.CowStr" })).*;
+        return (try self.allocExpr(.{ .call = .{
+            .callee = try self.allocExpr(.{ .ident = "r2z.alloc.CowSlice" }),
+            .generic_args = generic_args,
+            .args = &.{},
+        } })).*;
     }
 
     fn lowerOwnedStringCall(self: *Lowerer, call: ir.exprs.CoreCall, input: ast.Expr) anyerror!ast.Expr {
@@ -10166,39 +15318,65 @@ const Lowerer = struct {
         if (call.function == .string_from_utf8_lossy) {
             const args = try self.alloc.alloc(ast.Expr, 2);
             args[0] = .{ .ident = "allocator" };
-            args[1] = (try self.lowerAsRef(call.args[0], try self.allocExpr(input))).*;
+            args[1] = try self.lowerBorrowedSequence(call.args[0], try self.allocExpr(input));
             self.current_callable_is_allocating = true;
             return .{ .unary_op = .{ .op = .try_op, .operand = try self.allocExpr(.{ .call = .{
                 .callee = try self.allocExpr(.{ .ident = "r2z.alloc.String.from_utf8_lossy" }),
                 .args = args,
             } }) } };
         }
-        var reserved: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer reserved.deinit(self.alloc);
-        for (self.ir.graph.symbol_table.entities.items) |entity| try reserved.append(self.alloc, entity.name);
-        const name = try self.collectorBindingName("__r2z_string_bytes", reserved.items);
-        const statements = try self.alloc.alloc(ast.Stmt, 1);
-        statements[0] = .{ .let_stmt = .{ .name = name, .is_mut = true, .ty = null, .init = input } };
+        // `String::from_utf8` CONSUMES the vector it is handed: it takes the
+        // bytes and leaves the caller's vector empty, so handing it a copy
+        // would leave the original owner of those bytes still holding them and
+        // freeing storage the returned string owns. The shared receiver helper
+        // is the same one every other consuming receiver uses — a place is
+        // handed over by address and ends the call empty, a value with no place
+        // is materialized exactly once first — so the arm's own owner of this
+        // storage ends up empty and its release has nothing to free.
         const args = try self.alloc.alloc(ast.Expr, 1);
-        args[0] = .{ .unary_op = .{ .op = .addr_of, .operand = try self.allocExpr(.{ .ident = name }) } };
-        return .{ .block = .{
-            .stmts = statements,
-            .expr = try self.allocExpr(.{ .call = .{
-                .callee = try self.allocExpr(.{ .ident = if (call.function == .string_from_utf8)
-                    "r2z.alloc.String.from_utf8"
-                else
-                    "r2z.alloc.String.from_utf8_unchecked" }),
-                .args = args,
-            } }),
+        args[0] = try self.lowerOwnedReceiverPointer(call.args[0], try self.allocExpr(input));
+        return .{ .call = .{
+            .callee = try self.allocExpr(.{ .ident = if (call.function == .string_from_utf8)
+                "r2z.alloc.String.from_utf8"
+            else
+                "r2z.alloc.String.from_utf8_unchecked" }),
+            .args = args,
         } };
     }
-    fn isOwnedStringType(ty: ir.types.Type) bool {
-        return switch (ty) {
-            .external_nominal => |external| external.args.len == 0 and
-                (externalPathEqual(external.path, &.{ "alloc", "string", "String" }) or
-                    externalPathEqual(external.path, &.{ "std", "string", "String" })),
+
+    /// The `[]const T` a runtime helper that COPIES a sequence reads.
+    ///
+    /// The helper copies bytes, so it takes a slice and never ownership. A
+    /// borrow the call site already wrote is read through unchanged; a
+    /// sequence the call site NAMED is given its address, which is the
+    /// coercion Zig makes from an array to a slice. The source is evaluated
+    /// once either way — an address taken of a temporary is good for exactly
+    /// the call it appears in, and the runtime copies out of it before it is
+    /// gone — and a place that is already addressable is never copied into a
+    /// local to be addressed, because that would duplicate storage the caller
+    /// still owns and still releases.
+    ///
+    /// Whether the source is an array is read from its type where the
+    /// frontend recorded one, and from the array literal's own shape where it
+    /// did not: an array literal has exactly one lowered form, and handing
+    /// that form to a slice parameter without its address is the one coercion
+    /// that cannot be right.
+    fn lowerSourceSequenceAsSlice(
+        self: *Lowerer,
+        source_node: ir.exprs.NodeId,
+        source: *const ast.Expr,
+    ) anyerror!ast.Expr {
+        const read = try self.lowerMemoryReceiver(source_node, source);
+        const is_array = if (try self.exprType(source_node)) |source_type| switch (source_type) {
+            .array => true,
+            .reference => |reference| reference.pointee == .array,
             else => false,
-        };
+        } else read.* == .multi_array;
+        if (!is_array) return read.*;
+        return (try self.allocExpr(.{ .unary_op = .{
+            .op = .addr_of,
+            .operand = try self.allocExpr(read.*),
+        } })).*;
     }
 
     fn lowerCoreCall(self: *Lowerer, call: ir.exprs.CoreCall) anyerror!ast.Expr {
@@ -10225,26 +15403,56 @@ const Lowerer = struct {
                 .args = args,
             } };
         }
-        if (call.function == .convert_from and call.generic_args.len == 1 and
-            isOwnedStringType(call.generic_args[0]))
-        {
+        if (call.function == .convert_from and call.generic_args.len == 1) {
             if (call.args.len != 1) return error.InvalidCoreCallArity;
-            const string_args = try self.alloc.alloc(ast.Expr, 2);
-            string_args[0] = .{ .ident = "allocator" };
-            string_args[1] = (try self.lowerMemoryReceiver(
-                call.args[0],
-                try self.allocExpr(args[0]),
-            )).*;
-            try self.markRuntimeImport();
-            self.current_callable_is_allocating = true;
-            const string_call = try self.allocExpr(.{ .call = .{
-                .callee = try self.allocExpr(.{ .ident = "r2z.alloc.String.from_str" }),
-                .args = string_args,
-            } });
-            return .{ .unary_op = .{
-                .op = .try_op,
-                .operand = string_call,
-            } };
+            // Both conversions copy the caller's sequence into FRESH owned
+            // storage, which is why neither is a conversion the runtime can
+            // declare: `String::from` copies borrowed bytes and `Vec::from`
+            // copies elements, and the runtime already has one copy-into-owned
+            // helper for each. Both allocate, so the allocator leads the
+            // argument list and the enclosing callable declares one.
+            if (isOwnedStringType(call.generic_args[0])) {
+                const string_args = try self.alloc.alloc(ast.Expr, 2);
+                string_args[0] = .{ .ident = "allocator" };
+                string_args[1] = (try self.lowerMemoryReceiver(
+                    call.args[0],
+                    try self.allocExpr(args[0]),
+                )).*;
+                try self.markRuntimeImport();
+                self.current_callable_is_allocating = true;
+                const string_call = try self.allocExpr(.{ .call = .{
+                    .callee = try self.allocExpr(.{ .ident = "r2z.alloc.String.from_str" }),
+                    .args = string_args,
+                } });
+                return .{ .unary_op = .{
+                    .op = .try_op,
+                    .operand = string_call,
+                } };
+            }
+            // `Vec<T>::from(sequence)`: the element type is the vector's own,
+            // and the source is read through any borrow the call site wrote,
+            // which is what turns `&buf[..]` into the bytes themselves.
+            if (try vecElementOfContext(call.generic_args[0])) |element| {
+                const element_args = try self.alloc.alloc(ast.Type, 1);
+                element_args[0] = try self.lowerType(element);
+                const vec_args = try self.alloc.alloc(ast.Expr, 2);
+                vec_args[0] = .{ .ident = "allocator" };
+                vec_args[1] = try self.lowerSourceSequenceAsSlice(
+                    call.args[0],
+                    try self.allocExpr(args[0]),
+                );
+                try self.markRuntimeImport();
+                self.current_callable_is_allocating = true;
+                const vec_call = try self.allocExpr(.{ .call = .{
+                    .callee = try self.allocExpr(.{ .ident = "r2z.alloc.vec_from_slice" }),
+                    .generic_args = element_args,
+                    .args = vec_args,
+                } });
+                return .{ .unary_op = .{
+                    .op = .try_op,
+                    .operand = vec_call,
+                } };
+            }
         }
         const generic_args = try self.alloc.alloc(ast.Type, call.generic_args.len);
         for (call.generic_args, 0..) |arg, index| generic_args[index] = try self.lowerType(arg);
@@ -10466,8 +15674,28 @@ const Lowerer = struct {
             );
         }
 
+        // The receiver is read twice — once to test it, once to take the
+        // payload — so a receiver that is a CALL is evaluated once here.
+        // `self.inner.next()` advanced twice otherwise, and the iterator
+        // consumed two bytes per element.
+        // `Iterator::any` steps the receiver's OWN cursor, so it decides for
+        // itself whether that cursor already has a home: this binding is for
+        // the arms that read a receiver twice without moving it.
+        var subject: *const ast.Expr = value;
+        if (method != .iterator_any and switch (value.*) {
+            .ident => false,
+            else => true,
+        }) {
+            const subject_name = try self.iteratorTemporaryName("__r2z_option_subject");
+            try prologue.append(self.alloc, .{ .let_stmt = .{
+                .name = subject_name,
+                .init = value.*,
+            } });
+            subject = try self.allocExpr(.{ .ident = subject_name });
+        }
+
         const body = try self.lowerIteratorClosureBody(closure);
-        const param_name = try self.patternName(closure.params[0]);
+        const param_name = try self.closurePayloadName(closure.params[0]);
         const payload_name = try self.iteratorTemporaryName(try std.fmt.allocPrint(
             self.alloc,
             "__r2z_in_{s}",
@@ -10475,22 +15703,35 @@ const Lowerer = struct {
         ));
 
         const expanded: ast.Expr = switch (method) {
+            // Zig cannot `switch` an optional, so the old `null => null,
+            // else => |p|` expansion emitted `switch (value)` over a `?T`
+            // and never compiled. The optional `if` carries the same two
+            // cases, and `r2z.option.unwrap` is the payload read-back the
+            // `match` path already uses.
             .option_map, .option_and_then => blk: {
-                const mapped = try self.lowerInlineClosureBody(closure.params[0], payload_name, body);
-                const arms = try self.alloc.alloc(ast.MatchArm, 2);
-                const null_pattern: ast.Pattern = .{ .lit = .null_lit };
-                arms[0] = .{
-                    .patterns = &.{null_pattern},
-                    .body = .{ .lit = .null_lit },
-                };
-                arms[1] = .{
-                    .patterns = &.{.wildcard},
-                    .capture = .{ .name = payload_name },
-                    .body = mapped,
-                };
-                break :blk .{ .match_expr = .{
-                    .target = value,
-                    .arms = arms,
+                var mapped = try self.lowerInlineClosureBody(closure.params[0], payload_name, body);
+                if (mapped != .block) return error.UnsupportedExpression;
+                try self.markRuntimeImport();
+                const unwrap_args = try self.alloc.alloc(ast.Expr, 1);
+                unwrap_args[0] = (try self.allocExpr(subject.*)).*;
+                const rebind = try self.alloc.alloc(ast.Stmt, mapped.block.stmts.len + 1);
+                rebind[0] = .{ .let_stmt = .{
+                    .name = try self.alloc.dupe(u8, payload_name),
+                    .init = (try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .ident = "r2z.option.unwrap" }),
+                        .args = unwrap_args,
+                    } })).*,
+                } };
+                @memcpy(rebind[1..], mapped.block.stmts);
+                mapped.block.stmts = rebind;
+                break :blk .{ .if_expr = .{
+                    .cond = try self.allocExpr(.{ .bin_op = .{
+                        .op = .not_equal,
+                        .lhs = try self.allocExpr(subject.*),
+                        .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+                    } }),
+                    .then_body = try self.allocExpr(mapped),
+                    .else_body = try self.allocExpr(.{ .lit = .null_lit }),
                 } };
             },
             .result_map, .result_map_err => blk: {
@@ -10546,9 +15787,82 @@ const Lowerer = struct {
                     } },
                 };
                 break :blk .{ .match_expr = .{
-                    .target = value,
+                    .target = subject,
                     .arms = arms,
                 } };
+            },
+            // `Iterator::any` walks the receiver's own cursor and stops at
+            // the first element whose predicate holds. Zig has no member
+            // for it — the closure is the operation — so the walk is spelled
+            // out: `next` on the receiver as it stands, the predicate in the
+            // loop body, and an exit that leaves the cursor exactly where
+            // Rust leaves it, past the element that answered `true`.
+            .iterator_any => blk: {
+                const cursor: *const ast.Expr = if (exprIsAddressable(value.*))
+                    // A place — a binding, a field, an index, a dereference
+                    // chain — is already somewhere the walk can step, and a
+                    // copy of it would answer from a fresh full range while
+                    // leaving the caller's cursor where it was.
+                    value
+                else
+                    // Anything else is evaluated once into a local of its
+                    // own, which is the value a `for` input would have been
+                    // hoisted into anyway.
+                    local_cursor: {
+                        const cursor_name = try self.iteratorTemporaryName("__r2z_any_iter");
+                        if (self.current_owner_reserved) |reserved| {
+                            try reserved.append(self.alloc, cursor_name);
+                        }
+                        try prologue.append(self.alloc, .{ .let_stmt = .{
+                            .name = cursor_name,
+                            .init = value.*,
+                            .is_mut = true,
+                        } });
+                        break :local_cursor try self.allocExpr(.{ .ident = cursor_name });
+                    };
+                const item_name = try self.iteratorTemporaryName("__r2z_any_item");
+                const found_name = try self.iteratorTemporaryName("__r2z_any_found");
+                if (self.current_owner_reserved) |reserved| {
+                    try reserved.appendSlice(self.alloc, &.{ item_name, found_name });
+                }
+                try prologue.append(self.alloc, .{ .let_stmt = .{
+                    .name = found_name,
+                    .init = .{ .lit = .{ .bool_lit = false } },
+                    .is_mut = true,
+                } });
+
+                const hit = try self.alloc.alloc(ast.Stmt, 2);
+                hit[0] = .{ .assign = .{
+                    .target = .{ .ident = found_name },
+                    .val = .{ .lit = .{ .bool_lit = true } },
+                    .op = .assign,
+                } };
+                hit[1] = .{ .expr_stmt = try self.allocExpr(.{ .break_expr = .{} }) };
+                const predicate = try self.lowerIteratorPredicateBody(
+                    closure.params[0],
+                    body,
+                    item_name,
+                );
+                const loop_body = try self.alloc.alloc(ast.Stmt, 1);
+                loop_body[0] = .{ .expr_stmt = try self.allocExpr(.{ .if_expr = .{
+                    .cond = try self.allocExpr(predicate),
+                    .then_body = try self.allocExpr(.{ .block = .{ .stmts = hit } }),
+                } }) };
+                const captures = try self.alloc.alloc([]const u8, 1);
+                captures[0] = item_name;
+                const step = try self.allocExpr(.{ .call = .{
+                    .callee = try self.allocExpr(.{ .field_access = .{
+                        .target = try self.allocExpr(cursor.*),
+                        .field_name = "next",
+                    } }),
+                    .args = &.{},
+                } });
+                try prologue.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .while_expr = .{
+                    .cond = step,
+                    .captures = captures,
+                    .body = .{ .stmts = loop_body },
+                } }) });
+                break :blk ast.Expr{ .ident = found_name };
             },
             else => return error.UnsupportedStandardMethod,
         };
@@ -10588,6 +15902,47 @@ const Lowerer = struct {
         return .{ .block = block };
     }
 
+    /// Lower an iterator adapter's inline closure into a block the adapter
+    /// can splice into one of its own branches: the parameter's pattern bound
+    /// to `item`, then the closure body's own statements, with its tail
+    /// expression as the block's value.
+    ///
+    /// The binding follows the parameter PATTERN rather than the item's type,
+    /// because the pattern is where the source wrote what it wanted: `|&b|`
+    /// asks for the element the iterator yields dereferenced, and `|b|`
+    /// names that element as it stands. A predicate body with statements —
+    /// `|&b| { seen += 1; b == b'%' }` — keeps them, so a `FnMut` capture
+    /// the body assigns to is still assigned where the caller can see it.
+    fn lowerIteratorPredicateBody(
+        self: *Lowerer,
+        param: ir.exprs.NodeId,
+        body: ast.Expr,
+        item: []const u8,
+    ) anyerror!ast.Expr {
+        // The body arrives already lowered: the adapter lowering this serves
+        // needed it for its own arms, and lowering the same closure twice
+        // would mint a second set of names for one set of statements.
+        const nested: ?ast.Block = switch (body) {
+            .block => |value| value,
+            else => null,
+        };
+        var statements: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer statements.deinit(self.alloc);
+        try self.appendIteratorClosureBindings(param, .{ .ident = item }, &statements);
+        if (nested) |inner| try statements.appendSlice(self.alloc, inner.stmts);
+        const owned_statements = try statements.toOwnedSlice(self.alloc);
+        const block: ast.Block = .{
+            .stmts = owned_statements,
+            .expr = if (nested) |inner| inner.expr else try self.allocExpr(body),
+        };
+        for (owned_statements) |*statement| {
+            if (statement.* == .let_stmt and statement.let_stmt.is_mut) {
+                statement.let_stmt.is_mut = try astMutatesBinding(block, statement.let_stmt.name, 0);
+            }
+        }
+        return .{ .block = block };
+    }
+
     /// The `Result` payload behind a pointer-like receiver, or null when the
     /// receiver is not a `Result`.
     fn taggedResultType(
@@ -10614,6 +15969,30 @@ const Lowerer = struct {
         patterns: []ast.Pattern,
         body: ast.Expr,
         target_name: []const u8,
+    ) anyerror!ast.Expr {
+        var prelude: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer prelude.deinit(self.alloc);
+        const value = try self.lowerOptionalMatchArmInto(patterns, body, target_name, &prelude);
+        if (prelude.items.len == 0) return value;
+        return .{ .block = .{
+            .stmts = try prelude.toOwnedSlice(self.alloc),
+            .expr = try self.allocExpr(value),
+        } };
+    }
+
+    /// Rewrite an optional arm's selectors and read its payload back.
+    ///
+    /// The read-back is a statement rather than part of the arm's value,
+    /// because an ordered chain runs it ahead of the guard: the guard reads
+    /// the very binding it introduces. A single switch that has no guard keeps
+    /// the two together in a block of its own, which is what
+    /// `lowerOptionalMatchArm` builds over this one.
+    fn lowerOptionalMatchArmInto(
+        self: *Lowerer,
+        patterns: []ast.Pattern,
+        body: ast.Expr,
+        target_name: []const u8,
+        prelude: *std.ArrayListUnmanaged(ast.Stmt),
     ) anyerror!ast.Expr {
         var binding_name: ?[]const u8 = null;
         var binds_whole_value = false;
@@ -10647,6 +16026,14 @@ const Lowerer = struct {
         const initializer: ast.Expr = if (binds_whole_value)
             .{ .ident = target_name }
         else blk: {
+            // Zig has no optional destructuring, so the `Some(v)` payload is
+            // read back through the runtime. Without this the emitted file
+            // names `r2z.option.unwrap` while `imports` is empty, and the
+            // package fails to compile on `use of undeclared identifier
+            // 'r2z'`. Only the payload path emits the runtime call — a
+            // `Some(_)` arm and an irrefutable binding do not — so the mark
+            // belongs here and not at the top of the function.
+            try self.markRuntimeImport();
             const args = try self.alloc.alloc(ast.Expr, 1);
             args[0] = .{ .ident = target_name };
             break :blk .{ .call = .{
@@ -10654,18 +16041,1834 @@ const Lowerer = struct {
                 .args = args,
             } };
         };
-        const statements = try self.alloc.alloc(ast.Stmt, 1);
-        statements[0] = .{ .let_stmt = .{
+        try prelude.append(self.alloc, .{ .let_stmt = .{
             .name = name,
             .init = initializer,
             .is_mut = try astMutatesBinding(body, name, 0),
+        } });
+        return body;
+    }
+
+    /// The Zig switch subject a `match` lowers to.
+    ///
+    /// Every dispatch of the ordered guarded chain needs its own subject node.
+    /// The AST is a tree of arena pointers, so sharing one would make it a DAG
+    /// for no gain; a shallow copy is enough because nothing rewrites a
+    /// lowered expression in place.
+    fn matchSubject(
+        self: *Lowerer,
+        option_name: ?[]const u8,
+        scrutinee: *const ast.Expr,
+    ) anyerror!*const ast.Expr {
+        if (option_name) |name| return self.allocExpr(.{ .bin_op = .{
+            .op = .not_equal,
+            .lhs = try self.allocExpr(.{ .ident = name }),
+            .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+        } });
+        return self.allocExpr(scrutinee.*);
+    }
+
+    /// Whether any arm carries a guard, which is what selects the ordered chain
+    /// over the single switch.
+    fn matchHasGuard(arms: []const ir.exprs.MatchArm) bool {
+        for (arms) |arm| {
+            if (arm.guard != null) return true;
+        }
+        return false;
+    }
+
+    /// Whether any arm binds the subject by reference.
+    ///
+    /// Such an arm takes the *address* of the matched value, so a dispatch for
+    /// it has to name the scrutinee's own place. Rust only allows a reference
+    /// binding on a place as well — a `ref mut` over a temporary is rejected —
+    /// so naming the scrutinee there evaluates nothing twice.
+    fn matchCapturesByReference(self: *Lowerer, arms: []const ir.exprs.MatchArm) anyerror!bool {
+        for (arms) |arm| {
+            const capture = try self.referenceMatchCapture(arm.patterns);
+            if (capture) |value| {
+                if (value.by_ref) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether these lowered selectors match every value.
+    ///
+    /// `emit.zig` collapses such a selector list to `else`, because a wildcard
+    /// or a bare binding is a catch-all and anything beside it would be an
+    /// unreachable prong. A dispatch built on one must leave out its own `else`
+    /// prong for the same reason.
+    fn armSelectorsIrrefutable(patterns: []const ast.Pattern) bool {
+        var has_wildcard = patterns.len == 0;
+        var selector_count: usize = 0;
+        for (patterns) |pattern| {
+            switch (pattern) {
+                .wildcard => has_wildcard = true,
+                .binding => {},
+                else => selector_count += 1,
+            }
+        }
+        return has_wildcard or selector_count == 0;
+    }
+
+    /// Whether an arm's lowered value can carry this arm's result out of the
+    /// ordered chain.
+    ///
+    /// A body that leaves the function or the loop is not a value, and Zig
+    /// rejects a `break` with no operand beside one that has a value. A block
+    /// counts by what its tail produces, exactly as `emit.zig` reads it.
+    fn matchYieldCarriesValue(value: ast.Expr) bool {
+        return switch (value) {
+            .return_expr, .break_expr, .continue_expr, .unreachable_, .panic_ => false,
+            .block => |block| if (block.expr) |tail|
+                matchYieldCarriesValue(tail.*)
+            else
+                false,
+            else => true,
+        };
+    }
+
+    /// Whether `emit.zig` would destructure this struct pattern into a labeled
+    /// block of its own: more than a single tuple-element binding, with at
+    /// least one field bound by a pattern binding.
+    fn structPatternNeedsFieldBindings(struct_pattern: ast.StructPattern) bool {
+        if (struct_pattern.fields.len == 1 and
+            std.mem.eql(u8, struct_pattern.fields[0].name, "0") and
+            struct_pattern.fields[0].pat == .binding)
+        {
+            return false;
+        }
+        for (struct_pattern.fields) |field| {
+            if (field.pat == .binding) return true;
+        }
+        return false;
+    }
+
+    /// Whether this struct pattern names a variant inside its payload's own
+    /// pattern: `Err(IoError(e))` is two tests, not one.
+    fn structPatternHasNestedPayload(struct_pattern: ast.StructPattern) bool {
+        for (struct_pattern.fields) |field| {
+            if (field.pat == .struct_pat) return true;
+        }
+        return false;
+    }
+
+    /// Read a struct pattern's fields into `prelude` and return the selectors
+    /// to dispatch on.
+    ///
+    /// The emitter's destructure block breaks out with the arm's own value, so
+    /// it cannot also hold the `break` that hands that value to the ordered
+    /// chain. An arm that would get one therefore names its payload in the
+    /// prong and reads the fields here, ahead of the guard and the body. Every
+    /// other arm keeps its lowered selectors, and with them the shape the
+    /// emitter already produces.
+    ///
+    /// A field that is itself a payload pattern cannot be read here: the tag it
+    /// names has not been tested yet, and reading a union field that is not
+    /// active is what Zig refuses. It is reported as a nested dispatch instead,
+    /// which the chain builds once the labels are known.
+    fn bindMatchPatternFields(
+        self: *Lowerer,
+        lowered_patterns: []ast.Pattern,
+        prelude: *std.ArrayListUnmanaged(ast.Stmt),
+        nested: *?*NestedPayloadDispatch,
+    ) anyerror![]ast.Pattern {
+        var rewritten: std.ArrayListUnmanaged(ast.Pattern) = .empty;
+        defer rewritten.deinit(self.alloc);
+        var changed = false;
+        for (lowered_patterns) |pattern| {
+            const struct_pattern = switch (pattern) {
+                .struct_pat => |value| value,
+                else => {
+                    try rewritten.append(self.alloc, pattern);
+                    continue;
+                },
+            };
+            if (!structPatternNeedsFieldBindings(struct_pattern) and
+                !structPatternHasNestedPayload(struct_pattern))
+            {
+                try rewritten.append(self.alloc, pattern);
+                continue;
+            }
+            changed = true;
+            const payload_name = try self.iteratorTemporaryName("__r2z_match_payload");
+            const selector: ast.Pattern = if (struct_pattern.name) |name|
+                .{ .enum_literal = name }
+            else
+                .wildcard;
+            try rewritten.append(self.alloc, selector);
+            try rewritten.append(self.alloc, .{ .binding = payload_name });
+            for (struct_pattern.fields) |field| {
+                switch (field.pat) {
+                    .binding => |binding| {
+                        try prelude.append(self.alloc, .{ .let_stmt = .{
+                            .name = binding,
+                            .init = .{ .field_access = .{
+                                .target = try self.allocExpr(.{ .ident = payload_name }),
+                                .field_name = field.name,
+                            } },
+                            .is_mut = false,
+                        } });
+                    },
+                    .struct_pat => |inner_pattern| {
+                        if (nested.* != null) return error.UnsupportedPattern;
+                        const child = try self.alloc.create(NestedPayloadDispatch);
+                        child.* = try self.buildNestedPayloadDispatch(
+                            inner_pattern,
+                            try self.matchPayloadField(struct_pattern, payload_name, field.name),
+                            0,
+                        );
+                        nested.* = child;
+                    },
+                    .wildcard => {},
+                    else => return error.UnsupportedPattern,
+                }
+            }
+        }
+        if (!changed) return lowered_patterns;
+        return rewritten.toOwnedSlice(self.alloc);
+    }
+
+    /// Read a variant's tuple-one payload directly; other payloads are records.
+    fn matchPayloadField(
+        self: *Lowerer,
+        pattern: ast.StructPattern,
+        payload_name: []const u8,
+        field_name: []const u8,
+    ) !*const ast.Expr {
+        const payload = try self.allocExpr(.{ .ident = payload_name });
+        if (pattern.fields.len == 1 and std.mem.eql(u8, field_name, "0")) return payload;
+        return self.allocExpr(.{ .field_access = .{
+            .target = payload,
+            .field_name = field_name,
+        } });
+    }
+
+    fn buildNestedPayloadDispatch(
+        self: *Lowerer,
+        pattern: ast.StructPattern,
+        subject: *const ast.Expr,
+        depth: usize,
+    ) anyerror!NestedPayloadDispatch {
+        if (depth >= nested_pattern_depth_limit) return error.UnsupportedPattern;
+        const payload_name = try self.iteratorTemporaryName("__r2z_match_payload");
+        const selectors = try self.alloc.alloc(ast.Pattern, 2);
+        selectors[0] = if (pattern.name) |name|
+            .{ .enum_literal = name }
+        else
+            .wildcard;
+        selectors[1] = .{ .binding = payload_name };
+        var bindings: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer bindings.deinit(self.alloc);
+        var inner: ?*NestedPayloadDispatch = null;
+        for (pattern.fields) |field| {
+            switch (field.pat) {
+                .binding => |binding| {
+                    try bindings.append(self.alloc, .{ .let_stmt = .{
+                        .name = binding,
+                        .init = (try self.matchPayloadField(pattern, payload_name, field.name)).*,
+                    } });
+                },
+                .struct_pat => |inner_pattern| {
+                    if (inner != null) return error.UnsupportedPattern;
+                    const child = try self.alloc.create(NestedPayloadDispatch);
+                    child.* = try self.buildNestedPayloadDispatch(
+                        inner_pattern,
+                        try self.matchPayloadField(pattern, payload_name, field.name),
+                        depth + 1,
+                    );
+                    inner = child;
+                },
+                .wildcard => {},
+                else => return error.UnsupportedPattern,
+            }
+        }
+        return .{
+            .subject = subject,
+            .selectors = selectors,
+            .bindings = try bindings.toOwnedSlice(self.alloc),
+            .inner = inner,
+        };
+    }
+
+    /// Whether this pattern names a variant inside a payload's own pattern.
+    ///
+    /// `Err(IoError(e))` is two tests, and Zig's switch prong carries only
+    /// one: it writes the tag of a struct pattern and drops its fields. So
+    /// the question is asked of the IR pattern, which is what the lowering
+    /// turns into the `ast.Pattern` tree that would lose the inner tag.
+    fn patternHasNestedPayload(self: *Lowerer, pat_id: ir.exprs.NodeId, depth: usize) anyerror!bool {
+        if (depth >= nested_pattern_depth_limit) return false;
+        if (pat_id >= self.ir.bodies.pats.len) return false;
+        const fields: []const ir.exprs.FieldPat = switch (self.ir.bodies.pats[pat_id].kind) {
+            .struct_pat => |structure| structure.fields,
+            .external_variant => |variant| variant.fields,
+            else => return false,
+        };
+        for (fields) |field| {
+            const inner = field.pat orelse continue;
+            if (self.ir.bodies.pats[inner].kind == .struct_pat) return true;
+            if (try self.patternHasNestedPayload(inner, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    /// Whether one of these arms needs the ordered chain because its pattern
+    /// nests a refutable payload pattern.
+    ///
+    /// A whole-match switch has no place for the second test, so the arm goes
+    /// to the chain, which can hold it and still fall through. An arm whose
+    /// payload is captured BY REFERENCE rewrites its own selector before the
+    /// chain ever sees it, so it is left exactly as it is rather than routed
+    /// somewhere the nested pattern would be dropped.
+    fn matchNeedsNestedPayloadChain(
+        self: *Lowerer,
+        arms: []const ir.exprs.MatchArm,
+    ) anyerror!bool {
+        for (arms) |arm| {
+            if (try self.armHasBoundAlternatives(arm)) return true;
+            var nested = false;
+            for (arm.patterns) |pat_id| {
+                if (try self.patternHasNestedPayload(pat_id, 0)) nested = true;
+            }
+            if (!nested) continue;
+            if (try self.referenceMatchCapture(arm.patterns) != null) return false;
+            return true;
+        }
+        return false;
+    }
+
+    /// Lower an arm's body and its guard under one shadow scope.
+    ///
+    /// A guard reads the bindings its own pattern introduces, so it is lowered
+    /// with those names visible and lands in the same prong, beside them.
+    fn lowerArmValueAndGuard(
+        self: *Lowerer,
+        arm: ir.exprs.MatchArm,
+        shadow_names: []const []const u8,
+        alias: ?OwnedCaptureAlias,
+    ) anyerror!LoweredMatchArm {
+        const previous_shadow_scope = self.current_shadow_scope;
+        var arm_shadow_scope: ShadowScope = .{
+            .names = shadow_names,
+            .parent = previous_shadow_scope,
+        };
+        self.current_shadow_scope = &arm_shadow_scope;
+        defer self.current_shadow_scope = previous_shadow_scope;
+        // Body lowering restores the alias override before the guard reads
+        // its original binding, which exists before the selected body runs.
+        return .{
+            .value = try self.lowerMatchArmBodyOverAlias(arm.body, alias),
+            .guard = if (arm.guard) |guard_id|
+                try self.allocExpr(try self.lowerExpr(guard_id))
+            else
+                null,
+        };
+    }
+
+    /// Lower `arms` as one self-contained Zig switch.
+    ///
+    /// This is the whole-match shape and it needs no arm to carry a guard,
+    /// because a Zig prong has no guard form. A match that does carry one goes
+    /// to `lowerGuardedMatch` instead.
+    fn lowerMatchArms(
+        self: *Lowerer,
+        option_name: ?[]const u8,
+        arms: []const ir.exprs.MatchArm,
+    ) anyerror![]ast.MatchArm {
+        const lowered = try self.alloc.alloc(ast.MatchArm, arms.len);
+        for (arms, 0..) |arm, index| {
+            const lowered_patterns = try self.lowerWholeMatchArmPatterns(arm, option_name);
+            const capture = lowered_patterns.capture;
+            // The emitter writes the payload binding itself when the arm takes
+            // it by value, so the release reads the name off the pattern
+            // rather than off a capture only a by-reference arm carries.
+            const bound_name: ?[]const u8 = if (capture) |capture_ast|
+                capture_ast.name
+            else
+                try self.matchArmBindingName(arm.patterns);
+            const bound_by_ref = if (capture) |capture_ast| capture_ast.by_ref else false;
+            // The release owns the payload through a MUTABLE ALIAS, and the arm
+            // body has to read THAT alias rather than the capture: the emitter
+            // writes a by-value capture as `|name|`, which Zig makes `const`, so
+            // the storage a consuming helper needs in order to transfer it
+            // cannot be reached through the capture at all. Redirecting the
+            // binding to the alias while the body is lowered is what makes
+            // `Ok(s) => Ok(s.into())` hand over a pointer it can write, and the
+            // release below then finds an alias the transfer already emptied,
+            // so it frees nothing a second time.
+            const alias = try self.ownedCaptureAlias(arm.patterns, bound_name, bound_by_ref);
+            const lowered_body = try self.lowerWholeMatchArmBody(
+                arm,
+                lowered_patterns.patterns,
+                option_name,
+                alias,
+            );
+            lowered[index] = .{
+                .patterns = lowered_patterns.patterns,
+                .body = if (alias) |owned| try self.appendOwnedCaptureRelease(owned, lowered_body) else lowered_body,
+                .capture = capture,
+            };
+        }
+        return lowered;
+    }
+
+    /// The mutable alias an owned match payload is released through, or null
+    /// when the arm's payload is not one this lowering releases.
+    ///
+    /// Every guard here is the release's own: an arm that binds nothing, one
+    /// that binds BY REFERENCE (the caller's value would be released), and one
+    /// whose payload is not a runtime container the allocator can release are
+    /// all arms this must leave exactly as they were.
+    fn ownedCaptureAlias(
+        self: *Lowerer,
+        patterns: []const ir.exprs.NodeId,
+        bound_name: ?[]const u8,
+        bound_by_ref: bool,
+    ) anyerror!?OwnedCaptureAlias {
+        if (!self.current_callable_is_allocating) return null;
+        if (bound_by_ref) return null;
+        const capture_name = bound_name orelse return null;
+        const payload = self.matchCapturePayload(patterns) orelse return null;
+        if (payload >= self.ir.bodies.pats.len) return null;
+        const payload_kind = self.ir.bodies.pats[payload].kind;
+        if (payload_kind != .binding) return null;
+        const type_id = self.ir.bodies.pats[payload].ty orelse return null;
+        const payload_type = try self.typeById(type_id);
+        if (!ownedRuntimeContainerType(payload_type)) return null;
+        // The override is keyed by the SOURCE name, which is what
+        // `activeClosureCaptureOverride` looks up; the capture name the emitter
+        // writes is what the alias is initialized from.
+        const source_name = payload_kind.binding.name;
+        if (source_name.len == 0) return null;
+        // The name this arm's alias already carries is kept: it is still the
+        // name that releases the payload, and a stable one keeps the emitted
+        // goldens unchanged for every arm that already reached this path.
+        const alias = try self.iteratorTemporaryName("__r2z_release");
+        return .{
+            .source_name = source_name,
+            .capture_name = capture_name,
+            .alias_name = alias,
+            .payload_type = payload_type,
+        };
+    }
+
+    /// Lower an arm's value with the payload binding redirected to its mutable
+    /// alias, so every read and every in-place write the body makes reaches the
+    /// owner the release is responsible for.
+    fn lowerMatchArmBodyOverAlias(
+        self: *Lowerer,
+        body: ir.exprs.NodeId,
+        alias: ?OwnedCaptureAlias,
+    ) anyerror!ast.Expr {
+        const owned = alias orelse return self.lowerExpr(body);
+        // An enclosing match can bind the same source name, so the entry this
+        // one shadows is restored rather than deleted: removing it would take
+        // the outer arm's binding with it.
+        const previous = self.active_closure_capture_overrides.get(owned.source_name);
+        try self.active_closure_capture_overrides.put(
+            self.alloc,
+            owned.source_name,
+            owned.alias_name,
+        );
+        const previous_move = self.active_owned_capture_move;
+        // Collected before the restore is armed: a scan that fails must not
+        // release the move set an enclosing arm is still using.
+        var installed = try self.collectOwnedCaptureMoves(owned, body);
+        defer {
+            if (previous) |shadowed| {
+                // Restoring state on the way out; there is nothing useful to
+                // do with an allocator failure here.
+                self.active_closure_capture_overrides.put(self.alloc, owned.source_name, shadowed) catch {};
+            } else {
+                _ = self.active_closure_capture_overrides.remove(owned.source_name);
+            }
+            installed.sites.deinit(self.alloc);
+            self.active_owned_capture_move = previous_move;
+        }
+        self.active_owned_capture_move = installed;
+        return self.lowerExpr(body);
+    }
+
+    /// The pattern an arm's capture binds, or null when the arm binds nothing
+    /// a single payload node names.
+    fn matchCapturePayload(self: *const Lowerer, patterns: []const ir.exprs.NodeId) ?ir.exprs.NodeId {
+        if (patterns.len != 1) return null;
+        const pat_id = patterns[0];
+        if (pat_id >= self.ir.bodies.pats.len) return null;
+        return switch (self.ir.bodies.pats[pat_id].kind) {
+            .external_variant => |variant| blk: {
+                if (variant.fields.len != 1) break :blk null;
+                break :blk variant.fields[0].pat orelse null;
+            },
+            // The tagged `Result` lowers to a struct with one field per arm,
+            // and the arm that matched binds exactly one of them.
+            .struct_pat => |struct_pat| blk: {
+                for (struct_pat.fields) |field| {
+                    const inner = field.pat orelse continue;
+                    if (inner >= self.ir.bodies.pats.len) continue;
+                    if (self.ir.bodies.pats[inner].kind != .binding) continue;
+                    break :blk inner;
+                }
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    /// The emitted name a whole-match arm binds from its single payload
+    /// pattern, or null when the arm binds nothing.
+    fn matchArmBindingName(self: *Lowerer, patterns: []const ir.exprs.NodeId) anyerror!?[]const u8 {
+        const payload = self.matchCapturePayload(patterns) orelse return null;
+        if (payload >= self.ir.bodies.pats.len) return null;
+        return switch (self.ir.bodies.pats[payload].kind) {
+            .binding => try self.patternName(payload),
+            else => null,
+        };
+    }
+
+    /// Release an owned payload a match arm binds when that arm's scope ends.
+    ///
+    /// Rust drops what a pattern binds when the arm ends, and a `Result` or
+    /// `Option` payload of an owned container carries heap storage. Without
+    /// the release the value the arm was handed leaks, and the test allocator
+    /// reports the leak instead of the behaviour the test was written for.
+    ///
+    /// The release sits in a `defer` ahead of the arm's own result, so the
+    /// result is computed first and the payload drops after it — the source's
+    /// order, and the only one that leaves a returned value intact.
+    fn appendOwnedCaptureRelease(
+        self: *Lowerer,
+        owned: OwnedCaptureAlias,
+        body: ast.Expr,
+    ) anyerror!ast.Expr {
+        // The alias carries the same storage and its own mutable pointer:
+        // `deinit` takes one, the capture the emitter wrote is immutable in the
+        // source, and the arm body was lowered to read the alias rather than
+        // the capture.
+        //
+        // The release is emitted UNCONDITIONALLY, because the answer to "did
+        // this arm move its payload?" is a property of the PATH TAKEN, not of
+        // the source: deciding it statically would either leak the branch that
+        // did not move or free the branch that did. What makes the
+        // unconditional form safe is that every move empties this alias IN
+        // PLACE — `collectOwnedCaptureMoves` decides which reads do — so the
+        // branch that moved finds nothing here and frees nothing, while every
+        // branch that stayed still frees what the arm held.
+        const release = try self.ownedCaptureReleaseStmts(owned);
+        // The alias has to be declared where the binding it copies is IN
+        // SCOPE, and AFTER it: the alias initializer is a read of that
+        // binding, so a `const __r2z_release = value` placed ahead of
+        // `const value = ...` names an identifier that is not declared yet.
+        // An arm whose payload comes from an optional declares that binding in
+        // a prelude block of its own — `const value =
+        // r2z.option.unwrap(subject)` — so wrapping the arm from outside named
+        // an identifier that does not exist at all, and the emitted file failed
+        // to compile with `undefined identifier`. Putting the alias and its
+        // release IMMEDIATELY AFTER the binding gives both the scope they need
+        // and the declaration they read; the arm's own value still reads the
+        // same alias, and the `defer` still runs after that value has been
+        // computed, because a `defer` fires at scope exit rather than at the
+        // statement it sits beside.
+        const block = switch (body) {
+            .block => |value| value,
+            else => null,
+        };
+        const binding_at = if (block) |inner|
+            blockBindingIndex(inner, owned.capture_name)
+        else
+            null;
+        if (block == null or binding_at == null) {
+            return .{ .block = .{
+                .stmts = release,
+                .expr = try self.allocExpr(body),
+            } };
+        }
+        const inner = block.?;
+        // `binding_at` is the index of the payload binding itself, so the
+        // insertion point is the statement AFTER it: index `at` would put the
+        // alias ahead of the declaration its initializer reads.
+        const at = binding_at.? + 1;
+        const stmts = try self.alloc.alloc(ast.Stmt, inner.stmts.len + release.len);
+        @memcpy(stmts[0..at], inner.stmts[0..at]);
+        @memcpy(stmts[at .. at + release.len], release);
+        @memcpy(stmts[at + release.len ..], inner.stmts[at..]);
+        return .{ .block = .{
+            .label = inner.label,
+            .stmts = stmts,
+            .expr = inner.expr,
         } };
-        return .{ .block = .{ .stmts = statements, .expr = try self.allocExpr(body) } };
+    }
+
+    /// The alias an arm reads its owned payload through, and the `defer` that
+    /// releases it when the arm ends.
+    fn ownedCaptureReleaseStmts(
+        self: *Lowerer,
+        owned: OwnedCaptureAlias,
+    ) anyerror![]const ast.Stmt {
+        // The alias carries the same storage and its own mutable pointer:
+        // `deinit` takes one, the capture the emitter wrote is immutable in the
+        // source, and the arm body was lowered to read the alias rather than
+        // the capture.
+        const release_args = try self.alloc.alloc(ast.Expr, 1);
+        release_args[0] = .{ .ident = "allocator" };
+        const release = try self.allocExpr(.{ .call = .{
+            .callee = try self.allocExpr(.{ .field_access = .{
+                .target = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, owned.alias_name) }),
+                .field_name = "deinit",
+            } }),
+            .args = release_args,
+        } });
+        const stmts = try self.alloc.alloc(ast.Stmt, 2);
+        stmts[0] = .{ .let_stmt = .{
+            .name = try self.alloc.dupe(u8, owned.alias_name),
+            .init = .{ .ident = try self.alloc.dupe(u8, owned.capture_name) },
+            .is_mut = true,
+        } };
+        stmts[1] = .{ .defer_stmt = .{ .expr = release.* } };
+        return stmts;
+    }
+
+    /// The statement of `block` that binds `name`, or null when it binds none.
+    fn blockBindingIndex(block: ast.Block, name: []const u8) ?usize {
+        for (block.stmts, 0..) |statement, index| {
+            switch (statement) {
+                .let_stmt => |binding| {
+                    if (std.mem.eql(u8, binding.name, name)) return index;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Handing an owned payload out of a match arm's alias
+    // -------------------------------------------------------------------------
+
+    /// Bookkeeping for one arm body's payload-transfer scan.
+    const OwnedCaptureScan = struct {
+        /// Expression ids that read the payload in a hand-off position.
+        sites: std.AutoHashMapUnmanaged(ir.exprs.NodeId, void),
+        /// `(node << 1) | transfer` entries already scanned, so a subexpression
+        /// reachable from two positions is visited once per position and a
+        /// self-referential node table cannot spin here.
+        visited: std.AutoHashMapUnmanaged(usize, void),
+    };
+
+    /// Every read of `alias` in `body` that hands the payload ON rather than
+    /// borrowing it.
+    fn collectOwnedCaptureMoves(
+        self: *Lowerer,
+        alias: OwnedCaptureAlias,
+        body: ir.exprs.NodeId,
+    ) anyerror!OwnedCaptureMove {
+        var scan: OwnedCaptureScan = .{ .sites = .empty, .visited = .empty };
+        errdefer {
+            scan.sites.deinit(self.alloc);
+            scan.visited.deinit(self.alloc);
+        }
+        try self.scanOwnedCaptureExpr(alias, body, true, &scan);
+        scan.visited.deinit(self.alloc);
+        return .{ .alias = alias, .sites = scan.sites };
+    }
+
+    /// Record `expr_id` when its value IS the payload, and keep looking
+    /// through the positions that are.
+    ///
+    /// `transfer` says the value of this expression leaves its own place, so a
+    /// bare read of the payload here moves it. Rust decides that by hand: out
+    /// through a `return` or a `break`, into a call parameter it declares by
+    /// value, into a new binding or an assignment, into an aggregate, or out as
+    /// the value of a block, a branch or an arm. Everything else — a method
+    /// receiver, a formatter argument, a slice descriptor, a length — reads
+    /// what the arm's release still owns, and keeps reading the alias.
+    fn scanOwnedCaptureExpr(
+        self: *Lowerer,
+        alias: OwnedCaptureAlias,
+        expr_id: ir.exprs.NodeId,
+        transfer: bool,
+        scan: *OwnedCaptureScan,
+    ) anyerror!void {
+        if (expr_id >= self.ir.bodies.exprs.len) return;
+        const key = (@as(usize, expr_id) << 1) | @intFromBool(transfer);
+        if (scan.visited.contains(key)) return;
+        try scan.visited.put(self.alloc, key, {});
+        switch (self.ir.bodies.exprs[expr_id].kind) {
+            .path => |path| {
+                if (!transfer) return;
+                // A turbofish turns the read into a call on the alias, which is
+                // not a payload at all; leave it exactly as it was.
+                if (path.generic_args.len != 0) return;
+                const entity = self.ir.graph.symbol_table.get(path.def) orelse return;
+                if (!std.mem.eql(u8, entity.name, alias.source_name)) return;
+                try scan.sites.put(self.alloc, expr_id, {});
+            },
+            // A block's tail is the block's value; its statements stand alone.
+            .block => |block| try self.scanOwnedCaptureBlock(alias, block, transfer, scan),
+            // A branch's value is the `if`'s value whatever the `if` is used
+            // for, and the condition owns nothing.
+            .if_else => |branch| {
+                try self.scanOwnedCaptureExpr(alias, branch.cond, false, scan);
+                try self.scanOwnedCaptureBranch(alias, branch.then_, branch.@"else", scan);
+            },
+            .if_let => |subject| {
+                try self.scanOwnedCaptureExpr(alias, subject.scrutinee, false, scan);
+                try self.scanOwnedCaptureBranch(alias, subject.then_, subject.@"else", scan);
+            },
+            .match => |subject| {
+                try self.scanOwnedCaptureExpr(alias, subject.scrutinee, false, scan);
+                for (subject.arms) |nested| {
+                    if (nested.guard) |guard| {
+                        try self.scanOwnedCaptureExpr(alias, guard, false, scan);
+                    }
+                    try self.scanOwnedCaptureExpr(alias, nested.body, true, scan);
+                }
+            },
+            .return_ => |returned| {
+                if (returned.value) |value| {
+                    try self.scanOwnedCaptureExpr(alias, value, true, scan);
+                }
+            },
+            .break_ => |brk| {
+                if (brk.value) |value| try self.scanOwnedCaptureExpr(alias, value, true, scan);
+            },
+            // The right-hand side moves into the place the left-hand names.
+            .assign => |assignment| {
+                try self.scanOwnedCaptureExpr(alias, assignment.target, false, scan);
+                try self.scanOwnedCaptureExpr(alias, assignment.value, true, scan);
+            },
+            // `?` yields what it was handed, so the hand-off follows it in.
+            .try_ => |inner| try self.scanOwnedCaptureExpr(alias, inner.inner, transfer, scan),
+            .cast => |cast| try self.scanOwnedCaptureExpr(alias, cast.operand, transfer, scan),
+            .call => |call| {
+                for (call.args, 0..) |arg, index| {
+                    const moves = try self.callArgumentTakesPayloadByValue(call, index, alias);
+                    try self.scanOwnedCaptureExpr(alias, arg, moves, scan);
+                }
+            },
+            // A receiver is a hand-off only when the source declared `self` BY
+            // VALUE: `&self` and `&mut self` are borrows there, and the runtime
+            // reaches them through the address of the alias, in place. Each
+            // argument is judged by the method's own declared parameter, the
+            // same one the call's argument loop types it against.
+            .method_call => |method| {
+                try self.scanOwnedCaptureExpr(
+                    alias,
+                    method.receiver,
+                    try self.methodReceiverTakesPayload(method, alias),
+                    scan,
+                );
+                for (method.args, 0..) |arg, index| {
+                    const param_type = self.methodCallArgumentType(method.method, index);
+                    const moves = param_type != null and typeEquals(param_type.?, alias.payload_type);
+                    try self.scanOwnedCaptureExpr(alias, arg, moves, scan);
+                }
+            },
+            // An aggregate is filled by moving into each of its slots.
+            .struct_lit => |literal| {
+                if (literal.base) |base| try self.scanOwnedCaptureExpr(alias, base, false, scan);
+                for (literal.fields) |field| {
+                    try self.scanOwnedCaptureExpr(alias, field.value, true, scan);
+                }
+            },
+            .external_variant => |variant| try self.scanOwnedCaptureFields(alias, variant, scan),
+            .enum_variant => |variant| try self.scanOwnedCaptureFields(alias, variant, scan),
+            .array => |array| {
+                for (array.elements) |element| {
+                    try self.scanOwnedCaptureExpr(alias, element, true, scan);
+                }
+            },
+            .vec_lit => |vec| {
+                for (vec.elements) |element| {
+                    try self.scanOwnedCaptureExpr(alias, element, true, scan);
+                }
+            },
+            // A loop body IS walked, because everything inside it can hand the
+            // payload on: a `return`, a `break value`, a by-value call, a
+            // binding, a by-value receiver. Only its TAIL is not a hand-off —
+            // Rust requires a loop body to be `()`, so the value there is
+            // dropped rather than moved somewhere that outlives the alias.
+            .loop_ => |loop_expr| try self.scanOwnedCaptureBlock(alias, loop_expr.body, false, scan),
+            .while_ => |loop_expr| {
+                try self.scanOwnedCaptureExpr(alias, loop_expr.cond, false, scan);
+                try self.scanOwnedCaptureBlock(alias, loop_expr.body, false, scan);
+            },
+            .for_ => |loop_expr| {
+                try self.scanOwnedCaptureExpr(alias, loop_expr.iterable, false, scan);
+                switch (loop_expr.iter_kind) {
+                    .range, .slice, .enumerate => {},
+                    .multi => |inputs| {
+                        for (inputs) |input| {
+                            try self.scanOwnedCaptureExpr(alias, input, false, scan);
+                        }
+                    },
+                    .adapter => |chain| {
+                        try self.scanOwnedCaptureExpr(alias, chain.source, false, scan);
+                    },
+                }
+                try self.scanOwnedCaptureBlock(alias, loop_expr.body, false, scan);
+            },
+            // Below here every position names a place or reads an operand Rust
+            // only borrows. The scan still descends, because a nested call
+            // keeps the signature that call declares.
+            .field => |field| try self.scanOwnedCaptureExpr(alias, field.base, false, scan),
+            .index => |index| {
+                try self.scanOwnedCaptureExpr(alias, index.base, false, scan);
+                try self.scanOwnedCaptureExpr(alias, index.index, false, scan);
+            },
+            .binary => |binary| {
+                try self.scanOwnedCaptureExpr(alias, binary.lhs, false, scan);
+                try self.scanOwnedCaptureExpr(alias, binary.rhs, false, scan);
+            },
+            .unary => |unary| try self.scanOwnedCaptureExpr(alias, unary.operand, false, scan),
+            .range => |range| {
+                try self.scanOwnedCaptureExpr(alias, range.start, false, scan);
+                if (range.end) |end| try self.scanOwnedCaptureExpr(alias, end, false, scan);
+            },
+            // The formatter writes through a borrow; it is handed the argument,
+            // not the ownership.
+            .format_write => |format| {
+                try self.scanOwnedCaptureExpr(alias, format.writer, false, scan);
+                for (format.args) |arg| try self.scanOwnedCaptureExpr(alias, arg, false, scan);
+            },
+            .iterator_chain => |chain| {
+                try self.scanOwnedCaptureExpr(alias, chain.source, false, scan);
+            },
+            .literal, .unit, .core_function, .core_call, .closure, .panic_, .unsupported, .continue_ => {},
+        }
+    }
+
+    fn scanOwnedCaptureBlock(
+        self: *Lowerer,
+        alias: OwnedCaptureAlias,
+        block: ir.exprs.BlockExpr,
+        transfer: bool,
+        scan: *OwnedCaptureScan,
+    ) anyerror!void {
+        for (block.statements) |statement| {
+            try self.scanOwnedCaptureStatement(alias, statement, scan);
+        }
+        if (block.tail) |tail| {
+            try self.scanOwnedCaptureExpr(alias, tail, transfer, scan);
+        }
+    }
+
+    fn scanOwnedCaptureBranch(
+        self: *Lowerer,
+        alias: OwnedCaptureAlias,
+        then_block: ir.exprs.BlockExpr,
+        else_branch: ir.exprs.ElseBranch,
+        scan: *OwnedCaptureScan,
+    ) anyerror!void {
+        try self.scanOwnedCaptureBlock(alias, then_block, true, scan);
+        switch (else_branch) {
+            .none => {},
+            .block => |block| try self.scanOwnedCaptureBlock(alias, block, true, scan),
+            .chain => |chain| try self.scanOwnedCaptureExpr(alias, chain, true, scan),
+        }
+    }
+
+    fn scanOwnedCaptureStatement(
+        self: *Lowerer,
+        alias: OwnedCaptureAlias,
+        statement: ir.exprs.NodeId,
+        scan: *OwnedCaptureScan,
+    ) anyerror!void {
+        if (statement >= self.ir.bodies.stmts.len) return;
+        switch (self.ir.bodies.stmts[statement].kind) {
+            // A new binding takes its initialiser by value.
+            .let => |binding| {
+                if (binding.init) |initializer| {
+                    try self.scanOwnedCaptureExpr(alias, initializer, true, scan);
+                }
+            },
+            .let_else => |binding| {
+                try self.scanOwnedCaptureExpr(alias, binding.init, true, scan);
+                try self.scanOwnedCaptureBlock(alias, binding.else_block, true, scan);
+            },
+            // A statement's value is dropped, which is what the release would
+            // have done to the alias anyway; only the calls inside it move.
+            .expr => |expr| try self.scanOwnedCaptureExpr(alias, expr, false, scan),
+            .item => {},
+        }
+    }
+
+    fn scanOwnedCaptureFields(
+        self: *Lowerer,
+        alias: OwnedCaptureAlias,
+        variant: anytype,
+        scan: *OwnedCaptureScan,
+    ) anyerror!void {
+        for (variant.tuple_fields) |field| {
+            try self.scanOwnedCaptureExpr(alias, field, true, scan);
+        }
+        for (variant.named_fields) |field| {
+            try self.scanOwnedCaptureExpr(alias, field.value, true, scan);
+        }
+    }
+
+    /// Whether the SOURCE callee takes its `index`th argument as this payload,
+    /// BY VALUE.
+    ///
+    /// The verdict comes from the source's own signature, never from the shape
+    /// of the lowered call. A runtime entry point that receives its operand by
+    /// address — `String::from_utf8`, `CowStr::from_owned` — already empties the
+    /// pointer it was handed, and moving its argument here as well would hand
+    /// the same payload to two owners. Those are not reachable anyway:
+    /// `String::from_utf8` is a `core_call`, and a foreign callee has no source
+    /// parameter to read.
+    fn callArgumentTakesPayloadByValue(
+        self: *Lowerer,
+        call: ir.exprs.Call,
+        index: usize,
+        alias: OwnedCaptureAlias,
+    ) anyerror!bool {
+        if (self.directFreeCallArgumentType(call.call_kind, index)) |param_type| {
+            return typeEquals(param_type, alias.payload_type);
+        }
+        const def = switch (call.call_kind) {
+            .free => return false,
+            .associated, .constructor => |source_def| source_def,
+        };
+        const method = self.structMethodForDef(def) orelse return false;
+        const receiver = method.receiver;
+        if (receiver == null) {
+            // An associated function declares no receiver, so its parameters
+            // line up with its arguments one for one.
+            if (index >= method.params.len) return false;
+            return typeEquals(method.params[index].ty, alias.payload_type);
+        }
+        // A method reached in associated position passes its receiver as the
+        // FIRST argument, and `StructMethod.params` does not list it, so every
+        // declared parameter sits one argument later.
+        if (index == 0) {
+            if (receiver.? != .owned) return false;
+            if (index >= call.args.len) return false;
+            const receiver_type = try self.exprType(call.args[0]);
+            const known = receiver_type orelse return false;
+            return typeEquals(known, alias.payload_type);
+        }
+        const param_index = index - 1;
+        if (param_index >= method.params.len) return false;
+        return typeEquals(method.params[param_index].ty, alias.payload_type);
+    }
+
+    /// Whether a method receiver is a hand-off of this payload rather than a
+    /// borrow of it.
+    ///
+    /// The answer comes from the method's own DECLARATION, never from
+    /// `MethodCall.receiver_mode`. That mode is the invocation form the call
+    /// site was resolved with, and by-value is its default: `self.clone()`
+    /// and `e.utf8_error()` both arrive as `.value` even though Rust declares
+    /// `&self`, so reading it as proof empties an alias under a borrowed read
+    /// and leaks the bytes that read was still going to use.
+    ///
+    /// A method with no declaration here — a standard-library trait method, or
+    /// one the runtime rewrites to take its receiver by address — says nothing
+    /// about ownership at all, so it borrows. That is also the safe direction
+    /// for the conversions that already consume: `Cow::into_owned` and
+    /// `CowStr::from_owned` reach the payload through a pointer that empties
+    /// it, and marking the read as well would move the same payload twice.
+    fn methodReceiverTakesPayload(
+        self: *Lowerer,
+        method: ir.exprs.MethodCall,
+        alias: OwnedCaptureAlias,
+    ) anyerror!bool {
+        const declared = self.structMethodForDef(method.method) orelse return false;
+        if (declared.receiver == null or declared.receiver.? != .owned) return false;
+        const receiver_type = try self.exprType(method.receiver);
+        const known = receiver_type orelse return false;
+        return typeEquals(known, alias.payload_type);
+    }
+
+    /// The runtime transfer that hands an owned payload out of its alias, or
+    /// null when this read is not one.
+    ///
+    /// The alias is the only mutable handle the arm has on the payload, so a
+    /// read that hands the payload on goes through it: the runtime copies the
+    /// owner out and empties the alias where it stands, which is what leaves
+    /// the arm's release free to run unconditionally. A read that only borrows
+    /// keeps naming the alias directly, so nothing is emptied and the release
+    /// still has the payload to free.
+    fn lowerOwnedCaptureTransfer(
+        self: *Lowerer,
+        expr_id: ir.exprs.NodeId,
+        path: ir.exprs.PathExpr,
+    ) anyerror!?ast.Expr {
+        const active = self.active_owned_capture_move orelse return null;
+        if (!active.sites.contains(expr_id)) return null;
+        // The scan keys on the source name, and the lowering resolves that name
+        // through the same override this arm installed. A read that does not
+        // land on the alias is not the hand-off the scan recorded.
+        const resolved = try self.lowerResolvedEntityName(path.def);
+        defer self.alloc.free(resolved);
+        if (!std.mem.eql(u8, resolved, active.alias.alias_name)) return null;
+        try self.markRuntimeImport();
+        const generic_args = try self.alloc.alloc(ast.Type, 1);
+        generic_args[0] = try self.lowerType(active.alias.payload_type);
+        const args = try self.alloc.alloc(ast.Expr, 1);
+        args[0] = .{ .unary_op = .{
+            .op = .addr_of,
+            .operand = try self.allocExpr(.{
+                .ident = try self.alloc.dupe(u8, active.alias.alias_name),
+            }),
+        } };
+        return .{ .call = .{
+            .callee = try self.allocExpr(.{ .ident = "r2z.alloc.takeOwned" }),
+            .generic_args = generic_args,
+            .args = args,
+        } };
+    }
+
+    fn lowerWholeMatchArmPatterns(
+        self: *Lowerer,
+        arm: ir.exprs.MatchArm,
+        option_name: ?[]const u8,
+    ) anyerror!LoweredMatchSelectors {
+        if (arm.patterns.len == 0) return error.MissingMatchPattern;
+        if (arm.patterns.len > self.ir.bodies.pats.len) {
+            return error.MissingPatternNode;
+        }
+        const lowered_patterns = try self.lowerArmPatterns(arm.patterns);
+        const capture = try self.referenceMatchCapture(arm.patterns);
+        if (option_name != null and capture != null) return error.UnsupportedPattern;
+        if (capture != null) {
+            const selector = switch (lowered_patterns[0]) {
+                .struct_pat => |pattern| pattern.name orelse return error.MissingPatternName,
+                else => return error.UnsupportedPattern,
+            };
+            lowered_patterns[0] = .{ .enum_literal = selector };
+        }
+        return .{ .patterns = lowered_patterns, .capture = capture };
+    }
+
+    fn lowerWholeMatchArmBody(
+        self: *Lowerer,
+        arm: ir.exprs.MatchArm,
+        lowered_patterns: []ast.Pattern,
+        option_name: ?[]const u8,
+        alias: ?OwnedCaptureAlias,
+    ) anyerror!ast.Expr {
+        var arm_shadow_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer arm_shadow_names.deinit(self.alloc);
+        for (arm.patterns) |p_id| {
+            try self.appendPatternBindingName(p_id, &arm_shadow_names);
+        }
+        const lowered_arm = try self.lowerArmValueAndGuard(arm, arm_shadow_names.items, alias);
+        // This shape has no place to put a guard, and a caller that has one
+        // belongs on the ordered chain instead of losing it here.
+        if (lowered_arm.guard != null) return error.UnsupportedMatchGuard;
+        if (option_name) |name|
+            return self.lowerOptionalMatchArm(lowered_patterns, lowered_arm.value, name);
+        return lowered_arm.value;
+    }
+
+    /// Whether Zig can take this expression's address, so a reference capture
+    /// can point into the storage the source named.
+    ///
+    /// An indexed place counts, and so does a dereferenced one: `values[i]` is
+    /// the element the index names and `p.*` is the place `p` points at, so an
+    /// alias of either reaches the same storage. The index itself is not part
+    /// of the verdict — it is evaluated once, by the binding, not by the alias.
+    fn exprIsAddressable(value: ast.Expr) bool {
+        return switch (value) {
+            .ident, .field_access => true,
+            .unary_op => |unary| unary.op == .deref and exprIsAddressable(unary.operand.*),
+            // `a[i]` lowers to the `index` builtin, and Zig indexes an lvalue.
+            .builtin => |builtin| std.mem.eql(u8, builtin.name, "index") and
+                builtin.args.len == 2 and exprIsAddressable(builtin.args[0]),
+            else => false,
+        };
+    }
+
+    /// Bind the scrutinee once, ahead of the chain, and return the expression
+    /// every dispatch reads.
+    ///
+    /// A binding captures the value, so a side-effecting scrutinee runs a
+    /// single time however many dispatches read it. An arm that binds the
+    /// subject by reference cannot use that copy: Zig hands a `|*name|` capture
+    /// the address of the value its switch reads, and a copy would point into
+    /// storage the source never sees. Such an arm takes the address of the
+    /// scrutinee's own place instead, which evaluates the place once and still
+    /// reaches the original storage. Rust allows a reference binding only on a
+    /// place, so the alias is legal wherever the capture is; a temporary has no
+    /// storage to alias and keeps the copy.
+    fn bindGuardChainSubject(
+        self: *Lowerer,
+        statements: *std.ArrayListUnmanaged(ast.Stmt),
+        scrutinee: *const ast.Expr,
+        option_name: ?[]const u8,
+        arms: []const ir.exprs.MatchArm,
+    ) anyerror!*const ast.Expr {
+        if (option_name) |name| {
+            // An optional scrutinee is bound by the caller, and every dispatch
+            // reads `matchSubject`'s `name != null`, so this chain needs no
+            // second local.
+            return self.allocExpr(.{ .ident = name });
+        }
+        if (try self.matchCapturesByReference(arms) and exprIsAddressable(scrutinee.*)) {
+            const place_name = try self.iteratorTemporaryName("__r2z_match_place");
+            try statements.append(self.alloc, .{ .let_stmt = .{
+                .name = place_name,
+                .init = .{ .unary_op = .{
+                    .op = .addr_of,
+                    .operand = try self.allocExpr(scrutinee.*),
+                } },
+                .is_mut = false,
+            } });
+            return self.allocExpr(.{ .unary_op = .{
+                .op = .deref,
+                .operand = try self.allocExpr(.{ .ident = place_name }),
+            } });
+        }
+        const subject_name = try self.iteratorTemporaryName("__r2z_match_subject");
+        try statements.append(self.alloc, .{ .let_stmt = .{
+            .name = subject_name,
+            .init = scrutinee.*,
+            .is_mut = false,
+        } });
+        return self.allocExpr(.{ .ident = subject_name });
+    }
+
+    fn appendArmAlternatives(
+        self: *Lowerer,
+        pat_id: ir.exprs.NodeId,
+        alternatives: *std.ArrayListUnmanaged(ir.exprs.NodeId),
+    ) anyerror!void {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        switch (self.ir.bodies.pats[pat_id].kind) {
+            .@"or" => |pattern| {
+                for (pattern.alternatives) |alternative| try self.appendArmAlternatives(alternative, alternatives);
+            },
+            else => try alternatives.append(self.alloc, pat_id),
+        }
+    }
+
+    fn patternHasBindings(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror!bool {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        return switch (self.ir.bodies.pats[pat_id].kind) {
+            .binding => true,
+            inline .struct_pat, .external_variant => |pattern| fields: {
+                for (pattern.fields) |field| {
+                    if (field.shorthand) break :fields true;
+                    if (field.pat) |child| {
+                        if (try self.patternHasBindings(child)) break :fields true;
+                    }
+                }
+                break :fields false;
+            },
+            .reference => |pattern| try self.patternHasBindings(pattern.inner),
+            .tuple => |pattern| elements: {
+                for (pattern.elements) |child| {
+                    if (try self.patternHasBindings(child)) break :elements true;
+                }
+                break :elements false;
+            },
+            .slice => |pattern| elements: {
+                for (pattern.elements) |child| {
+                    if (try self.patternHasBindings(child)) break :elements true;
+                }
+                break :elements if (pattern.rest) |child| try self.patternHasBindings(child) else false;
+            },
+            .@"or" => |pattern| alternatives: {
+                for (pattern.alternatives) |child| {
+                    if (try self.patternHasBindings(child)) break :alternatives true;
+                }
+                break :alternatives false;
+            },
+            else => false,
+        };
+    }
+
+    fn armHasBoundAlternatives(self: *Lowerer, arm: ir.exprs.MatchArm) anyerror!bool {
+        var multiple = arm.patterns.len > 1;
+        for (arm.patterns) |pat_id| {
+            if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+            if (self.ir.bodies.pats[pat_id].kind == .@"or") multiple = true;
+        }
+        if (!multiple) return false;
+        for (arm.patterns) |pat_id| {
+            if (try self.patternHasBindings(pat_id)) return true;
+        }
+        return false;
+    }
+
+    /// Alternatives bind the same Rust names, even when extraction gave each a local id.
+    fn claimAlternativeBindings(
+        self: *Lowerer,
+        pat_id: ir.exprs.NodeId,
+        canonical: *std.StringHashMapUnmanaged([]const u8),
+    ) anyerror!void {
+        const names = self.current_local_binding_names orelse return;
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        switch (self.ir.bodies.pats[pat_id].kind) {
+            .binding => |binding| {
+                const emitted = try names.claimPatternAlias(
+                    self.alloc,
+                    &self.ir.graph.symbol_table,
+                    pat_id,
+                    binding.name,
+                    canonical.get(binding.name),
+                );
+                try canonical.put(self.alloc, binding.name, emitted);
+            },
+            inline .struct_pat, .external_variant => |pattern| {
+                for (pattern.fields) |field| {
+                    if (field.pat) |child| try self.claimAlternativeBindings(child, canonical);
+                }
+            },
+            .reference => |pattern| try self.claimAlternativeBindings(pattern.inner, canonical),
+            .tuple => |pattern| {
+                for (pattern.elements) |child| try self.claimAlternativeBindings(child, canonical);
+            },
+            .slice => |pattern| {
+                for (pattern.elements) |child| try self.claimAlternativeBindings(child, canonical);
+                if (pattern.rest) |child| try self.claimAlternativeBindings(child, canonical);
+            },
+            .@"or" => |pattern| {
+                for (pattern.alternatives) |child| try self.claimAlternativeBindings(child, canonical);
+            },
+            else => {},
+        }
+    }
+
+    /// Lower one arm of the chain into the plan its dispatch is built from.
+    fn planGuardChainArm(
+        self: *Lowerer,
+        arm: ir.exprs.MatchArm,
+        option_name: ?[]const u8,
+    ) anyerror!GuardChainArm {
+        const selectors = try self.lowerWholeMatchArmPatterns(arm, option_name);
+        var prelude: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer prelude.deinit(self.alloc);
+        var nested: ?*NestedPayloadDispatch = null;
+        // An optional scrutinee owns its own pattern rewriting in
+        // `lowerOptionalMatchArm`, and a capture has already replaced its
+        // struct pattern with the tag it matches on.
+        const patterns = if (selectors.capture == null and option_name == null)
+            try self.bindMatchPatternFields(selectors.patterns, &prelude, &nested)
+        else
+            selectors.patterns;
+        var arm_shadow_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer arm_shadow_names.deinit(self.alloc);
+        for (arm.patterns) |p_id| {
+            try self.appendPatternBindingName(p_id, &arm_shadow_names);
+        }
+        const bound_name = if (selectors.capture) |capture|
+            capture.name
+        else
+            try self.matchArmBindingName(arm.patterns);
+        const bound_by_ref = if (selectors.capture) |capture| capture.by_ref else false;
+        const alias = try self.ownedCaptureAlias(arm.patterns, bound_name, bound_by_ref);
+        const lowered_arm = try self.lowerArmValueAndGuard(arm, arm_shadow_names.items, alias);
+        // The payload read-back is a prelude statement, not part of the value:
+        // the guard reads the very binding it introduces, so it has to be in
+        // scope before the test runs. It is bound before the prelude is handed
+        // over, because handing it over empties the list.
+        const raw_value = if (option_name) |name|
+            try self.lowerOptionalMatchArmInto(patterns, lowered_arm.value, name, &prelude)
+        else
+            lowered_arm.value;
+        // Only the selected body owns the payload. A false guard must leave
+        // it alive for the following arm rather than release its storage.
+        const value = if (alias) |owned|
+            try self.appendOwnedCaptureRelease(owned, raw_value)
+        else
+            raw_value;
+        return .{
+            .patterns = patterns,
+            .capture = selectors.capture,
+            .prelude = try prelude.toOwnedSlice(self.alloc),
+            .guard = lowered_arm.guard,
+            .value = value,
+            .nested = nested,
+        };
+    }
+
+    /// The expression a dispatch arm ends on: the arm's result, handed to the
+    /// chain's own label.
+    ///
+    /// A body that already leaves the function or its loop is kept as it is.
+    /// Zig rejects a `break` with no operand beside one that carries a value,
+    /// and a labelled exit to a source loop is the source's own, not the
+    /// chain's to rewrite.
+    fn guardArmYield(self: *Lowerer, label: ?[]const u8, value: ast.Expr) anyerror!ast.Expr {
+        if (!matchYieldCarriesValue(value)) return value;
+        return .{
+            .break_expr = .{
+                .value = try self.allocExpr(value),
+                // A result only ever leaves the chain through its own label, and
+                // the chain is labelled exactly when an arm carries one.
+                .label = label orelse return error.MissingGuardChainLabel,
+            },
+        };
+    }
+
+    /// Append the statements that run one arm inside a dispatch prong.
+    ///
+    /// The chain's block is the only labelled block an arm may contain: a value
+    /// the emitter had to wrap in a block of its own would name that inner
+    /// label and carry the result out of the arm instead of into the chain. So
+    /// an unlabelled block is flattened into the arm, and its tail becomes the
+    /// yield — where nothing guards the arm.
+    ///
+    /// A guarded arm is different: Rust decides the arm with the guard before
+    /// its body does anything, so the whole body runs inside the test. Splicing
+    /// the statements ahead of it would let a false guard leave an arm's side
+    /// effects behind.
+    fn appendGuardArmStatements(
+        self: *Lowerer,
+        out: *std.ArrayListUnmanaged(ast.Stmt),
+        label: ?[]const u8,
+        guard: ?*const ast.Expr,
+        value: ast.Expr,
+    ) anyerror!void {
+        if (guard) |condition| {
+            try out.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .if_expr = .{
+                .cond = condition,
+                .then_body = try self.allocExpr(.{ .block = .{
+                    .stmts = try self.guardArmBody(label, value),
+                } }),
+                .else_body = null,
+            } }) });
+            return;
+        }
+        switch (value) {
+            .block => |block| blk: {
+                if (block.label != null) break :blk;
+                try out.appendSlice(self.alloc, block.stmts);
+                const tail = block.expr orelse return;
+                return self.appendGuardArmStatements(out, label, null, tail.*);
+            },
+            else => {},
+        }
+        try out.append(self.alloc, try self.appendGuardYield(label, value));
+    }
+
+    /// The statements a guarded arm runs inside its test.
+    ///
+    /// An unlabelled block IS the arm body, so it becomes the test's body and
+    /// its tail is what hands the result to the chain. Anything else is the
+    /// arm's own result, wrapped so the test has a body to hold it.
+    fn guardArmBody(
+        self: *Lowerer,
+        label: ?[]const u8,
+        value: ast.Expr,
+    ) anyerror![]ast.Stmt {
+        switch (value) {
+            .block => |block| {
+                // A block that already carries a label holds its own exit, so
+                // it is emitted whole: its breaks have to keep reaching that
+                // label rather than the chain's.
+                if (block.label != null) {
+                    const whole = try self.alloc.alloc(ast.Stmt, 1);
+                    whole[0] = .{ .expr_stmt = try self.allocExpr(.{ .block = block }) };
+                    return whole;
+                }
+                const stmts = try self.alloc.alloc(ast.Stmt, block.stmts.len + 1);
+                @memcpy(stmts[0..block.stmts.len], block.stmts);
+                var len = block.stmts.len;
+                if (block.expr) |tail| {
+                    stmts[len] = try self.appendGuardYield(label, tail.*);
+                    len += 1;
+                }
+                return stmts[0..len];
+            },
+            else => {},
+        }
+        const stmts = try self.alloc.alloc(ast.Stmt, 1);
+        stmts[0] = try self.appendGuardYield(label, value);
+        return stmts;
+    }
+
+    /// The one statement an arm ends on: its result handed to the chain, or the
+    /// exit its own body already is.
+    fn appendGuardYield(
+        self: *Lowerer,
+        label: ?[]const u8,
+        value: ast.Expr,
+    ) anyerror!ast.Stmt {
+        return .{ .expr_stmt = try self.allocExpr(try self.guardArmYield(label, value)) };
+    }
+
+    /// Lower a guarded `match` as a labeled block of ordered one-arm dispatches.
+    ///
+    /// Zig has no guard form in a switch prong, so every arm becomes its own
+    /// `switch` over the subject and a guarded arm's prong holds
+    /// `if (guard) break :__r2z_match_block <arm>`. A false guard leaves the
+    /// prong, so the next dispatch runs and the candidate after it gets its
+    /// turn — the ordered fall-through Rust specifies. A selector that does not
+    /// match never reaches its guard, so no guard runs for an arm that cannot
+    /// be chosen.
+    ///
+    /// The carrier is a labelled block and not a loop, because the chain is not
+    /// a loop: nothing repeats. An arm body that breaks or continues is source
+    /// control flow, and an unlabelled one would land on the carrier — the break
+    /// would leave the chain carrying the wrong value, and the continue would
+    /// start the chain over and evaluate the subject a second time. Naming the
+    /// carrier's label on the exits the chain generates itself keeps the two
+    /// apart.
+    ///
+    /// Every generated exit names the block, so nothing falls off the end of it
+    /// and the block ends in `unreachable`. Rust checks exhaustiveness without
+    /// counting a guarded arm, so the arms up to the first unguarded catch-all
+    /// already cover every value; the chain stops there instead of emitting
+    /// dispatches nothing can reach, and the fall-through past an exhaustive
+    /// set of literals is the `unreachable`.
+    ///
+    /// The result is linear in the arm count, and the scrutinee is bound once
+    /// above the chain, so every dispatch reads the same value and a
+    /// side-effecting scrutinee runs a single time.
+    fn lowerGuardedMatch(
+        self: *Lowerer,
+        scrutinee: *const ast.Expr,
+        option_name: ?[]const u8,
+        arms: []const ir.exprs.MatchArm,
+    ) anyerror!ast.Expr {
+        var statements: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer statements.deinit(self.alloc);
+        const subject = try self.bindGuardChainSubject(&statements, scrutinee, option_name, arms);
+
+        var plans: std.ArrayListUnmanaged(GuardChainArm) = .empty;
+        defer plans.deinit(self.alloc);
+        var covers_every_value = false;
+        var yields_value = false;
+        for (arms) |arm| {
+            if (covers_every_value) break;
+            const split = try self.armHasBoundAlternatives(arm);
+            var alternatives: std.ArrayListUnmanaged(ir.exprs.NodeId) = .empty;
+            defer alternatives.deinit(self.alloc);
+            if (split) {
+                var canonical: std.StringHashMapUnmanaged([]const u8) = .empty;
+                defer canonical.deinit(self.alloc);
+                for (arm.patterns) |pat_id| {
+                    try self.appendArmAlternatives(pat_id, &alternatives);
+                    try self.claimAlternativeBindings(pat_id, &canonical);
+                }
+            }
+            const count = if (split) alternatives.items.len else 1;
+            for (0..count) |index| {
+                var selected = arm;
+                if (split) selected.patterns = alternatives.items[index .. index + 1];
+                const plan = try self.planGuardChainArm(selected, option_name);
+                covers_every_value = plan.guard == null and armSelectorsIrrefutable(plan.patterns);
+                yields_value = yields_value or matchYieldCarriesValue(plan.value);
+                try plans.append(self.alloc, plan);
+                if (covers_every_value) break;
+            }
+        }
+
+        // A chain whose every arm already leaves the function or its loop
+        // carries no result, and Zig reports a label that names nothing as
+        // unused, so the label exists exactly when some arm hands one over.
+        const label: ?[]const u8 = if (yields_value)
+            try self.iteratorTemporaryName("__r2z_match_block")
+        else
+            null;
+        for (plans.items) |plan| {
+            try self.appendGuardChainDispatch(&statements, label, option_name, subject, plan);
+        }
+        if (label != null) {
+            // Every value the chain can be given was already taken by an arm
+            // above, so this is only reached when the last of them failed its
+            // own guard — a fall-through Rust's exhaustiveness rule rules out.
+            try statements.append(self.alloc, .{
+                .expr_stmt = try self.allocExpr(.{ .unreachable_ = {} }),
+            });
+        }
+        return .{ .block = .{
+            .label = label,
+            .stmts = try statements.toOwnedSlice(self.alloc),
+        } };
+    }
+
+    /// Append one arm's dispatch to the ordered chain.
+    ///
+    /// A refutable selector needs an `else` prong of its own, or a subject it
+    /// does not match would leave the switch instead of reaching the arms Rust
+    /// lists after this one.
+    ///
+    /// An arm that names a variant INSIDE its payload dispatches again from
+    /// its own prong, and the guard and the result move inside that second
+    /// prong: the guard reads a binding the nested tag introduced, so it may
+    /// only run once that tag has matched.
+    fn appendGuardChainDispatch(
+        self: *Lowerer,
+        statements: *std.ArrayListUnmanaged(ast.Stmt),
+        label: ?[]const u8,
+        option_name: ?[]const u8,
+        subject: *const ast.Expr,
+        plan: GuardChainArm,
+    ) anyerror!void {
+        var body: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer body.deinit(self.alloc);
+        // The field bindings come first, so the guard and the body both read
+        // the names this arm's own pattern introduced.
+        try body.appendSlice(self.alloc, plan.prelude);
+        if (plan.nested) |nested| {
+            try self.appendNestedPayloadDispatch(&body, nested, label, plan.guard, plan.value);
+        } else {
+            try self.appendGuardArmStatements(&body, label, plan.guard, plan.value);
+        }
+        // The arm is a block of statements rather than a tail expression, so
+        // the exit that carries the result out stays a statement inside it.
+        const dispatch = try self.alloc.alloc(
+            ast.MatchArm,
+            if (armSelectorsIrrefutable(plan.patterns)) 1 else 2,
+        );
+        dispatch[0] = .{
+            .patterns = plan.patterns,
+            .capture = plan.capture,
+            .body = .{ .block = .{ .stmts = try body.toOwnedSlice(self.alloc) } },
+        };
+        if (dispatch.len == 2) {
+            dispatch[1] = .{
+                .patterns = &.{.wildcard},
+                .body = .{ .unit = {} },
+            };
+        }
+        try statements.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .match_expr = .{
+            .target = try self.matchSubject(option_name, subject),
+            .arms = dispatch,
+        } }) });
+    }
+
+    /// Append the dispatch a nested payload pattern becomes, carrying the
+    /// arm's guard and result into its deepest matching prong.
+    ///
+    /// Each level is a `switch` over the payload the level above bound: the
+    /// matching prong reads that payload's own fields and dispatches again
+    /// when a deeper pattern follows, and every other prong does NOTHING. A
+    /// payload of another variant therefore leaves this arm altogether and
+    /// reaches the arms Rust lists after it — which is the fall-through the
+    /// ordered chain gives every other way an arm declines a value, and the
+    /// reason the payload's fields are read here rather than unconditionally
+    /// in the outer prong.
+    fn appendNestedPayloadDispatch(
+        self: *Lowerer,
+        out: *std.ArrayListUnmanaged(ast.Stmt),
+        nested: *const NestedPayloadDispatch,
+        label: ?[]const u8,
+        guard: ?*const ast.Expr,
+        value: ast.Expr,
+    ) anyerror!void {
+        var prong: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer prong.deinit(self.alloc);
+        try prong.appendSlice(self.alloc, nested.bindings);
+        if (nested.inner) |inner| {
+            try self.appendNestedPayloadDispatch(&prong, inner, label, guard, value);
+        } else {
+            try self.appendGuardArmStatements(&prong, label, guard, value);
+        }
+        const dispatch = try self.alloc.alloc(ast.MatchArm, 2);
+        dispatch[0] = .{
+            .patterns = nested.selectors,
+            .capture = null,
+            .body = .{ .block = .{ .stmts = try prong.toOwnedSlice(self.alloc) } },
+        };
+        dispatch[1] = .{
+            .patterns = &.{.wildcard},
+            .body = .{ .unit = {} },
+        };
+        try out.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .match_expr = .{
+            .target = nested.subject,
+            .arms = dispatch,
+        } }) });
+    }
+
+    /// One read applied to the payload on the way to a binding.
+    const IfLetProjection = union(enum) {
+        /// The Nth element of a tuple payload.
+        tuple_index: u32,
+        /// The pointee of a reference. A pattern that reads THROUGH one takes
+        /// a copy of the place it reached; it neither moves an owner nor keeps
+        /// a borrow alive.
+        dereference,
+    };
+
+    /// One binding an `if let` payload pattern introduces.
+    const IfLetBinding = struct {
+        name: []const u8,
+        /// The PATTERN this name was read out of, which is what makes it
+        /// claimable: two bindings may share a spelling, and only the pattern
+        /// says which local each one is.
+        pat_id: ir.exprs.NodeId,
+        /// The name this binding is EMITTED under, claimed through the pattern
+        /// so the collector and every later reference agree on one spelling.
+        emitted_name: ?[]const u8 = null,
+        /// The reads applied to the payload, in the order the pattern wrote
+        /// them.
+        ///
+        /// An order and a count are both load-bearing, which is why this is
+        /// not a flag: `Some(&(a, b))` reads `payload.*[0]` and not
+        /// `payload[0].*`, and `Some((&&a, b))` reads through two references.
+        /// A sequence ending in `dereference` is a copy of the place reached.
+        projections: []const IfLetProjection,
+    };
+
+    /// Every name an `if let` payload pattern introduces, in source order.
+    ///
+    /// Zig's `if` takes no pattern, so the payload is bound once to a
+    /// temporary and each name is read back out of it as an ordinary `let`.
+    /// `Some(v)` introduces one binding over the whole payload;
+    /// `Some((&first_byte, remaining))` introduces two, the first reading
+    /// through the reference its pattern wrote.
+    ///
+    /// Only patterns whose reads are positional are answered. An or-pattern,
+    /// a range, a literal or a named-field pattern names no single place in
+    /// the payload to read from, and refusing is honest where picking one
+    /// would not be.
+    fn collectIfLetBindings(
+        self: *Lowerer,
+        pat_id: ir.exprs.NodeId,
+        projections: []const IfLetProjection,
+        out: *std.ArrayListUnmanaged(IfLetBinding),
+    ) anyerror!void {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        switch (self.ir.bodies.pats[pat_id].kind) {
+            .wildcard => {},
+            .binding => |binding| {
+                if (binding.name.len == 0) return error.MissingBindingName;
+                const owned = try self.alloc.dupe(IfLetProjection, projections);
+                errdefer self.alloc.free(owned);
+                try out.append(self.alloc, .{
+                    .name = try self.alloc.dupe(u8, binding.name),
+                    .pat_id = pat_id,
+                    .projections = owned,
+                });
+            },
+            .reference => |reference| {
+                try self.collectIfLetBindings(
+                    reference.inner,
+                    try self.appendIfLetProjection(projections, .dereference),
+                    out,
+                );
+            },
+            .tuple => |tp| {
+                if (tp.rest) return error.UnsupportedPattern;
+                for (tp.elements, 0..) |element, index| {
+                    try self.collectIfLetBindings(
+                        element,
+                        try self.appendIfLetProjection(projections, .{
+                            .tuple_index = @intCast(index),
+                        }),
+                        out,
+                    );
+                }
+            },
+            // A variant nested INSIDE the payload needs its own test and its
+            // own unwrap — `if let Some(Some(v))` has two conditions, not one
+            // — and this shape can only express the outer one. Flattening it
+            // would read the inner payload unconditionally, so it is refused
+            // rather than approximated. The OUTER variant is stripped once by
+            // the caller, before this runs.
+            .struct_pat, .external_variant => return error.UnsupportedPattern,
+            else => return error.UnsupportedPattern,
+        }
+    }
+
+    /// `projections` plus one more read, as a fresh slice.
+    fn appendIfLetProjection(
+        self: *Lowerer,
+        projections: []const IfLetProjection,
+        step: IfLetProjection,
+    ) ![]const IfLetProjection {
+        const extended = try self.alloc.alloc(IfLetProjection, projections.len + 1);
+        @memcpy(extended[0..projections.len], projections);
+        extended[projections.len] = step;
+        return extended;
+    }
+
+    /// The pattern the payload itself is matched against, or null when the
+    /// payload was IGNORED.
+    ///
+    /// The variant is stripped ONCE, here, because Zig's `if` tests the option
+    /// and hands over its payload already unwrapped. A wildcard payload is not
+    /// written as one: the IR records `Some(_)` as a variant whose field list
+    /// is EMPTY, because there is no name to bind — which says nothing about
+    /// the variant's arity, and nothing here is allowed to read it as though
+    /// the variant carried no payload. It is still a match; it just introduces
+    /// no name, so null is the whole answer and no placeholder pattern is
+    /// invented for it. `Some` and `None` are told apart by
+    /// `ifLetOptionIsPresent`, not by this: a zero-field `None` means the same
+    /// thing structurally and means the OPPOSITE branch.
+    ///
+    /// A variant that declares MORE than one field names no single payload this
+    /// shape can read, and says so.
+    fn ifLetPayloadPattern(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror!?ir.exprs.NodeId {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        return switch (self.ir.bodies.pats[pat_id].kind) {
+            .struct_pat => |sp| if (sp.fields.len == 0)
+                null
+            else if (sp.fields.len == 1)
+                sp.fields[0].pat orelse error.UnsupportedPattern
+            else
+                error.UnsupportedPattern,
+            .external_variant => |variant| if (variant.fields.len == 0)
+                null
+            else if (variant.fields.len == 1)
+                variant.fields[0].pat orelse error.UnsupportedPattern
+            else
+                error.UnsupportedPattern,
+            else => error.UnsupportedPattern,
+        };
+    }
+
+    /// An `if let` subject, evaluated once and ready to bind: a reference is
+    /// dereferenced so the binding holds the value rather than a pointer to it.
+    ///
+    /// The subject is bound before anything reads it, so a side-effecting
+    /// scrutinee runs exactly once however many dispatches test it. What the
+    /// source's pattern is tested AGAINST is the caller's question: an optional
+    /// is compared with `null`, a tagged union is switched on its tag, and
+    /// this function is the part both of them share.
+    fn lowerIfLetSubject(self: *Lowerer, scrutinee_id: ir.exprs.NodeId) anyerror!ast.Expr {
+        const scrutinee = try self.lowerExpr(scrutinee_id);
+        const subject_type = try self.exprType(scrutinee_id) orelse
+            return error.MissingExpressionType;
+        if (subject_type != .reference) return scrutinee;
+        return .{ .unary_op = .{ .op = .deref, .operand = try self.allocExpr(scrutinee) } };
+    }
+
+    /// Whether an `if let` on an optional names the arm that HOLDS a value.
+    ///
+    /// `Some` and `None` reach here in the same shape — a variant, with a
+    /// payload or with its payload ignored — and they take opposite branches,
+    /// so the variant's own identity is what decides. It is read from the
+    /// declaration the graph recorded, not from the spelling in the source:
+    /// the entity must be a `variant`, and the enum that owns it must be the
+    /// Option this subject is. A local `enum Option` cannot pass for one,
+    /// because a value of it is not an optional and the caller never routes a
+    /// non-optional subject here.
+    fn ifLetOptionIsPresent(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror!bool {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        return switch (self.ir.bodies.pats[pat_id].kind) {
+            .struct_pat => |sp| try self.optionVariantIsPresent(sp.def),
+            .path => |path_pat| try self.optionVariantIsPresent(path_pat.def),
+            .external_variant => |variant| blk: {
+                if (!externalPathEqual(variant.owner.path, &.{ "core", "option", "Option" }) and
+                    !externalPathEqual(variant.owner.path, &.{ "std", "option", "Option" }))
+                {
+                    break :blk error.UnsupportedPattern;
+                }
+                break :blk try optionArmHoldsValue(variant.variant);
+            },
+            else => error.UnsupportedPattern,
+        };
+    }
+
+    fn optionVariantIsPresent(self: *Lowerer, def: ir.spine.EntityId) anyerror!bool {
+        const entity = self.ir.graph.symbol_table.get(def) orelse return error.MissingDefinition;
+        if (entity.kind != .variant) return error.UnsupportedPattern;
+        const owner = self.ir.graph.symbol_table.get(entity.parent orelse
+            return error.MissingParentId) orelse return error.MissingDefinition;
+        if (owner.kind != .enum_ or !std.mem.eql(u8, owner.name, "Option")) {
+            return error.UnsupportedPattern;
+        }
+        return optionArmHoldsValue(entity.name);
+    }
+
+    /// Polarity of one arm of the Option enum, or a refusal when the name is
+    /// neither. These are the only two arms an `if let` can name, and they
+    /// mean opposite branches, so an arm this does not recognise is refused
+    /// rather than guessed at — a wrong answer here would silently run the
+    /// source's `then` where it wrote `else`.
+    fn optionArmHoldsValue(name: []const u8) anyerror!bool {
+        if (std.mem.eql(u8, name, "Some")) return true;
+        if (std.mem.eql(u8, name, "None")) return false;
+        return error.UnsupportedPattern;
+    }
+
+    /// `if let Enum::Variant(..) = e` as a `switch`: the prong that takes is
+    /// the one that makes the payload's own binding, so the reads that unpack
+    /// it are emitted inside that prong beside the branch body. A name bound
+    /// ahead of the switch would refer to storage the switch never carried
+    /// out, which is the whole difference between this and a condition.
+    ///
+    /// The subject was bound once, ahead of this, so a scrutinee with side
+    /// effects runs exactly as the source ran it. The selectors come from
+    /// `lowerArmPatterns` and the payload reads from `bindMatchPatternFields`
+    /// — the same two a `match` arm goes through — so a unit variant, a
+    /// struct-like variant and a tuple variant all dispatch the way a `match`
+    /// over the same value would. No optional is invented for a value that has
+    /// none: a subject with no tag to switch on is a different pattern, and
+    /// the subject's own type is what chose this route.
+    fn lowerVariantIfLetSwitch(
+        self: *Lowerer,
+        pat_id: ir.exprs.NodeId,
+        subject_name: []const u8,
+        then_block: ast.Block,
+        else_expr: ?*const ast.Expr,
+    ) anyerror!ast.Expr {
+        const lowered = try self.lowerArmPatterns(&.{pat_id});
+        var payload_reads: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer payload_reads.deinit(self.alloc);
+        var nested: ?*NestedPayloadDispatch = null;
+        const selectors = try self.bindMatchPatternFields(lowered, &payload_reads, &nested);
+        // An `if let` has no chain to hold a second dispatch, and reading the
+        // nested payload before its tag is tested is what Zig refuses. Refuse
+        // rather than emit a switch that names a field it never checked.
+        if (nested != null) return error.UnsupportedPattern;
+        if (selectors.len == 0) return error.UnsupportedPattern;
+        const matched_body: ast.Expr = if (payload_reads.items.len == 0)
+            ast.Expr{ .block = then_block }
+        else blk: {
+            const stmts = try self.alloc.alloc(
+                ast.Stmt,
+                payload_reads.items.len + then_block.stmts.len,
+            );
+            @memcpy(stmts[0..payload_reads.items.len], payload_reads.items);
+            @memcpy(stmts[payload_reads.items.len..], then_block.stmts);
+            break :blk ast.Expr{ .block = .{
+                .stmts = stmts,
+                .expr = if (then_block.expr) |tail|
+                    try self.allocExpr(tail.*)
+                else
+                    try self.allocExpr(.{ .unit = {} }),
+            } };
+        };
+        const otherwise = try self.alloc.alloc(ast.Pattern, 1);
+        otherwise[0] = .wildcard;
+        const arms = try self.alloc.alloc(ast.MatchArm, 2);
+        arms[0] = .{ .patterns = selectors, .body = matched_body };
+        arms[1] = .{
+            .patterns = otherwise,
+            .body = if (else_expr) |branch| branch.* else .{ .unit = {} },
+        };
+        return .{ .match_expr = .{
+            .target = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, subject_name) }),
+            .arms = arms,
+        } };
     }
 
     pub fn lowerExpr(self: *Lowerer, expr_id: ir.exprs.NodeId) anyerror!ast.Expr {
         if (expr_id >= self.ir.bodies.exprs.len) {
             return error.MissingExpressionNode;
+        }
+
+        // A context that names a trait object asks for that trait's BORROWED
+        // HANDLE, so a concrete borrow arriving at one is erased here. Every
+        // site that can state such a context — a declared parameter, a
+        // declared binding, a payload an enclosing expression already typed —
+        // reaches this one answer, and the handle points at the caller's own
+        // value, so nothing is copied to perform the erasure.
+        if (self.dynCoercionContext()) |handle| {
+            if (!try self.exprAlreadyDynTrait(expr_id, handle)) {
+                const previous_value_type = self.expected_value_type;
+                const previous_argument_type = self.expected_argument_type;
+                self.expected_value_type = null;
+                self.expected_argument_type = null;
+                const erased = self.lowerExpr(expr_id) catch |err| {
+                    self.expected_value_type = previous_value_type;
+                    self.expected_argument_type = previous_argument_type;
+                    return err;
+                };
+                self.expected_value_type = previous_value_type;
+                self.expected_argument_type = previous_argument_type;
+                return self.buildDynTraitHandle(handle, expr_id, erased);
+            }
         }
 
         const ir_expr = self.ir.bodies.exprs[expr_id];
@@ -10700,27 +17903,38 @@ const Lowerer = struct {
                 .boolean => |b| ast.Expr{ .lit = .{ .bool_lit = b } },
             },
             .array => |a| blk: {
+                const literal_type = try self.nodeType(expr_id);
                 // A Rust tuple expression reaches the backend as an array
                 // node carrying a tuple type. Zig spells that value
                 // `.{ a, b }`; `[_]struct { A, B }{ a, b }` would be an
                 // array of tuples, which is a different value entirely.
-                if (a.repeat == null) {
-                    if (ir_expr.ty) |tid| {
-                        if (try self.typeById(tid) == .tuple) {
-                            var items = try self.alloc.alloc(ast.Expr, a.elements.len);
-                            for (a.elements, 0..) |el, i| items[i] = try self.lowerExpr(el);
-                            break :blk ast.Expr{ .tuple = items };
-                        }
-                    }
+                const is_tuple = if (literal_type) |known| switch (known) {
+                    .tuple => true,
+                    else => false,
+                } else false;
+                if (a.repeat == null and is_tuple) {
+                    var items = try self.alloc.alloc(ast.Expr, a.elements.len);
+                    for (a.elements, 0..) |el, i| items[i] = try self.lowerExpr(el);
+                    break :blk ast.Expr{ .tuple = items };
                 }
-                const elem_ast: ?ast.Type = if (ir_expr.ty) |tid| blk_type: {
-                    const literal_type = try self.typeById(tid);
-                    break :blk_type try self.lowerType(switch (literal_type) {
-                        .array => |array| array.elem,
-                        .slice => |slice| slice.elem,
-                        else => literal_type,
-                    });
+                const element_type: ?ir.types.Type = if (literal_type) |known| switch (known) {
+                    // A tuple has no single element type, and the tuple
+                    // spelling above already returned for every shape a
+                    // tuple can reach here with.
+                    .tuple => null,
+                    .array => |array| array.elem,
+                    .slice => |slice| slice.elem,
+                    else => |other| other,
                 } else null;
+                const elem_ast: ?ast.Type = if (element_type) |elem|
+                    try self.lowerType(elem)
+                else
+                    null;
+                // The elements are the literal's element type, so a nested
+                // literal the frontend left untyped resolves from here.
+                const previous_expected_type = self.expected_value_type;
+                if (element_type) |elem| self.expected_value_type = elem;
+                defer self.expected_value_type = previous_expected_type;
                 if (a.repeat) |len| {
                     if (a.elements.len == 0) return error.MissingArrayElement;
                     const elem = try self.allocExpr(try self.lowerExpr(a.elements[0]));
@@ -10741,8 +17955,11 @@ const Lowerer = struct {
                     },
                 };
             },
-            .vec_lit => return error.UnsupportedExpression,
-            .path => |pe| try self.lowerPathExpr(pe),
+            .vec_lit => |vec| try self.lowerVecLiteral(ir_expr, vec),
+            .path => |pe| blk: {
+                if (try self.lowerOwnedCaptureTransfer(expr_id, pe)) |transfer| break :blk transfer;
+                break :blk try self.lowerPathExpr(pe);
+            },
             .block => |be| ast.Expr{ .block = try self.lowerBlock(be) },
             .unit => ast.Expr{ .unit = {} },
             .if_else => |ie| blk: {
@@ -10761,21 +17978,183 @@ const Lowerer = struct {
                     },
                 };
             },
+            // `if let Some(v) = x` — Zig's `if` takes a `bool`, an optional or
+            // an error union, never a pattern, so the subject is bound once
+            // and the rest of the shape is decided from there. An OPTIONAL
+            // subject is compared with `null` and its payload read back
+            // through the same `r2z.option.unwrap` the `match` path uses; a
+            // TAGGED UNION subject is switched on its tag, which is what
+            // `if let Enum::Variant(..) = e` means. The subject's own type
+            // picks the route, because both spellings arrive as the same
+            // pattern shape. Each name an optional's pattern introduces
+            // arrives as an ordinary `let`, since a pattern may read SEVERAL
+            // places out of one payload — `Some((&first_byte, remaining))` —
+            // and one capture binds the payload under exactly one name.
             .if_let => |il| blk: {
-                const cond = try self.allocExpr(try self.lowerExpr(il.scrutinee));
-                const then_expr = try self.allocExpr(ast.Expr{ .block = try self.lowerBlock(il.then_) });
+                const subject_name = try self.iteratorTemporaryName("__r2z_if_let");
+                const subject = try self.lowerIfLetSubject(il.scrutinee);
+                const subject_type = try self.exprType(il.scrutinee) orelse
+                    return error.MissingExpressionType;
+                // An optional is tested against `null`; anything else is a
+                // tagged union whose variant the source named, and that is a
+                // tag test. The two are the same shape in the source and two
+                // different conditions in Zig, so the subject's own type is
+                // what decides which one this is — never the spelling of the
+                // pattern, which both of them spell the same way.
+                const subject_is_option = subject_type == .option or
+                    self.canonicalExternalMethodType(subject_type) == .option;
+                var bindings: std.ArrayListUnmanaged(IfLetBinding) = .empty;
+                defer {
+                    for (bindings.items) |binding| self.alloc.free(binding.projections);
+                    bindings.deinit(self.alloc);
+                }
+                // The outer variant is stripped ONCE here, because Zig's
+                // `if` tests the option and hands over its payload already.
+                // Anything nested deeper needs a test of its own and is
+                // refused by the collector rather than flattened. A payload
+                // that was IGNORED introduces no name at all.
+                var is_present = true;
+                if (subject_is_option) {
+                    is_present = try self.ifLetOptionIsPresent(il.pattern);
+                    // The empty arm holds no value, so it has no payload to
+                    // read out of it and introduces no name. Asking it for one
+                    // anyway would look for a payload it never had, and a unit
+                    // arm is recorded as a pattern with no fields at all.
+                    if (is_present) {
+                        if (try self.ifLetPayloadPattern(il.pattern)) |payload_pat| {
+                            try self.collectIfLetBindings(payload_pat, &.{}, &bindings);
+                        }
+                    }
+                }
+                // Each name is claimed BY PATTERN, before the arm's own block
+                // is lowered and registers the locals inside it. A name may
+                // repeat across the two — shadowing is ordinary Rust, and
+                // `if let Some((&a, remaining)) { let (b, remaining) = ..; }`
+                // shadows rather than conflicts — so the claim, not the
+                // spelling, decides which local each binding IS. Claiming in
+                // scope order is what gives the outer binding the plain name
+                // and the inner one the renamed copy every later reference
+                // then resolves through.
+                for (bindings.items) |*binding| {
+                    binding.emitted_name = if (self.current_local_binding_names) |names|
+                        try names.claimPatternName(
+                            self.alloc,
+                            &self.ir.graph.symbol_table,
+                            binding.pat_id,
+                            binding.name,
+                        )
+                    else
+                        binding.name;
+                }
+                var then_block = try self.lowerBlock(il.then_);
+                // Nothing bound — `if let Some(_) = x` — reads no part of the
+                // payload, so there is no alias and no unwrap at all. Emitting
+                // either would be work the source never asked for and a local
+                // Zig would reject as unused.
+                const whole_payload = bindings.items.len == 1 and
+                    bindings.items[0].projections.len == 0;
+                const prologue_len: usize = if (bindings.items.len == 0)
+                    0
+                else if (whole_payload)
+                    1
+                else
+                    bindings.items.len + 1;
+                if (prologue_len == 0) {
+                    try self.markRuntimeImport();
+                } else {
+                    const rebind = try self.alloc.alloc(ast.Stmt, then_block.stmts.len + prologue_len);
+                    // The unwrap always reads the SUBJECT, which the statement
+                    // above already evaluated once. The binding it introduces
+                    // is a name of its own: reusing the argument's name for it
+                    // would make `const payload = r2z.option.unwrap(payload)`
+                    // define the payload in terms of itself.
+                    const payload_local_name = if (whole_payload)
+                        try self.alloc.dupe(u8, bindings.items[0].emitted_name orelse bindings.items[0].name)
+                    else
+                        try self.iteratorTemporaryName("__r2z_if_let_payload");
+                    const unwrap_args = try self.alloc.alloc(ast.Expr, 1);
+                    unwrap_args[0] = .{ .ident = subject_name };
+                    rebind[0] = .{ .let_stmt = .{
+                        .name = payload_local_name,
+                        .init = (try self.allocExpr(.{ .call = .{
+                            .callee = try self.allocExpr(.{ .ident = "r2z.option.unwrap" }),
+                            .args = unwrap_args,
+                        } })).*,
+                    } };
+                    if (!whole_payload) {
+                        const payload_name = payload_local_name;
+                        for (bindings.items, 0..) |binding, offset| {
+                            // The reads go on in the order the PATTERN wrote
+                            // them: `Some(&(a, b))` reaches `payload.*[0]` and
+                            // `Some((&&a, b))` reads through two references.
+                            var source: ast.Expr = .{ .ident = payload_name };
+                            for (binding.projections) |projection| {
+                                switch (projection) {
+                                    .tuple_index => |field| {
+                                        const index_args = try self.alloc.alloc(ast.Expr, 2);
+                                        index_args[0] = source;
+                                        index_args[1] = .{ .lit = .{ .int = field } };
+                                        source = .{
+                                            .builtin = .{ .name = "index", .args = index_args },
+                                        };
+                                    },
+                                    .dereference => {
+                                        // The node the read applies to is
+                                        // copied out BEFORE `source` is
+                                        // overwritten: assigning the union
+                                        // that holds the operand can rewrite
+                                        // it out from under the copy, and the
+                                        // result is an expression whose
+                                        // pointers name nothing.
+                                        const pointee = try self.allocExpr(source);
+                                        source = .{ .unary_op = .{
+                                            .op = .deref,
+                                            .operand = pointee,
+                                        } };
+                                    },
+                                }
+                            }
+                            rebind[1 + offset] = .{ .let_stmt = .{
+                                .name = try self.alloc.dupe(u8, binding.emitted_name orelse binding.name),
+                                .init = source,
+                            } };
+                        }
+                    }
+                    @memcpy(rebind[prologue_len..], then_block.stmts);
+                    then_block.stmts = rebind;
+                    try self.markRuntimeImport();
+                }
                 const else_expr: ?*const ast.Expr = switch (il.@"else") {
                     .none => null,
-                    .block => |eb| try self.allocExpr(ast.Expr{ .block = try self.lowerBlock(eb) }),
+                    .block => |eb| try self.allocExpr(.{ .block = try self.lowerBlock(eb) }),
                     .chain => |chain_id| try self.allocExpr(try self.lowerExpr(chain_id)),
                 };
-                break :blk ast.Expr{
-                    .if_expr = .{
-                        .cond = cond,
-                        .then_body = then_expr,
-                        .else_body = else_expr,
-                    },
-                };
+                const statements = try self.alloc.alloc(ast.Stmt, 1);
+                statements[0] = .{ .let_stmt = .{
+                    .name = try self.alloc.dupe(u8, subject_name),
+                    .init = subject,
+                    .is_mut = false,
+                } };
+                // An optional is a test against `null` — `None` is the arm
+                // that is EQUAL to it, which is the whole difference between
+                // the two and the reason the variant's identity was read.
+                // A tagged union is a `switch`, so the prong that takes is the
+                // one that makes the payload's own binding: a name bound
+                // outside it would refer to storage the switch never carried
+                // out, and the reads that unpack it belong beside it.
+                const decision: ast.Expr = if (subject_is_option) .{ .if_expr = .{
+                    .cond = try self.allocExpr(.{ .bin_op = .{
+                        .op = if (is_present) .not_equal else .equal,
+                        .lhs = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, subject_name) }),
+                        .rhs = try self.allocExpr(.{ .lit = .null_lit }),
+                    } }),
+                    .then_body = try self.allocExpr(.{ .block = then_block }),
+                    .else_body = else_expr,
+                } } else try self.lowerVariantIfLetSwitch(il.pattern, subject_name, then_block, else_expr);
+                break :blk (try self.allocExpr(.{ .block = .{
+                    .stmts = statements,
+                    .expr = try self.allocExpr(decision),
+                } })).*;
             },
             .match => |me| blk: {
                 const target = try self.allocExpr(try self.lowerExpr(me.scrutinee));
@@ -10787,58 +18166,55 @@ const Lowerer = struct {
                 else
                     null;
                 if (me.arms.len == 0) return error.MissingMatchArm;
-                var arms = try self.alloc.alloc(ast.MatchArm, me.arms.len);
-                for (me.arms, 0..) |arm, i| {
-                    if (arm.guard != null) return error.UnsupportedMatchGuard;
-                    if (arm.patterns.len == 0) return error.MissingMatchPattern;
-                    if (arm.patterns.len > self.ir.bodies.pats.len) {
-                        return error.MissingPatternNode;
-                    }
-                    const lowered_patterns = try self.lowerArmPatterns(arm.patterns);
-                    const capture = try self.referenceMatchCapture(arm.patterns);
-                    if (option_name != null and capture != null) return error.UnsupportedPattern;
-                    if (capture != null) {
-                        const selector = switch (lowered_patterns[0]) {
-                            .struct_pat => |pattern| pattern.name orelse return error.MissingPatternName,
-                            else => return error.UnsupportedPattern,
-                        };
-                        lowered_patterns[0] = .{ .enum_literal = selector };
-                    }
-                    var arm_shadow_names: std.ArrayListUnmanaged([]const u8) = .empty;
-                    defer arm_shadow_names.deinit(self.alloc);
-                    for (arm.patterns) |p_id| {
-                        try self.appendPatternBindingName(p_id, &arm_shadow_names);
-                    }
-                    const body_expr = arm_body: {
-                        const previous_shadow_scope = self.current_shadow_scope;
-                        var arm_shadow_scope: ShadowScope = .{
-                            .names = arm_shadow_names.items,
-                            .parent = previous_shadow_scope,
-                        };
-                        self.current_shadow_scope = &arm_shadow_scope;
-                        defer self.current_shadow_scope = previous_shadow_scope;
-                        break :arm_body try self.lowerExpr(arm.body);
-                    };
-                    arms[i] = .{
-                        .patterns = lowered_patterns,
-                        .body = if (option_name) |name|
-                            try self.lowerOptionalMatchArm(lowered_patterns, body_expr, name)
-                        else
-                            body_expr,
-                        .capture = capture,
-                    };
+                // The dispatch tests the subject and an arm reads its payload
+                // back, so a scrutinee that is a CALL has to be evaluated
+                // once. Lowering it twice advanced an iterator twice:
+                // `match self.inner.next() { Some(byte) => .. }` consumed two
+                // bytes per arm and encoded every other one.
+                //
+                // A PLACE is left alone. `values[next_index(counter)]` read
+                // through a `|*v|` capture writes into the slice, and a
+                // binding in front of it turned the capture's pointer into
+                // one to a copy — the write landed there and the caller's
+                // element never changed.
+                var subject: *const ast.Expr = target;
+                var subject_name: ?[]const u8 = null;
+                if (option_name == null and target.* == .call) {
+                    subject_name = try self.iteratorTemporaryName("__r2z_match_subject");
+                    subject = try self.allocExpr(.{ .ident = subject_name.? });
                 }
-                const lowered_match: ast.Expr = .{ .match_expr = .{
-                    .target = if (option_name) |name| try self.allocExpr(.{ .bin_op = .{
-                        .op = .not_equal,
-                        .lhs = try self.allocExpr(.{ .ident = name }),
-                        .rhs = try self.allocExpr(.{ .lit = .null_lit }),
-                    } }) else target,
-                    .arms = arms,
-                } };
+                // A guard has no place in a Zig prong, and neither has a
+                // pattern that names a variant INSIDE its payload: both need
+                // the ordered chain, which is the shape that can test the
+                // nested tag and fall through to the arms after it.
+                const lowered_match: ast.Expr = if (matchHasGuard(me.arms) or
+                    (option_name == null and try self.matchNeedsNestedPayloadChain(me.arms)))
+                    try self.lowerGuardedMatch(subject, option_name, me.arms)
+                else
+                    .{ .match_expr = .{
+                        .target = try self.matchSubject(option_name, subject),
+                        .arms = try self.lowerMatchArms(option_name, me.arms),
+                    } };
                 if (option_name) |name| {
                     const statements = try self.alloc.alloc(ast.Stmt, 1);
                     statements[0] = .{ .let_stmt = .{ .name = name, .init = target.* } };
+                    break :blk .{ .block = .{
+                        .stmts = statements,
+                        .expr = try self.allocExpr(lowered_match),
+                    } };
+                }
+                if (subject_name) |name| {
+                    // An arm that binds the subject by reference writes
+                    // THROUGH the place the dispatch reads, so the binding
+                    // has to carry that mutability: a `const` copy turned the
+                    // capture's pointer into `*const T` and the arm's write
+                    // into `cannot assign to constant`.
+                    const statements = try self.alloc.alloc(ast.Stmt, 1);
+                    statements[0] = .{ .let_stmt = .{
+                        .name = name,
+                        .init = target.*,
+                        .is_mut = try self.matchCapturesByReference(me.arms),
+                    } };
                     break :blk .{ .block = .{
                         .stmts = statements,
                         .expr = try self.allocExpr(lowered_match),
@@ -10848,10 +18224,14 @@ const Lowerer = struct {
             },
             .loop_ => |le| blk: {
                 const cond = try self.allocExpr(ast.Expr{ .lit = .{ .bool_lit = true } });
+                var body = try self.lowerBlock(le.body);
+                const label = takeLoopLabel(&body);
+                try takeLoopTailAsStatement(self.alloc, &body);
                 break :blk ast.Expr{
                     .while_expr = .{
                         .cond = cond,
-                        .body = try self.lowerBlock(le.body),
+                        .body = body,
+                        .label = label,
                     },
                 };
             },
@@ -10868,12 +18248,15 @@ const Lowerer = struct {
                 };
                 self.current_shadow_scope = &capture_shadow_scope;
                 defer self.current_shadow_scope = previous_shadow_scope;
-                const body = try self.lowerBlock(we.body);
+                var body = try self.lowerBlock(we.body);
+                const label = takeLoopLabel(&body);
+                try takeLoopTailAsStatement(self.alloc, &body);
                 break :blk ast.Expr{
                     .while_expr = .{
                         .cond = cond,
                         .captures = captures,
                         .body = body,
+                        .label = label,
                     },
                 };
             },
@@ -10893,6 +18276,7 @@ const Lowerer = struct {
                 var runtime_inputs: std.ArrayListUnmanaged(RuntimeIteratorInput) = .empty;
                 defer runtime_inputs.deinit(self.alloc);
                 var value_capture_name: ?[]const u8 = null;
+                var typed_range: ?TypedRangeFor = null;
                 if (fe.pattern >= self.ir.bodies.pats.len) return error.MissingPatternNode;
 
                 switch (fe.iter_kind) {
@@ -10913,6 +18297,12 @@ const Lowerer = struct {
                             ));
                             break :slice_input;
                         }
+                        // A range with a matched pair of integer endpoints is
+                        // driven by the typed iterator loop: a Zig `for` binds
+                        // `usize` for every range, which cannot carry a
+                        // signed or a narrow counter.
+                        typed_range = try self.planTypedRangeFor(fe);
+                        if (typed_range != null) break :slice_input;
                         const iterable = try self.lowerForInput(fe.iterable, try self.patternCapturesByReference(fe.pattern));
                         const iterable_ty = try self.exprType(fe.iterable);
                         const exact_type = if (iterable_ty) |value|
@@ -10947,6 +18337,7 @@ const Lowerer = struct {
                             try inputs.append(self.alloc, iterable);
                         }
                         try self.appendPatternCaptures(fe.pattern, &captures_list);
+                        try self.retypeRangeLoopBinding(fe, &captures_list, &destructure);
                     },
 
                     .range => {
@@ -11080,6 +18471,8 @@ const Lowerer = struct {
                 defer self.current_value_capture_scopes = previous_value_capture_scopes;
 
                 var body = try self.lowerBlock(fe.body);
+                const label = takeLoopLabel(&body);
+                try takeLoopTailAsStatement(self.alloc, &body);
 
                 const prologue = destructure.items.len + iterator_items.items.len;
                 if (prologue > 0) {
@@ -11088,6 +18481,10 @@ const Lowerer = struct {
                     @memcpy(merged[iterator_items.items.len..][0..destructure.items.len], destructure.items);
                     @memcpy(merged[prologue..], body.stmts);
                     body.stmts = merged;
+                }
+
+                if (typed_range) |plan| {
+                    break :blk try self.lowerTypedRangeFor(plan, body, label);
                 }
 
                 const for_inputs = try inputs.toOwnedSlice(self.alloc);
@@ -11101,6 +18498,7 @@ const Lowerer = struct {
                             .inputs = for_inputs,
                             .captures = captures,
                             .body = body,
+                            .label = label,
                         },
                     };
                 }
@@ -11109,6 +18507,7 @@ const Lowerer = struct {
                     for_inputs,
                     captures,
                     body,
+                    label,
                 );
                 if (iterator_hoist.items.len == 0) break :blk loop;
                 const stmts = try self.alloc.alloc(ast.Stmt, iterator_hoist.items.len + 1);
@@ -11117,10 +18516,18 @@ const Lowerer = struct {
                 break :blk ast.Expr{ .block = .{ .stmts = stmts } };
             },
             .break_ => |be| blk: {
-                const val = if (be.value) |v| try self.allocExpr(try self.lowerExpr(v)) else null;
-                break :blk ast.Expr{ .break_expr = val };
+                break :blk ast.Expr{ .break_expr = .{
+                    .value = if (be.value) |v| try self.allocExpr(try self.lowerExpr(v)) else null,
+                    .label = be.label,
+                } };
             },
-            .continue_ => ast.Expr{ .continue_expr = {} },
+            // Zig's `continue` restarts the innermost loop, so a label naming
+            // an outer one has to survive into the AST: dropping it would send
+            // the restart to the wrong loop and answer a different question
+            // with no diagnostic.
+            .continue_ => |continue_expr| blk: {
+                break :blk ast.Expr{ .continue_expr = .{ .label = continue_expr.label } };
+            },
             .core_call => |call| try self.lowerCoreCall(call),
             .core_function => |function| try self.lowerCoreFunction(function),
             .external_variant => |variant| try self.lowerExternalVariant(expr_id, variant),
@@ -11142,6 +18549,39 @@ const Lowerer = struct {
                         if (c.args.len != 1) return error.UnsupportedExpression;
                         break :blk try self.lowerLocalClosureCall(closure, emitted_name, c.args[0]);
                     }
+                }
+
+                // `io::Cursor::new(source)` is the one standard-library
+                // constructor the runtime rewrites rather than names. Rust
+                // takes the source BY VALUE, so the argument's own type is
+                // the cursor's parameter, and the runtime cursor is built
+                // from that source and a read position that starts at zero —
+                // nothing is allocated and nothing is copied.
+                if (c.call_kind == .associated and self.isIoCursorNew(callee_def)) {
+                    if (c.args.len != 1) return error.GenericArgumentArityMismatch;
+                    try self.markRuntimeImport();
+                    const source_type = try self.exprType(c.args[0]) orelse
+                        return error.MissingExpressionType;
+                    const params = try self.alloc.alloc(ast.Type, 1);
+                    params[0] = try self.lowerType(source_type);
+                    // The generic argument belongs to the TYPE, not to the
+                    // call: `r2z.io.Cursor(T).init(source)` is how a runtime
+                    // cursor is built, and `init` is a declaration inside the
+                    // type the parameter list instantiates.
+                    const cursor_type = try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .ident = "r2z.io.Cursor" }),
+                        .generic_args = params,
+                        .args = &.{},
+                    } });
+                    const call_args = try self.alloc.alloc(ast.Expr, 1);
+                    call_args[0] = try self.lowerExpr(c.args[0]);
+                    break :blk (try self.allocExpr(.{ .call = .{
+                        .callee = try self.allocExpr(.{ .field_access = .{
+                            .target = cursor_type,
+                            .field_name = "init",
+                        } }),
+                        .args = call_args,
+                    } })).*;
                 }
 
                 const allocates =
@@ -11191,14 +18631,21 @@ const Lowerer = struct {
                     self.current_owner_reserved = previous_owner_reserved;
                 }
 
-                const allocator_index: usize = if (allocates and
-                    c.call_kind == .associated and
-                    c.args.len > 0) 1 else 0;
+                // The allocator leads the value-argument list, and the
+                // declaration agrees: `lowerFnEntity` puts it ahead of every
+                // value parameter — a hoisted method's `self` included —
+                // while a method inside its own struct declares `self`
+                // implicitly, so `self` is never one of these arguments
+                // either. An associated call such as `FromHex::from_hex(hex)`
+                // therefore passes it FIRST: `from_hex(T, allocator, hex)`.
+                // Emitting it after the first argument produced
+                // `from_hex(T, hex, allocator)`, which binds `hex` to the
+                // allocator parameter and Zig rejects the type.
                 var args = try self.alloc.alloc(
                     ast.Expr,
                     c.args.len + if (allocates) @as(usize, 1) else 0,
                 );
-                if (allocates) args[allocator_index] = .{ .ident = "allocator" };
+                if (allocates) args[0] = .{ .ident = "allocator" };
                 for (c.args, 0..) |arg_id, i| {
                     const previous_expected_type = self.expected_argument_type;
                     const previous_expected_expr_id = self.expected_argument_expr_id;
@@ -11207,19 +18654,34 @@ const Lowerer = struct {
                         arg_id
                     else
                         null;
-                    const destination_index = i + if (allocates and i >= allocator_index)
-                        @as(usize, 1)
-                    else
-                        0;
+                    const destination_index = i + if (allocates) @as(usize, 1) else 0;
                     args[destination_index] = lowered_arg: {
                         defer {
                             self.expected_argument_type = previous_expected_type;
                             self.expected_argument_expr_id = previous_expected_expr_id;
                         }
-                        break :lowered_arg try self.lowerExpr(arg_id);
+                        const lowered_arg_value = try self.lowerExpr(arg_id);
+                        // A fat borrow lowers to the value itself, and a
+                        // `&mut T` parameter of a translated generic lowers to
+                        // the Zig pointer `*T`. The address is what bridges the
+                        // two, and only this argument needs it: one that is
+                        // already a pointer is the pointer the parameter wrote.
+                        break :lowered_arg if (try self.argumentTakesGenericBorrowAddress(
+                            c,
+                            i,
+                            arg_id,
+                        ))
+                            (try self.allocExpr(.{
+                                .unary_op = .{
+                                    .op = .addr_of,
+                                    .operand = try self.allocExpr(lowered_arg_value),
+                                },
+                            })).*
+                        else
+                            lowered_arg_value;
                     };
                 }
-                const generic_args = try self.lowerCallGenericArgs(expr_id, callee_def, c.args);
+                const generic_args = try self.lowerCallGenericArgs(expr_id, callee_def, c.args, &.{});
                 const lowered_call = if (c.call_kind == .constructor)
                     try self.lowerTupleStructConstructor(callee_def, generic_args, args)
                 else blk_call: {
@@ -11258,17 +18720,39 @@ const Lowerer = struct {
                         .args = call_args,
                     } };
                 }
-                const receiver = try self.allocExpr(try self.lowerExpr(mc.receiver));
                 const method_entity = self.ir.graph.symbol_table.get(mc.method) orelse {
                     return error.MissingDefinition;
                 };
                 try self.validateMethodTopology(method_entity);
-                if (try self.lowerBoundConversion(expr_id, method_entity, receiver)) |conversion| {
+                const method_name = method_entity.renamed_to orelse method_entity.name;
+                // A blanket impl types its receiver from the impl's declared
+                // bound plus the receiver's own length, and the frontend
+                // leaves such a receiver untyped. Handing that answer to the
+                // receiver's own lowering is what lets
+                // `[0x66, ..].encode_hex::<String>()` emit a typed array
+                // literal rather than the identity-less one the AST rejects.
+                const previous_receiver_type = self.expected_value_type;
+                defer self.expected_value_type = previous_receiver_type;
+                const blanket_target = try self.blanketCallTarget(mc.method, method_name, mc.receiver);
+                if (blanket_target) |target| {
+                    self.expected_value_type = target.self_type;
+                }
+                const lowered_receiver = try self.allocExpr(try self.lowerExpr(mc.receiver));
+                if (try self.lowerBoundConversion(expr_id, method_entity, lowered_receiver, mc.receiver)) |conversion| {
                     if (mc.args.len != 0) return error.UnsupportedStandardMethod;
                     break :blk conversion;
                 }
-                const method_name = method_entity.renamed_to orelse method_entity.name;
-                const allocates = self.directCallAllocates(mc.method);
+                // A trait method reference carries no allocation effect of its
+                // own — the effect belongs to the impl's `fn` — so the call
+                // has to be resolved before its result can be known to be
+                // fallible. Unresolved, the hoisted `encode_hex(..) ->
+                // !r2z.alloc.String` reached the `==` in `test_to_hex` as a
+                // bare error union and Zig rejected the whole comparison.
+                const allocates = self.directCallAllocates(mc.method) or
+                    (if (blanket_target) |target|
+                        self.directCallAllocates(target.method_fn_id)
+                    else
+                        false) or try self.stdMethodTakesAllocatorArg(mc.receiver, method_name);
 
                 var owned_prelude: std.ArrayListUnmanaged(ast.Stmt) = .empty;
                 defer owned_prelude.deinit(self.alloc);
@@ -11286,6 +18770,11 @@ const Lowerer = struct {
                     self.current_owner_reserved = previous_owner_reserved;
                 }
 
+                // A `String` receiver that needs mutable storage binds ahead
+                // of this: the source evaluates the receiver first, and the
+                // argument loop below is what fills the rest of the prelude.
+                const receiver_prelude_at = owned_prelude.items.len;
+
                 // An inline closure argument cannot be lowered on its own, so
                 // the closure-taking combinators are expanded whole before the
                 // argument loop reaches the bare `.closure` node. Arguments
@@ -11293,18 +18782,25 @@ const Lowerer = struct {
                 if (method_entity.kind == .method_ref and mc.args.len == 1) {
                     if (try self.lookupRecognizedStdMethod(mc.receiver, method_name)) |recognized| {
                         switch (recognized) {
-                            .option_map, .option_and_then, .result_map, .result_map_err => {
+                            .option_map, .option_and_then, .result_map, .result_map_err, .iterator_any => {
                                 if (self.inlineClosureArgument(mc.args[0])) |closure| {
                                     break :blk try self.lowerDirectCallResult(
                                         expr_id,
                                         try self.lowerInlineClosureCombinator(
                                             recognized,
                                             mc.receiver,
-                                            receiver,
+                                            lowered_receiver,
                                             closure,
                                         ),
                                         allocates,
                                     );
+                                }
+                                // The expansion is the only shape there is:
+                                // the predicate has to be spelled out at the
+                                // call site, so a named `fn` reaching here
+                                // cannot become an `r2z` iterator call.
+                                if (recognized == .iterator_any) {
+                                    return error.UnsupportedStandardMethod;
                                 }
                             },
                             else => {},
@@ -11327,51 +18823,98 @@ const Lowerer = struct {
                     }
                     args[i] = try self.lowerExpr(arg_id);
                 }
-
-                const standard_call = if (method_entity.kind == .method_ref) try self.lowerStdMethodCall(
+                const standard_call = if (method_entity.kind == .method_ref or
+                    try self.dynTraitMethodReceiver(mc.receiver)) try self.lowerStdMethodCall(
                     method_name,
                     mc.receiver,
-                    receiver,
+                    lowered_receiver,
                     args,
                     mc.args,
                     mc.generic_args,
                 ) else null;
-                const blanket_call = if (method_entity.kind == .method_ref)
-                    try self.lowerBlanketImplMethodCall(
-                        expr_id,
-                        mc,
-                        method_name,
-                        receiver.*,
-                        args,
-                        &owned_prelude,
-                    )
-                else
-                    null;
+                // Which declaration the resolver attached decides nothing
+                // here: the blanket branch is chosen by RESOLUTION, not by the
+                // entity's kind. `blanketCallTarget` answers only for a
+                // blanket impl's own method, whether the call reached the
+                // trait's `method_ref` or the impl's `fn` — and which of the
+                // two a given call carries is the resolver's business, not
+                // this branch's. Gating on `.method_ref` refused the
+                // `fn`-bound half, and `fn encode<T: AsRef<[u8]>>(data: T)`
+                // reaching its method through the pre-existing name lookup
+                // emitted `data.encode_hex(..)` as a Zig member call, which no
+                // `[]const u8` has a field for.
+                const blanket_call = try self.lowerBlanketImplMethodCall(
+                    expr_id,
+                    mc,
+                    method_name,
+                    lowered_receiver.*,
+                    args,
+                    &owned_prelude,
+                );
+                // The standard runtime branch owns its own allocator threading
+                // AND its own fallibility: every arm in `lowerStdMethodCall`
+                // that allocates already raised `current_callable_is_allocating`
+                // so the enclosing callable declares the allocator, and every
+                // arm that can fail already wrapped its result in `try`.
+                // Wrapping it again here — which the user-call path below
+                // needs, because a user function's own body is what decides
+                // whether it can fail — put a second `try` around a call that
+                // had one, and around helpers that return a plain value.
                 const lowered_call = if (standard_call) |lowered|
-                    try self.lowerDirectCallResult(expr_id, lowered.*, allocates)
+                    lowered.*
                 else if (blanket_call) |lowered|
                     try self.lowerDirectCallResult(expr_id, lowered, allocates)
                 else blk_call: {
-                    const call_args = if (allocates) alloc_args: {
+                    // `rev`/`count` and their siblings have no Zig member on
+                    // a range or an `r2z` iterator, so the fall-through below
+                    // emitted `range.count()` and Zig rejected the call with
+                    // "no field or member function named 'count'". A user
+                    // type's own method of the same name still goes through,
+                    // so the refusal is scoped to these two receivers.
+                    if (method_entity.kind == .method_ref and
+                        isMissingIteratorMethod(method_name) and
+                        try self.isRangeOrRuntimeIteratorReceiver(mc.receiver))
+                    {
+                        return error.UnsupportedStandardMethod;
+                    }
+                    const call_receiver = try self.bindRuntimeStringReceiver(
+                        &owned_prelude,
+                        receiver_prelude_at,
+                        lowered_receiver,
+                        mc.receiver,
+                        method_name,
+                    );
+                    const generic_args = try self.lowerCallGenericArgs(expr_id, mc.method, mc.args, mc.generic_args);
+                    // An impl whose self type is not this crate's own has no
+                    // struct to hold the method, so the declaration was hoisted
+                    // to module scope under a name of its own and takes the
+                    // converted value as its first parameter. A member call
+                    // would ask the RECEIVER's type for something its own
+                    // impls never wrote; this asks the function the source
+                    // actually declared.
+                    const hoisted = moduleHoistedImplMethod(self, mc.method);
+                    const callee = if (hoisted) |method_id|
+                        try self.allocExpr(try self.lowerResolvedEntity(method_id))
+                    else
+                        try self.allocExpr(ast.Expr{
+                            .field_access = .{
+                                .target = call_receiver,
+                                .field_name = try self.alloc.dupe(u8, method_name),
+                            },
+                        });
+                    const call_args = if (hoisted) |method_id|
+                        try self.hoistedSelfArguments(method_id, call_receiver, args, allocates)
+                    else if (allocates) alloc_args: {
                         const result = try self.alloc.alloc(ast.Expr, args.len + 1);
                         result[0] = .{ .ident = "allocator" };
                         @memcpy(result[1..], args);
                         break :alloc_args result;
                     } else args;
-                    const field_access = try self.allocExpr(ast.Expr{
-                        .field_access = .{
-                            .target = receiver,
-                            .field_name = try self.alloc.dupe(u8, method_name),
-                        },
-                    });
-                    const generic_args = try self.lowerCallGenericArgs(expr_id, mc.method, mc.args);
-                    const call_expr = ast.Expr{
-                        .call = .{
-                            .callee = field_access,
-                            .generic_args = generic_args,
-                            .args = call_args,
-                        },
-                    };
+                    const call_expr = ast.Expr{ .call = .{
+                        .callee = callee,
+                        .generic_args = generic_args,
+                        .args = call_args,
+                    } };
                     break :blk_call try self.lowerDirectCallResult(expr_id, call_expr, allocates);
                 };
                 if (owned_prelude.items.len == 0) break :blk lowered_call;
@@ -11470,6 +19013,23 @@ const Lowerer = struct {
                 if (ev.named_fields.len > 0 and ev.tuple_fields.len > 0) {
                     return error.VariantArityMismatch;
                 }
+                // `io::ErrorKind` is a real standard enum, so its variants
+                // arrive as `enum_variant` rather than as a synthetic
+                // prelude type. A unit variant IS its runtime member, under the
+                // same std spelling on both sides, so it names that member
+                // directly — the runtime enum the type side already maps
+                // `std::io::ErrorKind` to, with no second declaration
+                // generated here. A payload-carrying variant is a different
+                // shape and still refuses.
+                if (self.isIoErrorKindVariant(ev.def)) {
+                    if (ev.tuple_fields.len != 0 or ev.named_fields.len != 0) {
+                        return error.VariantArityMismatch;
+                    }
+                    break :blk .{ .field_access = .{
+                        .target = try self.allocExpr(.{ .ident = "r2z.io.ErrorKind" }),
+                        .field_name = try self.alloc.dupe(u8, ev.variant),
+                    } };
+                }
                 if (self.syntheticExternalType(ev.def)) |synthetic_kind| {
                     switch (synthetic_kind) {
                         .option => {
@@ -11487,8 +19047,17 @@ const Lowerer = struct {
                             {
                                 return error.VariantArityMismatch;
                             }
+                            const option_type = try self.nodeType(expr_id) orelse
+                                return error.MissingTypedLiteralIdentity;
+                            // As with `Ok`, the `Some` node is the only place
+                            // that states what its payload is.
+                            const previous_expected_type = self.expected_value_type;
+                            if (option_type == .option) {
+                                self.expected_value_type = option_type.option.*;
+                            }
+                            defer self.expected_value_type = previous_expected_type;
                             break :blk .{ .cast = .{
-                                .target = try self.lowerType(try self.typeById(ir_expr.ty orelse return error.MissingTypedLiteralIdentity)),
+                                .target = try self.lowerType(option_type),
                                 .operand = try self.allocExpr(try self.lowerExpr(ev.tuple_fields[0])),
                             } };
                         },
@@ -11499,39 +19068,129 @@ const Lowerer = struct {
                             {
                                 return error.VariantArityMismatch;
                             }
-                            const fields = try self.alloc.alloc(ast.StructInitField, 1);
-                            errdefer self.alloc.free(fields);
-                            const name = try self.alloc.dupe(u8, ev.variant);
-                            errdefer self.alloc.free(name);
-                            const expr = try self.lowerExpr(ev.tuple_fields[0]);
-                            fields[0] = .{
-                                .name = name,
-                                .expr = expr,
-                            };
-                            // `r2z.Result` is a union and `.{}` is a struct
-                            // literal, so the anonymous form only coerces
-                            // where an expected type already reaches it. Naming
-                            // the union keeps `Ok`/`Err` a `Result` in every
-                            // position. A `Result` that lowers to a Zig error
-                            // union carries its payload bare and has no union
-                            // to name, so it keeps the anonymous initializer.
-                            const tagged_name: ?ast.Type = tagged: {
-                                const node_type = try self.typeById(
-                                    ir_expr.ty orelse break :tagged null,
+                            // Which `Result` this constructor builds decides
+                            // how it is spelled, and the node's own type — its
+                            // annotation, or the context the enclosing
+                            // expression established — is what says.
+                            // `current_return_type` is the fallback for a node
+                            // the frontend left unannotated: the frame that
+                            // returns it still states what it returns, and
+                            // nothing else does. Guessing the other way here
+                            // is what emitted `.{ .Ok = 7 }` where a Zig error
+                            // union wants the bare payload.
+                            // The descriptor is read from whatever carrier the
+                            // type carries, and lives in this frame: a type the
+                            // lowering spells as an error union has no table
+                            // entry to borrow from.
+                            var node_arms_value: ir.types.Result = undefined;
+                            const node_arms: ?*const ir.types.Result =
+                                if ((try self.nodeType(expr_id))) |node_type|
+                                    (if (resultDescriptorOf(node_type)) |descriptor| node_descriptor: {
+                                        node_arms_value = descriptor;
+                                        break :node_descriptor &node_arms_value;
+                                    } else null)
+                                else
+                                    null;
+                            var return_arms_value: ir.types.Result = undefined;
+                            const return_arms: ?*const ir.types.Result =
+                                if (self.current_return_type) |return_type|
+                                    (if (resultDescriptorOf(return_type)) |descriptor| return_descriptor: {
+                                        return_arms_value = descriptor;
+                                        break :return_descriptor &return_arms_value;
+                                    } else null)
+                                else
+                                    null;
+                            const result: ?*const ir.types.Result = node_arms orelse return_arms;
+                            const is_ok = std.mem.eql(u8, ev.variant, "Ok");
+                            // Whether this `Result` is a Zig error union decides
+                            // two things below: the constructor has no union to
+                            // name, and its error argument is the one place an
+                            // error tag belongs. Both are answered from the
+                            // descriptor this node resolved — the frame's
+                            // return type is the fallback for resolving that
+                            // descriptor, not a substitute for it, because a
+                            // callable can build a `Result` as a local value
+                            // and return something else entirely.
+                            const native_error_union = if (result) |arms|
+                                self.resultUsesErrorUnion(.{ .result = arms })
+                            else
+                                false;
+                            const previous_expected_type = self.expected_value_type;
+                            if (result) |arms| {
+                                // Nothing else in the source says what
+                                // `[0x66, ..]` is inside `Ok([0x66, ..])`, and
+                                // Zig needs a type name on an array literal, so
+                                // this is where the frontend's missing
+                                // annotation is recovered.
+                                self.expected_value_type = if (is_ok) arms.ok else arms.err;
+                            }
+                            defer self.expected_value_type = previous_expected_type;
+                            // A payload-free variant of the error enum IS the
+                            // tag an error union keeps bare, so it is emitted
+                            // as one here and the ordinary union member it
+                            // would otherwise become is never built. Any other
+                            // payload is lowered as the value it is and mapped
+                            // afterwards: only the value that lands in the
+                            // error slot is in error position, so a call
+                            // argument or a local binding underneath keeps
+                            // ordinary semantics.
+                            const constant_tag: ?[]const u8 = if (result) |arms|
+                                if (is_ok or !native_error_union)
+                                    null
+                                else
+                                    self.errorTagConstant(ev.tuple_fields[0], arms.err)
+                            else
+                                null;
+                            if (constant_tag) |tag| {
+                                break :blk .{ .lit = .{ .error_tag = try self.alloc.dupe(u8, tag) } };
+                            }
+                            const payload = try self.lowerExpr(ev.tuple_fields[0]);
+                            if (result) |arms| {
+                                if (native_error_union) {
+                                    // A Zig error union carries its payload
+                                    // bare and its error as the error set, so
+                                    // `Ok(v)` IS `v` and `Err(e)` IS `e` — the
+                                    // latter's payload is the error variant
+                                    // itself, which `errorTagMapping` turns
+                                    // into the tag that value is. There is no
+                                    // union here to name, so the tagged
+                                    // initializer has nothing to say.
+                                    if (is_ok) {
+                                        // `Ok(v)` IS `v`, and the union already
+                                        // spells the payload type, so a cast is
+                                        // only what a number needs: a bare `7`
+                                        // carries no type of its own. Every
+                                        // other payload IS already the value
+                                        // the slot takes, and a cast naming a
+                                        // named type is a node the AST
+                                        // validator refuses outright
+                                        // (ast.zig:1226-1228) — an enum
+                                        // payload reached it and the whole
+                                        // translation died on it.
+                                        if (isIntegerType(arms.ok) or
+                                            isFloatType(arms.ok))
+                                        {
+                                            break :blk .{ .cast = .{
+                                                .target = try self.lowerType(arms.ok),
+                                                .operand = try self.allocExpr(payload),
+                                            } };
+                                        }
+                                        break :blk payload;
+                                    }
+                                    break :blk try self.errorTagMapping(payload, arms.err);
+                                }
+                                // `r2z.Result` is a union and `.{}` is a
+                                // struct literal, so the anonymous form only
+                                // coerces where an expected type already
+                                // reaches it. Naming the union keeps
+                                // `Ok`/`Err` a `Result` in every position.
+                                break :blk try self.taggedResultArm(
+                                    ev.variant,
+                                    payload,
+                                    try self.lowerTaggedResult(arms.ok, arms.err),
                                 );
-                                if (self.resultUsesErrorUnion(node_type)) break :tagged null;
-                                const result = switch (node_type) {
-                                    .result => |value| value.*,
-                                    else => break :tagged null,
-                                };
-                                break :tagged (try self.allocType(
-                                    try self.lowerTaggedResult(result.ok, result.err),
-                                )).*;
-                            };
-                            break :blk .{ .struct_init = .{
-                                .type_name = tagged_name,
-                                .fields = fields,
-                            } };
+                            }
+                            break :blk try self.taggedResultArm(ev.variant, payload, null);
                         },
                     }
                 }
@@ -11555,24 +19214,17 @@ const Lowerer = struct {
                     },
                 }
                 const variant_name = try self.alloc.dupe(u8, ev.variant);
-                const returns_error_union = if (self.current_return_type) |return_type|
-                    self.resultUsesErrorUnion(return_type)
-                else
-                    false;
-                // A payload-free variant of a Zig error set becomes
-                // `error.Name`. A variant that carries fields is a value, not
-                // an error name, so it keeps the union initializer below.
-                if (returns_error_union and
-                    ev.tuple_fields.len == 0 and
-                    ev.named_fields.len == 0)
-                {
-                    const error_name = try self.alloc.dupe(u8, "error");
-                    const error_target = try self.allocExpr(.{ .ident = error_name });
-                    break :blk .{ .field_access = .{
-                        .target = error_target,
-                        .field_name = variant_name,
-                    } };
-                }
+                // A payload-free variant is a value of its enum here, and it
+                // stays one. `error.Name` is not a spelling of this
+                // expression but of the error value a `Result` that lowers to
+                // a Zig error union carries bare, and the `Err` constructor is
+                // what knows both that the union is a native one and that its
+                // argument is the value in the error slot — see
+                // `errorTagConstant` and `errorTagMapping`. Deciding it here
+                // from the enclosing frame's return type instead turned every
+                // field-free enum in a `Result`-returning body into a tag: a
+                // `Result`'s own `Ok` value, and the ordinary enum values
+                // around it.
                 if (ev.named_fields.len > 0) {
                     // A struct-style variant carries an anonymous struct, so the
                     // payload is a second initializer nested inside the variant
@@ -11606,15 +19258,57 @@ const Lowerer = struct {
                         },
                     };
                 }
-                // A field-less variant is a value of the union, so it names
-                // that union first. A variant carrying a tuple payload keeps
-                // the bare-identifier spelling below.
+                // A field-less variant is a value of its enum, and which
+                // spelling that takes follows the declaration the enum's own
+                // lowering picks. A data-carrying enum declares as a tagged
+                // `union(enum)`, where every variant is a field and a
+                // payload-free one is declared `void`: the value is then the
+                // struct initializer that fills that field, and `Enum.Variant`
+                // would be the union's tag enum instead, whose type is wrong
+                // everywhere except the one comparison a tag happens to
+                // satisfy — `FromHexError::OddLength.to_string()` handed the
+                // formatter a tag and the runtime rejected it. A purely
+                // field-free enum declares as a plain Zig `enum`, whose
+                // members are bare tags with no field to initialize at all,
+                // so the value is the tag itself.
                 if (ev.tuple_fields.len == 0) {
-                    break :blk ast.Expr{
-                        .ident = try self.unitVariantName(ev.def, variant_name),
-                    };
+                    const owner_name = try self.enumOwnerName(ev.def);
+                    if (!self.enumDeclaresTagFields(ev.def)) {
+                        break :blk ast.Expr{ .field_access = .{
+                            .target = try self.allocExpr(.{ .ident = owner_name }),
+                            .field_name = variant_name,
+                        } };
+                    }
+                    const fields = try self.alloc.alloc(ast.StructInitField, 1);
+                    fields[0] = .{ .name = variant_name, .expr = .{ .unit = {} } };
+                    break :blk ast.Expr{ .struct_init = .{
+                        .type_name = ast.Type{ .named = owner_name },
+                        .fields = fields,
+                    } };
                 }
-                break :blk ast.Expr{ .ident = variant_name };
+                const tuple_payload = try self.alloc.alloc(ast.Expr, ev.tuple_fields.len);
+                errdefer self.alloc.free(tuple_payload);
+                for (ev.tuple_fields, 0..) |field_id, index| {
+                    tuple_payload[index] = try self.lowerExpr(field_id);
+                }
+                // One element is the field type itself; several form the
+                // anonymous tuple struct the union field declares.
+                const payload: ast.Expr = if (tuple_payload.len == 1)
+                    tuple_payload[0]
+                else
+                    .{ .tuple = tuple_payload };
+                const tuple_fields_list = try self.alloc.alloc(ast.StructInitField, 1);
+                errdefer self.alloc.free(tuple_fields_list);
+                tuple_fields_list[0] = .{
+                    .name = variant_name,
+                    .expr = payload,
+                };
+                break :blk ast.Expr{
+                    .struct_init = .{
+                        .type_name = ast.Type{ .named = try self.enumOwnerName(ev.def) },
+                        .fields = tuple_fields_list,
+                    },
+                };
             },
             .field => |fe| blk: {
                 const base = try self.allocExpr(try self.lowerExpr(fe.base));
@@ -11641,21 +19335,45 @@ const Lowerer = struct {
                 if (ie.index >= self.ir.bodies.exprs.len) {
                     return error.MissingExpressionNode;
                 }
-                const base = try self.allocExpr(try self.lowerExpr(ie.base));
+                var base = try self.allocExpr(try self.lowerExpr(ie.base));
+                // A lowered `Vec` is an `ArrayListUnmanaged`; Zig indexes the
+                // storage it holds, so read through `.items` before indexing.
+                const base_type = try self.exprType(ie.base);
+                if (needsContainerStorageProjection(base_type)) {
+                    // A `Vec` produced by a call is still an error union here:
+                    // `f()[0]` is lowered as a bare `f()` because Rust's `?`
+                    // already propagated, and `f().items` projects a member
+                    // the error union does not have. Hoisting the producer into
+                    // an owned temporary needs the `try` and `defer deinit`
+                    // that only statement position has, so refuse.
+                    if (base_type != null and self.resultUsesErrorUnion(base_type.?) or
+                        isUnpropagatedErrorUnionExpr(base.*))
+                    {
+                        return error.UnsupportedExpression;
+                    }
+                    base = try self.allocExpr(.{ .field_access = .{
+                        .target = base,
+                        .field_name = "items",
+                    } });
+                }
+                // Rust's indexing auto-derefs, and `lowerType` keeps a borrow
+                // of an ARRAY as the pointer it really is (`*const [N] u8`), so
+                // a hoisted `static ENC_TABLE: &[u8; N]` names its storage by
+                // address. The slice is taken through that address, which is
+                // also what keeps the static's address identity: nothing here
+                // copies the array out from under it.
+                if (borrowPointsAtArray(base_type)) {
+                    base = try self.allocExpr(.{ .unary_op = .{
+                        .op = .deref,
+                        .operand = base,
+                    } });
+                }
                 const idx = try self.allocExpr(switch (self.ir.bodies.exprs[ie.index].kind) {
                     // A slice index is a statement position: `s[0..n]`.
                     .range => |range| try self.lowerRangeSliceExpr(range, true),
                     else => try self.lowerExpr(ie.index),
                 });
-                var args = try self.alloc.alloc(ast.Expr, 2);
-                args[0] = base.*;
-                args[1] = idx.*;
-                break :blk ast.Expr{
-                    .builtin = .{
-                        .name = "index",
-                        .args = args,
-                    },
-                };
+                break :blk try self.indexSliceExpr(base, idx);
             },
             .cast => |cast| blk: {
                 const target_ir = try self.typeById(cast.target);
@@ -11666,7 +19384,7 @@ const Lowerer = struct {
                         .operand = try self.allocExpr(try self.lowerExpr(cast.operand)),
                     } };
                 }
-                if (isScalarCastType(cast.source_type)) {
+                if (isScalarCastSource(cast.source_type)) {
                     if (!isScalarCastType(target_ir)) return error.UnsupportedExpression;
                     switch (cast.kind) {
                         .as_ => {},
@@ -11684,11 +19402,36 @@ const Lowerer = struct {
                 // A From conversion exists only between unsigned scalars, so
                 // anything reaching the pointer path is not a legal primitive_from.
                 if (cast.kind == .primitive_from) return error.UnsupportedExpression;
-                const source_pointer = switch (cast.source_type) {
+                const target_pointer = switch (target_ir) {
                     .raw_ptr => |pointer| pointer,
                     else => return error.UnsupportedExpression,
                 };
-                const target_pointer = switch (target_ir) {
+                // A fat borrow is `&[T]`, `&mut [T]`, a bare `[T]` slice, or a
+                // `*const [T]` / `*mut [T]`, and every one of them carries the
+                // element AND the length. Casting between them re-labels the
+                // fat pointer and keeps both, so the emitted `@ptrCast` sits
+                // between two slices and loses neither the pointer nor the
+                // length.
+                //
+                // The rule is the one the frontend and the validator already
+                // apply, restated rather than reinvented: only a fat
+                // destination can hold the length, the element types have to
+                // agree, and a shared borrow cannot become a mutable pointer.
+                if (fatBorrowSlice(cast.source_type)) |source_slice| {
+                    const target_slice = switch (target_pointer.pointee) {
+                        .slice => |slice| slice,
+                        else => return error.UnsupportedExpression,
+                    };
+                    if (!fatBorrowCastCompatible(
+                        source_slice,
+                        target_slice,
+                        target_pointer.mut,
+                    )) {
+                        return error.UnsupportedExpression;
+                    }
+                    break :blk try self.fatBorrowCast(cast.source_type, target_ir, cast.operand);
+                }
+                const source_pointer = switch (cast.source_type) {
                     .raw_ptr => |pointer| pointer,
                     else => return error.UnsupportedExpression,
                 };
@@ -11750,20 +19493,31 @@ const Lowerer = struct {
                     try self.allocExpr(ast.Expr{ .unary_op = .{ .op = .deref, .operand = try self.allocExpr(raw_rhs) } })
                 else
                     try self.allocExpr(raw_rhs);
-                if (requiresRuntimeOperator(lhs_ty)) {
-                    defer self.alloc.destroy(lhs);
-                    defer self.alloc.destroy(lowered_rhs);
-                    break :blk try self.lowerRuntimeOperator("binary", @tagName(be.op), be.overflow, lhs.*, lowered_rhs.*);
+                // A literal the IR typed through a local ALIAS reaches Zig as a
+                // bare `comptime_int`, and every operator here is either a
+                // `comptime_int`-typed shift or a generic runtime helper that
+                // takes its width from the operand. Rust typed that literal
+                // inside the alias's own primitive, so the width is restored
+                // before either one sees it.
+                const widthed_lhs = try self.lowerAliasedLiteralOperand(be.lhs, lhs, lhs_ty);
+                const widthed_rhs = try self.lowerAliasedLiteralOperand(be.rhs, lowered_rhs, rhs_ty);
+                if (requiresRuntimeComparison(be.op, lhs_ty, rhs_ty)) {
+                    defer self.alloc.destroy(widthed_lhs);
+                    defer self.alloc.destroy(widthed_rhs);
+                    break :blk try self.lowerBorrowedComparison(be, widthed_lhs.*, widthed_rhs.*);
                 }
 
-                const rhs = if (!uses_float and (be.op == .shl or be.op == .shr)) shift: {
-                    const args = try self.alloc.alloc(ast.Expr, 1);
-                    args[0] = lowered_rhs.*;
-                    break :shift try self.allocExpr(.{ .builtin = .{
-                        .name = "intCast",
-                        .args = args,
-                    } });
-                } else lowered_rhs;
+                const is_integer_shift = !uses_float and (be.op == .shl or be.op == .shr);
+                const rhs = if (is_integer_shift)
+                    try self.allocExpr(try self.lowerShiftAmount(widthed_rhs.*))
+                else
+                    widthed_rhs;
+                // Rust shifts inside the left operand's type, so the left side
+                // must hold that type before the shift, not after it.
+                const shifted_lhs = if (is_integer_shift)
+                    try self.lowerShiftOperand(be.lhs, widthed_lhs, lhs_ty)
+                else
+                    widthed_lhs;
                 const op_kind: ast.BinOpKind = switch (be.op) {
                     .add => if (uses_float) .add else switch (be.overflow) {
                         .checked => .add,
@@ -11799,7 +19553,7 @@ const Lowerer = struct {
                 break :blk ast.Expr{
                     .bin_op = .{
                         .op = op_kind,
-                        .lhs = lhs,
+                        .lhs = shifted_lhs,
                         .rhs = rhs,
                     },
                 };
@@ -11810,17 +19564,58 @@ const Lowerer = struct {
                         break :blk owned;
                     }
                     if (self.shouldElideSliceBorrow(ue.operand)) {
+                        // The borrow is the slice descriptor, but a MUTABLE
+                        // one over an array the binding owns still writes that
+                        // array, and the address is what says so.
+                        const keep_address = switch (ue.op) {
+                            .ref => |mode| mode == .mutable and
+                                self.mutableBorrowWritesOwnedArray(ue.operand),
+                            else => false,
+                        };
+                        break :blk if (keep_address)
+                            try self.lowerAddressedSliceBorrow(ue.operand)
+                        else
+                            try self.lowerExpr(ue.operand);
+                    }
+                    // `&dyn Trait` IS the borrowed handle, so the address-of
+                    // reifies nothing; the operand is what becomes the
+                    // handle, and taking ITS address is the erase. Applied
+                    // after the coercion runs on the operand, it emits the
+                    // handle by value exactly as the by-value parameter is
+                    // declared.
+                    if (try self.borrowIsTraitObjectItself(expr_id)) {
+                        break :blk try self.lowerExpr(ue.operand);
+                    }
+                    // `&*container` borrows the SEQUENCE the container derefs
+                    // to, and that sequence is a slice in Zig, so the borrow
+                    // of it IS the slice. `&*bytes` over a `Vec<u8>` names
+                    // `&[u8]`; taking the address of the descriptor instead
+                    // would hand the callee a pointer to a list.
+                    if (try self.borrowOfContainerStorage(ue.operand)) {
                         break :blk try self.lowerExpr(ue.operand);
                     }
                 }
                 if (ue.op == .deref and self.shouldElideValueCaptureDeref(ue.operand)) {
                     break :blk try self.lowerExpr(ue.operand);
                 }
+                if (ue.op == .deref) {
+                    // A runtime container's `Deref` target is its element
+                    // sequence, which a lowered `Vec` holds in `items`. Zig
+                    // cannot dereference a list, so `*vec` reads that slice —
+                    // the same bytes the Rust deref names, in the same storage.
+                    if (needsContainerStorageProjection(try self.exprType(ue.operand))) {
+                        const projected = try self.allocExpr(try self.lowerExpr(ue.operand));
+                        break :blk (try self.allocExpr(.{ .field_access = .{
+                            .target = projected,
+                            .field_name = "items",
+                        } })).*;
+                    }
+                }
                 const operand = try self.allocExpr(try self.lowerExpr(ue.operand));
 
                 const is_int_literal = self.isIntegerLiteral(ue.operand);
                 const operand_type = (try self.exprType(ue.operand)) orelse self.expected_argument_type;
-                const is_int_op = is_int_literal or isIntegerType(operand_type);
+                const is_int_op = is_int_literal or self.isIntegerOperand(operand_type);
                 const is_bit_not = (ue.op == .bit_not) or (ue.op == .logical_not and is_int_op);
 
                 const final_operand = if (is_bit_not and is_int_literal) blk_cast: {
@@ -11912,6 +19707,9 @@ const Lowerer = struct {
                 self.explicit_try_expr = te.inner;
                 defer self.explicit_try_expr = previous_explicit_try;
                 const operand_expr = try self.lowerExpr(te.inner);
+                if (try self.lowerOptionPropagation(operand_expr, te.inner)) |propagated| {
+                    break :blk propagated;
+                }
                 if (try self.lowerTaggedResultPropagation(operand_expr, te.inner)) |propagated| {
                     break :blk propagated;
                 }
@@ -11949,6 +19747,178 @@ const Lowerer = struct {
             },
         };
     }
+
+    /// Element type of a `vec!` literal, in descending order of authority:
+    /// the annotation the literal carries, then the type the enclosing
+    /// expression has already established, then the first element's own type —
+    /// which is what inference settles on anyway. A nested literal is
+    /// unannotated, so the context is what names its element; an empty `vec![]`
+    /// with neither names nothing and has no element to stand in for it, and is
+    /// refused rather than guessed at.
+    fn vecLiteralElementType(
+        self: *Lowerer,
+        ir_expr: ir.exprs.Expr,
+        vec: ir.exprs.VecLit,
+    ) anyerror!ir.types.Type {
+        // An annotation on the literal is the source stating what it is.
+        if (ir_expr.ty) |tid| {
+            if (try vecElementOfContext(try self.typeById(tid))) |element| return element;
+        }
+        // A nested literal has no annotation of its own: the frontend leaves
+        // the inner node of `vec![vec![1, 100, 2], ..]` untyped and types the
+        // integer literals themselves `i32`, Rust's default for an unsuffixed
+        // literal, while the context the enclosing `vec!` established is the
+        // better answer — `Vec<Vec<u32>>` names the inner element `u32`, and
+        // that is the type they are appended into.
+        if (self.expected_value_type) |context| {
+            if (try vecElementOfContext(context)) |element| return element;
+        }
+        if (vec.elements.len == 0) return error.MissingExpressionType;
+        return (try self.exprType(vec.elements[0])) orelse error.MissingExpressionType;
+    }
+
+    /// The element type a `Vec<T>` names, or null when `context` is not one.
+    fn vecElementOfContext(context: ir.types.Type) anyerror!?ir.types.Type {
+        switch (context) {
+            .external_nominal => |external| {
+                if (!isAllocVecPath(external.path)) return null;
+                if (external.args.len != 1) return error.GenericArgumentArityMismatch;
+                return external.args[0];
+            },
+            else => return null,
+        }
+    }
+
+    /// One `try <owner>.append(allocator, <element>);` statement.
+    ///
+    /// Every element builds its own `ast.Expr` nodes. The emitter walks a
+    /// shared tree, so one call node reused across statements would print the
+    /// last element at every position — `vec![(0, 1), (2, 3)]` would append
+    /// `(2, 3)` twice and still compile.
+    fn vecAppendStatement(self: *Lowerer, owner_name: []const u8, element: ast.Expr) anyerror!ast.Stmt {
+        const args = try self.alloc.alloc(ast.Expr, 2);
+        args[0] = .{ .ident = "allocator" };
+        args[1] = element;
+        return .{ .expr_stmt = try self.allocExpr(.{ .unary_op = .{
+            .op = .try_op,
+            .operand = try self.allocExpr(.{ .call = .{
+                .callee = try self.allocExpr(.{ .field_access = .{
+                    .target = try self.allocExpr(.{ .ident = owner_name }),
+                    .field_name = "append",
+                } }),
+                .args = args,
+            } }),
+        } }) };
+    }
+
+    /// `vec![a, b, c]` and `vec![a; n]`.
+    ///
+    /// `Vec<T>` lowers to `std.ArrayListUnmanaged(T)`, a container that owns
+    /// its buffer and hands it back through `deinit(gpa)`. Appending through
+    /// `allocator` is what keeps that promise: the finished list holds memory
+    /// the same allocator can release, so the `deinit(allocator)` every other
+    /// `Vec` producer emits stays correct. A struct literal over a comptime
+    /// array would type-check and then free static memory the moment anyone
+    /// deinitialised it.
+    ///
+    /// The repeated form fills the list through one `for` over `0..n` instead
+    /// of `n` unrolled `append` calls. `n` is a literal in Rust but need not
+    /// be a small one, and unrolling turns a valid `vec![0u8; 1 << 20]` into
+    /// a million statements.
+    fn lowerVecLiteral(
+        self: *Lowerer,
+        ir_expr: ir.exprs.Expr,
+        vec: ir.exprs.VecLit,
+    ) anyerror!ast.Expr {
+        const element_type = try self.vecLiteralElementType(ir_expr, vec);
+        const owner_type = try self.lowerRuntimeGenericExternalType(
+            "std.ArrayListUnmanaged",
+            &.{element_type},
+            1,
+        );
+        const owner_name = try self.iteratorTemporaryName("__r2z_vec");
+        // The emitter's fallback numbers a value block by nesting depth, so
+        // two literals in one statement list would land on the same label.
+        const label = try std.fmt.allocPrint(self.alloc, "{s}_value", .{owner_name});
+        const owner_type_expr: ast.Expr = switch (owner_type) {
+            .named => |name| .{ .ident = name },
+            .generic => |generic| .{ .call = .{
+                .callee = try self.allocExpr(.{ .ident = generic.name }),
+                .generic_args = generic.params,
+                .args = &.{},
+            } },
+            else => return error.UnsupportedCollectionType,
+        };
+
+        var stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer stmts.deinit(self.alloc);
+        try stmts.append(self.alloc, .{ .let_stmt = .{
+            .name = owner_name,
+            .ty = owner_type,
+            .init = .{ .field_access = .{
+                .target = try self.allocExpr(owner_type_expr),
+                .field_name = "empty",
+            } },
+            .is_mut = true,
+        } });
+        // `errdefer`, not `defer`: on the way out the block hands the list to
+        // its caller, which owns it from then on. Only an allocation failure
+        // while building it still has to release what was appended so far.
+        try stmts.append(self.alloc, .{ .defer_stmt = .{
+            .expr = .{ .call = .{
+                .callee = try self.allocExpr(.{ .field_access = .{
+                    .target = try self.allocExpr(.{ .ident = owner_name }),
+                    .field_name = "deinit",
+                } }),
+                .args = &.{.{ .ident = "allocator" }},
+            } },
+            .is_errdefer = true,
+        } });
+
+        // Every element of this list has the `Vec`'s element type, including
+        // a nested literal the frontend left untyped.
+        const previous_expected_type = self.expected_value_type;
+        self.expected_value_type = element_type;
+        defer self.expected_value_type = previous_expected_type;
+
+        if (vec.repeat) |count| {
+            if (vec.elements.len != 1) return error.UnsupportedExpression;
+            const body = try self.alloc.alloc(ast.Stmt, 1);
+            body[0] = try self.vecAppendStatement(
+                owner_name,
+                try self.lowerExpr(vec.elements[0]),
+            );
+            // The input slice is allocated, not `&.{ .. }`: the range holds
+            // two heap-allocated endpoints, so the literal is a runtime
+            // temporary and a pointer to it dangles the moment this block
+            // ends. Validation reads it back after lowering and segfaulted.
+            const inputs = try self.alloc.alloc(ast.Expr, 1);
+            inputs[0] = .{ .range = .{
+                .start = try self.allocExpr(.{ .lit = .{ .uint = 0 } }),
+                .end = try self.allocExpr(.{ .lit = .{ .uint = count } }),
+            } };
+            const captures = try self.alloc.alloc(ast.Capture, 1);
+            captures[0] = .{ .name = "_" };
+            try stmts.append(self.alloc, .{ .expr_stmt = try self.allocExpr(.{ .for_expr = .{
+                .inputs = inputs,
+                .captures = captures,
+                .body = .{ .stmts = body },
+            } }) });
+        } else {
+            for (vec.elements) |element| {
+                try stmts.append(
+                    self.alloc,
+                    try self.vecAppendStatement(owner_name, try self.lowerExpr(element)),
+                );
+            }
+        }
+
+        return .{ .block = .{
+            .label = label,
+            .stmts = try stmts.toOwnedSlice(self.alloc),
+            .expr = try self.allocExpr(.{ .ident = owner_name }),
+        } };
+    }
     /// Lower `operand?` when the operand is a `Result` that becomes the tagged
     /// `r2z.Result` union, and `null` when a Zig `try` is the right spelling.
     ///
@@ -11959,7 +19929,29 @@ const Lowerer = struct {
     /// over the two tags. A differing error type needs a conversion the
     /// backend has no faithful spelling for, and dropping it would silently
     /// change the program, so it is reported instead.
+    /// What a blanket impl's method call resolves to: the hoisted function
+    /// the call becomes, and the self type it is called with. Null when the
+    /// method has no blanket impl, the impl declares no method by that name,
+    /// or the receiver is neither a known array nor an array literal whose
+    /// length the bound can type.
+    const BlanketCallTarget = struct {
+        method_fn_id: ir.spine.EntityId,
+        self_type: ir.types.Type,
+    };
 
+    fn blanketCallTarget(
+        self: *Lowerer,
+        method_def: ir.spine.EntityId,
+        method_name: []const u8,
+        receiver: ir.exprs.NodeId,
+    ) !?BlanketCallTarget {
+        const impl_id = self.blanketImplForMethod(method_def) orelse return null;
+        const method_fn_id = self.blanketImplMethod(impl_id, method_name) orelse return null;
+        // Element type from the declared bound, never from the literal.
+        const element = self.blanketBoundElement(impl_id) orelse return null;
+        const self_type = (try self.blanketReceiverType(receiver, element)) orelse return null;
+        return .{ .method_fn_id = method_fn_id, .self_type = self_type };
+    }
 
     /// Emit a call to a blanket impl's method as a direct call to the hoisted
     /// free function.
@@ -11989,20 +19981,16 @@ const Lowerer = struct {
         args: []const ast.Expr,
         prelude: *std.ArrayListUnmanaged(ast.Stmt),
     ) !?ast.Expr {
-        const trait_id = self.methodRefTrait(mc.method) orelse return null;
-        const impl_id = self.blanketImplFor(trait_id) orelse return null;
-        const method_fn_id = self.blanketImplMethod(impl_id, method_name) orelse return null;
-
-        // Element type from the declared bound, never from the literal.
-        const element = self.blanketBoundElement(impl_id) orelse return null;
-        const self_type = (try self.blanketReceiverType(mc.receiver, element)) orelse return null;
+        const target = (try self.blanketCallTarget(mc.method, method_name, mc.receiver)) orelse return null;
+        const method_fn_id = target.method_fn_id;
+        const self_type = target.self_type;
 
         const takes_allocator = self.hoistedMethodTakesAllocator(method_fn_id);
 
         // Comptime type arguments: the impl's own `T` first, then the
         // method's own parameters, matching the declared parameter order.
         const self_type_ast = try self.lowerType(self_type);
-        const method_generics = try self.lowerCallGenericArgs(expr_id, method_fn_id, mc.args);
+        const method_generics = try self.lowerCallGenericArgs(expr_id, method_fn_id, mc.args, mc.generic_args);
         const generic_args = try self.alloc.alloc(ast.Type, method_generics.len + 1);
         generic_args[0] = self_type_ast;
         @memcpy(generic_args[1..], method_generics);
@@ -12012,23 +20000,45 @@ const Lowerer = struct {
         // receiver is bound to a local first.
         const receiver_ref = try self.bindReceiverForAddress(prelude, receiver, self_type_ast);
 
+        // The hoisted declaration takes the allocator as a real parameter, so
+        // the call site names one. Every other path that emits that
+        // `allocator` identifier also raises `current_callable_is_allocating`,
+        // which is what makes the enclosing function — or a translated
+        // `#[test]` — declare a local allocator. Without it the argument
+        // resolved to nothing: a test reached
+        // `encode_hex([6]u8, r2z.alloc.String, allocator, &x)` with no
+        // `allocator` in scope and Zig rejected it.
+        if (takes_allocator) self.current_callable_is_allocating = true;
         const call_args = try self.alloc.alloc(
             ast.Expr,
             1 + @as(usize, @intFromBool(takes_allocator)) + args.len,
         );
-        call_args[0] = receiver_ref;
-        var at: usize = 1;
+        // The hoisted declaration puts the allocator immediately before the
+        // first value parameter — `paramsWithAllocator` inserts it at the
+        // method's own generic count — and the receiver is that first value
+        // parameter. Emitting the allocator after the receiver called
+        // `from_hex(T, hex, allocator)` against a declaration of
+        // `from_hex(comptime T, allocator, hex)`.
+        var at: usize = 0;
         if (takes_allocator) {
             call_args[at] = .{ .ident = "allocator" };
             at += 1;
         }
+        call_args[at] = receiver_ref;
+        at += 1;
         @memcpy(call_args[at..][0..args.len], args);
 
-        return ast.Expr{ .call = .{
-            .callee = try self.allocExpr(.{ .ident = try self.hoistedNameFor(method_fn_id) }),
-            .generic_args = generic_args,
-            .args = call_args,
-        } };
+        return .{
+            .call = .{
+                // A hoisted method is declared at module scope, so a call from
+                // another translated module has to name it as `root.encode_hex`.
+                // `hoistedNameFor` returns the bare name; `lowerResolvedEntityName`
+                // resolves the same name and adds the owning module's alias.
+                .callee = try self.allocExpr(.{ .ident = try self.lowerResolvedEntityName(method_fn_id) }),
+                .generic_args = generic_args,
+                .args = call_args,
+            },
+        };
     }
 
     /// The `self` expression for a hoisted call, which takes a pointer. A
@@ -12064,6 +20074,103 @@ const Lowerer = struct {
         })).*;
     }
 
+    /// The owned `String` behind the type wrappers a receiver can carry, or
+    /// null when the receiver is some other type. The wrappers are the ones
+    /// `lowerMemoryReceiver` and `memoryElementType` already peel, so the
+    /// answer agrees with how the receiver itself was lowered.
+    fn ownedStringType(ty: ir.types.Type) ?ir.types.Type {
+        var current = ty;
+        for (0..128) |_| {
+            if (isOwnedStringType(current)) return current;
+            current = switch (current) {
+                .@"opaque" => |opaque_type| (opaque_type.concrete orelse return null).*,
+                .boxed => |boxed| boxed.*,
+                else => return null,
+            };
+        }
+        return null;
+    }
+
+    /// Whether `r2z.alloc.String` spells the receiver of `method_name`
+    /// `self: *String` rather than `self: *const String`.
+    ///
+    /// Every shared view takes the shared receiver, which Zig hands over from
+    /// whatever storage the call site already has. The rest need mutable
+    /// storage: `into_bytes` transfers the allocation out and empties the
+    /// string, `push`/`push_str`/`extend` grow it, `clear`/`reserve` reshape
+    /// it, and `as_mut_str` hands out a mutable view of it.
+    fn stringMethodNeedsMutableReceiver(method_name: []const u8) bool {
+        const mutable_receiver_methods = [_][]const u8{
+            "as_mut_str", "clear",    "extend",  "into_bytes",
+            "push",       "push_str", "reserve",
+        };
+        for (mutable_receiver_methods) |candidate| {
+            if (std.mem.eql(u8, method_name, candidate)) return true;
+        }
+        return false;
+    }
+
+    /// Give a `String` receiver that is a temporary the storage its method
+    /// needs to be reached through `self: *String`.
+    ///
+    /// Zig has no address-of expression for a call result, so a receiver with
+    /// no storage of its own is bound to a local — `(try r2z.alloc.String
+    /// .from_str(..)).into_bytes()` is rejected with "cast discards const
+    /// qualifier" otherwise. The binding goes in at `prelude_at`, ahead of
+    /// whatever the call's own arguments bound there, because the receiver is
+    /// what the source evaluates first. `deinit` runs when the enclosing
+    /// expression ends: a consuming method leaves the string empty, so that
+    /// call is a no-op rather than a second free, and a method that only
+    /// mutates frees exactly what the source would have dropped.
+    fn bindRuntimeStringReceiver(
+        self: *Lowerer,
+        prelude: *std.ArrayListUnmanaged(ast.Stmt),
+        prelude_at: usize,
+        receiver_expr: *const ast.Expr,
+        receiver_node: ir.exprs.NodeId,
+        method_name: []const u8,
+    ) !*const ast.Expr {
+        if (!stringMethodNeedsMutableReceiver(method_name)) return receiver_expr;
+        const receiver_type = (try self.exprType(receiver_node)) orelse return receiver_expr;
+        const owned_type = ownedStringType(receiver_type) orelse return receiver_expr;
+        // A PLACE already owns its storage, and Zig takes the mutable self
+        // pointer straight from a place: a binding, a field, an index, or a
+        // dereference. Aliasing one into a fresh local would COPY the string and
+        // leave the original place still naming the allocation the transfer
+        // already handed away, so the deferred release would free storage the
+        // caller still owns. Only a value with no place at all — a call result,
+        // the shape the existing `__r2z_string_receiver` test covers — needs one,
+        // and only that copy is genuinely unaliased.
+        if (exprIsAddressable(receiver_expr.*)) return receiver_expr;
+        const reserved = self.current_owner_reserved orelse return receiver_expr;
+        try self.appendCollectorImportAliases(reserved);
+        const name = try self.collectorBindingName("__r2z_string_receiver", reserved.items);
+        try reserved.append(self.alloc, name);
+        try prelude.insert(self.alloc, prelude_at, .{ .let_stmt = .{
+            .name = name,
+            .ty = try self.lowerType(owned_type),
+            .init = receiver_expr.*,
+            .is_mut = true,
+        } });
+        const held = try self.allocExpr(.{ .ident = name });
+        const deinit = try self.allocExpr(.{ .field_access = .{
+            .target = held,
+            .field_name = try self.alloc.dupe(u8, "deinit"),
+        } });
+        try prelude.insert(self.alloc, prelude_at + 1, .{ .defer_stmt = .{
+            .expr = .{ .call = .{
+                .callee = deinit,
+                .args = &.{.{ .ident = "allocator" }},
+            } },
+            .is_errdefer = false,
+        } });
+        // `deinit` names the enclosing allocator, which is what makes the
+        // callable declare one.
+        self.current_callable_is_allocating = true;
+        const bound_receiver = try self.allocExpr(.{ .ident = name });
+        return bound_receiver;
+    }
+
     /// The trait a `.method_ref` names, if it is a trait method reference.
     fn methodRefTrait(self: *const Lowerer, method: ir.spine.EntityId) ?ir.spine.EntityId {
         const entity = self.ir.graph.symbol_table.get(method) orelse return null;
@@ -12071,9 +20178,18 @@ const Lowerer = struct {
         return entity.parent;
     }
 
-    /// The blanket impl in this crate for `trait_id`: an impl whose own self
-    /// type is a type parameter rather than a concrete declaration.
+    /// The one blanket impl in this crate for `trait_id`: an impl whose own
+    /// self type is a type parameter rather than a concrete declaration.
+    ///
+    /// Two of them for one trait name the method ambiguously, and a
+    /// constrained receiver does not make the pair less ambiguous — nothing
+    /// about the receiver's declaration says which impl its method comes from.
+    /// The frontend's `lookupBlanketAsRefBytesTrait` refuses that pair rather
+    /// than picking one, so this refuses it too: taking the first match would
+    /// dispatch a call the resolver deliberately left unresolved, to a
+    /// declaration the source never named.
     fn blanketImplFor(self: *const Lowerer, trait_id: ir.spine.EntityId) ?ir.spine.EntityId {
+        var found: ?ir.spine.EntityId = null;
         const count = self.ir.graph.symbol_table.count();
         for (0..count) |idx| {
             const impl_id: ir.spine.EntityId = @intCast(idx);
@@ -12086,9 +20202,37 @@ const Lowerer = struct {
             const last = lastPathSegment(trait_path.segments) orelse continue;
             if (last.id == null or last.id.? != trait_id) continue;
             if (blanketSelfTypeParam(impl_body.self_ty) == null) continue;
-            return impl_id;
+            if (found != null) return null;
+            found = impl_id;
         }
-        return null;
+        return found;
+    }
+
+    /// The blanket impl a method call names, whether the call reached the
+    /// trait's method reference or the impl's own `fn`.
+    ///
+    /// The two are the same declaration read from different ends, and which
+    /// one a call carries depends on where it is written. At a call site the
+    /// receiver is a concrete value, so the resolver attaches the trait's
+    /// method reference. Inside a generic wrapper the receiver is a type
+    /// parameter, and the resolver attaches the blanket impl's `fn` itself:
+    /// inside `fn encode<T: AsRef<[u8]>>(data: T)`, `data.encode_hex()` has no
+    /// trait method reference to name, and the trait round trip finds nothing.
+    /// Walking up from the `fn` reads the same impl, so the call resolves.
+    fn blanketImplForMethod(self: *const Lowerer, method_def: ir.spine.EntityId) ?ir.spine.EntityId {
+        if (self.methodRefTrait(method_def)) |trait_id| {
+            if (self.blanketImplFor(trait_id)) |impl_id| return impl_id;
+        }
+        const entity = self.ir.graph.symbol_table.get(method_def) orelse return null;
+        if (entity.kind != .fn_) return null;
+        const parent_id = entity.parent orelse return null;
+        if (parent_id >= self.ir.bodies.bodies.len) return null;
+        const parent = switch (self.ir.bodies.bodies[parent_id]) {
+            .impl_ => |body| body,
+            else => return null,
+        };
+        if (blanketSelfTypeParam(parent.self_ty) == null) return null;
+        return parent_id;
     }
 
     /// The `fn` entity a blanket impl declares for `method_name`.
@@ -12109,6 +20253,71 @@ const Lowerer = struct {
             return item_id;
         }
         return null;
+    }
+
+    /// The Zig type for a function parameter whose declared type is a
+    /// callable the frontend could not pin to a concrete type, or null when
+    /// the parameter is not one.
+    ///
+    /// `impl FnOnce(&str) -> T` is the shape a generic test helper is written
+    /// in: `fn test_hash<T: Eq + Debug>(hash_func: impl FnOnce(&str) -> T, ..)`.
+    /// The IR keeps it as an opaque bound over `core::ops::FnOnce` that
+    /// inference never resolved, so `lowerType` reaches its
+    /// `error.UnresolvedOpaqueType` arm and the whole crate is refused over a
+    /// helper the source spells plainly.
+    ///
+    /// What is recovered here is what the IR actually carries, and nothing
+    /// else: a bound argument that is already a function pointer lowers as
+    /// that pointer, so a signature the frontend did resolve is preserved
+    /// exactly. A bare `Fn`/`FnMut`/`FnOnce` bound carries no signature at
+    /// all, and Zig's `anytype` parameter is the honest spelling of "whatever
+    /// this call site passes" — it names no arity and no result type the
+    /// source did not state, and the call inside the body still has to
+    /// type-check. Inventing `*const fn (?) T` instead would assert a
+    /// signature nothing in the IR supports.
+    fn lowerCallableParamType(self: *Lowerer, param_type: ir.types.Type) !?ast.Type {
+        const opaque_type = switch (param_type) {
+            .@"opaque" => |value| value,
+            else => return null,
+        };
+        // A resolved carrier is a concrete type, not a callable signature.
+        if (opaque_type.concrete != null) return null;
+        var callable = false;
+        var signature: ?*const ir.types.FnPtr = null;
+        for (opaque_type.bounds) |bound| {
+            if (!isClosureTraitPath(bound.path)) continue;
+            callable = true;
+            for (bound.args) |arg| {
+                switch (arg) {
+                    .fn_ptr => |fn_ptr| signature = fn_ptr,
+                    else => {},
+                }
+            }
+        }
+        if (signature) |fn_ptr| {
+            const pointer_type = try self.lowerType(.{ .fn_ptr = fn_ptr });
+            return pointer_type;
+        }
+        return if (callable) ast.Type{ .named = "anytype" } else null;
+    }
+
+    /// Whether a trait bound path names one of Rust's three closure traits,
+    /// spelled bare or through the `core::ops` prelude path it resolves to.
+    fn isClosureTraitPath(path: ir.types.Path) bool {
+        const segments = path.segments;
+        return switch (segments.len) {
+            1 => isClosureTraitName(segments[0].name),
+            3 => std.mem.eql(u8, segments[0].name, "core") and
+                std.mem.eql(u8, segments[1].name, "ops") and
+                isClosureTraitName(segments[2].name),
+            else => false,
+        };
+    }
+
+    fn isClosureTraitName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "Fn") or
+            std.mem.eql(u8, name, "FnMut") or
+            std.mem.eql(u8, name, "FnOnce");
     }
 
     /// The type-parameter name a blanket impl's self type is written as, if
@@ -12166,13 +20375,31 @@ const Lowerer = struct {
     /// and used as-is, so a receiver the bound does not accept is refused. A
     /// receiver that is an array literal takes its LENGTH from the literal
     /// and its ELEMENT type from the bound.
+    ///
+    /// A receiver typed by a type parameter is the third accepted shape, and
+    /// it is the shape a generic wrapper is written in: inside
+    /// `fn encode<T: AsRef<[u8]>>(data: T)` the body says `data.encode_hex()`,
+    /// where `data` is `T` and the method belongs to `impl<T: AsRef<[u8]>>
+    /// ToHex for T`. There is no array to read a length from and no element
+    /// type to check, but the hoisted function takes `comptime T: type`, so
+    /// the parameter itself is the right self type. Refusing it left
+    /// `data.encode_hex(..)` as a Zig member call on a `[]const u8`.
     fn blanketReceiverType(
         self: *Lowerer,
         receiver: ir.exprs.NodeId,
         element: ir.types.Type,
     ) !?ir.types.Type {
         if (receiver >= self.ir.bodies.exprs.len) return null;
-        if (try self.exprType(receiver)) |known| {
+        const receiver_expr = self.ir.bodies.exprs[receiver];
+        // An untyped literal still takes its element type from the declared
+        // bound. Reconstructing it from fallback integer types invents i32
+        // before that context can apply.
+        const known_type = if (receiver_expr.kind == .array and receiver_expr.ty == null)
+            null
+        else
+            try self.exprType(receiver);
+        if (known_type) |known| {
+            if (isTypeParameterPath(known)) return known;
             const array = switch (known) {
                 .array => |value| value,
                 else => return null,
@@ -12188,7 +20415,7 @@ const Lowerer = struct {
         if (literal.elements.len == 0) return null;
         const array = try self.alloc.create(ir.types.Array);
         array.* = .{ .elem = element, .len = .{ .literal = literal.elements.len } };
-        return ir.types.Type{ .array = array };
+        return .{ .array = array };
     }
 
     fn sameIrType(left: ir.types.Type, right: ir.types.Type) bool {
@@ -12197,6 +20424,49 @@ const Lowerer = struct {
             .prim => |value| value == right.prim,
             else => false,
         };
+    }
+
+    /// Whether a type names a type parameter rather than a declaration. A path
+    /// segment without an entity id is how the IR spells `T`: no declaration
+    /// named `T` exists, so the name binds to whatever the enclosing callable
+    /// declares as a `comptime` parameter.
+    fn isTypeParameterPath(ty: ir.types.Type) bool {
+        const path = switch (ty) {
+            .path => |value| value,
+            else => return false,
+        };
+        if (path.segments.len != 1) return false;
+        const segment = path.segments[0];
+        return segment.id == null and segment.name.len != 0;
+    }
+
+    /// Whether an `AsRef`-shaped borrow of `receiver_node` is a borrow OF the
+    /// value behind the receiver rather than the receiver itself.
+    ///
+    /// The blanket impl `impl<T: AsRef<[u8]>> ToHex for T` writes its body as
+    /// `self.as_ref()` with `self: &T` and `T` the impl's own type parameter.
+    /// `AsRef` is implemented for `T`, not for `&T`, so Rust's method lookup
+    /// dereferences the receiver and reborrows from the value: what the call
+    /// yields is `&[u8]`, never the `&T` it was written on.
+    ///
+    /// Only a type-parameter pointee is decided here, and it is decided by the
+    /// IR rather than by a name. `self` lowers to `*const T` for a
+    /// `comptime T: type` the declaration merely bounded, so handing that
+    /// pointer to a `[]const u8` parameter asks Zig for a pointer-to-slice
+    /// coercion and fails; the pointee is what the source wrote, and reading
+    /// through the pointer keeps the borrow rather than copying the handle.
+    /// A concrete pointee keeps its own path: a `&[u8]` the receiver really
+    /// holds is already the slice, and dereferencing it would copy one.
+    fn borrowReadsThroughGenericPointee(
+        self: *Lowerer,
+        receiver_node: ir.exprs.NodeId,
+    ) anyerror!bool {
+        const receiver_type = (try self.exprType(receiver_node)) orelse return false;
+        const reference = switch (receiver_type) {
+            .reference => |value| value,
+            else => return false,
+        };
+        return isTypeParameterPath(reference.pointee);
     }
 
     /// Whether a hoisted blanket method takes a leading allocator, matching
@@ -12217,7 +20487,152 @@ const Lowerer = struct {
         const entity = self.ir.graph.symbol_table.get(method_fn_id) orelse {
             return error.MissingDefinition;
         };
-        return try self.alloc.dupe(u8, entity.name);
+        const owned_name = try self.alloc.dupe(u8, entity.name);
+        return owned_name;
+    }
+
+    /// Free-function argument order: optional allocator, receiver, source arguments.
+    fn hoistedSelfArguments(
+        self: *Lowerer,
+        method_fn_id: ir.spine.EntityId,
+        receiver: *const ast.Expr,
+        args: []const ast.Expr,
+        allocates: bool,
+    ) ![]ast.Expr {
+        const receiver_index: usize = if (allocates) 1 else 0;
+        const result = try self.alloc.alloc(ast.Expr, args.len + 1 + receiver_index);
+        if (allocates) result[0] = .{ .ident = "allocator" };
+        result[receiver_index] = if (hoistedSelfParameterIsBorrow(self, method_fn_id))
+            (try self.allocExpr(.{ .unary_op = .{
+                .op = .addr_of,
+                .operand = try self.allocExpr(receiver.*),
+            } })).*
+        else
+            receiver.*;
+        @memcpy(result[receiver_index + 1 ..], args);
+        return result;
+    }
+
+    /// The `Item` a `next`-driven iterator carrier yields.
+    ///
+    /// A `slice::Iter` publishes `&T` and `slice::IterMut` publishes `&mut T`,
+    /// which is the whole reason those two are modelled as pointer-yielding
+    /// iterators. A half-open range publishes its endpoint, and each `core::iter`
+    /// adapter publishes whatever the base it wraps published. `Zip` publishes
+    /// a pair, which is not one type, so it answers null.
+    fn iteratorCarrierItemType(self: *Lowerer, ty: ir.types.Type) !?ir.types.Type {
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return null,
+        };
+        if (external.path.len != 3 or external.args.len == 0) return null;
+        if (!std.mem.eql(u8, external.path[0], "core") and
+            !std.mem.eql(u8, external.path[0], "std")) return null;
+        if (std.mem.eql(u8, external.path[1], "slice")) {
+            if (external.args.len != 1) return null;
+            const mutable = if (std.mem.eql(u8, external.path[2], "IterMut"))
+                true
+            else if (std.mem.eql(u8, external.path[2], "Iter"))
+                false
+            else
+                return null;
+            const borrow = try self.alloc.create(ir.types.Ref);
+            borrow.* = .{ .mut = mutable, .pointee = external.args[0] };
+            return .{ .reference = borrow };
+        }
+        const element = external.args[external.args.len - 1];
+        if (std.mem.eql(u8, external.path[1], "ops") and
+            std.mem.eql(u8, external.path[2], "Range")) return element;
+        if (!std.mem.eql(u8, external.path[1], "iter")) return null;
+        if (std.mem.eql(u8, external.path[2], "Zip")) return null;
+        if (!isRuntimeIteratorAdapterName(external.path[2])) return null;
+        return self.iteratorCarrierItemType(element);
+    }
+
+    /// The `Option<T>` a `next()` call yields when the frontend left the node
+    /// untyped.
+    ///
+    /// `Iterator::next` is declared to return `Option<Self::Item>`, and the
+    /// carriers the runtime drives by `next` each say which `Item` they
+    /// publish. A `?` on such a call is Rust's `Option` propagation, and it can
+    /// only be recognised as one when the call is known to be an optional —
+    /// without this the `?` falls through to a native `try` and asks an
+    /// enclosing `-> Option<u8>` for an error union it does not return.
+    fn iteratorNextOptionType(self: *Lowerer, operand_id: ir.exprs.NodeId) !?ir.types.Type {
+        if (operand_id >= self.ir.bodies.exprs.len) return null;
+        const call = switch (self.ir.bodies.exprs[operand_id].kind) {
+            .method_call => |value| value,
+            else => return null,
+        };
+        if (call.args.len != 0) return null;
+        const method = self.ir.graph.symbol_table.get(call.method) orelse return null;
+        if (!std.mem.eql(u8, method.name, "next")) return null;
+        const receiver_type = try self.exprType(call.receiver) orelse return null;
+        const carrier = peelReceiverType(receiver_type);
+        if (!isNextDrivenIteratorCarrier(carrier)) return null;
+        const item = try self.iteratorCarrierItemType(carrier) orelse return null;
+        const option = try self.alloc.create(ir.types.Type);
+        option.* = item;
+        return .{ .option = option };
+    }
+
+    /// `x?` where `x` is an OPTIONAL, as Zig's own optional propagation.
+    ///
+    /// `try` is for error unions and an optional is not one, so `?` on an
+    /// optional is Zig's `orelse`: the `None` leaves the enclosing function as
+    /// its own `None`. Rust's `?` is that exact operation whenever the
+    /// enclosing function returns an optional, so this is
+    /// `{ const __r2z_try_optional = x; if (__r2z_try_optional) |v| v else
+    /// return null; }` — one evaluation of the operand, and the value carried
+    /// out of the block rather than dropped.
+    ///
+    /// Anything else has no `FromResidual` in the standard library to run, so
+    /// this is not the shape and the answer is null.
+    fn lowerOptionPropagation(
+        self: *Lowerer,
+        operand: ast.Expr,
+        operand_id: ir.exprs.NodeId,
+    ) !?ast.Expr {
+        // A `next()` the inference pass never typed is still an optional: the
+        // carrier's own `Item` is the answer, and without it the `?` below
+        // would not be recognised as propagation at all.
+        const operand_type = (try self.exprType(operand_id)) orelse
+            (try self.iteratorNextOptionType(operand_id)) orelse
+            return null;
+        if (operand_type != .option and self.canonicalExternalMethodType(operand_type) != .option) return null;
+        // A `?` inside an iterator ADAPTER body leaves the closure, which is
+        // the item the chain yields; it cannot return from the function that
+        // built the chain, so an adapter body whose enclosing result is the
+        // collection's own is not this shape either.
+        if (self.current_collector) |open| {
+            if (open.result != null) return null;
+        }
+        const enclosing = self.current_return_type orelse return null;
+        if (enclosing != .option and self.canonicalExternalMethodType(enclosing) != .option) return null;
+        const subject = try self.iteratorTemporaryName("__r2z_try_optional");
+        const payload = try self.iteratorTemporaryName("__r2z_try_value");
+        const statements = try self.alloc.alloc(ast.Stmt, 1);
+        statements[0] = .{ .let_stmt = .{
+            .name = try self.alloc.dupe(u8, subject),
+            .init = operand,
+            .is_mut = false,
+        } };
+        const branch = try self.allocExpr(.{ .if_expr = .{
+            .cond = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, subject) }),
+            .then_capture = .{
+                .name = try self.alloc.dupe(u8, payload),
+                .by_ref = false,
+            },
+            .then_body = try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, payload) }),
+            .else_body = try self.allocExpr(.{ .return_expr = try self.allocExpr(.{
+                .lit = .{ .null_lit = {} },
+            }) }),
+        } });
+        return (try self.allocExpr(.{ .block = .{
+            .label = null,
+            .stmts = statements,
+            .expr = branch,
+        } })).*;
     }
     fn lowerTaggedResultPropagation(
         self: *Lowerer,
@@ -12225,62 +20640,321 @@ const Lowerer = struct {
         operand_id: ir.exprs.NodeId,
     ) !?ast.Expr {
         const operand_type = (try self.exprType(operand_id)) orelse return null;
-        if (self.resultUsesErrorUnion(operand_type)) return null;
+        // A native operand carries its error as a bare Zig tag, so it is
+        // MATCHED rather than switched on, and that tag has to become a value
+        // of the source's own error type before any `From` can take it.
+        const source_native = self.resultUsesErrorUnion(operand_type);
         const operand_result = switch (operand_type) {
             .result => |value| value.*,
             else => return null,
         };
-        const enclosing = self.current_return_type orelse
-            return error.UnsupportedResultPropagation;
+        // A `?` inside a `Result` collect's adapter body reports in the
+        // collection. Rust's `?` leaves the `map` closure there, and `collect`
+        // turns that into the collection's own `Err`; returning from the
+        // enclosing function instead would report it in the function's result
+        // and leave the function entirely, which a `collect` in let or
+        // argument position cannot survive.
+        const collector: ?Collector = if (self.current_collector) |open|
+            (if (open.result != null) open else null)
+        else
+            null;
+        const enclosing = if (collector) |open| open.result.? else blk: {
+            const declared = self.current_return_type orelse
+                return error.UnsupportedResultPropagation;
+            break :blk declared;
+        };
         const enclosing_result = switch (enclosing) {
             .result => |value| value.*,
             else => return error.UnsupportedResultPropagation,
         };
-        if (!typeEquals(operand_result.err, enclosing_result.err)) {
-            return error.UnsupportedResultErrorConversion;
+        // A plain `try` IS Rust's `?` in exactly one shape: the operand is
+        // native, the enclosing result is native, and the two error types
+        // agree, so the identity conversion needs no call and the union can be
+        // propagated as it stands. Every other pairing has a conversion to
+        // run, and a native operand has to be matched to reach its tag at all.
+        const native_error = self.resultFieldsUseErrorUnion(enclosing_result);
+        if (source_native and native_error and
+            typeEquals(operand_result.err, enclosing_result.err))
+        {
+            return null;
         }
-
-        const ok_patterns = try self.alloc.alloc(ast.Pattern, 1);
-        ok_patterns[0] = .{ .enum_literal = try self.alloc.dupe(u8, "Ok") };
-        const err_patterns = try self.alloc.alloc(ast.Pattern, 1);
-        err_patterns[0] = .{ .enum_literal = try self.alloc.dupe(u8, "Err") };
-
-        // A `void` payload has nothing to bind, so the success prong carries
-        // no capture at all.
+        const err_capture = try self.alloc.dupe(u8, "__r2z_try_err");
+        // Rust's `?` runs the operand's error through `From` before it leaves
+        // for the enclosing result, and a crate that hands a `Result<T,
+        // io::Error>` out of a `Result<U, crate::Error>` says so in its own
+        // `impl From<io::Error> for crate::Error`. That conversion is a real
+        // call to a real declaration, so the Err arm runs it here rather than
+        // either guessing a cast or giving up on the source that compiles.
+        // Identical errors are the identity conversion, and that is the case
+        // that needs no call at all.
+        const source_value: ast.Expr = if (source_native)
+            try self.sourceErrorValueFromTag(err_capture, operand_result.err)
+        else
+            .{ .ident = try self.alloc.dupe(u8, err_capture) };
+        const converted_err: ?ast.Expr = if (typeEquals(
+            operand_result.err,
+            enclosing_result.err,
+        )) null else try self.lowerResultErrorConversion(
+            source_value,
+            operand_result.err,
+            enclosing_result.err,
+        );
+        // A Zig error union carries its error bare, so when the enclosing
+        // result is one, the converted error IS the value the Err arm leaves
+        // with: `errorTagMapping` names the tag that value is, and there is no
+        // union here to build. Otherwise the arm reports into a tagged
+        // `r2z.Result` and the same value goes in its `Err` slot.
+        const converted: ast.Expr = if (converted_err) |value|
+            value
+        else
+            source_value;
+        const exit_err: ast.Expr = if (native_error)
+            try self.errorTagMapping(converted, enclosing_result.err)
+        else
+            converted;
+        const err_body: ast.Expr = if (collector) |open|
+            try self.collectorErrorExit(open, exit_err)
+        else if (native_error)
+            .{ .return_expr = try self.allocExpr(exit_err) }
+        else
+            .{
+                .return_expr = try self.allocExpr(
+                    try self.taggedResultError(exit_err, enclosing_result),
+                ),
+            };
+        // A `void` payload has nothing to bind, so the success side carries no
+        // capture at all.
         const ok_capture: ?ast.Capture = if (operand_result.ok == .prim and
             operand_result.ok.prim == .unit)
             null
         else
             .{ .name = try self.alloc.dupe(u8, "__r2z_try_ok") };
-        const err_capture = try self.alloc.dupe(u8, "__r2z_try_err");
         const ok_body: ast.Expr = if (ok_capture) |capture|
             .{ .ident = capture.name }
         else
             .{ .unit = {} };
-
-        const err_fields = try self.alloc.alloc(ast.StructInitField, 1);
-        err_fields[0] = .{
-            .name = try self.alloc.dupe(u8, "Err"),
-            .expr = .{ .ident = err_capture },
-        };
-        const enclosing_name = (try self.allocType(
-            try self.lowerTaggedResult(enclosing_result.ok, enclosing_result.err),
-        )).*;
-        const err_value = try self.allocExpr(.{
-            .struct_init = .{ .type_name = enclosing_name, .fields = err_fields },
-        });
-
+        // A native operand is an error union, so its two outcomes are a
+        // payload-capturing `if`: the success capture IS the Ok value and the
+        // error capture IS the tag. A tagged operand keeps the two-arm switch
+        // it has always had.
+        if (source_native) {
+            return .{ .if_expr = .{
+                .cond = try self.allocExpr(operand),
+                .then_capture = ok_capture,
+                .then_body = try self.allocExpr(ok_body),
+                .else_capture = .{ .name = err_capture },
+                .else_body = try self.allocExpr(err_body),
+            } };
+        }
+        const ok_patterns = try self.alloc.alloc(ast.Pattern, 1);
+        ok_patterns[0] = .{ .enum_literal = try self.alloc.dupe(u8, "Ok") };
+        const err_patterns = try self.alloc.alloc(ast.Pattern, 1);
+        err_patterns[0] = .{ .enum_literal = try self.alloc.dupe(u8, "Err") };
         const arms = try self.alloc.alloc(ast.MatchArm, 2);
         arms[0] = .{ .patterns = ok_patterns, .capture = ok_capture, .body = ok_body };
         arms[1] = .{
             .patterns = err_patterns,
             .capture = .{ .name = err_capture },
-            .body = .{ .return_expr = err_value },
+            .body = err_body,
         };
         return .{ .match_expr = .{
             .target = try self.allocExpr(operand),
             .arms = arms,
         } };
+    }
+
+    /// The crate's own `From` conversion of a `?` error, or a refusal when it
+    /// declares none.
+    ///
+    /// Rust's `?` converts the operand's error into the enclosing result's
+    /// error, and the only conversion it can reach is `From`: the blanket
+    /// `impl<T> From<T> for T` when the two already agree, otherwise whatever
+    /// the crate declared. A crate that hands a `Result<T, io::Error>` out of a
+    /// `Result<U, crate::Error>` declared `impl From<io::Error> for
+    /// crate::Error>`, and THAT declaration is what gets called. The error is
+    /// built by a real `fn from` with a real signature, never cast through a
+    /// runtime helper that would have to guess the layout on both sides.
+    ///
+    /// A crate that declared no such impl has not written code that compiles,
+    /// so a source that reaches here without one keeps the refusal rather than
+    /// being given a conversion nobody wrote.
+    fn lowerResultErrorConversion(
+        self: *Lowerer,
+        source_value: ast.Expr,
+        source_err: ir.types.Type,
+        target_err: ir.types.Type,
+    ) anyerror!ast.Expr {
+        const from_id = self.userFromConversion(source_err, target_err) orelse
+            return error.UnsupportedResultErrorConversion;
+        // The same callee spelling any other associated call gets: a `from`
+        // written in a trait impl is a trait-impl member first and an
+        // inherent method only when the impl declared no trait.
+        const callee = if (try self.qualifyTraitImplMethod(from_id)) |trait_method|
+            trait_method
+        else
+            try self.qualifyInherentMethod(from_id, try self.lowerResolvedEntity(from_id));
+        const allocates = self.directCallAllocates(from_id);
+        // The conversion is part of the source, so an allocator it needs is one
+        // the enclosing callable declares, exactly as for any other call it
+        // makes.
+        if (allocates) self.current_callable_is_allocating = true;
+        const args = try self.alloc.alloc(ast.Expr, if (allocates) 2 else 1);
+        if (allocates) args[0] = .{ .ident = "allocator" };
+        args[args.len - 1] = source_value;
+        const call = ast.Expr{ .call = .{
+            .callee = try self.allocExpr(callee),
+            .args = args,
+        } };
+        if (!allocates) return call;
+        return .{ .unary_op = .{ .op = .try_op, .operand = try self.allocExpr(call) } };
+    }
+
+    /// The source's own error value for a native error tag.
+    ///
+    /// A Zig error union carries its error as a bare tag, while a `From` impl
+    /// is declared over the source's own error TYPE, so the tag has to become
+    /// a value of that type before the conversion can take it. The runtime's
+    /// `errorTagValue` is the way back: it walks the source enum's declared
+    /// fields, so a tag the enum does not declare has no value there and is
+    /// refused rather than reported as a failure the source never had.
+    /// Reusing it keeps that property instead of growing a second mapping here.
+    fn sourceErrorValueFromTag(
+        self: *Lowerer,
+        tag_capture: []const u8,
+        source_err: ir.types.Type,
+    ) anyerror!ast.Expr {
+        try self.markRuntimeImport();
+        const generic_args = try self.alloc.alloc(ast.Type, 1);
+        generic_args[0] = try self.lowerType(source_err);
+        const args = try self.alloc.alloc(ast.Expr, 1);
+        args[0] = .{ .ident = try self.alloc.dupe(u8, tag_capture) };
+        return .{ .call = .{
+            .callee = try self.allocExpr(.{ .ident = "r2z.errorTagValue" }),
+            .generic_args = generic_args,
+            .args = args,
+        } };
+    }
+
+    /// The enclosing tagged `r2z.Result` carrying `err_value` in its `Err`
+    /// slot.
+    fn taggedResultError(
+        self: *Lowerer,
+        err_value: ast.Expr,
+        enclosing_result: ir.types.Result,
+    ) anyerror!ast.Expr {
+        const err_fields = try self.alloc.alloc(ast.StructInitField, 1);
+        err_fields[0] = .{ .name = try self.alloc.dupe(u8, "Err"), .expr = err_value };
+        const type_name = (try self.allocType(
+            try self.lowerTaggedResult(enclosing_result.ok, enclosing_result.err),
+        )).*;
+        return .{ .struct_init = .{ .type_name = type_name, .fields = err_fields } };
+    }
+
+    /// The `fn from` a crate declared to turn `source` into `target`, or null
+    /// when it declared no such conversion.
+    ///
+    /// The trait is `From` and the signature is `fn from(source) -> Self`,
+    /// which inside `impl From<source> for target` is `target` by definition.
+    /// Both are checked, and the signature is what finally decides: a crate's
+    /// own conversion trait can carry a method named `from` that converts
+    /// something else entirely, and a blanket `impl<T> From<T> for T` says
+    /// nothing about this pair. Two impls claiming the same exact conversion is
+    /// not a choice either of them, so that pair is refused rather than picked.
+    fn userFromConversion(
+        self: *const Lowerer,
+        source: ir.types.Type,
+        target: ir.types.Type,
+    ) ?ir.spine.EntityId {
+        const count = self.ir.graph.symbol_table.count();
+        var found: ?ir.spine.EntityId = null;
+        for (0..count) |index| {
+            const impl_id: ir.spine.EntityId = @intCast(index);
+            if (impl_id >= self.ir.bodies.bodies.len) continue;
+            const impl_body = switch (self.ir.bodies.bodies[impl_id]) {
+                .impl_ => |body| body,
+                else => continue,
+            };
+            const trait_path = impl_body.trait_path orelse continue;
+            if (!self.canonicalFromTrait(impl_id, trait_path)) continue;
+            // A generic impl states its conversion in terms of its own
+            // parameters, so its declared types are not this pair's types even
+            // when they read alike. The count is the test, not whether the
+            // metadata block happens to be present.
+            const generic_params: usize = if (impl_body.generics) |generics|
+                generics.params.len
+            else
+                0;
+            if (generic_params != 0) continue;
+            if (!typeEquals(impl_body.self_ty, target)) continue;
+            if (impl_body.trait_args.len != 1) continue;
+            if (!typeEquals(impl_body.trait_args[0], source)) continue;
+            const method = self.userFromMethod(impl_id, source, target) orelse continue;
+            if (found != null and found.? != method) return null;
+            found = method;
+        }
+        return found;
+    }
+
+    /// Whether an impl's trait path is exactly `core::convert::From`.
+    ///
+    /// This asks the pipeline's one trait-identity predicate rather than
+    /// growing a second convention beside it. A name is not an identity: a
+    /// crate may declare its own `trait From<E> { fn from(e: E) -> Self; }`,
+    /// and that impl carries the same leaf name and can carry the same
+    /// signature, so leaf-plus-signature would call a conversion the source
+    /// never offered. `boundPathMatches` resolves the path the way Rust does —
+    /// written out, imported by `use core::convert::From;`, or carrying that
+    /// use on its first segment — and treats `std` as `core` because std
+    /// re-exports it, so a root-qualified `std::convert::From` is answered too.
+    fn canonicalFromTrait(
+        self: *const Lowerer,
+        impl_id: ir.spine.EntityId,
+        path: ir.types.Path,
+    ) bool {
+        return ir.bodies.boundPathMatches(
+            &self.ir.graph,
+            impl_id,
+            path,
+            &.{ "core", "convert", "From" },
+        );
+    }
+
+    /// The `fn from` that impl declares for exactly this pair, or null when it
+    /// declares none, or declares something that is not this conversion.
+    fn userFromMethod(
+        self: *const Lowerer,
+        impl_id: ir.spine.EntityId,
+        source: ir.types.Type,
+        target: ir.types.Type,
+    ) ?ir.spine.EntityId {
+        if (impl_id >= self.ir.bodies.bodies.len) return null;
+        const impl_body = switch (self.ir.bodies.bodies[impl_id]) {
+            .impl_ => |body| body,
+            else => return null,
+        };
+        for (impl_body.assoc_items) |item_id| {
+            const entity = self.ir.graph.symbol_table.get(item_id) orelse continue;
+            if (entity.kind != .fn_) continue;
+            if (!std.mem.eql(u8, entity.name, "from")) continue;
+            if (item_id >= self.ir.bodies.bodies.len) continue;
+            const function = switch (self.ir.bodies.bodies[item_id]) {
+                .fn_ => |body| body,
+                else => continue,
+            };
+            if (function.params.len != 1) continue;
+            if (!typeEquals(function.params[0].ty, source)) continue;
+            // `From` is written `fn from(error: E) -> Self`, and this impl's
+            // self type has already been proven to BE the target, so `Self`
+            // in this return position is that target by definition. The check
+            // is the same recognised `Self` path every other reader in this
+            // file asks `isSelfPath` about, not a second, looser way to read
+            // the name. The PARAMETER stays a concrete comparison: it is the
+            // source error Rust actually converts, and a `Self` there would be
+            // a conversion of the target into itself, which is not this one.
+            if (!typeEquals(function.ret, target) and !isSelfPath(function.ret)) continue;
+            return item_id;
+        }
+        return null;
     }
 
     /// Whether taking a reference to this place must re-assert the alignment
@@ -12335,22 +21009,61 @@ const Lowerer = struct {
                 } else return error.InvalidTypeTraversal;
             }
         }
+        // DECISION — this package implements the Rust RELEASE profile, and
+        // the choice is not derivable from Rust's grammar. Rust has two
+        // overflow profiles and one spelling: under the default release
+        // profile `overflow-checks` is off, so `a + b`, `a += b`, `-` and
+        // `-=` all wrap; under debug all four panic. The binary path keys its
+        // Zig operator off `BinaryExpr.overflow`, which `ts_ext.zig` fills in
+        // as `.wrapping`, and `wrapping_add` and friends — which wrap under
+        // BOTH profiles, so they pin the choice to release — reach the backend
+        // as the same `.binary` node with the same `.wrapping`. Reading the
+        // field here therefore agrees with `a + b` by construction.
+        //
+        // Round 2 clamped this to `.checked` on the strength of Rust having
+        // no wrapping compound-assignment SPELLING (`t +%= x` does not parse).
+        // That is true and irrelevant: the absence of a spelling is not the
+        // absence of wrapping semantics, and the clamp left one Rust operation
+        // with two behaviours — `255u8 + 1` wrapped to 0 while `x += 1` on the
+        // same `u8` panicked — so the package matched neither profile.
+        // Clamping the binary path instead is not available here either:
+        // `ts_ext.zig` writes `.wrapping` on every `AssignExpr` and on every
+        // `BinaryExpr`, so nothing in the IR distinguishes `a + b` from
+        // `a.wrapping_add(b)` except the fact that only the former may be
+        // re-clamped.
+        const overflow = assignment.overflow;
         if (assignment.op != .plain and requiresRuntimeOperator(try self.exprType(assignment.target))) {
             const address: ast.Expr = .{ .unary_op = .{ .op = .addr_of, .operand = try self.allocExpr(target) } };
             return .{ .expr_stmt = try self.allocExpr(try self.lowerRuntimeOperator(
                 "assign",
                 @tagName(assignment.op),
-                assignment.overflow,
+                overflow,
                 address,
                 value,
             )) };
         }
-        const wrapping = assignment.overflow == .wrapping;
+        // `<<=` and `>>=` share the `u5` amount rule with the plain shifts, and
+        // the runtime operator path above has already taken its own cast.
+        const shift_value = if (assignment.op == .shl or assignment.op == .shr)
+            try self.lowerShiftAmount(value)
+        else
+            value;
+        // Zig spells the wrapping compound form for integers only — `f64 +%= f64`
+        // does not compile — so a float target keeps the plain operator, the
+        // same way `uses_float` keeps `a + b` on `.add`. Nothing else consults
+        // `wraps`: `.saturating` is the one IR mode Zig cannot spell as a
+        // compound assignment, `ts_ext.zig` never writes one onto an
+        // `AssignExpr`, and the trapping operator is its safe fallback.
+        const wraps = switch (assignment.op) {
+            .add, .sub, .mul => overflow == .wrapping and
+                !isFloatType(peelPointers(try self.exprType(assignment.target))),
+            else => false,
+        };
         const op: ast.AssignOp = switch (assignment.op) {
             .plain => .assign,
-            .add => if (wrapping) .add_assign_wrap else .add_assign,
-            .sub => if (wrapping) .sub_assign_wrap else .sub_assign,
-            .mul => if (wrapping) .mul_assign_wrap else .mul_assign,
+            .add => if (wraps) .add_assign_wrap else .add_assign,
+            .sub => if (wraps) .sub_assign_wrap else .sub_assign,
+            .mul => if (wraps) .mul_assign_wrap else .mul_assign,
             .div => .div_assign,
             .rem => .mod_assign,
             .bit_and => .bit_and_assign,
@@ -12361,7 +21074,7 @@ const Lowerer = struct {
         };
         return .{ .assign = .{
             .target = target,
-            .val = value,
+            .val = shift_value,
             .op = op,
         } };
     }
@@ -12408,6 +21121,35 @@ const Lowerer = struct {
                             else => return error.UnsupportedPattern,
                         };
                     },
+                    // `let _ = EXPR;` binds nothing, but Rust still runs the
+                    // initializer — that is where a macro's statement
+                    // expression keeps its side effects. Zig spells the same
+                    // discard `_ = EXPR;`, and a `void` or diverging
+                    // initializer cannot be discarded at all, so it stays a
+                    // bare statement, exactly as an expression statement
+                    // does.
+                    .wildcard => {
+                        const discard_id = ls.init orelse return error.MissingInitializer;
+                        const discarded = try self.lowerExpr(discard_id);
+                        switch (discarded) {
+                            .return_expr, .break_expr, .continue_expr, .unreachable_, .panic_ => {
+                                break :blk ast.Stmt{ .expr_stmt = try self.allocExpr(discarded) };
+                            },
+                            else => {},
+                        }
+                        const produces_nothing = if (try self.exprType(discard_id)) |discarded_type|
+                            discarded_type == .prim and
+                                (discarded_type.prim == .unit or discarded_type.prim == .never)
+                        else
+                            false;
+                        break :blk if (produces_nothing)
+                            ast.Stmt{ .expr_stmt = try self.allocExpr(discarded) }
+                        else
+                            ast.Stmt{ .assign = .{
+                                .target = .{ .ident = "_" },
+                                .val = discarded,
+                            } };
+                    },
                     else => return error.UnsupportedPattern,
                 };
                 if (binding.name.len == 0) return error.MissingBindingName;
@@ -12415,7 +21157,54 @@ const Lowerer = struct {
                     try names.claimPatternName(self.alloc, &self.ir.graph.symbol_table, pattern_target_id, binding.name)
                 else
                     binding.name;
-                const init_id = ls.init orelse return error.MissingInitializer;
+                // `let PAT;` with no initializer is Rust's late
+                // initialization: the binding is in scope from here and
+                // definite assignment happens on some later path. Zig's typed
+                // declaration over `undefined` is the same declaration — it
+                // carries no value of its own, so it can neither read as one
+                // nor stand in for one, and the source is what proved the read
+                // comes after the write.
+                //
+                // `var` up front, because Rust lets an IMMUTABLE `let x;` be
+                // assigned exactly once later and Zig's `const` rejects that.
+                // `lowerBlock` walks the block it emitted and puts the binding
+                // back to `const` when nothing reaches it, which is the same
+                // rule every other binding already goes through.
+                if (ls.init == null) {
+                    // The annotation when the source wrote one, otherwise the
+                    // type the producer recorded for the binding itself: there
+                    // is no initializer expression here to read a type from,
+                    // and Zig spells an unassigned slot against one.
+                    const late_type_id = (ls.ty orelse
+                        self.ir.bodies.pats[pattern_target_id].ty orelse
+                        ir_stmt.ty) orelse
+                        return error.UnsupportedLateBinding;
+                    const late_type = try self.typeById(late_type_id);
+                    // Rust drops what a binding owns when its scope ends, and
+                    // this lowering releases that storage through the runtime's
+                    // `deinit(allocator)`. Whether that release is correct
+                    // depends on a fact Rust's own borrow checker computes and
+                    // this pass cannot yet see: WHICH paths assign the binding.
+                    // Releasing unconditionally frees storage nobody allocated
+                    // on the paths that do not assign it; never releasing leaks
+                    // the owner on the paths that do. Neither is a translation
+                    // of what the source said, so a late-initialized container
+                    // is refused here — BEFORE an undefined slot for it exists —
+                    // rather than lowered into either. An arithmetic, boolean,
+                    // pointer or blob type carries no allocation to get wrong,
+                    // and the source's guarantee that every read follows a
+                    // write is exactly what `undefined` means, so those lower.
+                    if (ownedRuntimeContainerType(late_type)) {
+                        return error.UnsupportedLateBinding;
+                    }
+                    break :blk ast.Stmt{ .let_stmt = .{
+                        .name = try self.alloc.dupe(u8, binding_name),
+                        .ty = try self.lowerType(late_type),
+                        .init = .{ .lit = .undefined_lit },
+                        .is_mut = true,
+                    } };
+                }
+                const init_id = ls.init.?;
                 const init_expr = if (tuple_field) |field| blk_field: {
                     const tuple_target = if (self.ir.bodies.exprs[init_id].kind == .unary and
                         self.ir.bodies.exprs[init_id].kind.unary.op == .deref)
@@ -12430,52 +21219,47 @@ const Lowerer = struct {
                         .target = target,
                         .field_name = field_name,
                     } };
-                } else try self.lowerExpr(init_id);
-                const ty: ?ast.Type = if (ls.ty orelse self.ir.bodies.exprs[init_id].ty) |t_id|
-                    try self.lowerType(try self.typeById(t_id))
+                } else try self.lowerLetInitializer(init_id, if (ls.ty) |declared_id|
+                    try self.typeById(declared_id)
+                else
+                    null);
+                const binding_type = if (ls.ty orelse self.ir.bodies.exprs[init_id].ty) |t_id|
+                    try self.typeById(t_id)
                 else
                     null;
+                const ty: ?ast.Type = if (binding_type) |binding_ir_type|
+                    try self.lowerType(binding_ir_type)
+                else
+                    null;
+                // `r2z.alloc.String` reaches its mutating and consuming
+                // methods through `self: *String`, so a binding that one of
+                // them needs has to be `var` even where the source spelled it
+                // immutable: `into_bytes` transfers the allocation out of the
+                // string, and `const` storage rejects that with "cast
+                // discards const qualifier". Aliasing the binding into a
+                // fresh local would instead leave the original holding an
+                // allocation already handed away. `lowerBlock` downgrades the
+                // `var` again when nothing in the block reaches it.
+                const owned_string = binding_type != null and ownedStringType(binding_type.?) != null;
 
                 break :blk ast.Stmt{
                     .let_stmt = .{
                         .name = try self.alloc.dupe(u8, binding_name),
                         .ty = ty,
                         .init = init_expr,
-                        .is_mut = binding.mutable,
+                        .is_mut = binding.mutable or owned_string,
                     },
                 };
             },
-            .let_else => |le| blk: {
-                if (le.pattern >= self.ir.bodies.pats.len) return error.MissingPatternNode;
-                const pat = self.ir.bodies.pats[le.pattern];
-                var pattern_target_id: ir.exprs.NodeId = le.pattern;
-                const binding = switch (pat.kind) {
-                    .binding => |b| b,
-                    .reference => |reference| blk_ref: {
-                        if (reference.inner >= self.ir.bodies.pats.len) {
-                            return error.MissingPatternNode;
-                        }
-                        pattern_target_id = reference.inner;
-                        break :blk_ref switch (self.ir.bodies.pats[reference.inner].kind) {
-                            .binding => |b| b,
-                            else => return error.UnsupportedPattern,
-                        };
-                    },
-                    else => return error.UnsupportedPattern,
-                };
-                if (binding.name.len == 0) return error.MissingBindingName;
-                const binding_name = if (self.current_local_binding_names) |names|
-                    try names.claimPatternName(self.alloc, &self.ir.graph.symbol_table, pattern_target_id, binding.name)
-                else
-                    binding.name;
-                const init_expr = try self.lowerExpr(le.init);
-                break :blk ast.Stmt{
-                    .let_stmt = .{
-                        .name = try self.alloc.dupe(u8, binding_name),
-                        .init = init_expr,
-                        .is_mut = false,
-                    },
-                };
+            // `let PAT = EXPR else { .. }` only ever has a refutable pattern,
+            // and none of those has the `ast.Stmt` form this branch could
+            // build: the only patterns it accepts below are irrefutable, and
+            // emitting one kept the binding and silently discarded
+            // `else_block`, so a `let .. else { return }` would fall through
+            // instead of diverging. Refuse until the else arm can be lowered.
+            .let_else => |le| {
+                _ = le;
+                return error.UnsupportedStatement;
             },
             .expr => |e_id| blk: {
                 if (e_id >= self.ir.bodies.exprs.len) return error.MissingExpressionNode;
@@ -12485,11 +21269,11 @@ const Lowerer = struct {
                     },
                     else => {
                         const lowered = try self.lowerExpr(e_id);
-                        // `return`, `break`, `continue`, and `panic` are
-                        // statements that happen to produce a type. Wrapping
-                        // them in a discard is a syntax error.
+                        // `return`, `break`, `continue`, `unreachable` and
+                        // `panic` are statements that happen to produce a
+                        // type. Wrapping them in a discard is a syntax error.
                         switch (lowered) {
-                            .return_expr, .break_expr, .continue_expr, .panic_ => {
+                            .return_expr, .break_expr, .continue_expr, .unreachable_, .panic_ => {
                                 break :blk ast.Stmt{ .expr_stmt = try self.allocExpr(lowered) };
                             },
                             else => {},
@@ -12583,13 +21367,24 @@ const Lowerer = struct {
     // For-loop capture helpers
     // -------------------------------------------------------------------------
 
+    /// Whether a loop pattern binds a POINTER to the item rather than the item.
+    ///
+    /// Rust's `&T` is a pointer only while `T` is SIZED. `&str` and `&[T]`
+    /// borrow a fat pointer that already carries the element and the length,
+    /// and `lowerType` spells each of them as the Zig slice it is — so the
+    /// binding IS the item, and a `|*item|` capture would hand the body a
+    /// pointer to the descriptor it meant to read (`formatter.writeAll(c)`
+    /// with `c: *const []const u8`). A borrow of a sized pointee still lowers
+    /// to a Zig pointer, and that capture is the one that is right.
     fn patternCapturesByReference(self: *const Lowerer, pat_id: ir.exprs.NodeId) !bool {
         if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
         const pattern = self.ir.bodies.pats[pat_id];
         if (pattern.kind != .binding) return false;
         if (pattern.kind.binding.mode != .value) return true;
         const type_id = pattern.ty orelse return false;
-        return (try self.typeById(type_id)) == .reference;
+        const binding_type = try self.typeById(type_id);
+        if (binding_type != .reference) return false;
+        return !borrowLowersToFatValue(binding_type.reference.pointee);
     }
 
     /// The node a `for` input actually walks. `.iter()` and `.iter_mut()` are
@@ -12630,6 +21425,212 @@ const Lowerer = struct {
             .name = "index",
             .args = index_args,
         } })).*;
+    }
+
+    /// A `for x in a..b` driven by the typed iterator loop instead of a Zig
+    /// `for`.
+    const TypedRangeFor = struct {
+        range: LoweredIteratorRange,
+        /// The name the loop body binds each value to, or null when the
+        /// pattern is a wildcard and the source named nothing.
+        item_name: ?[]const u8,
+    };
+
+    /// The integer type a range endpoint really has, or null when the source
+    /// left it open.
+    ///
+    /// This is `iteratorRangeEndpointType` without the refusal: a `for` whose
+    /// endpoints are not a matched pair of integers keeps the `usize` binding
+    /// a Zig `for` gives it rather than failing the whole callable.
+    fn iteratorRangeEndpointTypeOrNull(
+        self: *Lowerer,
+        node: ir.exprs.NodeId,
+    ) ?ir.types.Type {
+        if (node >= self.ir.bodies.exprs.len) return null;
+        const known = self.concreteExprType(node) orelse
+            (self.exprType(node) catch return null) orelse return null;
+        return integerOperandType(known);
+    }
+
+    /// Whether this loop pattern names exactly one value, which is what a
+    /// cursor step can hand the body.
+    fn patternNamesOneValue(self: *const Lowerer, pat_id: ir.exprs.NodeId) bool {
+        if (pat_id >= self.ir.bodies.pats.len) return false;
+        return switch (self.ir.bodies.pats[pat_id].kind) {
+            .binding, .reference, .wildcard => true,
+            else => false,
+        };
+    }
+
+    /// The element type `for x in a..b` really binds.
+    ///
+    /// The RANGE's own type is the authority when it carries one: `Range<i64>`
+    /// says the loop yields `i64` whatever the two endpoints happen to be
+    /// typed as, and `Range<usize>` says the Zig `for`'s own `usize` binding
+    /// is already the one the source wrote. A range the frontend left
+    /// untyped falls back to its endpoints, which answer only when they
+    /// AGREE — two endpoints inference never reconciled are not one type, and
+    /// inventing one would be a type the source never wrote.
+    fn rangeLoopElementType(self: *Lowerer, range_id: ir.exprs.NodeId) ?ir.types.Type {
+        if (self.concreteExprType(range_id)) |declared| {
+            if (rangeNominalElement(declared)) |element| {
+                return integerOperandType(element);
+            }
+        }
+        const range = switch (self.ir.bodies.exprs[range_id].kind) {
+            .range => |value| value,
+            else => return null,
+        };
+        const end_node = range.end orelse return null;
+        const start_type = self.iteratorRangeEndpointTypeOrNull(range.start) orelse return null;
+        const end_type = self.iteratorRangeEndpointTypeOrNull(end_node) orelse return null;
+        if (!typeEquals(start_type, end_type)) return null;
+        return start_type;
+    }
+
+    /// The element type a `Range<T>` nominal names, or null when this is not
+    /// one.
+    fn rangeNominalElement(ty: ir.types.Type) ?ir.types.Type {
+        const external = switch (ty) {
+            .external_nominal => |value| value,
+            else => return null,
+        };
+        if (external.args.len != 1) return null;
+        const path = external.path;
+        if (path.len != 3) return null;
+        if (!std.mem.eql(u8, path[0], "core") and !std.mem.eql(u8, path[0], "std")) return null;
+        if (!std.mem.eql(u8, path[1], "ops")) return null;
+        if (!std.mem.eql(u8, path[2], "Range")) return null;
+        return external.args[0];
+    }
+
+    /// Whether a Zig `for` over this range would bind the wrong value.
+    ///
+    /// A Zig `for` over a range binds `usize` whatever the range's element
+    /// type says, so two ranges cannot use it. A SIGNED one arrives as a
+    /// wrapped `usize` — `-513..513` starts at `usize` minus 513 and never
+    /// reaches zero. An INCLUSIVE one has to be spelled `end + 1` in the `for`
+    /// form, and at the element type's own maximum that sum is not a value the
+    /// type can hold: `254u8..=255u8` would ask a `u8` for 256.
+    ///
+    /// Every other range — `0..127` as a `u8`, `0..n` as a `usize` — is a real
+    /// counter the `for` already carries, and it keeps its shape.
+    fn rangeForNeedsTypedLoop(element_type: ir.types.Type, inclusive: bool) bool {
+        if (inclusive) return true;
+        const primitive = switch (element_type) {
+            .prim => |value| value,
+            else => return false,
+        };
+        return isSignedPrimitive(primitive);
+    }
+
+    /// Plan the typed iterator loop for `for x in a..b`, or null when this
+    /// loop is not one.
+    ///
+    /// The typed loop binds what the source wrote, which is the only shape
+    /// that can carry a signed counter or an inclusive endpoint. It also
+    /// stops AT the endpoint rather than past it, which is what keeps the
+    /// inclusive maximum intact.
+    fn planTypedRangeFor(self: *Lowerer, fe: ir.exprs.ForExpr) anyerror!?TypedRangeFor {
+        if (fe.iterable >= self.ir.bodies.exprs.len) return null;
+        const range = switch (self.ir.bodies.exprs[fe.iterable].kind) {
+            .range => |value| value,
+            else => return null,
+        };
+        const end_node = range.end orelse return null;
+        if (fe.pattern >= self.ir.bodies.pats.len) return null;
+        if (!self.patternNamesOneValue(fe.pattern)) return null;
+        if (try self.patternCapturesByReference(fe.pattern)) return null;
+        const element_type = self.rangeLoopElementType(fe.iterable) orelse return null;
+        if (!rangeForNeedsTypedLoop(element_type, range.inclusive)) return null;
+        const item_name = if (self.ir.bodies.pats[fe.pattern].kind == .wildcard)
+            null
+        else
+            try self.patternName(fe.pattern);
+        return .{
+            .range = .{
+                .start = try self.lowerExpr(range.start),
+                .end = try self.lowerExpr(end_node),
+                .item_type = try self.lowerType(element_type),
+                .inclusive = range.inclusive,
+            },
+            .item_name = item_name,
+        };
+    }
+
+    /// The typed iterator loop a planned `for x in a..b` becomes.
+    ///
+    /// The shared setup binds both endpoints to temporaries, so an end that is
+    /// a call is evaluated once however many steps the loop takes, and the
+    /// loop's own label rides on the generated `while`: a `break` or a
+    /// `continue` in the body reaches THIS loop, the way it reached the `for`
+    /// the source wrote.
+    fn lowerTypedRangeFor(
+        self: *Lowerer,
+        plan: TypedRangeFor,
+        body: ast.Block,
+        label: ?[]const u8,
+    ) anyerror!ast.Expr {
+        var statements: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer statements.deinit(self.alloc);
+        const range_loop = try self.appendIteratorRangeSetup(plan.range, .forward, &statements);
+        var inner: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        defer inner.deinit(self.alloc);
+        // The cursor already has the range's own element type, so the body's
+        // binding is a plain read of it — nothing is cast to get here.
+        if (plan.item_name) |name| {
+            try inner.append(self.alloc, .{ .let_stmt = .{
+                .name = name,
+                .init = range_loop.item,
+                .is_mut = false,
+            } });
+        }
+        try inner.appendSlice(self.alloc, body.stmts);
+        if (body.expr) |tail| try inner.append(self.alloc, .{ .expr_stmt = tail });
+        try self.appendIteratorRangeLoop(range_loop, inner.items, &statements, label);
+        return .{ .block = .{ .stmts = try statements.toOwnedSlice(self.alloc) } };
+    }
+
+    /// Give a `for x in a..b` binding the range's own element type.
+    ///
+    /// A Zig `for` over a range yields `usize`, so `for (0u8..2) |x|` binds a
+    /// `usize` and every use of `x` against the `u8` the source wrote is a
+    /// type error. The index the loop really produces is taken back to the
+    /// element type as the first statement of the body, which is where a
+    /// pattern's own binding prelude already goes.
+    ///
+    /// A `usize` range is left alone: its binding already has the type the
+    /// loop produces, and the extra statement would cast a value to itself.
+    fn retypeRangeLoopBinding(
+        self: *Lowerer,
+        fe: ir.exprs.ForExpr,
+        captures: *std.ArrayListUnmanaged(ast.Capture),
+        prelude: *std.ArrayListUnmanaged(ast.Stmt),
+    ) anyerror!void {
+        if (fe.iterable >= self.ir.bodies.exprs.len) return;
+        if (captures.items.len != 1) return;
+        if (captures.items[0].by_ref) return;
+        if (try self.patternCapturesByReference(fe.pattern)) return;
+        const range = switch (self.ir.bodies.exprs[fe.iterable].kind) {
+            .range => |value| value,
+            else => return,
+        };
+        if (range.start >= self.ir.bodies.exprs.len) return;
+        const item_type = (try self.exprType(range.start)) orelse return;
+        if (typeEquals(item_type, .{ .prim = .usize })) return;
+        const index_name = try self.iteratorTemporaryName("__r2z_range_index");
+        const binding_name = captures.items[0].name;
+        captures.items[0].name = index_name;
+        const cast_args = try self.alloc.alloc(ast.Expr, 1);
+        cast_args[0] = (try self.allocExpr(.{ .ident = try self.alloc.dupe(u8, index_name) })).*;
+        try prelude.append(self.alloc, .{ .let_stmt = .{
+            .name = try self.alloc.dupe(u8, binding_name),
+            .ty = try self.lowerType(item_type),
+            .init = (try self.allocExpr(.{ .builtin = .{
+                .name = "intCast",
+                .args = cast_args,
+            } })).*,
+        } });
     }
 
     /// Append the flat capture name(s) for a simple loop pattern (bindings,
@@ -12719,6 +21720,23 @@ const Lowerer = struct {
             .wildcard => try self.alloc.dupe(u8, "_"),
             else => return error.UnsupportedPattern,
         };
+    }
+
+    /// The base name for the temporary that carries a closure parameter's
+    /// payload.
+    ///
+    /// A closure parameter is usually a binding or a wildcard, which
+    /// `patternName` names directly. A tuple destructuring names no single
+    /// value — `|(i, pair)|` binds two — so the temporary is named after the
+    /// shape and `appendIteratorClosureBindings` destructures it in place,
+    /// exactly as it does for an iterator-chain source. Every other shape still
+    /// goes through `patternName` and keeps its existing name and claim.
+    fn closurePayloadName(self: *Lowerer, pat_id: ir.exprs.NodeId) anyerror![]const u8 {
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        switch (self.ir.bodies.pats[pat_id].kind) {
+            .tuple => return "tuple",
+            else => return self.patternName(pat_id),
+        }
     }
 
     /// Capture for one zip (`multi`) input. A plain binding/reference yields a
@@ -13049,6 +22067,30 @@ const Lowerer = struct {
         };
     }
 
+    /// Whether a match-arm pattern contains a tuple pattern.
+    ///
+    /// A Zig switch prong has no tuple form. `.{a, b}` is only a `const`
+    /// destructuring pattern, so a tuple pattern in an arm emitted an invalid
+    /// prong and declared none of the names it mentioned — round 1's fix H in
+    /// pattern position rather than value position. Zig destructures a tuple
+    /// through a value capture on the switch *subject*, which the arm
+    /// lowering does not build, so the honest move is to refuse.
+    fn patternHasTupleElement(self: *Lowerer, pat_id: ir.exprs.NodeId, depth: usize) anyerror!bool {
+        if (depth >= 64) return error.UnsupportedPattern;
+        if (pat_id >= self.ir.bodies.pats.len) return error.MissingPatternNode;
+        const fields: []const ir.exprs.FieldPat = switch (self.ir.bodies.pats[pat_id].kind) {
+            .tuple => return true,
+            .struct_pat => |sp| sp.fields,
+            .external_variant => |variant| variant.fields,
+            else => return false,
+        };
+        for (fields) |field| {
+            const inner = field.pat orelse continue;
+            if (try self.patternHasTupleElement(inner, depth + 1)) return true;
+        }
+        return false;
+    }
+
     /// Lower one match arm's pattern list. `ast.Pattern` has no or-pattern
     /// tag, so a top-level `a | b` becomes one `ast.Pattern` per alternative;
     /// `MatchArm.patterns` is a slice and the emitter prints those entries
@@ -13056,7 +22098,10 @@ const Lowerer = struct {
     fn lowerArmPatterns(self: *Lowerer, pat_ids: []const ir.exprs.NodeId) anyerror![]ast.Pattern {
         var lowered: std.ArrayListUnmanaged(ast.Pattern) = .empty;
         errdefer lowered.deinit(self.alloc);
-        for (pat_ids) |pat_id| try self.appendLoweredArmPattern(pat_id, &lowered);
+        for (pat_ids) |pat_id| {
+            if (try self.patternHasTupleElement(pat_id, 0)) return error.UnsupportedPattern;
+            try self.appendLoweredArmPattern(pat_id, &lowered);
+        }
         return lowered.toOwnedSlice(self.alloc);
     }
 
@@ -13144,7 +22189,15 @@ const Lowerer = struct {
             entity.renamed_to orelse entity.name;
         for (self.current_parameter_names) |param| {
             if (std.mem.eql(u8, param.name, name)) return true;
-            if (std.mem.startsWith(u8, param.name, "_") and std.mem.eql(u8, param.name[1..], name)) return true;
+        }
+        // A parameter the body writes is declared `_p` and read as `p`, so the
+        // name a body path carries is the copy's, not the signature's. The
+        // pair was recorded where the copy was made; deriving it from the
+        // spelling instead breaks the moment a body binding of its own pushes
+        // the signature name to `_p_1`, because `p_1` is not a body name at
+        // all.
+        for (self.current_mutable_copies) |copy| {
+            if (std.mem.eql(u8, copy.body_name, name)) return true;
         }
         return false;
     }
@@ -13270,11 +22323,55 @@ const Lowerer = struct {
         return true;
     }
 
+    /// Whether a local closure defined in this block writes to `name` itself.
+    ///
+    /// A closure body is not part of the block's statement list — it is
+    /// emitted at the closure's call site — so `astMutatesBinding` cannot see
+    /// an assignment inside one, and the downgrade would turn a `var` the
+    /// closure writes into a `const`.
+    ///
+    /// Only a `&mut` capture reaches the outer binding. A by-value capture is
+    /// copied into a `__r2z_capture_*` snapshot where the closure was created,
+    /// and the closure body mutates that copy, so the original is never
+    /// assigned: counting it here kept a `var` nothing writes, and Zig rejects
+    /// a `var` that is never mutated.
+    fn blockCaptureWritesBinding(
+        self: *Lowerer,
+        statements: []const ir.exprs.NodeId,
+        name: []const u8,
+    ) anyerror!bool {
+        for (statements) |stmt_id| {
+            if (stmt_id >= self.ir.bodies.stmts.len) return error.MissingStatementNode;
+            const let_stmt = switch (self.ir.bodies.stmts[stmt_id].kind) {
+                .let => |value| value,
+                else => continue,
+            };
+            const init_id = let_stmt.init orelse continue;
+            if (init_id >= self.ir.bodies.exprs.len) return error.MissingExpressionNode;
+            const closure = switch (self.ir.bodies.exprs[init_id].kind) {
+                .closure => |value| value,
+                else => continue,
+            };
+            for (closure.captures) |capture| {
+                if (capture.mode != .by_mut_ref) continue;
+                if (std.mem.eql(u8, capture.name, name)) return true;
+            }
+        }
+        return false;
+    }
+
     fn astMutationTarget(expression: ast.Expr, name: []const u8, depth: usize) error{InvalidAstTraversal}!bool {
         if (depth >= 256) return error.InvalidAstTraversal;
         return switch (expression) {
             .ident => |identifier| std.mem.eql(u8, identifier, name),
             .field_access => |field| astMutationTarget(field.target.*, name, depth + 1),
+            .unary_op => |unary| if (unary.op == .addr_of or unary.op == .deref)
+                // `r2z.ops.assign(&t, v)` reaches the target through an
+                // address-of, which the old walk did not follow, so a
+                // big-integer `t += v` looked unmutated.
+                astMutationTarget(unary.operand.*, name, depth + 1)
+            else
+                false,
             .builtin => |builtin| if (std.mem.eql(u8, builtin.name, "index") and builtin.args.len > 0)
                 astMutationTarget(builtin.args[0], name, depth + 1)
             else
@@ -13380,9 +22477,7 @@ const Lowerer = struct {
         for (self.current_capture_names) |capture_name| {
             try reserved_names.append(self.alloc, capture_name);
         }
-        for (self.current_parameter_names) |param| {
-            try reserved_names.append(self.alloc, param.name);
-        }
+        try self.appendParameterNames(&reserved_names);
         if (self.current_callable_name) |name| {
             try reserved_names.append(self.alloc, name);
         }
@@ -13396,7 +22491,16 @@ const Lowerer = struct {
                     const item = self.ir.graph.symbol_table.get(item_id) orelse {
                         return error.MissingEntityId;
                     };
+                    // A block-local `fn` is a DECLARATION, not a statement:
+                    // Zig has no nested functions, so it is hoisted to the
+                    // module beside this file's other declarations (see
+                    // `appendBlockLocalFunctions`) and contributes nothing
+                    // here. A parent that is a FUNCTION is what identifies it,
+                    // so an impl method — which reaches this file the ordinary
+                    // way — is untouched.
                     if (item.kind == .static_) continue;
+                    if (item.kind == .fn_ and item.parent != null and
+                        (self.ir.graph.symbol_table.get(item.parent.?) orelse continue).kind == .fn_) continue;
                 },
                 else => {},
             }
@@ -13522,7 +22626,9 @@ const Lowerer = struct {
         const label = if (be.labelled) |l| try self.alloc.dupe(u8, l) else null;
         const block: ast.Block = .{ .label = label, .stmts = stmts, .expr = tail_expr };
         for (stmts) |*statement| {
-            if (statement.* == .let_stmt and statement.let_stmt.is_mut) {
+            if (statement.* == .let_stmt and statement.let_stmt.is_mut and
+                !try self.blockCaptureWritesBinding(be.statements, statement.let_stmt.name))
+            {
                 statement.let_stmt.is_mut = try astMutatesBinding(block, statement.let_stmt.name, 0);
             }
         }

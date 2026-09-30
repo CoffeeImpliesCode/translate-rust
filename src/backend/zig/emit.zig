@@ -57,8 +57,8 @@ pub fn emitFile(
         try emitEscapedString(allocator, &buf, t.name);
         try buf.appendSlice(allocator, "\" {\n");
 
-        for (t.body.stmts) |stmt| {
-            try emitStmt(allocator, &buf, stmt, 1);
+        for (t.body.stmts, 0..) |stmt, index| {
+            try emitStmt(allocator, &buf, try unusedBindingAsDiscard(allocator, t.body, index, stmt), 1);
         }
         if (t.body.expr) |tail_expr| {
             try emitStmt(allocator, &buf, .{ .expr_stmt = tail_expr }, 1);
@@ -382,17 +382,27 @@ fn emitFnDecl(
     // validator exists to catch, so the invariant is unwrapped here.
     const body = fd.body.?;
     try buf.appendSlice(allocator, " {\n");
-    for (body.stmts) |stmt| {
-        try emitStmt(allocator, buf, stmt, depth + 1);
+    // Rust permits an unused receiver; Zig requires an explicit discard.
+    if (fd.params.len > 0 and std.mem.eql(u8, fd.params[0].name, "self") and
+        !blockReadsNameOutside(body, body.stmts.len, "self"))
+    {
+        try emitIndent(allocator, buf, depth + 1);
+        try buf.appendSlice(allocator, "_ = self;\n");
+    }
+    for (body.stmts, 0..) |stmt, index| {
+        try emitStmt(
+            allocator,
+            buf,
+            try unusedBindingAsDiscard(allocator, body, index, stmt),
+            depth + 1,
+        );
     }
     if (body.expr) |tail_expr| {
         try emitIndent(allocator, buf, depth + 1);
         if (tail_expr.* == .return_expr or tail_expr.* == .panic_) {
             try emitExpr(allocator, buf, tail_expr.*, depth + 1);
             try buf.appendSlice(allocator, ";\n");
-        } else if (isStatementLike(tail_expr.*) and
-            (tail_expr.* != .block or !blockHasValue(tail_expr.block)))
-        {
+        } else if (isStatementLike(tail_expr.*) and !exprCarriesValue(tail_expr.*)) {
             try emitExpr(allocator, buf, tail_expr.*, depth + 1);
             try buf.appendSlice(allocator, "\n");
         } else {
@@ -638,8 +648,10 @@ fn emitStmtScoped(
         },
         .expr_stmt => |es| {
             try emitIndent(allocator, buf, depth);
+            const form = statementForm(es.*);
+            if (form == .discard_value) try buf.appendSlice(allocator, "_ = ");
             try emitExprScoped(context, allocator, buf, es.*, depth);
-            if (!isStatementLike(es.*) and es.* != .if_expr and es.* != .match_expr) {
+            if (form == .semicolon or form == .discard_value) {
                 try buf.appendSlice(allocator, ";");
             }
             try buf.appendSlice(allocator, "\n");
@@ -647,6 +659,9 @@ fn emitStmtScoped(
     }
 }
 
+/// True when the emitted text is a Zig statement a function body may end on.
+/// A tail `if` or `switch` is a statement as well, but it has to produce the
+/// return value, so it does not belong here.
 fn isStatementLike(expr: ast.Expr) bool {
     return switch (expr) {
         .block, .while_expr, .for_expr => true,
@@ -654,12 +669,280 @@ fn isStatementLike(expr: ast.Expr) bool {
     };
 }
 
+/// How an expression has to be written in statement position.
+const StatementForm = enum {
+    /// Already a whole Zig statement: `{ ... }`, `if (...) ...`,
+    /// `while ...`, `for ... ...`, `switch ...`.
+    bare,
+    /// A value expression: emit it and terminate it with `;`.
+    semicolon,
+    /// A loop that carries a value out of it. Zig rejects an unused non-void
+    /// loop result, so the value is discarded explicitly.
+    discard_value,
+};
+
+/// Whether one branch of an `if` is already a whole Zig statement, so the
+/// `if` around it needs no `;` of its own.
+fn ifBranchIsStatement(expr: ast.Expr) bool {
+    return switch (expr) {
+        .block, .while_expr, .for_expr, .match_expr => true,
+        else => false,
+    };
+}
+
+/// Whether every branch of this `if` is written as a statement already.
+fn ifIsWholeStatement(if_expr: ast.IfExpr) bool {
+    if (!ifBranchIsStatement(if_expr.then_body.*)) return false;
+    if (if_expr.else_body) |else_body| {
+        if (!ifBranchIsStatement(else_body.*)) return false;
+    }
+    return true;
+}
+
+fn statementForm(expr: ast.Expr) StatementForm {
+    return switch (expr) {
+        .while_expr => |while_expr| if (loopYieldsValue(while_expr)) .discard_value else .bare,
+        .block, .for_expr, .match_expr => .bare,
+        // `if (c) { ... }` is a whole statement, and `if (c) x;` is not: Zig
+        // reads a bare value, a `break`, or a `continue` in a branch as the
+        // `if`'s own expression and wants the `;` that terminates it. Without
+        // one the emitted file stops parsing at the end of that branch.
+        .if_expr => |if_expr| if (ifIsWholeStatement(if_expr)) .bare else .semicolon,
+        else => .semicolon,
+    };
+}
+
+/// True when the expression produces a value the position around it has to
+/// consume. A Rust `loop` that returns one lowers to a value-bearing `while`,
+/// which the statement forms alone cannot see.
+fn exprCarriesValue(expr: ast.Expr) bool {
+    return switch (expr) {
+        .block => |block| blockHasValue(block),
+        .while_expr => |while_expr| loopYieldsValue(while_expr),
+        else => false,
+    };
+}
+
+/// True when two source labels name the same target. A null label is the
+/// unlabeled exit, and it matches only another null.
+fn sameSourceLabel(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
 fn blockHasValue(block: ast.Block) bool {
+    if (blockHasLabelledValueExit(block)) return true;
     const tail = block.expr orelse return false;
     return switch (tail.*) {
-        .return_expr, .break_expr, .continue_expr, .panic_ => false,
+        .return_expr, .break_expr, .continue_expr, .unreachable_, .panic_ => false,
         else => true,
     };
+}
+
+/// Which control exit a subtree scan counts as reaching the scope it was
+/// asked about. The three questions differ only in the exit they accept, so
+/// they share one walk.
+const ExitQueryKind = enum {
+    /// Any `break`. This is what decides whether the emitted `break :label`
+    /// exists, so a loop that answers it has to keep the label.
+    break_exit,
+    /// Any `continue`. `continue` restarts a loop and never a block, so it
+    /// keeps a loop label alive on its own.
+    continue_exit,
+    /// A `break` carrying a value. A Rust `loop` yields a value in Zig
+    /// exactly when one of these reaches it; a valueless `break 'label`
+    /// leaves the loop without one, so it never answers this.
+    value_break,
+};
+
+/// One question a subtree scan answers: which exits reach the scope being
+/// scanned.
+const ExitQuery = struct {
+    /// Source label the exit has to name to count.
+    label: ?[]const u8,
+    /// True when an exit naming nothing counts too. Rust's bare `break` and
+    /// `continue` reach the innermost enclosing loop whatever the loops
+    /// around it carry, so only the scope being scanned may claim one.
+    unlabeled_ok: bool,
+    kind: ExitQueryKind,
+
+    /// The query one loop deeper. A nested loop claims an unlabeled exit
+    /// before the loop around it can.
+    fn nested(self: ExitQuery) ExitQuery {
+        return .{ .label = self.label, .unlabeled_ok = false, .kind = self.kind };
+    }
+
+    /// True when an inner scope carries the label this query looks for, so an
+    /// exit naming it lands there rather than on the scope being scanned. Rust
+    /// lets a nested loop or block shadow a label, and an exit the emitter
+    /// resolves to that scope never names the loop around it. The value query
+    /// keeps the looser rule because it picks a loop shape, while a label
+    /// query has to follow where the exit really lands or it keeps a label
+    /// nothing names.
+    fn shadowed(self: ExitQuery, label: ?[]const u8) bool {
+        return self.kind != .value_break and sameSourceLabel(label, self.label);
+    }
+
+    /// Scans a nested loop's body, unless that loop took the label and holds
+    /// the exits that name it.
+    fn nestedLoopBody(self: ExitQuery, label: ?[]const u8, body: ast.Block) bool {
+        return !self.shadowed(label) and blockHasLoopExitTo(body, self.nested());
+    }
+
+    /// Scans a nested block's body. A block claims no unlabeled exit, because
+    /// a bare `break` inside a Rust block still belongs to the loop around it,
+    /// so the query passes through unchanged.
+    fn nestedBlockBody(self: ExitQuery, label: ?[]const u8, block: ast.Block) bool {
+        return !self.shadowed(label) and blockHasLoopExitTo(block, self);
+    }
+};
+
+/// True when the block hands a value out through a `break` that names the
+/// block itself. The exit can sit in a statement as well as in the tail, so a
+/// labelled block with no tail of its own still produces one.
+fn blockHasLabelledValueExit(block: ast.Block) bool {
+    const label = block.label orelse return false;
+    const query: ExitQuery = .{ .label = label, .unlabeled_ok = false, .kind = .value_break };
+    for (block.stmts) |stmt| {
+        if (stmtHasLoopExitTo(stmt, query)) return true;
+    }
+    if (block.expr) |tail| return exprHasLoopExitTo(tail.*, query);
+    return false;
+}
+
+/// True when the loop carries a value out of itself. Zig's `while` produces
+/// one only through a `break` that carries a value, and Rust's `loop` lowers to
+/// exactly that shape, so the exit has to be found before the loop can be
+/// written as a statement.
+///
+/// The loop's own source label is what an exit has to name to reach it
+/// through any nesting; an unlabeled exit reaches it only when no nested loop
+/// claims that first.
+fn loopYieldsValue(loop_expr: ast.WhileExpr) bool {
+    return blockHasLoopExitTo(loop_expr.body, .{
+        .label = loop_expr.label,
+        .unlabeled_ok = true,
+        .kind = .value_break,
+    });
+}
+
+/// The source label the emitted loop has to carry, or null when nothing inside
+/// it names that label. Zig rejects a loop label no `break` or `continue` uses,
+/// so the prefix is written only when an exit landing in the loop's own body
+/// emits it. The `else` arm runs once the loop is over and is not scanned,
+/// because an exit there belongs to whatever surrounds the loop.
+fn usedLoopLabel(body: ast.Block, target: ExitTarget) ?[]const u8 {
+    const label = target.source_label orelse return null;
+    // A `break` names the loop only when the loop's own Zig label is where a
+    // break lands. A value-carrying loop hands its value out through a
+    // generated wrapper block instead, so its breaks name that block and
+    // leave the source label to `continue` alone.
+    if (sameSourceLabel(target.break_label, label) and
+        blockHasLoopExitTo(body, .{ .label = label, .unlabeled_ok = true, .kind = .break_exit }))
+    {
+        return label;
+    }
+    if (blockHasLoopExitTo(body, .{
+        .label = label,
+        .unlabeled_ok = true,
+        .kind = .continue_exit,
+    })) return label;
+    return null;
+}
+
+fn blockHasLoopExitTo(block: ast.Block, query: ExitQuery) bool {
+    for (block.stmts) |stmt| {
+        if (stmtHasLoopExitTo(stmt, query)) return true;
+    }
+    if (block.expr) |tail| return exprHasLoopExitTo(tail.*, query);
+    return false;
+}
+
+fn stmtHasLoopExitTo(stmt: ast.Stmt, query: ExitQuery) bool {
+    return switch (stmt) {
+        .let_stmt => |let_stmt| exprHasLoopExitTo(let_stmt.init, query),
+        .assign => |assign| exprHasLoopExitTo(assign.target, query) or
+            exprHasLoopExitTo(assign.val, query),
+        .defer_stmt => |defer_stmt| exprHasLoopExitTo(defer_stmt.expr, query),
+        .expr_stmt => |expr| exprHasLoopExitTo(expr.*, query),
+    };
+}
+
+fn matchHasLoopExitTo(match: ast.Match, query: ExitQuery) bool {
+    for (match.arms) |arm| {
+        if (exprHasLoopExitTo(arm.body, query)) return true;
+    }
+    return false;
+}
+
+fn exprsHaveLoopExitTo(exprs: []const ast.Expr, query: ExitQuery) bool {
+    for (exprs) |expr| {
+        if (exprHasLoopExitTo(expr, query)) return true;
+    }
+    return false;
+}
+
+fn exprHasLoopExitTo(expr: ast.Expr, query: ExitQuery) bool {
+    return switch (expr) {
+        // An unlabeled `break` leaves the innermost enclosing loop, so a
+        // nested loop claims it before the loop around it can. An exit that
+        // names the label says which loop it belongs to and passes through.
+        .break_expr => |break_expr| switch (query.kind) {
+            .value_break => {
+                if (break_expr.value == null) return false;
+                if (break_expr.label) |label| return sameSourceLabel(label, query.label);
+                return query.unlabeled_ok;
+            },
+            .break_exit => if (break_expr.label) |label|
+                sameSourceLabel(label, query.label)
+            else
+                query.unlabeled_ok,
+            .continue_exit => false,
+        },
+        .continue_expr => |continue_expr| switch (query.kind) {
+            .continue_exit => if (continue_expr.label) |label|
+                sameSourceLabel(label, query.label)
+            else
+                query.unlabeled_ok,
+            .break_exit, .value_break => false,
+        },
+        .while_expr => |while_expr| query.nestedLoopBody(while_expr.label, while_expr.body),
+        .for_expr => |for_expr| query.nestedLoopBody(for_expr.label, for_expr.body),
+        .block => |block| query.nestedBlockBody(block.label, block),
+        .match_expr => |match| matchHasLoopExitTo(match, query),
+        .if_expr => |if_expr| exprHasLoopExitTo(if_expr.cond.*, query) or
+            exprHasLoopExitTo(if_expr.then_body.*, query) or
+            (if_expr.else_body != null and exprHasLoopExitTo(if_expr.else_body.?.*, query)),
+        .bin_op => |bin_op| exprHasLoopExitTo(bin_op.lhs.*, query) or
+            exprHasLoopExitTo(bin_op.rhs.*, query),
+        .unary_op => |unary_op| exprHasLoopExitTo(unary_op.operand.*, query),
+        .cast => |cast| exprHasLoopExitTo(cast.operand.*, query),
+        .call => |call| exprHasLoopExitTo(call.callee.*, query) or
+            exprsHaveLoopExitTo(call.args, query),
+        .field_access => |field_access| exprHasLoopExitTo(field_access.target.*, query),
+        .builtin => |builtin| exprsHaveLoopExitTo(builtin.args, query),
+        .array_init => |array| exprsHaveLoopExitTo(array.elements, query),
+        .multi_array => |array| exprsHaveLoopExitTo(array.elements, query),
+        .repeat => |repeat| exprHasLoopExitTo(repeat.elem.*, query),
+        .tuple => |elements| exprsHaveLoopExitTo(elements, query),
+        .struct_init => |struct_init| structInitHasLoopExitTo(struct_init, query),
+        .range => |range| exprHasLoopExitTo(range.start.*, query) or
+            (range.end != null and exprHasLoopExitTo(range.end.?.*, query)),
+        // `return loop { ... }` owns the breaks inside the returned loop, but
+        // a `break` in a returned conditional belongs to this one.
+        .return_expr => |value| if (value) |inner|
+            return exprHasLoopExitTo(inner.*, query)
+        else
+            false,
+        .lit, .unit, .ident, .panic_, .unsupported, .unreachable_ => false,
+    };
+}
+
+fn structInitHasLoopExitTo(struct_init: ast.StructInit, query: ExitQuery) bool {
+    for (struct_init.fields) |field| {
+        if (exprHasLoopExitTo(field.expr, query)) return true;
+    }
+    return false;
 }
 
 const GeneratedMatchName = struct {
@@ -670,9 +953,76 @@ const GeneratedMatchName = struct {
 const EmitContext = struct {
     active_names: []const GeneratedMatchName = &.{},
     active_capture_names: []const []const u8 = &.{},
+    /// Scopes a `break` or a `continue` in this position can land on,
+    /// innermost first. Each entry lives in the frame of the loop or block
+    /// that opened it, so the chain needs no allocation and unwinds with the
+    /// emission that built it.
+    exit_scope: ?*const ExitScope = null,
 };
 const match_payload_base = "__r2z_match_payload";
 const match_arm_base = "__r2z_match_arm";
+const value_loop_base = "__r2z_value_loop";
+const value_block_base = "__r2z_value_block";
+
+/// What kind of scope an exit target stands for. `continue` may only name a
+/// loop, and a block target is never the innermost loop.
+const ExitTargetKind = enum {
+    loop,
+    block,
+};
+
+/// One scope a control exit can land on. A value-carrying loop is two Zig
+/// scopes standing for one Rust loop, so it needs separate names: the wrapper
+/// block hands the value out and the `while` inside it is the one `continue`
+/// restarts.
+const ExitTarget = struct {
+    /// Source label this target answers to, or null when it carries none.
+    source_label: ?[]const u8,
+    /// True when an unlabeled exit lands here. Rust's bare `break` and
+    /// `continue` reach the innermost enclosing loop whatever labels the loops
+    /// around it carry, so every loop sets it and only the innermost one is
+    /// reached. A block never sets it: a bare `break` inside a Rust block
+    /// still belongs to the loop around the block.
+    innermost_loop: bool,
+    /// Zig label a `break` into this target names; null needs no label.
+    break_label: ?[]const u8,
+    /// Zig label a `continue` into this target names; null needs no label.
+    continue_label: ?[]const u8,
+    kind: ExitTargetKind,
+};
+
+const ExitScope = struct {
+    target: ExitTarget,
+    parent: ?*const ExitScope,
+};
+
+fn findExitTarget(scope: ?*const ExitScope, source_label: ?[]const u8) ?ExitTarget {
+    var current = scope;
+    while (current) |node| : (current = node.parent) {
+        if (sameSourceLabel(node.target.source_label, source_label)) return node.target;
+    }
+    return null;
+}
+
+fn findContinueTarget(scope: ?*const ExitScope, source_label: ?[]const u8) ?ExitTarget {
+    var current = scope;
+    while (current) |node| : (current = node.parent) {
+        if (node.target.kind != .loop) continue;
+        if (sameSourceLabel(node.target.source_label, source_label)) return node.target;
+    }
+    return null;
+}
+
+/// The innermost loop scope, which is where an unlabeled `break` and an
+/// unlabeled `continue` both land. Blocks never set `innermost_loop`, so the
+/// loop a generated value block sits inside is still the one reached.
+fn findInnermostLoopTarget(scope: ?*const ExitScope) ?ExitTarget {
+    var current = scope;
+    while (current) |node| : (current = node.parent) {
+        if (node.target.innermost_loop) return node.target;
+    }
+    return null;
+}
 
 fn generatedMatchNameText(
     buffer: *[64]u8,
@@ -682,9 +1032,8 @@ fn generatedMatchNameText(
     return std.fmt.bufPrint(buffer, "{s}_{d}", .{ name.base, name.suffix }) catch unreachable;
 }
 
-fn generatedMatchNameEquals(value: []const u8, name: GeneratedMatchName) bool {
-    var buffer: [64]u8 = undefined;
-    return std.mem.eql(u8, value, generatedMatchNameText(&buffer, name));
+fn generatedMatchNameEquals(value: []const u8, name: []const u8) bool {
+    return std.mem.eql(u8, value, name);
 }
 
 fn generatedMatchNamesEqual(
@@ -712,23 +1061,25 @@ fn emitCaptureBinding(
     try emitIdent(allocator, buf, capture.name);
 }
 
-fn emitRepeatElementType(
+/// The payload a captured `if` binds, written between the condition and the
+/// branch: `if (cond) |x| ...`. A loop payload spells a capture the same way,
+/// so the identifier is quoted the same way too.
+fn emitIfCapture(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
-    type_name: ast.Type,
+    capture: ?ast.Capture,
 ) std.mem.Allocator.Error!void {
-    switch (type_name) {
-        .array => |array| try emitType(allocator, buf, array.elem.*),
-        .array_expr => |array| try emitType(allocator, buf, array.elem.*),
-        else => try emitType(allocator, buf, type_name),
-    }
+    const binding = capture orelse return;
+    try buf.appendSlice(allocator, "|");
+    try emitCaptureBinding(allocator, buf, binding);
+    try buf.appendSlice(allocator, "| ");
 }
 
 fn lexicalRoot(value: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, value, '.') orelse value.len;
     return value[0..end];
 }
-fn typeContainsGeneratedMatchName(ty: ast.Type, name: GeneratedMatchName) bool {
+fn typeContainsGeneratedMatchName(ty: ast.Type, name: []const u8) bool {
     return switch (ty) {
         .prim, .any_opaque, .void_type => false,
         .ptr => |pointer| typeContainsGeneratedMatchName(pointer.elem.*, name),
@@ -778,7 +1129,7 @@ fn typeContainsGeneratedMatchName(ty: ast.Type, name: GeneratedMatchName) bool {
     };
 }
 
-fn patternContainsGeneratedMatchName(pattern: ast.Pattern, name: GeneratedMatchName) bool {
+fn patternContainsGeneratedMatchName(pattern: ast.Pattern, name: []const u8) bool {
     return switch (pattern) {
         .wildcard, .lit, .range_pat => false,
         .binding, .enum_literal => |value| generatedMatchNameEquals(lexicalRoot(value), name),
@@ -801,7 +1152,7 @@ fn patternContainsGeneratedMatchName(pattern: ast.Pattern, name: GeneratedMatchN
     };
 }
 
-fn stmtContainsGeneratedMatchName(stmt: ast.Stmt, name: GeneratedMatchName) bool {
+fn stmtContainsGeneratedMatchName(stmt: ast.Stmt, name: []const u8) bool {
     return switch (stmt) {
         .let_stmt => |let_statement| {
             if (generatedMatchNameEquals(lexicalRoot(let_statement.name), name)) return true;
@@ -819,7 +1170,7 @@ fn stmtContainsGeneratedMatchName(stmt: ast.Stmt, name: GeneratedMatchName) bool
     };
 }
 
-fn blockContainsGeneratedMatchName(block: ast.Block, name: GeneratedMatchName) bool {
+fn blockContainsGeneratedMatchName(block: ast.Block, name: []const u8) bool {
     if (block.label) |label| {
         if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
     }
@@ -830,7 +1181,7 @@ fn blockContainsGeneratedMatchName(block: ast.Block, name: GeneratedMatchName) b
     return false;
 }
 
-fn matchContainsGeneratedMatchName(match: ast.Match, name: GeneratedMatchName) bool {
+fn matchContainsGeneratedMatchName(match: ast.Match, name: []const u8) bool {
     if (exprContainsGeneratedMatchName(match.target.*, name)) return true;
     for (match.arms) |arm| {
         for (arm.patterns) |pattern| {
@@ -844,9 +1195,9 @@ fn matchContainsGeneratedMatchName(match: ast.Match, name: GeneratedMatchName) b
     return false;
 }
 
-fn exprContainsGeneratedMatchName(expression: ast.Expr, name: GeneratedMatchName) bool {
+fn exprContainsGeneratedMatchName(expression: ast.Expr, name: []const u8) bool {
     return switch (expression) {
-        .lit, .unit, .unsupported, .panic_, .continue_expr => false,
+        .lit, .unit, .unsupported, .panic_, .unreachable_ => false,
         .ident => |value| generatedMatchNameEquals(lexicalRoot(value), name),
         .field_access => |field_access| exprContainsGeneratedMatchName(field_access.target.*, name),
         .call => |call| {
@@ -922,6 +1273,9 @@ fn exprContainsGeneratedMatchName(expression: ast.Expr, name: GeneratedMatchName
             return false;
         },
         .while_expr => |while_expression| {
+            if (while_expression.label) |label| {
+                if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+            }
             if (exprContainsGeneratedMatchName(while_expression.cond.*, name)) return true;
             if (while_expression.captures) |captures| {
                 for (captures) |capture| {
@@ -938,6 +1292,9 @@ fn exprContainsGeneratedMatchName(expression: ast.Expr, name: GeneratedMatchName
             return false;
         },
         .for_expr => |for_expression| {
+            if (for_expression.label) |label| {
+                if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+            }
             for (for_expression.inputs) |input| {
                 if (exprContainsGeneratedMatchName(input, name)) return true;
             }
@@ -955,8 +1312,23 @@ fn exprContainsGeneratedMatchName(expression: ast.Expr, name: GeneratedMatchName
             if (range.end) |end| return exprContainsGeneratedMatchName(end.*, name);
             return false;
         },
-        .return_expr, .break_expr => |value| {
+        .return_expr => |value| {
             if (value) |inner| return exprContainsGeneratedMatchName(inner.*, name);
+            return false;
+        },
+        .break_expr => |break_expr| {
+            if (break_expr.label) |label| {
+                if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+            }
+            if (break_expr.value) |inner| {
+                return exprContainsGeneratedMatchName(inner.*, name);
+            }
+            return false;
+        },
+        .continue_expr => |continue_expr| {
+            if (continue_expr.label) |label| {
+                return generatedMatchNameEquals(lexicalRoot(label), name);
+            }
             return false;
         },
     };
@@ -978,17 +1350,45 @@ fn freshGeneratedMatchName(
                 break;
             }
         }
+        var candidate_buffer: [64]u8 = undefined;
+        const candidate_text = generatedMatchNameText(&candidate_buffer, candidate);
         if (!active) {
             for (active_capture_names) |capture_name| {
-                if (generatedMatchNameEquals(capture_name, candidate)) {
+                if (generatedMatchNameEquals(capture_name, candidate_text)) {
                     active = true;
                     break;
                 }
             }
         }
-        if (!active and !matchContainsGeneratedMatchName(match, candidate)) return candidate;
+        if (!active and !matchContainsGeneratedMatchName(match, candidate_text)) {
+            return candidate;
+        }
     }
     @panic("exhausted generated match names");
+}
+
+/// Picks the label the emitter writes for `scope`, a loop or a block it is
+/// about to label. The depth seeds the suffix because two scopes at the same
+/// depth never overlap, so their labels can share a suffix; the search then
+/// walks forward past anything the scope already uses.
+///
+/// The scope is searched as a whole, so a name the source itself binds, or a
+/// source label it carries, is treated as taken. A Rust identifier is free to
+/// spell `__r2z_value_loop_0`, and a generated label must not land on it.
+fn freshGeneratedLabel(
+    buffer: *[64]u8,
+    scope: ast.Expr,
+    base: []const u8,
+    depth: usize,
+) []const u8 {
+    var suffix = depth;
+    while (suffix < depth + 1024) : (suffix += 1) {
+        // The label is spelled with the suffix even at zero, so the text the
+        // scope is searched for is the text the emitter writes.
+        const candidate_text = std.fmt.bufPrint(buffer, "{s}_{d}", .{ base, suffix }) catch unreachable;
+        if (!exprContainsGeneratedMatchName(scope, candidate_text)) return candidate_text;
+    }
+    @panic("exhausted generated label names");
 }
 
 pub fn emitExpr(
@@ -1010,6 +1410,7 @@ fn emitChunkLoop(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     loop: ast.ForExpr,
+    label: ?[]const u8,
     depth: usize,
 ) !bool {
     const iterable = loop.inputs[0];
@@ -1078,6 +1479,7 @@ fn emitChunkLoop(
         try emitExprScoped(context, allocator, buf, chunks.target, depth);
         try buf.appendSlice(allocator, ";\n");
         try emitIndent(allocator, buf, depth);
+        try emitSourceLoopLabel(allocator, buf, label);
         try buf.appendSlice(allocator, "while (__r2z_iter.next()) |");
         try emitCaptureBinding(allocator, buf, capture);
         try buf.appendSlice(allocator, "| {\n");
@@ -1097,6 +1499,7 @@ fn emitChunkLoop(
         try emitExprScoped(context, allocator, buf, size, depth);
         try buf.appendSlice(allocator, ");\n");
         try emitIndent(allocator, buf, depth);
+        try emitSourceLoopLabel(allocator, buf, label);
         try buf.appendSlice(allocator, "while (__r2z_chunks_exact.next()) |");
         try emitCaptureBinding(allocator, buf, capture);
         try buf.appendSlice(allocator, "| {\n");
@@ -1110,6 +1513,7 @@ fn emitChunkLoop(
 
     try buf.appendSlice(allocator, "var __chunk_index: usize = 0;\n");
     try emitIndent(allocator, buf, depth);
+    try emitSourceLoopLabel(allocator, buf, label);
     try buf.appendSlice(allocator, "while (");
     try emitReceiver(context, allocator, buf, chunks.target, depth);
     try buf.appendSlice(allocator, ".len > __chunk_index) : (__chunk_index += ");
@@ -1133,13 +1537,13 @@ fn emitChunkLoop(
     return true;
 }
 
-/// True for expressions that bind tighter than `.` and `[`, so they can be
-/// used as a receiver without parentheses. A struct literal is the case that
-/// matters here: `Range{ .start = 0 }.step_by(2)` does not parse, so the
-/// receiver has to be written `(Range{ .start = 0 }).step_by(2)`.
+/// True for expressions that bind tighter than `.` and `[`. Prefix unary
+/// operators need a group: `(try f()).method()` must not become
+/// `try f().method()`. Dereference is postfix and needs no group here.
 fn isAtomicExpr(expr: ast.Expr) bool {
     return switch (expr) {
-        .lit, .ident, .field_access, .call, .unary_op, .cast, .builtin => true,
+        .lit, .ident, .field_access, .call, .cast, .builtin => true,
+        .unary_op => |unary| unary.op == .deref,
         else => false,
     };
 }
@@ -1252,11 +1656,7 @@ fn emitExprScoped(
         .lit => |l| try emitLiteral(allocator, buf, l),
         .ident => |id| try emitIdent(allocator, buf, id),
         .field_access => |fa| {
-            if (fa.target.* == .ident and std.mem.eql(u8, fa.target.ident, "error")) {
-                try buf.appendSlice(allocator, "error");
-            } else {
-                try emitReceiver(context, allocator, buf, fa.target.*, depth);
-            }
+            try emitReceiver(context, allocator, buf, fa.target.*, depth);
             try buf.appendSlice(allocator, ".");
             try emitIdent(allocator, buf, fa.field_name);
         },
@@ -1424,7 +1824,7 @@ fn emitExprScoped(
         .repeat => |rp| {
             if (rp.type_name) |tn| {
                 try buf.appendSlice(allocator, "[_]");
-                try emitRepeatElementType(allocator, buf, tn);
+                try emitType(allocator, buf, tn);
             } else {
                 try buf.appendSlice(allocator, ".");
             }
@@ -1490,42 +1890,42 @@ fn emitExprScoped(
             try buf.appendSlice(allocator, "if (");
             try emitExprScoped(context, allocator, buf, ie.cond.*, depth);
             try buf.appendSlice(allocator, ") ");
+            try emitIfCapture(allocator, buf, ie.then_capture);
             try emitExprScoped(context, allocator, buf, ie.then_body.*, depth);
             if (ie.else_body) |eb| {
                 try buf.appendSlice(allocator, " else ");
+                try emitIfCapture(allocator, buf, ie.else_capture);
                 try emitExprScoped(context, allocator, buf, eb.*, depth);
             }
         },
         .while_expr => |we| {
-            try buf.appendSlice(allocator, "while (");
-            try emitExprScoped(context, allocator, buf, we.cond.*, depth);
-            try buf.appendSlice(allocator, ")");
-            if (we.captures) |caps| {
-                try buf.appendSlice(allocator, " |");
-                for (caps, 0..) |cap, i| {
-                    if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try buf.appendSlice(allocator, cap);
-                }
-                try buf.appendSlice(allocator, "|");
+            if (loopYieldsValue(we)) {
+                try emitValueLoopScoped(context, allocator, buf, we, depth);
+                return;
             }
-            if (we.continue_expr) |ce| {
-                try buf.appendSlice(allocator, " : (");
-                try emitExprScoped(context, allocator, buf, ce.*, depth);
-                try buf.appendSlice(allocator, ")");
-            }
-            try buf.appendSlice(allocator, " ");
-            try emitBlockScoped(context, allocator, buf, we.body, depth);
-            if (we.else_body) |eb| {
-                try buf.appendSlice(allocator, " else ");
-                try emitExprScoped(context, allocator, buf, eb.*, depth);
-            }
+            try emitWhileScoped(context, allocator, buf, we, depth);
         },
         .for_expr => |fe| {
-            if (try emitChunkLoop(context, allocator, buf, fe, depth)) return;
+            const target: ExitTarget = .{
+                .source_label = fe.label,
+                .innermost_loop = true,
+                .break_label = fe.label,
+                .continue_label = fe.label,
+                .kind = .loop,
+            };
+            var loop_scope: ExitScope = .{
+                .target = target,
+                .parent = context.exit_scope,
+            };
+            var loop_context = context.*;
+            loop_context.exit_scope = &loop_scope;
+            const label = usedLoopLabel(fe.body, target);
+            if (try emitChunkLoop(&loop_context, allocator, buf, fe, label, depth)) return;
+            try emitSourceLoopLabel(allocator, buf, label);
             try buf.appendSlice(allocator, "for (");
             for (fe.inputs, 0..) |inp, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
-                try emitExprScoped(context, allocator, buf, inp, depth);
+                try emitExprScoped(&loop_context, allocator, buf, inp, depth);
             }
             try buf.appendSlice(allocator, ") |");
             for (fe.captures, 0..) |cap, i| {
@@ -1533,8 +1933,10 @@ fn emitExprScoped(
                 try emitCaptureBinding(allocator, buf, cap);
             }
             try buf.appendSlice(allocator, "| ");
-            try emitBlockScoped(context, allocator, buf, fe.body, depth);
+            try emitBlockScoped(&loop_context, allocator, buf, fe.body, depth);
             if (fe.else_body) |eb| {
+                // The `else` arm runs once the loop is over, so an exit in it
+                // belongs to whatever is outside the loop.
                 try buf.appendSlice(allocator, " else ");
                 try emitExprScoped(context, allocator, buf, eb.*, depth);
             }
@@ -1554,18 +1956,175 @@ fn emitExprScoped(
                 try buf.appendSlice(allocator, "return");
             }
         },
-        .break_expr => |be| {
-            if (be) |val| {
+        .break_expr => |break_expr| {
+            // A labeled exit names the source target it belongs to. An
+            // unlabeled one leaves the innermost enclosing loop, whatever
+            // labels the loops around it carry, so it resolves to the loop
+            // target and not to any block the emitter generated inside it.
+            const target = if (break_expr.label) |label|
+                findExitTarget(context.exit_scope, label)
+            else
+                findInnermostLoopTarget(context.exit_scope);
+            const named_label: ?[]const u8 = if (target) |exit| exit.break_label else null;
+            if (break_expr.value) |val| {
                 try buf.appendSlice(allocator, "break ");
+                if (named_label) |label| {
+                    try buf.appendSlice(allocator, ":");
+                    try emitIdent(allocator, buf, label);
+                    try buf.appendSlice(allocator, " ");
+                }
                 try emitExprScoped(context, allocator, buf, val.*, depth);
             } else {
                 try buf.appendSlice(allocator, "break");
+                if (named_label) |label| {
+                    try buf.appendSlice(allocator, " :");
+                    try emitIdent(allocator, buf, label);
+                }
             }
         },
-        .continue_expr => {
+        .continue_expr => |continue_expr| {
+            // `continue` restarts a loop and never a block, so the chain skips
+            // every block target and lands on the loop that answers to this
+            // label.
+            const target = if (continue_expr.label) |label|
+                findContinueTarget(context.exit_scope, label)
+            else
+                findInnermostLoopTarget(context.exit_scope);
             try buf.appendSlice(allocator, "continue");
+            if (target) |exit| {
+                if (exit.continue_label) |label| {
+                    try buf.appendSlice(allocator, " :");
+                    try emitIdent(allocator, buf, label);
+                }
+            }
         },
+        .unreachable_ => try buf.appendSlice(allocator, "unreachable"),
     }
+}
+
+/// Writes the `label: ` prefix a Zig loop carries, or nothing when the source
+/// loop has no label.
+fn emitSourceLoopLabel(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    label: ?[]const u8,
+) std.mem.Allocator.Error!void {
+    const text = label orelse return;
+    try emitIdent(allocator, buf, text);
+    try buf.appendSlice(allocator, ": ");
+}
+
+/// Writes the loop header, up to but not including its body. The target is
+/// passed in because it decides the label: only the label an exit really
+/// lands on may be written.
+fn emitWhileHeader(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    loop_expr: ast.WhileExpr,
+    target: ExitTarget,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    try emitSourceLoopLabel(allocator, buf, usedLoopLabel(loop_expr.body, target));
+    try buf.appendSlice(allocator, "while (");
+    try emitExprScoped(context, allocator, buf, loop_expr.cond.*, depth);
+    try buf.appendSlice(allocator, ")");
+    if (loop_expr.captures) |caps| {
+        try buf.appendSlice(allocator, " |");
+        for (caps, 0..) |cap, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try buf.appendSlice(allocator, cap);
+        }
+        try buf.appendSlice(allocator, "|");
+    }
+    if (loop_expr.continue_expr) |ce| {
+        try buf.appendSlice(allocator, " : (");
+        try emitExprScoped(context, allocator, buf, ce.*, depth);
+        try buf.appendSlice(allocator, ")");
+    }
+    try buf.appendSlice(allocator, " ");
+}
+
+/// Emits the body and the `else` arm of a loop whose header is already out.
+/// The exit target is pushed here, so it covers the body and nothing else.
+fn emitLoopBodyScoped(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    loop_expr: ast.WhileExpr,
+    target: ExitTarget,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    // The target outlives the body because the body is emitted below, still
+    // inside this frame.
+    var loop_scope: ExitScope = .{ .target = target, .parent = context.exit_scope };
+    var loop_context = context.*;
+    loop_context.exit_scope = &loop_scope;
+    try emitBlockScoped(&loop_context, allocator, buf, loop_expr.body, depth);
+    if (loop_expr.else_body) |eb| {
+        // The `else` arm runs once the loop is over, so an exit in it belongs
+        // to whatever is outside the loop rather than to the loop.
+        try buf.appendSlice(allocator, " else ");
+        try emitExprScoped(context, allocator, buf, eb.*, depth);
+    }
+}
+
+/// Emits a plain `while`. Entering the loop happens here, so every nested
+/// `break` inside the body resolves against it.
+fn emitWhileScoped(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    loop_expr: ast.WhileExpr,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    const target: ExitTarget = .{
+        .source_label = loop_expr.label,
+        .innermost_loop = true,
+        .break_label = loop_expr.label,
+        .continue_label = loop_expr.label,
+        .kind = .loop,
+    };
+    try emitWhileHeader(context, allocator, buf, loop_expr, target, depth);
+    try emitLoopBodyScoped(context, allocator, buf, loop_expr, target, depth);
+}
+
+/// Emits a loop that carries a value out of itself. Zig's `while` takes its
+/// value from a `break` that names it, but a loop can only be labelled from
+/// the outside, so the loop goes inside a labelled block and its own
+/// value-carrying breaks name that block. Labelling the loop *body* instead
+/// does not work: Zig then wants one type from every path through that block,
+/// and the loop result stays void.
+///
+/// The two scopes stand for one Rust loop, so the chain records both: `break`
+/// names the wrapper block that carries the value and `continue` names the
+/// `while` itself, which is the scope Zig actually restarts.
+fn emitValueLoopScoped(
+    context: *const EmitContext,
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    loop_expr: ast.WhileExpr,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    var label_buffer: [64]u8 = undefined;
+    const label = freshGeneratedLabel(
+        &label_buffer,
+        .{ .while_expr = loop_expr },
+        value_loop_base,
+        depth,
+    );
+    try emitIdent(allocator, buf, label);
+    try buf.appendSlice(allocator, ": {\n");
+    const target: ExitTarget = .{
+        .source_label = loop_expr.label,
+        .innermost_loop = true,
+        .break_label = label,
+        .continue_label = loop_expr.label,
+        .kind = .loop,
+    };
+    try emitWhileHeader(context, allocator, buf, loop_expr, target, depth);
+    try emitLoopBodyScoped(context, allocator, buf, loop_expr, target, depth);
+    try buf.appendSlice(allocator, "}");
 }
 
 fn emitMatchExpr(
@@ -1635,14 +2194,21 @@ fn emitMatchExpr(
 
         try buf.appendSlice(allocator, " =>");
         if (explicit_capture) |capture| {
-            try buf.appendSlice(allocator, " |");
-            if (capture.by_ref) try buf.appendSlice(allocator, "*");
-            try emitIdent(allocator, buf, capture.name);
-            try buf.appendSlice(allocator, "|");
+            // Zig refuses a capture nothing reads: naming one is `error: unused
+            // capture`, and discarding it as `_` is `error: discard of
+            // capture`. An arm that only tests the tag writes no capture.
+            if (exprContainsGeneratedMatchName(arm.body, capture.name)) {
+                try buf.appendSlice(allocator, " |");
+                if (capture.by_ref) try buf.appendSlice(allocator, "*");
+                try emitIdent(allocator, buf, capture.name);
+                try buf.appendSlice(allocator, "|");
+            }
         } else if (direct_binding) |binding| {
-            try buf.appendSlice(allocator, " |");
-            try emitIdent(allocator, buf, binding);
-            try buf.appendSlice(allocator, "|");
+            if (exprContainsGeneratedMatchName(arm.body, binding)) {
+                try buf.appendSlice(allocator, " |");
+                try emitIdent(allocator, buf, binding);
+                try buf.appendSlice(allocator, "|");
+            }
         }
         if (needs_destructure) {
             const payload_name = freshGeneratedMatchName(
@@ -1659,9 +2225,14 @@ fn emitMatchExpr(
                 match_arm_base,
             );
             try active_names.append(allocator, arm_name);
+            // The prong is still inside every scope around it: a `break` an arm
+            // body carries leaves through the label of the block or loop that
+            // opened it, which is what the generated match chain and a
+            // collection's own exit block rely on.
             const arm_context: EmitContext = .{
                 .active_names = active_names.items,
                 .active_capture_names = arm_capture_names.items,
+                .exit_scope = context.exit_scope,
             };
 
             try buf.appendSlice(allocator, " |");
@@ -1683,6 +2254,7 @@ fn emitMatchExpr(
                 const arm_context: EmitContext = .{
                     .active_names = active_names.items,
                     .active_capture_names = arm_capture_names.items,
+                    .exit_scope = context.exit_scope,
                 };
                 try emitExprScoped(&arm_context, allocator, buf, arm.body, depth + 1);
             } else {
@@ -1778,7 +2350,7 @@ fn emitMatchDestructureBody(
 
     try emitIndent(allocator, buf, depth + 2);
     switch (body) {
-        .return_expr, .break_expr, .continue_expr, .panic_ => {
+        .return_expr, .break_expr, .continue_expr, .unreachable_, .panic_ => {
             try emitExprScoped(context, allocator, buf, body, depth + 2);
             try buf.appendSlice(allocator, ";\n");
         },
@@ -1804,6 +2376,45 @@ fn emitBlock(
     try emitBlockScoped(&context, allocator, buf, block, depth);
 }
 
+/// Zig refuses a local nothing reads; Rust allows an unused binding. A
+/// declaration no other statement in its block names is therefore emitted as
+/// `_ = <init>;`: the initialiser still runs for its effects and the
+/// unused-local error does not. A name that DOES occur keeps its binding,
+/// because a false positive here would discard a value that is live.
+fn unusedBindingAsDiscard(
+    allocator: std.mem.Allocator,
+    block: ast.Block,
+    index: usize,
+    stmt: ast.Stmt,
+) !ast.Stmt {
+    _ = allocator;
+    const let_stmt = switch (stmt) {
+        .let_stmt => |value| value,
+        else => return stmt,
+    };
+    const name = let_stmt.name;
+    if (name.len == 0 or std.mem.startsWith(u8, name, "_")) return stmt;
+    // A `.unit` initialiser is either "no initialiser" — the source bound the
+    // name and assigned it later, and that assignment is the use this scan
+    // cannot see — or a real unit value, which `_ =` would not accept.
+    if (let_stmt.init == .unit) return stmt;
+    if (blockReadsNameOutside(block, index, name)) return stmt;
+    return .{ .assign = .{ .target = .{ .ident = "_" }, .val = let_stmt.init } };
+}
+
+/// Whether any statement other than `index`, or the block's tail, names
+/// `name`.
+fn blockReadsNameOutside(block: ast.Block, index: usize, name: []const u8) bool {
+    for (block.stmts, 0..) |stmt, other| {
+        if (other == index) continue;
+        if (stmtContainsGeneratedMatchName(stmt, name)) return true;
+    }
+    if (block.expr) |tail| {
+        if (exprContainsGeneratedMatchName(tail.*, name)) return true;
+    }
+    return false;
+}
+
 fn emitBlockScoped(
     context: *const EmitContext,
     allocator: std.mem.Allocator,
@@ -1815,36 +2426,59 @@ fn emitBlockScoped(
     const value_label: ?[]const u8 = if (block.label) |label|
         label
     else if (blockHasValue(block))
-        std.fmt.bufPrint(
+        freshGeneratedLabel(
             &generated_label_buffer,
-            "__r2z_value_block_{d}",
-            .{depth},
-        ) catch unreachable
+            .{ .block = block },
+            value_block_base,
+            depth,
+        )
     else
         null;
+    // A labelled block is its own exit target. It never claims an unlabeled
+    // `break`: in Rust that still belongs to the loop around the block, so
+    // only an exit naming this block's label stops here.
+    var block_context = context.*;
     if (value_label) |label| {
+        var block_scope: ExitScope = .{
+            .target = .{
+                .source_label = block.label,
+                .innermost_loop = false,
+                .break_label = label,
+                .continue_label = null,
+                .kind = .block,
+            },
+            .parent = context.exit_scope,
+        };
+        block_context.exit_scope = &block_scope;
         try emitIdent(allocator, buf, label);
         try buf.appendSlice(allocator, ": ");
     }
     try buf.appendSlice(allocator, "{\n");
-    for (block.stmts) |stmt| {
-        try emitStmtScoped(context, allocator, buf, stmt, depth + 1);
+    for (block.stmts, 0..) |stmt, index| {
+        try emitStmtScoped(
+            &block_context,
+            allocator,
+            buf,
+            try unusedBindingAsDiscard(allocator, block, index, stmt),
+            depth + 1,
+        );
     }
     if (block.expr) |tail| {
         try emitIndent(allocator, buf, depth + 1);
         if (tail.* == .return_expr or tail.* == .break_expr or
-            tail.* == .continue_expr or tail.* == .panic_)
+            tail.* == .continue_expr or tail.* == .unreachable_ or
+            tail.* == .panic_)
         {
-            try emitExprScoped(context, allocator, buf, tail.*, depth + 1);
+            try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
             try buf.appendSlice(allocator, ";\n");
         } else if (value_label) |label| {
             try buf.appendSlice(allocator, "break :");
             try emitIdent(allocator, buf, label);
             try buf.appendSlice(allocator, " ");
-            try emitExprScoped(context, allocator, buf, tail.*, depth + 1);
+            try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
             try buf.appendSlice(allocator, ";\n");
         } else {
-            try emitExprScoped(context, allocator, buf, tail.*, depth + 1);
+            try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
             try buf.appendSlice(allocator, "\n");
         }
     }
@@ -1913,6 +2547,12 @@ fn emitLiteral(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), l
             try buf.appendSlice(allocator, "\"");
             try emitEscapedString(allocator, buf, s);
             try buf.appendSlice(allocator, "\"");
+        },
+        // A Zig error-set value is `error.<tag>`, never a field of a user
+        // binding, so the tag is the only part that needs escaping.
+        .error_tag => |tag| {
+            try buf.appendSlice(allocator, "error.");
+            try emitIdent(allocator, buf, tag);
         },
         .null_lit => try buf.appendSlice(allocator, "null"),
         .undefined_lit => try buf.appendSlice(allocator, "undefined"),
@@ -2115,7 +2755,7 @@ test "emitFile: rejects generated tests without std and empty test bodies" {
     const no_std: ast.File = .{
         .path = "src/root.zig",
         .tests = &.{.{ .name = "missing std", .body = .{
-            .expr = &ast.Expr{ .continue_expr = {} },
+            .expr = &ast.Expr{ .continue_expr = .{} },
         } }},
     };
     try std.testing.expectError(
@@ -2314,4 +2954,279 @@ test "emitExpr: nested value blocks use distinct labels" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__r2z_value_block_0:") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__r2z_value_block_1:") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "block:") == null);
+}
+
+test "emitExpr: prefix unary receivers preserve field access precedence" {
+    const operand: ast.Expr = .{ .ident = "value" };
+    const cases = [_]struct { op: ast.UnaryOpKind, expected: []const u8 }{
+        .{ .op = .try_op, .expected = "(try value).field" },
+        .{ .op = .addr_of, .expected = "(&value).field" },
+        .{ .op = .negate, .expected = "(-value).field" },
+        .{ .op = .bit_not, .expected = "(~value).field" },
+        .{ .op = .bool_not, .expected = "(!value).field" },
+        .{ .op = .deref, .expected = "value.*.field" },
+    };
+    for (cases) |case| {
+        const receiver: ast.Expr = .{ .unary_op = .{
+            .op = case.op,
+            .operand = &operand,
+        } };
+        const field: ast.Expr = .{ .field_access = .{
+            .target = &receiver,
+            .field_name = "field",
+        } };
+        var buffer: std.ArrayListUnmanaged(u8) = .empty;
+        defer buffer.deinit(std.testing.allocator);
+        try emitExpr(std.testing.allocator, &buffer, field, 0);
+        try std.testing.expectEqualStrings(case.expected, buffer.items);
+    }
+}
+
+// A Rust `loop` that returns a value lowers to a `while` whose only exit
+// carries one, and Zig takes the loop's value from exactly that exit. So the
+// question the emitter has to answer first is whether the loop carries one at
+// all, and the answer has to come from the loop's own exits: a value-carrying
+// break deeper in the tree belongs to whatever loop encloses it there.
+test "loopYieldsValue: only the loop's own value-carrying exit counts" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const unit_exit: ast.Expr = .{ .break_expr = .{} };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+
+    const unit_loop: ast.WhileExpr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &unit_exit }} },
+    };
+    const value_loop: ast.WhileExpr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    };
+    const nested_value_loop: ast.Expr = .{ .while_expr = value_loop };
+    const nested_for_loop: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{.{ .ident = "items" }},
+        .captures = &.{.{ .name = "item" }},
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+
+    try std.testing.expect(!loopYieldsValue(unit_loop));
+    try std.testing.expect(loopYieldsValue(value_loop));
+    try std.testing.expect(!loopYieldsValue(.{
+        .cond = &condition,
+        .body = .{ .stmts = &.{
+            .{ .expr_stmt = &nested_value_loop },
+            .{ .expr_stmt = &nested_for_loop },
+            .{ .expr_stmt = &unit_exit },
+        } },
+    }));
+
+    // A `break` behind a conditional, a block or a match arm still exits the
+    // loop that owns it.
+    const then_exit: ast.Expr = .{ .block = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} } };
+    const conditional: ast.Expr = .{ .if_expr = .{
+        .cond = &subject,
+        .then_body = &then_exit,
+    } };
+    const matched: ast.Expr = .{ .match_expr = .{
+        .target = &subject,
+        .arms = &.{.{ .patterns = &.{.wildcard}, .body = value_exit }},
+    } };
+    try std.testing.expect(loopYieldsValue(.{
+        .cond = &condition,
+        .body = .{ .stmts = &.{
+            .{ .expr_stmt = &conditional },
+            .{ .expr_stmt = &matched },
+        } },
+    }));
+}
+
+test "emitExpr: a value-carrying loop exits through its own label" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, loop, 0);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "while (true) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__r2z_value_loop_0: {") != null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, buffer.items, "break :__r2z_value_loop_0 value;"),
+    );
+}
+
+test "emitExpr: a nested unit loop keeps the break that belongs to it" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const unit_exit: ast.Expr = .{ .break_expr = .{} };
+    const inner: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &unit_exit }} },
+    } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+    const outer: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{
+            .{ .expr_stmt = &inner },
+            .{ .expr_stmt = &value_exit },
+        } },
+    } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, outer, 0);
+    // Only the outer loop's own value-carrying exit names the label; the unit
+    // loop nested in it leaves with a plain `break`.
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "break;") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, buffer.items, "break :"));
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "break :__r2z_value_loop_0 value;") != null,
+    );
+}
+
+test "emitExpr: a value loop nested in a unit loop is discarded, the outer stays a loop" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+    const inner: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+    const unit_exit: ast.Expr = .{ .break_expr = .{} };
+    const outer: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{
+            .{ .expr_stmt = &inner },
+            .{ .expr_stmt = &unit_exit },
+        } },
+    } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, outer, 0);
+    // The outer loop carries no value of its own, so it stays a bare loop and
+    // the inner one, whose value the statement throws away, is labelled.
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "_ = __r2z_value_loop_1: {") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "break :__r2z_value_loop_1 value;") != null,
+    );
+}
+
+test "emitExpr: a value-carrying loop keeps its value as a block tail" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+    const block: ast.Expr = .{ .block = .{ .expr = &loop } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, block, 0);
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "break :__r2z_value_block_0 __r2z_value_loop_1: {") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "break :__r2z_value_loop_1 value;") != null,
+    );
+}
+
+test "emitExpr: a value-carrying loop keeps its value as a call argument" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+    const callee: ast.Expr = .{ .ident = "take" };
+    const call: ast.Expr = .{ .call = .{ .callee = &callee, .args = &.{loop} } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitExpr(std.testing.allocator, &buffer, call, 0);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "take(__r2z_value_loop_0: {") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "break :__r2z_value_loop_0 value;") != null,
+    );
+}
+
+test "emitStmt: a let binding keeps the value of a value-carrying loop" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+    const binding: ast.Stmt = .{ .let_stmt = .{ .name = "total", .init = loop } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitStmt(std.testing.allocator, &buffer, binding, 1);
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "const total = __r2z_value_loop_1: {") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "break :__r2z_value_loop_1 value;") != null,
+    );
+}
+
+test "emitStmt: a value-carrying loop used as a statement discards its value" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const subject: ast.Expr = .{ .ident = "value" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &subject } };
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitStmt(std.testing.allocator, &buffer, .{ .expr_stmt = &loop }, 1);
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "_ = __r2z_value_loop_1: {") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, buffer.items, "break :__r2z_value_loop_1 value;") != null,
+    );
+}
+
+test "emitStmt: a unit loop statement stays a bare statement" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const unit_exit: ast.Expr = .{ .break_expr = .{} };
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &unit_exit }} },
+    } };
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try emitStmt(std.testing.allocator, &buffer, .{ .expr_stmt = &loop }, 1);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "while (true) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "break;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "__r2z_value_loop_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "_ = ") == null);
+}
+
+test "emitFile: a value-carrying loop tail is returned instead of dropped" {
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const counter: ast.Expr = .{ .ident = "i" };
+    const value_exit: ast.Expr = .{ .break_expr = .{ .value = &counter } };
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .body = .{ .stmts = &.{.{ .expr_stmt = &value_exit }} },
+    } };
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "square",
+            .ret_type = .{ .prim = .u32 },
+            .body = .{ .expr = &loop },
+        } }},
+    };
+    const source = try emitFile(std.testing.allocator, &file);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return __r2z_value_loop_1: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "break :__r2z_value_loop_1 i;") != null);
 }

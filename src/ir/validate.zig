@@ -58,6 +58,10 @@ pub const ValidationError = error{
 /// reason per unsupported construct ("cast target type", "macro {s}", ...);
 /// without this the only thing a caller could ever see was the bare error.
 /// Thread-local so concurrent validations cannot cross-contaminate.
+/// The reason is COPIED, not borrowed: the IR it names lives in an arena the
+/// failing translation releases before its caller reads the diagnosis back,
+/// and a slice read after that free is a wild pointer.
+threadlocal var pending_reason_buffer: [256]u8 = undefined;
 threadlocal var pending_unsupported_reason: ?[]const u8 = null;
 
 /// Read and clear the pending unsupported-expression reason. Returns null
@@ -332,6 +336,91 @@ fn isTraitAssocConstDeclaration(ir: *const RustIr, id: spine.EntityId) bool {
     return false;
 }
 
+/// Append every name a declaration's generic metadata binds. `generic_params`
+/// carries the type parameters in source order; `generics.params` carries the
+/// same declarations with their const and lifetime parameters alongside.
+fn appendGenericParamNames(
+    allocator: std.mem.Allocator,
+    names: *std.ArrayListUnmanaged([]const u8),
+    generics: ?types_mod.Generics,
+) std.mem.Allocator.Error!void {
+    const params = if (generics) |value| value.params else return;
+    for (params) |param| {
+        try names.append(allocator, switch (param) {
+            .type_ => |value| value.name,
+            .const_ => |value| value.name,
+            .lifetime => |value| value.name,
+        });
+    }
+}
+
+/// Every generic name any declaration in the crate binds, as one list.
+///
+/// A table row no body walk reaches — an expression, statement, pattern, or
+/// interned type that no owner references — has no lexical scope of its own,
+/// and `validateBodies` still has to resolve the types those rows carry. Their
+/// null-id path roots may name a parameter some declaration binds; this is the
+/// union of those bindings. A name nothing declares is still
+/// `UnresolvedTypePath`, so a genuinely unknown type stays refused.
+///
+/// One decision, written twice: `validateNominalCrateGenericNames` in
+/// serialize.zig resolves unreachable rows the same way for `--dump rustir`,
+/// and the two must agree or one accepts what the other rejects.
+fn crateGenericNames(allocator: std.mem.Allocator, ir: *const RustIr) !GenericNames {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+    for (ir.bodies.bodies) |body| {
+        switch (body) {
+            .fn_ => |fn_body| {
+                try names.appendSlice(allocator, fn_body.generic_params);
+                try appendGenericParamNames(allocator, &names, fn_body.generics);
+            },
+            .struct_ => |struct_body| {
+                try names.appendSlice(allocator, struct_body.generic_params);
+                for (struct_body.methods) |method| {
+                    try names.appendSlice(allocator, method.generic_params);
+                    try appendGenericParamNames(allocator, &names, method.generics);
+                }
+            },
+            .enum_ => |enum_body| try names.appendSlice(allocator, enum_body.generic_params),
+            .trait_ => |trait_body| {
+                try names.appendSlice(allocator, trait_body.generic_params);
+                try appendGenericParamNames(allocator, &names, trait_body.generics);
+                for (trait_body.methods) |method| {
+                    try names.appendSlice(allocator, method.generic_params);
+                    try appendGenericParamNames(allocator, &names, method.generics);
+                }
+                for (trait_body.assoc_types) |assoc_type| {
+                    try appendGenericParamNames(allocator, &names, assoc_type.generics);
+                }
+            },
+            .impl_ => |impl_body| try appendGenericParamNames(
+                allocator,
+                &names,
+                impl_body.generics,
+            ),
+            .type_alias => |alias_body| try names.appendSlice(
+                allocator,
+                alias_body.generic_params,
+            ),
+            .const_, .none => {},
+        }
+    }
+    return names.toOwnedSlice(allocator);
+}
+
+/// The context an unreachable row is validated in, built once per pass.
+fn unreachableRowContext(
+    ir: *const RustIr,
+    cache: *?GenericNames,
+) ValidationError!GenericContext {
+    if (cache.* == null) {
+        cache.* = crateGenericNames(ir.graph.allocator, ir) catch
+            return error.OutOfMemory;
+    }
+    return .{ .names = cache.*.? };
+}
+
 fn validateBodies(ir: *const RustIr) ValidationError!void {
     const b = &ir.bodies;
     const entity_count = ir.graph.symbol_table.entities.items.len;
@@ -474,8 +563,18 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                 };
                 try validateGenericNames(alias_body.generic_params);
                 // The alias's own parameters are in scope in its target, so the
-                // target's null-id path segments must resolve against them.
-                try validateType(ir, b, alias_body.target, alias_body.generic_params);
+                // target's null-id path segments must resolve against them. An
+                // associated type is an alias whose owner is an `impl`, and the
+                // impl binds the rest: `impl Deref for DropGuard<T, F> { type
+                // Target = T; }` declares no parameter of its own to name `T`
+                // with, so the owning scope is resolved alongside the alias's.
+                const owner_context = try ownerGenericContext(ir, b, @intCast(entity_id));
+                const alias_context: GenericContext = .{
+                    .names = alias_body.generic_params,
+                    .outer_names = owner_context.names,
+                    .outer_params = owner_context.params,
+                };
+                try validateTypeContext(ir, b, alias_body.target, alias_context);
             },
             .impl_ => {
                 const body_kind = body orelse return error.MissingBodyMetadata;
@@ -518,6 +617,13 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
         }
     }
 
+    // A row no owner walk reached is re-walked below. It has no lexical scope
+    // of its own, so its generic names resolve against the whole crate rather
+    // than against an empty one: a leftover operand typed by a parameter the
+    // declaring function binds is a well-formed row, not an unresolved path.
+    var unreachable_names: ?GenericNames = null;
+    defer if (unreachable_names) |names| ir.graph.allocator.free(names);
+
     for (b.exprs, 0..) |expr, index| {
         try validateExpr(ir, b, expr, index);
         if (!context_seen.expressions[index]) {
@@ -525,7 +631,7 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                 ir,
                 b,
                 @intCast(index),
-                .{ .names = &.{} },
+                try unreachableRowContext(ir, &unreachable_names),
                 &walker,
                 &context_seen,
             );
@@ -538,7 +644,7 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                 ir,
                 b,
                 .{ .pattern = @intCast(index) },
-                .{ .names = &.{} },
+                try unreachableRowContext(ir, &unreachable_names),
                 &context_seen,
             );
         }
@@ -550,19 +656,19 @@ fn validateBodies(ir: *const RustIr) ValidationError!void {
                 ir,
                 b,
                 .{ .statement = @intCast(index) },
-                .{ .names = &.{} },
+                try unreachableRowContext(ir, &unreachable_names),
                 &context_seen,
             );
         }
     }
     for (ir.types, 0..) |ty, index| {
         if (!context_seen.root_types[index]) {
-            try validateType(ir, b, ty, &.{});
+            try validateTypeContext(ir, b, ty, try unreachableRowContext(ir, &unreachable_names));
         }
     }
     for (b.types, 0..) |ty, index| {
         if (!context_seen.body_types[index]) {
-            try validateType(ir, b, ty, &.{});
+            try validateTypeContext(ir, b, ty, try unreachableRowContext(ir, &unreachable_names));
         }
     }
 }
@@ -677,11 +783,33 @@ fn validateStructBody(
         if (method.name.len == 0) return error.IncompleteGenericMetadata;
         try validateGenericNames(method.generic_params);
         const method_params = if (method.generics) |generics| generics.params else &.{};
+        // A method re-parented onto the struct from an `impl` is written inside
+        // that impl as well, so the impl's parameters bind names in the
+        // signature the way the struct's own do.
+        const impl_context = try implMethodGenericContext(ir, b, owner, method.name);
         const method_context: GenericContext = .{
             .names = method.generic_params,
             .params = method_params,
             .outer_names = struct_context.names,
             .outer_params = struct_context.params,
+            .impl_names = impl_context.names,
+            .impl_params = impl_context.params,
+            .implicit_self = true,
+            .self_entity = owner,
+        };
+        // The signature is written in those two scopes, so it is resolved
+        // against them: a null-id root must be a name the method binds, the
+        // struct binds, or the owning `impl` binds. A name no scope declares is
+        // still `UnresolvedTypePath`.
+        for (method.params) |param| try validateTypeContext(ir, b, param.ty, method_context);
+        try validateTypeContext(ir, b, method.ret, method_context);
+        // A bound or where clause on the method is written in the same two
+        // owners as its signature, so it reads both scopes too.
+        const method_outer: GenericContext = .{
+            .names = struct_context.names,
+            .params = struct_context.params,
+            .impl_names = impl_context.names,
+            .impl_params = impl_context.params,
             .implicit_self = true,
             .self_entity = owner,
         };
@@ -691,11 +819,9 @@ fn validateStructBody(
                 b,
                 generics,
                 method.generic_params,
-                struct_context,
+                method_outer,
             );
         }
-        for (method.params) |param| try validateTypeContext(ir, b, param.ty, method_context);
-        try validateTypeContext(ir, b, method.ret, method_context);
         try validateExprRef(b, method.body);
         if (b.exprs[method.body].kind != .block) return error.InvalidFunctionBody;
         try validateCoreCallsInRoot(
@@ -868,7 +994,18 @@ fn validateGenericNames(names: GenericNames) ValidationError!void {
     }
 }
 
-fn validateGenericPathContext(
+/// The one rule for the segments of a nominal path: the TERMINAL has to name
+/// a declaration, a null-id name before it is a MODULE PREFIX — where the
+/// terminal was looked up rather than a type of its own — and a null-id name
+/// after a generic root is an associated-type step.
+///
+/// `crate::enc::Iter` is three segments and only `Iter` names one. The
+/// frontend deliberately leaves the prefixes lexically unresolvable, so
+/// reading one as an undeclared name refused every qualified nominal in the
+/// crate, `fn f(x: crate::enc::Iter)` and `impl Iterator for crate::enc::Iter`
+/// alike. The terminal is what keeps this narrow: `enc::Missing` and a bare
+/// `Missing` are still `UnresolvedTypePath`.
+fn validateNominalPathSegments(
     ir: *const RustIr,
     b: *const Bodies,
     path: types_mod.Path,
@@ -876,6 +1013,7 @@ fn validateGenericPathContext(
 ) ValidationError!void {
     if (path.segments.len == 0) return error.InvalidTypePath;
     if (try validateImplicitSelfPath(ir, b, path, context)) return;
+    const terminal_resolved = path.segments[path.segments.len - 1].id != null;
     var generic_root = false;
     for (path.segments, 0..) |segment, index| {
         if (segment.name.len == 0) return error.InvalidTypePath;
@@ -883,10 +1021,21 @@ fn validateGenericPathContext(
             try validateEntityRef(ir, id);
         } else if (index == 0 and contextGenericNameKnown(context, segment.name)) {
             generic_root = true;
+        } else if (terminal_resolved and index + 1 < path.segments.len) {
+            continue;
         } else if (!generic_root) {
             return error.UnresolvedTypePath;
         }
     }
+}
+
+fn validateGenericPathContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    path: types_mod.Path,
+    context: GenericContext,
+) ValidationError!void {
+    return validateNominalPathSegments(ir, b, path, context);
 }
 fn normalizedNameEqual(left: []const u8, right: []const u8) bool {
     if (left.len != right.len) return false;
@@ -1050,11 +1199,16 @@ fn validateGenericsContext(
     generic_names: GenericNames,
     outer: GenericContext,
 ) ValidationError!void {
+    // Every scope the outer binds is carried in, so a bound or where clause
+    // resolves against the same owners the declaration's signature is written
+    // in — a re-parented method's bounds reach the impl it came from.
     const context: GenericContext = .{
         .names = generic_names,
         .params = generics.params,
         .outer_names = outer.names,
         .outer_params = outer.params,
+        .impl_names = outer.impl_names,
+        .impl_params = outer.impl_params,
         .implicit_self = outer.implicit_self,
         .self_entity = outer.self_entity,
     };
@@ -1194,11 +1348,24 @@ fn genericNameKnown(generic_names: GenericNames, name: []const u8) bool {
     return false;
 }
 
+/// The generic scopes one signature or expression is written in.
+///
+/// Second copy of `NominalContext` in serialize.zig. The two must decide
+/// identically or `--dump rustir` refuses a crate that translation accepts,
+/// so change both together — including the crate-wide scope that table rows
+/// no owner walk reaches resolve against (`crateGenericNames` here,
+/// `validateNominalCrateGenericNames` there).
 const GenericContext = struct {
     names: GenericNames,
     params: []const types_mod.GenericParam = &.{},
     outer_names: GenericNames = &.{},
     outer_params: []const types_mod.GenericParam = &.{},
+    /// Third scope, for a signature written inside two owners. A method that
+    /// `finalizePendingImpls` re-parents onto a struct is written inside the
+    /// struct and inside the `impl` it came from, so both bind names there.
+    /// Kept apart from `outer_*` so neither scope has to displace the other.
+    impl_names: GenericNames = &.{},
+    impl_params: []const types_mod.GenericParam = &.{},
     implicit_self: bool = false,
     self_entity: ?spine.EntityId = null,
 };
@@ -1261,6 +1428,42 @@ fn ownerGenericContext(
     return error.InvalidParent;
 }
 
+/// The generic context an owning `impl` lends to a method re-parented onto
+/// its target's `StructBody.methods`.
+///
+/// `finalizePendingImpls` copies an impl's method onto the target struct
+/// without carrying the impl's generics across, so `impl<'a, T, I> From<I>
+/// for Wrapping<'a, T>` leaves `from`'s parameter `I` with no in-scope name
+/// even though the frontend bound it. The method's own `fn_` entity still has
+/// the impl as its parent, so the impl is recovered by matching that entity's
+/// name against the `fn_` children of the impls parented to `owner` — the
+/// same name `finalizePendingImpls` itself matches on when it appends.
+///
+/// Two impls on one struct declaring a method of the same name is ambiguous,
+/// and yields an empty context: taking either impl's parameters would admit a
+/// name the method does not bind.
+fn implMethodGenericContext(
+    ir: *const RustIr,
+    b: *const Bodies,
+    owner: spine.EntityId,
+    method_name: []const u8,
+) ValidationError!GenericContext {
+    const entities = ir.graph.symbol_table.entities.items;
+    var method_entity: ?spine.EntityId = null;
+    for (entities, 0..) |candidate, index| {
+        if (candidate.kind != .fn_) continue;
+        if (!std.mem.eql(u8, candidate.name, method_name)) continue;
+        const impl_id = candidate.parent orelse continue;
+        if (@as(usize, impl_id) >= entities.len) continue;
+        if (entities[impl_id].kind != .impl_) continue;
+        if (entities[impl_id].parent == null or entities[impl_id].parent.? != owner) continue;
+        if (method_entity != null) return .{ .names = &.{} };
+        method_entity = @intCast(index);
+    }
+    const fn_entity = method_entity orelse return .{ .names = &.{} };
+    return ownerGenericContext(ir, b, fn_entity);
+}
+
 fn genericParamNameKnown(params: []const types_mod.GenericParam, name: []const u8) bool {
     for (params) |param| {
         const candidate = switch (param) {
@@ -1277,7 +1480,9 @@ fn contextGenericNameKnown(context: GenericContext, name: []const u8) bool {
         genericNameKnown(context.names, name) or
         genericParamNameKnown(context.params, name) or
         genericNameKnown(context.outer_names, name) or
-        genericParamNameKnown(context.outer_params, name);
+        genericParamNameKnown(context.outer_params, name) or
+        genericNameKnown(context.impl_names, name) or
+        genericParamNameKnown(context.impl_params, name);
 }
 
 fn concreteSelfEntity(ir: *const RustIr, ty: Type) ?spine.EntityId {
@@ -1368,21 +1573,7 @@ fn validateTypeContextDepth(
     if (depth >= types_mod.traversal_depth_max) return error.InvalidTypeTraversal;
     const child_depth = depth + 1;
     switch (ty) {
-        .path => |path| {
-            if (path.segments.len == 0) return error.InvalidTypePath;
-            if (try validateImplicitSelfPath(ir, b, path, context)) return;
-            var generic_root = false;
-            for (path.segments, 0..) |segment, index| {
-                if (segment.name.len == 0) return error.InvalidTypePath;
-                if (segment.id) |id| {
-                    try validateEntityRef(ir, id);
-                } else if (index == 0 and contextGenericNameKnown(context, segment.name)) {
-                    generic_root = true;
-                } else if (!generic_root) {
-                    return error.UnresolvedTypePath;
-                }
-            }
-        },
+        .path => |path| try validateNominalPathSegments(ir, b, path, context),
         .external_nominal => |external| {
             try validateExternalNominal(ir, b, external, context, child_depth);
         },
@@ -1942,6 +2133,26 @@ fn referenceToRawPointerCompatible(source_ref: *const types_mod.Ref, target_raw:
     return false;
 }
 
+/// `&[T]` and `&mut [T]` are modelled as a slice, and a `*const [T]` /
+/// `*mut [T]` destination is a raw pointer to that same unsized slice: both
+/// carry the element AND the length, so the cast re-labels one as the other
+/// and keeps both. Only the fat destination can stand for a slice — a thin
+/// `*const u8` has nowhere to keep the length — and the mutability still has
+/// to hold: a shared slice cannot become a mutable pointer, while a mutable
+/// one can become either. Same rule as `sliceToRawPointerCompatible` in
+/// `infer.zig` and in `ts_ext.zig`.
+fn sliceToRawPointerCompatible(
+    source_slice: *const types_mod.Slice,
+    target_raw: *const types_mod.RawPtr,
+) bool {
+    if (target_raw.mut and source_slice.const_) return false;
+    const target_slice = switch (target_raw.pointee) {
+        .slice => |value| value,
+        else => return false,
+    };
+    return sameType(source_slice.elem, target_slice.elem);
+}
+
 fn referenceArrayToSliceCompatible(
     source_ref: *const types_mod.Ref,
     target_slice: *const types_mod.Slice,
@@ -1954,6 +2165,13 @@ fn referenceArrayToSliceCompatible(
     return sameType(source_array.elem, target_slice.elem);
 }
 
+/// The width a `From` conversion is measured against. `.char` carries the
+/// same 32 the frontend's own `infer.unsignedPrimitiveWidth` gives it, and it
+/// has to: `char::from(byte)` is an ordinary `From` conversion the frontend
+/// lowers to a `primitive_from` cast and `infer.isValidPrimitiveFrom`
+/// accepts, so a validator that gave `char` no width would refuse a cast the
+/// frontend had already decided was well formed — and `u8` to `char` is valid
+/// Rust.
 fn unsignedPrimitiveWidth(primitive: types_mod.Prim) ?u16 {
     return switch (primitive) {
         .u8 => 8,
@@ -1962,6 +2180,7 @@ fn unsignedPrimitiveWidth(primitive: types_mod.Prim) ?u16 {
         .u64 => 64,
         .u128 => 128,
         .usize => 64,
+        .char => 32,
         else => null,
     };
 }
@@ -1995,6 +2214,7 @@ fn isValidCastType(kind: exprs.ConversionKind, source: Type, target: Type) bool 
             .raw_ptr => |target_pointer| switch (source) {
                 .raw_ptr => |source_pointer| rawPointeesCastCompatible(source_pointer, target_pointer),
                 .reference => |source_reference| referenceToRawPointerCompatible(source_reference, target_pointer),
+                .slice => |source_slice| sliceToRawPointerCompatible(source_slice, target_pointer),
                 .prim => |source_prim| isIntegerPrimitive(source_prim) and isThinRawPointer(target_pointer),
                 else => false,
             },
@@ -2013,7 +2233,9 @@ fn isValidCastType(kind: exprs.ConversionKind, source: Type, target: Type) bool 
 /// every existing `error.UnsupportedExpression` match keeps working; a caller
 /// that wants the detail reads it back with `takeUnsupportedReason`.
 fn rejectUnsupportedMarker(reason: []const u8) ValidationError {
-    pending_unsupported_reason = reason;
+    const kept = reason[0..@min(reason.len, pending_reason_buffer.len)];
+    @memcpy(pending_reason_buffer[0..kept.len], kept);
+    pending_unsupported_reason = pending_reason_buffer[0..kept.len];
     return error.UnsupportedExpression;
 }
 
@@ -2847,6 +3069,160 @@ test "validation rejects owner-bound canonical body types outside context" {
     try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
 }
 
+/// `fn g<T>(v: T) -> bool { v == v }` and its arithmetic sibling, after
+/// lowering: expressions 1 and 2 are the operator's operands, 3 the operator,
+/// 4 the body block. `operand_type_name` is the null-id path body type both
+/// operands carry — the parameter they are typed by, or a name nothing binds.
+fn genericBinaryOperandIr(
+    allocator: std.mem.Allocator,
+    op: exprs.BinaryOp,
+    operand_type_name: []const u8,
+) !RustIr {
+    var ir = try validReducedIr(allocator);
+    const expressions = try allocator.alloc(exprs.Expr, 5);
+    @memcpy(expressions[0..ir.bodies.exprs.len], ir.bodies.exprs);
+    for ([_]exprs.NodeId{ 1, 2 }) |operand| {
+        expressions[@intCast(operand)] = .{
+            .id = operand,
+            .span = test_span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 1, .generic_args = &.{} } },
+        };
+    }
+    expressions[3] = .{
+        .id = 3,
+        .span = test_span,
+        .ty = 1,
+        .kind = .{ .binary = .{
+            .op = op,
+            .overflow = .checked,
+            .lhs = 1,
+            .rhs = 2,
+        } },
+    };
+    expressions[4] = .{
+        .id = 4,
+        .span = test_span,
+        .ty = 1,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 3, .labelled = null } },
+    };
+    ir.bodies.exprs = expressions;
+    // Allocated, not `&.{...}`: the segment name is a runtime value, so the
+    // literal would be a stack temporary that dies with this frame.
+    const segments = try allocator.alloc(types_mod.PathSegment, 1);
+    segments[0] = .{ .name = operand_type_name, .id = null };
+    const operand_type: Type = .{ .path = .{ .segments = segments } };
+    const body_types = try allocator.alloc(Type, 2);
+    body_types[0] = operand_type;
+    body_types[1] = .{ .prim = .bool };
+    ir.bodies.types = body_types;
+    const params = try allocator.alloc(items.Param, 1);
+    params[0] = .{ .name = "v", .ty = operand_type, .span = test_span };
+    var function_body = ir.bodies.bodies[1].fn_;
+    function_body.generic_params = &.{"T"};
+    function_body.params = params;
+    function_body.ret = .{ .prim = .bool };
+    @constCast(ir.bodies.bodies)[1] = .{ .fn_ = function_body };
+    // The reduced fixture's `const_`/`static_` bodies initialise from
+    // expression 2, which this fixture claims for an operator operand. Move
+    // them onto the block so the operator stays the only thing walked.
+    for ([_]usize{ 4, 5 }) |const_entity| {
+        var const_body = ir.bodies.bodies[const_entity].const_;
+        const_body.init = 0;
+        @constCast(ir.bodies.bodies)[const_entity] = .{ .const_ = const_body };
+    }
+    return ir;
+}
+
+test "validation accepts a comparison over a generic operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try genericBinaryOperandIr(arena.allocator(), .eq, "T");
+
+    try validateForTranslation(&ir);
+}
+
+test "validation accepts arithmetic over a generic operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try genericBinaryOperandIr(arena.allocator(), .add, "T");
+
+    try validateForTranslation(&ir);
+}
+
+test "validation rejects an unknown type on a binary operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try genericBinaryOperandIr(arena.allocator(), .eq, "Undeclared");
+
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
+}
+
+/// The same operator, with its operands left behind rather than referenced:
+/// `resolveMethods` replaces a binary node it will not lower with an
+/// `.unsupported` marker, which drops the operand ids while the operand rows
+/// stay in the table. `with_marker` keeps that refusal in place; without it
+/// the fixture is the orphaned rows alone, which is what `validateBodies` has
+/// to re-walk in the crate's generic scopes rather than an empty one.
+fn orphanedBinaryOperandIr(
+    allocator: std.mem.Allocator,
+    operand_type_name: []const u8,
+    with_marker: bool,
+) !RustIr {
+    var ir = try genericBinaryOperandIr(allocator, .eq, operand_type_name);
+    const detached = try allocator.dupe(exprs.Expr, ir.bodies.exprs);
+    if (with_marker) {
+        detached[3] = .{
+            .id = 3,
+            .span = test_span,
+            .ty = 1,
+            .kind = .{ .unsupported = .{
+                .reason = "operator requires primitive operands",
+                .suggested_version = .v1,
+            } },
+        };
+    } else {
+        detached[4] = .{
+            .id = 4,
+            .span = test_span,
+            .ty = 1,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = null, .labelled = null } },
+        };
+    }
+    ir.bodies.exprs = detached;
+    return ir;
+}
+
+test "validation accepts operand rows no owner walk reaches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try orphanedBinaryOperandIr(arena.allocator(), "T", false);
+
+    try validateForTranslation(&ir);
+}
+
+test "validation rejects an unknown type on an unreachable operand row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try orphanedBinaryOperandIr(arena.allocator(), "Undeclared", false);
+
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
+}
+
+test "a leftover operator reports its own refusal, not an unresolved path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try orphanedBinaryOperandIr(arena.allocator(), "T", true);
+
+    try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&ir));
+}
+
 test "validation rejects an invalid core call arity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3230,6 +3606,161 @@ test "validation rejects a type alias with empty or duplicate generic names" {
         error.IncompleteGenericMetadata,
         validateForTranslation(&duplicate),
     );
+}
+
+/// A struct whose method and associated type both arrive from one `impl` — the
+/// shape `finalizePendingImpls` produces. The struct's `StructBody.methods`
+/// holds the method, the impl keeps the generics, and nothing on the struct
+/// records that either was written inside the impl.
+///
+/// The struct declares no parameters of its own, so `method_param_ty` and
+/// `assoc_target` can name an impl parameter (`I`, `T`) or a name no scope
+/// binds (`Absent`) — and nothing else decides which.
+fn implOwnedItemIr(
+    allocator: std.mem.Allocator,
+    method_param_ty: Type,
+    assoc_target: Type,
+) !RustIr {
+    var ir = try validReducedIr(allocator);
+    const struct_id: spine.EntityId = 2;
+    // Entities 7, 8 and 9 are the impl, its method, and its associated type.
+    // The first hangs off the struct and the other two off the impl, so none
+    // of the three is a module item.
+    const impl_id: spine.EntityId = 7;
+    const method_id: spine.EntityId = 8;
+    const assoc_id: spine.EntityId = 9;
+
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = "From for EmptyStruct",
+        .span = test_span,
+        .visibility = .public,
+        .parent = struct_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "from",
+        .span = test_span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try ir.graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .type_alias,
+        .name = "Target",
+        .span = test_span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const self_type: Type = .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } };
+    const old_bodies = ir.bodies.bodies;
+    const body_table = try allocator.alloc(bodies_mod.BodyKind, old_bodies.len + 3);
+    @memcpy(body_table[0..old_bodies.len], old_bodies);
+    body_table[impl_id] = .{ .impl_ = .{
+        .self_ty = .{ .path = .{ .segments = &.{.{ .name = "EmptyStruct", .id = struct_id }} } },
+        .trait_path = .{ .segments = &.{
+            .{ .name = "core", .id = null },
+            .{ .name = "ops", .id = null },
+            .{ .name = "Deref", .id = null },
+        } },
+        .generics = .{ .params = &.{
+            .{ .type_ = .{ .name = "I", .bounds = &.{} } },
+            .{ .type_ = .{ .name = "T", .bounds = &.{} } },
+        }, .where_clauses = &.{} },
+        .assoc_items = &.{ method_id, assoc_id },
+    } };
+    body_table[method_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = self_type,
+        .body = 0,
+    } };
+    // The associated type declares no parameter of its own, exactly as
+    // `type Target = T;` does.
+    body_table[assoc_id] = .{ .type_alias = .{ .target = assoc_target } };
+    ir.bodies.bodies = body_table;
+
+    const method: bodies_mod.StructMethod = .{
+        .name = "from",
+        .params = &.{.{ .name = "into", .ty = method_param_ty, .span = test_span }},
+        .ret = self_type,
+        .body = 0,
+        .receiver = .owned,
+    };
+    var struct_body = ir.bodies.bodies[struct_id].struct_;
+    struct_body.methods = &.{method};
+    @constCast(ir.bodies.bodies)[struct_id] = .{ .struct_ = struct_body };
+    return ir;
+}
+
+// The `wrapping` shape: `impl<I, T> From<I> for EmptyStruct { fn from(into:
+// I) -> Self }`, re-parented onto the struct. `I` is bound by the impl and by
+// nothing the struct records, so the struct's copy of the method can only
+// validate it if the owning impl's scope is read.
+test "validation accepts a reparented struct method naming the impl's parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "I", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    try validateForTranslation(&ir);
+}
+
+// The `drop_guard` shape: `impl Deref for DropGuard<T, F> { type Target = T;
+// }`. The method's parameter is `Self` so the struct body cannot reject it,
+// leaving the associated type as the only thing the impl's scope can save.
+test "validation accepts an associated type naming the impl's parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    try validateForTranslation(&ir);
+}
+
+// Reading the owning impl must not become a blanket admission: a method
+// parameter that no scope declares is still an unresolved path.
+test "validation still rejects a reparented struct method naming an undeclared type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "Absent", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    );
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
+}
+
+// The same, for the associated type: the impl's parameters do not make every
+// name resolvable in its target.
+test "validation still rejects an associated type naming an undeclared type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ir = try implOwnedItemIr(
+        arena.allocator(),
+        .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } },
+        .{ .path = .{ .segments = &.{.{ .name = "Absent", .id = null }} } },
+    );
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
 }
 
 test "validation accepts alloc external nominal and rejects unknown root" {
@@ -3653,4 +4184,147 @@ test "validation rejects malformed range and flat-map references" {
         .terminal = .collect_vec,
     } };
     try std.testing.expectError(error.InvalidExprRef, validateForTranslation(&invalid_closure));
+}
+
+/// A crate whose only expression is the cast `source as target`, with the
+/// operand typed by `source` so the validator has to judge the conversion
+/// itself rather than a missing type.
+fn slicePointerCastIr(
+    allocator: std.mem.Allocator,
+    source: Type,
+    target: Type,
+) !RustIr {
+    var ir = try validReducedIr(allocator);
+    ir.bodies.types = &.{ source, target };
+    @constCast(ir.bodies.exprs)[0].ty = 0;
+    @constCast(ir.bodies.exprs)[0].kind.block.tail = 1;
+    @constCast(ir.bodies.exprs)[1] = .{
+        .id = 1,
+        .span = test_span,
+        .ty = 1,
+        .kind = .{ .cast = .{
+            .operand = 0,
+            .source_type = source,
+            .target = 1,
+        } },
+    };
+    return ir;
+}
+
+// `&[u8]` and `*const [u8]` are the same fat pointer under two names, so the
+// cast between them is legal Rust; `&mut [u8]` reaches `*mut [u8]` the same
+// way. Both carry the length across, which is the whole of what the cast is.
+test "validation accepts a slice cast to a const pointer to the same slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const byte_slice: Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    var ir = try slicePointerCastIr(
+        arena.allocator(),
+        byte_slice,
+        .{ .raw_ptr = &.{
+            .mut = false,
+            .pointee = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
+        } },
+    );
+    try validateForTranslation(&ir);
+}
+
+test "validation accepts a mutable slice cast to a mutable pointer to the same slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ir = try slicePointerCastIr(
+        arena.allocator(),
+        .{ .slice = &.{ .const_ = false, .elem = .{ .prim = .u8 } } },
+        .{ .raw_ptr = &.{
+            .mut = true,
+            .pointee = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
+        } },
+    );
+    try validateForTranslation(&ir);
+}
+
+// The boundaries of that rule: a shared slice cannot become a mutable
+// pointer, a thin pointer has nowhere to keep the length, and a pointer to a
+// different element is a different type.
+test "validation rejects a slice cast whose destination does not hold the same slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const shared_slice: Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+
+    var to_mutable = try slicePointerCastIr(
+        allocator,
+        shared_slice,
+        .{ .raw_ptr = &.{
+            .mut = true,
+            .pointee = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
+        } },
+    );
+    try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&to_mutable));
+
+    var to_thin = try slicePointerCastIr(
+        allocator,
+        shared_slice,
+        .{ .raw_ptr = &.{ .mut = false, .pointee = .{ .prim = .u8 } } },
+    );
+    try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&to_thin));
+
+    var to_other_element = try slicePointerCastIr(
+        allocator,
+        shared_slice,
+        .{ .raw_ptr = &.{
+            .mut = false,
+            .pointee = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u32 } } },
+        } },
+    );
+    try std.testing.expectError(
+        error.UnsupportedExpression,
+        validateForTranslation(&to_other_element),
+    );
+}
+
+// `char::from(byte)` is an ordinary `From` conversion, and a validator that
+// gave `char` no width refused a cast the frontend had already accepted.
+test "validation accepts a u8 to char primitive_from" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try expectAcceptedCastValidation(arena.allocator(), .u8, .char, false, .primitive_from);
+}
+
+// `crate::enc::Iter` is three segments and only the last one names a
+// declaration; the leading ones are where the terminal was looked up. The
+// declaration the return type names is the empty struct at entity 2 in
+// `validReducedIr`.
+test "validation accepts a module-qualified nominal whose terminal resolves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ir = try validReducedIr(arena.allocator());
+    @constCast(ir.bodies.bodies)[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .path = .{ .segments = &.{
+            .{ .name = "crate", .id = null },
+            .{ .name = "self", .id = null },
+            .{ .name = "EmptyStruct", .id = 2 },
+        } } },
+        .body = 0,
+    } };
+    try validateForTranslation(&ir);
+}
+
+// The prefixes are read as prefixes because the terminal RESOLVED. One that
+// does not is a name nothing declares, and stays refused however many module
+// segments precede it.
+test "validation rejects a qualified nominal whose terminal does not resolve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ir = try validReducedIr(arena.allocator());
+    @constCast(ir.bodies.bodies)[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .path = .{ .segments = &.{
+            .{ .name = "crate", .id = null },
+            .{ .name = "Missing", .id = null },
+        } } },
+        .body = 0,
+    } };
+    try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
 }

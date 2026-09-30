@@ -5024,11 +5024,25 @@ fn genericNameKnown(names: []const []const u8, name: []const u8) bool {
     }
     return false;
 }
+
+/// The generic scopes one signature or expression is written in.
+///
+/// Second copy of `GenericContext` in validate.zig. The two must decide
+/// identically or `--dump rustir` refuses a crate that translation accepts,
+/// so change both together — including the crate-wide scope that table rows
+/// no owner walk reaches resolve against (`validateNominalCrateGenericNames`
+/// here, `crateGenericNames` there).
 const NominalContext = struct {
     names: []const []const u8,
     params: []const types.GenericParam = &.{},
     outer_names: []const []const u8 = &.{},
     outer_params: []const types.GenericParam = &.{},
+    /// Third scope, for a signature written inside two owners. A method that
+    /// `finalizePendingImpls` re-parents onto a struct is written inside the
+    /// struct and inside the `impl` it came from, so both bind names there.
+    /// Kept apart from `outer_*` so neither scope has to displace the other.
+    impl_names: []const []const u8 = &.{},
+    impl_params: []const types.GenericParam = &.{},
     implicit_self: bool = false,
     self_entity: ?spine.EntityId = null,
 };
@@ -5123,6 +5137,41 @@ fn nominalOwnerContext(
     }
     return error.InvalidParent;
 }
+
+/// The generic context an owning `impl` lends to a method re-parented onto
+/// its target's `StructBody.methods`.
+///
+/// `finalizePendingImpls` copies an impl's method onto the target struct
+/// without carrying the impl's generics across, so `impl<'a, T, I> From<I>
+/// for Wrapping<'a, T>` leaves `from`'s parameter `I` with no in-scope name
+/// even though the frontend bound it. The method's own `fn_` entity still has
+/// the impl as its parent, so the impl is recovered by matching that entity's
+/// name against the `fn_` children of the impls parented to `owner` — the
+/// same name `finalizePendingImpls` itself matches on when it appends.
+///
+/// Two impls on one struct declaring a method of the same name is ambiguous,
+/// and yields an empty context: taking either impl's parameters would admit a
+/// name the method does not bind.
+fn nominalImplMethodGenericContext(
+    environment: NominalEnvironment,
+    owner: spine.EntityId,
+    method_name: []const u8,
+) !NominalContext {
+    const entities = environment.entities;
+    var method_entity: ?spine.EntityId = null;
+    for (entities, 0..) |candidate, index| {
+        if (candidate.kind != .fn_) continue;
+        if (!std.mem.eql(u8, candidate.name, method_name)) continue;
+        const impl_id = candidate.parent orelse continue;
+        if (@as(usize, impl_id) >= entities.len) continue;
+        if (entities[impl_id].kind != .impl_) continue;
+        if (entities[impl_id].parent == null or entities[impl_id].parent.? != owner) continue;
+        if (method_entity != null) return .{ .names = &.{} };
+        method_entity = @intCast(index);
+    }
+    const fn_entity = method_entity orelse return .{ .names = &.{} };
+    return nominalOwnerContext(environment, fn_entity);
+}
 fn nominalGenericCountForEntity(
     environment: NominalEnvironment,
     id: spine.EntityId,
@@ -5154,7 +5203,9 @@ fn nominalNameKnown(context: NominalContext, name: []const u8) bool {
         genericNameKnown(context.names, name) or
         nominalParamNameKnown(context.params, name) or
         genericNameKnown(context.outer_names, name) or
-        nominalParamNameKnown(context.outer_params, name);
+        nominalParamNameKnown(context.outer_params, name) or
+        genericNameKnown(context.impl_names, name) or
+        nominalParamNameKnown(context.impl_params, name);
 }
 fn nominalConcreteSelfEntity(environment: NominalEnvironment, ty: types.Type) ?spine.EntityId {
     const candidate: ?spine.EntityId = switch (ty) {
@@ -5277,6 +5328,8 @@ fn validateNominalTypeContextDepth(
                     }
                 } else if (index == 0 and nominalNameKnown(context, segment.name)) {
                     generic_root = true;
+                } else if (path.segments[path.segments.len - 1].id != null and index + 1 < path.segments.len) {
+                    continue;
                 } else if (!generic_root) {
                     return error.UnresolvedTypePath;
                 }
@@ -5396,6 +5449,8 @@ fn validateNominalPathContext(
             }
         } else if (index == 0 and nominalNameKnown(context, segment.name)) {
             generic_root = true;
+        } else if (path.segments[path.segments.len - 1].id != null and index + 1 < path.segments.len) {
+            continue;
         } else if (!generic_root) {
             return error.UnresolvedTypePath;
         }
@@ -5527,11 +5582,16 @@ fn validateNominalGenericsContext(
     generics: types.Generics,
     outer: NominalContext,
 ) !void {
+    // Every scope the outer binds is carried in, so a bound or where clause
+    // resolves against the same owners the declaration's signature is written
+    // in — a re-parented method's bounds reach the impl it came from.
     const context: NominalContext = .{
         .names = &.{},
         .params = generics.params,
         .outer_names = outer.names,
         .outer_params = outer.params,
+        .impl_names = outer.impl_names,
+        .impl_params = outer.impl_params,
         .implicit_self = outer.implicit_self,
         .self_entity = outer.self_entity,
     };
@@ -5610,11 +5670,18 @@ fn validateNominalBody(
                     generics.params
                 else
                     &.{};
+                // A method re-parented onto the struct from an `impl` is
+                // written inside that impl as well, so the impl's parameters
+                // bind names in the signature the way the struct's own do.
+                const impl_context =
+                    try nominalImplMethodGenericContext(environment, owner, method.name);
                 const method_scope: NominalContext = .{
                     .names = method.generic_params,
                     .params = method_params,
                     .outer_names = struct_scope.names,
                     .outer_params = struct_scope.params,
+                    .impl_names = impl_context.names,
+                    .impl_params = impl_context.params,
                     .implicit_self = true,
                     .self_entity = owner,
                 };
@@ -5622,8 +5689,18 @@ fn validateNominalBody(
                     try validateNominalTypeContext(environment, param.ty, method_scope);
                 }
                 try validateNominalTypeContext(environment, method.ret, method_scope);
+                // A bound or where clause on the method is written in the same
+                // two owners as its signature, so it reads both scopes too.
+                const method_outer: NominalContext = .{
+                    .names = struct_scope.names,
+                    .params = struct_scope.params,
+                    .impl_names = impl_context.names,
+                    .impl_params = impl_context.params,
+                    .implicit_self = true,
+                    .self_entity = owner,
+                };
                 if (method.generics) |generics| {
-                    try validateNominalGenericsContext(environment, generics, struct_scope);
+                    try validateNominalGenericsContext(environment, generics, method_outer);
                 }
             }
         },
@@ -5748,12 +5825,20 @@ fn validateNominalBody(
             }
         },
         // The alias's own parameters are in scope in its target, so its
-        // id-free path segments resolve against them here too.
-        .type_alias => |alias_body| try validateNominalType(
-            environment,
-            alias_body.target,
-            alias_body.generic_params,
-        ),
+        // id-free path segments resolve against them here too. An associated
+        // type is an alias whose owner is an `impl`, and the impl binds the
+        // rest: `impl Deref for DropGuard<T, F> { type Target = T; }` declares
+        // no parameter of its own to name `T` with, so the owning scope is
+        // resolved alongside the alias's.
+        .type_alias => |alias_body| {
+            const owner_context = try nominalOwnerContext(environment, owner);
+            const alias_scope: NominalContext = .{
+                .names = alias_body.generic_params,
+                .outer_names = owner_context.names,
+                .outer_params = owner_context.params,
+            };
+            try validateNominalTypeContext(environment, alias_body.target, alias_scope);
+        },
     }
 }
 
@@ -6152,11 +6237,18 @@ fn validateNominalCoreCallsInBody(
                     generics.params
                 else
                     &.{};
+                const impl_context =
+                    try nominalImplMethodGenericContext(environment, owner, method.name);
                 const method_scope: NominalContext = .{
                     .names = method.generic_params,
                     .params = method_params,
                     .outer_names = struct_scope.names,
                     .outer_params = struct_scope.params,
+                    // The body of a method re-parented from an `impl` was
+                    // written inside that impl, so its core call generics read
+                    // that scope too.
+                    .impl_names = impl_context.names,
+                    .impl_params = impl_context.params,
                     .implicit_self = true,
                     .self_entity = owner,
                 };
@@ -6194,6 +6286,109 @@ fn validateNominalCoreCallsInBody(
             }
         },
     }
+}
+
+/// Append every name a declaration's generic metadata binds.
+fn appendNominalGenericParamNames(
+    allocator: std.mem.Allocator,
+    names: *std.ArrayListUnmanaged([]const u8),
+    generics: ?types.Generics,
+) std.mem.Allocator.Error!void {
+    const params = if (generics) |value| value.params else return;
+    for (params) |param| {
+        try names.append(allocator, switch (param) {
+            .type_ => |value| value.name,
+            .const_ => |value| value.name,
+            .lifetime => |value| value.name,
+        });
+    }
+}
+
+/// Every generic name any declaration in the crate binds, as one list.
+///
+/// A table row no body walk reaches has no lexical scope of its own, and
+/// `validateNominalTables` still has to resolve the types those rows carry.
+/// Their null-id path roots may name a parameter some declaration binds; a
+/// name nothing declares is still `UnresolvedTypePath`.
+///
+/// One decision, written twice: `crateGenericNames` in validate.zig resolves
+/// unreachable rows the same way for the translation path, and the two must
+/// agree or `--dump rustir` accepts what translation rejects.
+fn validateNominalCrateGenericNames(environment: NominalEnvironment) ![]const []const u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer names.deinit(environment.allocator);
+    for (environment.bodies.bodies) |body| {
+        switch (body) {
+            .fn_ => |fn_body| {
+                try names.appendSlice(environment.allocator, fn_body.generic_params);
+                try appendNominalGenericParamNames(
+                    environment.allocator,
+                    &names,
+                    fn_body.generics,
+                );
+            },
+            .struct_ => |struct_body| {
+                try names.appendSlice(environment.allocator, struct_body.generic_params);
+                for (struct_body.methods) |method| {
+                    try names.appendSlice(environment.allocator, method.generic_params);
+                    try appendNominalGenericParamNames(
+                        environment.allocator,
+                        &names,
+                        method.generics,
+                    );
+                }
+            },
+            .enum_ => |enum_body| try names.appendSlice(
+                environment.allocator,
+                enum_body.generic_params,
+            ),
+            .trait_ => |trait_body| {
+                try names.appendSlice(environment.allocator, trait_body.generic_params);
+                try appendNominalGenericParamNames(
+                    environment.allocator,
+                    &names,
+                    trait_body.generics,
+                );
+                for (trait_body.methods) |method| {
+                    try names.appendSlice(environment.allocator, method.generic_params);
+                    try appendNominalGenericParamNames(
+                        environment.allocator,
+                        &names,
+                        method.generics,
+                    );
+                }
+                for (trait_body.assoc_types) |assoc_type| {
+                    try appendNominalGenericParamNames(
+                        environment.allocator,
+                        &names,
+                        assoc_type.generics,
+                    );
+                }
+            },
+            .impl_ => |impl_body| try appendNominalGenericParamNames(
+                environment.allocator,
+                &names,
+                impl_body.generics,
+            ),
+            .type_alias => |alias_body| try names.appendSlice(
+                environment.allocator,
+                alias_body.generic_params,
+            ),
+            .const_, .none => {},
+        }
+    }
+    return names.toOwnedSlice(environment.allocator);
+}
+
+/// The context an unreachable row is validated in, built once per pass.
+fn nominalUnreachableRowContext(
+    environment: NominalEnvironment,
+    cache: *?[]const []const u8,
+) !NominalContext {
+    if (cache.* == null) {
+        cache.* = try validateNominalCrateGenericNames(environment);
+    }
+    return .{ .names = cache.*.? };
 }
 
 fn validateNominalTables(
@@ -6274,13 +6469,19 @@ fn validateNominalTables(
             &context_seen,
         );
     }
+    // A row no owner walk reached is re-walked below. It has no lexical scope
+    // of its own, so its generic names resolve against the whole crate rather
+    // than against an empty one.
+    var unreachable_names: ?[]const []const u8 = null;
+    defer if (unreachable_names) |names| environment.allocator.free(names);
+
     for (body_data.exprs, 0..) |_, index| {
         if (!context_seen.expressions[index]) {
             try validateNominalCoreCallsInRoot(
                 environment,
                 root_types,
                 @intCast(index),
-                .{ .names = &.{} },
+                try nominalUnreachableRowContext(environment, &unreachable_names),
                 &walker,
                 &context_seen,
             );
@@ -6292,7 +6493,7 @@ fn validateNominalTables(
                 environment,
                 root_types,
                 .{ .pattern = @intCast(index) },
-                .{ .names = &.{} },
+                try nominalUnreachableRowContext(environment, &unreachable_names),
                 &context_seen,
             );
         }
@@ -6303,19 +6504,27 @@ fn validateNominalTables(
                 environment,
                 root_types,
                 .{ .statement = @intCast(index) },
-                .{ .names = &.{} },
+                try nominalUnreachableRowContext(environment, &unreachable_names),
                 &context_seen,
             );
         }
     }
     for (root_types, 0..) |ty, index| {
         if (!context_seen.root_types[index]) {
-            try validateNominalType(environment, ty, &.{});
+            try validateNominalTypeContext(
+                environment,
+                ty,
+                try nominalUnreachableRowContext(environment, &unreachable_names),
+            );
         }
     }
     for (body_data.types, 0..) |ty, index| {
         if (!context_seen.body_types[index]) {
-            try validateNominalType(environment, ty, &.{});
+            try validateNominalTypeContext(
+                environment,
+                ty,
+                try nominalUnreachableRowContext(environment, &unreachable_names),
+            );
         }
     }
     for (instantiations, 0..) |instantiation, index| {
@@ -6602,4 +6811,140 @@ test "decodeGraph rejects sparse dependency IDs" {
         \\],"entities":[],"modules":[],"uses":[]}]}
     ;
     try expectDecodeGraphError(std.testing.allocator, bytes, error.InvalidDependency);
+}
+
+/// The tables `v == v` leaves behind when the operator is refused:
+/// expressions 0 and 1 are its operands, 2 the marker that replaced it, 3 the
+/// body block. Nothing references 0 or 1, so `validateNominalTables` re-walks
+/// them with no lexical scope of their own. `operand_type_name` is the null-id
+/// path body type they carry — the parameter they are typed by, or a name
+/// nothing binds.
+fn leftoverOperandIr(
+    allocator: std.mem.Allocator,
+    operand_type_name: []const u8,
+) !RustIr {
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+    var g = graph.CrateGraph.init(allocator);
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "g",
+        .span = span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{1},
+        .attributes = &.{},
+    });
+    try g.addCrate(.{
+        .name = "leftover_operand",
+        .edition = 2021,
+        .kind = .lib,
+        .root = 0,
+        .deps = &.{},
+        .is_translated = true,
+    });
+    // Allocated, not `&.{...}`: the segment name is a runtime value, so a
+    // literal would be a stack temporary that dies with this frame.
+    const segments = try allocator.alloc(types.PathSegment, 1);
+    segments[0] = .{ .name = operand_type_name, .id = null };
+    const operand_type: types.Type = .{ .path = .{ .segments = segments } };
+    const body_types = try allocator.alloc(types.Type, 2);
+    body_types[0] = operand_type;
+    body_types[1] = .{ .prim = .bool };
+    const params = try allocator.alloc(items.Param, 1);
+    params[0] = .{ .name = "v", .ty = operand_type, .span = span };
+    const expression_table = try allocator.alloc(exprs.Expr, 4);
+    expression_table[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = 1, .generic_args = &.{} } },
+    };
+    expression_table[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = 1, .generic_args = &.{} } },
+    };
+    expression_table[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = 1,
+        .kind = .{ .unsupported = .{
+            .reason = "operator requires primitive operands",
+            .suggested_version = .v1,
+        } },
+    };
+    expression_table[3] = .{
+        .id = 3,
+        .span = span,
+        .ty = 1,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 2, .labelled = null } },
+    };
+    const body_table = try allocator.alloc(bodies_mod.BodyKind, 2);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = params,
+        .ret = .{ .prim = .bool },
+        .generic_params = &.{"T"},
+        .body = 3,
+    } };
+    return .{
+        .crate_name = "leftover_operand",
+        .graph = g,
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = body_types,
+            .bodies = body_table,
+        },
+    };
+}
+
+test "encode accepts a leftover operator operand typed by a generic parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir_data = try leftoverOperandIr(allocator, "T");
+
+    _ = try encode(allocator, &ir_data);
+}
+
+test "encode rejects an unknown type on a leftover operator operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir_data = try leftoverOperandIr(allocator, "Undeclared");
+
+    try std.testing.expectError(error.UnresolvedTypePath, encode(allocator, &ir_data));
 }

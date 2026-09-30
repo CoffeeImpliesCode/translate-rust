@@ -1,4 +1,5 @@
 const std = @import("std");
+const tests = @import("./error/tests.zig");
 const r2z = @import("r2z");
 
 pub const FromHexError = union(enum) {
@@ -20,3 +21,7 @@ pub const FromHexError = union(enum) {
         };
     }
 };
+
+test "translated tests reachable through ./error/tests.zig" {
+    _ = tests;
+}

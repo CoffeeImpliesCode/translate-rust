@@ -21,7 +21,7 @@ typedef struct {
     uint8_t opening_hash_count;
 } Scanner;
 
-void *tree_sitter_rust_external_scanner_create() { return ts_calloc(1, sizeof(Scanner)); }
+void *tree_sitter_rust_external_scanner_create(void) { return ts_calloc(1, sizeof(Scanner)); }
 
 void tree_sitter_rust_external_scanner_destroy(void *payload) { ts_free((Scanner *)payload); }
 

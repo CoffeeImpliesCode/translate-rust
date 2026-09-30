@@ -1,7 +1,5 @@
 //! resolve_methods — Method, Trait, Operator and Constructor resolution (P4).
 //!
-//! See notes/design/source-model-type-inference.md §3.3 + §5 (P4).
-//!
 //! After type inference gives concrete receiver types (P3), this pass
 //! resolves method calls (`r.m(args)`), constructors (`T::new(...)`),
 //! operators (`+`, `*`, `^`, ...), and trait implementations against:
@@ -37,6 +35,13 @@ pub const StdMethod = enum {
     result_ok,
     result_unwrap,
     result_unwrap_err,
+    /// Rust `Result::expect(msg)`. Returns the Ok arm, so its type is the Ok
+    /// type whichever way the error arm lowers.
+    result_expect,
+    /// Rust `Result::expect_err(msg)`. Returns the Err arm, which a Zig error
+    /// union holds as a typed tag and a tagged `r2z.Result` holds as a value —
+    /// so unlike `unwrap_err`, both representations admit it.
+    result_expect_err,
     result_unwrap_or,
     result_map,
     result_map_err,
@@ -79,10 +84,64 @@ pub const StdMethod = enum {
     /// Rust `String::into_bytes`. The runtime hands the backing `Vec(u8)`
     /// over and leaves the string empty.
     string_into_bytes,
+    /// Rust `String::as_bytes`: the same bytes, borrowed.
+    string_as_bytes,
+    /// Rust `String::len`: the UTF-8 byte length, not a character count.
+    string_len,
     format_write_str,
+    /// Rust `std::io::Error::kind`: the classification the runtime holds as
+    /// `r2z.io.ErrorKind`, returned by value.
+    io_error_kind,
     /// Rust `ToString::to_string`. Blanket-implemented for `T: Display`;
     /// see `hasGraphFreeDisplay` and `isBoundStandardMethod`.
     to_string,
+
+    // ── Ownership, borrowing, and the conversions between them ──────────────
+    //
+    // Every variant here names one std operation whose RESULT is a different
+    // owner than its receiver, or whose receiver is a borrowed value that has
+    // to produce an owned one. They are grouped because they are one question
+    // asked about the `alloc` runtime's three owners: what does this call hand
+    // back, and who owns it afterwards.
+
+    /// Rust `str::as_bytes`: the bytes a `&str` already borrows. No copy, and
+    /// the borrow keeps pointing at the original string.
+    str_as_bytes,
+    /// Rust `ToOwned for str`: copies borrowed bytes into a fresh `String`.
+    str_to_owned,
+    /// Rust `ToOwned for [T]`: copies a borrowed slice into a fresh `Vec<T>`.
+    slice_to_owned,
+    /// Rust `ToOwned for Cow<'a, B>`: hands back the owned payload — a
+    /// `String` for `Cow<str>`, a `Vec<T>` for `Cow<[T]>`. `into_owned` is the
+    /// same operation with the receiver consumed, so both answer.
+    cow_to_owned,
+    /// Rust `Cow::as_bytes`: the borrowed bytes of either representation. A
+    /// `Cow<str>` reaches `[]const u8` and a `Cow<[T]>` reaches `[]const T`.
+    cow_as_bytes,
+
+    /// Rust `String::push`: appends one code point to an owned string.
+    string_push,
+    /// Rust `String::push_str`: appends borrowed bytes to an owned string.
+    string_push_str,
+    /// Rust `String::extend`: appends every item an iterator yields.
+    string_extend,
+    /// Rust `Vec<T>::push`: appends one element to an owned vector.
+    vec_push,
+    /// Rust `Vec<T>::extend`: appends every item an iterator yields.
+    vec_extend,
+
+    /// Rust `FromUtf8Error::utf8_error`: the validation detail the error
+    /// retains after `String::from_utf8` hands the bytes back separately.
+    from_utf8_error_utf8_error,
+
+    /// Rust `Into<Cow<'_, B>>` from a value that BORROWS `B`: the same bytes,
+    /// tagged `Borrowed`. `&str` into `Cow<str>` and `&[T]` into
+    /// `Cow<[T]>` are this, and neither copies.
+    into_cow_borrowed,
+    /// Rust `Into<Cow<'a, B>>` from a value that OWNS `B`: ownership of the
+    /// bytes moves into the `Cow`, tagged `Owned`. `String` into `Cow<str>`
+    /// and `Vec<T>` into `Cow<[T]>` are this.
+    into_cow_owned,
 
     default,
     clone,
@@ -115,8 +174,6 @@ const reason_operator_operands_unresolved = "operator operands unresolved";
 const reason_operator_operand_dispatched_call =
     "operator operand is a dispatched method call whose result type this pass does not name";
 const reason_operator_requires_primitives = "operator requires primitive operands";
-const reason_blanket_impl_receiver =
-    "blanket impl names no receiver type: backend validateMethodTopology has no parent to hoist onto";
 const reason_opaque_iterator_method =
     "opaque receiver: backend lookupRecognizedStdMethod has no arm for this iterator method";
 
@@ -175,38 +232,6 @@ fn lookupTraitMethodCandidates(
         }
     }
     return lookup;
-}
-
-/// The `method_name` a crate-local blanket `impl<T: AsRef<[u8]>> Trait for T`
-/// provides, or null when no such impl has it.
-///
-/// A blanket impl is the one piece of evidence a receiver with no type of its
-/// own can carry: the impl names no concrete self type, so it provides its
-/// method for every type its bound admits, and Rust checks that bound against
-/// the type inference settles on. Resolving the call therefore asserts
-/// nothing the bound has not already promised — in particular it never names
-/// an element type for an array literal, which is what an unsuffixed
-/// `[0x66, 0x6f, ..]` has not got. Two blanket impls providing the same
-/// method are ambiguous, and stay refused.
-fn lookupBlanketAsRefBytesMethod(
-    g: *const graph.CrateGraph,
-    b: *const bodies.Bodies,
-    method_name: []const u8,
-) ?spine.EntityId {
-    if (method_name.len == 0) return null;
-    var candidate: ?spine.EntityId = null;
-    for (g.symbol_table.entities.items) |ent| {
-        if (ent.kind != .impl_) continue;
-        const parts = parseTraitImplName(ent.name) orelse continue;
-        if (!isBlanketAsRefBytesImpl(b, ent.id, parts.type_name)) continue;
-        for (g.symbol_table.entities.items) |child| {
-            if (child.kind != .fn_ or child.parent != ent.id) continue;
-            if (!std.mem.eql(u8, child.name, method_name)) continue;
-            if (candidate != null) return null;
-            candidate = child.id;
-        }
-    }
-    return candidate;
 }
 
 /// Whether `impl_id` is a trait impl whose own self type is the type
@@ -327,6 +352,12 @@ const receiver_unpeel_depth_max: usize = 128;
 /// this rule per predicate is how two of them came to disagree about one
 /// type.
 ///
+/// Not every predicate peels. The blanket receiver gate asks for the bare
+/// type parameter path itself, because the backend's `blanketReceiverType`
+/// does not peel either: it builds a self type for an array or for a bare
+/// one-segment path and builds none for a carrier, so peeling there would
+/// admit a receiver whose call lowers to a member call on a slice.
+///
 /// `null` means the walk could not finish: an `impl Trait` that recovered no
 /// carrier names nothing at all, and no side downstream can peel it.
 fn unpeelReceiverType(t: types.Type) ?types.Type {
@@ -344,6 +375,40 @@ fn unpeelReceiverType(t: types.Type) ?types.Type {
         }
     }
     return null;
+}
+
+/// An exact `std::io` path, all three segments and no generic arguments.
+///
+/// A basename is not the test. A crate that declares its own `io::ErrorKind`
+/// is not this one, and neither is a std `io` type this runtime has no name
+/// for, so every reader that asks "is this the io type the runtime holds"
+/// asks it here rather than answering from the leaf alone.
+fn isExactStdIoType(external: types.ExternalNominal, leaf: []const u8) bool {
+    return external.args.len == 0 and external.path.len == 3 and
+        std.mem.eql(u8, external.path[0], "std") and
+        std.mem.eql(u8, external.path[1], "io") and
+        std.mem.eql(u8, external.path[2], leaf);
+}
+
+/// Whether `external` is exactly the `alloc` (or `std`) nominal the runtime
+/// owns, with the argument count its own std declaration fixes.
+///
+/// The whole path and the arity are the test, for the reason
+/// `isExactStdIoType` gives. A crate's own `Vec` is not `alloc::vec::Vec`, a
+/// `Cow<str>` is not a `Cow<[u8]>`, and a bare `Cow` with no payload names
+/// nothing the runtime can build — so a reader that answered from the leaf
+/// alone would hand the backend a receiver it has no arm for.
+fn isExactAllocNominal(
+    external: types.ExternalNominal,
+    module: []const u8,
+    name: []const u8,
+    arg_count: usize,
+) bool {
+    return external.args.len == arg_count and external.path.len == 3 and
+        (std.mem.eql(u8, external.path[0], "alloc") or
+            std.mem.eql(u8, external.path[0], "std")) and
+        std.mem.eql(u8, external.path[1], module) and
+        std.mem.eql(u8, external.path[2], name);
 }
 
 /// Match std prelude methods on known types, automatically unwrapping
@@ -382,6 +447,14 @@ pub fn lookupStdMethod(
             // has an error VALUE to hand back depends on how it lowers, not
             // on its type, and that is `lookupResultRepresentationMethod`'s
             // one question.
+            // `expect` and `expect_err` ARE decided here, and both `Result`
+            // representations answer the same way. `expect` returns the Ok arm
+            // and reads no error value. `expect_err` returns the Err arm, which
+            // a Zig error union holds as a typed tag and a tagged `r2z.Result`
+            // holds as a value — so unlike `unwrap_err`, neither form leaves it
+            // with nothing to hand back.
+            if (std.mem.eql(u8, method_name, "expect")) return .result_expect;
+            if (std.mem.eql(u8, method_name, "expect_err")) return .result_expect_err;
             if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
             if (std.mem.eql(u8, method_name, "map")) return .result_map;
             if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
@@ -399,6 +472,18 @@ pub fn lookupStdMethod(
             if (std.mem.eql(u8, method_name, "split_first")) return .slice_split_first;
             if (std.mem.eql(u8, method_name, "chunks")) return .slice_chunks;
             if (std.mem.eql(u8, method_name, "copy_from_slice")) return .slice_copy_from_slice;
+            // `impl<T: Clone> ToOwned for [T] { type Owned = Vec<T> }` is a
+            // specialization for the UNSIZED slice only. An array is `Clone` in
+            // its own right — `impl<T: Clone, const N: usize> Clone for [T; N]`
+            // — so the blanket `impl<T: Clone> ToOwned for T { type Owned = T }`
+            // is what applies to it and `[T; N].to_owned()` is a clone of the
+            // same array, not a `Vec<T>`. `str` never reaches this arm at all:
+            // it is a distinct unsized primitive whose `Owned` is a `String`,
+            // and `&str` carries no slice this arm could read an element from.
+            if (std.mem.eql(u8, method_name, "to_owned")) {
+                if (cur_t == .array) return .clone;
+                return .slice_to_owned;
+            }
         },
         .external_nominal => |external| {
             const is_option = external.path.len == 3 and
@@ -426,26 +511,94 @@ pub fn lookupStdMethod(
                 if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
                 if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
                 if (std.mem.eql(u8, method_name, "unwrap_err")) return .result_unwrap_err;
+                if (std.mem.eql(u8, method_name, "expect")) return .result_expect;
+                if (std.mem.eql(u8, method_name, "expect_err")) return .result_expect_err;
                 if (std.mem.eql(u8, method_name, "unwrap_or")) return .result_unwrap_or;
                 if (std.mem.eql(u8, method_name, "map")) return .result_map;
                 if (std.mem.eql(u8, method_name, "map_err")) return .result_map_err;
                 if (std.mem.eql(u8, method_name, "as_ref")) return .result_as_ref;
             }
             // `String` is the one Rust owner whose runtime type is a distinct
-            // Zig type (`r2z.alloc.String`) rather than a plain list, and
-            // `into_bytes` is the one method that only it has: it hands the
-            // backing `Vec(u8)` over and leaves the string empty. A `&str`,
-            // a `Vec<u8>`, and a slice borrow each reach a different runtime
-            // type, so all of them stay refused.
-            if (external.args.len == 0 and external.path.len == 3 and
-                (std.mem.eql(u8, external.path[0], "alloc") or
-                    std.mem.eql(u8, external.path[0], "std")) and
-                std.mem.eql(u8, external.path[1], "string") and
-                std.mem.eql(u8, external.path[2], "String") and
-                std.mem.eql(u8, method_name, "into_bytes"))
-            {
-                return .string_into_bytes;
+            // Zig type (`r2z.alloc.String`) rather than a plain list, so its
+            // methods are the ones that read or grow the bytes it owns:
+            // `into_bytes` hands the backing `Vec(u8)` over and leaves the
+            // string empty, `as_bytes` borrows those same bytes, `len` counts
+            // them, and `push`/`push_str`/`extend` append to them. A `&str`, a
+            // `Vec<u8>`, and a slice borrow each reach a different runtime type,
+            // so all of them stay refused here.
+            if (isExactAllocNominal(external, "string", "String", 0)) {
+                if (std.mem.eql(u8, method_name, "into_bytes")) return .string_into_bytes;
+                if (std.mem.eql(u8, method_name, "as_bytes")) return .string_as_bytes;
+                if (std.mem.eql(u8, method_name, "len")) return .string_len;
+                if (std.mem.eql(u8, method_name, "push")) return .string_push;
+                if (std.mem.eql(u8, method_name, "push_str")) return .string_push_str;
+                if (std.mem.eql(u8, method_name, "extend")) return .string_extend;
+                // `ToOwned` is blanket-implemented for every `T: Clone` with
+                // `Owned = T`, so a `String` asked for its own `to_owned` is
+                // handed itself. The operation IS the clone this table already
+                // names, and admitting it as anything else would claim the
+                // call produces a different owner.
+                if (std.mem.eql(u8, method_name, "to_owned")) return .clone;
             }
+            // `str` is the unsized primitive `&str` borrows, and it is the
+            // runtime's `[]const u8` rather than a `r2z.alloc.String`, so
+            // `as_bytes` on it is not the owned string's and not the byte
+            // slice's: it hands back the very same borrowed bytes. `to_owned`
+            // is the other half of that borrow — the copy that ends it, and a
+            // `String` rather than the `Vec<u8>` the slice's own `to_owned`
+            // produces, because `impl ToOwned for str` names `String` and
+            // `impl ToOwned for [T]` names `Vec<T>`.
+            //
+            // `len` and `is_empty` count the same bytes either spelling does,
+            // and both are genuine `str` methods, so a borrowed string keeps
+            // them now that it is not a slice here.
+            if (types.isStr(.{ .external_nominal = external })) {
+                if (std.mem.eql(u8, method_name, "as_bytes")) return .str_as_bytes;
+                if (std.mem.eql(u8, method_name, "to_owned")) return .str_to_owned;
+                if (std.mem.eql(u8, method_name, "len")) return .slice_len;
+                if (std.mem.eql(u8, method_name, "is_empty")) return .slice_is_empty;
+            }
+            // A `Vec<T>` reads its element type off its own nominal, so both
+            // growing methods are admitted for every element and the backend
+            // appends whichever one the argument carries.
+            if (isExactAllocNominal(external, "vec", "Vec", 1)) {
+                if (std.mem.eql(u8, method_name, "push")) return .vec_push;
+                if (std.mem.eql(u8, method_name, "extend")) return .vec_extend;
+                // Same blanket `ToOwned` as the string's, for the same reason.
+                if (std.mem.eql(u8, method_name, "to_owned")) return .clone;
+            }
+            // A `Cow` is already the runtime's explicit-ownership union, so
+            // `as_bytes` reads whichever representation the value holds, and
+            // only `into_owned` trades the borrow for the owned payload it was
+            // guarding.
+            //
+            // `to_owned` is a DIFFERENT operation and is deliberately not this
+            // one. `impl<T: Clone> ToOwned for T { type Owned = T }` is the
+            // blanket every `Clone` type takes, and a `Cow` is `Clone`, so
+            // `to_owned` hands back a CLONE of the same `Cow` through `&self`
+            // — the receiver is still usable afterwards. `into_owned` is the
+            // consuming half: it moves and yields `B::Owned`. Answering both
+            // names with the consuming variant would move a value Rust only
+            // borrowed, so a later use of the receiver would read a moved
+            // value.
+            if (isExactAllocNominal(external, "borrow", "Cow", 1)) {
+                if (std.mem.eql(u8, method_name, "as_bytes")) return .cow_as_bytes;
+                if (std.mem.eql(u8, method_name, "into_owned")) return .cow_to_owned;
+                if (std.mem.eql(u8, method_name, "to_owned")) return .clone;
+            }
+            // `FromUtf8Error` is what `String::from_utf8` hands back when the
+            // bytes are not UTF-8. It owns the bytes AND retains why they
+            // failed, and `utf8_error` is the half that says why — the same
+            // `core::str::Utf8Error` a direct `str::from_utf8` produces.
+            if (isExactAllocNominal(external, "string", "FromUtf8Error", 0) and
+                std.mem.eql(u8, method_name, "utf8_error")) return .from_utf8_error_utf8_error;
+            // `std::io::Error::kind` is the one std `io` method the runtime
+            // owns end to end: the receiver is `r2z.io.Error`, and what it
+            // hands back is `r2z.io.ErrorKind`, a payload-free enum compared by
+            // value. The path is matched in full, so a crate's own `io::Error`
+            // and every other std `io` nominal stay out.
+            if (isExactStdIoType(external, "Error") and
+                std.mem.eql(u8, method_name, "kind")) return .io_error_kind;
             if (external.path.len == 3 and
                 (std.mem.eql(u8, external.path[0], "core") or std.mem.eql(u8, external.path[0], "std")))
             {
@@ -1403,17 +1556,22 @@ fn closureTypeMarker(g: *const graph.CrateGraph) ?types.Type {
     return .{ .fn_ptr = signature };
 }
 
+/// `receiver_ty` is the receiver's declared type, passed in rather than
+/// derived here: every caller has already recovered it for the dispatch it is
+/// about to make, and re-walking the receiver's expression chain to ask the
+/// same question a second time is work for a value the caller holds.
 fn receiverNominalName(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
     receiver_node: exprs.NodeId,
+    receiver_ty: ?types.Type,
 ) ?[]const u8 {
     if (receiver_node >= b.exprs.len) return null;
     const receiver = b.exprs[receiver_node];
 
     // The path's resolved EntityId is the local binding identity. Use its
     // declaration/inferred type directly; never infer a type from spelling.
-    if (receiverDeclaredType(g, b, receiver_node)) |ty| {
+    if (receiver_ty) |ty| {
         if (getTypeName(g, ty)) |type_name| {
             const nominal_name = normalizeNominalName(type_name);
             if (nominal_name.len > 0) return nominal_name;
@@ -1476,6 +1634,20 @@ fn pathDeclaredType(
                     else => {},
                 }
             }
+        }
+    }
+
+    // A `const` — and a `static`, which the body model spells the same way —
+    // declares its own type beside its name. A top-level constant is parented
+    // to the module rather than to a function, so the parameter walk below
+    // never reaches it and the whole function gives up first. `infer`'s
+    // `getKnownType` already reads this same slot without that detour, and
+    // reading it here is what makes `CONTROL.contains(0)` a name lookup
+    // instead of a refusal.
+    if (path.def < b.bodies.len) {
+        switch (b.bodies[path.def]) {
+            .const_ => |constant| return constant.ty,
+            else => {},
         }
     }
     const fn_id = entity.parent orelse return null;
@@ -1685,13 +1857,54 @@ fn operandRefused(
     };
 }
 
-fn isScalarOperandType(t: types.Type) bool {
+/// Whether an operator may read this type as one of its operands.
+///
+/// A `.path` that names a local `type` alias stands for the very value its
+/// alias body names, so `type Chunk = u32;` has to answer for `u32`: the CST
+/// layer records the alias path as the declared type wherever the alias is
+/// spelled, and refusing an operator on it refuses `u32` arithmetic written
+/// through a name. Everything else that is not a primitive once references
+/// are peeled is a nominal, an aggregate, or a type this pass could not
+/// name, and none of those is a scalar operand.
+fn isScalarOperandType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    t: types.Type,
+) bool {
     var current = t;
-    for (0..128) |_| {
-        if (current != .reference) return current == .prim;
-        current = current.reference.pointee;
+    var hops: usize = 0;
+    while (hops < 128) : (hops += 1) {
+        switch (current) {
+            .reference => current = current.reference.pointee,
+            .path => current = aliasBodyType(g, b, current.path) orelse return false,
+            .prim => return true,
+            else => return false,
+        }
     }
     return false;
+}
+
+/// The type a local `type` alias stands for, or null when the path names no
+/// alias body this pass can read.
+///
+/// The terminal segment carries the EntityId the path resolved to, and a
+/// `type_alias` body names its own target, so a chain of aliases resolves the
+/// same way the CST layer resolves a single one. A path that resolved to a
+/// nominal, or did not resolve at all, has no body to follow.
+fn aliasBodyType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    path: types.Path,
+) ?types.Type {
+    if (path.segments.len == 0) return null;
+    const alias_id = path.segments[path.segments.len - 1].id orelse return null;
+    const entity = g.symbol_table.get(alias_id) orelse return null;
+    if (entity.kind != .type_alias) return null;
+    if (alias_id >= b.bodies.len) return null;
+    return switch (b.bodies[alias_id]) {
+        .type_alias => |alias| alias.target,
+        else => null,
+    };
 }
 
 fn isRuntimeMemoryMethod(t: types.Type, name: []const u8) bool {
@@ -1722,14 +1935,20 @@ fn operandIsPrimitive(
     const operand = b.exprs[node];
     if (operand.ty) |type_id| {
         if (type_id >= b.types.len) return false;
-        return isScalarOperandType(b.types[type_id]);
+        return isScalarOperandType(g, b, b.types[type_id]);
     }
     return switch (operand.kind) {
         .literal => |literal| switch (literal) {
             .int, .float, .character, .boolean => true,
             .string, .byte_array => false,
         },
-        .path => |path| isScalarOperandType(pathDeclaredType(g, b, path) orelse return false),
+        .path => |path| isScalarOperandType(g, b, pathDeclaredType(g, b, path) orelse return false),
+        // A method call is primitive on the same rule `operandTypeResolved`
+        // already follows for it: a result type this pass names is a real
+        // value, and whether it is one an operator can read is that type's
+        // own question. Asking here is what keeps the two halves from
+        // disagreeing — a `len()` this pass names is `usize` to both.
+        .method_call => isScalarOperandType(g, b, stdMethodResultType(g, b, node, 0) orelse return false),
         .binary => |binary| operandIsPrimitive(g, b, binary.lhs) and operandIsPrimitive(g, b, binary.rhs),
         .cast => true,
         else => false,
@@ -1743,24 +1962,39 @@ fn replaceWithUnsupported(e: *exprs.Expr, reason: []const u8) void {
     } };
 }
 
-fn isRetainedIteratorProjection(
+/// The retained slice-iterator shape a method call's receiver has.
+///
+/// `slice.iter()` is a receiver the Zig backend lowers to the runtime's own
+/// `r2z.SliceIter`, so a method over it lands on a real runtime iterator.
+/// `slice.iter().cloned()` keeps the borrow-erasing call itself in the tree
+/// instead, and that call has no runtime value: the backend reaches no
+/// `cloned` member on the iterator it would hand back, so a method over
+/// THIS shape is a call it cannot satisfy whatever the name is. The two
+/// shapes therefore admit different names.
+const RetainedIteratorProjection = enum {
+    slice_iterator,
+    cloned_projection,
+};
+
+fn retainedIteratorProjection(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
     receiver_node: exprs.NodeId,
-) bool {
+) ?RetainedIteratorProjection {
     var projection_node = receiver_node;
+    var crossed_cloned = false;
     var depth: usize = 0;
     while (depth < b.exprs.len) : (depth += 1) {
-        if (projection_node >= b.exprs.len) return false;
+        if (projection_node >= b.exprs.len) return null;
         const method_call = switch (b.exprs[projection_node].kind) {
             .method_call => |value| value,
-            else => return false,
+            else => return null,
         };
-        const method = g.symbol_table.get(method_call.method) orelse return false;
+        const method = g.symbol_table.get(method_call.method) orelse return null;
         if (std.mem.eql(u8, method.name, "iter") or
             std.mem.eql(u8, method.name, "iter_mut"))
         {
-            if (method_call.receiver >= b.exprs.len) return false;
+            if (method_call.receiver >= b.exprs.len) return null;
             const receiver = b.exprs[method_call.receiver];
             const receiver_ty = if (receiver.ty) |type_id|
                 if (type_id < b.types.len) b.types[type_id] else null
@@ -1768,25 +2002,215 @@ fn isRetainedIteratorProjection(
                 pathDeclaredType(g, b, receiver.kind.path)
             else
                 null;
-            const std_method = lookupStdMethod(receiver_ty orelse return false, method.name) orelse return false;
-            return std_method == .slice_iter or std_method == .slice_iter_mut;
+            const std_method = lookupStdMethod(receiver_ty orelse return null, method.name) orelse return null;
+            if (std_method != .slice_iter and std_method != .slice_iter_mut) return null;
+            return if (crossed_cloned) .cloned_projection else .slice_iterator;
         }
-        if (!std.mem.eql(u8, method.name, "cloned")) return false;
+        if (!std.mem.eql(u8, method.name, "cloned")) return null;
+        crossed_cloned = true;
         projection_node = method_call.receiver;
     }
-    return false;
+    return null;
 }
 
-fn isRuntimeIoMethod(g: *const graph.CrateGraph, b: *const bodies.Bodies, method_id: exprs.DefId, receiver: types.Type, name: []const u8) bool {
-    const trait_name: []const u8 = if (std.mem.eql(u8, name, "read_exact"))
-        "Read"
+/// The method names the runtime drives over a retained slice iterator.
+///
+/// `cloned` erases the borrow the iterator hands out, and `rev` wraps it in
+/// the `core::iter::Rev` carrier the runtime already has as `r2z.Rev`. Both
+/// stay ordinary calls over the receiver this pass kept in the tree, so
+/// neither needs the backend to resolve a carrier of its own before it can
+/// lower them. Any other name over this receiver shape has no such arm, which
+/// is why the admission is this list and not the receiver's whole method set.
+fn isRetainedIteratorProjectionMethod(
+    projection: RetainedIteratorProjection,
+    method_name: []const u8,
+) bool {
+    if (std.mem.eql(u8, method_name, "cloned") or
+        std.mem.eql(u8, method_name, "rev"))
+    {
+        return true;
+    }
+    return projection == .slice_iterator and
+        isRetainedSliceIteratorMemberMethod(method_name);
+}
+
+/// The names a BARE `slice.iter()` receiver adds to that list.
+///
+/// Such a receiver lowers to `r2z.sliceIter(T, xs)`, and `len` and `clone`
+/// are the two members of `r2z.SliceIter`/`r2z.SliceIterMut` that a method
+/// call on that value reaches: both take `self: *const Self`, and Zig binds
+/// a `*const` receiver from a temporary. `next`, `next_back` and `nth` take
+/// `self: *Self` and do not compile on one — the backend has to bind the
+/// iterator to a local first, exactly as its `for` hoisting does — so they
+/// stay refused. Nothing else belongs here either: `count`, `last`,
+/// `position` and `rev` name no member at all, the backend answers
+/// `as_slice` with the receiver itself rather than a call to it, and
+/// `size_hint` returns a two-field struct where Rust has a `Range`.
+fn isRetainedSliceIteratorMemberMethod(method_name: []const u8) bool {
+    return std.mem.eql(u8, method_name, "len") or
+        std.mem.eql(u8, method_name, "clone");
+}
+
+/// Whether `name` is one of the two `std::io` methods the runtime owns end to
+/// end, called on a receiver that is proven to implement the trait that
+/// declares it.
+///
+/// The proof is `bodies.genericBound`, which is what keeps a crate's own
+/// `Read` from standing in for `std::io::Read`. Where it is asked from differs
+/// by receiver, because the two shapes keep their bounds in different places:
+///
+/// - `fn f<R: ?Sized + io::Read>(r: &mut R)` and `fn f(w: &mut dyn Write)`.
+///   The bound is on the signature, so the `fn` is the scope that declares it
+///   and either the method's own parent or the receiver expression's owner
+///   names that scope.
+/// - `fn f(w: &mut impl Write)`. The bound is on the `impl Trait` itself, so
+///   the only thing the method's parent adds is noise; the receiver's own
+///   scope answers it.
+///
+/// A std trait method has no entity in the crate graph, so `method_id` names
+/// nothing here and the receiver's own scope is the only scope available. That
+/// is why the second lookup is not merely a fallback: for `&mut dyn Read` it is
+/// the arm that resolves.
+fn isRuntimeIoMethod(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver_node: exprs.NodeId,
+    method_id: exprs.DefId,
+    receiver: types.Type,
+    name: []const u8,
+) bool {
+    const trait_path: []const []const u8 = if (std.mem.eql(u8, name, "read_exact"))
+        &.{ "std", "io", "Read" }
     else if (std.mem.eql(u8, name, "write_all"))
-        "Write"
+        &.{ "std", "io", "Write" }
     else
         return false;
-    const method = g.symbol_table.get(method_id) orelse return false;
-    const owner = method.parent orelse return false;
-    return bodies.genericBound(g, b, owner, receiver, &.{ "std", "io", trait_name }) != null;
+    if (g.symbol_table.get(method_id)) |method| {
+        if (method.parent) |owner| {
+            if (bodies.genericBound(g, b, owner, receiver, trait_path) != null) return true;
+        }
+    }
+    const owner = expressionOwner(g, b, receiver_node, 0) orelse return false;
+    return bodies.genericBound(g, b, owner, receiver, trait_path) != null;
+}
+
+/// Whether the expression at `node` is the general `std::io::Write::write_all`
+/// the runtime lowers through an explicit allocator.
+///
+/// The two `std::io` methods are not alike here. `read_exact` fills a buffer
+/// the caller already owns and copies nothing, so a body that calls it
+/// allocates nothing and must not be marked for it. `write_all` hands the
+/// writer's own bytes to `r2z.io.write_all`, which can grow a `Vec` and so
+/// needs a `gpa` the runtime has no way to invent; a body that calls it is
+/// allocating and the backend sources one. Marking the wrong one is not a
+/// missed effect but a fabricated one, so `read_exact` is not answered here at
+/// all.
+///
+/// The proof is `isRuntimeIoMethod` — the same one the dispatch in
+/// `resolveMethods` admits the call with — so the effect recorded here and the
+/// arm the backend lowers can never disagree about which calls they cover.
+/// Nothing is keyed off the name alone: a crate's own `write_all`, or an
+/// inherent method that happens to share the name, has no `std::io::Write`
+/// receiver and is not this.
+pub fn stdIoWriteMethodAllocates(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+) bool {
+    if (node >= b.exprs.len) return false;
+    const method = switch (b.exprs[node].kind) {
+        .method_call => |value| value,
+        else => return false,
+    };
+    if (method.receiver >= b.exprs.len) return false;
+    const receiver_ty = receiverDeclaredType(g, b, method.receiver) orelse return false;
+    return isRuntimeIoMethod(g, b, method.receiver, method.method, receiver_ty, "write_all");
+}
+
+/// Whether the expression at `node` is the std `Vec` conversion that copies its
+/// argument sequence into a freshly owned vector.
+///
+/// This is a real allocation and has to be marked as one: the runtime lowers it
+/// as `r2z.alloc.vec_from_slice(T, gpa, sequence)`, so the backing store is
+/// allocated under the `gpa` this flag is what causes the enclosing callable to
+/// source. Marking it and the backend emitting the `gpa` it needs are the same
+/// fact seen from two sides, and a caller that skips the mark hands that
+/// expression an allocator it never declared.
+///
+/// The evidence is the resolved target, not the name: the call has to be a
+/// `convert_from` whose recorded target IS the `alloc` `Vec`. A `From` impl
+/// this crate wrote, or a conversion into some other owner, is a different
+/// question and is not answered here.
+pub fn stdVecConversionAllocates(
+    _: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+) bool {
+    if (node >= b.exprs.len) return false;
+    const call = switch (b.exprs[node].kind) {
+        .core_call => |value| value,
+        else => return false,
+    };
+    if (call.function != .convert_from) return false;
+    if (call.generic_args.len != 1) return false;
+    const external = switch (call.generic_args[0]) {
+        .external_nominal => |value| value,
+        else => return false,
+    };
+    return externalPathIs(external.path, &.{ "alloc", "vec", "Vec" });
+}
+
+/// Whether the expression at `node` is a `Result` method the runtime reaches
+/// for an allocator, and so makes its enclosing body allocating.
+///
+/// This deliberately makes NO claim about whether the payload owns anything,
+/// because the backend cannot make one either: the runtime's PUBLIC
+/// `r2z.Result::unwrap` / `expect` / `expect_err` take the `gpa` on every call,
+/// pure payload or not. A frontend that answered "no" for a `Result<u64,
+/// Fault>` would decline to inject an allocator, the backend would still emit
+/// `allocator` at that call, and the result would be a reference to a binding
+/// that does not exist — so the two sides have to agree by construction rather
+/// than by each reasoning separately. Asking about the payload would make that
+/// agreement accidental, and would be wrong the moment either side changed its
+/// mind about a type.
+///
+/// The REPRESENTATION is the real question, and it is asked through the same
+/// `errorTypeIsZigErrorSet` `lookupResultRepresentationMethod` uses rather than
+/// re-derived. On the native error union the error lives IN the union as a
+/// typed tag, so there is no error value to release and nothing to hand a
+/// `gpa` to: `expect` stays the two-argument builtin, and `unwrap` is Zig's own
+/// over the union. Only `expect_err` reaches the runtime there, as
+/// `r2z.expect_error_union_err(gpa, E, union, msg)`.
+///
+/// Nothing here is keyed off a name alone. A crate's own `unwrap`, or an
+/// inherent method that shares one, has no `Result` receiver and is not this.
+pub fn stdResultCleanupAllocates(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+) bool {
+    if (node >= b.exprs.len) return false;
+    const method = switch (b.exprs[node].kind) {
+        .method_call => |value| value,
+        else => return false,
+    };
+    if (method.receiver >= b.exprs.len) return false;
+    const receiver_ty = receiverDeclaredType(g, b, method.receiver) orelse return false;
+    const result = switch (unpeelReceiverType(receiver_ty) orelse return false) {
+        .result => |value| value.*,
+        else => return false,
+    };
+    const native_error_union = result.is_error_unionable and errorTypeIsZigErrorSet(b, result.err);
+    const name = g.symbol_table.get(method.method) orelse return false;
+    const is_unwrap = std.mem.eql(u8, name.name, "unwrap");
+    const is_expect = std.mem.eql(u8, name.name, "expect");
+    const is_expect_err = std.mem.eql(u8, name.name, "expect_err");
+    if (!is_unwrap and !is_expect and !is_expect_err) return false;
+    // The PUBLIC `r2z.Result` takes the allocator on all three, and the
+    // backend emits it on all three, so this side must too — or the emitted
+    // `allocator` names a binding that was never introduced.
+    if (!native_error_union) return true;
+    return is_expect_err;
 }
 
 fn isBoundStandardMethod(
@@ -1842,6 +2266,187 @@ fn isBoundStandardMethod(
         return bodies.genericBound(g, b, owner, b.types[result_id], &.{ "core", "convert", "From" }) != null;
     }
     return false;
+}
+
+/// The type `x.into()` is being converted INTO, once inference has settled it.
+///
+/// Rust leaves that to inference — `&str` converts to both a `String` and a
+/// `Cow<str>`, and neither is the default — so this reads the type the call
+/// was already given and never picks one. A call inference could not settle is
+/// refused here, which keeps a missing target from being answered with a
+/// conversion that happens to exist.
+fn intoCallTarget(b: *const bodies.Bodies, expression: exprs.Expr) ?types.Type {
+    const type_id = expression.ty orelse return null;
+    if (type_id >= b.types.len) return null;
+    return b.types[type_id];
+}
+
+/// The std ownership conversion a concrete `x.into()` names, or null when
+/// std declares no such pair.
+///
+/// The target has to be a `Cow` with exactly one payload, because that is the
+/// only std owner whose `From` impls are about ownership and not about
+/// reformatting: `String` into `Cow<str>` hands the backing vector over,
+/// `Vec<T>` into `Cow<[T]>` does the same, and a borrowed `&B` into
+/// `Cow<B>` is the identity tagged `Borrowed`. Every pair is matched on both
+/// types, so `String` into `Cow<[u8]>`, `&str` into `Cow<[u8]>`, and a
+/// receiver that is neither owned nor a reference stay out — each is a pair
+/// std does not declare, and admitting one would emit a conversion the runtime
+/// has no arm for.
+pub fn lookupStdIntoMethod(receiver: types.Type, target: types.Type) ?StdMethod {
+    const target_external = switch (target) {
+        .external_nominal => |value| value,
+        else => return null,
+    };
+    if (!isExactAllocNominal(target_external, "borrow", "Cow", 1)) return null;
+    const payload = target_external.args[0];
+
+    // The borrowed half. A `&B` and a `&mut B` both become `Cow::Borrowed`
+    // over the very bytes the reference points at, so only the pointee is
+    // compared — the mutability is not part of the payload the `Cow` holds.
+    // A raw pointer is deliberately not admitted: Rust has no `From<&*const B>`
+    // for `Cow`, and a pointer-to-pointer deref is not something this pass can
+    // prove is the same bytes.
+    //
+    // A `Cow<'a, str>` payload is the `str` PRIMITIVE, read straight off the
+    // source's own spelling, and a `&str` receiver's pointee is that same
+    // primitive. There is nothing to normalize between them, so the literal
+    // comparison below is the whole rule — and it is exact: `&[u8]` does not
+    // match a `Cow<str>`, which is Rust's own answer, because `From<&[u8]>` for
+    // `Cow<'a, str>` does not exist and the two borrows are not the same value.
+    if (receiver == .reference) {
+        if (types.deepEqual(receiver.reference.pointee, payload)) return .into_cow_borrowed;
+    }
+
+    // The owned half. `String` is the owner of `str` and `Vec<T>` the owner of
+    // `[T]`, and each moves into the `Cow` rather than being copied: the
+    // element type is compared, not just the owner, so a `Vec<u8>` is not an
+    // owner of `[u16]`.
+    const source_external = switch (receiver) {
+        .external_nominal => |value| value,
+        else => return null,
+    };
+    if (types.isStr(payload)) {
+        if (isExactAllocNominal(source_external, "string", "String", 0)) return .into_cow_owned;
+        return null;
+    }
+    const slice = switch (payload) {
+        .slice => |value| value.elem,
+        else => return null,
+    };
+    if (!isExactAllocNominal(source_external, "vec", "Vec", 1)) return null;
+    if (!types.deepEqual(source_external.args[0], slice)) return null;
+    return .into_cow_owned;
+}
+
+/// `core::convert::From`, the trait a concrete `.into()` is resolved through
+/// when the crate's own impl is what provides it. `std::convert::From` proves
+/// the same path, since std re-exports core's.
+const core_convert_from: []const []const u8 = &.{ "core", "convert", "From" };
+
+/// The crate-local `From` impl a concrete `x.into()` is written as.
+///
+/// `into()` reaches `<Target as Into<Source>>::into`, and the blanket
+/// `impl<U, T> Into<U> for T where U: From<T>` forwards that to
+/// `<Target as From<Source>>::from`. So the call the source really names is an
+/// impl block IN this crate — `impl<'a> From<PercentDecode<'a>> for
+/// Cow<'a, [u8]>` is what makes `percent_decode(..).into()` a `Cow<[u8]>` —
+/// and neither the receiver's nominal nor any std table holds it, because the
+/// impl names a type this crate itself declares.
+///
+/// The trait is proved by its FULL path through `bodies.boundPathMatches`, not
+/// by a leaf name: a crate that declares its own `trait From<T>` writes
+/// `impl From<A> for B` there, and comparing the last segment alone would let
+/// that homonym answer a call Rust resolves through core's blanket `Into` to
+/// `core::convert::From` — rebinding the callee to a function the source does
+/// not name. The impl is the owner its own path is resolved in, which is what
+/// lets a short `From` reach the right answer through the module's `use`.
+///
+/// Both ends are matched on the impl's own types, never on their spellings: an
+/// impl of some other `From`, or of this `From` for another source or another
+/// target, is a different conversion and does not answer this call.
+pub fn userFromImplMethod(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    source: types.Type,
+    target: types.Type,
+) ?spine.EntityId {
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .impl_) continue;
+        if (entity.id >= b.bodies.len) continue;
+        const implementation = switch (b.bodies[entity.id]) {
+            .impl_ => |body| body,
+            else => continue,
+        };
+        const trait_path = implementation.trait_path orelse continue;
+        if (!bodies.boundPathMatches(g, entity.id, trait_path, core_convert_from)) continue;
+        if (implementation.trait_args.len != 1) continue;
+        if (!types.deepEqual(implementation.trait_args[0], source)) continue;
+        if (!types.deepEqual(implementation.self_ty, target)) continue;
+        for (g.symbol_table.entities.items) |child| {
+            if (child.kind == .fn_ and child.parent == entity.id and
+                std.mem.eql(u8, child.name, "from")) return child.id;
+        }
+    }
+    return null;
+}
+
+/// Whether an external nominal's path is exactly `wanted`, segment for segment.
+///
+/// The arity is deliberately not part of this. It is the answer to "which enum
+/// is this", and an enum's payload is the very thing a caller here is asking
+/// someone else to supply.
+pub fn externalPathIs(actual: []const []const u8, wanted: []const []const u8) bool {
+    if (actual.len != wanted.len) return false;
+    for (actual, wanted) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+/// The one crate `From` impl that turns `source` into a target whose enum is
+/// exactly `owner_path`, or null when there is not exactly one.
+///
+/// `owner_path` is what a `match` pattern says about its scrutinee: matching
+/// `Cow::Borrowed(..)` names the scrutinee's enum — `alloc::borrow::Cow` —
+/// without saying anything about the payload `B`. That is enough to choose the
+/// conversion, because the IMPL carries the payload. The crate's
+/// `impl From<PercentDecode<'a>> for Cow<'a, [u8]>` is the only way a
+/// `PercentDecode` becomes a `Cow`, and its own `self_ty` says which `B`. The
+/// pattern therefore fixes the owner and the impl fixes the argument, and
+/// neither is guessed.
+///
+/// Two impls for the same source into the same owner are genuinely ambiguous in
+/// Rust as well, so more than one is null rather than whichever the entity table
+/// happens to yield first. The trait is proved by full path exactly as
+/// `userFromImplMethod` proves it, for the same reason.
+pub fn uniqueFromImplTargetForOwner(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    source: types.Type,
+    owner_path: []const []const u8,
+) ?types.Type {
+    var found: ?types.Type = null;
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .impl_) continue;
+        if (entity.id >= b.bodies.len) continue;
+        const implementation = switch (b.bodies[entity.id]) {
+            .impl_ => |body| body,
+            else => continue,
+        };
+        const trait_path = implementation.trait_path orelse continue;
+        if (!bodies.boundPathMatches(g, entity.id, trait_path, core_convert_from)) continue;
+        if (implementation.trait_args.len != 1) continue;
+        if (!types.deepEqual(implementation.trait_args[0], source)) continue;
+        const target = switch (implementation.self_ty) {
+            .external_nominal => |value| value,
+            else => continue,
+        };
+        if (!externalPathIs(target.path, owner_path)) continue;
+        if (found != null) return null;
+        found = implementation.self_ty;
+    }
+    return found;
 }
 
 fn associatedSelfType(declared: types.Type, actual: types.Type, depth: usize) ?types.Type {
@@ -1933,16 +2538,45 @@ fn ownedStringType(g: *const graph.CrateGraph) ?types.Type {
     return .{ .external_nominal = .{ .path = path, .args = &.{} } };
 }
 
+/// The `std::io::ErrorKind` nominal. The path is allocated from the crate
+/// graph's allocator, which the pipeline backs with an arena.
+fn ioErrorKindType(g: *const graph.CrateGraph) ?types.Type {
+    const path = g.allocator.alloc([]const u8, 3) catch return null;
+    path[0] = "std";
+    path[1] = "io";
+    path[2] = "ErrorKind";
+    return .{ .external_nominal = .{ .path = path, .args = &.{} } };
+}
+
 /// Result type of a std method whose result the RUNTIME owns, read off the
 /// receiver rather than from a signature in the graph.
 ///
-/// Two methods reach this, and both name their own result exactly:
+/// Seven methods reach this, and all seven name their own result exactly:
 ///
 /// - `to_string` returns the owned `String` of Rust's blanket
 ///   `impl<T: Display> ToString for T`, which the backend lowers to
 ///   `r2z.alloc.String`.
 /// - `Result<T, E>::unwrap_err(&self) -> E` returns the error arm of the
 ///   receiver, and the receiver is the `Result` that arm sits in.
+/// - `Result<T, E>::expect(msg) -> T` and `expect_err(msg) -> E` return the two
+///   arms of that same `Result`. `unwrap_err` is decided by the representation
+///   having an error VALUE; these two are admitted on every `Result`, because
+///   a Zig error union holds its error as a typed tag and a tagged
+///   `r2z.Result` holds it as a payload, so neither form comes up empty. Each
+///   still names the arm its own receiver has.
+/// - `len()` returns the element count of the sequence it is called on, and
+///   `usize` is that count's type in every Rust build. A slice, a `[T; N]`,
+///   and an owned `String` are all a count of owned bytes, and all lower to a
+///   Zig `.len`.
+/// - `String::as_bytes(&self) -> &[u8]` names the bytes the string owns. Only
+///   the owned `String` receiver names it; a slice's own `as_bytes` and a
+///   `&str` reach different runtime types and stay unresolved here. The shape
+///   is inference's own, byte for byte: the two halves have to name the same
+///   value or an operator over one of them reads a type the other never built.
+/// - `std::io::Error::kind(&self) -> ErrorKind` names the classification the
+///   receiver's own io type carries, which the backend lowers to
+///   `r2z.io.ErrorKind`. Both ends are the exact `std::io` path, so a crate's
+///   own `kind` and every other std `io` nominal stay out of it.
 ///
 /// Every other std method returns a primitive, an iterator, or something this
 /// pass cannot name, so it stays unresolved and an operator over it is still
@@ -1963,8 +2597,37 @@ fn stdMethodResultType(
     if (method.receiver >= b.exprs.len) return null;
     const entity = g.symbol_table.get(method.method) orelse return null;
     const is_to_string = std.mem.eql(u8, entity.name, "to_string");
-    if (!is_to_string and !std.mem.eql(u8, entity.name, "unwrap_err")) return null;
+    const is_len = std.mem.eql(u8, entity.name, "len");
+    const is_as_bytes = std.mem.eql(u8, entity.name, "as_bytes");
+    const is_expect = std.mem.eql(u8, entity.name, "expect");
+    const is_expect_err = std.mem.eql(u8, entity.name, "expect_err");
+    const is_error_kind = std.mem.eql(u8, entity.name, "kind");
+    if (!is_to_string and !is_len and !is_as_bytes and !is_expect and
+        !is_expect_err and !is_error_kind and
+        !std.mem.eql(u8, entity.name, "unwrap_err")) return null;
     const receiver_ty = receiverDeclaredType(g, b, method.receiver) orelse return null;
+    if (is_len) {
+        // The evidence is the dispatch the resolver admits the call on, so
+        // this cannot name a `len` the resolver would refuse: only a receiver
+        // `lookupStdMethod` matches the slice `len` or the owned `String` one
+        // for is typed here. A `Vec` receiver, or an
+        // `ExactSizeIterator::len` on an iterator, keeps its own signature and
+        // stays unresolved.
+        const std_method = lookupStdMethod(receiver_ty, "len") orelse return null;
+        if (std_method != .slice_len and std_method != .string_len) return null;
+        return .{ .prim = .usize };
+    }
+    if (is_as_bytes) {
+        // The same evidence rule as `len`, for the same reason: a `Vec<u8>`,
+        // a `&str`, and a slice each reach a different runtime type here, and
+        // typing them from this receiver's dispatch would hand an operator a
+        // value the backend never builds.
+        const std_method = lookupStdMethod(receiver_ty, "as_bytes") orelse return null;
+        if (std_method != .string_as_bytes) return null;
+        const bytes = g.allocator.create(types.Slice) catch return null;
+        bytes.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+        return .{ .slice = bytes };
+    }
     if (is_to_string) {
         // The call is admitted on exactly the two rules the resolver applies to
         // it: the graph-free `Display` set, or a crate-local `impl Display`.
@@ -1975,6 +2638,38 @@ fn stdMethodResultType(
             if (!isBoundStandardMethod(g, b, expression, receiver_ty, "to_string")) return null;
         }
         return ownedStringType(g);
+    }
+    if (is_expect or is_expect_err) {
+        // The same evidence rule as `len` and `as_bytes`: a `Result` is the only
+        // receiver either of these has, and the arm each returns is named off
+        // that same receiver. `expect` returns the Ok arm and `expect_err` the
+        // Err arm, and the Err arm is a value for BOTH representations — a
+        // typed tag inside a Zig error union, a payload inside a tagged
+        // `r2z.Result` — so neither representation is a reason to leave this
+        // unresolved.
+        const name: []const u8 = if (is_expect) "expect" else "expect_err";
+        const admitted = lookupStdMethod(receiver_ty, name) orelse return null;
+        const wanted: StdMethod = if (is_expect) .result_expect else .result_expect_err;
+        if (admitted != wanted) return null;
+        const result = switch (unpeelReceiverType(receiver_ty) orelse return null) {
+            .result => |value| value.*,
+            else => return null,
+        };
+        return if (is_expect) result.ok else result.err;
+    }
+    if (is_error_kind) {
+        // `std::io::Error::kind` names the classification its receiver is
+        // io-shaped for. Both the receiver and the result are the exact
+        // `std::io` path, so a crate's own `kind`, and every other std `io`
+        // nominal, stay out of it.
+        const external = switch (unpeelReceiverType(receiver_ty) orelse return null) {
+            .external_nominal => |value| value,
+            else => return null,
+        };
+        if (!isExactStdIoType(external, "Error")) return null;
+        const admitted = lookupStdMethod(receiver_ty, "kind") orelse return null;
+        if (admitted != .io_error_kind) return null;
+        return ioErrorKindType(g);
     }
     // The question is the one `lookupResultRepresentationMethod` already
     // answers for the CALL, so the two cannot disagree: a `Result` that lowers
@@ -2052,10 +2747,118 @@ fn expressionOwner(g: *const graph.CrateGraph, b: *const bodies.Bodies, node: ex
     };
 }
 
-fn boundOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, lhs: exprs.NodeId, rhs: exprs.NodeId, module: []const u8, name: []const u8) bool {
-    const receiver = operatorOperandType(g, b, lhs) orelse return false;
-    const owner = expressionOwner(g, b, lhs, 0) orelse expressionOwner(g, b, rhs, 0) orelse return false;
-    return bodies.genericBound(g, b, owner, receiver, &.{ "core", module, name }) != null;
+/// Whether `node`'s own operand type carries `trait_path` as a declared bound.
+///
+/// `bodies.genericBound` answers that, but it answers it about a SCOPE: it
+/// walks up from `owner` through the scopes that can declare a parameter's
+/// bound. Both operands of an operator have an owner and a type of their own,
+/// and a comparison is admitted when the pair pins the bound on EITHER side,
+/// so the operand and the scope it is asked about stay one node.
+fn operandHasGenericBound(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+    trait_path: []const []const u8,
+) bool {
+    const receiver = operatorOperandType(g, b, node) orelse return false;
+    const owner = expressionOwner(g, b, node, 0) orelse return false;
+    return bodies.genericBound(g, b, owner, receiver, trait_path) != null;
+}
+
+fn boundOperator(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    lhs: exprs.NodeId,
+    rhs: exprs.NodeId,
+    module: []const u8,
+    name: []const u8,
+) bool {
+    const trait_path: []const []const u8 = &.{ "core", module, name };
+    return operandHasGenericBound(g, b, lhs, trait_path) or
+        operandHasGenericBound(g, b, rhs, trait_path);
+}
+
+/// One edge of core's own supertrait graph, as `core/src/cmp.rs` declares it:
+/// `PartialOrd<Rhs>: PartialEq<Rhs>`, `Eq: PartialEq<Self>`, and
+/// `Ord: Eq + PartialOrd<Self>`.
+///
+/// These are the whole table because they are the supertraits this pass is
+/// asked about, and each edge is one std's own declaration spells out. A
+/// bound that reaches an operator trait through the table is therefore a
+/// bound Rust admits, which is what makes the operator valid source before it
+/// ever reaches this pass. Nothing here is an unrelated capability granted to
+/// a bound that does not have it: `Eq` buys `==` and not `<`, because only
+/// the edges below are walked.
+///
+/// No crate trait appears in it. A crate's `trait Eq` is a different trait
+/// from `core::cmp::Eq` and nothing in this graph says what it requires, so
+/// `bodies.genericBound` — which a crate-local trait can never satisfy for a
+/// `core::` path, because its module is not an extern one — stays the only
+/// thing that decides whether a declared bound IS a core one.
+const CoreSupertrait = struct {
+    from: []const []const u8,
+    to: []const []const u8,
+};
+
+const core_supertraits = [_]CoreSupertrait{
+    .{ .from = &.{ "core", "cmp", "PartialOrd" }, .to = &.{ "core", "cmp", "PartialEq" } },
+    .{ .from = &.{ "core", "cmp", "Eq" }, .to = &.{ "core", "cmp", "PartialEq" } },
+    .{ .from = &.{ "core", "cmp", "Ord" }, .to = &.{ "core", "cmp", "Eq" } },
+    .{ .from = &.{ "core", "cmp", "Ord" }, .to = &.{ "core", "cmp", "PartialOrd" } },
+};
+
+/// How deep the table is followed. Its longest chain is two edges, so this is
+/// what keeps an edge added to it later from looping, not what the chain
+/// needs.
+const core_supertrait_depth_max: usize = 8;
+
+fn traitPathEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_part, right_part| {
+        if (!std.mem.eql(u8, left_part, right_part)) return false;
+    }
+    return true;
+}
+
+/// Whether core's supertrait graph reaches `wanted` from `declared`.
+fn coreSupertraitReaches(
+    declared: []const []const u8,
+    wanted: []const []const u8,
+    depth: usize,
+) bool {
+    if (depth >= core_supertrait_depth_max) return false;
+    for (core_supertraits) |edge| {
+        if (!traitPathEqual(edge.from, declared)) continue;
+        if (traitPathEqual(edge.to, wanted)) return true;
+        if (coreSupertraitReaches(edge.to, wanted, depth + 1)) return true;
+    }
+    return false;
+}
+
+/// Whether either operand's own declared bounds reach the operator's trait
+/// through core's supertrait graph rather than through the trait itself.
+///
+/// `T: Eq` is `T: PartialEq` in Rust, so `assert_eq!(hashed, expected)` over
+/// such a `T` is valid source and its `==` is a typed binary operator. Nothing
+/// else about the operator changes: it stays a `binary` node over two
+/// operands whose types stay the generic parameter each was declared with, so
+/// the backend still emits the comparison it emits for any other typed
+/// operator.
+fn coreSupertraitOperator(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    binary: exprs.BinaryExpr,
+    module: []const u8,
+    name: []const u8,
+) bool {
+    const wanted: []const []const u8 = &.{ "core", module, name };
+    for ([_]exprs.NodeId{ binary.lhs, binary.rhs }) |node| {
+        for (core_supertraits) |edge| {
+            if (!coreSupertraitReaches(edge.from, wanted, 0)) continue;
+            if (operandHasGenericBound(g, b, node, edge.from)) return true;
+        }
+    }
+    return false;
 }
 
 /// True when `r2z.ops.equal` has value semantics for `ty`.
@@ -2178,7 +2981,18 @@ fn builtInEqualityType(b: *const bodies.Bodies, ty: types.Type) bool {
         .slice, .array, .option, .raw_ptr => true,
         .result => |result| equalityPayloadComparable(result.ok, 0) and
             equalityPayloadComparable(result.err, 0),
-        .external_nominal => |external| isListBackedOwnerNominal(external),
+        // `std::io::ErrorKind` is a payload-free std enum the backend lowers to
+        // `r2z.io.ErrorKind`, and Zig compares a tag by value. The path is
+        // matched in full, so no other std `io` nominal and no crate's own
+        // `ErrorKind` rides in on the leaf.
+        //
+        // `str` is here for the same reason the byte slice is: it is Rust's
+        // unsized byte sequence, and `&str == &str` compares the bytes. It
+        // reaches this arm on its own now that a borrowed string is a
+        // `reference` to the `str` PRIMITIVE rather than a `[]const u8`.
+        .external_nominal => |external| isListBackedOwnerNominal(external) or
+            isExactStdIoType(external, "ErrorKind") or
+            types.isStr(ty),
         .path => |path| enumVariantsComparable(b, path),
         else => false,
     };
@@ -2310,7 +3124,8 @@ fn supportsBinaryOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, b
         if (untypedArrayEqualityOperand(g, b, binary.rhs, binary.lhs)) return true;
     }
     if (boundOperator(g, b, binary.lhs, binary.rhs, operation[0], operation[1])) return true;
-    const receiver = receiverNominalName(g, b, binary.lhs) orelse return false;
+    if (coreSupertraitOperator(g, b, binary, operation[0], operation[1])) return true;
+    const receiver = receiverNominalName(g, b, binary.lhs, receiverDeclaredType(g, b, binary.lhs)) orelse return false;
     return lookupTraitMethod(g, operation[1], receiver, operation[2]) != null;
 }
 fn resolveAssignmentOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, expression: *exprs.Expr) std.mem.Allocator.Error!bool {
@@ -2329,7 +3144,7 @@ fn resolveAssignmentOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies
         .shl => .{ "ShlAssign", "shl_assign" },
         .shr => .{ "ShrAssign", "shr_assign" },
     };
-    const receiver_name = receiverNominalName(g, b, assignment.target) orelse return false;
+    const receiver_name = receiverNominalName(g, b, assignment.target, receiverDeclaredType(g, b, assignment.target)) orelse return false;
     const method = lookupTraitMethod(g, operation[0], receiver_name, operation[1]) orelse
         return boundOperator(g, b, assignment.target, assignment.value, "ops", operation[0]);
     const args = try g.allocator.dupe(exprs.NodeId, &.{assignment.value});
@@ -2371,9 +3186,8 @@ pub fn resolveMethods(
 
             const receiver = b.exprs[receiver_node];
             const receiver_ty = receiverDeclaredType(g, b, receiver_node);
-            const iterator_projection = isRetainedIteratorProjection(g, b, receiver_node);
-            if (iterator_projection) {
-                if (std.mem.eql(u8, method_name, "cloned")) {
+            if (retainedIteratorProjection(g, b, receiver_node)) |projection| {
+                if (isRetainedIteratorProjectionMethod(projection, method_name)) {
                     stats.std_resolved += 1;
                 } else {
                     replaceWithUnsupported(e, reason_method_dispatch_unavailable);
@@ -2382,7 +3196,7 @@ pub fn resolveMethods(
                 continue;
             }
 
-            const receiver_name = receiverNominalName(g, b, receiver_node);
+            const receiver_name = receiverNominalName(g, b, receiver_node, receiver_ty);
             var resolved = false;
             if (receiver_name) |name| {
                 // Inherent methods have precedence over trait methods.
@@ -2449,34 +3263,51 @@ pub fn resolveMethods(
                         isRuntimeIteratorMethod(ty, method_name) or
                         isRuntimeMemoryMethod(ty, method_name) or
                         isBoundStandardMethod(g, b, e.*, ty, method_name) or
-                        isRuntimeIoMethod(g, b, mc.method, ty, method_name))
+                        isRuntimeIoMethod(g, b, receiver_node, mc.method, ty, method_name))
                     {
                         stats.std_resolved += 1;
                         resolved = true;
                     }
+
+                    // `x.into()` is written against the blanket
+                    // `Into<U> for T where U: From<T>`, so the target is not
+                    // anywhere in the receiver — Rust reads it off the
+                    // context and this reads it off the type inference already
+                    // gave the call. Two questions follow from having both
+                    // ends: is the pair one of std's own ownership
+                    // conversions, or is it an impl block this crate wrote?
+                    // A pair that is neither stays unresolved, because
+                    // answering it with the nearest std conversion would emit
+                    // a call the source never wrote.
+                    if (!resolved and std.mem.eql(u8, method_name, "into")) {
+                        if (intoCallTarget(b, e.*)) |target| {
+                            if (lookupStdIntoMethod(ty, target) != null) {
+                                stats.std_resolved += 1;
+                                resolved = true;
+                            } else if (userFromImplMethod(g, b, ty, target)) |from_id| {
+                                mc.method = from_id;
+                                stats.trait_resolved += 1;
+                                resolved = true;
+                            }
+                        }
+                    }
                 }
             }
             // A blanket `impl<T: AsRef<[u8]>> Trait for T` provides its method
-            // for every type its bound admits, and it does admit an array
-            // literal — but it does not say WHICH type, and that is the whole
-            // of what a call needs here. The Zig backend hoists a method onto
-            // the type that implements it, and a blanket impl over a type
-            // parameter has no such type: `validateMethodTopology` refuses it
-            // outright with `GenericDefinitionMismatch`.
-            //
-            // The turbofish is no longer part of the reason. `MethodCall`
-            // carries `generic_args`, so `encode_hex::<String>()` now binds its
-            // result type in the IR and reaches this rule intact. What is
-            // still missing is the HOST type to hoist the method onto, which
-            // only a backend change can supply, so the call stays refused and
-            // the reason names the cause that remains. A receiver that HAS a
-            // type of its own still reaches the impl the ordinary way, through
-            // the name lookup above.
-            if (!resolved and receiver.kind == .array) {
-                if (lookupBlanketAsRefBytesMethod(g, b, method_name) != null) {
-                    replaceWithUnsupported(e, reason_blanket_impl_receiver);
-                    stats.unsupported_methods += 1;
-                    continue;
+            // for every type its bound admits, and a receiver that carries
+            // that bound is one of them: an array, or the type parameter a
+            // generic wrapper bounds in its own signature. The impl names no
+            // concrete self type, so nothing here can pick the call's method
+            // by receiver name; what it can do is name the TRAIT, which is
+            // how the backend reaches the impl it provides the method from.
+            // The receiver's type is the one derived above, so the gate asks
+            // about the same value this branch has been reading.
+            if (!resolved and blanketReceiver(g, b, receiver_node, receiver, receiver_ty)) {
+                if (lookupBlanketAsRefBytesTrait(g, b, method_name)) |trait_id| {
+                    if (bindBlanketImplMethod(g, mc.method, trait_id)) {
+                        stats.trait_resolved += 1;
+                        resolved = true;
+                    }
                 }
             }
             if (!resolved) {
@@ -2516,7 +3347,720 @@ pub fn resolveMethods(
         }
     }
 
+    // Runs last, and on the tree the loop above has finished rewriting: an
+    // assignment this pass refuses is no longer an assignment, so a
+    // late-initialized binding has to read what is left.
+    try typeLateInitializedBindings(g, b);
+
     return stats;
+}
+
+/// What the solver decided about one local binding: the name its source
+/// spelling carries, and the type its occurrences were typed as.
+const TypedBinding = struct {
+    name: []const u8,
+    ty: exprs.TypeId,
+};
+
+/// A `let` the source declares with NO initializer, so an assignment that
+/// follows is the only thing in the program that fixes its type.
+const LateLetBinding = struct {
+    name: []const u8,
+    pattern: exprs.NodeId,
+    statement: exprs.NodeId,
+};
+
+/// The late-initialized bindings currently in scope, innermost last, so a name
+/// an inner block shadows is the one an assignment inside it reaches.
+const LateLetScope = struct {
+    entries: std.ArrayListUnmanaged(LateLetBinding) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *LateLetScope) void {
+        self.entries.deinit(self.allocator);
+    }
+};
+
+/// Nesting bound for the walk below. A body's own structure nests a handful of
+/// blocks deep; this is the same kind of stop every other expression walk in
+/// this file uses, not a limit on what Rust can write.
+const late_let_depth_max = 512;
+
+/// Type every `let` the source declares without an initializer, from the
+/// assignments that fill it.
+///
+/// `let mut byte;` is a real Rust declaration with a real type, and inference
+/// already has it: `byte = buf[0]` emits an ordinary unification edge between
+/// the assignment's target and its value, so the solver types every occurrence
+/// of the binding and the `.ty` on those expressions is that type. What was
+/// missing was the type ON THE DECLARATION — both the `let` statement and its
+/// pattern carry a `ty`, and both were null, so a backend reading the binding
+/// found a declaration it could not name.
+///
+/// Nothing is inferred here and nothing is defaulted. The recorded type is a
+/// TypeId the solver already produced for this very binding, copied to the two
+/// places a declaration is read from. A binding no assignment ever types — a
+/// declaration the source itself annotates is already handled upstream, and an
+/// assignment the compiler refused is not an assignment any more — keeps its
+/// null type, exactly as before.
+///
+/// The cost is one pass over the expressions and one walk of each body, not a
+/// walk per declaration: the typed-binding table is built once for the crate
+/// and every declaration in every function reads from it.
+fn typeLateInitializedBindings(
+    g: *const graph.CrateGraph,
+    b: *bodies.Bodies,
+) std.mem.Allocator.Error!void {
+    // Most crates declare none of these, and the answer costs one scan.
+    var declared = false;
+    for (b.stmts) |statement| switch (statement.kind) {
+        .let => |ls| {
+            if (ls.init == null and ls.ty == null) declared = true;
+        },
+        else => {},
+    };
+    if (!declared) return;
+
+    var typed: std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding) = .empty;
+    defer typed.deinit(g.allocator);
+    for (b.exprs) |expression| {
+        const path = switch (expression.kind) {
+            .path => |value| value,
+            else => continue,
+        };
+        const ty = expression.ty orelse continue;
+        const entity = g.symbol_table.get(path.def) orelse continue;
+        try typed.put(g.allocator, path.def, .{ .name = entity.name, .ty = ty });
+    }
+    if (typed.count() == 0) return;
+
+    var scope: LateLetScope = .{ .allocator = g.allocator };
+    defer scope.deinit();
+    for (b.bodies) |body| {
+        const function = switch (body) {
+            .fn_ => |value| value,
+            else => continue,
+        };
+        if (function.body >= b.exprs.len) continue;
+        const block = switch (b.exprs[function.body].kind) {
+            .block => |value| value,
+            else => continue,
+        };
+        try resolveLateLetsInBlock(b, block, &scope, &typed, 0);
+    }
+}
+
+fn resolveLateLetsInBlock(
+    b: *bodies.Bodies,
+    block: exprs.BlockExpr,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    if (depth >= late_let_depth_max) return;
+    const frame = scope.entries.items.len;
+    // A block's own declarations leave scope with it, so an assignment below
+    // cannot reach a binding declared inside a sibling block.
+    defer scope.entries.shrinkRetainingCapacity(frame);
+    for (block.statements) |statement| {
+        if (statement >= b.stmts.len) continue;
+        switch (b.stmts[statement].kind) {
+            .let => |ls| {
+                try declareLateLet(b, scope, frame, statement, ls);
+                if (ls.init) |init| {
+                    try resolveLateLetsInExpr(b, init, scope, typed, depth + 1);
+                }
+            },
+            .let_else => |let_else| {
+                try resolveLateLetsInExpr(b, let_else.init, scope, typed, depth + 1);
+                try resolveLateLetsInBlock(b, let_else.else_block, scope, typed, depth + 1);
+            },
+            .expr => |expression| try resolveLateLetsInExpr(b, expression, scope, typed, depth + 1),
+            .item => {},
+        }
+    }
+    if (block.tail) |tail| try resolveLateLetsInExpr(b, tail, scope, typed, depth + 1);
+}
+
+/// Enter a `let` into the current block's frame.
+///
+/// A declaration WITH an initializer is the value of that name in this scope,
+/// so it shadows whatever an earlier `let` of the same name declared, and the
+/// shadowed entry goes: an assignment after this point belongs to the new
+/// binding, not to the late-initialized one underneath it.
+fn declareLateLet(
+    b: *bodies.Bodies,
+    scope: *LateLetScope,
+    frame: usize,
+    statement: exprs.NodeId,
+    ls: exprs.LetStmt,
+) std.mem.Allocator.Error!void {
+    if (ls.pattern >= b.pats.len) return;
+    const binding = switch (b.pats[ls.pattern].kind) {
+        .binding => |value| value,
+        else => return,
+    };
+    if (binding.name.len == 0) return;
+    if (ls.init != null or ls.ty != null) {
+        var index = scope.entries.items.len;
+        while (index > frame) {
+            index -= 1;
+            if (!std.mem.eql(u8, scope.entries.items[index].name, binding.name)) continue;
+            _ = scope.entries.orderedRemove(index);
+            break;
+        }
+        return;
+    }
+    try scope.entries.append(scope.allocator, .{
+        .name = binding.name,
+        .pattern = ls.pattern,
+        .statement = statement,
+    });
+}
+
+/// Record the type the solver produced for a late-initialized binding on the
+/// two nodes a declaration is read from.
+///
+/// `Bodies` keeps its tables as const slices, and this pass already rewrites
+/// expression nodes through `@constCast` for the same reason: the tables are
+/// the pipeline's to hand over, and a declaration's own type is filled in
+/// here because nothing before the solve has one to fill in with.
+fn recordLateLetType(
+    b: *bodies.Bodies,
+    pattern: exprs.NodeId,
+    statement: exprs.NodeId,
+    ty: exprs.TypeId,
+) void {
+    if (ty >= b.types.len) return;
+    if (pattern < b.pats.len) @constCast(b.pats)[pattern].ty = ty;
+    if (statement < b.stmts.len) @constCast(b.stmts)[statement].ty = ty;
+}
+
+fn resolveLateLetsInExpr(
+    b: *bodies.Bodies,
+    node: exprs.NodeId,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    if (node >= b.exprs.len or depth >= late_let_depth_max) return;
+    switch (b.exprs[node].kind) {
+        // `x = value` is what fixes a late-initialized binding: the solver has
+        // already unified the target with the value, so the target's own type
+        // is this binding's type and the compound forms need nothing more than
+        // that either.
+        .assign => |assign| {
+            if (assign.op == .plain and assign.target < b.exprs.len) {
+                if (b.exprs[assign.target].kind == .path) {
+                    const def = b.exprs[assign.target].kind.path.def;
+                    if (typed.get(def)) |found| {
+                        var index = scope.entries.items.len;
+                        while (index > 0) {
+                            index -= 1;
+                            const entry = scope.entries.items[index];
+                            if (!std.mem.eql(u8, entry.name, found.name)) continue;
+                            recordLateLetType(b, entry.pattern, entry.statement, found.ty);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Either side may itself hold one: `*slot = { let n; n = 1; n }`
+            // binds nothing late, but the block on the right owns one.
+            try resolveLateLetsInExpr(b, assign.target, scope, typed, depth + 1);
+            try resolveLateLetsInExpr(b, assign.value, scope, typed, depth + 1);
+        },
+        // Every position that can hold a `let` statement. The child set is the
+        // one `exprs.NodeWalker` enqueues, so an assignment hiding in a call
+        // argument, an iterator adapter's closure, a struct field's
+        // initializer or an index base is found where the graph says it is —
+        // while the scope stack this pass keeps is what a flat walk cannot
+        // supply: a block's declarations still leave scope with it, and a
+        // `let` WITH an initializer still shadows the late-initialized binding
+        // of the same name underneath it.
+        .block => |block| try resolveLateLetsInBlock(b, block, scope, typed, depth + 1),
+        .if_else => |if_else| {
+            try resolveLateLetsInExpr(b, if_else.cond, scope, typed, depth + 1);
+            try resolveLateLetsInBlock(b, if_else.then_, scope, typed, depth + 1);
+            try resolveLateLetsInElse(b, if_else.@"else", scope, typed, depth + 1);
+        },
+        .if_let => |if_let| {
+            try resolveLateLetsInPattern(b, if_let.pattern, scope, typed, depth + 1);
+            try resolveLateLetsInExpr(b, if_let.scrutinee, scope, typed, depth + 1);
+            try resolveLateLetsInBlock(b, if_let.then_, scope, typed, depth + 1);
+            try resolveLateLetsInElse(b, if_let.@"else", scope, typed, depth + 1);
+        },
+        .while_ => |while_| {
+            try resolveLateLetsInExpr(b, while_.cond, scope, typed, depth + 1);
+            if (while_.capture) |capture| {
+                try resolveLateLetsInPattern(b, capture, scope, typed, depth + 1);
+            }
+            try resolveLateLetsInBlock(b, while_.body, scope, typed, depth + 1);
+        },
+        .loop_ => |loop_| try resolveLateLetsInBlock(b, loop_.body, scope, typed, depth + 1),
+        .for_ => |for_| {
+            try resolveLateLetsInPattern(b, for_.pattern, scope, typed, depth + 1);
+            try resolveLateLetsInExpr(b, for_.iterable, scope, typed, depth + 1);
+            try resolveLateLetsInBlock(b, for_.body, scope, typed, depth + 1);
+            try resolveLateLetsInIterKind(b, for_.iter_kind, scope, typed, depth + 1);
+        },
+        .match => |match| {
+            try resolveLateLetsInExpr(b, match.scrutinee, scope, typed, depth + 1);
+            for (match.arms) |arm| {
+                for (arm.patterns) |pattern| {
+                    try resolveLateLetsInPattern(b, pattern, scope, typed, depth + 1);
+                }
+                if (arm.guard) |guard| try resolveLateLetsInExpr(b, guard, scope, typed, depth + 1);
+                try resolveLateLetsInExpr(b, arm.body, scope, typed, depth + 1);
+            }
+        },
+        .closure => |closure| try resolveLateLetsInClosure(b, closure, scope, typed, depth + 1),
+        .iterator_chain => |chain| try resolveLateLetsInChain(b, chain, scope, typed, depth + 1),
+        .break_ => |brk| {
+            if (brk.value) |value| try resolveLateLetsInExpr(b, value, scope, typed, depth + 1);
+        },
+        .array => |array| {
+            for (array.elements) |element| {
+                try resolveLateLetsInExpr(b, element, scope, typed, depth + 1);
+            }
+        },
+        .vec_lit => |vector| {
+            for (vector.elements) |element| {
+                try resolveLateLetsInExpr(b, element, scope, typed, depth + 1);
+            }
+        },
+        .range => |range| {
+            try resolveLateLetsInExpr(b, range.start, scope, typed, depth + 1);
+            if (range.end) |end| try resolveLateLetsInExpr(b, end, scope, typed, depth + 1);
+        },
+        .call => |call| {
+            for (call.args) |argument| {
+                try resolveLateLetsInExpr(b, argument, scope, typed, depth + 1);
+            }
+        },
+        .core_call => |call| {
+            for (call.args) |argument| {
+                try resolveLateLetsInExpr(b, argument, scope, typed, depth + 1);
+            }
+        },
+        .method_call => |method| {
+            try resolveLateLetsInExpr(b, method.receiver, scope, typed, depth + 1);
+            for (method.args) |argument| {
+                try resolveLateLetsInExpr(b, argument, scope, typed, depth + 1);
+            }
+        },
+        .struct_lit => |literal| {
+            for (literal.fields) |field| {
+                try resolveLateLetsInExpr(b, field.value, scope, typed, depth + 1);
+            }
+            if (literal.base) |base| {
+                try resolveLateLetsInExpr(b, base, scope, typed, depth + 1);
+            }
+        },
+        .enum_variant => |variant| {
+            for (variant.tuple_fields) |field| {
+                try resolveLateLetsInExpr(b, field, scope, typed, depth + 1);
+            }
+            for (variant.named_fields) |field| {
+                try resolveLateLetsInExpr(b, field.value, scope, typed, depth + 1);
+            }
+        },
+        .external_variant => |variant| {
+            for (variant.tuple_fields) |field| {
+                try resolveLateLetsInExpr(b, field, scope, typed, depth + 1);
+            }
+            for (variant.named_fields) |field| {
+                try resolveLateLetsInExpr(b, field.value, scope, typed, depth + 1);
+            }
+        },
+        .format_write => |format_write| {
+            try resolveLateLetsInExpr(b, format_write.writer, scope, typed, depth + 1);
+            for (format_write.args) |argument| {
+                try resolveLateLetsInExpr(b, argument, scope, typed, depth + 1);
+            }
+        },
+        .field => |field| try resolveLateLetsInExpr(b, field.base, scope, typed, depth + 1),
+        .index => |index| {
+            try resolveLateLetsInExpr(b, index.base, scope, typed, depth + 1);
+            try resolveLateLetsInExpr(b, index.index, scope, typed, depth + 1);
+        },
+        .cast => |cast| try resolveLateLetsInExpr(b, cast.operand, scope, typed, depth + 1),
+        .binary => |binary| {
+            try resolveLateLetsInExpr(b, binary.lhs, scope, typed, depth + 1);
+            try resolveLateLetsInExpr(b, binary.rhs, scope, typed, depth + 1);
+        },
+        .unary => |unary| try resolveLateLetsInExpr(b, unary.operand, scope, typed, depth + 1),
+        .try_ => |try_expr| try resolveLateLetsInExpr(b, try_expr.inner, scope, typed, depth + 1),
+        .return_ => |ret| {
+            if (ret.value) |value| try resolveLateLetsInExpr(b, value, scope, typed, depth + 1);
+        },
+        // A name, a literal, a type, or a recorded refusal holds no
+        // statements.
+        .path, .literal, .unit, .panic_, .continue_, .core_function, .unsupported => {},
+    }
+}
+
+/// The `else` half of an `if` or an `if let`.
+fn resolveLateLetsInElse(
+    b: *bodies.Bodies,
+    branch: exprs.ElseBranch,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    switch (branch) {
+        .none => {},
+        .block => |block| try resolveLateLetsInBlock(b, block, scope, typed, depth + 1),
+        .chain => |chain| try resolveLateLetsInExpr(b, chain, scope, typed, depth + 1),
+    }
+}
+
+fn resolveLateLetsInClosure(
+    b: *bodies.Bodies,
+    closure: exprs.ClosureExpr,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    for (closure.params) |parameter| {
+        try resolveLateLetsInPattern(b, parameter, scope, typed, depth + 1);
+    }
+    try resolveLateLetsInBlock(b, closure.body, scope, typed, depth + 1);
+}
+
+/// One `core::iter` adapter. `map` / `filter` / `flat_map` carry a closure —
+/// a block of statements like any other — and `zip` names a second iterable
+/// written right here, so both can own a `let` no initializer reaches.
+fn resolveLateLetsInAdapter(
+    b: *bodies.Bodies,
+    adapter: exprs.IteratorAdapter,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    switch (adapter) {
+        .map => |map| try resolveLateLetsInClosure(b, map.closure, scope, typed, depth + 1),
+        .filter => |filter| try resolveLateLetsInClosure(b, filter.closure, scope, typed, depth + 1),
+        .flat_map => |closure| try resolveLateLetsInClosure(b, closure, scope, typed, depth + 1),
+        .zip => |zip| try resolveLateLetsInExpr(b, zip.other, scope, typed, depth + 1),
+        .enumerate, .range_rev, .other => {},
+    }
+}
+
+fn resolveLateLetsInChain(
+    b: *bodies.Bodies,
+    chain: exprs.IteratorChainExpr,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    try resolveLateLetsInExpr(b, chain.source, scope, typed, depth + 1);
+    for (chain.adapters) |adapter| {
+        try resolveLateLetsInAdapter(b, adapter, scope, typed, depth + 1);
+    }
+}
+
+fn resolveLateLetsInIterKind(
+    b: *bodies.Bodies,
+    kind: exprs.IterKind,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    switch (kind) {
+        .range, .slice, .enumerate => {},
+        .multi => |expressions| {
+            for (expressions) |expression| {
+                try resolveLateLetsInExpr(b, expression, scope, typed, depth + 1);
+            }
+        },
+        .adapter => |chain| try resolveLateLetsInChain(b, chain, scope, typed, depth + 1),
+    }
+}
+
+/// A pattern's own expressions. Only a range's bounds are written as code,
+/// so that is the only place a `let` can hide inside a pattern — but the
+/// sub-patterns are followed either way, because a range can sit inside any
+/// of them.
+fn resolveLateLetsInPattern(
+    b: *bodies.Bodies,
+    node: exprs.NodeId,
+    scope: *LateLetScope,
+    typed: *const std.AutoHashMapUnmanaged(exprs.DefId, TypedBinding),
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    if (node >= b.pats.len or depth >= late_let_depth_max) return;
+    switch (b.pats[node].kind) {
+        .range => |range| {
+            if (range.lo) |lo| try resolveLateLetsInExpr(b, lo, scope, typed, depth + 1);
+            if (range.hi) |hi| try resolveLateLetsInExpr(b, hi, scope, typed, depth + 1);
+        },
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                try resolveLateLetsInPattern(b, element, scope, typed, depth + 1);
+            }
+        },
+        .slice => |slice| {
+            for (slice.elements) |element| {
+                try resolveLateLetsInPattern(b, element, scope, typed, depth + 1);
+            }
+            if (slice.rest) |rest| try resolveLateLetsInPattern(b, rest, scope, typed, depth + 1);
+        },
+        .struct_pat => |struct_pat| {
+            for (struct_pat.fields) |field| {
+                if (field.pat) |field_pattern| {
+                    try resolveLateLetsInPattern(b, field_pattern, scope, typed, depth + 1);
+                }
+            }
+        },
+        .external_variant => |external_variant| {
+            for (external_variant.fields) |field| {
+                if (field.pat) |field_pattern| {
+                    try resolveLateLetsInPattern(b, field_pattern, scope, typed, depth + 1);
+                }
+            }
+        },
+        .reference => |reference| {
+            try resolveLateLetsInPattern(b, reference.inner, scope, typed, depth + 1);
+        },
+        .@"or" => |or_pattern| {
+            for (or_pattern.alternatives) |alternative| {
+                try resolveLateLetsInPattern(b, alternative, scope, typed, depth + 1);
+            }
+        },
+        .wildcard, .binding, .literal, .path, .unsupported => {},
+    }
+}
+
+/// Whether the receiver is one a crate-local blanket
+/// `impl<T: AsRef<[u8]>> Trait for T` provides its method for, and the trait
+/// it provides it from is the one the backend selects the impl by.
+///
+/// The impl provides the method for every type its bound admits, so the
+/// receiver has to be one that bound admits. Two shapes are, and they are the
+/// two the backend builds a self type for (`blanketReceiverType`), so the two
+/// sides cannot disagree about what a blanket call is:
+///
+/// - An array, typed or not. The self type is the bound's element with the
+///   receiver's own length.
+/// - A type parameter an enclosing declaration bounded by a byte-sequence
+///   `AsRef`: `fn encode<T: AsRef<[u8]>>(data: T) -> String { data.encode_hex() }`
+///   is hex/src/lib.rs:259-261, and it is the shape a generic wrapper is
+///   written in. There is no length and no element type to read here, and none
+///   is invented — the hoisted method takes the parameter itself as its self
+///   type, which is only right because the declaration says the parameter
+///   implements `AsRef<[u8]>`.
+///
+/// A CARRIER around the parameter — `&T`, `*T`, `Box<T>`, an `impl Trait` —
+/// is not one of the two, and is refused here rather than peeled. The backend
+/// hands the receiver's own type to `blanketReceiverType` and builds a self
+/// type only for an array or that bare path, so a peeled carrier would resolve
+/// the call and then leave `receiver.encode_hex(..)` in the output: a Zig
+/// member call on a slice, for a method Zig has no such field of. Refusing it
+/// in this pass is what turns that into a diagnostic.
+///
+/// Anything else is not evidence that this blanket impl applies, so the call
+/// keeps whatever reason its own dispatch earns.
+///
+/// `receiver_ty` is the type the call site already derived for this receiver;
+/// `receiver_node` is kept for the owner lookup, which is about the scope the
+/// receiver sits in rather than about its type.
+fn blanketReceiver(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver_node: exprs.NodeId,
+    receiver: exprs.Expr,
+    receiver_ty: ?types.Type,
+) bool {
+    if (blanketArrayReceiver(b, receiver)) return true;
+    return blanketBoundedTypeParamReceiver(g, b, receiver_node, receiver_ty);
+}
+
+/// Whether the receiver is an array, the shape whose self type the backend
+/// builds from the bound's element and the receiver's own length.
+fn blanketArrayReceiver(b: *const bodies.Bodies, receiver: exprs.Expr) bool {
+    if (receiver.kind == .array) return true;
+    const type_id = receiver.ty orelse return false;
+    if (type_id >= b.types.len) return false;
+    return b.types[type_id] == .array;
+}
+
+/// Whether the receiver's declared type IS a type parameter that an enclosing
+/// declaration bounded by a byte-sequence `AsRef`.
+///
+/// The declared type is read as it stands and never peeled, because the
+/// backend does not peel it either: `blanketReceiverType` tests the receiver's
+/// own type with `isTypeParameterPath`, which accepts a bare one-segment path
+/// and nothing else. A `&T` that this pass peeled to `T` would be admitted
+/// here and refused there, and a refused blanket call lowers to a member call
+/// on the slice rather than to anything that names the missing conversion.
+fn blanketBoundedTypeParamReceiver(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver_node: exprs.NodeId,
+    receiver_ty: ?types.Type,
+) bool {
+    const path = switch (receiver_ty orelse return false) {
+        .path => |value| value,
+        else => return false,
+    };
+    if (path.segments.len != 1) return false;
+    const segment = path.segments[0];
+    // A segment that names a declaration is not a type parameter. No
+    // declaration is named `T`, so a bare name with no entity id is exactly
+    // how the IR spells one — the same rule the backend's
+    // `isTypeParameterPath` reads before it takes the parameter itself as
+    // the self type, and the two must not disagree about which receivers are
+    // parameters at all.
+    if (segment.id != null or segment.name.len == 0) return false;
+    const owner = expressionOwner(g, b, receiver_node, 0) orelse return false;
+    return typeParamDeclaresByteAsRef(g, b, owner, segment.name);
+}
+
+/// How far a receiver's type parameter is looked for through the scopes that
+/// enclose it. It bounds the walk so a malformed or cyclic entity table stops
+/// it rather than looping, the way every other bounded walk in this pass does
+/// (`receiver_unpeel_depth_max`, `expressionOwner`).
+const generic_scope_depth_max: usize = 128;
+
+/// Whether any scope enclosing `owner` declares a type parameter named
+/// `param_name` whose own bounds include a byte-sequence `AsRef`.
+///
+/// A callable, an impl, and a trait are the scopes Rust lets such a bound be
+/// written in, and they are the three `bodies.genericBound` reads for the
+/// same walk. This pass reads them itself because the question is not which
+/// trait a bound names but what it requires of its argument — `AsRef<[u8]>`,
+/// not any `AsRef` — and `isByteSequenceAsRef` is the rule the blanket impl's
+/// own side is read by, so the receiver and the impl it reaches are judged by
+/// one rule rather than two.
+fn typeParamDeclaresByteAsRef(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    owner: spine.EntityId,
+    param_name: []const u8,
+) bool {
+    var current: ?spine.EntityId = owner;
+    var remaining = generic_scope_depth_max;
+    while (current) |id| {
+        if (remaining == 0 or @as(usize, id) >= b.bodies.len) return false;
+        remaining -= 1;
+        const generics = switch (b.bodies[id]) {
+            .fn_ => |function| function.generics,
+            .impl_ => |implementation| implementation.generics,
+            .trait_ => |trait_body| trait_body.generics,
+            else => null,
+        };
+        if (generics) |parameters| {
+            for (parameters.params) |parameter| {
+                const type_param = switch (parameter) {
+                    .type_ => |value| value,
+                    else => continue,
+                };
+                if (!std.mem.eql(u8, type_param.name, param_name)) continue;
+                for (type_param.bounds) |bound| {
+                    if (isByteSequenceAsRef(bound)) return true;
+                }
+            }
+            for (parameters.where_clauses) |clause| {
+                if (clause.self_ty.segments.len != 1) continue;
+                if (!std.mem.eql(u8, clause.self_ty.segments[0].name, param_name)) continue;
+                for (clause.bounds) |bound| {
+                    if (isByteSequenceAsRef(bound)) return true;
+                }
+            }
+        }
+        const entity = g.symbol_table.get(id) orelse return false;
+        current = entity.parent;
+    }
+    return false;
+}
+
+/// The trait a crate-local blanket `impl<T: AsRef<[u8]>> Trait for T`
+/// implements, when that impl declares `method_name`, or null when none does.
+///
+/// The answer is the TRAIT rather than the method because the trait is what
+/// the backend selects the impl from: it reads the trait off the call's
+/// `method_ref` (`methodRefTrait`) and finds the impl providing the method
+/// from it (`blanketImplFor`). The trait is taken from the impl body's own
+/// `trait_path`, the same linkage the backend reads, so the two cannot pick
+/// different traits. Two blanket impls providing the same method name the
+/// method ambiguously and stay refused.
+fn lookupBlanketAsRefBytesTrait(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    method_name: []const u8,
+) ?spine.EntityId {
+    if (method_name.len == 0) return null;
+    var candidate: ?spine.EntityId = null;
+    for (g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .impl_) continue;
+        const parts = parseTraitImplName(ent.name) orelse continue;
+        if (!isBlanketAsRefBytesImpl(b, ent.id, parts.type_name)) continue;
+        if (!implDeclaresMethod(g, ent.id, method_name)) continue;
+        const trait_id = implTraitEntity(b, ent.id) orelse continue;
+        if (candidate != null) return null;
+        candidate = trait_id;
+    }
+    return candidate;
+}
+
+fn implDeclaresMethod(
+    g: *const graph.CrateGraph,
+    impl_id: spine.EntityId,
+    method_name: []const u8,
+) bool {
+    for (g.symbol_table.entities.items) |child| {
+        if (child.kind != .fn_ or child.parent != impl_id) continue;
+        if (std.mem.eql(u8, child.name, method_name)) return true;
+    }
+    return false;
+}
+
+/// The trait entity an impl body implements, read off the body rather than
+/// off the impl's name. A macro-generated impl carries the name spelling
+/// (`ToHex for T`) and the body carries the resolved `trait_path`, and only
+/// the latter names an entity the backend can look the impl up by.
+fn implTraitEntity(b: *const bodies.Bodies, impl_id: spine.EntityId) ?spine.EntityId {
+    if (impl_id >= b.bodies.len) return null;
+    const implementation = switch (b.bodies[impl_id]) {
+        .impl_ => |value| value,
+        else => return null,
+    };
+    const path = implementation.trait_path orelse return null;
+    if (path.segments.len == 0) return null;
+    return path.segments[path.segments.len - 1].id;
+}
+
+/// Point a call at the trait whose blanket impl provides it, and report
+/// whether the call is now bound.
+///
+/// The backend hoists a blanket impl's method onto the crate module as a free
+/// function, and it finds that function through the trait the call names. The
+/// call's own `method_ref` is synthesized per call site and carries only the
+/// enclosing scope as its parent, so parenting it to the trait here is what
+/// puts the whole chain in reach — and it is the shape `Trait::method(..)`
+/// already arrives in, so nothing downstream meets a new one.
+///
+/// Only a `method_ref` that is still owned by a callable or a module is
+/// re-parented. One already owned by this trait is the same binding reached
+/// twice — two call sites can share one synthesized reference — and one owned
+/// by a DIFFERENT trait, an impl, or a type declaration was bound by a more
+/// specific rule, which overwriting would undo.
+fn bindBlanketImplMethod(
+    g: *const graph.CrateGraph,
+    method: exprs.DefId,
+    trait_id: spine.EntityId,
+) bool {
+    if (method >= g.symbol_table.entities.items.len) return false;
+    const entity = &@constCast(&g.symbol_table.entities).items[method];
+    if (entity.kind != .method_ref) return false;
+    if (entity.parent) |owner| {
+        if (owner == trait_id) return true;
+        const owner_entity = g.symbol_table.get(owner) orelse return false;
+        if (owner_entity.kind != .fn_ and owner_entity.kind != .module) return false;
+    }
+    entity.parent = trait_id;
+    return true;
 }
 
 /// The reason an operator over an untyped operand carries.
@@ -3266,4 +4810,202 @@ test "LocalInitializerFinder bounds nested patterns and expressions" {
     };
     rejected_expr_finder.visitExpr(0, 0);
     try std.testing.expect(rejected_expr_finder.depth_exceeded);
+}
+
+// A `let` the source declares with no initializer is typed by the assignment
+// that fills it. Here one such assignment sits inside the closure an
+// `iter().map(..)` adapter carries, which the walk used to stop before — the
+// adapter is neither a block nor a call shape the walk descended into — so
+// the declaration reached the backend with no type at all.
+//
+// The two `y` bindings are declared with DIFFERENT types on purpose. A walk
+// that ignored the closure's own scope would type both from one assignment,
+// and the two numbers would be indistinguishable; here each declaration can
+// only be right if it was reached from the assignment that fills it.
+test "late bindings inside an iterator adapter closure are typed from their own scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    const y_def = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "y"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // A second `let y` in a nested block is a SECOND binding, not the first
+    // one written again: it gets its own entity, and only the NAME is what the
+    // scope scan matches on. Sharing one id here would collapse the two
+    // declarations into one in the typed-binding table itself.
+    const y_inner_def = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "y"),
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    const types_store = try alloc.alloc(types.Type, 2);
+    types_store[0] = .{ .prim = .u8 };
+    types_store[1] = .{ .prim = .u32 };
+
+    const closure_body: exprs.BlockExpr = .{
+        .statements = &.{2},
+        .tail = 6,
+        .labelled = null,
+    };
+    const closure: exprs.ClosureExpr = .{
+        .captures = &.{},
+        .params = &.{},
+        .return_ty = null,
+        .body = closure_body,
+        .trait = .@"fn",
+    };
+    const adapters = try alloc.alloc(exprs.IteratorAdapter, 1);
+    adapters[0] = .{ .map = .{ .closure = closure } };
+
+    const exprs_store = try alloc.alloc(exprs.Expr, 9);
+    // The function body: `let y; y = 1u8; xs.map(|x| { let y; y = 2u32; y })`
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{ 0, 1 },
+            .tail = 4,
+            .labelled = null,
+        } },
+    };
+    exprs_store[1] = .{
+        .id = 1,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = y_def, .generic_args = &.{} } },
+    };
+    exprs_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = null,
+        .kind = .{ .assign = .{
+            .target = 1,
+            .op = .plain,
+            .value = 3,
+            .overflow = .checked,
+        } },
+    };
+    exprs_store[3] = .{
+        .id = 3,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "1",
+            .value = 1,
+            .base = .dec,
+            .ty_suffix = "u8",
+        } } },
+    };
+    exprs_store[4] = .{
+        .id = 4,
+        .span = span,
+        .ty = null,
+        .kind = .{ .iterator_chain = .{
+            .source = 5,
+            .adapters = adapters,
+            .terminal = .collect_vec,
+        } },
+    };
+    exprs_store[5] = .{ .id = 5, .span = span, .ty = null, .kind = .{ .unit = {} } };
+    exprs_store[6] = .{
+        .id = 6,
+        .span = span,
+        .ty = null,
+        .kind = .{ .assign = .{
+            .target = 7,
+            .op = .plain,
+            .value = 8,
+            .overflow = .checked,
+        } },
+    };
+    exprs_store[7] = .{
+        .id = 7,
+        .span = span,
+        .ty = 1,
+        .kind = .{ .path = .{ .def = y_inner_def, .generic_args = &.{} } },
+    };
+    exprs_store[8] = .{
+        .id = 8,
+        .span = span,
+        .ty = 1,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "2",
+            .value = 2,
+            .base = .dec,
+            .ty_suffix = "u32",
+        } } },
+    };
+
+    const stmts_store = try alloc.alloc(exprs.Statement, 3);
+    stmts_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .let = .{ .pattern = 0, .init = null, .ty = null } },
+    };
+    stmts_store[1] = .{ .id = 1, .span = span, .ty = null, .kind = .{ .expr = 2 } };
+    stmts_store[2] = .{
+        .id = 2,
+        .span = span,
+        .ty = null,
+        .kind = .{ .let = .{ .pattern = 1, .init = null, .ty = null } },
+    };
+
+    const pats_store = try alloc.alloc(exprs.Pattern, 2);
+    for (pats_store, 0..) |*pattern, index| {
+        pattern.* = .{
+            .id = @intCast(index),
+            .span = span,
+            .ty = null,
+            .kind = .{ .binding = .{
+                .name = "y",
+                .mode = .{ .value = {} },
+                .mutable = true,
+            } },
+        };
+    }
+
+    const bodies_store = try alloc.alloc(bodies.BodyKind, 2);
+    bodies_store[0] = .{ .none = {} };
+    bodies_store[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } };
+
+    var b: bodies.Bodies = .{
+        .exprs = exprs_store,
+        .stmts = stmts_store,
+        .pats = pats_store,
+        .types = types_store,
+        .bodies = bodies_store,
+    };
+
+    try typeLateInitializedBindings(&g, &b);
+
+    try std.testing.expectEqual(@as(exprs.TypeId, 0), stmts_store[0].ty.?);
+    try std.testing.expectEqual(@as(exprs.TypeId, 0), pats_store[0].ty.?);
+    try std.testing.expectEqual(@as(exprs.TypeId, 1), stmts_store[2].ty.?);
+    try std.testing.expectEqual(@as(exprs.TypeId, 1), pats_store[1].ty.?);
 }

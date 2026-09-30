@@ -446,6 +446,12 @@ const ResolvedCallEffectScanner = struct {
     exprs: []const exprs.Expr,
     stmts: []const exprs.Statement,
     bodies: []const bodies.BodyKind,
+    /// The graph and the typed body view, needed only for the one std method
+    /// this scanner asks about by its declared trait bound rather than by a
+    /// callee in `bodies`: a std trait method has no entity in this table, so
+    /// `bodyAllocates` cannot see it.
+    g: *const graph.CrateGraph,
+    view: *const bodies.Bodies,
 
     fn exprCallsAllocating(self: *const ResolvedCallEffectScanner, node_id: exprs.NodeId) bool {
         if (@as(usize, node_id) >= self.exprs.len) return false;
@@ -472,7 +478,18 @@ const ResolvedCallEffectScanner = struct {
             .break_ => |break_expr| if (break_expr.value) |value| self.exprCallsAllocating(value) else false,
             .call => |call| self.callTargetAllocates(call.call_kind) or
                 self.nodeListCallsAllocating(call.args),
+            // `methodTargetAllocates` reads the callee's OWN body, which is how
+            // a call into this crate propagates. Two std-shaped calls have no
+            // callee body here at all — the traits are outside the crate — so
+            // their effect comes from the call's resolved identity instead: a
+            // `std::io::Write::write_all`, which grows a buffer under an
+            // explicit `gpa`, and a `Result` method that releases a heap-owning
+            // payload through `alloc.dropTemporary(gpa)`. Both are the same
+            // question, "does executing this expression reach an allocator",
+            // asked of the arm of the switch that has no entity to ask it of.
             .method_call => |method_call| self.methodTargetAllocates(method_call.method) or
+                resolve_methods.stdIoWriteMethodAllocates(self.g, self.view, node_id) or
+                resolve_methods.stdResultCleanupAllocates(self.g, self.view, node_id) or
                 self.exprCallsAllocating(method_call.receiver) or
                 self.nodeListCallsAllocating(method_call.args),
             .struct_lit => |literal| self.structLiteralCallsAllocating(literal),
@@ -480,7 +497,13 @@ const ResolvedCallEffectScanner = struct {
             .field => |field| self.exprCallsAllocating(field.base),
             .format_write => |format| self.exprCallsAllocating(format.writer) or
                 self.nodeListCallsAllocating(format.args),
-            .core_call => |call| self.nodeListCallsAllocating(call.args),
+            // `Vec::from(sequence)` allocates the vector it copies into, and the
+            // runtime lowers it as `r2z.alloc.vec_from_slice(T, gpa, sequence)`,
+            // so it needs the `gpa` this flag is what causes the enclosing
+            // callable to source. It arrives as a CORE call rather than a method
+            // call, so it belongs on this arm and not on the one above.
+            .core_call => |call| self.nodeListCallsAllocating(call.args) or
+                resolve_methods.stdVecConversionAllocates(self.g, self.view, node_id),
             .core_function => false,
             .external_variant => |variant| blk: {
                 if (self.nodeListCallsAllocating(variant.tuple_fields)) break :blk true;
@@ -683,14 +706,18 @@ fn markFunctionAllocating(
 
 fn propagateResolvedCallEffects(
     bodies_list: *std.ArrayListUnmanaged(bodies.BodyKind),
-    expr_table: []const exprs.Expr,
-    stmt_table: []const exprs.Statement,
+    view: *const bodies.Bodies,
     g: *const graph.CrateGraph,
 ) void {
+    // The caller's own body view, so the std-method question this scanner asks
+    // reads exactly the expression and type tables `resolveMethods` just read.
+    // Every write still goes through `bodies_list`; this only reads.
     const scanner: ResolvedCallEffectScanner = .{
-        .exprs = expr_table,
-        .stmts = stmt_table,
+        .exprs = view.exprs,
+        .stmts = view.stmts,
         .bodies = bodies_list.items,
+        .g = g,
+        .view = view,
     };
     var round: usize = 0;
     while (round < bodies_list.items.len) : (round += 1) {
@@ -869,18 +896,89 @@ fn analyzeSourceWithGraph(
         .mod_id = 0,
     };
 
-    var fn_ids: std.ArrayListUnmanaged(spine.EntityId) = .empty;
-    defer fn_ids.deinit(allocator);
-    for (g.symbol_table.entities.items) |ent| {
-        if (ent.kind == .fn_) try fn_ids.append(allocator, ent.id);
-    }
-
-    for (fn_ids.items) |fn_id| {
-        if (fn_id >= bodies_list.items.len) return error.FunctionBodyMissing;
-        const origin = fn_origins.get(fn_id) orelse return error.FunctionModuleSourceMissing;
+    // Step 4 walks every function body there is, in the order the graph
+    // registered them.
+    //
+    // The cursor is what makes one pass enough. Every function the FILE
+    // declared is registered before this loop starts, and a function that only
+    // comes into existence while a body is being lowered — a block-local helper
+    // — is registered during it, so it necessarily lands at a LATER index:
+    // `symbol_table.add` hands ids out in registration order and appends.
+    // Advancing a cursor therefore reaches the newly registered ones without a
+    // second sweep, and the array's length is re-read each step precisely
+    // because lowering a body can grow it.
+    //
+    // Nothing here is keyed on a name or on a counted offset: identity is the
+    // graph's own `EntityId` throughout, so a block-local helper that shadows
+    // a name in the enclosing scope keeps its own identity and the order a body
+    // happens to be discovered in never becomes part of it. Nothing here
+    // resolves a call either — the resolution pass runs over the whole tree
+    // once every body exists, which is what makes a call written before the
+    // helper it names resolve the same way a call written after it does.
+    var cursor: usize = 0;
+    while (true) {
+        const entities = g.symbol_table.entities.items;
+        if (cursor >= entities.len) break;
+        // Copied, not referenced: lowering a body below can reallocate the
+        // array this slice points into.
+        const ent = entities[cursor];
+        cursor += 1;
+        if (ent.kind != .fn_) continue;
+        // Whether this is a BLOCK-LOCAL helper — one declared inside another
+        // function's body — is answered by the parent, and by nothing else.
+        //
+        // Such a helper is lowered IN PLACE, under its own scope, while the body
+        // enclosing it is read, so it is finished before this cursor reaches its
+        // id; picking it would ask `extractFunction` to find a CST node by a
+        // name the source never wrote, since such a helper carries a
+        // collision-safe emitted identity rather than its own spelling.
+        //
+        // The parent kind enumerates every case without ambiguity: a module
+        // function is parented to a `.module`, an inherent or trait method to a
+        // `.struct_` / `.enum_` / `.union_` / `.impl_`, and a block-local helper to
+        // the `.fn_` that holds it — including a helper declared inside another
+        // helper, which is parented to the outer one. It is also the same test
+        // the backend applies when it hoosts these, so declaration, extraction
+        // and emission share ONE definition of "block-local helper" instead of
+        // three that could drift.
+        //
+        // No body-derived test is OR'd in beside it. A body id cannot tell a
+        // lowered helper from an unlowered module function: `fn outer() { fn
+        // noop() {} noop(); }` puts the helper's block at expr id 0, and a module
+        // function also sits at body 0 until this loop reaches it — so any
+        // sentinel keyed on the id either refuses the crate's very first helper
+        // or skips a module function that still owes a body, and neither reading
+        // of the number is about ownership at all.
+        if (ent.parent) |parent_id| {
+            if (g.symbol_table.get(parent_id)) |parent| {
+                if (parent.kind == .fn_) continue;
+                // A std owner SEEDED into the graph — `Cursor::new` and the
+                // rest of the prelude surfaces `ensureExternalModule` builds —
+                // lives under an EXTERN module and has its body row already
+                // written. No source declared it, so there is no origin to
+                // find and no source text to extract it from; asking for one
+                // would refuse every crate that touches a seeded std item. The
+                // extern module is the whole evidence, and it is asked of the
+                // module row itself rather than inferred from a name.
+                if (parent.kind == .module) {
+                    if (g.moduleForEntity(parent_id)) |module| {
+                        if (module.is_extern) continue;
+                    }
+                }
+            }
+        }
+        // Everything left is this loop's work and is lowered from its OWN
+        // source. The function extracted just before this one is no guide to
+        // this one's text: the module's own functions are all registered first,
+        // so whichever of them ran last can be a completely unrelated sibling —
+        // or a different `#[test]` altogether — and reading this body out of
+        // that source would silently lower it against the wrong file. A missing
+        // origin is therefore refused outright rather than guessed at.
+        if (ent.id >= bodies_list.items.len) return error.FunctionBodyMissing;
+        const origin = fn_origins.get(ent.id) orelse return error.FunctionModuleSourceMissing;
         ts_ctx.src = origin.source;
         ts_ctx.mod_id = origin.lexical_module;
-        const extracted = try ts_ext.extractFunction(&ts_ctx, fn_id);
+        const extracted = try ts_ext.extractFunction(&ts_ctx, ent.id);
         if (!extracted) return error.FunctionBodyMissing;
     }
     // Seed allocation effects from direct collection producers.
@@ -918,7 +1016,7 @@ fn analyzeSourceWithGraph(
     );
     b_temp.types = types_list.items;
     _ = try resolve_methods.resolveMethods(&g, &b_temp);
-    propagateResolvedCallEffects(&bodies_list, exprs_list.items, stmts_list.items, &g);
+    propagateResolvedCallEffects(&bodies_list, &b_temp, &g);
     instantiation_table = try monomorphize.collectInstantiations(allocator, &g, &b_temp);
     // Inference records are keyed by source expression. Copy their
     // concrete argument slices into the long-lived table before `solved`
@@ -3218,13 +3316,9 @@ test "analyzeCrate enables the manifest default feature closure" {
         \\gated = ["shared"]
         \\shared = []
         \\extra = ["shared"]
-    ,
+        ,
     );
-    try writeTestFile(
-        allocator,
-        io,
-        root,
-        "src/lib.rs",
+    try writeTestFile(allocator, io, root, "src/lib.rs",
         \\#[cfg(feature = "gated")]
         \\pub fn gated() -> u8 { 1 }
     );

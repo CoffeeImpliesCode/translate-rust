@@ -177,6 +177,96 @@ pub fn build(b: *std.Build) void {
     const generate_hex_golden_cmd = b.addRunArtifact(hex_golden_generator);
     generate_hex_golden_step.dependOn(&generate_hex_golden_cmd.step);
 
+    const mini_golden_generator = b.addExecutable(.{
+        .name = "generate-mini-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_mini_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_mini_golden_step = b.step(
+        "generate-mini-golden",
+        "Regenerate mini source goldens from validated canonical IR",
+    );
+    const generate_mini_golden_cmd = b.addRunArtifact(mini_golden_generator);
+    generate_mini_golden_step.dependOn(&generate_mini_golden_cmd.step);
+
+    const compat_golden_generator = b.addExecutable(.{
+        .name = "generate-compat-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_compat_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_compat_golden_step = b.step(
+        "generate-compat-golden",
+        "Regenerate compat source goldens from validated canonical IR",
+    );
+    const generate_compat_golden_cmd = b.addRunArtifact(compat_golden_generator);
+    generate_compat_golden_step.dependOn(&generate_compat_golden_cmd.step);
+
+    const wyhash_golden_generator = b.addExecutable(.{
+        .name = "generate-wyhash-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_wyhash_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_wyhash_golden_step = b.step(
+        "generate-wyhash-golden",
+        "Regenerate wyhash source goldens from validated canonical IR",
+    );
+    const generate_wyhash_golden_cmd = b.addRunArtifact(wyhash_golden_generator);
+    generate_wyhash_golden_step.dependOn(&generate_wyhash_golden_cmd.step);
+
+    const adler_golden_generator = b.addExecutable(.{
+        .name = "generate-adler-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_adler_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_adler_golden_step = b.step(
+        "generate-adler-golden",
+        "Regenerate adler source goldens from validated canonical IR",
+    );
+    const generate_adler_golden_cmd = b.addRunArtifact(adler_golden_generator);
+    generate_adler_golden_step.dependOn(&generate_adler_golden_cmd.step);
+
+    const multimod_golden_generator = b.addExecutable(.{
+        .name = "generate-multimod-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/generate_multimod_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "translate_rust", .module = translate_rust },
+            },
+        }),
+    });
+    const generate_multimod_golden_step = b.step(
+        "generate-multimod-golden",
+        "Regenerate multimod source goldens from validated canonical IR",
+    );
+    const generate_multimod_golden_cmd = b.addRunArtifact(multimod_golden_generator);
+    generate_multimod_golden_step.dependOn(&generate_multimod_golden_cmd.step);
+
     // `zig build source` translates the complete mini source fixture and
     // checks that staged promotion publishes the generated package.
     const source_step = b.step("source", "Translate the complete mini source fixture");
@@ -217,7 +307,7 @@ pub fn build(b: *std.Build) void {
 
     // Mini is a complete positive wire fixture. Every other corpus fixture
     // remains rejection-only under the strict IR contract.
-    const test_crates_step = b.step("test-crates", "Translate mini and reject legacy wire fixtures");
+    const test_crates_step = b.step("test-crates", "Translate mini, reject legacy wire and unsupported source fixtures");
     {
         // r2z-core runtime library (standalone package, part of the pipeline).
         const tc = b.addSystemCommand(&.{ "sh", "-c", "cd r2z-core && zig build test --summary all" });
@@ -255,8 +345,45 @@ pub fn build(b: *std.Build) void {
         reject.step.dependOn(b.getInstallStep());
         test_crates_step.dependOn(&reject.step);
     }
+    // Source crates the translator must still refuse. The wire loop above only
+    // proves "exits non-zero", which stays green when a fixture starts failing
+    // with a *different* error, so these entries assert the typed error by
+    // name: the CLI reports it as `translate-rust failed: <Error>`. Each crate
+    // is a capability gap, not a defect; pinning the error makes the gap
+    // explicit and turns an accidental change in which error a crate fails
+    // with into a build failure.
+    const rejected_source_specs = [_][3][]const u8{
+        .{ "test/crates/siphasher", "siphasher", "UnresolvedTypePath" },
+        .{ "test/crates/itoa", "itoa", "UnsupportedExpression" },
+        .{ "test/crates/atoi", "atoi", "UnsupportedType" },
+        .{ "test/crates/seahash", "seahash", "UnsupportedExpression" },
+    };
+    for (rejected_source_specs) |spec| {
+        const reject = b.addSystemCommand(&.{
+            "sh",
+            "-c",
+            b.fmt(
+                \\set -eu
+                \\out=zig-out/r2z-check/source-{s}
+                \\test ! -e $out
+                \\trap 'rm -rf $out' EXIT
+                \\if log=$(./zig-out/bin/translate-rust {s} -o $out 2>&1); then
+                \\  echo "expected source crate {s} to be rejected" >&2
+                \\  exit 1
+                \\fi
+                \\printf '%s\n' "$log" | grep -q "translate-rust failed: {s}" || {{
+                \\  echo "expected source crate {s} to fail with {s}, got:" >&2
+                \\  printf '%s\n' "$log" >&2
+                \\  exit 1
+                \\}}
+                \\test ! -e $out
+            , .{ spec[1], spec[0], spec[1], spec[2], spec[1], spec[2] }),
+        });
+        reject.step.dependOn(b.getInstallStep());
+        test_crates_step.dependOn(&reject.step);
+    }
 
-    // ── unit tests (one artifact per module, per house convention) ──
+    // ── unit tests (one artifact per module) ────────────────────────────
     const test_step = b.step("test", "Run unit tests");
 
     // ── dead-source guard ───────────────────────────────────────────────
@@ -265,7 +392,7 @@ pub fn build(b: *std.Build) void {
     // tests do not run, and its type errors stay invisible. The walk runs at
     // configure time; only `check-sources` (and therefore `test`) fails on
     // what it finds.
-    unreachable_sources = findUnreachableSources(b.graph.io, b.allocator) catch |err| {
+    unreachable_sources = findUnreachableSources(b.allocator, b.graph.io) catch |err| {
         std.log.err("check-sources: {s}", .{@errorName(err)});
         @panic("check-sources: reachability walk failed");
     };
@@ -311,10 +438,29 @@ pub fn build(b: *std.Build) void {
     const model_tests = b.addTest(.{ .root_module = model });
     test_step.dependOn(&b.addRunArtifact(model_tests).step);
 
+    // Focused steps reuse the very Compile and Run steps `test` already
+    // owns, so a focused run is one test binary executed, not a second
+    // copy of the test root.
     const frontend_tests = b.addTest(.{ .root_module = frontend });
-    test_step.dependOn(&b.addRunArtifact(frontend_tests).step);
+    // Select a backend explicitly for frontend test comparisons.
+    // It sets this compile's own `use_llvm`; left unset the field stays
+    // null and the toolchain keeps its own backend selection, so ordinary
+    // builds are byte-identical. Whether LLVM changes the outcome is not
+    // measured; the option only makes the comparison runnable.
+    if (b.option(bool, "frontend-llvm", "Compile the frontend unit tests with LLVM (true) or the self-hosted backend (false); unset keeps the toolchain default")) |use_llvm| {
+        frontend_tests.use_llvm = use_llvm;
+    }
+    const run_frontend_tests = b.addRunArtifact(frontend_tests);
+    test_step.dependOn(&run_frontend_tests.step);
+    const test_frontend_step = b.step("test-frontend", "Run the frontend unit tests only");
+    test_frontend_step.dependOn(&run_frontend_tests.step);
+
     const backend_tests = b.addTest(.{ .root_module = backend });
-    test_step.dependOn(&b.addRunArtifact(backend_tests).step);
+    const run_backend_tests = b.addRunArtifact(backend_tests);
+    test_step.dependOn(&run_backend_tests.step);
+    const test_backend_step = b.step("test-backend", "Run the backend unit tests only");
+    test_backend_step.dependOn(&run_backend_tests.step);
+
     const driver_tests = b.addTest(.{ .root_module = driver });
     test_step.dependOn(&b.addRunArtifact(driver_tests).step);
 
@@ -405,6 +551,11 @@ const source_roots = [_][]const u8{
     "test/generate_mini_wire.zig",
     "test/generate_fnv_golden.zig",
     "test/generate_hex_golden.zig",
+    "test/generate_mini_golden.zig",
+    "test/generate_compat_golden.zig",
+    "test/generate_wyhash_golden.zig",
+    "test/generate_adler_golden.zig",
+    "test/generate_multimod_golden.zig",
     "test/e2e_test.zig",
     "test/golden_test.zig",
 };
@@ -447,7 +598,8 @@ fn resolveImport(
 ) !?[]const u8 {
     if (std.mem.endsWith(u8, target, ".zig")) {
         const dir = std.fs.path.dirname(from) orelse ".";
-        return try std.fs.path.join(allocator, &.{ dir, target });
+        const joined = try std.fs.path.join(allocator, &.{ dir, target });
+        return joined;
     }
     for (module_roots) |module| {
         if (std.mem.eql(u8, module.name, target)) return module.path;
@@ -464,7 +616,7 @@ fn byPath(_: void, a: []const u8, b: []const u8) bool {
 }
 
 /// Every `src/**/*.zig` file no build root reaches through `@import`.
-fn findUnreachableSources(io: std.Io, gpa: std.mem.Allocator) ![][]const u8 {
+fn findUnreachableSources(gpa: std.mem.Allocator, io: std.Io) ![][]const u8 {
     var present: std.StringHashMapUnmanaged(void) = .empty;
     {
         var dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });

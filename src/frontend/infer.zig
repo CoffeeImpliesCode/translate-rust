@@ -1,7 +1,5 @@
 //! infer — constraint generation & unification solver for P3.
 //!
-//! See notes/design/source-model-type-inference.md §2.2 + §3.1 + §3.2.
-//!
 //! Stage 1 (Gen): Walks the losslessly-lowered untyped body graph of each `.fn_`
 //! body and:
 //! (a) PINS authoritative `Expr.ty` slots (type annotations on `let`, suffixed
@@ -507,6 +505,11 @@ const Ctx = struct {
     /// Return types expected by enclosing expression tails.  Abstract
     /// associated calls need this context before a concrete impl is selected.
     expected_types: std.AutoHashMapUnmanaged(exprs.NodeId, types.Type) = .empty,
+    /// Type an explicit `let name: T = ..` annotation pinned on an
+    /// initialiser. The pin table records it too, but that table also carries
+    /// every inferred constraint; a rule that asks "what did the source WRITE
+    /// here" asks this one.
+    annotated_inits: std.AutoHashMapUnmanaged(exprs.NodeId, exprs.TypeId) = .empty,
     current_fn: ?exprs.DefId = null,
     type_expression_depth: usize = 0,
     /// Innermost value-producing loop, for constraining `break value`.
@@ -575,6 +578,7 @@ const Ctx = struct {
         self.local_types.deinit(self.alloc);
         self.known_nodes.deinit(self.alloc);
         self.expected_types.deinit(self.alloc);
+        self.annotated_inits.deinit(self.alloc);
         self.def_map.deinit(self.alloc);
         self.* = undefined;
     }
@@ -838,6 +842,18 @@ pub fn materializeDerivedTypes(
             try type_list.append(alloc, derived);
         }
     }
+
+    // The Defaults Phase in `solveWithGen` resolves an unconstrained integer
+    // class through `primTypeId(b, .i32)`, and that lookup only SEARCHES
+    // `b.types` — it never interns. A crate whose source never names `i32`
+    // therefore has no TypeId to hand the class, the phase silently does
+    // nothing, and every unconstrained integer expression keeps `ty = null`.
+    // Interning here makes the default reachable for exactly the crates that
+    // can use it, and leaves a crate with no unannotated integer or float
+    // literal with the type table it had before.
+    try internDefaultClassType(alloc, type_list, &g.classes, .integer, .i32);
+    try internDefaultClassType(alloc, type_list, &g.classes, .float, .f64);
+
     for (g.derived_pins.items) |derived_pin| {
         const type_id = findTypeIndexInSlice(type_list.items, derived_pin.ty) orelse
             return error.MissingDerivedType;
@@ -852,6 +868,34 @@ pub fn materializeDerivedTypes(
         };
         patterns[pin.node].ty = type_id;
     }
+}
+
+/// Append `.{ .prim = prim }` to `type_list` when a literal of class `class`
+/// exists and the list does not already name that primitive.
+///
+/// Interning is conditional on the class map so that a crate with no
+/// unannotated literal of this class keeps the type table it had, rather than
+/// carrying a default it can never select.
+fn internDefaultClassType(
+    alloc: std.mem.Allocator,
+    type_list: *std.ArrayListUnmanaged(types.Type),
+    classes: *const std.AutoHashMapUnmanaged(exprs.NodeId, Class),
+    class: Class,
+    prim: types.Prim,
+) !void {
+    var needed = false;
+    var it = classes.iterator();
+    while (it.next()) |entry| {
+        const candidate = entry.value_ptr.*;
+        if (candidate == class) {
+            needed = true;
+            break;
+        }
+    }
+    if (!needed) return;
+    const target: types.Type = .{ .prim = prim };
+    if (findTypeIndexInSlice(type_list.items, target) != null) return;
+    try type_list.append(alloc, target);
 }
 
 /// Locate the TypeId of a slice with the given primitive element type.
@@ -1016,7 +1060,16 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
                 if (rhs_ty != .reference) {
                     try addEq(ctx, bin.rhs, node);
                 }
-            } else {
+            } else if (lhs_known == null or lhs_known.? != .reference) {
+                // Rust auto-derefs a reference lhs, so the result takes the
+                // pointee type and the lhs edge above was deliberately not
+                // emitted. Folding the unconstrained rhs INTO the result
+                // would then contradict that: the literal's own default
+                // (i32, now that `materializeDerivedTypes` interns it) would
+                // become the result's type, where a cast around the whole
+                // expression records the pointee. The same guard the shift
+                // arm below already applies is the one that keeps
+                // `&u8 - 1` a `u8` result.
                 try addEq(ctx, bin.rhs, node);
             }
         },
@@ -1027,14 +1080,10 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
         .gt,
         .ge,
         => {
-            // A comparison yields `bool`, so neither operand takes its type
-            // from the result: both sides of `==` must already agree, and Rust
-            // requires them to have the same type. Whichever side inference
-            // already typed is therefore the only available source for the
-            // other one, and an untyped side must receive it structurally —
-            // `addEq` alone reaches only the node itself, so an `Ok([..])`
-            // compared against a `Result` call would leave the array literal
-            // inside it without an element type.
+            // PartialEq/PartialOrd may compare different concrete types
+            // (Vec<u8> against [u8; N], String against &str). Preserve both
+            // known operand types. Only an untyped operand takes context from
+            // its peer, including payloads inside constructors such as Ok.
             if (getKnownType(ctx, bin.lhs)) |lhs_ty| {
                 if (getKnownType(ctx, bin.rhs) == null) {
                     try constrainExpectedType(ctx, bin.rhs, lhs_ty);
@@ -1042,7 +1091,10 @@ fn walkBinary(ctx: *Ctx, node: exprs.NodeId, bin: exprs.BinaryExpr, fn_body: exp
             } else if (getKnownType(ctx, bin.rhs)) |rhs_ty| {
                 try constrainExpectedType(ctx, bin.lhs, rhs_ty);
             }
-            try addEq(ctx, bin.lhs, bin.rhs);
+            // Scalar classes still share their integer/float constraints.
+            if (lhs_known == null or rhs_known == null or lhs_known.? == .prim or rhs_known.? == .prim) {
+                try addEq(ctx, bin.lhs, bin.rhs);
+            }
             try pinKnownType(ctx, node, .{ .prim = .bool });
         },
         .shl, .shr => {
@@ -1091,18 +1143,172 @@ fn walkIf(ctx: *Ctx, node: exprs.NodeId, ie: exprs.IfExpr, fn_body: exprs.NodeId
     if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
 }
 
+/// The enum a `match`'s PATTERNS say its scrutinee is, carrying no payload.
+///
+/// This is the one place a scrutinee's type can arrive before the scrutinee
+/// expression itself has one, and it is the other direction of
+/// `variantPayloadType` — that one reads a payload out of a type the rest of
+/// the pass already knows; this one asks what the patterns around the value say
+/// it is. A conversion written `.into()` names its target nowhere in its own
+/// spelling, so when the surrounding patterns are the only other statement
+/// about it, they are the evidence.
+///
+/// Every arm's patterns must agree on one owner, because a `match` whose arms
+/// name two different enums is matching on something other than the scrutinee's
+/// type and so proves nothing about it. A pattern that says nothing about an
+/// enum — a wildcard, a binding, a range — is no objection either way.
+fn patternOwnerNominal(ctx: *Ctx, m: exprs.MatchExpr) ?types.ExternalNominal {
+    var owner: ?types.ExternalNominal = null;
+    for (m.arms) |arm| {
+        for (arm.patterns) |pattern_id| {
+            if (pattern_id >= ctx.b.pats.len) continue;
+            const seen = switch (ctx.b.pats[pattern_id].kind) {
+                .external_variant => |value| value.owner,
+                else => continue,
+            };
+            if (owner) |known| {
+                if (!resolve_methods.externalPathIs(known.path, seen.path)) return null;
+                continue;
+            }
+            owner = seen;
+        }
+    }
+    return owner;
+}
+
+/// The target a `match`'s patterns and the crate's `From` impls jointly force a
+/// `.into()` scrutinee to have, or null when they do not.
+///
+/// The two halves each supply what the other lacks. The PATTERNS fix the owner
+/// — matching `Cow::Borrowed(..)` and `Cow::Owned(..)` says the scrutinee is a
+/// `Cow`, which is not something the expression says about itself. The crate's
+/// `impl` blocks then fix the payload: the one `impl From<PercentDecode<'a>>
+/// for Cow<'a, [u8]>` is the only way a `PercentDecode` becomes a `Cow`, and its
+/// own `self_ty` says which `B` that is. Neither half is a guess about the
+/// other, and `uniqueFromImplTargetForOwner` returns null when the crate offers
+/// more than one, which is exactly the case Rust would also call ambiguous.
+///
+/// Only the scrutinee's own type is derived. The arms' RESULT type is a
+/// separate question and is never applied here — in
+/// `match self.clone().into() { Cow::Borrowed(b) => .., Cow::Owned(b) => .. }`
+/// inside a `-> Result<Cow<str>, Utf8Error>` function, the scrutinee is a
+/// `Cow<[u8]>` while every arm is that `Result`, and handing the scrutinee the
+/// arm type would overwrite a real value with one it does not have.
+fn matchDirectedIntoTarget(ctx: *Ctx, m: exprs.MatchExpr) ?types.Type {
+    if (m.scrutinee >= ctx.b.exprs.len) return null;
+    // A scrutinee that already has a type is not this pass's question.
+    if (getKnownType(ctx, m.scrutinee) != null) return null;
+    const call = switch (ctx.b.exprs[m.scrutinee].kind) {
+        .method_call => |value| value,
+        else => return null,
+    };
+    const name = getMethodName(ctx, call.method) orelse return null;
+    if (!std.mem.eql(u8, name, "into")) return null;
+    const owner = patternOwnerNominal(ctx, m) orelse return null;
+    const source = getKnownType(ctx, call.receiver) orelse return null;
+    const cg = ctx.cg orelse return null;
+    return resolve_methods.uniqueFromImplTargetForOwner(cg, ctx.b, source, owner.path);
+}
+
 /// Walk a `match` expression: unify the body expressions of all arms with match node.
 fn walkMatch(ctx: *Ctx, node: exprs.NodeId, m: exprs.MatchExpr, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
     std.debug.assert(node < ctx.b.exprs.len);
     std.debug.assert(m.scrutinee < ctx.b.exprs.len);
+    // A `match` is judged by the type every arm produces, so a position that
+    // demands a type of the match demands one of each arm too. Rust propagates
+    // the expectation inward exactly this way, and it is the only way an
+    // `.into()` written inside an arm learns what it is converting into: the
+    // arm body is not the enclosing block's tail, so nothing else names a
+    // target for it.
+    //
+    // The scrutinee is NOT one of them, and deliberately so. It is the value
+    // BEING matched, not one of the values the match PRODUCES — in
+    // `match self.into() { Cow::Borrowed(b) => .., Cow::Owned(b) => .. }` it
+    // is a `Cow<[u8]>` while every arm is a `Result<Cow<str>, Utf8Error>` —
+    // so handing it the arms' type would overwrite a real value with a type it
+    // does not have. What DOES fix the scrutinee is the patterns it is matched
+    // against, and for a `.into()` scrutinee that is a real derivation rather
+    // than a guess: the patterns name the OWNER, and the crate's `From` impls
+    // fix the payload. See `matchDirectedIntoTarget`.
+    const expected = contextualTypeAt(ctx, node, fn_body);
+    if (expected) |expected_ty| {
+        try ctx.expected_types.put(ctx.alloc, node, expected_ty);
+    }
     try walkExpr(ctx, m.scrutinee, fn_body);
+    // After the walk, not before: `self.clone()` has no type until something
+    // descends into it, and that clone is the conversion's SOURCE. Constraining
+    // afterwards also needs no second walk — `constrainExpectedType` pins the
+    // node directly, which is exactly what the walk would have done had it
+    // known the target when it got there.
+    if (matchDirectedIntoTarget(ctx, m)) |scrutinee_target| {
+        try constrainExpectedType(ctx, m.scrutinee, scrutinee_target);
+    }
     const scrutinee_ty = getKnownType(ctx, m.scrutinee);
     for (m.arms) |arm| {
         for (arm.patterns) |pattern| try bindMatchPatternKnownType(ctx, pattern, scrutinee_ty);
         if (arm.guard) |guard| try walkExpr(ctx, guard, fn_body);
         try addEq(ctx, node, arm.body);
+        if (expected) |expected_ty| try constrainExpectedType(ctx, arm.body, expected_ty);
         try walkExpr(ctx, arm.body, fn_body);
     }
+}
+
+/// The `Option<T>` a prelude `Some` CONSTRUCTOR builds.
+///
+/// The synthetic `core::option::Option` declares its `Some` field with its own
+/// uninstantiated parameter, so an arm that matches a constructor in place
+/// would otherwise bind `value` to that bare `T` — a name nothing in the
+/// function's scope declares, which every row that then carries it turns into
+/// an unresolved type path. The constructor says what it built: `Some(x)` is
+/// an `Option` whose payload is `x`, so read the payload there.
+///
+/// Only `Option` is read this way. `Ok(x)` and `Err(e)` each name one of two
+/// parameters and say nothing about the other, so a `Result` constructor
+/// leaves the pair half-determined and the declaration is no better a source
+/// — those scrutinees arrive from a call whose own return type already names
+/// both. The payload is pinned on the field node too, so the value the
+/// constructor carries has the identity the arm binding now reports.
+///
+/// The result is recorded ON THE CONSTRUCTOR NODE, not only handed to a match:
+/// anything that reads the node — a binding that takes it, a backend choosing
+/// a representation for it — reads the node, and a type derived only for a
+/// match pattern never reaches it.
+fn preludeVariantType(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+) std.mem.Allocator.Error!?types.Type {
+    if (node >= ctx.b.exprs.len) return null;
+    const variant = switch (ctx.b.exprs[node].kind) {
+        .enum_variant => |value| value,
+        else => return null,
+    };
+    const cg = ctx.cg orelse return null;
+    const owner = cg.symbol_table.get(variant.def) orelse return null;
+    const enum_id = if (owner.kind == .variant) owner.parent orelse return null else owner.id;
+    const enum_entity = cg.symbol_table.get(enum_id) orelse return null;
+    if (enum_entity.kind != .enum_) return null;
+    const module_id = enum_entity.parent orelse return null;
+    const module = cg.symbol_table.get(module_id) orelse return null;
+    if (module.kind != .module) return null;
+    const root_id = module.parent orelse return null;
+    const root = cg.symbol_table.get(root_id) orelse return null;
+    if (root.kind != .module) return null;
+    if (!std.mem.eql(u8, enum_entity.name, "Option") or
+        !std.mem.eql(u8, module.name, "option") or
+        !std.mem.eql(u8, root.name, "core"))
+    {
+        return null;
+    }
+    if (variant.tuple_fields.len != 1) return null;
+    const payload = getKnownType(ctx, variant.tuple_fields[0]) orelse return null;
+    try pinKnownType(ctx, variant.tuple_fields[0], payload);
+    const option = makeExternalNominalType(
+        ctx,
+        &.{ "core", "option", "Option" },
+        &.{payload},
+    ) orelse return null;
+    try pinKnownType(ctx, node, option);
+    return option;
 }
 
 /// Claim local entities in a pattern in lowering order. `let` bindings map
@@ -1201,7 +1407,7 @@ fn bindExternalVariantPattern(
     for (pattern.fields) |field| {
         const field_ty = externalVariantFieldType(ctx, pattern, known_ty, field.field);
         if (field.pat) |field_pattern| {
-            try bindPattern(ctx, field_pattern, init, field_ty);
+            _ = try bindPattern(ctx, field_pattern, init, field_ty);
         } else if (field.shorthand) {
             if (ctx.claimLocal(field.field)) |def| {
                 if (init) |init_node| try ctx.def_map.put(ctx.alloc, def, init_node);
@@ -1216,8 +1422,8 @@ fn bindPattern(
     pattern_id: exprs.NodeId,
     init: ?exprs.NodeId,
     known_ty: ?types.Type,
-) std.mem.Allocator.Error!void {
-    if (pattern_id >= ctx.b.pats.len) return;
+) std.mem.Allocator.Error!?exprs.DefId {
+    if (pattern_id >= ctx.b.pats.len) return null;
     const pattern_type: ?types.Type = if (known_ty) |ty| switch (ctx.b.pats[pattern_id].kind) {
         .binding => |binding| if (binding.mode == .value)
             ty
@@ -1238,6 +1444,7 @@ fn bindPattern(
                 if (init) |init_node| try ctx.def_map.put(ctx.alloc, def, init_node);
                 if (pattern_type) |ty| try ctx.local_types.put(ctx.alloc, def, ty);
             }
+            return def_id;
         },
         .tuple => |tuple| {
             for (tuple.elements, 0..) |element, index| {
@@ -1247,8 +1454,9 @@ fn bindPattern(
                 } else null;
                 // A destructured binding owns its tuple element type; it must
                 // not be equated with the whole tuple initializer.
-                try bindPattern(ctx, element, null, element_ty);
+                _ = try bindPattern(ctx, element, null, element_ty);
             }
+            return null;
         },
         .slice => |slice| {
             const element_ty: ?types.Type = if (known_ty) |ty| switch (ty) {
@@ -1261,11 +1469,28 @@ fn bindPattern(
                 },
                 else => null,
             } else null;
-            for (slice.elements) |element| try bindPattern(ctx, element, init, element_ty);
-            if (slice.rest) |rest| try bindPattern(ctx, rest, init, known_ty);
+            for (slice.elements) |element| _ = try bindPattern(ctx, element, init, element_ty);
+            if (slice.rest) |rest| _ = try bindPattern(ctx, rest, init, known_ty);
+            return null;
         },
         .struct_pat => |struct_pat| {
             const payload_ty = variantPayloadType(ctx, .{ .struct_pat = struct_pat }, known_ty);
+            // A nested local variant reads its own declared fields, not fields
+            // on the enum value passed down by the enclosing Result pattern.
+            if (ctx.cg) |cg| {
+                if (cg.symbol_table.get(struct_pat.def)) |variant| {
+                    if (variant.kind == .variant and payload_ty == null) {
+                        if (variant.parent) |parent| {
+                            if (parent < ctx.b.bodies.len and ctx.b.bodies[parent] == .enum_ and
+                                ctx.b.bodies[parent].enum_.generic_params.len == 0)
+                            {
+                                try bindMatchPattern(ctx, pattern_id);
+                                return null;
+                            }
+                        }
+                    }
+                }
+            }
             for (struct_pat.fields) |field| {
                 const field_ty = if (payload_ty != null and field.field.len > 0 and
                     std.mem.eql(u8, field.field, "0"))
@@ -1275,7 +1500,7 @@ fn bindPattern(
                 else
                     null;
                 if (field.pat) |field_pattern| {
-                    try bindPattern(ctx, field_pattern, init, field_ty);
+                    _ = try bindPattern(ctx, field_pattern, init, field_ty);
                 } else if (field.shorthand) {
                     const def_id = ctx.claimLocal(field.field);
                     if (init) |init_node| {
@@ -1288,21 +1513,25 @@ fn bindPattern(
                     }
                 }
             }
+            return null;
         },
         .external_variant => |external_variant| {
             try bindExternalVariantPattern(ctx, external_variant, init, known_ty);
+            return null;
         },
         .reference => |reference| {
             const inner_ty = if (known_ty) |ty| dereferencedType(ty) orelse ty else null;
-            try bindPattern(ctx, reference.inner, init, inner_ty);
+            _ = try bindPattern(ctx, reference.inner, init, inner_ty);
+            return null;
         },
         .@"or" => |or_pattern| {
             for (or_pattern.alternatives) |alternative| {
-                try bindPattern(ctx, alternative, init, known_ty);
+                _ = try bindPattern(ctx, alternative, init, known_ty);
             }
+            return null;
         },
-        .unsupported => {},
-        .wildcard, .literal, .path, .range => {},
+        .unsupported => return null,
+        .wildcard, .literal, .path, .range => return null,
     }
 }
 
@@ -1372,10 +1601,8 @@ fn bindMatchPattern(ctx: *Ctx, pattern_id: exprs.NodeId) std.mem.Allocator.Error
 fn bindMatchPatternType(ctx: *Ctx, pattern_id: exprs.NodeId, ty: ?types.Type) std.mem.Allocator.Error!void {
     if (pattern_id >= ctx.b.pats.len) return;
     switch (ctx.b.pats[pattern_id].kind) {
-        .binding => |binding| {
-            if (ctx.claimLocal(binding.name)) |def| {
-                if (ty) |known| try ctx.local_types.put(ctx.alloc, def, known);
-            }
+        .binding => {
+            _ = try bindPattern(ctx, pattern_id, null, ty);
         },
         .external_variant => |external_variant| {
             try bindExternalVariantPattern(ctx, external_variant, null, ty);
@@ -1392,11 +1619,11 @@ fn bindMatchPatternKnownType(
     if (pattern_id >= ctx.b.pats.len) return;
     switch (ctx.b.pats[pattern_id].kind) {
         .binding, .tuple, .slice, .reference, .@"or", .external_variant => {
-            try bindPattern(ctx, pattern_id, null, known_ty);
+            _ = try bindPattern(ctx, pattern_id, null, known_ty);
         },
         .struct_pat => {
             if (variantPayloadType(ctx, ctx.b.pats[pattern_id].kind, known_ty) != null) {
-                try bindPattern(ctx, pattern_id, null, known_ty);
+                _ = try bindPattern(ctx, pattern_id, null, known_ty);
             } else {
                 try bindMatchPattern(ctx, pattern_id);
             }
@@ -1412,18 +1639,21 @@ fn walkStmt(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
     switch (s.kind) {
         .let => |ls| {
             if (ls.init) |init| {
-                if (ls.ty) |ty| try addPin(ctx, init, ty);
+                if (ls.ty) |ty| {
+                    try ctx.annotated_inits.put(ctx.alloc, init, ty);
+                    try addPin(ctx, init, ty);
+                }
                 try walkExpr(ctx, init, fn_body);
                 const known_ty = annotatedOrKnownType(ctx, ls.ty, init);
-                try bindPattern(ctx, ls.pattern, init, known_ty);
+                _ = try bindPattern(ctx, ls.pattern, init, known_ty);
             } else {
-                try bindPattern(ctx, ls.pattern, null, null);
+                _ = try bindPattern(ctx, ls.pattern, null, null);
             }
         },
         .let_else => |le| {
             try walkExpr(ctx, le.init, fn_body);
             const known_ty = annotatedOrKnownType(ctx, null, le.init);
-            try bindPattern(ctx, le.pattern, le.init, known_ty);
+            _ = try bindPattern(ctx, le.pattern, le.init, known_ty);
             try walkBlock(ctx, le.else_block, fn_body, null);
         },
         .expr => |n| try walkExpr(ctx, n, fn_body),
@@ -1447,6 +1677,23 @@ fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?
     for (blk.statements) |s| try walkStmt(ctx, s, fn_body);
     if (blk.tail) |t| {
         if (blk_node) |bn| try addEq(ctx, bn, t);
+        // A block's value IS its tail's value, so whatever an enclosing position
+        // demands of the BLOCK it demands of the tail too. This is what carries
+        // a `Result` down through a `match` arm that is itself a nested `match`
+        // and on into the `Ok(..)`/`Err(..)` the inner one selects: the demand
+        // is stated once, at the outer position, and Rust propagates it the
+        // whole way in. Without it the inner match is asked for a type nothing
+        // around it supplies, and an `.into()` in one of ITS arms has no target
+        // at all.
+        //
+        // Recorded rather than constrained, because the tail has not been walked
+        // yet and a conversion in it asks `contextualTypeAt` for what its
+        // position demands while it is being walked.
+        if (blk_node) |bn| {
+            if (getKnownType(ctx, bn)) |demanded| {
+                try ctx.expected_types.put(ctx.alloc, t, demanded);
+            }
+        }
         try walkExpr(ctx, t, fn_body);
         // The function body's own tail yields the declared return type, so pin
         // it the same way a `return` statement is pinned. Nested blocks yield
@@ -1468,7 +1715,7 @@ fn walkClosureTyped(
     param_ty: ?types.Type,
 ) std.mem.Allocator.Error!void {
     for (closure.params, 0..) |param, index| {
-        try bindPattern(ctx, param, null, if (index == 0) param_ty else null);
+        _ = try bindPattern(ctx, param, null, if (index == 0) param_ty else null);
     }
     try walkBlock(ctx, closure.body, fn_body, null);
 }
@@ -1715,6 +1962,12 @@ fn isIntegerType(ty: types.Type) bool {
 }
 
 fn isLenReceiverType(ty: types.Type) bool {
+    // `str::len` counts the bytes of borrowed text, so a `&str` is a length
+    // receiver exactly as the `&[u8]` it used to be read as was. It reaches the
+    // nominal arm on its own now that it is a `reference` to the `str`
+    // PRIMITIVE rather than a `[]const u8`, and that arm names the owners and
+    // the iterators, none of which `str` is.
+    if (types.isStr(ty)) return true;
     return switch (ty) {
         .slice, .array => true,
         .reference => |reference| isLenReceiverType(reference.pointee),
@@ -1748,6 +2001,51 @@ fn isLenReceiverType(ty: types.Type) bool {
         else => false,
     };
 }
+
+/// What `base[index]` yields: one ELEMENT for a plain index, a RUN of them for
+/// a range — which is a sequence again, not an element.
+///
+/// `initial_bytes[..unchanged_bytes_len].to_owned()` is the shape that makes
+/// this load-bearing. Typed as its element, the index is a `u8`, and a `u8` has
+/// no `to_owned` that produces a `Vec`, so the conversion is unreachable and
+/// the whole chain behind it falls over for a reason that has nothing to do
+/// with ownership.
+///
+/// EVERY range kind yields a slice, over an array exactly as over a slice.
+/// `[T; N][..]` is not the whole array handed back: indexing an array delegates
+/// to `<[T]>`, and `<[T] as Index<RangeFull>>::Output` is `[T]` — unsized. So
+/// `bytes[..].to_owned()` is a `Vec<u8>` while `bytes.to_owned()` is a
+/// `[u8; N]`, and the difference between those two is the difference between
+/// this branch and the plain-index branch above, NOT something to be decided
+/// here. An array keeps its storage when a CONSTRUCTION demands an array — an
+/// array literal adapted to a demanded slice — which is a different mechanism
+/// with a different answer, and not `Index<RangeFull>::Output`.
+fn indexedResultType(ctx: *Ctx, base_type: types.Type, index_node: exprs.NodeId) ?types.Type {
+    const is_range = index_node < ctx.b.exprs.len and
+        ctx.b.exprs[index_node].kind == .range;
+    if (!is_range) return indexedElementType(base_type);
+
+    var base = base_type;
+    for (0..128) |_| {
+        switch (base) {
+            .reference => |reference| base = reference.pointee,
+            .boxed => |boxed| base = boxed.*,
+            else => break,
+        }
+    }
+    switch (base) {
+        // `makeSliceType` takes MUTABILITY, and a slice already carries the
+        // opposite sense, so the base's `const_` has to be flipped rather than
+        // passed straight through — reading `[]const T` as mutable would hand
+        // back `[]T` and lose the borrow the range preserves.
+        .slice => |slice| return makeSliceType(ctx, slice.elem, !slice.const_),
+        else => {
+            const element = indexedElementType(base) orelse return null;
+            return makeSliceType(ctx, element, false);
+        },
+    }
+}
+
 fn indexedElementType(ty: types.Type) ?types.Type {
     return switch (ty) {
         .array => |array| array.elem,
@@ -1851,6 +2149,64 @@ fn scalarOperandType(ty: types.Type) ?types.Type {
     };
 }
 
+/// The type a local `type` alias stands for, or null when the path names no
+/// alias body this pass can read. The terminal segment carries the EntityId
+/// the path resolved to and a `type_alias` body names its own target, so a
+/// chain of aliases resolves the same way the CST layer resolves a single one.
+fn aliasTargetType(ctx: *Ctx, path: types.Path) ?types.Type {
+    if (path.segments.len == 0) return null;
+    const alias_id = path.segments[path.segments.len - 1].id orelse return null;
+    if (alias_id >= ctx.b.bodies.len) return null;
+    if (ctx.cg) |cg| {
+        const entity = cg.symbol_table.get(alias_id) orelse return null;
+        if (entity.kind != .type_alias) return null;
+    }
+    return switch (ctx.b.bodies[alias_id]) {
+        .type_alias => |alias| alias.target,
+        else => null,
+    };
+}
+
+/// The primitive a type names, or null when it names none. A `.path` is a
+/// local `type` alias and stands for the very value its alias body names, so
+/// `type Chunk = u32;` has to answer for `u32`: the CST layer records the
+/// alias path as the declared type wherever the alias is spelled, and an
+/// answer that stopped at the name would leave `u32` arithmetic written
+/// through that name looking like arithmetic on no primitive at all. The hop
+/// bound matches the method resolver's scalar check, so a chain that loops
+/// ends the same way in both.
+fn aliasResolvedPrim(ctx: *Ctx, ty: types.Type) ?types.Prim {
+    var current = ty;
+    var hops: usize = 0;
+    while (hops < 128) : (hops += 1) {
+        switch (current) {
+            .path => current = aliasTargetType(ctx, current.path) orelse return null,
+            .@"opaque" => |opaque_type| {
+                current = (opaque_type.concrete orelse return null).*;
+            },
+            .prim => |primitive| return primitive,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// Whether `op` over a value of `prim` yields that same primitive. `!` is
+/// defined for `bool` and for every integer, `~` for every integer, and `-`
+/// for integers and floats; none of them changes the type of what it read,
+/// which is the whole reason a position stating what one of them IS is also
+/// stating what its operand is. `&` and `*` are absent — a borrow and a deref
+/// each produce a different type, or none this pass can name.
+fn unaryPreservesPrim(op: exprs.UnaryOp, prim: types.Prim) bool {
+    const integer = isIntegerType(.{ .prim = prim });
+    return switch (op) {
+        .negate => integer or prim == .f32 or prim == .f64,
+        .bit_not => integer,
+        .logical_not => integer or prim == .bool,
+        .ref, .deref => false,
+    };
+}
+
 fn dereferencedType(ty: types.Type) ?types.Type {
     return switch (ty) {
         .reference => |reference| reference.pointee,
@@ -1927,14 +2283,48 @@ fn unwrapTryType(ty: types.Type) ?types.Type {
     if (optionPayloadType(ty)) |payload| return payload;
     return resultPayloadType(ty, false);
 }
+
+/// The arm a `Result`/`Option` method hands back: the same arm whether the
+/// method panics with a message or not.
+///
+/// `expect` is `unwrap` with a message argument and `expect_err` is `unwrap_err`
+/// with one, and each returns exactly the arm its unwrapping twin does — the
+/// message decides nothing about the type. `resolve_methods` already dispatches
+/// the pair that way (`result_expect` takes the `Ok` arm, `result_expect_err`
+/// the `Err` arm, admitted on every `Result`), so answering the same question
+/// here is what keeps the frontend's type and the resolver's dispatch from
+/// disagreeing about which arm a call names.
+///
+/// A receiver that is not a `Result` or an `Option` answers nothing for any of
+/// the four, so a crate's own `expect` on some other type is left alone exactly
+/// as its own `unwrap` is today.
+fn knownTryArmMethodType(receiver_ty: types.Type, method_name: []const u8) ?types.Type {
+    if (std.mem.eql(u8, method_name, "unwrap")) return unwrapTryType(receiver_ty);
+    if (std.mem.eql(u8, method_name, "expect")) return unwrapTryType(receiver_ty);
+    if (std.mem.eql(u8, method_name, "unwrap_err")) return resultPayloadType(receiver_ty, true);
+    if (std.mem.eql(u8, method_name, "expect_err")) return resultPayloadType(receiver_ty, true);
+    return null;
+}
+
 fn makeRawPtrType(ctx: *Ctx, elem: types.Type, mutable: bool) ?types.Type {
     const pointer = ctx.alloc.create(types.RawPtr) catch return null;
     pointer.* = .{ .mut = mutable, .pointee = elem };
     return .{ .raw_ptr = pointer };
 }
 
+/// `&T`, for any pointee — and `str` is a pointee like any other.
+///
+/// Rust's unsized `str` is NOT `[]const u8`. It is the primitive a borrow of
+/// text points at, and `&str` is the reference to it. `impl ToOwned for str {
+/// type Owned = String }` and `impl ToOwned for [T] { type Owned = Vec<T> }`
+/// are therefore different traits for different pointees, and only the
+/// spelling of the borrow says which one a call reaches. Collapsing `str` into
+/// a byte slice here erased exactly that distinction, so the whole IR held one
+/// shape for both borrowed text and borrowed bytes.
+///
+/// The backend lowers a `reference` to a `str` pointee to the same Zig
+/// `[]const u8`, so the ABI is unchanged; the two stay separate types here.
 fn makeReferenceType(ctx: *Ctx, elem: types.Type, mutable: bool) ?types.Type {
-    if (types.isStr(elem)) return makeSliceType(ctx, .{ .prim = .u8 }, mutable);
     const reference = ctx.alloc.create(types.Ref) catch return null;
     reference.* = .{ .mut = mutable, .pointee = elem };
     return .{ .reference = reference };
@@ -2066,7 +2456,7 @@ fn makeSliceType(ctx: *Ctx, elem: types.Type, mutable: bool) ?types.Type {
 /// differ only in the carrier they name — both yield `&[T]` — so one matcher
 /// serves both. The root stays `core`: `std::slice` is a re-export of the
 /// same type, and inference only ever names the `core` path.
-fn sliceChunkedElement(ty: types.Type, comptime name: []const u8) ?types.Type {
+fn sliceChunkedElement(comptime name: []const u8, ty: types.Type) ?types.Type {
     return switch (ty) {
         .external_nominal => |external| blk: {
             if (external.path.len != 3 or external.args.len != 1) break :blk null;
@@ -2082,7 +2472,7 @@ fn sliceChunkedElement(ty: types.Type, comptime name: []const u8) ?types.Type {
     };
 }
 
-fn sliceChunkedType(ctx: *Ctx, elem: types.Type, comptime name: []const u8) ?types.Type {
+fn sliceChunkedType(comptime name: []const u8, ctx: *Ctx, elem: types.Type) ?types.Type {
     const args = ctx.alloc.alloc(types.Type, 1) catch return null;
     args[0] = elem;
     return .{ .external_nominal = .{
@@ -2092,21 +2482,21 @@ fn sliceChunkedType(ctx: *Ctx, elem: types.Type, comptime name: []const u8) ?typ
 }
 
 fn chunksExactElement(ty: types.Type) ?types.Type {
-    return sliceChunkedElement(ty, "ChunksExact");
+    return sliceChunkedElement("ChunksExact", ty);
 }
 
 fn chunksExactType(ctx: *Ctx, elem: types.Type) ?types.Type {
-    return sliceChunkedType(ctx, elem, "ChunksExact");
+    return sliceChunkedType("ChunksExact", ctx, elem);
 }
 
 /// `Chunks<T>` is the carrier `chunks(n)` returns. Unlike `ChunksExact`, it has
 /// no remainder, so nothing narrows its element.
 fn chunksElement(ty: types.Type) ?types.Type {
-    return sliceChunkedElement(ty, "Chunks");
+    return sliceChunkedElement("Chunks", ty);
 }
 
 fn chunksType(ctx: *Ctx, elem: types.Type) ?types.Type {
-    return sliceChunkedType(ctx, elem, "Chunks");
+    return sliceChunkedType("Chunks", ctx, elem);
 }
 fn makeOptionType(ctx: *Ctx, inner: types.Type) ?types.Type {
     const ptr = ctx.alloc.create(types.Type) catch return null;
@@ -2147,6 +2537,30 @@ fn makeExternalNominalType(
     return .{ .external_nominal = .{ .path = owned_path, .args = owned_args } };
 }
 
+/// What `slice::split_first` hands back: `Option<(&T, &[T])>`, the first
+/// element and the rest of the slice, both borrowed from the receiver.
+///
+/// Both borrows are SHARED whatever the receiver is. The method takes `&self`,
+/// so it hands out a shared element even when it is reached through a `&mut`
+/// slice; `split_first_mut` is a different method with a different signature,
+/// and reading this one as mutable would invent an exclusivity the source
+/// never asked for. The rest keeps the receiver's own slice type, so a
+/// `&mut [T]` receiver still yields a `&[T]` here — exactly what the runtime
+/// helper's `?struct { *const Elem, []const Elem }` can represent.
+fn splitFirstType(ctx: *Ctx, receiver_ty: types.Type) ?types.Type {
+    const element = sliceElementForMethod(receiver_ty) orelse return null;
+    const first = makeReferenceType(ctx, element, false) orelse return null;
+    const rest = makeSliceType(ctx, element, false) orelse return null;
+    const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
+    tuple[0] = first;
+    tuple[1] = rest;
+    return makeExternalNominalType(
+        ctx,
+        &.{ "core", "option", "Option" },
+        &.{.{ .tuple = tuple }},
+    );
+}
+
 fn externalNominalBase(ty: types.Type) ?types.ExternalNominal {
     var base = ty;
     while (true) {
@@ -2174,6 +2588,22 @@ fn knownAllocMethodType(
     receiver_ty: types.Type,
     method_name: []const u8,
 ) ?types.Type {
+    // `x.clone()` has the type of `x` for every `T: Clone`, and that is the
+    // WHOLE of `Clone` — the trait says the result is `Self`, so there is no
+    // receiver-specific rule to consult and none should be invented. One rule
+    // here is also what lets a chain like `self.clone().into()` carry a source
+    // type for its conversion: the `.into()` reads the type of what precedes
+    // it, and without this the clone is where the chain stops.
+    //
+    // A reference or a box is excluded because `x.clone()` on `x: &T` resolves
+    // to `T::clone`, which yields a `T` — not the reference. Those receivers
+    // fall through to the rules below rather than claiming the wrong type.
+    if (std.mem.eql(u8, method_name, "clone")) {
+        switch (receiver_ty) {
+            .reference, .boxed, .@"opaque" => {},
+            else => return receiver_ty,
+        }
+    }
     const external = externalNominalBase(receiver_ty);
     if (external) |value| {
         const is_vec = value.path.len == 3 and
@@ -2223,11 +2653,18 @@ fn knownAllocMethodType(
             }
         }
         if (is_string) {
-            if (std.mem.eql(u8, method_name, "as_ref") or
-                std.mem.eql(u8, method_name, "as_bytes") or
-                std.mem.eql(u8, method_name, "as_str"))
+            // `String::as_bytes(&self) -> &[u8]` names the OWNED bytes, and
+            // `String::as_str(&self) -> &str` names them as text. The second
+            // is not the first written another way: `&[u8]` and `&str` are
+            // different borrows of different pointees, and only the second one
+            // can answer `.to_owned()` with a `String`.
+            if (std.mem.eql(u8, method_name, "as_bytes") or
+                std.mem.eql(u8, method_name, "as_ref"))
             {
                 return makeSliceType(ctx, .{ .prim = .u8 }, false);
+            }
+            if (std.mem.eql(u8, method_name, "as_str")) {
+                return makeReferenceType(ctx, types.str_type, false);
             }
             if (std.mem.eql(u8, method_name, "into_bytes")) {
                 return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{.{ .prim = .u8 }});
@@ -2239,6 +2676,11 @@ fn knownAllocMethodType(
             }
             if (std.mem.eql(u8, method_name, "push") or
                 std.mem.eql(u8, method_name, "push_str") or
+                // `String::extend` is `Extend<A> for String`, and every `A`
+                // it is implemented for yields items the string appends — so
+                // the result is `()` whatever the iterator produces, and the
+                // backend reads the iterator off the argument, not the return.
+                std.mem.eql(u8, method_name, "extend") or
                 std.mem.eql(u8, method_name, "clear") or
                 std.mem.eql(u8, method_name, "reserve") or
                 std.mem.eql(u8, method_name, "truncate"))
@@ -2257,9 +2699,29 @@ fn knownAllocMethodType(
                     else => payload,
                 };
             }
-            if (std.mem.eql(u8, method_name, "into_owned") or
-                std.mem.eql(u8, method_name, "to_owned"))
-            {
+            // `Cow::as_bytes` reads whichever representation the value holds,
+            // so it hands back a borrow either way: `Cow<str>` reaches the
+            // runtime's `[]const u8`, and `Cow<[T]>` reaches `[]const T`. It
+            // is not the borrow `as_ref` gives — that one answers with the
+            // payload itself, and for `Cow<str>` that is a `&str` rather than
+            // the raw bytes it is made of.
+            if (std.mem.eql(u8, method_name, "as_bytes")) {
+                if (types.isStr(payload)) return makeSliceType(ctx, .{ .prim = .u8 }, false);
+                return switch (payload) {
+                    .slice => |slice| makeSliceType(ctx, slice.elem, false),
+                    else => payload,
+                };
+            }
+            // `into_owned` is the consuming half: it moves and hands back
+            // `B::Owned`. `to_owned` is NOT that operation — a `Cow` is `Clone`,
+            // so the blanket `impl<T: Clone> ToOwned for T { type Owned = T }`
+            // applies to it and the result is a `Cow` of the SAME payload, read
+            // through `&self`. Typing `to_owned` as the owned payload would
+            // make a call that only borrows consume its receiver.
+            // `value` is the Cow's own nominal, so handing it back is handing
+            // back the same `Cow<B>` — which is what a clone of one is.
+            if (std.mem.eql(u8, method_name, "to_owned")) return .{ .external_nominal = value };
+            if (std.mem.eql(u8, method_name, "into_owned")) {
                 if (types.isStr(payload)) {
                     return makeExternalNominalType(
                         ctx,
@@ -2277,13 +2739,58 @@ fn knownAllocMethodType(
                 };
             }
         }
+
+        // `str` is the unsized primitive, so it names no owner of its own and
+        // `impl ToOwned for str { type Owned = String }` is the operation that
+        // makes one: a copy of the borrowed bytes into a fresh `String`. It is
+        // deliberately NOT the slice rule below, and now it does not even
+        // reach it: a `&str` receiver peels to the `str` PRIMITIVE here, while
+        // a `&[u8]` receiver peels to a slice and is answered by the `Vec<u8>`
+        // that `impl ToOwned for [T]` names. The two spellings are different
+        // Rust borrows and they own differently.
+        if (types.isStr(.{ .external_nominal = value })) {
+            if (std.mem.eql(u8, method_name, "to_owned")) {
+                return makeExternalNominalType(ctx, &.{ "alloc", "string", "String" }, &.{});
+            }
+        }
+        // `String::from_utf8` hands back a `FromUtf8Error` when the bytes it
+        // consumed are not UTF-8, and that error owns the bytes AND retains
+        // why they failed. `utf8_error` is the half that says why, and it is
+        // the very `core::str::Utf8Error` a direct `str::from_utf8` produces —
+        // so the two paths hand the same value back and the caller's `Err`
+        // arm has one type either way.
+        const is_from_utf8_error = value.path.len == 3 and
+            (std.mem.eql(u8, value.path[0], "alloc") or
+                std.mem.eql(u8, value.path[0], "std")) and
+            std.mem.eql(u8, value.path[1], "string") and
+            std.mem.eql(u8, value.path[2], "FromUtf8Error") and
+            value.args.len == 0;
+        if (is_from_utf8_error and std.mem.eql(u8, method_name, "utf8_error")) {
+            return makeExternalNominalType(ctx, &.{ "core", "str", "Utf8Error" }, &.{});
+        }
     }
 
-    if (std.mem.eql(u8, method_name, "to_vec") or
-        std.mem.eql(u8, method_name, "to_owned"))
-    {
+    // `to_vec` and `to_owned` answer DIFFERENTLY on an array, and Rust is
+    // explicit about why. `to_vec` unsizes: `[T; N]` coerces to `[T]` and then
+    // `impl<T: Clone> ToOwned for [T] { type Owned = Vec<T> }` yields a `Vec<T>`,
+    // so both a slice and an array produce one. `to_owned` does NOT unsize — an
+    // array is `Clone` in its own right (`impl<T: Clone, const N: usize> Clone
+    // for [T; N]`), so the blanket `impl<T: Clone> ToOwned for T { type Owned =
+    // T }` is what applies and `[T; N].to_owned()` is the SAME array. Typing
+    // it as a `Vec` would hand the call a different Rust type than the source
+    // declares.
+    if (std.mem.eql(u8, method_name, "to_vec")) {
         if (sliceElementForMethod(receiver_ty)) |element| {
             return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{element});
+        }
+    }
+    if (std.mem.eql(u8, method_name, "to_owned")) {
+        switch (peelToSliceOrArray(receiver_ty) orelse return null) {
+            .slice => |slice| {
+                return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{slice.elem});
+            },
+            .array => |array| return .{ .array = array },
+            else => return null,
         }
     }
     if (std.mem.eql(u8, method_name, "as_slice") or
@@ -2294,6 +2801,94 @@ fn knownAllocMethodType(
         }
     }
     return null;
+}
+
+/// The slice or array a receiver really is, behind its references and boxes, or
+/// null when it names something else.
+///
+/// `str` is deliberately not a slice here. It is a distinct unsized primitive
+/// whose `ToOwned` is a `String`, and treating it as `[]const u8` would type
+/// `&str::to_owned` as a `Vec<u8>` — a different Rust owner than the one the
+/// source declared.
+fn peelToSliceOrArray(ty: types.Type) ?types.Type {
+    var current = ty;
+    for (0..128) |_| {
+        switch (current) {
+            .slice, .array => return current,
+            .reference => |reference| current = reference.pointee,
+            .boxed => |boxed| current = boxed.*,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// The type this position DEMANDS of its expression, however the demand is
+/// spelled, or null when nothing demands anything here.
+///
+/// Three sources, in Rust's own order of authority: an explicit annotation, an
+/// expectation an enclosing position already recorded for this node, and the
+/// declared return of a function whose body tail this node is.
+///
+/// A declared return that spells itself `Self` is the fourth case and the one
+/// that matters for conversions. The `from` of `impl From<A> for B` is written
+/// `-> Self`, and its arms are full of `value.into()` calls whose target is
+/// that very `B` — the impl's self type, which the enclosing declaration does
+/// name even though the function's own signature does not.
+fn contextualTypeAt(ctx: *Ctx, node: exprs.NodeId, fn_body: ?exprs.NodeId) ?types.Type {
+    if (annotatedType(ctx, node)) |annotated| return annotated;
+    if (ctx.expected_types.get(node)) |expected| return expected;
+    const body = fn_body orelse return null;
+    const tail = expectedTypeForTail(ctx, node, body) orelse return null;
+    if (returnTypeNamesNoType(tail)) return null;
+    if (!typeSpellsSelf(tail)) return tail;
+    const self_ty = currentImplSelfType(ctx) orelse return null;
+    if (returnTypeNamesNoType(self_ty)) return null;
+    return self_ty;
+}
+
+/// Whether a declared type is the `Self` of its own declaration, which names
+/// the enclosing impl rather than any type a table can hold.
+fn typeSpellsSelf(t: types.Type) bool {
+    return t == .path and t.path.segments.len == 1 and
+        std.mem.eql(u8, t.path.segments[0].name, "Self");
+}
+
+/// The result of a concrete `x.into()`, which is the type it is converted INTO.
+///
+/// `.into()` is written against `Into<U> for T where U: From<T>`, so its
+/// receiver names only the source: `&str` reaches a `String` AND a `Cow<str>`,
+/// `String` reaches a `Cow<str>` AND a `Vec<u8>`, and none of them is a default
+/// Rust would pick on its own. The target is therefore read off the position
+/// (`contextualTypeAt`) and never invented — a call nothing constrains stays
+/// untyped, which leaves the resolver free to refuse it with a reason instead
+/// of emitting one of the conversions at random.
+///
+/// The pair is checked before the target is returned, and both checks are the
+/// resolver's own predicates — `lookupStdIntoMethod` for std's ownership impls,
+/// `userFromImplMethod` for one this crate wrote — so the type recorded here and
+/// the dispatch `resolveMethods` admits afterwards cannot disagree about which
+/// `(source, target)` pairs are conversions at all.
+fn knownStdIntoType(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    receiver_ty: types.Type,
+    method_name: []const u8,
+    fn_body: ?exprs.NodeId,
+) ?types.Type {
+    if (!std.mem.eql(u8, method_name, "into")) return null;
+    const target = contextualTypeAt(ctx, node, fn_body) orelse return null;
+    // Two things can make a pair a conversion: std's own ownership impls, or
+    // an `impl From<A> for B` this crate wrote. Both questions are asked of
+    // the resolver's own predicates so that the type recorded here and the
+    // dispatch admitted after it cannot disagree about which pairs exist.
+    const cg = ctx.cg orelse return null;
+    if (resolve_methods.lookupStdIntoMethod(receiver_ty, target) == null and
+        resolve_methods.userFromImplMethod(cg, ctx.b, receiver_ty, target) == null)
+    {
+        return null;
+    }
+    return target;
 }
 
 fn publicIteratorPath(external: types.ExternalNominal, module: []const u8, name: []const u8) bool {
@@ -2392,11 +2987,118 @@ pub fn declaredBoundType(ty: types.Type, name: []const u8) ?types.Type {
     }
 }
 
+/// The associated type an `impl Iterator for Self` block declares, for a
+/// receiver that is a nominal the graph knows.
+///
+/// `declaredBoundType` answers only for a receiver that CARRIES its bounds — an
+/// `impl Trait`, an opaque — because those keep the bindings on the type itself.
+/// A concrete nominal keeps them nowhere on the type: `type Item = &'a str;` is
+/// written on the impl, and nothing inside `PercentEncode`'s nominal says so.
+/// Reading it there is the whole of what lets `iter.next()` have a type at all.
+///
+/// The trait is proved by its FULL path, never by the leaf name `Iterator`: a
+/// crate that declares its own `Iterator` writes the same word here and must
+/// not answer for core's. `std::io` re-exports core's, so both spellings reach
+/// the same predicate.
+const core_iter_iterator: []const []const u8 = &.{ "core", "iter", "Iterator" };
+
+/// Whether a `Self` path in an `impl` header and a receiver's nominal are the
+/// SAME type declaration.
+///
+/// The impl answers for its own `Self`, and that is a declaration rather than a
+/// word. Two modules may each declare their own `Iter`, and
+/// `impl Iterator for a::Iter` says nothing about `b::Iter`; comparing the leaf
+/// name alone let whichever impl the scan reached first answer for both, and
+/// every `next()` on the other one then carried the wrong element type.
+///
+/// A terminal entity id IS that declaration, so two ids have to be the same
+/// one. An id on one side and a bare name on the other is a comparison this
+/// pass cannot make at all: the bare side names a type nothing has resolved
+/// yet, so it is not evidence of the same declaration and does not stand in for
+/// one. Only a pair of fully unresolved names falls back to the spelling, which
+/// is the case a canonical std path produces — there is no local entity on
+/// either side to compare.
+/// Two ids are compared before anything about the spelling, and the spelling
+/// is not compared at all when they agree. The SAME declaration is written
+/// with and without its qualifier: `impl Iterator for crate::enc::Iter`
+/// declares the type a receiver `Iter` in that module already names, so
+/// requiring equal segment counts first refused a pair whose terminal ids
+/// were the same one.
+fn sameNominalDeclaration(left: types.Path, right: types.Path) bool {
+    if (left.segments.len == 0 or right.segments.len == 0) return false;
+    const left_id = left.segments[left.segments.len - 1].id;
+    const right_id = right.segments[right.segments.len - 1].id;
+    if (left_id != null and right_id != null) return left_id.? == right_id.?;
+    if (left_id != null or right_id != null) return false;
+    if (left.segments.len != right.segments.len) return false;
+    for (left.segments, right.segments) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+    }
+    return true;
+}
+
+fn implAssociatedType(ctx: *Ctx, ty: types.Type, name: []const u8) ?types.Type {
+    const cg = ctx.cg orelse return null;
+    const nominal = switch (ty) {
+        .path => |path| path,
+        else => return null,
+    };
+    if (nominal.segments.len == 0) return null;
+    for (cg.symbol_table.entities.items) |entity| {
+        if (entity.kind != .impl_) continue;
+        if (entity.id >= ctx.b.bodies.len) continue;
+        const implementation = switch (ctx.b.bodies[entity.id]) {
+            .impl_ => |body| body,
+            else => continue,
+        };
+        const trait_path = implementation.trait_path orelse continue;
+        // The trait is proved by its FULL path through the same canonical
+        // predicate `bodies.genericBound` uses, never by a leaf name: a crate
+        // that declares its own `Iterator` would otherwise answer with its own
+        // element type and every conversion built on it would be wrong.
+        if (!bodies.boundPathMatches(cg, entity.id, trait_path, core_iter_iterator)) continue;
+        const self_ty = switch (implementation.self_ty) {
+            .path => |path| path,
+            else => continue,
+        };
+        if (!sameNominalDeclaration(self_ty, nominal)) continue;
+        // `type Item = &'a str;` inside the impl is a TYPE ALIAS on that impl's
+        // OWN item list — which is how Rust spells the association, and where
+        // the frontend puts it. It is NOT an associated-type binding on the
+        // trait (`trait_associated_types`), which stays EMPTY for an impl that
+        // declares the item in its body rather than in the impl header. Reading
+        // only the binding therefore finds nothing at all, which is exactly why
+        // `iter.next()` stayed untyped.
+        //
+        // So the declaration is read from where it is written, and the trait
+        // binding is kept as the fallback for an impl that does use the
+        // `Iterator<Item = T>` spelling.
+        for (implementation.assoc_items) |assoc| {
+            if (assoc >= ctx.b.bodies.len) continue;
+            const child = cg.symbol_table.get(assoc) orelse continue;
+            if (!std.mem.eql(u8, child.name, name)) continue;
+            const alias = switch (ctx.b.bodies[assoc]) {
+                .type_alias => |body| body,
+                else => continue,
+            };
+            return alias.target;
+        }
+        for (implementation.trait_associated_types) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding.ty;
+        }
+    }
+    return null;
+}
+
 fn iteratorItemType(ctx: *Ctx, ty: types.Type) ?types.Type {
     // `impl Iterator<Item = T>` states the element outright. The carrier
     // reconstruction below can only rediscover it for the adapters it
     // models, so the declared binding is asked first and stands on its own.
     if (declaredBoundType(ty, "Item")) |declared| return declared;
+    // A concrete NOMINAL carries no bounds of its own, so the binding has to be
+    // read off the impl that declared it: `impl<'a> Iterator for PercentEncode<'a>
+    // { type Item = &'a str; }` is the only place that element type is written.
+    if (implAssociatedType(ctx, ty, "Item")) |declared| return declared;
     var base = ty;
     while (true) {
         switch (base) {
@@ -2423,6 +3125,18 @@ fn iteratorItemType(ctx: *Ctx, ty: types.Type) ?types.Type {
             }
             if (publicIteratorPath(external, "slice", "IterMut") and external.args.len == 1) {
                 return makeReferenceType(ctx, external.args[0], true);
+            }
+            // `Chunks<T>` and `ChunksExact<T>` hand out the chunked slice
+            // itself — `&[T]`, never its element — so a chain rooted at
+            // `.chunks(n)` carries a slice item that indexes into it. The
+            // two carriers differ only in the tail `remainder()` keeps, which
+            // says nothing about what `next()` yields.
+            if (external.args.len == 1 and
+                (publicIteratorPath(external, "slice", "Chunks") or
+                    publicIteratorPath(external, "slice", "ChunksExact")))
+            {
+                const chunk = makeSliceType(ctx, external.args[0], false) orelse return null;
+                return makeReferenceType(ctx, chunk, false);
             }
             if ((publicIteratorPath(external, "iter", "StepBy") or
                 publicIteratorPath(external, "iter", "Skip") or
@@ -2486,6 +3200,21 @@ fn knownIteratorMethodType(
             "Enumerate";
         return makeExternalNominalType(ctx, &.{ "core", "iter", type_name }, &.{receiver});
     }
+    // `next` yields `Option<Item>`. It is the one method every iterator answers
+    // with the element type the source declares ONCE, on its impl, and repeats
+    // nowhere at the use site — so a caller that cannot read that binding has
+    // nothing else to work from.
+    //
+    // This is what a `Some(x)` arm binds `x` to. Without it the binding stays
+    // whatever placeholder stands in for the element, and every conversion
+    // chained off it is unresolvable for a reason that has nothing to do with
+    // the conversion: in percent's `From<PercentEncode> for Cow`, `first.into()`
+    // fails not because the conversion is wrong but because `first` was never
+    // known to be a `&str`.
+    if (std.mem.eql(u8, method_name, "next")) {
+        const element = iteratorItemType(ctx, receiver) orelse return null;
+        return makeExternalNominalType(ctx, &.{ "core", "option", "Option" }, &.{element});
+    }
     if (std.mem.eql(u8, method_name, "zip")) {
         if (args.len == 0) return null;
         const other = getKnownType(ctx, args[0]) orelse return null;
@@ -2494,9 +3223,159 @@ fn knownIteratorMethodType(
 
     return null;
 }
-fn knownIteratorChainType(ctx: *Ctx, chain: exprs.IteratorChainExpr) ?types.Type {
+
+/// The container `collect::<B>()` hands back, or null when the call names none.
+///
+/// Rust's signature is `fn collect<B: FromIterator<Self::Item>>(self) -> B`,
+/// so the target is whatever the source says `B` is, in this order:
+///
+///  1. the turbofish, which is the caller's own binding for it;
+///  2. an explicit annotation on the binding the call initialises;
+///  3. the type the call's POSITION expects — the enclosing function's
+///     return type for a call in tail position.
+///
+/// `bindTurbofishCollectedElement` has already filled the one half a turbofish
+/// may leave open — `Vec<_>` takes its element from the receiver's `Item` — so
+/// the argument read here is the finished target. What is still standing is a
+/// placeholder no bound says anything about, and that is not a type: the
+/// positional rules below answer for it instead.
+///
+/// The positional rules are why `xs.map(..).collect()` is a `Vec<u8>` in a
+/// function declared `-> Result<Vec<u8>, u8>` and not a `Vec<Result<u8, u8>>`
+/// of the items it happens to yield. Rust reads the same target off the same
+/// position, and the items say only what the container is FILLED with.
+///
+/// The receiver has to be an `Iterator` this pass can read an `Item` off. A
+/// method called `collect` on anything else is a different method whose result
+/// this signature says nothing about, so it is left alone.
+fn knownCollectTargetType(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    expected: ?types.Type,
+) ?types.Type {
+    if (node >= ctx.b.exprs.len) return null;
+    const call = switch (ctx.b.exprs[node].kind) {
+        .method_call => |value| value,
+        else => return null,
+    };
+    const receiver_ty = getKnownType(ctx, call.receiver) orelse return null;
+    if (iteratorItemType(ctx, receiver_ty) == null) return null;
+    switch (call.generic_args.len) {
+        0 => {},
+        1 => {
+            const named = call.generic_args[0];
+            if (!containsInferPlaceholder(named)) return named;
+        },
+        // `collect` takes no type arguments but its one, so more than one is
+        // not a call this signature describes.
+        else => return null,
+    }
+    const contextual = annotatedType(ctx, node) orelse expected orelse return null;
+    return if (isCollectTargetType(ctx, contextual)) contextual else null;
+}
+
+/// The type an explicit annotation wrote on `node`, or null when none did.
+///
+/// The statement walk records it before it walks the initialiser, so a
+/// `collect` under the binding reads the annotation that names its target.
+fn annotatedType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
+    const type_id = ctx.annotated_inits.get(node) orelse return null;
+    if (type_id >= ctx.b.types.len) return null;
+    return ctx.b.types[type_id];
+}
+
+/// Whether `ty` is a shape `collect::<B>()` can hand back.
+///
+/// This is the whitelist of containers Rust's own `FromIterator` impls cover,
+/// not a guess at one: an expected type outside it is left alone, so the call
+/// stays untyped and the resolver keeps refusing the operator over it instead
+/// of typing it against something no collection can produce.
+fn isCollectTargetType(ctx: *Ctx, ty: types.Type) bool {
+    return switch (ty) {
+        .external_nominal => |external| isFromIteratorContainer(external.path),
+        // `Result<C, E>` and `Option<C>` collect by running the same
+        // `FromIterator` and stopping on the first failure, so the container
+        // is the arm the payload sits in, not the arm itself.
+        .result => |res| isCollectTargetType(ctx, res.ok),
+        .option => |inner| isCollectTargetType(ctx, inner.*),
+        .path => |path| if (path.segments.len == 1)
+            isEnclosingGenericParam(ctx, path.segments[0].name)
+        else
+            false,
+        .generic_inst => |inst| blk: {
+            const cg = ctx.cg orelse break :blk false;
+            const entity = cg.symbol_table.get(inst.decl) orelse break :blk false;
+            break :blk isEnclosingGenericParam(ctx, entity.name);
+        },
+        else => false,
+    };
+}
+
+/// Whether a `core`/`std`/`alloc` path names a container Rust collects into.
+fn isFromIteratorContainer(path: []const []const u8) bool {
+    if (path.len < 2) return false;
+    const name = path[path.len - 1];
+    const named = std.mem.eql(u8, name, "String") or
+        std.mem.eql(u8, name, "Vec") or
+        std.mem.eql(u8, name, "BTreeMap") or
+        std.mem.eql(u8, name, "BTreeSet") or
+        std.mem.eql(u8, name, "HashMap") or
+        std.mem.eql(u8, name, "HashSet") or
+        std.mem.eql(u8, name, "Result") or
+        std.mem.eql(u8, name, "Option");
+    if (!named) return false;
+    const root = path[0];
+    return std.mem.eql(u8, root, "core") or
+        std.mem.eql(u8, root, "std") or
+        std.mem.eql(u8, root, "alloc");
+}
+
+/// Whether `name` spells a type parameter of the function being walked.
+///
+/// A `C: FromIterator<Item>` parameter IS the un-instantiated target of a
+/// `collect`, and what it becomes is the instantiation's business: the same
+/// `char` items collect into a `String` and into a `Vec<char>`. Only a
+/// parameter the ENCLOSING function declares can be that; a crate-local
+/// nominal in the same position is not a `FromIterator` and stays out.
+fn isEnclosingGenericParam(ctx: *Ctx, name: []const u8) bool {
+    if (name.len == 0) return false;
+    const def = ctx.current_fn orelse return false;
+    if (def >= ctx.b.bodies.len) return false;
+    const params = switch (ctx.b.bodies[def]) {
+        .fn_ => |function| function.generic_params,
+        else => return false,
+    };
+    for (params) |param| {
+        if (std.mem.eql(u8, param, name)) return true;
+    }
+    return false;
+}
+/// The container an iterator chain's `collect` hands back, read off the
+/// position the chain sits in.
+///
+/// The method form already reads its target this way (`knownCollectTargetType`),
+/// and a chain lowered as one expression node has the same annotation and the
+/// same expected return type in front of it. Rust reads the target off that
+/// position too, so `xs.map(..).collect()` under a `Result<Vec<u8>, u8>`
+/// binding is that `Result` and not a `Vec` of the items the chain happens to
+/// yield: the items say only what the container is FILLED with.
+fn collectTargetFromContext(ctx: *Ctx, node: ?exprs.NodeId) ?types.Type {
+    const at_node = node orelse return null;
+    const contextual = annotatedType(ctx, at_node) orelse
+        ctx.expected_types.get(at_node) orelse
+        return null;
+    if (!isCollectTargetType(ctx, contextual)) return null;
+    return contextual;
+}
+
+fn knownIteratorChainType(
+    ctx: *Ctx,
+    node: ?exprs.NodeId,
+    chain: exprs.IteratorChainExpr,
+) ?types.Type {
     if (chain.terminal == .sum) return iteratorChainElementType(ctx, chain);
     if (chain.terminal == .collect_vec) {
+        if (collectTargetFromContext(ctx, node)) |target| return target;
         const element = iteratorChainElementType(ctx, chain) orelse return null;
         return makeExternalNominalType(ctx, &.{ "alloc", "vec", "Vec" }, &.{element});
     }
@@ -2744,6 +3623,62 @@ fn methodDeclaredReturnType(ctx: *Ctx, def: exprs.DefId) ?types.Type {
     return traitAssociatedReturnType(ctx, def);
 }
 
+/// The trait method signature a turbofish binds against: the declared return
+/// and the ordered type parameters the call supplies arguments for.
+const TraitMethodSignature = struct {
+    ret: types.Type,
+    /// Borrowed from the body table, which the frontend arena owns.
+    generic_params: []const []const u8,
+};
+
+/// The signature of the trait method that provides `method_name`, or null
+/// when this crate declares no such trait.
+///
+/// This is the second half of what a method call's callee can carry, for the
+/// shape that carries nothing: body lowering synthesizes one `method_ref` per
+/// call site and parents it to the enclosing callable or module
+/// (`pushMethodRef`), leaving its body slot `.none`. There is no `fn_` to read
+/// a return type or a parameter list from, and `traitAssociatedReturnType`
+/// cannot reach one either, because it reads the trait off the parent and the
+/// parent is a function. A turbofish on such a call then binds to nothing, and
+/// `xs.encode_hex::<String>()` — whose `ToHex::encode_hex` declares
+/// `fn encode_hex<T>(&self) -> T`, the bare parameter — stays untyped however
+/// the rest of the tree is read.
+///
+/// The trait is found the way Rust finds the method: by the name the call
+/// spells, among the traits this crate declares, narrowed to those whose
+/// method takes as many type parameters as the turbofish supplies. The arity
+/// is what keeps `ToHex::encode_hex` from answering for a same-named method
+/// elsewhere, and two DIFFERENT traits answering means the call is ambiguous
+/// in Rust too — so neither of them wins here.
+fn traitDeclaredMethod(
+    ctx: *const Ctx,
+    method_name: []const u8,
+    arg_count: usize,
+) ?TraitMethodSignature {
+    if (arg_count == 0 or method_name.len == 0) return null;
+    const cg = ctx.cg orelse return null;
+    var found: ?TraitMethodSignature = null;
+    var owner: ?spine.EntityId = null;
+    for (cg.symbol_table.entities.items, 0..) |entity, index| {
+        if (entity.kind != .trait_ or index >= ctx.b.bodies.len) continue;
+        const trait_body = switch (ctx.b.bodies[index]) {
+            .trait_ => |body| body,
+            else => continue,
+        };
+        for (trait_body.methods) |declared| {
+            if (!std.mem.eql(u8, declared.name, method_name)) continue;
+            if (declared.generic_params.len != arg_count) continue;
+            if (owner) |first| {
+                if (first != index) return null;
+            }
+            owner = @intCast(index);
+            found = .{ .ret = declared.ret, .generic_params = declared.generic_params };
+        }
+    }
+    return found;
+}
+
 fn knownCallReturnType(ctx: *Ctx, node: exprs.NodeId, call: exprs.Call) ?types.Type {
     const def = callDefinition(call);
     if (ctx.def_map.get(def)) |initializer| {
@@ -2847,6 +3782,24 @@ fn knownDeclaredMethodReturnType(
     return_type = substType(ctx.alloc, return_type, type_names.items, generic_args) catch return_type;
     return return_type;
 }
+/// The `std::io` trait whose bound a canonical I/O method name requires, or
+/// null for every other name.
+///
+/// This is the one place that answer is given, and both of its readers read it
+/// here: the result type below, and the buffer constraint further down. They
+/// therefore cannot disagree about which calls are the standard ones, and a
+/// method is not one of these until it is named here — which is where whoever
+/// adds one will find it.
+///
+/// Pure, and it answers a question about a name alone. The receiver's bound is
+/// the caller's to prove, and proving it is a symbol-table walk this must not
+/// repeat merely to be reused.
+fn stdIoMethodTrait(method_name: []const u8) ?[]const []const u8 {
+    if (std.mem.eql(u8, method_name, "read_exact")) return &.{ "std", "io", "Read" };
+    if (std.mem.eql(u8, method_name, "write_all")) return &.{ "std", "io", "Write" };
+    return null;
+}
+
 /// Infer the standard I/O result only when the receiver's generic parameter
 /// carries the corresponding non-optional trait bound.
 fn knownIoMethodResultType(
@@ -2854,12 +3807,7 @@ fn knownIoMethodResultType(
     receiver_ty: types.Type,
     method_name: []const u8,
 ) ?types.Type {
-    const trait_path: []const []const u8 = if (std.mem.eql(u8, method_name, "read_exact"))
-        &.{ "std", "io", "Read" }
-    else if (std.mem.eql(u8, method_name, "write_all"))
-        &.{ "std", "io", "Write" }
-    else
-        return null;
+    const trait_path = stdIoMethodTrait(method_name) orelse return null;
     const cg = ctx.cg orelse return null;
     const owner = ctx.current_fn orelse return null;
     if (bodies.genericBound(cg, ctx.b, owner, receiver_ty, trait_path) == null) return null;
@@ -3034,10 +3982,14 @@ fn knownCoreCallType(ctx: *Ctx, call: exprs.CoreCall) ?types.Type {
             return .{ .slice = slice };
         },
         .str_from_utf8, .str_from_utf8_unchecked => {
-            const string: types.Type = .{ .slice = &.{
-                .const_ = true,
-                .elem = .{ .prim = .u8 },
-            } };
+            // The ARGUMENT is bytes and the RESULT is borrowed text, and this
+            // is the call that turns one into the other:
+            // `pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error>`.
+            // Handing back the same `[]const u8` the argument already had would
+            // type `str::from_utf8(bytes)?.len()` as a byte count by accident
+            // rather than by a decision, and would leave the `Ok` payload a
+            // type no `.to_owned()` can answer for.
+            const string = makeReferenceType(ctx, types.str_type, false) orelse return null;
             if (call.function == .str_from_utf8_unchecked) return string;
             const result = ctx.alloc.create(types.Result) catch {
                 ctx.g.derived_error = true;
@@ -3128,6 +4080,17 @@ fn walkCoreCall(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Al
             call.generic_args = try ctx.alloc.dupe(types.Type, &.{argument});
         }
     }
+    // `Vec::from(sequence)` records its target as `alloc::vec::Vec` with an EMPTY
+    // payload, because nothing in the argument NAMES the element type — only
+    // the argument sequence does, and only once that is typed. An unfilled
+    // payload is not a smaller answer, it is an invalid one: `ir.validate`
+    // rejects a nominal whose argument list is missing, so the whole crate fails
+    // on a call whose type is in fact fully determined. `finalizeCoreCallTypeArguments`
+    // cannot repair it, because it completes an EMPTY argument list and this
+    // one has length.
+    if (call.function == .convert_from) {
+        try completeConvertTarget(ctx, node, call);
+    }
     if (getKnownType(ctx, node)) |result| try pinKnownType(ctx, node, result);
     switch (call.function) {
         .cmp_min, .cmp_max => if (coreTypeArgument(ctx, call.*)) |argument| {
@@ -3146,6 +4109,61 @@ fn walkCoreCall(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Al
         },
         else => {},
     }
+}
+
+/// Fill in an unfilled `Vec` conversion target from the argument sequence's
+/// element type, rewriting the recorded target as well as the call's result.
+///
+/// BOTH are rewritten, not just the result type, because the backend lowers the
+/// copy from the target's payload — `r2z.alloc.vec_from_slice(T, gpa, sequence)`
+/// — rather than from the expression's type. Leaving `generic_args[0]` unfilled
+/// would keep the arity error alive even with the call typed.
+///
+/// The completed type is recorded through the derived-type channel rather than
+/// pinned directly, so `materializeDerivedTypes` interns the row before
+/// `ir.validate` reads it; that is the same path every type inference derives
+/// rather than finds, and it dedupes, so two conversions producing the same
+/// `Vec<T>` share one row.
+///
+/// `sliceElementForMethod` resolves the element of a slice, array, reference,
+/// box, `Vec<T>`, `String`, or `Cow`. Reusing it avoids a conversion rule for
+/// each element type.
+fn completeConvertTarget(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    call: *exprs.CoreCall,
+) std.mem.Allocator.Error!void {
+    if (call.generic_args.len != 1) return;
+    const external = switch (call.generic_args[0]) {
+        .external_nominal => |value| value,
+        else => return,
+    };
+    // Only an UNFILLED target is this call's problem. A target that already
+    // carries its payload was written by something that knew the element, and a
+    // target that is not the `alloc` owner this pass can complete is left for
+    // its own admission rather than guessed at here.
+    if (external.args.len != 0) return;
+    if (external.path.len != 3) return;
+    if (!std.mem.eql(u8, external.path[1], "vec")) return;
+    if (!std.mem.eql(u8, external.path[2], "Vec")) return;
+    if (!std.mem.eql(u8, external.path[0], "alloc") and
+        !std.mem.eql(u8, external.path[0], "std")) return;
+    if (call.args.len != 1) return;
+    const argument_ty = getKnownType(ctx, call.args[0]) orelse return;
+    const element = sliceElementForMethod(argument_ty) orelse return;
+    const completed_args = try ctx.alloc.alloc(types.Type, 1);
+    completed_args[0] = element;
+    const completed: types.Type = .{ .external_nominal = .{
+        .path = external.path,
+        .args = completed_args,
+    } };
+    ctx.recordDerivedType(node, completed);
+    // Anything already cached for this node was the INCOMPLETE type, so the
+    // entry has to go — or every later reader in this same solve would keep
+    // seeing a `Vec` with no payload, and the pin would be right while the value
+    // every consumer actually reads was not.
+    _ = ctx.known_nodes.remove(node);
+    call.generic_args = try ctx.alloc.dupe(types.Type, &.{completed});
 }
 /// Derive a concrete Type for an argument expression node where possible.
 fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
@@ -3242,8 +4260,18 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
         .method_call => |method| {
             if (getMethodName(ctx, method.method)) |method_name| {
                 if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                    if (knownTryArmMethodType(receiver_ty, method_name)) |payload| return payload;
                     if (knownAllocMethodType(ctx, receiver_ty, method_name)) |alloc_result| {
                         return alloc_result;
+                    }
+                    if (knownStdIntoType(
+                        ctx,
+                        node,
+                        receiver_ty,
+                        method_name,
+                        null,
+                    )) |into_result| {
+                        return into_result;
                     }
                     if (knownBoundMethodReturnType(
                         ctx,
@@ -3262,6 +4290,19 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                     }
                     if (knownIteratorMethodType(ctx, method_name, receiver_ty, method.args)) |iterator_ty| {
                         return iterator_ty;
+                    }
+                    // `collect` is the one iterator method whose result the
+                    // turbofish names, so it is asked of the node rather than
+                    // of the receiver: the receiver types what the container
+                    // is FILLED with, and the call's own argument is what it
+                    // IS. Read from the table, because
+                    // `bindTurbofishCollectedElement` rewrites that argument
+                    // in place before the value copied out of the table here
+                    // is ever used.
+                    if (std.mem.eql(u8, method_name, "collect")) {
+                        if (knownCollectTargetType(ctx, node, null)) |collect_target| {
+                            return collect_target;
+                        }
                     }
                     if (std.mem.eql(u8, method_name, "ok")) {
                         if (resultPayloadType(receiver_ty, false)) |ok_payload| {
@@ -3378,6 +4419,10 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                             }
                         }
                     }
+                } else if (std.mem.eql(u8, method_name, "split_first")) {
+                    if (getKnownType(ctx, method.receiver)) |receiver_ty| {
+                        if (splitFirstType(ctx, receiver_ty)) |first_ty| return first_ty;
+                    }
                 } else if (std.mem.eql(u8, method_name, "chunks")) {
                     if (getKnownType(ctx, method.receiver)) |receiver_ty| {
                         if (sliceElementForMethod(receiver_ty)) |element| {
@@ -3479,7 +4524,7 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
                 }
                 if (getKnownType(ctx, method.receiver)) |receiver_ty| {
                     if (knownDeclaredMethodReturnType(ctx, receiver_ty, method_name)) |return_type| {
-                        return return_type;
+                        return substituteSelfLeaves(ctx, receiver_ty, return_type) orelse return_type;
                     }
                 }
             }
@@ -3497,7 +4542,7 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
         },
         .index => |index| {
             if (getKnownType(ctx, index.base)) |base_type| {
-                if (indexedElementType(base_type)) |element_type| return element_type;
+                if (indexedResultType(ctx, base_type, index.index)) |result_type| return result_type;
             }
             if (e.ty) |tid| {
                 if (tid < ctx.b.types.len) return ctx.b.types[tid];
@@ -3516,16 +4561,26 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
             else
                 null,
             .negate, .bit_not => getKnownType(ctx, unary.operand),
+            // `!x` is a `bool` over a bool and the same integer over an
+            // integer, so an operand nothing has typed yet leaves the
+            // negation unnamed too. Naming it `bool` anyway is a guess that
+            // outruns the walk: it makes the node look typed, and a position
+            // that states what this expression IS — `mask[i] &= !(1 << n)` —
+            // then finds a type to agree with and states nothing, so the
+            // literal underneath keeps the `i32` an unconstrained integer
+            // defaults to.
             .logical_not => if (getKnownType(ctx, unary.operand)) |op_ty| blk: {
-                if (isIntegerType(op_ty)) break :blk op_ty;
+                if (aliasResolvedPrim(ctx, op_ty)) |primitive| {
+                    if (unaryPreservesPrim(.logical_not, primitive)) break :blk op_ty;
+                }
                 break :blk types.Type{ .prim = .bool };
-            } else types.Type{ .prim = .bool },
+            } else null,
             .ref => |mode| if (getKnownType(ctx, unary.operand)) |pointee|
                 makeReferenceType(ctx, pointee, mode == .mutable)
             else
                 null,
         },
-        .iterator_chain => |chain| return knownIteratorChainType(ctx, chain),
+        .iterator_chain => |chain| return knownIteratorChainType(ctx, node, chain),
         .range => |range| {
             const start_ty = getKnownType(ctx, range.start);
             const end_ty = if (range.end) |end| getKnownType(ctx, end) else null;
@@ -3814,6 +4869,25 @@ fn rawPointeesCastCompatible(
     return true;
 }
 
+/// `&[T]` and `&mut [T]` are modelled as a slice, and a `*const [T]` /
+/// `*mut [T]` destination is a raw pointer to that same unsized slice: both
+/// carry the element AND the length, so the cast re-labels one as the other
+/// and keeps both. Only the fat destination can stand for a slice — a thin
+/// `*const u8` has nowhere to keep the length — and the mutability still has
+/// to hold: a shared slice cannot become a mutable pointer, while a mutable
+/// one can become either.
+fn sliceToRawPointerCompatible(
+    source_slice: *const types.Slice,
+    target_raw: *const types.RawPtr,
+) bool {
+    if (target_raw.mut and source_slice.const_) return false;
+    const target_slice = switch (target_raw.pointee) {
+        .slice => |value| value,
+        else => return false,
+    };
+    return typeEqual(source_slice.elem, target_slice.elem);
+}
+
 fn isValidPrimitiveFrom(source: types.Type, target: types.Type) bool {
     const source_primitive = switch (source) {
         .prim => |primitive| primitive,
@@ -3859,6 +4933,7 @@ fn isValidCast(
             .raw_ptr => |target_ptr| switch (effective_source) {
                 .raw_ptr => |source_ptr| rawPointeesCastCompatible(source_ptr, target_ptr),
                 .reference => |source_ref| referenceToRawPointerCompatible(source_ref, target_ptr),
+                .slice => |source_slice| sliceToRawPointerCompatible(source_slice, target_ptr),
                 .prim => |source_prim| isIntegerPrimitive(source_prim) and isThinRawPointer(target_ptr),
                 else => false,
             },
@@ -3885,7 +4960,13 @@ fn loopCarrierElementType(ctx: *Ctx, iterable: exprs.NodeId) ?types.Type {
             .array => |array| return makeReferenceType(ctx, array.elem, reference.mut),
             else => {},
         },
-        .slice => |slice| return makeReferenceType(ctx, slice.elem, !slice.const_),
+        // `for x in xs` walks the elements; only `xs.iter()` hands out a
+        // borrow, and that receiver arrives here as the iterator carrier
+        // instead. A mutable slice is the one case that still yields `&mut T`.
+        .slice => |slice| return if (slice.const_)
+            slice.elem
+        else
+            makeReferenceType(ctx, slice.elem, true),
         .array => |array| return array.elem,
         else => {},
     }
@@ -3899,7 +4980,8 @@ fn loopElementType(ctx: *Ctx, iterable: exprs.NodeId, iter_kind: exprs.IterKind)
             const range_ty = getKnownType(ctx, iterable) orelse return null;
             return iteratorItemType(ctx, range_ty) orelse range_ty;
         },
-        .slice => return loopCarrierElementType(ctx, iterable),
+        .slice => return loopCarrierElementType(ctx, iterable) orelse
+            rangeExpressionItemType(ctx, iterable),
         .enumerate => {
             const element = loopCarrierElementType(ctx, iterable) orelse return null;
             const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
@@ -3916,10 +4998,65 @@ fn loopElementType(ctx: *Ctx, iterable: exprs.NodeId, iter_kind: exprs.IterKind)
             return .{ .tuple = tuple };
         },
         .adapter => |chain| {
-            const iterator_ty = knownIteratorChainType(ctx, chain) orelse return null;
+            const iterator_ty = knownIteratorChainType(ctx, null, chain) orelse return null;
             return iteratorItemType(ctx, iterator_ty);
         },
     }
+}
+
+/// The item a range expression yields, or null when `node` is not a range.
+///
+/// `unwrapIterable` labels `for x in a..b` with the slice kind and the range
+/// expression itself, so the carrier reading finds no slice to read an
+/// element off and the binding falls back to the default integer type:
+/// `for round in 0u8..2` binds a `usize`, and every use of it is then a type
+/// error against the `u8` the source wrote.
+fn rangeExpressionItemType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
+    if (node >= ctx.b.exprs.len) return null;
+    const range = switch (ctx.b.exprs[node].kind) {
+        .range => |value| value,
+        else => return null,
+    };
+    const range_ty = getKnownType(ctx, node) orelse return null;
+    return iteratorItemType(ctx, range_ty) orelse getKnownType(ctx, range.start);
+}
+
+/// The loop counter and the range it walks are ONE value in Rust, and the
+/// body is what says which one: `for i in 0..127 { low_bits_of_byte(i) }`
+/// names `u8` at the call, because `low_bits_of_byte` declares `byte: u8`.
+/// Nothing above settles it. The range carries no type of its own at this
+/// point — `rangeExpressionItemType` needs one and finds none — so both its
+/// endpoints fall through to the unconstrained-integer default while the
+/// counter the body's own calls pinned reads as something else. They are one
+/// value, so the two answers cannot both stand.
+///
+/// So the edge is drawn after the body, from the range's start to the first
+/// expression that mentions the binding: `def_map` recorded that node when
+/// `walkPath` walked it, and the body's own calls have already pinned it. One
+/// edge, not a pin — the type is already decided on the body's side, and a pin
+/// here would be a second statement of it instead of the single class both
+/// names then read from. The endpoint is the start and not the end because
+/// `walkExpr` has already tied those together, and it is the start because
+/// that is what a backend reads the loop's item type off.
+///
+/// A binding the body never mentions has no occurrence to draw the edge to and
+/// needs none: nothing said what it is, so the default that reached the range
+/// also reaches the counter, and the two agree. A `for` over anything but a
+/// range has no endpoints to unify, which is the `.range` arm's own gate.
+fn unifyRangeBinding(
+    ctx: *Ctx,
+    iterable: exprs.NodeId,
+    binding: ?exprs.DefId,
+) std.mem.Allocator.Error!void {
+    const def = binding orelse return;
+    if (iterable >= ctx.b.exprs.len) return;
+    const range = switch (ctx.b.exprs[iterable].kind) {
+        .range => |value| value,
+        else => return,
+    };
+    const occurrence = ctx.def_map.get(def) orelse return;
+    if (occurrence >= ctx.b.exprs.len or range.start >= ctx.b.exprs.len) return;
+    try addEq(ctx, range.start, occurrence);
 }
 
 /// Recover explicit concrete generic arguments carried by a resolved result
@@ -3935,9 +5072,86 @@ fn explicitArgsForNode(ctx: *Ctx, node: exprs.NodeId) ?types.GenericArgs {
         else => null,
     };
 }
-/// Recover the declared return type for a call in an enclosing block tail.
+/// How deep a tail chain is followed. Each step moves strictly inward through
+/// one construct's own tail, so the cap is only here for a table that points at
+/// itself.
+const tail_chain_depth_max: usize = 128;
+
+/// Whether `node` is the value the function body ultimately produces.
+///
+/// Tail position is not only the outermost statement. A body that is an `if`
+/// returns whichever branch ran, so `else { None }` is as much the function's
+/// value as a bare `None` tail would be — and a value only one branch reaches
+/// is exactly the one that had no type before. Every construct that passes
+/// control onward carries its own tail into the next one: a block, an
+/// `if`/`else`, an `if let`, a `match` arm, a `loop`. A position is a return
+/// position when the chain reaches it, so all six readers of that question
+/// answer it the same way.
+fn isBodyTail(
+    ctx: *Ctx,
+    body: exprs.NodeId,
+    node: exprs.NodeId,
+    depth: usize,
+) bool {
+    if (depth >= tail_chain_depth_max) return false;
+    if (body >= ctx.b.exprs.len) return false;
+    if (body == node) return true;
+    return switch (ctx.b.exprs[body].kind) {
+        .block => |block| if (block.tail) |tail|
+            isBodyTail(ctx, tail, node, depth + 1)
+        else
+            false,
+        .if_else => |if_expr| {
+            if (if_expr.then_.tail) |tail| {
+                if (isBodyTail(ctx, tail, node, depth + 1)) return true;
+            }
+            return isElseBodyTail(ctx, if_expr.@"else", node, depth + 1);
+        },
+        .if_let => |if_let| {
+            if (if_let.then_.tail) |tail| {
+                if (isBodyTail(ctx, tail, node, depth + 1)) return true;
+            }
+            return isElseBodyTail(ctx, if_let.@"else", node, depth + 1);
+        },
+        .match => |match_expr| {
+            for (match_expr.arms) |arm| {
+                if (isBodyTail(ctx, arm.body, node, depth + 1)) return true;
+            }
+            return false;
+        },
+        // A `loop` is deliberately NOT followed. `loop { .. }` in tail position
+        // evaluates to `()` in Rust, whatever its body ends with; it is the
+        // `break` that carries a value out, and this walk follows expressions
+        // rather than the path control takes. Treating a loop's tail as the
+        // function's value would claim return position for a statement that is
+        // not returned, so the case is left to a pass that can follow the break.
+        else => false,
+    };
+}
+
+fn isElseBodyTail(
+    ctx: *Ctx,
+    branch: exprs.ElseBranch,
+    node: exprs.NodeId,
+    depth: usize,
+) bool {
+    if (depth >= tail_chain_depth_max) return false;
+    return switch (branch) {
+        .none => false,
+        .block => |block| if (block.tail) |tail|
+            isBodyTail(ctx, tail, node, depth + 1)
+        else
+            false,
+        .chain => |chain| isBodyTail(ctx, chain, node, depth + 1),
+    };
+}
+
+/// Recover the declared return type for an expression in the body's tail chain.
 /// This supplies the expected type for abstract associated calls whose
-/// declaration still contains `Self` or an associated projection.
+/// declaration still contains `Self` or an associated projection, and it is
+/// what types a variant that carries no type of its own — `None` has no
+/// payload to read one from, and its declared option is the only thing that
+/// says what it is.
 fn expectedTypeForTail(
     ctx: *Ctx,
     node: exprs.NodeId,
@@ -3945,13 +5159,16 @@ fn expectedTypeForTail(
 ) ?types.Type {
     if (fn_body >= ctx.b.exprs.len) return null;
     const body_expr = ctx.b.exprs[fn_body];
-    if (body_expr.kind != .block or body_expr.kind.block.tail != node) return null;
+    if (body_expr.kind != .block) return null;
+    const tail = body_expr.kind.block.tail orelse return null;
+    if (!isBodyTail(ctx, tail, node, 0)) return null;
     return findFnReturnType(ctx.b, fn_body);
 }
 
-/// Recover the expected generic result for a tail call. This is deliberately
-/// limited to the enclosing block tail: using a function's return type for an
-/// arbitrary nested call would bind unrelated call sites to the same record.
+/// Recover the expected generic result for a call in the body's tail chain.
+/// The limit is the chain, not the position: using a function's return type for
+/// an arbitrary nested call would bind unrelated call sites to the same record,
+/// and a call no branch of the body can reach is exactly such a site.
 fn expectedGenericTypeForTail(
     ctx: *Ctx,
     node: exprs.NodeId,
@@ -3987,6 +5204,172 @@ fn explicitArgsMatchSignature(
     }
 }
 
+/// How far a demand for an index result travels back through nested indexes to
+/// the literal it reads. Each step moves strictly outward from the position
+/// that stated the demand, so the cap is only here for a table that points at
+/// itself.
+const index_base_walk_depth_max: usize = 32;
+
+/// Carry the type an index PRODUCES back into what it reads.
+///
+/// A range index (`x[a..b]`) yields a view over the base's elements and a plain
+/// one (`x[i]`) yields a single element, so what a position states for the
+/// index is a statement about the base's element — and it says nothing at all
+/// until it reaches the base. `&[][..]` writes no element type anywhere: an
+/// empty literal has no sibling to read one from, and its `0..` says only
+/// where the view starts. The borrow's own `&[u8]` is the one statement of
+/// what the empty slice holds, and this is what hands it down.
+///
+/// Only a base that is still unresolved is asked. A base the source already
+/// typed says what it is, and pinning a demand onto it would invent a coercion
+/// the source never wrote.
+fn constrainIndexedBase(
+    ctx: *Ctx,
+    index: exprs.IndexExpr,
+    result: types.Type,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    if (depth >= index_base_walk_depth_max) return;
+    if (index.base >= ctx.b.exprs.len) return;
+    // The bounds of a sequence index are `Range<usize>` in Rust, and a range
+    // node carries no type of its own, so nothing else states this.
+    const is_range = index.index < ctx.b.exprs.len and
+        ctx.b.exprs[index.index].kind == .range;
+    if (is_range) {
+        try constrainExpectedType(ctx, index.index, .{ .prim = .usize });
+    }
+    var element = result;
+    if (is_range) {
+        element = indexedElementType(result) orelse return;
+    }
+    try constrainIndexedBaseElements(ctx, index.base, element, depth + 1);
+}
+
+/// State what the ELEMENTS of an index's base are, and nothing else.
+///
+/// The base of `x[i]` and of `x[a..b]` is a place, not a value a position is
+/// converting, so a base that already carries a type of its own keeps it: an
+/// owned length, a slice's `const` and a nominal element are all statements
+/// the source made. `&mut rows[1][..]` asks a `rows` that already reads
+/// `[[u8; 2]; 2]` for a `u8`, and asking it to become `[]const u8` is what
+/// dropped a dimension per level out of it.
+///
+/// A base still carrying nothing is the other half of the same rule. The
+/// `[]const u8` demanded of it is a real coercion — Rust unsizes an array into
+/// the slice a borrow or an index names — and `constrainExpectedType` spends a
+/// demanded slice on the literal underneath through `literalElementIdentity`,
+/// which rebuilds the element from the literal's own spines rather than
+/// storing the demanded slice in its place. One level out costs one level
+/// back, at the lengths the source wrote. A nested index is that same crossing
+/// one more time, which is why the element is rewrapped there rather than
+/// passed bare.
+///
+/// A genuinely empty `[]`, a `[0; 4]` whose `0` no use has fixed, and an
+/// element nothing named yet all arrive here unresolved too — which is the
+/// only place a demand belongs.
+fn constrainIndexedBaseElements(
+    ctx: *Ctx,
+    base: exprs.NodeId,
+    element: types.Type,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    if (depth >= index_base_walk_depth_max) return;
+    if (base >= ctx.b.exprs.len) return;
+    if (getKnownType(ctx, base)) |known| {
+        try nameUnnamedElement(ctx, base, known, element);
+        return;
+    }
+    const base_ty = makeSliceType(ctx, element, false) orelse return;
+    switch (ctx.b.exprs[base].kind) {
+        .array => try constrainExpectedType(ctx, base, base_ty),
+        // A nested index is another place, and its own type ends the walk
+        // wherever it has one; where it has none the demand crosses it as the
+        // slice its base's elements are, one more level of the same crossing.
+        .index => |nested| try constrainIndexedBase(ctx, nested, base_ty, depth + 1),
+        .path => try constrainBorrowedLocalInitializer(ctx, base, base_ty),
+        else => {},
+    }
+}
+
+/// Name an element a base's own type leaves as a hole, leaving everything else
+/// about it — an array's length, a slice's `const` — as the source wrote it.
+///
+/// A base whose type this module recorded is a decision it made, and a
+/// decision is not a hole; the fill is for a type the table handed over with
+/// nothing under its element, where nothing has been recorded to contradict.
+fn nameUnnamedElement(
+    ctx: *Ctx,
+    base: exprs.NodeId,
+    known: types.Type,
+    element: types.Type,
+) std.mem.Allocator.Error!void {
+    if (ctx.known_nodes.get(base) != null) return;
+    const named: ?types.Type = switch (known) {
+        .array => |array| if (isUnnamedElement(array.elem)) rebuilt: {
+            const copy = try ctx.alloc.create(types.Array);
+            copy.* = .{ .elem = element, .len = array.len };
+            break :rebuilt .{ .array = copy };
+        } else null,
+        .slice => |slice| if (isUnnamedElement(slice.elem)) rebuilt: {
+            const copy = try ctx.alloc.create(types.Slice);
+            copy.* = .{ .const_ = slice.const_, .elem = element };
+            break :rebuilt .{ .slice = copy };
+        } else null,
+        else => null,
+    };
+    if (named) |replacement| try pinKnownType(ctx, base, replacement);
+}
+
+/// Whether an element identity is still standing for whatever the constraints
+/// around it will name: an `unsupported` hole, or a `_` placeholder.
+fn isUnnamedElement(ty: types.Type) bool {
+    return ty == .unsupported or isInferPlaceholderType(ty);
+}
+
+/// The element type an array literal holds, given the element type a position
+/// demands of it.
+///
+/// The literal's own nesting and lengths are the source's — `[[0; 2]; 2]` is
+/// two arrays of two whatever a position asks of it — so a demand is spent AT
+/// the literal rather than replacing the shape it wrote. A child that is
+/// itself an array literal holds its own array, and the demanded element
+/// (`[]E`, say) is only what that child coerces to; the child's own `[M]E` is
+/// what the literal actually holds, so the demand crosses into the child
+/// instead of stopping at it — one level further in, because the child's
+/// elements are what `[]E` names — until it reaches a level whose elements are
+/// not arrays, which is the only level that keeps the demanded element.
+///
+/// Reconstructing the element here is what keeps a binding's shape whole when
+/// the demand arrived one level out per nested index. Recording the demanded
+/// slice as the element instead leaves the child the source wrote as an array
+/// unaccounted for one level above it, which is how a dimension is lost.
+fn literalElementIdentity(
+    ctx: *Ctx,
+    literal: exprs.ArrayExpr,
+    demanded: types.Type,
+) std.mem.Allocator.Error!types.Type {
+    if (literal.elements.len == 0) return demanded;
+    const child = literal.elements[0];
+    if (child >= ctx.b.exprs.len) return demanded;
+    const child_literal = switch (ctx.b.exprs[child].kind) {
+        .array => |array| array,
+        else => return demanded,
+    };
+    // A child the source already typed says what it is, and the literal's
+    // element is that child whatever the demand called it.
+    if (getKnownType(ctx, child)) |known| {
+        if (known == .array) return known;
+    }
+    const inner = indexedElementType(demanded) orelse return demanded;
+    const element = try literalElementIdentity(ctx, child_literal, inner);
+    const array = try ctx.alloc.create(types.Array);
+    array.* = .{
+        .elem = element,
+        .len = .{ .literal = @intCast(child_literal.repeat orelse child_literal.elements.len) },
+    };
+    return .{ .array = array };
+}
+
 fn constrainExpectedType(
     ctx: *Ctx,
     node: exprs.NodeId,
@@ -4001,11 +5384,27 @@ fn constrainExpectedType(
         const literal = ctx.b.exprs[node].kind.array;
         const array = try ctx.alloc.create(types.Array);
         array.* = .{
-            .elem = expected.slice.elem,
+            // The literal's element is what the source's own nesting makes it,
+            // not the slice a position demanded of that element: `[[0; 2]; 2]`
+            // adapts to a demanded `[][]u8` as `[2][2]u8`, one level of slice
+            // spent per level of array the literal wrote.
+            .elem = try literalElementIdentity(ctx, literal, expected.slice.elem),
             .len = .{ .literal = literal.repeat orelse @intCast(literal.elements.len) },
         };
         target = .{ .array = array };
     }
+    // Recorded as well as applied. Pinning fixes THIS node's type, but a node
+    // that is itself a composite — a nested `match`, a block — gets walked
+    // afterwards, and its own inference has to be able to ask what its position
+    // expects of it. `contextualTypeAt` reads this table for exactly that, so a
+    // conversion inside such a node can reach the expectation stated outside
+    // it. Without the record the demand stops at the node it was stated for, and
+    // everything beneath has to invent a target it cannot see.
+    //
+    // `target` is recorded rather than `expected`, because an array literal
+    // adapted to a demanded slice IS the array, and the node's own type is what
+    // a later reader should find.
+    try ctx.expected_types.put(ctx.alloc, node, target);
     try pinKnownType(ctx, node, target);
     switch (ctx.b.exprs[node].kind) {
         .array => |array| switch (target) {
@@ -4022,6 +5421,26 @@ fn constrainExpectedType(
             },
             else => {},
         },
+        // `base[..]` is a view over the base, not a value read out of it, so
+        // what a position states for the index is a statement about what the
+        // base holds. That is the whole way `&[][..]` learns it is bytes: the
+        // empty literal underneath names no element and has no sibling that
+        // does, so the demand has to travel back down to it.
+        .index => |index| {
+            try constrainIndexedBase(ctx, index, target, 0);
+        },
+        // A range IS its endpoints — `a..b` names one integer type — so a
+        // position that says what the range is says what both ends are. The
+        // walk tied the two together with an `eq` edge already; this is the
+        // identity the node itself never had. Only an integer demand reaches
+        // the ends: a sequence index range is `usize`, and nothing else here
+        // states what a range holds.
+        .range => |range| {
+            if (isIntegerType(target)) {
+                try constrainExpectedType(ctx, range.start, target);
+                if (range.end) |end| try constrainExpectedType(ctx, end, target);
+            }
+        },
         .unary => |unary| {
             if (unary.op == .ref) {
                 switch (target) {
@@ -4030,14 +5449,34 @@ fn constrainExpectedType(
                         try constrainBorrowedLocalInitializer(ctx, unary.operand, reference.pointee);
                     },
                     .slice => {
-                        if (unary.operand < ctx.b.exprs.len and ctx.b.exprs[unary.operand].kind == .array) {
-                            try constrainExpectedType(ctx, unary.operand, target);
+                        // `&[]` borrows the literal itself and `&[][..]`
+                        // borrows a view of it. The demand the position states
+                        // is the same one either way, so a range index is
+                        // handed it beside the array literal, and what it does
+                        // with it is `constrainIndexedBase`'s.
+                        if (unary.operand < ctx.b.exprs.len) {
+                            switch (ctx.b.exprs[unary.operand].kind) {
+                                .array, .index => try constrainExpectedType(ctx, unary.operand, target),
+                                else => {},
+                            }
                         }
                         // `&mut [T]` lowers to a mutable slice, not a reference,
                         // so a borrowed binding reaches this arm too.
                         try constrainBorrowedLocalInitializer(ctx, unary.operand, target);
                     },
                     else => {},
+                }
+            } else {
+                // `!x`, `~x` and `-x` produce the type they read, so a
+                // position that names what the negation IS names what it
+                // read. `mask[i] &= !(1 << n)` is written this way: the
+                // demand reaches the shift, the shift reaches the `1`, and
+                // the `1` keeps `Chunk`'s `u32` instead of the `i32` an
+                // unconstrained integer literal would default to.
+                if (aliasResolvedPrim(ctx, target)) |prim| {
+                    if (unaryPreservesPrim(unary.op, prim)) {
+                        try constrainExpectedType(ctx, unary.operand, target);
+                    }
                 }
             }
         },
@@ -4056,6 +5495,36 @@ fn constrainExpectedType(
                 }
             },
             else => {},
+        },
+        // `Some(x)` is `Option<T>` and `Ok(x)`/`Err(e)` are `Result<T, E>`
+        // wherever the value stands, so a position that says what the option or
+        // the result holds is what says what the payload holds: the variant
+        // node itself says nothing about it. A variant carrying no field —
+        // `None` — takes the whole declared type and pushes nothing, and that
+        // declared type is the only thing that ever said what it is.
+        .external_variant => |variant| {
+            const payload: ?types.Type = switch (target) {
+                .option => |inner| if (std.mem.eql(u8, variant.variant, "Some"))
+                    inner.*
+                else
+                    null,
+                .result => |result| if (std.mem.eql(u8, variant.variant, "Ok"))
+                    result.ok
+                else if (std.mem.eql(u8, variant.variant, "Err"))
+                    result.err
+                else
+                    null,
+                else => null,
+            };
+            const field: ?exprs.NodeId = if (variant.tuple_fields.len == 1)
+                variant.tuple_fields[0]
+            else if (variant.named_fields.len == 1)
+                variant.named_fields[0].value
+            else
+                null;
+            if (payload) |payload_ty| {
+                if (field) |field_node| try constrainExpectedType(ctx, field_node, payload_ty);
+            }
         },
         else => {},
     }
@@ -4097,6 +5566,221 @@ fn constrainBorrowedLocalInitializer(
     if (init_ty == .array) try ctx.local_types.put(ctx.alloc, path.def, init_ty);
 }
 
+/// The bounds under which a byte sink lives. Both name `u8` for a slice, an
+/// array and a vector, and their `&mut W` / `&W` / `Box<W>` forms delegate to
+/// those, so a value that reaches either bound is a value of bytes however the
+/// source spelled it. `std` is the only root asked for, the same spelling
+/// `knownIoMethodResultType` uses; the lookup resolves the name through the
+/// callee's own `use`, so a crate's own `Read` is never matched here.
+const io_sink_bounds: [2][]const []const u8 = .{
+    &.{ "std", "io", "Write" },
+    &.{ "std", "io", "Read" },
+};
+
+/// How far a sink constraint walks back through borrows, bindings and indexes
+/// to the container it came from. Each step moves strictly outward from the
+/// literal, so the cap is only here for a table that points at itself.
+const io_sink_walk_depth_max: usize = 32;
+
+/// Rust takes a byte sink's element type from the bound, not from the call
+/// site. `let mut buf = [0; 1];` names no element at all, and the only `T` for
+/// which `&mut [T]` is a `Write` is `u8`: trait selection answers first, so
+/// the unconstrained-integer fallback never gets the chance to say `i32`.
+/// Nothing here reads a literal's text — the bound is what says what these
+/// bytes are, and a literal whose element something else already named keeps
+/// that element.
+fn constrainIoSinkArguments(
+    ctx: *Ctx,
+    def: exprs.DefId,
+    args: []const exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    const cg = ctx.cg orelse return;
+    if (def >= ctx.b.bodies.len) return;
+    const function = switch (ctx.b.bodies[def]) {
+        .fn_ => |body| body,
+        else => return,
+    };
+    if (args.len != function.params.len) return;
+    for (args, function.params) |arg, param| {
+        if (!declaresIoSinkBound(cg, ctx.b, def, param.ty)) continue;
+        try constrainIoSinkElement(ctx, arg, 0);
+    }
+}
+
+/// Whether a parameter names a type parameter the callee bounds by `Write` or
+/// `Read`. The reference and box layers around that parameter are peeled by the
+/// same lookup that resolves a receiver's bound, so `&mut W` with `W: Write`
+/// and a plain `W` are one question, not two.
+fn declaresIoSinkBound(
+    cg: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    def: exprs.DefId,
+    param: types.Type,
+) bool {
+    for (io_sink_bounds) |trait_path| {
+        if (bodies.genericBound(cg, b, def, param, trait_path) != null) return true;
+    }
+    return false;
+}
+
+/// The same question asked of a METHOD call, where the bound is on the
+/// receiver and there is no parameter to ask. `fn unsigned<R>(r: &mut R) where
+/// R: ?Sized + io::Read` puts `std::io::Read` on `R`, so `r.read_exact(&mut
+/// buf)` inherits that bound the way it inherits every other method of the
+/// trait — through the receiver — while the buffer it fills is one of the
+/// call's own arguments rather than a parameter the callee hands back.
+///
+/// The receiver bound alone does not say a buffer is there. `Read::
+/// read_vectored` takes `&mut [IoSliceMut]`, `Read::read_to_string` takes
+/// `&mut String` and `Write::write_fmt` takes `&mut Arguments` — all of them
+/// borrowed arguments of a `std::io` receiver, none of them bytes. So the name
+/// is read first, out of the same `stdIoMethodTrait` that gives this very call
+/// its result type: one name, the one trait that name requires, and the one
+/// buffer it takes. Asking for the bound the name asks for is also what keeps a
+/// crate's own `read_exact`, or an inherent method of the same name, out — it
+/// carries no `std::io` bound to be found.
+fn constrainIoSinkMethodArguments(
+    ctx: *Ctx,
+    method_name: []const u8,
+    receiver_ty: ?types.Type,
+    args: []const exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    const trait_path = stdIoMethodTrait(method_name) orelse return;
+    const cg = ctx.cg orelse return;
+    const owner = ctx.current_fn orelse return;
+    const receiver = receiver_ty orelse return;
+    if (bodies.genericBound(cg, ctx.b, owner, receiver, trait_path) == null) return;
+    // Both of those methods take exactly the one buffer and nothing else, so an
+    // arity that does not match is not a call this describes.
+    if (args.len != 1) return;
+    if (!borrowedArgument(ctx, args[0])) return;
+    try constrainIoSinkElement(ctx, args[0], 0);
+}
+
+/// Whether the expression at `node` is a borrow, which is the only shape a
+/// byte sink is handed over in — `read_exact` takes `&mut [u8]`, `write_all`
+/// takes `&[u8]`, and neither takes a buffer by value.
+fn borrowedArgument(ctx: *Ctx, node: exprs.NodeId) bool {
+    if (node >= ctx.b.exprs.len) return false;
+    return switch (ctx.b.exprs[node].kind) {
+        .unary => |unary| unary.op == .ref,
+        else => false,
+    };
+}
+
+/// Push the byte element back to the container the source actually built, and
+/// pin every node the walk passed through so the backend reads a type at each
+/// one.
+///
+/// A sink names no array of its own: the source writes
+/// `let mut buf = [0; 1]; let mut writable = &mut buf[..];`, so the bound has
+/// to reach through the borrow, the binding and the index to reach the literal
+/// that nothing else types. Each step answers with the type its own node now
+/// has, which is what the step above it pins.
+fn constrainIoSinkElement(
+    ctx: *Ctx,
+    node: exprs.NodeId,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    if (depth >= io_sink_walk_depth_max) return;
+    if (node >= ctx.b.exprs.len) return;
+    switch (ctx.b.exprs[node].kind) {
+        .unary => |unary| {
+            const mode = switch (unary.op) {
+                .ref => |value| value,
+                else => return,
+            };
+            try constrainIoSinkElement(ctx, unary.operand, depth + 1);
+            const pointee = getKnownType(ctx, unary.operand) orelse return;
+            const borrowed = makeReferenceType(ctx, pointee, mode == .mutable) orelse return;
+            try pinKnownType(ctx, node, borrowed);
+        },
+        .path => |path| {
+            const init = ctx.def_map.get(path.def) orelse return;
+            if (init == node) return;
+            try constrainIoSinkElement(ctx, init, depth + 1);
+            const init_ty = getKnownType(ctx, init) orelse return;
+            try ctx.local_types.put(ctx.alloc, path.def, init_ty);
+            try pinKnownType(ctx, node, init_ty);
+        },
+        .index => |index| {
+            try constrainIoSinkElement(ctx, index.base, depth + 1);
+            const base_ty = getKnownType(ctx, index.base) orelse return;
+            const selected = indexedResultType(ctx, base_ty, index.index) orelse return;
+            try pinKnownType(ctx, node, selected);
+        },
+        .array => {
+            // The literal is the end of the walk, and demanding the slice
+            // `[u8]` of it is the one step that already fixes an array's
+            // element and pins the array shape. A literal that already has a
+            // type of its own has nothing to take from the bound.
+            if (ctx.known_nodes.get(node) != null) return;
+            const bytes = makeSliceType(ctx, .{ .prim = .u8 }, false) orelse return;
+            try constrainExpectedType(ctx, node, bytes);
+        },
+        .vec_lit => {
+            if (ctx.known_nodes.get(node) != null) return;
+            const bytes = makeExternalNominalType(
+                ctx,
+                &.{ "alloc", "vec", "Vec" },
+                &.{.{ .prim = .u8 }},
+            ) orelse return;
+            try constrainExpectedType(ctx, node, bytes);
+        },
+        else => {},
+    }
+}
+
+/// Record what each argument position DEMANDS of the expression written there.
+///
+/// A call is where Rust hands a callee's own parameter type to whatever stands
+/// in that position, and for a conversion written as `.into()` it is the only
+/// place the target is ever named: `decode_utf8_lossy(bytes.into())` says
+/// `Cow<'_, [u8]>` in the signature and nowhere else, and `bytes.into()` would
+/// otherwise have no way to learn what it is converting into.
+///
+/// Only the DECLARED type is recorded. Nothing is pinned and no inference runs
+/// from it here, so a callee whose parameter still names one of its own type
+/// parameters, or one the frontend recovered no concrete for, records nothing
+/// and its arguments are walked exactly as before. The arity has to line up:
+/// a call with fewer arguments than parameters, or more, has no one-to-one
+/// correspondence to read, and guessing one would type an expression against a
+/// parameter it was never passed to.
+fn recordArgumentExpectations(
+    ctx: *Ctx,
+    def: exprs.DefId,
+    args: []const exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    if (def >= ctx.b.bodies.len) return;
+    const function = switch (ctx.b.bodies[def]) {
+        .fn_ => |declaration| declaration,
+        else => return,
+    };
+    if (function.params.len != args.len) return;
+    // Naming the callee's type parameters is what tells a parameter type that
+    // is still generic from one that is concrete, and a callee with no generic
+    // parameters at all cannot have one. Reading that off the body the
+    // parameters are already in skips the duplicate-and-free that asking the
+    // graph for them costs on every call expression in the crate.
+    const declares_generics = blk: {
+        const generics = function.generics orelse break :blk false;
+        break :blk generics.params.len > 0 or generics.where_clauses.len > 0;
+    };
+    const param_names: []const []const u8 = if (declares_generics)
+        (getGenericParamNames(ctx, def) catch return)
+    else
+        &.{};
+    defer {
+        if (declares_generics) ctx.alloc.free(param_names);
+    }
+    for (args, function.params) |arg, param| {
+        if (arg >= ctx.b.exprs.len) continue;
+        if (returnTypeNamesNoType(param.ty)) continue;
+        if (param_names.len > 0 and typeContainsParam(param.ty, param_names)) continue;
+        try ctx.expected_types.put(ctx.alloc, arg, param.ty);
+    }
+}
+
 fn constrainConcreteArguments(
     ctx: *Ctx,
     definition: bodies.BodyKind,
@@ -4132,8 +5816,14 @@ fn constrainConcreteArguments(
 /// Walk a free/associated/constructor call: recurse into args and, when the
 /// callee is generic, unify argument types with instantiated parameter types.
 fn handleCall(ctx: *Ctx, node: exprs.NodeId, c: exprs.Call, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
-    for (c.args) |a| try walkExpr(ctx, a, fn_body);
     const def = callDefinition(c);
+    // Before the arguments are walked, not after: an argument that is itself
+    // `.into()` reads what its position demands while it is being walked.
+    try recordArgumentExpectations(ctx, def, c.args);
+    for (c.args) |a| try walkExpr(ctx, a, fn_body);
+    // After the arguments are walked, so a sink that an argument's own literal
+    // already typed is left exactly as that literal typed it.
+    try constrainIoSinkArguments(ctx, def, c.args);
     const expected_type = expectedTypeForTail(ctx, node, fn_body);
     if (expected_type) |expected| {
         try ctx.expected_types.put(ctx.alloc, node, expected);
@@ -4388,6 +6078,23 @@ fn instantiateGenericDef(
     if (ret_ty) |return_ty| {
         if (try substitutedTypeId(ctx, return_ty, param_names, concrete_args)) |tid| {
             try addPin(ctx, node, tid);
+        } else if (typeContainsParam(return_ty, param_names)) {
+            // A generic return that nothing in the crate had interned yet is
+            // still fully DETERMINED here — every parameter is bound above, so
+            // substitution names one exact type. Dropping it for want of a table
+            // row leaves the call untyped for a reason that has nothing to do
+            // with the call, and that is the shape a seeded std constructor
+            // always lands in: nothing in the source spells `Cursor<[u8; 3]>`,
+            // so the only thing that can produce it is this substitution.
+            //
+            // Recording is the same channel `materializeDerivedTypes` already
+            // uses for a type inference DERIVES rather than finds, so the row
+            // lands in the table before the backend reads it. It is not a pin
+            // shortcut: `recordDerivedType` dedupes against both the table and
+            // the types already recorded, so this only ever ADDS the one row
+            // that was missing and re-derives nothing.
+            const derived = try substType(ctx.alloc, return_ty, param_names, concrete_args);
+            ctx.recordDerivedType(node, derived);
         }
     }
 }
@@ -4746,6 +6453,36 @@ fn parseAssertionCondition(reason: []const u8, expr_count: usize) ?exprs.NodeId 
     return condition;
 }
 
+/// Carry the target's declared type into a plain assignment's value.
+///
+/// `x = v` states that `v` IS `x`'s type, and Rust carries that statement
+/// inward. `state.bytes = &[][..]` names no element anywhere in the source —
+/// an empty literal has no sibling to read one from — so the field's own
+/// `&[u16]` is the only thing in the expression that says what the empty slice
+/// holds. The `eq` edge settles the value's own row but stops there: it joins
+/// two nodes without reaching anything underneath them.
+///
+/// Only a value that carries no type of its own is asked, for the same reason
+/// `constrainCompoundAssignment` asks in that order. A value the source
+/// already typed has said what it is, and pushing the target's type onto one
+/// the source coerced — a `&mut [T]` written into a `&[T]`, a `[T; N]` into a
+/// `&[T]` — would replace the borrow qualifier it was written with.
+fn constrainAssignedValue(
+    ctx: *Ctx,
+    target: exprs.NodeId,
+    value: exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    if (getKnownType(ctx, value) != null) return;
+    // A target that names nothing concrete — a cfg-gated declaration, an
+    // `as _` destination, a not-yet-materialized `impl Trait` return — has no
+    // type to state, and the equality edge is the only answer left.
+    const target_ty = getKnownType(ctx, target) orelse return;
+    if (target_ty == .unsupported) return;
+    if (isInferPlaceholderType(target_ty)) return;
+    if (returnTypeNamesNoType(target_ty)) return;
+    try constrainExpectedType(ctx, value, target_ty);
+}
+
 fn constrainCompoundAssignment(
     ctx: *Ctx,
     target: exprs.NodeId,
@@ -4766,6 +6503,24 @@ fn constrainCompoundAssignment(
     } else {
         try addEq(ctx, target, value);
     }
+}
+
+fn tupleLiteralField(ctx: *Ctx, base: exprs.NodeId, index: usize) ?exprs.NodeId {
+    var current = base;
+    for (0..ctx.b.exprs.len) |_| {
+        if (current >= ctx.b.exprs.len) return null;
+        const expression = ctx.b.exprs[current];
+        switch (expression.kind) {
+            .path => |path| current = ctx.def_map.get(path.def) orelse return null,
+            .array => |literal| {
+                const ty = getKnownType(ctx, current) orelse return null;
+                if (ty != .tuple or index >= literal.elements.len) return null;
+                return literal.elements[index];
+            },
+            else => return null,
+        }
+    }
+    return null;
 }
 
 /// Recursively walk an expression node in the graph.
@@ -4794,7 +6549,7 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .if_else => |ie| try walkIf(ctx, node, ie, fn_body),
         .if_let => |il| {
             try walkExpr(ctx, il.scrutinee, fn_body);
-            try bindPattern(ctx, il.pattern, null, getKnownType(ctx, il.scrutinee));
+            _ = try bindPattern(ctx, il.pattern, null, getKnownType(ctx, il.scrutinee));
             try walkBlock(ctx, il.then_, fn_body, null);
             switch (il.@"else") {
                 .none => {},
@@ -4813,7 +6568,7 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             if (w.capture == null) try pinKnownType(ctx, w.cond, .{ .prim = .bool });
             try walkExpr(ctx, w.cond, fn_body);
             if (w.capture) |capture| {
-                try bindPattern(ctx, capture, null, getKnownType(ctx, w.cond));
+                _ = try bindPattern(ctx, capture, null, getKnownType(ctx, w.cond));
             }
             try walkBlock(ctx, w.body, fn_body, null);
         },
@@ -4827,8 +6582,9 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
                 .adapter => |chain| try walkIteratorChain(ctx, chain, fn_body),
             }
             const element_ty = loopElementType(ctx, f.iterable, f.iter_kind);
-            try bindPattern(ctx, f.pattern, null, element_ty);
+            const binding = try bindPattern(ctx, f.pattern, null, element_ty);
             try walkBlock(ctx, f.body, fn_body, null);
+            try unifyRangeBinding(ctx, f.iterable, binding);
         },
         .break_ => |br| {
             if (br.value) |v| {
@@ -4856,6 +6612,17 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .enum_variant => |ev| {
             for (ev.tuple_fields) |f| try walkExpr(ctx, f, fn_body);
             for (ev.named_fields) |f| try walkExpr(ctx, f.value, fn_body);
+            // `Some(x)` is an `Option` where it stands, not only where a
+            // `match` reads one off it, so the identity is recorded here and
+            // every reader of the node gets it.
+            _ = try preludeVariantType(ctx, node);
+            // The same demand the external variants answer: a body that returns
+            // a value from this position says what that value is, and a variant
+            // is no more exempt from it than a call is. A crate's own enum gets
+            // the question asked of it the same way `Option` and `Result` do.
+            if (expectedTypeForTail(ctx, node, fn_body)) |expected| {
+                try constrainExpectedType(ctx, node, expected);
+            }
         },
         .external_variant => |variant| {
             for (variant.tuple_fields) |field| try walkExpr(ctx, field, fn_body);
@@ -4868,6 +6635,9 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         },
         .field => |f| {
             try walkExpr(ctx, f.base, fn_body);
+            if (std.fmt.parseInt(usize, f.field, 10) catch null) |index| {
+                if (tupleLiteralField(ctx, f.base, index)) |element| try addEq(ctx, node, element);
+            }
             if (getKnownType(ctx, node)) |known| try pinKnownType(ctx, node, known);
         },
         .index => |ix| {
@@ -4961,7 +6731,10 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             try walkExpr(ctx, a.target, fn_body);
             try walkExpr(ctx, a.value, fn_body);
             switch (a.op) {
-                .plain => try addEq(ctx, a.target, a.value),
+                .plain => {
+                    try addEq(ctx, a.target, a.value);
+                    try constrainAssignedValue(ctx, a.target, a.value);
+                },
                 .add, .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => try constrainCompoundAssignment(ctx, a.target, a.value),
             }
             try pinKnownType(ctx, node, .{ .prim = .unit });
@@ -4997,6 +6770,14 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .closure => |closure| try walkClosure(ctx, closure, fn_body),
         .iterator_chain => |chain| {
             try walkIteratorChain(ctx, chain, fn_body);
+            // A `collect` in tail position takes its target from the
+            // function's declared return type, the same way the call form
+            // does in `handleCall`. A chain is the call form once the
+            // frontend has folded it into one node, so it needs the same
+            // record or it falls back to a `Vec` of its own items.
+            if (expectedTypeForTail(ctx, node, fn_body)) |expected| {
+                try ctx.expected_types.put(ctx.alloc, node, expected);
+            }
             if (getKnownType(ctx, node)) |known| {
                 if (findTypeIndex(ctx.b, known)) |type_id| {
                     try addPin(ctx, node, type_id);
@@ -5014,7 +6795,74 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
                 if (condition != node) try walkExpr(ctx, condition, fn_body);
             }
         },
-        .array => |a| for (a.elements) |el| try walkExpr(ctx, el, fn_body),
+        .array => |a| {
+            for (a.elements) |el| try walkExpr(ctx, el, fn_body);
+            // A position that says what this literal IS wins over the sibling
+            // rule below, and a tuple is where that matters most. A Rust tuple
+            // `(0, Some(0))` reaches the IR as an array of two elements with no
+            // repeat, exactly as `[0, 0]` does, so nothing in the node says the
+            // elements are unrelated — but the declared `(usize, Option<usize>)`
+            // hands them to each position, and forcing the `Some` to be whatever
+            // the `0` is would invent a type the source never wrote.
+            // An `impl Trait` return names no type this literal can be coerced
+            // to, so it says nothing here and the sibling rule below still runs
+            // — the same guard the `return` arm and `.into()` target apply
+            // before they use a declared return as an expectation.
+            if (expectedTypeForTail(ctx, node, fn_body)) |expected| {
+                if (!returnTypeNamesNoType(expected)) {
+                    try constrainExpectedType(ctx, node, expected);
+                    return;
+                }
+            }
+            if (e.ty) |type_id| {
+                if (type_id < ctx.b.types.len and ctx.b.types[type_id] == .tuple) {
+                    const fields = ctx.b.types[type_id].tuple;
+                    for (a.elements, 0..) |element, index| {
+                        if (index < fields.len and isConcreteDerivedType(fields[index])) {
+                            try constrainExpectedType(ctx, element, fields[index]);
+                        }
+                    }
+                    return;
+                }
+            }
+            // An array literal has ONE element type, and Rust fixes the
+            // elements that name none from the ones that do: in
+            // `[CONTINUATION_BIT, 1]` the sibling says `u8`, so the bare `1` is
+            // a `u8`. Walking the elements leaves that one free, the solver
+            // defaults it to `i32`, and then the array has no element type at
+            // all — so the `let` holding it has none either, and every later
+            // borrow of that binding has no pointee to hand on.
+            //
+            // The same door `.range` opens below for `a..b`: the sibling is
+            // what says so, not a default.
+            var element_type: ?types.Type = null;
+            for (a.elements) |el| {
+                element_type = getKnownType(ctx, el) orelse continue;
+                for (a.elements) |other| {
+                    if (other == el) continue;
+                    try constrainExpectedType(ctx, other, element_type.?);
+                }
+                break;
+            }
+            // The array is itself a value once its element type is known.
+            // Constraining the elements is not enough on its own: with both
+            // elements typed and the literal still carrying no identity, the
+            // `let` that binds it binds nothing, and everything downstream —
+            // the slice range, the borrow, the path — has nothing to carry on.
+            // `pinKnownType` interns the row through the ordinary derived-type
+            // path when the table has not seen it yet, which is the same road
+            // every other derived type takes; nothing here is a default.
+            if (element_type) |elem| {
+                if (ctx.b.exprs[node].ty == null) {
+                    const array = try ctx.alloc.create(types.Array);
+                    array.* = .{
+                        .elem = elem,
+                        .len = .{ .literal = @intCast(a.repeat orelse a.elements.len) },
+                    };
+                    try pinKnownType(ctx, node, .{ .array = array });
+                }
+            }
+        },
         .vec_lit => |vec| for (vec.elements) |el| try walkExpr(ctx, el, fn_body),
         .range => |range| {
             try walkExpr(ctx, range.start, fn_body);
@@ -5077,6 +6925,40 @@ fn constrainInherentMethodArguments(
     }
 }
 
+/// Constrain the argument of a STANDARD method against the parameter its own
+/// signature declares, for the methods whose parameter type is not a type
+/// parameter and so is not reached by the inherent-method path above.
+///
+/// `String::push_str(&mut self, string: &str)` appends borrowed TEXT. Its
+/// argument is a position that says what an expression in it has to be, and a
+/// `"..."` written there carries no type of its own, so the demand is stated
+/// here rather than left for something downstream to guess. It is borrowed
+/// text and not borrowed bytes: only the second one can be `to_owned()` into
+/// the `String` this very call is building.
+///
+/// The receiver decides. A crate's own `String`, a `Vec<u8>`, and a slice
+/// borrow each reach a different runtime type, and a `push_str` this table
+/// does not admit must not have its argument typed as if it were the owned
+/// string's.
+fn constrainStandardMethodArguments(
+    ctx: *Ctx,
+    method_name: []const u8,
+    receiver_ty: ?types.Type,
+    args: []const exprs.NodeId,
+) std.mem.Allocator.Error!void {
+    if (!std.mem.eql(u8, method_name, "push_str")) return;
+    const external = externalNominalBase(receiver_ty orelse return) orelse return;
+    const is_owned_string = external.args.len == 0 and external.path.len == 3 and
+        (std.mem.eql(u8, external.path[0], "alloc") or
+            std.mem.eql(u8, external.path[0], "std")) and
+        std.mem.eql(u8, external.path[1], "string") and
+        std.mem.eql(u8, external.path[2], "String");
+    if (!is_owned_string) return;
+    if (args.len != 1) return;
+    const borrowed_str = makeReferenceType(ctx, types.str_type, false) orelse return;
+    try constrainExpectedType(ctx, args[0], borrowed_str);
+}
+
 /// Pin the result type a method call's own turbofish declares.
 ///
 /// `xs.collect::<Vec<u8>>()` and `s.parse::<u32>()` name the result type at the
@@ -5087,11 +6969,41 @@ fn constrainInherentMethodArguments(
 /// receiver-shaped rule, because that is what Rust does. Returns false when
 /// there is no turbofish, or when substitution cannot produce a concrete
 /// type, leaving the ordinary inference rules to run.
-fn pinTurbofishResultType(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall) std.mem.Allocator.Error!bool {
+///
+/// The call is read from the expression table, not from the copy the walker
+/// holds: `bindTurbofishCollectedElement` rewrites a `collect` turbofish in
+/// place, and a copy taken before that rewrite would substitute a placeholder
+/// the walk has already replaced with the element the receiver's `Item` names.
+fn pinTurbofishResultType(ctx: *Ctx, node: exprs.NodeId) std.mem.Allocator.Error!bool {
+    if (node >= ctx.b.exprs.len) return false;
+    const m = switch (ctx.b.exprs[node].kind) {
+        .method_call => |value| value,
+        else => return false,
+    };
     if (m.generic_args.len == 0) return false;
-    const declared = methodDeclaredReturnType(ctx, m.method) orelse return false;
-    const param_names = getGenericParamNames(ctx, m.method) catch return false;
-    defer ctx.alloc.free(param_names);
+    // The signature the substitution runs on, and the names it binds. A
+    // concrete `fn_` carries both; a bodiless call-site `method_ref` carries
+    // neither, and the trait that declares the method carries both from its
+    // own signature. `getGenericParamNames` hands back a caller-freed
+    // duplicate while a trait signature is read straight out of the body
+    // table, so only the first is owned here.
+    var declared: types.Type = undefined;
+    var owned_names: []const []const u8 = &.{};
+    var param_names: []const []const u8 = &.{};
+    if (methodDeclaredReturnType(ctx, m.method)) |fn_return| {
+        declared = fn_return;
+        param_names = getGenericParamNames(ctx, m.method) catch return false;
+        owned_names = param_names;
+    } else if (getMethodName(ctx, m.method)) |method_name| {
+        const signature = traitDeclaredMethod(
+            ctx,
+            method_name,
+            m.generic_args.len,
+        ) orelse return false;
+        declared = signature.ret;
+        param_names = signature.generic_params;
+    } else return false;
+    defer ctx.alloc.free(owned_names);
     if (param_names.len == 0 or param_names.len != m.generic_args.len) return false;
     // The declared return has to actually mention a parameter: a turbofish on
     // a method that returns something concrete says nothing new, and the
@@ -5227,6 +7139,12 @@ fn bindCollectedElementPlaceholder(
 /// `impl Iterator<Item = (usize, usize)>` and that bound says what it yields.
 /// A receiver that declares no Item binds nothing, and the placeholder is
 /// left standing for the resolver to refuse — this never guesses.
+///
+/// The receiver has to be WALKED before this runs. A receiver this pass has
+/// not descended into has no type of its own yet, so the `Item` this reads
+/// off it is not there to read; the placeholder would survive a walk that
+/// could have completed it, and the call would stay untyped for the rest of
+/// the frontend. Every caller therefore walks the receiver first.
 fn bindTurbofishCollectedElement(ctx: *Ctx, node: exprs.NodeId, receiver: exprs.NodeId) void {
     if (node >= ctx.b.exprs.len or receiver >= ctx.b.exprs.len) return;
     const call = &@constCast(ctx.b.exprs)[node].kind.method_call;
@@ -5239,15 +7157,45 @@ fn bindTurbofishCollectedElement(ctx: *Ctx, node: exprs.NodeId, receiver: exprs.
     }
 }
 
+/// A declared `-> Self` is a statement about the CALLEE's own type. Pinning it
+/// onto a call node carries that statement into the CALLER, where `Self` names
+/// nothing: the caller has no impl in scope to resolve it against, and every
+/// later reader sees a segment called `Self` pointing at an entity called
+/// something else. `CONTROLS.add(b' ')` on a module constant is the shape that
+/// leaks — thirty-three chained calls, each carrying the callee's `Self` into a
+/// context that cannot mean it. The receiver is the one thing at the call site
+/// that answers it, so every `Self` leaf becomes the receiver's own base type
+/// here, at the producer, where the answer exists.
+///
+/// The rewrite itself is the IR's, so one rule serves every caller that has to
+/// carry a `Self` spelling out of the impl that gave it meaning, and a
+/// signature keeps its own shape around the leaf. Null says the declared type
+/// names no `Self` anywhere, and the caller keeps what it already had.
+fn substituteSelfLeaves(ctx: *Ctx, receiver: types.Type, declared: types.Type) ?types.Type {
+    if (!types.mentionsSelf(declared)) return null;
+    const self_type = types.peelCarrier(receiver) orelse return null;
+    // Every failure the IR's rewrite reports answers null here, which means
+    // "keep the declared type" — the spelling the frontend already had, and the
+    // one this whole call chain existed to improve on rather than to guarantee
+    // under memory pressure or past the traversal bound. It cannot mean "half
+    // replaced": the IR's rewrite returns an error rather than a null for every
+    // failure, so nothing partial arrives here.
+    return types.replaceSelfLeaves(ctx.alloc, self_type, declared) catch null;
+}
+
 fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: exprs.NodeId) std.mem.Allocator.Error!void {
-    bindTurbofishCollectedElement(ctx, node, m.receiver);
     const m_name = getMethodName(ctx, m.method) orelse {
         try walkExpr(ctx, m.receiver, fn_body);
         for (m.args) |a| try walkExpr(ctx, a, fn_body);
-        _ = try pinTurbofishResultType(ctx, node, m);
+        bindTurbofishCollectedElement(ctx, node, m.receiver);
+        _ = try pinTurbofishResultType(ctx, node);
         return;
     };
     try walkExpr(ctx, m.receiver, fn_body);
+    // The receiver is walked FIRST: the `Item` an open `collect` turbofish is
+    // completed from is that receiver's own bound, and a receiver this pass
+    // has not descended into has no type to read it off.
+    bindTurbofishCollectedElement(ctx, node, m.receiver);
     const receiver_ty = getKnownType(ctx, m.receiver);
     for (m.args) |a| {
         if (receiver_ty) |known_receiver| {
@@ -5261,12 +7209,17 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
         try walkExpr(ctx, a, fn_body);
     }
     try constrainInherentMethodArguments(ctx, m_name, receiver_ty, m.args);
+    try constrainStandardMethodArguments(ctx, m_name, receiver_ty, m.args);
+    // After the arguments are walked, for the same reason the free-call path is:
+    // a buffer an argument's own literal already typed is left as that literal
+    // typed it, and one nothing else typed is fixed here.
+    try constrainIoSinkMethodArguments(ctx, m_name, receiver_ty, m.args);
     // An explicit turbofish is the caller's own binding for the method's type
     // parameters, so it decides the result type here — ahead of every
     // receiver-shaped rule below, exactly as `recv.m::<u32>()` wins over what
     // `recv` alone would imply. With no turbofish this is a no-op and the
     // existing rules run unchanged.
-    if (try pinTurbofishResultType(ctx, node, m)) return;
+    if (try pinTurbofishResultType(ctx, node)) return;
     if (std.mem.eql(u8, m_name, "ok")) {
         if (receiver_ty) |known_receiver| {
             if (resultPayloadType(known_receiver, false)) |ok_payload| {
@@ -5278,8 +7231,16 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
         return;
     }
     if (receiver_ty) |known_receiver| {
+        if (knownTryArmMethodType(known_receiver, m_name)) |payload| {
+            try pinKnownType(ctx, node, payload);
+            return;
+        }
         if (knownAllocMethodType(ctx, known_receiver, m_name)) |alloc_result| {
             try pinKnownType(ctx, node, alloc_result);
+            return;
+        }
+        if (knownStdIntoType(ctx, node, known_receiver, m_name, fn_body)) |into_result| {
+            try pinKnownType(ctx, node, into_result);
             return;
         }
         if (knownBoundMethodReturnType(ctx, known_receiver, m_name, m.method)) |bound_result| {
@@ -5304,6 +7265,17 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
     if (receiver_ty) |known_receiver| {
         if (knownIteratorMethodType(ctx, m_name, known_receiver, m.args)) |iterator_ty| {
             try pinKnownType(ctx, node, iterator_ty);
+            return;
+        }
+    }
+    // The terminal `collect` is typed from its target: its own turbofish,
+    // completed by `bindTurbofishCollectedElement` from the receiver's
+    // `Item`, or else the position the call sits in. It runs after the
+    // adapter rules because a receiver that is not an `Iterator` has no
+    // `Item` to fill a turbofish with, and those rules are what decide that.
+    if (std.mem.eql(u8, m_name, "collect")) {
+        if (knownCollectTargetType(ctx, node, expectedTypeForTail(ctx, node, fn_body))) |collect_target| {
+            try pinKnownType(ctx, node, collect_target);
             return;
         }
     }
@@ -5336,6 +7308,7 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
     }
 
     if (std.mem.eql(u8, m_name, "split_at") or
+        std.mem.eql(u8, m_name, "split_first") or
         std.mem.eql(u8, m_name, "chunks") or
         std.mem.eql(u8, m_name, "chunks_exact") or
         std.mem.eql(u8, m_name, "remainder"))
@@ -5510,7 +7483,8 @@ fn walkMethodCall(ctx: *Ctx, node: exprs.NodeId, m: exprs.MethodCall, fn_body: e
     }
     if (receiver_ty) |known_receiver| {
         if (knownDeclaredMethodReturnType(ctx, known_receiver, m_name)) |return_type| {
-            try pinKnownType(ctx, node, return_type);
+            const result = substituteSelfLeaves(ctx, known_receiver, return_type) orelse return_type;
+            try pinKnownType(ctx, node, result);
         }
     }
 }
@@ -5732,6 +7706,26 @@ fn finalizeCoreCallTypeArguments(
     }
 }
 
+/// Reason published for a cast whose operand carries no type at all, so the
+/// solver has no source type to check the destination against. `ir.validate`
+/// carries this text out to the caller, which is what turns an opaque
+/// `error.InvalidCast` into a diagnosis naming the construct.
+const unresolved_cast_operand_reason = "unresolved cast operand type";
+
+/// Replace a cast with a named refusal on the non-fatal channel.
+///
+/// The cast is not a wrong cast, it is an unresolved one: the frontend never
+/// typed the operand and never recorded a source type, so `isValidCast` has
+/// nothing to rule on and any verdict it returned would be a guess. Naming the
+/// expression is both safer than guessing and more useful than aborting the
+/// whole crate with an error that does not say which expression was at fault.
+fn markUntypedCastOperand(e: *exprs.Expr) void {
+    e.kind = .{ .unsupported = .{
+        .reason = unresolved_cast_operand_reason,
+        .suggested_version = .v1,
+    } };
+}
+
 /// Run unification solver on pre-computed constraint Gen over `b`.
 pub fn solveWithGen(
     alloc: std.mem.Allocator,
@@ -5860,6 +7854,34 @@ pub fn solveWithGen(
         const root = findRoot(parent, @intCast(i));
         result_types[i] = if (bottom[i]) never_type_id orelse concrete[root] else concrete[root];
     }
+    // Partial tuple rows are private to their source literal. Refine them
+    // only after every child has a solved type; aliases then see the same row.
+    for (b.exprs) |expression| {
+        const literal = switch (expression.kind) {
+            .array => |array| array,
+            else => continue,
+        };
+        if (literal.repeat != null) continue;
+        const type_id = expression.ty orelse continue;
+        if (type_id >= b.types.len or b.types[type_id] != .tuple) continue;
+        const fields = b.types[type_id].tuple;
+        if (fields.len != literal.elements.len or isConcreteDerivedType(b.types[type_id])) continue;
+        var complete = true;
+        for (literal.elements) |element| {
+            const child_type = result_types[element] orelse {
+                complete = false;
+                break;
+            };
+            if (!isConcreteDerivedType(b.types[child_type])) {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete) continue;
+        for (literal.elements, 0..) |element, index| {
+            @constCast(fields)[index] = b.types[result_types[element].?];
+        }
+    }
 
     // Core generic arguments may become knowable only after unification has
     // applied a return-type or assignment constraint.
@@ -5886,16 +7908,28 @@ pub fn solveWithGen(
         const target_is_placeholder = isInferPlaceholderType(b.types[cast.target]);
         const target_is_resolved_wildcard = !target_is_placeholder and
             resolved_wildcards[cast.target];
-        if (std.meta.activeTag(cast.source_type) != .unsupported and
+        const source_type_is_unsupported = std.meta.activeTag(cast.source_type) == .unsupported;
+        if (!source_type_is_unsupported and
             !target_is_placeholder and !target_is_resolved_wildcard)
         {
             continue;
         }
 
-        const source_type_id: ?exprs.TypeId = if (std.meta.activeTag(cast.source_type) == .unsupported)
+        const source_type_id: ?exprs.TypeId = if (source_type_is_unsupported)
             if (cast.operand < result_types.len) result_types[cast.operand] else null
         else
             findTypeIndex(b, cast.source_type);
+        if (source_type_is_unsupported and source_type_id == null and
+            cast.operand < b.exprs.len and b.exprs[cast.operand].ty == null)
+        {
+            // Recorded source type still pending, nothing the solver produced
+            // for the operand, and no type ever interned on it. There is no
+            // source type here, so this cast is unresolved rather than wrong.
+            // Say so by name instead of aborting the crate with an error that
+            // does not identify the expression.
+            markUntypedCastOperand(&@constCast(b.exprs)[node]);
+            continue;
+        }
         const resolved_source_id = source_type_id orelse blk: {
             if (cast.operand < b.exprs.len) {
                 const operand_type = b.exprs[cast.operand].ty orelse return error.InvalidCast;
@@ -5936,7 +7970,7 @@ pub fn solveWithGen(
         if (resolved_source_id >= b.types.len or final_target_id >= b.types.len) {
             return error.InvalidCast;
         }
-        const source_type = if (std.meta.activeTag(cast.source_type) == .unsupported)
+        const source_type = if (source_type_is_unsupported)
             b.types[resolved_source_id]
         else
             cast.source_type;
@@ -7331,4 +9365,50 @@ test "I/O method result requires matching generic bound" {
         .external_nominal = .{ .path = &.{ "std", "io", "Error" } },
     }, result.result.err);
     try std.testing.expect(knownIoMethodResultType(&ctx, receiver, "write_all") == null);
+}
+
+fn nominalPathForTest(
+    alloc: std.mem.Allocator,
+    segments: []const struct { []const u8, ?spine.EntityId },
+) !types.Path {
+    const stored = try alloc.alloc(types.PathSegment, segments.len);
+    for (segments, stored) |source, *target| {
+        target.* = .{ .name = source[0], .id = source[1] };
+    }
+    return .{ .segments = stored };
+}
+
+// The same declaration is written with and without its qualifier:
+// `impl Iterator for crate::enc::Iter` declares the type a receiver `Iter` in
+// that module already names, and the pair was refused for having different
+// segment counts before their ids were ever compared.
+test "a qualified impl self type names the same declaration as a bare receiver" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const qualified = try nominalPathForTest(alloc, &.{
+        .{ "crate", @as(?spine.EntityId, 1) },
+        .{ "enc", null },
+        .{ "Iter", @as(?spine.EntityId, 7) },
+    });
+    const bare = try nominalPathForTest(alloc, &.{.{ "Iter", @as(?spine.EntityId, 7) }});
+    const other = try nominalPathForTest(alloc, &.{.{ "Iter", @as(?spine.EntityId, 8) }});
+    const full_unresolved = try nominalPathForTest(alloc, &.{
+        .{ "core", null },
+        .{ "iter", null },
+        .{ "Iterator", null },
+    });
+    const leaf_unresolved = try nominalPathForTest(alloc, &.{.{ "Iterator", null }});
+
+    try std.testing.expect(sameNominalDeclaration(qualified, bare));
+    try std.testing.expect(sameNominalDeclaration(bare, qualified));
+    try std.testing.expect(!sameNominalDeclaration(qualified, other));
+    // One side resolved and the other not is a comparison this pass cannot
+    // make; the spelling must not stand in for the missing id.
+    try std.testing.expect(!sameNominalDeclaration(qualified, leaf_unresolved));
+    try std.testing.expect(!sameNominalDeclaration(leaf_unresolved, qualified));
+    // Two fully unresolved paths fall back to the spelling, and that is the
+    // whole spelling: a leaf alone never stands for a full path.
+    try std.testing.expect(!sameNominalDeclaration(full_unresolved, leaf_unresolved));
 }

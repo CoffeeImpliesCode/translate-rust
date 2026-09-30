@@ -417,6 +417,23 @@ fn mapArrayLen(e: *Ctx, node: ts.Node) TypeMapError!types.ArrayLen {
     return .{ .literal = @intCast(value) };
 }
 
+/// Whether a `tuple_type` node really is a Rust tuple rather than a
+/// parenthesized type.
+///
+/// Rust groups a type with parentheses — `&(dyn Error + 'static)`, and the
+/// plain `(T)` that reads the same way — and needs a trailing comma to spell a
+/// one-element tuple: `(T,)`. The vendored grammar has no node for the
+/// grouping form, so both arrive as a `tuple_type` with one child and the
+/// comma is the only thing that separates them. More than one child is a
+/// tuple in either spelling.
+fn isTupleTypeNode(node: ts.Node, raw: []const u8) bool {
+    if (node.namedChildCount() != 1) return true;
+    const outer = std.mem.trim(u8, raw, " \t\r\n");
+    if (outer.len < 2 or !std.mem.endsWith(u8, outer, ")")) return true;
+    const inner = std.mem.trimEnd(u8, outer[0 .. outer.len - 1], " \t\r\n");
+    return std.mem.endsWith(u8, inner, ",");
+}
+
 /// Lower a tree-sitter type node into a wire `types.Type`.
 fn mapType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
     const kind = node.kind();
@@ -452,15 +469,6 @@ fn mapType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
                 const s = try e.alloc.create(types.Slice);
                 s.* = .{ .const_ = !mut, .elem = elem };
                 return .{ .slice = s };
-            }
-            if (std.mem.eql(u8, inn.kind(), "primitive_type") and std.mem.eql(u8, text(e, inn), "str")) {
-                const s = try e.alloc.create(types.Slice);
-                s.* = .{ .const_ = !mut, .elem = .{ .prim = .u8 } };
-                return .{ .slice = s };
-            }
-            if (std.mem.eql(u8, inn.kind(), "array_type")) {
-                const mapped: types.Type = try mapType(e, inn);
-                return mapped;
             }
             const r = try e.alloc.create(types.Ref);
             errdefer e.alloc.destroy(r);
@@ -542,6 +550,10 @@ fn mapType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
             try tup.append(e.alloc, try mapType(e, c));
         }
         if (tup.items.len == 0) return .{ .prim = .unit };
+        if (tup.items.len == 1 and !isTupleTypeNode(node, text(e, node))) {
+            // `(T)` groups; only `(T,)` is a one-element tuple.
+            return tup.items[0];
+        }
         const tuple_types: []const types.Type = try tup.toOwnedSlice(e.alloc);
         return .{ .tuple = tuple_types };
     }
@@ -644,77 +656,6 @@ fn isKnownExternalCrate(g: *const graph.CrateGraph, name: []const u8) bool {
     return false;
 }
 
-fn preludeExternalPath(name: []const u8) ?[]const []const u8 {
-    if (std.mem.eql(u8, name, "String")) return &.{ "alloc", "string", "String" };
-    if (std.mem.eql(u8, name, "Vec")) return &.{ "alloc", "vec", "Vec" };
-    if (std.mem.eql(u8, name, "From")) return &.{ "core", "convert", "From" };
-    if (std.mem.eql(u8, name, "Into")) return &.{ "core", "convert", "Into" };
-    if (std.mem.eql(u8, name, "TryFrom")) return &.{ "core", "convert", "TryFrom" };
-    if (std.mem.eql(u8, name, "TryInto")) return &.{ "core", "convert", "TryInto" };
-    if (std.mem.eql(u8, name, "AsRef")) return &.{ "core", "convert", "AsRef" };
-    if (std.mem.eql(u8, name, "AsMut")) return &.{ "core", "convert", "AsMut" };
-    if (std.mem.eql(u8, name, "Default")) return &.{ "core", "default", "Default" };
-    if (std.mem.eql(u8, name, "Clone")) return &.{ "core", "clone", "Clone" };
-    if (std.mem.eql(u8, name, "Copy")) return &.{ "core", "marker", "Copy" };
-    if (std.mem.eql(u8, name, "Send")) return &.{ "core", "marker", "Send" };
-    if (std.mem.eql(u8, name, "Sync")) return &.{ "core", "marker", "Sync" };
-    if (std.mem.eql(u8, name, "Sized")) return &.{ "core", "marker", "Sized" };
-    if (std.mem.eql(u8, name, "Unpin")) return &.{ "core", "marker", "Unpin" };
-    if (std.mem.eql(u8, name, "Fn")) return &.{ "core", "ops", "Fn" };
-    if (std.mem.eql(u8, name, "FnMut")) return &.{ "core", "ops", "FnMut" };
-    if (std.mem.eql(u8, name, "FnOnce")) return &.{ "core", "ops", "FnOnce" };
-    if (std.mem.eql(u8, name, "Drop")) return &.{ "core", "ops", "Drop" };
-    if (std.mem.eql(u8, name, "Iterator")) return &.{ "core", "iter", "Iterator" };
-    if (std.mem.eql(u8, name, "IntoIterator")) return &.{ "core", "iter", "IntoIterator" };
-    if (std.mem.eql(u8, name, "DoubleEndedIterator")) return &.{ "core", "iter", "DoubleEndedIterator" };
-    if (std.mem.eql(u8, name, "ExactSizeIterator")) return &.{ "core", "iter", "ExactSizeIterator" };
-    if (std.mem.eql(u8, name, "Extend")) return &.{ "core", "iter", "Extend" };
-    if (std.mem.eql(u8, name, "Debug")) return &.{ "core", "fmt", "Debug" };
-    if (std.mem.eql(u8, name, "Display")) return &.{ "core", "fmt", "Display" };
-    if (std.mem.eql(u8, name, "Hash")) return &.{ "core", "hash", "Hash" };
-    if (std.mem.eql(u8, name, "Hasher")) return &.{ "core", "hash", "Hasher" };
-    if (std.mem.eql(u8, name, "PartialEq")) return &.{ "core", "cmp", "PartialEq" };
-    if (std.mem.eql(u8, name, "Eq")) return &.{ "core", "cmp", "Eq" };
-    if (std.mem.eql(u8, name, "PartialOrd")) return &.{ "core", "cmp", "PartialOrd" };
-    if (std.mem.eql(u8, name, "Ord")) return &.{ "core", "cmp", "Ord" };
-    if (std.mem.eql(u8, name, "Add")) return &.{ "core", "ops", "Add" };
-    if (std.mem.eql(u8, name, "Sub")) return &.{ "core", "ops", "Sub" };
-    if (std.mem.eql(u8, name, "Mul")) return &.{ "core", "ops", "Mul" };
-    if (std.mem.eql(u8, name, "Div")) return &.{ "core", "ops", "Div" };
-    if (std.mem.eql(u8, name, "Rem")) return &.{ "core", "ops", "Rem" };
-    if (std.mem.eql(u8, name, "Not")) return &.{ "core", "ops", "Not" };
-    if (std.mem.eql(u8, name, "BitAnd")) return &.{ "core", "ops", "BitAnd" };
-    if (std.mem.eql(u8, name, "BitOr")) return &.{ "core", "ops", "BitOr" };
-    if (std.mem.eql(u8, name, "BitXor")) return &.{ "core", "ops", "BitXor" };
-    if (std.mem.eql(u8, name, "Shl")) return &.{ "core", "ops", "Shl" };
-    if (std.mem.eql(u8, name, "Shr")) return &.{ "core", "ops", "Shr" };
-    if (std.mem.eql(u8, name, "Neg")) return &.{ "core", "ops", "Neg" };
-    if (std.mem.eql(u8, name, "AddAssign")) return &.{ "core", "ops", "AddAssign" };
-    if (std.mem.eql(u8, name, "SubAssign")) return &.{ "core", "ops", "SubAssign" };
-    if (std.mem.eql(u8, name, "MulAssign")) return &.{ "core", "ops", "MulAssign" };
-    if (std.mem.eql(u8, name, "DivAssign")) return &.{ "core", "ops", "DivAssign" };
-    if (std.mem.eql(u8, name, "RemAssign")) return &.{ "core", "ops", "RemAssign" };
-    if (std.mem.eql(u8, name, "BitAndAssign")) return &.{ "core", "ops", "BitAndAssign" };
-    if (std.mem.eql(u8, name, "BitOrAssign")) return &.{ "core", "ops", "BitOrAssign" };
-    if (std.mem.eql(u8, name, "BitXorAssign")) return &.{ "core", "ops", "BitXorAssign" };
-    if (std.mem.eql(u8, name, "ShlAssign")) return &.{ "core", "ops", "ShlAssign" };
-    if (std.mem.eql(u8, name, "ShrAssign")) return &.{ "core", "ops", "ShrAssign" };
-    if (std.mem.eql(u8, name, "Index")) return &.{ "core", "ops", "Index" };
-    if (std.mem.eql(u8, name, "IndexMut")) return &.{ "core", "ops", "IndexMut" };
-    if (std.mem.eql(u8, name, "Deref")) return &.{ "core", "ops", "Deref" };
-    if (std.mem.eql(u8, name, "DerefMut")) return &.{ "core", "ops", "DerefMut" };
-    return null;
-}
-
-fn preludePathSegments(allocator: std.mem.Allocator, name: []const u8) !?[]const types.PathSegment {
-    const external = preludeExternalPath(name) orelse return null;
-    const segments = try allocator.alloc(types.PathSegment, external.len);
-    for (external, 0..) |seg_name, i| {
-        segments[i] = .{ .name = try allocator.dupe(u8, seg_name), .id = null };
-    }
-    return segments;
-}
-
 /// The `alloc`/`core`/`std` path bound by the `extern crate` use alias `name`
 /// in the module that owns `owner_id`, or null when `name` is not one. The
 /// result borrows from the graph, which owns both the slice and its segments,
@@ -738,6 +679,47 @@ fn externalUseAlias(
         if (external.path.len == 0) return null;
         if (found != null) return null;
         found = external.path;
+    }
+    return found;
+}
+
+/// The external path a glob import makes visible under `name` in the module
+/// that owns `owner_id`, or null when no single glob source binds it. A glob
+/// publishes only what its source module exports, so only a `pub use` of an
+/// external path counts. Two glob sources binding the same name are ambiguous
+/// and resolve to null, matching `externalUseAlias`.
+fn globExternalUseAlias(
+    g: *const graph.CrateGraph,
+    owner_id: spine.EntityId,
+    name: []const u8,
+) ?[]const []const u8 {
+    const module_id = owningModule(g, owner_id) orelse return null;
+    var found: ?[]const []const u8 = null;
+    for (g.uses.items) |use_decl| {
+        if (use_decl.kind != .glob) continue;
+        const glob_entity = g.symbol_table.get(use_decl.id) orelse continue;
+        if (glob_entity.parent != module_id) continue;
+        const source_id = use_decl.target;
+        const source = g.symbol_table.get(source_id) orelse continue;
+        if (source.kind != .module) continue;
+        var source_found: ?[]const []const u8 = null;
+        for (g.uses.items) |exported| {
+            const exported_entity = g.symbol_table.get(exported.id) orelse continue;
+            if (exported_entity.kind != .use_) continue;
+            if (exported_entity.parent != source_id) continue;
+            if (!exported.is_pub_export) continue;
+            if (!std.mem.eql(u8, exported.local_name, name)) continue;
+            const external = switch (exported.kind) {
+                .external => |value| value,
+                else => continue,
+            };
+            if (external.path.len == 0) continue;
+            if (source_found != null) return null;
+            source_found = external.path;
+        }
+        if (source_found == null) continue;
+        if (found != null) return null;
+        found = source_found;
     }
     return found;
 }
@@ -947,7 +929,7 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
     if (!had_scoped_segments and prelude_visible and
         (std.mem.eql(u8, nm, "String") or std.mem.eql(u8, nm, "Vec")))
     {
-        const prelude_path = preludeExternalPath(nm).?;
+        const prelude_path = ts_ext.preludeExternalPath(nm).?;
         const external_path = try e.alloc.alloc([]const u8, prelude_path.len);
         var copied: usize = 0;
         errdefer {
@@ -981,7 +963,7 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         const bound = bindPathWithPrelude(e.g, e.bodies_list.items, owner_id, &.{}, &path) catch |err| switch (err) {
             error.UnresolvedNominalType => {
                 if (!had_scoped_segments) {
-                    if (preludeExternalPath(nm)) |prelude_path| {
+                    if (ts_ext.preludeExternalPath(nm)) |prelude_path| {
                         const ext_path = try e.alloc.alloc([]const u8, prelude_path.len);
                         for (prelude_path, 0..) |seg, i| {
                             ext_path[i] = try e.alloc.dupe(u8, seg);
@@ -1178,6 +1160,11 @@ fn bodyHasGenericParam(body: bodies.BodyKind, name: []const u8) bool {
                     };
                     if (std.mem.eql(u8, param_name, name)) return true;
                 }
+            }
+        },
+        .enum_ => |enum_body| {
+            for (enum_body.generic_params) |param| {
+                if (std.mem.eql(u8, param, name)) return true;
             }
         },
         .type_alias => |alias_body| {
@@ -1575,13 +1562,14 @@ pub const BoundPath = enum {
     external,
 };
 
-/// Rewrites `path` in place so it names an external type. Two forms reach this
-/// step: a path rooted at `core`/`std`/`alloc`, and a path whose segment at
+/// Rewrites `path` in place so it names an external type. Three forms reach
+/// this step: a path rooted at `core`/`std`/`alloc`, a path whose segment at
 /// `index` is an `extern crate` use alias (`use core::slice;` then
-/// `slice::Iter`). External names are never graph entities, so the rewritten
-/// segments are provenance-only. The previous segment array is left to its
-/// owner, which may still reference it. Returns false when neither form
-/// applies.
+/// `slice::Iter`), and a path whose segment a glob import publishes
+/// (`mod m { pub use core::fmt; }` then `use m::*;` and `fmt::Formatter`).
+/// External names are never graph entities, so the rewritten segments are
+/// provenance-only. The previous segment array is left to its owner, which
+/// may still reference it. Returns false when none of the forms applies.
 fn bindExternalNominalPath(
     g: *const graph.CrateGraph,
     owner_id: spine.EntityId,
@@ -1589,7 +1577,8 @@ fn bindExternalNominalPath(
     index: usize,
 ) DeclarationTypeError!bool {
     const root = path.segments[index].name;
-    const alias = externalUseAlias(g, owner_id, root) orelse {
+    const alias = externalUseAlias(g, owner_id, root) orelse
+        globExternalUseAlias(g, owner_id, root) orelse {
         // An absolute external root already spells the whole path; only the
         // provenance-only ids need clearing. A bare `std` names the crate, not
         // a type, so a root segment needs a nominal segment after it.
@@ -1722,7 +1711,7 @@ fn bindPathWithPrelude(
     return bindPath(g, bodies_list, owner_id, extra_generic_params, path) catch |err| switch (err) {
         error.UnresolvedNominalType => {
             if (path.segments.len == 1) {
-                if (preludePathSegments(g.allocator, path.segments[0].name) catch null) |segments| {
+                if (ts_ext.preludePathSegments(g.allocator, path.segments[0].name) catch null) |segments| {
                     path.segments = segments;
                     return .external;
                 }
@@ -2406,7 +2395,7 @@ fn parseTraitBound(e: *Ctx, node: ts.Node) !?types.Bound {
         break :blk .{ .segments = segs };
     };
     if (bound_path.segments.len == 1) {
-        if (preludePathSegments(e.alloc, bound_path.segments[0].name) catch null) |prelude_segs| {
+        if (ts_ext.preludePathSegments(e.alloc, bound_path.segments[0].name) catch null) |prelude_segs| {
             bound_path.segments = prelude_segs;
         }
     }
@@ -2677,6 +2666,35 @@ fn nominalItemId(e: *const Ctx) ?spine.EntityId {
     return @intCast(e.bodies_list.items.len - 1);
 }
 
+/// Type parameter names a nominal declaration introduces, in source order. A
+/// bare parameter is a `type_identifier` child of `type_parameters`; one that
+/// carries bounds or a default arrives wrapped in `type_parameter`.
+fn collectTypeParameterNames(e: *Ctx, item: ts.Node) ![]const []const u8 {
+    var params: std.ArrayListUnmanaged([]const u8) = .empty;
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (!std.mem.eql(u8, child.kind(), "type_parameters")) continue;
+
+        var j: u32 = 0;
+        while (child.namedChild(j)) |parameter| : (j += 1) {
+            const parameter_kind = parameter.kind();
+            if (std.mem.eql(u8, parameter_kind, "type_identifier")) {
+                try params.append(e.alloc, try e.alloc.dupe(u8, text(e, parameter)));
+                continue;
+            }
+            if (!std.mem.eql(u8, parameter_kind, "type_parameter") and
+                !std.mem.eql(u8, parameter_kind, "const_parameter")) continue;
+            var k: u32 = 0;
+            while (parameter.namedChild(k)) |parameter_child| : (k += 1) {
+                if (!std.mem.eql(u8, parameter_child.kind(), "type_identifier")) continue;
+                try params.append(e.alloc, try e.alloc.dupe(u8, text(e, parameter_child)));
+                break;
+            }
+        }
+    }
+    return params.toOwnedSlice(e.alloc);
+}
+
 fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     var name: []const u8 = "";
     var fields_node: ?ts.Node = null;
@@ -2779,12 +2797,17 @@ fn enumItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
         }
     }
     const variants_slice: []const items.Variant = try variants.toOwnedSlice(e.alloc);
-    e.bodies_list.items[eid] = .{ .enum_ = .{
-        .kind = kind,
-        .variants = variants_slice,
-        .repr_int = null,
-        .non_exhaustive = false,
-    } };
+    e.bodies_list.items[eid] = .{
+        .enum_ = .{
+            .kind = kind,
+            // A variant field type names the enum's own parameter, so the names
+            // must survive on the body for binding and validation.
+            .generic_params = try collectTypeParameterNames(e, item),
+            .variants = variants_slice,
+            .repr_int = null,
+            .non_exhaustive = false,
+        },
+    };
 }
 
 fn unionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
@@ -2801,6 +2824,7 @@ fn unionItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     const union_fields: []const items.Field = if (fields_node) |fn_| try mapFields(e, fn_) else &.{};
     e.bodies_list.items[eid] = .{ .struct_ = .{
         .layout = .named,
+        .generic_params = try collectTypeParameterNames(e, item),
         .fields = union_fields,
     } };
 }
@@ -3465,54 +3489,6 @@ fn lowerConstArray(
     return id;
 }
 
-fn hexDigit(value: u8) ?u8 {
-    if (value >= '0' and value <= '9') return value - '0';
-    if (value >= 'a' and value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' and value <= 'F') return value - 'A' + 10;
-    return null;
-}
-
-fn decodeEscapedBytes(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-    var bytes: std.ArrayListUnmanaged(u8) = .empty;
-    defer bytes.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < body.len) {
-        const current = body[i];
-        if (current != '\\') {
-            try bytes.append(allocator, current);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if (i >= body.len) return error.InvalidLiteral;
-        const escaped = body[i];
-        switch (escaped) {
-            'n' => try bytes.append(allocator, '\n'),
-            'r' => try bytes.append(allocator, '\r'),
-            't' => try bytes.append(allocator, '\t'),
-            '0' => try bytes.append(allocator, 0),
-            '\\' => try bytes.append(allocator, '\\'),
-            '"' => try bytes.append(allocator, '"'),
-            '\'' => try bytes.append(allocator, '\''),
-            'x' => {
-                if (i + 2 >= body.len) return error.InvalidLiteral;
-                const high = hexDigit(body[i + 1]) orelse return error.InvalidLiteral;
-                const low = hexDigit(body[i + 2]) orelse return error.InvalidLiteral;
-                try bytes.append(allocator, high * 16 + low);
-                i += 2;
-            },
-            '\n' => {},
-            '\r' => {
-                if (i + 1 < body.len and body[i + 1] == '\n') i += 1;
-            },
-            else => return error.InvalidLiteral,
-        }
-        i += 1;
-    }
-    return bytes.toOwnedSlice(allocator);
-}
-
 fn decodeRawBytes(allocator: std.mem.Allocator, raw: []const u8, prefix_len: usize) !?[]const u8 {
     var marker = prefix_len;
     var hash_count: usize = 0;
@@ -3544,13 +3520,13 @@ fn decodeRustByteLiteral(allocator: std.mem.Allocator, raw: []const u8) !?[]cons
     if (quote == '\'') {
         if (raw.len < prefix_len + 3) return null;
         if (raw[raw.len - 1] != '\'') return null;
-        const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+        const bytes = try ts_ext.decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1], false);
         if (bytes.len == 1) return bytes;
         allocator.free(bytes);
         return null;
     }
     if (quote != '"' or raw.len < prefix_len + 2 or raw[raw.len - 1] != '"') return null;
-    const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1]);
+    const bytes = try ts_ext.decodeEscapedBytes(allocator, raw[prefix_len + 1 .. raw.len - 1], false);
     return bytes;
 }
 
@@ -3577,7 +3553,7 @@ fn lowerConstString(e: *Ctx, node: ts.Node) !exprs.NodeId {
     if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') {
         return error.InvalidLiteral;
     }
-    const bytes = try e.alloc.dupe(u8, raw[1 .. raw.len - 1]);
+    const bytes = try ts_ext.decodeEscapedBytes(e.alloc, raw[1 .. raw.len - 1], true);
     errdefer e.alloc.free(bytes);
     const id: exprs.NodeId = try appendExpr(e, .{ .literal = .{ .string = .{ .bytes = bytes } } });
     return id;
@@ -3587,6 +3563,9 @@ const ConstLowerError = std.mem.Allocator.Error || error{
     InvalidConstArray,
     InvalidLiteral,
     UnsupportedConstInitializer,
+    /// A `Self` substitution refused for depth rather than carried through:
+    /// the method's own return type is answered as a whole or not at all.
+    InvalidTypeTraversal,
 };
 
 /// Parsed integer text, with the Rust-only suffix separated from the digits.
@@ -4167,8 +4146,42 @@ fn lowerConstMethodCall(
         .fn_ => |body| body,
         else => return error.UnsupportedConstInitializer,
     };
+    // The declared return may name `Self`, and `Self` belongs to the callee's
+    // own impl: a const initializer has no impl in scope, so a `Self` left
+    // standing here reaches every later reader as a segment called `Self`
+    // pointing at an entity called something else. The receiver answers it —
+    // the method was resolved from the receiver's own nominal a few lines up,
+    // so that nominal is exactly what `Self` means here — and the rewrite keeps
+    // every container the signature put around the leaf, so `Option<Self>`
+    // stays an `Option` and `Result<Self, E>` keeps its `E`.
+    //
+    // `mentionsSelf` answers conservatively, so a return type too deep for the
+    // walk to see the end of enters this branch on purpose. The refusal is the
+    // IR's own `InvalidTypeTraversal` and travels out of here as an error,
+    // rather than reaching the `orelse` below and being read as "there was no
+    // `Self` to rewrite" — which is the only thing that null means.
+    //
+    // What is bound is the REWRITTEN type, not the method's own row: filling in
+    // a segment id on the signature every reader inside that impl still reads is
+    // a shared-row mutation, and skipping the bind instead is not an answer
+    // either — a sibling that is not a `Self` leaf still needs its own
+    // resolution, and `Pair<u8, u8>` declared after its impl would otherwise
+    // stay an unresolved id in the `Err` slot of a const that runs before
+    // declarations are bound. Binding the rewrite resolves that sibling in the
+    // method's own context, where its names mean the same thing they do inside
+    // the impl, and leaves the callee's signature untouched.
     var method_ret = method_body.ret;
-    try bindConstTypeForOwner(e, method_id, &.{}, &method_ret);
+    var receiver_typed: ?types.Type = null;
+    if (types.mentionsSelf(method_ret)) {
+        const self_type = types.peelCarrier(receiver_ty) orelse
+            return error.UnsupportedConstInitializer;
+        var rewritten = try types.replaceSelfLeaves(e.alloc, self_type, method_ret) orelse
+            return error.UnsupportedConstInitializer;
+        try bindConstTypeForOwner(e, method_id, &.{}, &rewritten);
+        receiver_typed = rewritten;
+    } else {
+        try bindConstTypeForOwner(e, method_id, &.{}, &method_ret);
+    }
     const params = if (method_body.params.len > 0 and
         std.mem.eql(u8, method_body.params[0].name, "self"))
         method_body.params[1..]
@@ -4195,7 +4208,10 @@ fn lowerConstMethodCall(
         .method = method_id,
         .args = owned_args,
     } });
-    try setConstExprType(e, id, expected orelse method_ret);
+    // What the call produces is what the receiver says it produces. `expected`
+    // is the annotation of the POSITION, which decides the type only for a call
+    // the receiver cannot speak for.
+    try setConstExprType(e, id, receiver_typed orelse expected orelse method_ret);
     return id;
 }
 
@@ -4854,7 +4870,7 @@ fn implItem(
             }
             if (impl_trait_path) |*tp| {
                 if (tp.segments.len == 1) {
-                    if (preludePathSegments(e.alloc, tp.segments[0].name) catch null) |prelude_segs| {
+                    if (ts_ext.preludePathSegments(e.alloc, tp.segments[0].name) catch null) |prelude_segs| {
                         tp.segments = prelude_segs;
                     }
                 }
@@ -8088,4 +8104,232 @@ test "cst records type alias generic parameters on the alias body" {
         .path => |path| path,
         else => return error.TestUnexpectedResult,
     }, &.{"V"});
+}
+
+test "cst binds an enum parameter named in a variant field type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub enum Error<E> {
+        \\    Other(E),
+        \\    WouldBlock,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const enum_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .enum_ and std.mem.eql(u8, entity.name, "Error")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[enum_id]) {
+        .enum_ => |enum_body| enum_body,
+        else => return error.TestUnexpectedResult,
+    };
+    // The variant field names the enum's own parameter, so the name must
+    // survive on the body for binding and for validation's generic context.
+    try std.testing.expectEqual(@as(usize, 1), body.generic_params.len);
+    try std.testing.expectEqualStrings("E", body.generic_params[0]);
+    const variant_fields = switch (body.variants[0].fields) {
+        .tuple => |fields| fields,
+        else => return error.TestUnexpectedResult,
+    };
+    try expectSegmentNames(switch (variant_fields[0]) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    }, &.{"E"});
+}
+
+test "cst rejects an unresolvable enum variant field type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        // Recording the enum's parameters must not make any name bindable.
+        .src = "pub enum Error<E> { Other(Missing) }",
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
+}
+
+test "cst binds a union parameter named in a field type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src = "pub union Either<T> { left: T, right: u8 }",
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // A union shares the struct body shape, so its parameters must be
+    // recorded on the same field the binder reads them from.
+    const union_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .union_ and std.mem.eql(u8, entity.name, "Either")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[union_id]) {
+        .struct_ => |struct_body| struct_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), body.generic_params.len);
+    try std.testing.expectEqualStrings("T", body.generic_params[0]);
+    try expectSegmentNames(switch (body.fields[0].ty) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    }, &.{"T"});
+}
+
+test "cst binds a glob re-exported external name in a type position" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\mod coreprovider {
+        \\    pub use core::fmt;
+        \\}
+        \\use coreprovider::*;
+        \\pub fn format(_: &mut fmt::Formatter) {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // The glob publishes `fmt`, so the parameter must bind to the full
+    // external path rather than reject the path.
+    const fn_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "format")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[fn_id]) {
+        .fn_ => |fn_body| fn_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), body.params.len);
+    const pointee = switch (body.params[0].ty) {
+        .reference => |reference| reference.pointee,
+        else => return error.TestUnexpectedResult,
+    };
+    const external = switch (pointee) {
+        .external_nominal => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const expected_path = [_][]const u8{ "core", "fmt", "Formatter" };
+    try std.testing.expectEqual(expected_path.len, external.path.len);
+    for (expected_path, external.path) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "cst rejects a glob name that its source module does not export" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        // A private `use` is not re-exported, so the glob must not publish it.
+        .src =
+        \\mod coreprovider {
+        \\    use core::fmt;
+        \\}
+        \\use coreprovider::*;
+        \\pub fn format(_: &mut fmt::Formatter) {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
+}
+
+test "cst rejects a glob name two glob sources both publish" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        // Two globs binding the same name is ambiguous, as in Rust.
+        .src =
+        \\mod a {
+        \\    pub use core::cell::Cell;
+        \\}
+        \\mod b {
+        \\    pub use core::cell::Cell;
+        \\}
+        \\use a::*;
+        \\use b::*;
+        \\pub fn take(_: Cell) {}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
 }

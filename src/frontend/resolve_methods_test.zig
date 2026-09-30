@@ -1278,6 +1278,132 @@ test "a to_string result compares as an owned String" {
     try std.testing.expect(b.exprs[7].kind == .binary);
 }
 
+test "a slice len result is a primitive operand of an operator" {
+    // `hex/src/lib.rs:315, 318` and `:368, 375` are exactly this shape:
+    //     if data.len() % 2 != 0 { .. }
+    // The resolver admits `len` on a slice, so the call is left in the tree
+    // with nothing marked on it, and the operator is the only place left that
+    // can say what it reads. A `usize` result type is what it says, and that is
+    // also what makes the operand primitive, so the two halves agree instead
+    // of one admitting the operator and the other refusing its operand.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const len_method = try addEntity(&g, a, .fn_, "len", root);
+
+    var types_store = [_]types.Type{
+        .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
+    };
+
+    // 0 is the slice, 1 its `len()`, 2 the literal `*` multiplies, 3 the
+    // operator over the two.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = len_method,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
+            .text = "2",
+            .value = 2,
+            .base = .dec,
+            .ty_suffix = null,
+        } } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .mul,
+            .overflow = .wrapping,
+            .lhs = 1,
+            .rhs = 2,
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 0), stats.unsupported_operators);
+    try std.testing.expect(b.exprs[3].kind == .binary);
+}
+
+test "a len this pass cannot type still refuses its operator" {
+    // The same `len` name on the other side of the boundary. `impl
+    // ExactSizeIterator for Bytes { fn len(&self) -> usize }` resolves as an
+    // ordinary trait method, so the call is dispatched and nothing on it is
+    // marked, but no runtime `len` backs it and this pass names no result
+    // type for it. The operator is then refused with the reason that says
+    // which half is missing, and the call itself stays dispatchable.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const bytes = try addEntity(&g, a, .struct_, "Bytes", root);
+    const exact_size = try addEntity(&g, a, .impl_, "iter::ExactSizeIterator for Bytes", root);
+    const len_method = try addEntity(&g, a, .fn_, "len", exact_size);
+
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "Bytes", .id = bytes }} } },
+    };
+
+    // Same four nodes as the slice case, one owner type apart.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = len_method,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
+            .text = "2",
+            .value = 2,
+            .base = .dec,
+            .ty_suffix = null,
+        } } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .mul,
+            .overflow = .wrapping,
+            .lhs = 1,
+            .rhs = 2,
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.trait_resolved);
+    try std.testing.expectEqual(@as(usize, 0), stats.unsupported_methods);
+    try std.testing.expectEqual(@as(usize, 1), stats.unsupported_operators);
+    try expectUnsupportedReason(
+        &b.exprs[3],
+        "operator operand is a dispatched method call whose result type this pass does not name",
+    );
+    // The call is untouched: only the operator reads an unnameable value.
+    try std.testing.expect(b.exprs[1].kind == .method_call);
+}
+
 // ── Equality pair rules: what is admitted, and what is refused on purpose ──
 //
 // `r2z.ops.equal` walks a list-backed owner by descending into the list it
@@ -1710,28 +1836,19 @@ test "String::into_bytes dispatches on the owned string and nowhere else" {
     try expectUnsupported(&b.exprs[7]);
 }
 
-test "a blanket AsRef<[u8]> impl names no receiver type, so an untyped array literal stops there" {
-    // `[0x66, 0x6f, 0x6f, 0x62, 0x61, 0x72]` is `[T; 6]` for whatever `T` the
-    // surrounding context fixes, so the literal itself proves no element type
-    // and `arrayReceiverType` leaves it untyped. `impl<T: AsRef<[u8]>> ToHex
-    // for T` does admit it — the declared bound is the only evidence that
-    // says so, and an array `[E; N]` meets `AsRef<[u8]>` only for `E = u8`.
-    // But the bound never says WHICH `T`, and a call needs exactly that:
+test "an owned String reads its own bytes, and a chain off them reads a slice" {
+    // `text.as_bytes()` is not a slice's own `as_bytes`: the receiver is the
+    // runtime's `r2z.alloc.String`, and what the call hands back is a borrow of
+    // the bytes that string owns. That borrow is what makes
+    // `text.as_bytes().len()` a slice `len` over a typed `usize` operand rather
+    // than an untyped one, and it is why the chain is worth a test of its own.
     //
-    //   * the result type. `encode_hex<U: FromIterator<char>>(&self) -> U`
-    //     is fixed only at the call site, `exprs.MethodCall` carries no type
-    //     arguments, and the frontend drops a turbofish, so
-    //     `encode_hex::<String>()` binds nothing anywhere in the IR.
-    //   * the method itself. The Zig backend hoists a method onto the type
-    //     that implements it, and a blanket impl over a type parameter has no
-    //     such type: `validateMethodTopology` refuses it with
-    //     `error.GenericDefinitionMismatch`.
-    //
-    // Resolving the call would only move that failure downstream and hide it,
-    // so it is refused here with a reason that names the cause. The refusal is
-    // DELIBERATE: an element type is never invented from the literals'
-    // magnitudes, and a receiver that has a type of its own still reaches the
-    // impl through the ordinary name lookup.
+    // A `&str` is the other runtime type that answers — `str::as_bytes` hands
+    // back the very bytes the borrow already points at, no copy — so it is
+    // checked here as a positive rather than as a refusal. The `Vec<u8>` this
+    // test used to carry is gone: `Vec` has no `as_bytes` in Rust at all, so
+    // the call was never a shape this resolver could be right about either way,
+    // and pinning a refusal on it asserted a fact about Rust that is false.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1739,7 +1856,123 @@ test "a blanket AsRef<[u8]> impl names no receiver type, so an untyped array lit
     defer g.deinit();
 
     const root = try addEntity(&g, a, .module, "", null);
-    _ = try addEntity(&g, a, .trait_, "ToHex", root);
+    const as_bytes = try addEntity(&g, a, .fn_, "as_bytes", root);
+    const len = try addEntity(&g, a, .fn_, "len", root);
+
+    var types_store = [_]types.Type{
+        .{ .external_nominal = .{ .path = &.{ "alloc", "string", "String" } } },
+        .{ .reference = &.{ .mut = false, .pointee = types.str_type } },
+    };
+
+
+    // 0/1: an owned `String` and its `len()`. 2: the literal `2`.
+    // 3: `text.len() * 2`. 4/5: the same string and its `as_bytes()`.
+    // 6: the `len()` over that borrow. 7: the operator over it.
+    // 8/9: a `&str` and the `as_bytes()` it does answer.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = len,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
+            .text = "2",
+            .value = 2,
+            .base = .dec,
+            .ty_suffix = null,
+        } } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .mul,
+            .overflow = .wrapping,
+            .lhs = 1,
+            .rhs = 2,
+        } } },
+        .{ .id = 4, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 4,
+            .receiver_mode = .shared,
+            .method = as_bytes,
+            .args = &.{},
+        } } },
+        .{ .id = 6, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 5,
+            .receiver_mode = .shared,
+            .method = len,
+            .args = &.{},
+        } } },
+        .{ .id = 7, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .mul,
+            .overflow = .wrapping,
+            .lhs = 6,
+            .rhs = 2,
+        } } },
+        .{ .id = 8, .span = span, .ty = 1, .kind = .{ .unit = {} } },
+        .{ .id = 9, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 8,
+            .receiver_mode = .shared,
+            .method = as_bytes,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+
+    // Each surviving node is the observation. `resolveMethods` replaces a call
+    // it refuses with an `.unsupported` marker, so a node that is still a
+    // `.method_call` is a call that was admitted, and a counter would only
+    // restate that — while changing for reasons unrelated to this test whenever
+    // any other std path admits a call in the same graph.
+    try std.testing.expect(b.exprs[1].kind == .method_call);
+    try std.testing.expect(b.exprs[5].kind == .method_call);
+    try std.testing.expect(b.exprs[6].kind == .method_call);
+    // Both operators survive: the `len` over the borrowed bytes reads as a
+    // `usize`, so the operand over it is primitive on both sides.
+    try std.testing.expect(b.exprs[3].kind == .binary);
+    try std.testing.expect(b.exprs[7].kind == .binary);
+    // A `&str` answers too, and for a different reason than the owned string:
+    // `str::as_bytes` hands back the bytes the borrow already points at, so
+    // nothing is copied and the runtime value is a plain `[]const u8` rather
+    // than the owned string's own view. The `String` case above is the one
+    // that reads bytes OUT of an owner.
+    try std.testing.expect(b.exprs[9].kind == .method_call);
+}
+
+test "a blanket AsRef<[u8]> impl binds an array receiver's call to the trait it implements" {
+    // `[0x66, 0x6f, 0x6f, 0x62, 0x61, 0x72]` is `[T; 6]` for whatever `T` the
+    // surrounding context fixes, so the literal itself proves no element type
+    // and `arrayReceiverType` leaves it untyped. `impl<T: AsRef<[u8]>> ToHex
+    // for T` does admit it — the declared bound is the only evidence that
+    // says so, and an array `[E; N]` meets `AsRef<[u8]>` only for `E = u8`.
+    //
+    // The impl names no concrete self type, so no name lookup can pick the
+    // call's method. What the resolver can do is name the TRAIT, and that is
+    // what the backend selects the impl from: `methodRefTrait` reads it off
+    // the call's `method_ref` and `blanketImplFor` finds the impl providing
+    // the method. The call's own `method_ref` is synthesized per call site and
+    // carries only the enclosing module, so parenting it to the trait is what
+    // puts that chain in reach.
+    //
+    // The element type is still never invented from the literals' magnitudes:
+    // the bound names it, and a receiver that has a type of its own still
+    // reaches the impl through the ordinary name lookup.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const to_hex = try addEntity(&g, a, .trait_, "ToHex", root);
     const to_hex_impl = try addEntity(&g, a, .impl_, "ToHex for T", root);
     _ = try addEntity(&g, a, .fn_, "encode_hex", to_hex_impl);
     _ = try addEntity(&g, a, .fn_, "encode_hex_upper", to_hex_impl);
@@ -1748,9 +1981,11 @@ test "a blanket AsRef<[u8]> impl names no receiver type, so an untyped array lit
     _ = try addEntity(&g, a, .fn_, "render", display_impl);
     const text_impl = try addEntity(&g, a, .impl_, "ToText for T", root);
     _ = try addEntity(&g, a, .fn_, "encode_text", text_impl);
-    // The unresolved names a call reaches the resolver with.
-    const encode_hex_ident = try addEntity(&g, a, .fn_, "encode_hex", root);
-    const encode_hex_upper_ident = try addEntity(&g, a, .fn_, "encode_hex_upper", root);
+    // The unresolved names a call reaches the resolver with, in the shape
+    // body lowering synthesizes them: a `method_ref` owned by the enclosing
+    // module.
+    const encode_hex_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+    const encode_hex_upper_ident = try addEntity(&g, a, .method_ref, "encode_hex_upper", root);
     const render_ident = try addEntity(&g, a, .fn_, "render", root);
     const encode_text_ident = try addEntity(&g, a, .fn_, "encode_text", root);
     const missing_ident = try addEntity(&g, a, .fn_, "not_a_method", root);
@@ -1777,7 +2012,11 @@ test "a blanket AsRef<[u8]> impl names no receiver type, so an untyped array lit
     const bodies_store = [_]bodies.BodyKind{
         .none,
         .none,
-        .{ .impl_ = .{ .self_ty = self_param, .generics = .{ .params = &hex_generics, .where_clauses = &.{} } } },
+        .{ .impl_ = .{
+            .self_ty = self_param,
+            .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = to_hex }} },
+            .generics = .{ .params = &hex_generics, .where_clauses = &.{} },
+        } },
         .none,
         .none,
         .{ .impl_ = .{ .self_ty = self_param, .generics = .{ .params = &display_generics, .where_clauses = &.{} } } },
@@ -1799,22 +2038,40 @@ test "a blanket AsRef<[u8]> impl names no receiver type, so an untyped array lit
             .repeat = null,
         } } },
         .{ .id = 1, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
-            .text = "0x66", .value = hex_values[0], .base = .hex, .ty_suffix = null,
+            .text = "0x66",
+            .value = hex_values[0],
+            .base = .hex,
+            .ty_suffix = null,
         } } } },
         .{ .id = 2, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
-            .text = "0x6f", .value = hex_values[1], .base = .hex, .ty_suffix = null,
+            .text = "0x6f",
+            .value = hex_values[1],
+            .base = .hex,
+            .ty_suffix = null,
         } } } },
         .{ .id = 3, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
-            .text = "0x6f", .value = hex_values[2], .base = .hex, .ty_suffix = null,
+            .text = "0x6f",
+            .value = hex_values[2],
+            .base = .hex,
+            .ty_suffix = null,
         } } } },
         .{ .id = 4, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
-            .text = "0x62", .value = hex_values[3], .base = .hex, .ty_suffix = null,
+            .text = "0x62",
+            .value = hex_values[3],
+            .base = .hex,
+            .ty_suffix = null,
         } } } },
         .{ .id = 5, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
-            .text = "0x61", .value = hex_values[4], .base = .hex, .ty_suffix = null,
+            .text = "0x61",
+            .value = hex_values[4],
+            .base = .hex,
+            .ty_suffix = null,
         } } } },
         .{ .id = 6, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
-            .text = "0x72", .value = hex_values[5], .base = .hex, .ty_suffix = null,
+            .text = "0x72",
+            .value = hex_values[5],
+            .base = .hex,
+            .ty_suffix = null,
         } } } },
         .{ .id = 7, .span = span, .ty = null, .kind = .{ .method_call = .{
             .receiver = 0,
@@ -1851,7 +2108,10 @@ test "a blanket AsRef<[u8]> impl names no receiver type, so an untyped array lit
             .repeat = 4,
         } } },
         .{ .id = 13, .span = span, .ty = 0, .kind = .{ .literal = .{ .int = .{
-            .text = "0_u8", .value = 0, .base = .hex, .ty_suffix = "u8",
+            .text = "0_u8",
+            .value = 0,
+            .base = .hex,
+            .ty_suffix = "u8",
         } } } },
         .{ .id = 14, .span = span, .ty = null, .kind = .{ .method_call = .{
             .receiver = 12,
@@ -1871,30 +2131,25 @@ test "a blanket AsRef<[u8]> impl names no receiver type, so an untyped array lit
 
     const stats = try resolve_methods.resolveMethods(&g, &b);
 
-    // All three calls the one `ToHex` impl provides are refused, whether the
+    // All three calls the one `ToHex` impl provides are bound, whether the
     // literal's elements were typed or not: the rule reads the impl's bound to
-    // find the method, and then declines it because the bound names no `T`.
-    try std.testing.expectEqual(@as(usize, 0), stats.trait_resolved);
-    try expectUnsupportedReason(
-        &b.exprs[7],
-        "blanket impl names no receiver type: backend validateMethodTopology has no parent to hoist onto",
-    );
-    try expectUnsupportedReason(
-        &b.exprs[8],
-        "blanket impl names no receiver type: backend validateMethodTopology has no parent to hoist onto",
-    );
-    // A literal whose single element DOES carry `u8` gets no better: the
-    // element type is not what was missing.
-    try expectUnsupportedReason(
-        &b.exprs[14],
-        "blanket impl names no receiver type: backend validateMethodTopology has no parent to hoist onto",
-    );
+    // find the trait, and each call's own `method_ref` is re-parented onto it.
+    try std.testing.expectEqual(@as(usize, 3), stats.trait_resolved);
+    for ([_]exprs.NodeId{ 7, 8, 14 }) |node| {
+        const call = switch (b.exprs[node].kind) {
+            .method_call => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        const entity = g.symbol_table.get(call.method) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(spine.EntityKind.method_ref, entity.kind);
+        try std.testing.expectEqual(@as(?spine.EntityId, to_hex), entity.parent);
+    }
 
     // The bound is the whole of the evidence, in both directions. `Display` is
     // not `AsRef<[u8]>`, `AsRef<str>` is not `AsRef<[u8]>`, and no impl at all
     // provides `not_a_method`, so those three stay refused on the older
     // grounds, with their own reasons.
-    try std.testing.expectEqual(@as(usize, 6), stats.unsupported_methods);
+    try std.testing.expectEqual(@as(usize, 3), stats.unsupported_methods);
     try expectUnsupportedReason(&b.exprs[9], "method receiver unavailable");
     try expectUnsupportedReason(&b.exprs[10], "method receiver unavailable");
     try expectUnsupportedReason(&b.exprs[11], "method receiver unavailable");
@@ -2181,7 +2436,10 @@ test "a struct literal receiver recovers the type its own definition names" {
             .base = null,
         } } },
         .{ .id = 1, .span = span, .ty = null, .kind = .{ .literal = .{ .int = .{
-            .text = "0", .value = 0, .base = .dec, .ty_suffix = null,
+            .text = "0",
+            .value = 0,
+            .base = .dec,
+            .ty_suffix = null,
         } } } },
         .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
             .receiver = 0,
@@ -2694,23 +2952,38 @@ test "a crate enum compares when every variant carries a comparable value" {
     var exprs_store = [_]exprs.Expr{
         .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
         .{ .id = 1, .span = span, .ty = null, .kind = .{ .binary = .{
-            .op = .eq, .overflow = .checked, .lhs = 0, .rhs = 2,
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 0,
+            .rhs = 2,
         } } },
         .{ .id = 2, .span = span, .ty = 0, .kind = .{ .unit = {} } },
         .{ .id = 3, .span = span, .ty = null, .kind = .{ .binary = .{
-            .op = .eq, .overflow = .checked, .lhs = 2, .rhs = 0,
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 2,
+            .rhs = 0,
         } } },
         .{ .id = 4, .span = span, .ty = 1, .kind = .{ .unit = {} } },
         .{ .id = 5, .span = span, .ty = null, .kind = .{ .binary = .{
-            .op = .eq, .overflow = .checked, .lhs = 4, .rhs = 6,
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 4,
+            .rhs = 6,
         } } },
         .{ .id = 6, .span = span, .ty = 1, .kind = .{ .unit = {} } },
         .{ .id = 7, .span = span, .ty = null, .kind = .{ .binary = .{
-            .op = .eq, .overflow = .checked, .lhs = 6, .rhs = 4,
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 6,
+            .rhs = 4,
         } } },
         .{ .id = 8, .span = span, .ty = 2, .kind = .{ .unit = {} } },
         .{ .id = 9, .span = span, .ty = null, .kind = .{ .binary = .{
-            .op = .eq, .overflow = .checked, .lhs = 8, .rhs = 10,
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 8,
+            .rhs = 10,
         } } },
         .{ .id = 10, .span = span, .ty = 2, .kind = .{ .unit = {} } },
     };
@@ -3015,4 +3288,1885 @@ test "an operator over a dispatched call names the call, not the operator" {
     try expectUnsupportedReason(&b.exprs[5], "operator operands unresolved");
     try std.testing.expectEqual(@as(usize, 1), stats.std_resolved);
     try std.testing.expectEqual(@as(usize, 2), stats.unsupported_operators);
+}
+
+// ── Type aliases are the value they stand for ─────────────────────────────
+//
+// `type Chunk = u32;` reaches this pass as a `.path`, because that is what the
+// CST layer records wherever the alias is spelled — and percent-encoding spells
+// it in a field type (`mask: [Chunk; ASCII_RANGE_LEN / BITS_PER_CHUNK]`), so
+// every element read out of that table arrives as the alias path. A predicate
+// that only recognises `.prim` therefore refuses `&` on a `u32` because the
+// source said `Chunk`, and `percent-encoding/src/lib.rs:85,94,100` all read
+// that way.
+
+test "a type alias to an integer is a primitive operand of an operator" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const chunk = try addEntity(&g, a, .type_alias, "Chunk", root);
+
+    // Bodies are indexed by EntityId, so the alias body lands on the alias.
+    var bodies_store = [_]bodies.BodyKind{ .none, .{ .type_alias = .{
+        .target = .{ .prim = .u32 },
+    } } };
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "Chunk", .id = chunk }} } },
+    };
+
+    // `(chunk & mask)`: both operands reach this pass as the alias path.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 2, .span = span, .ty = 0, .kind = .{ .binary = .{
+            .op = .bit_and,
+            .overflow = .wrapping,
+            .lhs = 0,
+            .rhs = 1,
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 0), stats.unsupported_operators);
+    try std.testing.expect(b.exprs[2].kind == .binary);
+}
+
+test "an indexed compound assign through a type alias is not refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const chunk = try addEntity(&g, a, .type_alias, "Chunk", root);
+
+    var bodies_store = [_]bodies.BodyKind{ .none, .{ .type_alias = .{
+        .target = .{ .prim = .u32 },
+    } } };
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "Chunk", .id = chunk }} } },
+        .{ .prim = .u8 },
+        .{ .prim = .u32 },
+    };
+
+    // `mask[i] |= 1 << x` as percent-encoding writes it: the assign target is
+    // an INDEX expression, and its type is the element type of the table, which
+    // the alias path names.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = 1, .kind = .{ .literal = .{ .int = .{
+            .text = "0",
+            .value = 0,
+            .base = .dec,
+            .ty_suffix = null,
+        } } } },
+        .{ .id = 2, .span = span, .ty = 0, .kind = .{ .index = .{
+            .base = 0,
+            .index = 1,
+        } } },
+        .{ .id = 3, .span = span, .ty = 2, .kind = .{ .literal = .{ .int = .{
+            .text = "1",
+            .value = 1,
+            .base = .dec,
+            .ty_suffix = null,
+        } } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .assign = .{
+            .target = 2,
+            .op = .bit_or,
+            .value = 3,
+            .overflow = .wrapping,
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 0), stats.unsupported_operators);
+    try std.testing.expect(b.exprs[4].kind == .assign);
+}
+
+test "a path that names a nominal is still not a scalar operand" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const ascii_set = try addEntity(&g, a, .struct_, "AsciiSet", root);
+
+    // No alias body: `AsciiSet` is a nominal, and a nominal has no scalar
+    // reading. Following a path must not become admitting every path.
+    var bodies_store = [_]bodies.BodyKind{ .none, .none };
+    var types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "AsciiSet", .id = ascii_set }} } },
+    };
+
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 2, .span = span, .ty = 0, .kind = .{ .binary = .{
+            .op = .bit_and,
+            .overflow = .wrapping,
+            .lhs = 0,
+            .rhs = 1,
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.unsupported_operators);
+    try expectUnsupportedReason(
+        &b.exprs[2],
+        "operator requires primitive operands",
+    );
+}
+
+test "a rev on a retained slice iterator dispatches and an unknown one does not" {
+    // seahash/src/reference.rs:46 writes the loop `for &i in int.iter().rev()`,
+    // which reaches the resolver as an ordinary `rev` call whose receiver is
+    // the `slice.iter()` this pass keeps in the tree rather than as an
+    // iterator chain. `rev` belongs to that receiver the way `cloned` does:
+    // the runtime already carries it as `r2z.Rev`, so the call stays ordinary
+    // and needs no carrier of its own. `render` is the other half of the
+    // pair — a name the runtime drives over no carrier at all — and it stays
+    // refused, which is what keeps the admission a list instead of the
+    // receiver's whole method set.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const iter_ident = try addEntity(&g, a, .fn_, "iter", root);
+    const rev_ident = try addEntity(&g, a, .fn_, "rev", root);
+    const render_ident = try addEntity(&g, a, .fn_, "render", root);
+
+    var slice_payload: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_payload }};
+
+    // 0: the `&[u8]` `int` names, 1: `int.iter()`, 2: `int.iter().rev()`,
+    // 3: `int.iter().render()`. Both calls read the SAME retained iterator,
+    // so the only thing that separates them is the method name.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = iter_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = rev_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = render_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // `iter` is the std method the typed receiver earns on its own, and `rev`
+    // now rides the arm `cloned` has always ridden. The admitted call stays
+    // in the tree, bound to the method entity it was written with.
+    try std.testing.expectEqual(@as(usize, 2), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 1), stats.unsupported_methods);
+    try std.testing.expect(b.exprs[2].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, rev_ident), b.exprs[2].kind.method_call.method);
+
+    // The refusal is keyed on the METHOD over this receiver shape, and it
+    // says which half of the rule the call could not meet.
+    try expectUnsupportedReason(&b.exprs[3], "method dispatch unavailable");
+}
+
+test "a len and a clone on a bare slice iterator dispatch, and a mutating member does not" {
+    // `xs.iter()` is a receiver the Zig backend lowers to the runtime's own
+    // `r2z.SliceIter(T)`, and `len` and `clone` are members of that struct a
+    // method call reaches on it, so the resolver no longer refuses them here.
+    // `next` is refused for the opposite reason: it takes `self: *Self`, which
+    // does not compile on the temporary the receiver lowers to, and `render`
+    // names no member of it at all.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const iter_ident = try addEntity(&g, a, .fn_, "iter", root);
+    const len_ident = try addEntity(&g, a, .fn_, "len", root);
+    const clone_ident = try addEntity(&g, a, .fn_, "clone", root);
+    const next_ident = try addEntity(&g, a, .fn_, "next", root);
+    const render_ident = try addEntity(&g, a, .fn_, "render", root);
+
+    var slice_payload: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_payload }};
+
+    // 0: the `&[u8]` receiver, 1: `xs.iter()`, 2: `xs.iter().len()`,
+    // 3: `xs.iter().clone()`, 4: `xs.iter().next()`, 5: `xs.iter().render()`.
+    // Every call reads the SAME retained iterator, so the method name is the
+    // only thing that separates the two admitted calls from the two refused.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = iter_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = len_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = clone_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = next_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = render_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // `iter` is the std method the typed receiver earns on its own; `len` and
+    // `clone` join it over the iterator it leaves in the tree.
+    try std.testing.expectEqual(@as(usize, 3), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 2), stats.unsupported_methods);
+    try std.testing.expect(b.exprs[2].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, len_ident), b.exprs[2].kind.method_call.method);
+    try std.testing.expect(b.exprs[3].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, clone_ident), b.exprs[3].kind.method_call.method);
+
+    // The member that mutates through `self` and the one the runtime does not
+    // declare both stay refused, each with the reason that says why.
+    try expectUnsupportedReason(&b.exprs[4], "method dispatch unavailable");
+    try expectUnsupportedReason(&b.exprs[5], "method dispatch unavailable");
+}
+
+test "a len over a cloned projection stays refused while cloned itself dispatches" {
+    // The bare iterator is a runtime value the backend can call into; the
+    // `cloned` projection is not, so the names the bare iterator admits must
+    // NOT leak onto it. Admitting them there would emit a method call on the
+    // `r2z.SliceIter` that has no `cloned` member, which is the trap this arm
+    // exists to keep shut.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const iter_ident = try addEntity(&g, a, .fn_, "iter", root);
+    const cloned_ident = try addEntity(&g, a, .fn_, "cloned", root);
+    const len_ident = try addEntity(&g, a, .fn_, "len", root);
+    const clone_ident = try addEntity(&g, a, .fn_, "clone", root);
+
+    var slice_payload: types.Slice = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    var types_store = [_]types.Type{.{ .slice = &slice_payload }};
+
+    // 0: the `&[u8]` receiver, 1: `xs.iter()`, 2: `xs.iter().cloned()`,
+    // 3: `xs.iter().cloned().len()`, 4: `xs.iter().cloned().clone()`. The
+    // last two are the names the bare iterator admits, over the projection.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = iter_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = cloned_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .value,
+            .method = len_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .value,
+            .method = clone_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // `iter` and `cloned` resolve; the two member names do not, because the
+    // receiver they would land on is the projection and not the iterator.
+    try std.testing.expectEqual(@as(usize, 2), stats.std_resolved);
+    try std.testing.expectEqual(@as(usize, 2), stats.unsupported_methods);
+    try std.testing.expect(b.exprs[2].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, cloned_ident), b.exprs[2].kind.method_call.method);
+
+    try expectUnsupportedReason(&b.exprs[3], "method dispatch unavailable");
+    try expectUnsupportedReason(&b.exprs[4], "method dispatch unavailable");
+}
+
+test "a blanket AsRef<[u8]> impl binds a bounded type parameter receiver's call to the trait it implements" {
+    // `fn encode<T: AsRef<[u8]>>(data: T) -> String { data.encode_hex() }` is
+    // the shape hex/src/lib.rs:259-261 is written in, and the call is the
+    // blanket impl's method whether or not the two spell their parameter the
+    // same way. It is spelled `U` here on purpose: `lookupTraitMethodCandidates`
+    // can only match a receiver NAME against an impl's own self-type spelling,
+    // so with `impl<U: AsRef<[u8]>> ToHex for U` no name lookup can bind this
+    // call and the trait linkage is the only route to the impl. What the
+    // resolver can prove is the receiver's own declaration: `T` is bounded by
+    // a byte-sequence `AsRef`, which is what the impl's bound requires of its
+    // self type.
+    //
+    // The trait is the linkage, because it is what the backend selects the
+    // impl from: `methodRefTrait` reads it off the call's `method_ref` and
+    // `blanketImplFor` finds the impl providing the method. Each call's own
+    // `method_ref` is synthesized per call site and carries only the enclosing
+    // module, so parenting it to the trait is what puts that chain in reach.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const to_hex = try addEntity(&g, a, .trait_, "ToHex", root);
+    const to_hex_impl = try addEntity(&g, a, .impl_, "ToHex for U", root);
+    _ = try addEntity(&g, a, .fn_, "encode_hex", to_hex_impl);
+    const encode = try addEntity(&g, a, .fn_, "encode", root);
+    _ = try addEntity(&g, a, .field, "data", encode);
+    const encode_hex_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+    const encode_where = try addEntity(&g, a, .fn_, "encode_where", root);
+    _ = try addEntity(&g, a, .field, "data", encode_where);
+    const encode_where_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+    const encode_plain = try addEntity(&g, a, .fn_, "encode_plain", root);
+    _ = try addEntity(&g, a, .field, "data", encode_plain);
+    const encode_plain_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+    const encode_text = try addEntity(&g, a, .fn_, "encode_text", root);
+    _ = try addEntity(&g, a, .field, "data", encode_text);
+    const encode_text_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+    const encode_other = try addEntity(&g, a, .fn_, "encode_other", root);
+    _ = try addEntity(&g, a, .field, "data", encode_other);
+    const encode_other_ident = try addEntity(&g, a, .method_ref, "encode_hex_upper", root);
+
+    const byte_seq: types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const as_ref_bytes: types.Bound = .{
+        .path = .{ .segments = &.{.{ .name = "AsRef", .id = null }} },
+        .args = &.{byte_seq},
+    };
+    const self_param: types.Type = .{ .path = .{ .segments = &.{.{ .name = "U", .id = null }} } };
+    const impl_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "U", .bounds = &.{as_ref_bytes} },
+    }};
+    // `encode` bounds the parameter in its own signature; `encode_where` puts
+    // the same bound in a `where` clause. Both are the declaration the
+    // receiver is read from, and both are scopes the generic walk reads.
+    const bounded_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{as_ref_bytes} },
+    }};
+    const where_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{} },
+    }};
+    const where_clauses = [_]types.WhereClause{.{
+        .self_ty = .{ .segments = &.{.{ .name = "T", .id = null }} },
+        .bounds = &.{as_ref_bytes},
+    }};
+    const plain_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{} },
+    }};
+    const text_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{
+            .{ .path = .{ .segments = &.{.{ .name = "AsRef", .id = null }} }, .args = &.{types.str_type} },
+        } },
+    }};
+
+    // `bodies` is sparse and indexed by entity id, so each scope is written
+    // at its own entity's slot rather than at a counted offset.
+    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 19;
+    bodies_store[to_hex_impl] = .{ .impl_ = .{
+        .self_ty = self_param,
+        .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = to_hex }} },
+        .generics = .{ .params = &impl_generics, .where_clauses = &.{} },
+    } };
+    bodies_store[encode] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &bounded_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[encode_where] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &where_generics, .where_clauses = &where_clauses } },
+    };
+    bodies_store[encode_plain] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &plain_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[encode_text] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &text_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[encode_other] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &bounded_generics, .where_clauses = &.{} } },
+    };
+
+    const types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    };
+
+    // 0/2/4/6/8: a `data: T` receiver, each parented to the callable that
+    // declares the bound it is read from. 1/3/5/7/9: that receiver's call.
+    const exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 5, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = encode_hex_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 8, .generic_args = &.{} } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .shared,
+            .method = encode_where_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 11, .generic_args = &.{} } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 4,
+            .receiver_mode = .shared,
+            .method = encode_plain_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 6, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 14, .generic_args = &.{} } } },
+        .{ .id = 7, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 6,
+            .receiver_mode = .shared,
+            .method = encode_text_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 8, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 17, .generic_args = &.{} } } },
+        .{ .id = 9, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 8,
+            .receiver_mode = .shared,
+            .method = encode_other_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // Both calls the bound admits are bound to the trait the impl
+    // implements, whether the bound is written on the parameter or in a
+    // `where` clause beside it.
+    try std.testing.expectEqual(@as(usize, 2), stats.trait_resolved);
+    for ([_]exprs.NodeId{ 1, 3 }) |node| {
+        const call = switch (b.exprs[node].kind) {
+            .method_call => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        const entity = g.symbol_table.get(call.method) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(spine.EntityKind.method_ref, entity.kind);
+        try std.testing.expectEqual(@as(?spine.EntityId, to_hex), entity.parent);
+    }
+
+    // The bound is the whole of the evidence, in both directions. A bare `T`
+    // promises nothing, `AsRef<str>` is not `AsRef<[u8]>`, and no impl
+    // provides `encode_hex_upper`, so those three keep whatever reason their
+    // own dispatch earns rather than resolving on the method's name.
+    try std.testing.expectEqual(@as(usize, 3), stats.unsupported_methods);
+    for ([_]exprs.NodeId{ 5, 7, 9 }) |node| {
+        try expectUnsupported(&b.exprs[node]);
+    }
+}
+
+test "two blanket AsRef<[u8]> impls leave a bounded type parameter receiver's call refused" {
+    // Two impls providing `encode_hex` for a self type the bound admits name
+    // the method ambiguously, and a bounded type parameter does not make the
+    // pair less ambiguous: nothing about the receiver's declaration says which
+    // impl its method comes from.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const to_hex = try addEntity(&g, a, .trait_, "ToHex", root);
+    const to_hex_impl = try addEntity(&g, a, .impl_, "ToHex for U", root);
+    _ = try addEntity(&g, a, .fn_, "encode_hex", to_hex_impl);
+    const to_text = try addEntity(&g, a, .trait_, "ToText", root);
+    const to_text_impl = try addEntity(&g, a, .impl_, "ToText for U", root);
+    _ = try addEntity(&g, a, .fn_, "encode_hex", to_text_impl);
+    const encode = try addEntity(&g, a, .fn_, "encode", root);
+    const data = try addEntity(&g, a, .field, "data", encode);
+    const encode_hex_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+
+    const byte_seq: types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const as_ref_bytes: types.Bound = .{
+        .path = .{ .segments = &.{.{ .name = "AsRef", .id = null }} },
+        .args = &.{byte_seq},
+    };
+    const self_param: types.Type = .{ .path = .{ .segments = &.{.{ .name = "U", .id = null }} } };
+    const impl_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "U", .bounds = &.{as_ref_bytes} },
+    }};
+    const bounded_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{as_ref_bytes} },
+    }};
+
+    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 10;
+    bodies_store[to_hex_impl] = .{ .impl_ = .{
+        .self_ty = self_param,
+        .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = to_hex }} },
+        .generics = .{ .params = &impl_generics, .where_clauses = &.{} },
+    } };
+    bodies_store[to_text_impl] = .{ .impl_ = .{
+        .self_ty = self_param,
+        .trait_path = .{ .segments = &.{.{ .name = "ToText", .id = to_text }} },
+        .generics = .{ .params = &impl_generics, .where_clauses = &.{} },
+    } };
+    bodies_store[encode] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &bounded_generics, .where_clauses = &.{} } },
+    };
+
+    const types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    };
+
+    const exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = data, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = encode_hex_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    try std.testing.expectEqual(@as(usize, 0), stats.trait_resolved);
+    try std.testing.expectEqual(@as(usize, 1), stats.unsupported_methods);
+    try expectUnsupported(&b.exprs[1]);
+}
+
+test "a core supertrait carries an operator over a generic parameter" {
+    // `fn test_hash<T: Eq + core::fmt::Debug>(..)` asserting `hashed ==
+    // expected` is const-fnv1a-hash/src/lib.rs:79-83. core declares
+    // `Eq: PartialEq<Self>`, so `T: Eq` IS `T: PartialEq` and the `==` Rust
+    // writes there is valid source over a typed binary operator: it stays a
+    // `binary` node whose two operands keep the parameter they were declared
+    // with, which is what the backend emits for any other typed operator.
+    //
+    // The edges are the ones core's own declarations spell out — `Ord` buys
+    // both, `PartialOrd` buys `PartialEq`, `Eq` buys neither ordering — and
+    // nothing else, so a bare parameter, an `Eq` compared with `<`, and a
+    // crate trait that happens to be named `Eq` all stay refused.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const tests = try addEntity(&g, a, .module, "tests", root);
+    const eq_hash = try addEntity(&g, a, .fn_, "test_hash", tests);
+    const eq_hashed = try addEntity(&g, a, .field, "hashed", eq_hash);
+    _ = try addEntity(&g, a, .field, "expected", eq_hash);
+    const plain_hash = try addEntity(&g, a, .fn_, "plain_hash", tests);
+    const plain_hashed = try addEntity(&g, a, .field, "hashed", plain_hash);
+    _ = try addEntity(&g, a, .field, "expected", plain_hash);
+    const ord_hash = try addEntity(&g, a, .fn_, "ord_hash", tests);
+    const ord_hashed = try addEntity(&g, a, .field, "hashed", ord_hash);
+    _ = try addEntity(&g, a, .field, "expected", ord_hash);
+    const partial_ord_hash = try addEntity(&g, a, .fn_, "partial_ord_hash", tests);
+    const partial_ord_hashed = try addEntity(&g, a, .field, "hashed", partial_ord_hash);
+    _ = try addEntity(&g, a, .field, "expected", partial_ord_hash);
+    const eq_order = try addEntity(&g, a, .fn_, "eq_order", tests);
+    const eq_order_hashed = try addEntity(&g, a, .field, "hashed", eq_order);
+    _ = try addEntity(&g, a, .field, "expected", eq_order);
+    const crate_eq = try addEntity(&g, a, .trait_, "Eq", root);
+    const local_hash = try addEntity(&g, a, .fn_, "local_hash", tests);
+    const local_hashed = try addEntity(&g, a, .field, "hashed", local_hash);
+    _ = try addEntity(&g, a, .field, "expected", local_hash);
+
+    // The bounds are core's own paths, spelled the way the CST layer spells a
+    // prelude name: `bodies.genericBound` resolves them against
+    // `core::cmp::PartialEq` and `core::cmp::PartialOrd` with no crate entity
+    // involved, which is what keeps a crate trait named `Eq` out.
+    const eq_bound: types.Bound = .{ .path = .{ .segments = &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "cmp", .id = null },
+        .{ .name = "Eq", .id = null },
+    } } };
+    const ord_bound: types.Bound = .{ .path = .{ .segments = &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "cmp", .id = null },
+        .{ .name = "Ord", .id = null },
+    } } };
+    const partial_ord_bound: types.Bound = .{ .path = .{ .segments = &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "cmp", .id = null },
+        .{ .name = "PartialOrd", .id = null },
+    } } };
+    const debug_bound: types.Bound = .{ .path = .{ .segments = &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "fmt", .id = null },
+        .{ .name = "Debug", .id = null },
+    } } };
+
+    const eq_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{ eq_bound, debug_bound } },
+    }};
+    const plain_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{} },
+    }};
+    const ord_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{ord_bound} },
+    }};
+    const partial_ord_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{partial_ord_bound} },
+    }};
+    const eq_only_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{eq_bound} },
+    }};
+    // A crate trait named `Eq` resolves to the crate's own declaration, and
+    // that is not core's `Eq`: the id the bound carries is the evidence, and
+    // no supertrait of the local trait gives it PartialEq.
+    const local_eq_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{
+            .{ .path = .{ .segments = &.{.{ .name = "Eq", .id = crate_eq }} } },
+        } },
+    }};
+
+    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 21;
+    bodies_store[eq_hash] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &eq_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[plain_hash] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &plain_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[ord_hash] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &ord_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[partial_ord_hash] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &partial_ord_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[eq_order] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &eq_only_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[crate_eq] = .{ .trait_ = .{ .name = "Eq" } };
+    bodies_store[local_hash] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &local_eq_generics, .where_clauses = &.{} } },
+    };
+
+    const types_store = [_]types.Type{
+        .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    };
+
+    // 0/1 and 2: `T: Eq + Debug` compared for equality, in both directions.
+    // 3/4 and 5: the same two operands over a parameter with no bound at all.
+    // 6/7 and 8/9: `T: Ord` compared for equality and for ordering.
+    // 10/11 and 12: `T: PartialOrd` compared for equality.
+    // 13/14 and 15: `T: Eq` compared for ordering, which Eq does not give.
+    // 16/17 and 18: a parameter bounded by the crate's own `Eq`.
+    const exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = eq_hashed, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 4, .generic_args = &.{} } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .eq, .overflow = .checked, .lhs = 0, .rhs = 1 } } },
+        .{ .id = 3, .span = span, .ty = 0, .kind = .{ .path = .{ .def = plain_hashed, .generic_args = &.{} } } },
+        .{ .id = 4, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .eq, .overflow = .checked, .lhs = 3, .rhs = 4 } } },
+        .{ .id = 6, .span = span, .ty = 0, .kind = .{ .path = .{ .def = ord_hashed, .generic_args = &.{} } } },
+        .{ .id = 7, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 10, .generic_args = &.{} } } },
+        .{ .id = 8, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .eq, .overflow = .checked, .lhs = 6, .rhs = 7 } } },
+        .{ .id = 9, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .lt, .overflow = .checked, .lhs = 6, .rhs = 7 } } },
+        .{ .id = 10, .span = span, .ty = 0, .kind = .{ .path = .{ .def = partial_ord_hashed, .generic_args = &.{} } } },
+        .{ .id = 11, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 13, .generic_args = &.{} } } },
+        .{ .id = 12, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .eq, .overflow = .checked, .lhs = 10, .rhs = 11 } } },
+        .{ .id = 13, .span = span, .ty = 0, .kind = .{ .path = .{ .def = eq_order_hashed, .generic_args = &.{} } } },
+        .{ .id = 14, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 16, .generic_args = &.{} } } },
+        .{ .id = 15, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .lt, .overflow = .checked, .lhs = 13, .rhs = 14 } } },
+        .{ .id = 16, .span = span, .ty = 0, .kind = .{ .path = .{ .def = local_hashed, .generic_args = &.{} } } },
+        .{ .id = 17, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 20, .generic_args = &.{} } } },
+        .{ .id = 18, .span = span, .ty = null, .kind = .{ .binary = .{ .op = .eq, .overflow = .checked, .lhs = 16, .rhs = 17 } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // Every operator whose trait the declared bounds reach stays a binary node
+    // over the two operands it was written over, and each operand keeps the
+    // generic parameter it was declared with: nothing is rewritten, dropped,
+    // or given a concrete type the source never named.
+    for ([_]exprs.NodeId{ 2, 8, 9, 12 }) |node| {
+        try std.testing.expect(b.exprs[node].kind == .binary);
+        const binary = b.exprs[node].kind.binary;
+        for ([_]exprs.NodeId{ binary.lhs, binary.rhs }) |operand| {
+            const operand_ty = b.exprs[operand].ty orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("T", b.types[operand_ty].path.segments[0].name);
+        }
+    }
+
+    // And a bound that reaches no edge of core's supertrait graph still
+    // refuses its operator rather than borrowing another trait's capability.
+    try std.testing.expectEqual(@as(usize, 3), stats.unsupported_operators);
+    for ([_]exprs.NodeId{ 5, 15, 18 }) |node| {
+        try expectUnsupported(&b.exprs[node]);
+    }
+}
+
+test "a carrier around a bounded type parameter keeps the blanket call refused" {
+    // `fn encode<T: AsRef<[u8]>>(data: &T) -> String { data.encode_hex() }` is
+    // the declaration above with one word changed, and that word is the whole
+    // question. The bound is on the parameter either way, all three callables
+    // declare their parameter as `T`, and the impl is still spelled
+    // `ToHex for U` against callers that name theirs `T` — so no name lookup
+    // can bind any of the three calls and the receiver's own type is the only
+    // thing that tells them apart.
+    //
+    // The bare parameter is the shape the backend builds a self type for:
+    // `blanketReceiverType` hands the receiver's type to `isTypeParameterPath`,
+    // and a one-segment path with no entity id IS the hoisted method's
+    // `comptime T: type`. A reference or a box wrapped around the parameter
+    // gets no self type at all, and the backend answers such a call by
+    // returning null — which leaves `data.encode_hex()` in the output as a Zig
+    // member call on a slice, naming a field no slice has. So each carrier is
+    // refused in this pass, where the reason can say so, and the bare call
+    // beside them still reaches the trait.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const to_hex = try addEntity(&g, a, .trait_, "ToHex", root);
+    const to_hex_impl = try addEntity(&g, a, .impl_, "ToHex for U", root);
+    _ = try addEntity(&g, a, .fn_, "encode_hex", to_hex_impl);
+    const encode = try addEntity(&g, a, .fn_, "encode", root);
+    _ = try addEntity(&g, a, .field, "data", encode);
+    const encode_hex_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+    const encode_ref = try addEntity(&g, a, .fn_, "encode_ref", root);
+    _ = try addEntity(&g, a, .field, "data", encode_ref);
+    const encode_ref_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+    const encode_boxed = try addEntity(&g, a, .fn_, "encode_boxed", root);
+    _ = try addEntity(&g, a, .field, "data", encode_boxed);
+    const encode_boxed_ident = try addEntity(&g, a, .method_ref, "encode_hex", root);
+
+    const byte_seq: types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const as_ref_bytes: types.Bound = .{
+        .path = .{ .segments = &.{.{ .name = "AsRef", .id = null }} },
+        .args = &.{byte_seq},
+    };
+    const self_param: types.Type = .{ .path = .{ .segments = &.{.{ .name = "U", .id = null }} } };
+    const impl_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "U", .bounds = &.{as_ref_bytes} },
+    }};
+    const bounded_generics = [_]types.GenericParam{.{
+        .type_ = .{ .name = "T", .bounds = &.{as_ref_bytes} },
+    }};
+
+    // `bodies` is sparse and indexed by entity id, so each scope is written
+    // at its own entity's slot rather than at a counted offset.
+    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 13;
+    bodies_store[to_hex_impl] = .{ .impl_ = .{
+        .self_ty = self_param,
+        .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = to_hex }} },
+        .generics = .{ .params = &impl_generics, .where_clauses = &.{} },
+    } };
+    bodies_store[encode] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &bounded_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[encode_ref] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &bounded_generics, .where_clauses = &.{} } },
+    };
+    bodies_store[encode_boxed] = .{
+        .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &bounded_generics, .where_clauses = &.{} } },
+    };
+
+    const param_path: types.Type = .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } };
+    const param_ref: types.Ref = .{ .mut = false, .pointee = param_path };
+    const types_store = [_]types.Type{
+        param_path,
+        .{ .reference = &param_ref },
+        .{ .boxed = &param_path },
+    };
+
+    // 0/2/4: a bare `T`, a `&T`, a `Box<T>`. 1/3/5: each receiver's call.
+    const exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = 5, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = encode_hex_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = 1, .kind = .{ .path = .{ .def = 8, .generic_args = &.{} } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .shared,
+            .method = encode_ref_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = 2, .kind = .{ .path = .{ .def = 11, .generic_args = &.{} } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 4,
+            .receiver_mode = .shared,
+            .method = encode_boxed_ident,
+            .args = &.{},
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    const stats = try resolve_methods.resolveMethods(&g, &b);
+
+    // The bare parameter reaches the trait the impl implements, which is the
+    // linkage the backend selects the impl from: one call, not three.
+    try std.testing.expectEqual(@as(usize, 1), stats.trait_resolved);
+    const call = switch (b.exprs[1].kind) {
+        .method_call => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const entity = g.symbol_table.get(call.method) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(spine.EntityKind.method_ref, entity.kind);
+    try std.testing.expectEqual(@as(?spine.EntityId, to_hex), entity.parent);
+
+    // Each carrier keeps the reason its own dispatch earns. Nothing was
+    // re-parented onto a trait for them, so the backend is never handed a
+    // blanket route it has no self type to take.
+    try std.testing.expectEqual(@as(usize, 2), stats.unsupported_methods);
+    try expectUnsupportedReason(&b.exprs[3], "method dispatch unavailable");
+    try expectUnsupportedReason(&b.exprs[5], "method dispatch unavailable");
+}
+
+// ── `Result::expect` / `Result::expect_err` ─────────────────────────────────
+//
+// This is the shape leb128/src/lib.rs is written in:
+//     pub enum Fault { Bad }
+//     pub fn make() -> Result<u8, Fault> { Ok(7) }
+//     pub fn value() -> u8 { make().expect("valid payload") }
+//
+// The two names return opposite arms, so they are answered from opposite ends
+// of the same receiver. `expect` returns the Ok payload, whatever the error
+// lowers to. `expect_err` returns the Err arm, and the two `Result`s here
+// differ in how that arm is held: a fieldless `Fault` lowers to the Zig error
+// union `Fault!u8` and keeps the error as a typed tag, a data-carrying
+// `FaultDetail` lowers to the runtime's tagged `r2z.Result` and keeps it as a
+// payload beside the Ok value. Both hand an error value back, so both admit the
+// method, and each has to hand back ITS OWN `E`.
+
+test "expect returns the Ok payload and expect_err the error arm of its own Result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const make = try addEntity(&g, a, .fn_, "make", root);
+    const make_detailed = try addEntity(&g, a, .fn_, "make_detailed", root);
+    const fault = try addEntity(&g, a, .enum_, "Fault", root);
+    const fault_detail = try addEntity(&g, a, .enum_, "FaultDetail", root);
+    const bad = try addEntity(&g, a, .variant, "Bad", fault);
+    const bad_detail = try addEntity(&g, a, .variant, "BadDetail", fault_detail);
+    const expect_ident = try addEntity(&g, a, .fn_, "expect", root);
+    const expect_err_ident = try addEntity(&g, a, .fn_, "expect_err", root);
+    const checked_add_ident = try addEntity(&g, a, .fn_, "checked_add", root);
+
+    // `Fault` carries nothing, so it is a Zig error set and the error is a tag
+    // inside the union. `FaultDetail` carries `code`, so it is not one and the
+    // error is a value beside the payload. Both report `is_error_unionable`,
+    // which is why that flag alone cannot answer for either.
+    const error_set_result: types.Type = .{ .result = &.{
+        .ok = .{ .prim = .u8 },
+        .err = .{ .path = .{ .segments = &.{.{ .name = "Fault", .id = fault }} } },
+        .is_error_unionable = true,
+    } };
+    const value_result: types.Type = .{ .result = &.{
+        .ok = .{ .prim = .u8 },
+        .err = .{ .path = .{ .segments = &.{.{ .name = "FaultDetail", .id = fault_detail }} } },
+        .is_error_unionable = true,
+    } };
+    var types_store = [_]types.Type{ error_set_result, value_result };
+
+    // 0/3: the two `Result`-returning calls. 1/4: `.expect(..)` on each, with
+    // the borrowed message. 2/5: `checked_add` on each `expect` result, which
+    // is admitted only when that result is the `u8` payload. 6: `.expect_err`
+    // on the error-union `Result`. 7: that error arm against `Fault::Bad`.
+    // 8: `.expect_err` on the value-carrying `Result`. 9: `Fault::Bad`.
+    // 10: that error arm against `FaultDetail::BadDetail`. 11: `FaultDetail`.
+    // 12/13: the message and the `1`.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .call = .{
+            .call_kind = .{ .free = make },
+            .args = &.{},
+        } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .value,
+            .method = expect_ident,
+            .args = &.{12},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 1,
+            .receiver_mode = .value,
+            .method = checked_add_ident,
+            .args = &.{13},
+        } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .call = .{
+            .call_kind = .{ .free = make_detailed },
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 3,
+            .receiver_mode = .value,
+            .method = expect_ident,
+            .args = &.{12},
+        } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 4,
+            .receiver_mode = .value,
+            .method = checked_add_ident,
+            .args = &.{13},
+        } } },
+        .{ .id = 6, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .value,
+            .method = expect_err_ident,
+            .args = &.{12},
+        } } },
+        .{ .id = 7, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 6,
+            .rhs = 9,
+        } } },
+        .{ .id = 8, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 3,
+            .receiver_mode = .value,
+            .method = expect_err_ident,
+            .args = &.{12},
+        } } },
+        .{ .id = 9, .span = span, .ty = null, .kind = .{ .enum_variant = .{
+            .def = bad,
+            .variant = "Bad",
+            .tuple_fields = &.{},
+            .named_fields = &.{},
+        } } },
+        .{ .id = 10, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 8,
+            .rhs = 11,
+        } } },
+        .{ .id = 11, .span = span, .ty = null, .kind = .{ .enum_variant = .{
+            .def = bad_detail,
+            .variant = "BadDetail",
+            .tuple_fields = &.{},
+            .named_fields = &.{},
+        } } },
+        .{ .id = 12, .span = span, .ty = null, .kind = .{ .literal = .{
+            .string = .{ .bytes = "valid payload" },
+        } } },
+        .{ .id = 13, .span = span, .ty = null, .kind = .{ .literal = .{
+            .int = .{ .text = "1", .value = 1, .base = .dec, .ty_suffix = null },
+        } } },
+    };
+
+    var bodies_store = [_]bodies.BodyKind{.none} ** 10;
+    bodies_store[make] = .{ .fn_ = .{ .params = &.{}, .ret = error_set_result, .body = 0 } };
+    bodies_store[make_detailed] = .{ .fn_ = .{ .params = &.{}, .ret = value_result, .body = 0 } };
+    bodies_store[fault] = .{ .enum_ = .{
+        .kind = .c_like,
+        .variants = &.{
+            .{ .name = "Bad", .fields = .none, .discriminant = null },
+        },
+    } };
+    bodies_store[fault_detail] = .{ .enum_ = .{
+        .kind = .data,
+        .variants = &.{
+            .{ .name = "BadDetail", .fields = .{ .named = &.{
+                .{ .name = "code", .ty = .{ .prim = .u8 }, .visibility = .public, .span = span },
+            } }, .discriminant = null },
+        },
+    } };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+
+    // `expect` returns the Ok payload, so each of its results is the `u8` the
+    // call site goes on to do arithmetic with, and the integer method chained
+    // off it is a real method. This holds for both lowerings alike: `expect`
+    // reads no error value.
+    try std.testing.expect(b.exprs[1].kind == .method_call);
+    try std.testing.expect(b.exprs[2].kind == .method_call);
+    try std.testing.expect(b.exprs[4].kind == .method_call);
+    try std.testing.expect(b.exprs[5].kind == .method_call);
+
+    // `expect_err` reads the Err arm, and each receiver's arm is a value a
+    // comparison is written against: the fieldless `Fault` as a tag inside
+    // `Fault!u8`, the data-carrying `FaultDetail` as a payload beside the Ok
+    // value. Both enums carry the value comparison Rust's derived `PartialEq`
+    // gives them, which is what the pair rule walks.
+    try std.testing.expect(b.exprs[6].kind == .method_call);
+    try std.testing.expect(b.exprs[7].kind == .binary);
+    try std.testing.expect(b.exprs[8].kind == .method_call);
+    try std.testing.expect(b.exprs[10].kind == .binary);
+}
+
+// ── A constant as a method receiver ─────────────────────────────────────────
+//
+// percent-encoding/src/lib.rs builds its bit table once and reads it from
+// everywhere:
+//     pub struct Set { mask: u32 }
+//     impl Set { pub const fn contains(&self, bit: u8) -> bool { .. } }
+//     pub const CONTROL: &Set = &Set { mask: 1 };
+//     pub fn contains(bit: u8) -> bool { CONTROL.contains(bit) }
+//
+// A constant IS its own declaration: the type beside its name is the only
+// account of what every later mention of it is, and inference reaches the
+// initializer rather than the declaration when it types a mention. Reading the
+// declaration is what makes the dispatch a name lookup instead of a refusal.
+
+test "a constant's own declared type is what types its method receiver" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const set = try addEntity(&g, a, .struct_, "Set", root);
+    const set_impl = try addEntity(&g, a, .impl_, "Set", root);
+    const contains_fn = try addEntity(&g, a, .fn_, "contains", set_impl);
+    const control = try addEntity(&g, a, .const_, "CONTROL", root);
+    const table = try addEntity(&g, a, .const_, "TABLE", root);
+    const len_ident = try addEntity(&g, a, .fn_, "len", root);
+    const contains_ident = try addEntity(&g, a, .method_ref, "contains", root);
+
+    const set_type: types.Type = .{ .path = .{ .segments = &.{.{ .name = "Set", .id = set }} } };
+    const set_ref: types.Ref = .{ .mut = false, .pointee = set_type };
+    // `TABLE` is a `[u8; N]` whose length is a const-generic PARAMETER rather
+    // than a literal. Nothing here needs N's value: the declaration already
+    // names the receiver's type, and a length this pass cannot evaluate is not
+    // a reason to leave the receiver untyped.
+    const table_type: types.Type = .{ .array = &.{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .generic = 0 },
+    } };
+
+    // 0/2: the two constants as bare paths, the way every later mention of one
+    // arrives. 1: `CONTROL.contains(0)`. 3/4/5: `TABLE.len() % 2`. 6: the `0`
+    // argument. 7/8: the two initializers.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .path = .{ .def = control, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = contains_ident,
+            .args = &.{6},
+        } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .path = .{ .def = table, .generic_args = &.{} } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .shared,
+            .method = len_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .literal = .{
+            .int = .{ .text = "2", .value = 2, .base = .dec, .ty_suffix = null },
+        } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .rem,
+            .overflow = .checked,
+            .lhs = 3,
+            .rhs = 4,
+        } } },
+        .{ .id = 6, .span = span, .ty = null, .kind = .{ .literal = .{
+            .int = .{ .text = "0", .value = 0, .base = .dec, .ty_suffix = null },
+        } } },
+        .{ .id = 7, .span = span, .ty = null, .kind = .{ .struct_lit = .{
+            .def = set,
+            .fields = &.{},
+            .base = null,
+        } } },
+        .{ .id = 8, .span = span, .ty = null, .kind = .{ .array = .{
+            .elements = &.{},
+            .repeat = null,
+        } } },
+    };
+
+    var bodies_store = [_]bodies.BodyKind{.none} ** 8;
+    bodies_store[control] = .{ .const_ = .{ .ty = .{ .reference = &set_ref }, .init = 7 } };
+    bodies_store[table] = .{ .const_ = .{ .ty = table_type, .init = 8 } };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &bodies_store,
+    };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+
+    // `CONTROL: &Set` is a borrow of a `Set`, and the borrow is peeled to the
+    // `Set` whose inherent block declares `contains`. The call is bound to the
+    // crate's own function, not left as a name nothing answers to.
+    try std.testing.expect(b.exprs[1].kind == .method_call);
+    try std.testing.expectEqual(contains_fn, b.exprs[1].kind.method_call.method);
+
+    // `TABLE`'s array type comes from the declaration too, so `len` is admitted
+    // on it and its `usize` result is the primitive the `%` reads.
+    try std.testing.expect(b.exprs[3].kind == .method_call);
+    try std.testing.expect(b.exprs[5].kind == .binary);
+}
+
+// ── `std::io::Error::kind` ──────────────────────────────────────────────────
+//
+// leb128 reads the end of its input through the io error rather than through
+// its own:
+//     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => { .. }
+//
+// That comparison is the point. `kind()` is a method on `std::io::Error`, and
+// what it hands back is `std::io::ErrorKind` — a payload-free std enum the
+// backend lowers to `r2z.io.ErrorKind`, which Zig compares with `==`. So the
+// resolver has to name that result, or the pair rule has nothing to admit the
+// operator on.
+
+test "io::Error::kind names the ErrorKind a std comparison is written against" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const kind_ident = try addEntity(&g, a, .method_ref, "kind", null);
+    const unexpected_eof = try addEntity(&g, a, .variant, "UnexpectedEof", root);
+
+    const error_type: types.Type = .{ .external_nominal = .{
+        .path = &.{ "std", "io", "Error" },
+        .args = &.{},
+    } };
+    const error_kind_type: types.Type = .{ .external_nominal = .{
+        .path = &.{ "std", "io", "ErrorKind" },
+        .args = &.{},
+    } };
+    var types_store = [_]types.Type{ error_type, error_kind_type };
+
+    // 0: the `std::io::Error` the failed read returned. 1:
+    // `ErrorKind::UnexpectedEof`. 2: `e.kind()`. 3/4: the same comparison in
+    // both operand orders, which is how the two sides of an `assert_eq!` read.
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = 1, .kind = .{ .path = .{ .def = unexpected_eof, .generic_args = &.{} } } },
+        .{ .id = 2, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = kind_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 1,
+            .rhs = 2,
+        } } },
+        .{ .id = 4, .span = span, .ty = null, .kind = .{ .binary = .{
+            .op = .eq,
+            .overflow = .checked,
+            .lhs = 2,
+            .rhs = 1,
+        } } },
+    };
+
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+
+    // The call survives, so neither comparison is skipped as a read of a
+    // refused operand; both then survive as comparisons. An `ErrorKind` is a
+    // payload-free enum the runtime compares by value, in either position.
+    try std.testing.expect(b.exprs[2].kind == .method_call);
+    try std.testing.expect(b.exprs[3].kind == .binary);
+    try std.testing.expect(b.exprs[4].kind == .binary);
+}
+
+// ── `std::io` methods on a receiver that carries its bound itself ───────────
+
+/// Register `use <path>;` the way the ingest pass records an unresolved rooted
+/// std path, so a bound spelled by its short name resolves through the import
+/// the source actually wrote.
+///
+/// Every string is copied rather than borrowed. `CrateGraph.deinit` frees the
+/// local name, the path array and every segment in it, so a literal handed
+/// straight through is an `InvalidFree` at teardown — which surfaces as a
+/// crash in whichever test drops the graph, not in the one that registered
+/// the import.
+fn addExternalUse(
+    g: *graph.CrateGraph,
+    a: std.mem.Allocator,
+    parent: spine.EntityId,
+    local_name: []const u8,
+    path: []const []const u8,
+) !spine.EntityId {
+    const id = try addEntity(g, a, .use_, local_name, parent);
+    const owned_path = try a.alloc([]const u8, path.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned_path[0..copied]) |segment| a.free(segment);
+        a.free(owned_path);
+    }
+    for (path) |segment| {
+        owned_path[copied] = try a.dupe(u8, segment);
+        copied += 1;
+    }
+    const owned_name = try a.dupe(u8, local_name);
+    errdefer a.free(owned_name);
+    try g.addUse(.{
+        .id = id,
+        .kind = .{ .external = .{ .path = owned_path } },
+        .local_name = owned_name,
+        .is_pub_export = false,
+        .target = 0,
+        .span = span,
+    });
+    return id;
+}
+
+/// Storage for one `&mut dyn Trait` receiver.
+///
+/// Every piece is a field written through a pointer, never a local of a
+/// builder function, and that is the whole point. A `dyn_trait` is a slice of
+/// bounds and each bound is a slice of path segments, so a helper that built
+/// them as its own locals and returned the type would hand back a slice to a
+/// stack frame that has already ended. The segment's `id` is exactly what
+/// `boundPathMatches` reads to find the importing `use`, so a dangling id
+/// reads back as null, the identity proof misses, and every dyn receiver
+/// quietly falls back to being refused — which looks exactly like a broken
+/// production rule rather than a broken fixture.
+const DynReceiver = struct {
+    segment: types.PathSegment,
+    bounds: [1]types.Bound,
+    ref: types.Ref,
+
+    fn init(self: *DynReceiver, name: []const u8, use_id: ?spine.EntityId) void {
+        self.segment = .{ .name = name, .id = use_id };
+        self.bounds = .{.{ .path = .{ .segments = (&self.segment)[0..1] } }};
+        self.ref = .{ .mut = true, .pointee = .{ .dyn_trait = self.bounds[0..] } };
+    }
+
+    fn ty(self: *const DynReceiver) types.Type {
+        return .{ .reference = &self.ref };
+    }
+};
+
+test "a dyn std io receiver resolves the io method its own bound names" {
+    // `use std::io::{Read, Write}; fn read_byte(input: &mut dyn Read)` is the
+    // shape dyn-io/src/lib.rs:1-9 is written in, and it is the one leb128's
+    // `pub fn unsigned<R>(r: &mut R) where R: ?Sized + io::Read` reduces to
+    // once its own `R` is substituted. The receiver names its trait itself, so
+    // there is no method entity to read the bound from and no type parameter to
+    // look it up under: the object type's own bounds ARE the declaration, and
+    // `boundPathMatches` resolves the short `Read` through the very
+    // `use std::io::Read` the source wrote.
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const read_use = try addExternalUse(&g, a, root, "Read", &.{ "std", "io", "Read" });
+    const write_use = try addExternalUse(&g, a, root, "Write", &.{ "std", "io", "Write" });
+
+    const read_byte = try addEntity(&g, a, .fn_, "read_byte", root);
+    const input = try addEntity(&g, a, .field, "input", read_byte);
+    const read_exact_ident = try addEntity(&g, a, .fn_, "read_exact", root);
+    const write_byte = try addEntity(&g, a, .fn_, "write_byte", root);
+    const output = try addEntity(&g, a, .field, "output", write_byte);
+    const write_all_ident = try addEntity(&g, a, .fn_, "write_all", root);
+
+    var read_dyn: DynReceiver = undefined;
+    read_dyn.init("Read", read_use);
+    var write_dyn: DynReceiver = undefined;
+    write_dyn.init("Write", write_use);
+    var types_store = [_]types.Type{ read_dyn.ty(), write_dyn.ty() };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = input, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .mutable,
+            .method = read_exact_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = 1, .kind = .{ .path = .{ .def = output, .generic_args = &.{} } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .mutable,
+            .method = write_all_ident,
+            .args = &.{},
+        } } },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+
+    // Both calls survive as calls: `read_exact` on a `dyn Read` and `write_all`
+    // on a `dyn Write` are the two the runtime owns end to end, and neither one
+    // is the other's — a `Read` receiver has no `Write` bound, so the proof
+    // that admits one is the same proof that keeps the other out. The node
+    // itself is the observation, not a tally: `resolveMethods` replaces a call
+    // it refuses with an `.unsupported` marker, so a surviving `.method_call`
+    // already says the call was admitted.
+    try std.testing.expect(b.exprs[1].kind == .method_call);
+    try std.testing.expect(b.exprs[3].kind == .method_call);
+}
+
+test "a dyn receiver bound by a crate's own trait is not the std io reader" {
+    // Same shape as above with `use std::io::Read;` removed. A crate that
+    // declares its own `Read` writes `dyn Read` and means ITS trait, so nothing
+    // about the receiver names `std::io::Read` and the call has to stay refused.
+    // Without this the bound would be decided from the name alone, and every
+    // crate could claim the runtime's io reader by declaring a homonym.
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    _ = try addEntity(&g, a, .trait_, "Read", root);
+    const read_byte = try addEntity(&g, a, .fn_, "read_byte", root);
+    const input = try addEntity(&g, a, .field, "input", read_byte);
+    const read_exact_ident = try addEntity(&g, a, .fn_, "read_exact", root);
+
+    // The crate's own `Read`: the same shape, but with no `use` to resolve the
+    // name through, so `boundPathMatches` finds nothing and the call is refused.
+    var crate_read_dyn: DynReceiver = undefined;
+    crate_read_dyn.init("Read", null);
+    var types_store = [_]types.Type{crate_read_dyn.ty()};
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = input, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .mutable,
+            .method = read_exact_ident,
+            .args = &.{},
+        } } },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+    try expectUnsupportedReason(&b.exprs[1], "method dispatch unavailable");
+}
+
+// ── Ownership: `ToOwned`, the growing methods, and UTF-8 errors ─────────────
+
+test "each std owner answers only the methods its own runtime type has" {
+    const str_ref: types.Type = .{ .reference = &.{ .mut = false, .pointee = types.str_type } };
+    const u8_slice: types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const string: types.Type = .{ .external_nominal = .{ .path = &.{ "alloc", "string", "String" } } };
+    const bytes_vec: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    const str_cow: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{types.str_type},
+    } };
+    const from_utf8_error: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "FromUtf8Error" },
+    } };
+
+    // `&str` is the runtime's `[]const u8`, so `as_bytes` hands back the very
+    // bytes it already borrows and `to_owned` is the copy that ends the borrow.
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .str_as_bytes),
+        resolve_methods.lookupStdMethod(str_ref, "as_bytes"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .str_to_owned),
+        resolve_methods.lookupStdMethod(str_ref, "to_owned"),
+    );
+    // A borrowed slice's `Owned` is a `Vec<T>` — a different owner from the
+    // `String` a `str` produces, which is why the two are separate answers.
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .slice_to_owned),
+        resolve_methods.lookupStdMethod(u8_slice, "to_owned"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .string_push_str),
+        resolve_methods.lookupStdMethod(string, "push_str"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .string_extend),
+        resolve_methods.lookupStdMethod(string, "extend"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .vec_push),
+        resolve_methods.lookupStdMethod(bytes_vec, "push"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .vec_extend),
+        resolve_methods.lookupStdMethod(bytes_vec, "extend"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .cow_as_bytes),
+        resolve_methods.lookupStdMethod(str_cow, "as_bytes"),
+    );
+    // `into_owned` is the CONSUMING half and yields the owned payload.
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .cow_to_owned),
+        resolve_methods.lookupStdMethod(str_cow, "into_owned"),
+    );
+    // `to_owned` is not that. A `Cow` is `Clone`, so the blanket
+    // `impl<T: Clone> ToOwned for T { type Owned = T }` applies and the result is
+    // a CLONE of the same `Cow`, taken through `&self` — the receiver is still
+    // usable afterwards. Answering it like `into_owned` would consume a borrow.
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .clone),
+        resolve_methods.lookupStdMethod(str_cow, "to_owned"),
+    );
+    // The same blanket gives `[T; N]` back unchanged, where only the UNSIZED
+    // slice is specialized to a `Vec<T>`. So an array's `to_owned` is a clone
+    // and a slice's is an allocation — two receivers of the same shape and two
+    // different Rust owners.
+    const byte_array: types.Type = .{ .array = &.{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .literal = 4 },
+    } };
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .clone),
+        resolve_methods.lookupStdMethod(byte_array, "to_owned"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .from_utf8_error_utf8_error),
+        resolve_methods.lookupStdMethod(from_utf8_error, "utf8_error"),
+    );
+}
+
+test "the ownership methods are decided by the full std path, never the leaf" {
+    // Three homonyms, each of which a real crate can declare. `lookupStdMethod`
+    // matches `alloc::string::String` in full — root, module, and leaf — so a
+    // crate's own `String`, `Vec`, or `FromUtf8Error` reaches none of the arms
+    // above and keeps whatever reason its own dispatch earns. This is the same
+    // rule `isExactStdIoType` already states for `std::io`.
+    const crate_string: types.Type = .{ .external_nominal = .{
+        .path = &.{ "my_text", "string", "String" },
+    } };
+    const crate_vec: types.Type = .{ .external_nominal = .{
+        .path = &.{ "my_text", "vec", "Vec" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    const crate_error: types.Type = .{ .external_nominal = .{
+        .path = &.{ "my_text", "string", "FromUtf8Error" },
+    } };
+
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, null),
+        resolve_methods.lookupStdMethod(crate_string, "push_str"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, null),
+        resolve_methods.lookupStdMethod(crate_string, "to_owned"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, null),
+        resolve_methods.lookupStdMethod(crate_vec, "push"),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, null),
+        resolve_methods.lookupStdMethod(crate_error, "utf8_error"),
+    );
+    // A `Cow` with no payload names nothing the runtime can build, so it is not
+    // the `Cow<str>` the arms above answer for.
+    const payloadless_cow: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+    } };
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, null),
+        resolve_methods.lookupStdMethod(payloadless_cow, "as_bytes"),
+    );
+}
+
+// ── `.into()` ──────────────────────────────────────────────────────────────
+
+test "an into conversion is admitted only for a pair std actually declares" {
+    const str_ref: types.Type = .{ .reference = &.{ .mut = false, .pointee = types.str_type } };
+    const slice_ref: types.Type = .{ .reference = &.{
+        .mut = false,
+        .pointee = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
+    } };
+    const string: types.Type = .{ .external_nominal = .{ .path = &.{ "alloc", "string", "String" } } };
+    const bytes_vec: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    const str_cow: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{types.str_type},
+    } };
+    const bytes_cow: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{.{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } }},
+    } };
+
+    // The borrowed half is the identity tagged `Borrowed`, and the owned half
+    // moves the receiver's own owner across tagged `Owned`. Both are one
+    // answer per side: which of them applies is decided by the RECEIVER, never
+    // by which one reads more naturally at the call site.
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .into_cow_borrowed),
+        resolve_methods.lookupStdIntoMethod(str_ref, str_cow),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .into_cow_borrowed),
+        resolve_methods.lookupStdIntoMethod(slice_ref, bytes_cow),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .into_cow_owned),
+        resolve_methods.lookupStdIntoMethod(string, str_cow),
+    );
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .into_cow_owned),
+        resolve_methods.lookupStdIntoMethod(bytes_vec, bytes_cow),
+    );
+
+    // A `&mut B` borrows exactly the bytes a `&B` does — mutability is not part
+    // of what the `Cow` holds — so it is the same borrowed conversion.
+    const mutable_str_ref: types.Type = .{ .reference = &.{ .mut = true, .pointee = types.str_type } };
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .into_cow_borrowed),
+        resolve_methods.lookupStdIntoMethod(mutable_str_ref, str_cow),
+    );
+
+    // The element type is part of the payload, not decoration: a `Cow<[u16]>`
+    // is owned by a `Vec<u16>`, so the owned half reads the source's element
+    // and not merely that it is a vector.
+    const u16_vec: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = &.{.{ .prim = .u16 }},
+    } };
+    const u16_cow: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{.{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u16 } } }},
+    } };
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, .into_cow_owned),
+        resolve_methods.lookupStdIntoMethod(u16_vec, u16_cow),
+    );
+
+    // `&str` into a `String` is a real, valid conversion — and deliberately
+    // not one this predicate claims. It answers for the `Cow` ownership
+    // conversions and nothing else, because those are the pairs whose result
+    // changes who owns the bytes; a `String` is reached by `ToOwned`, not by
+    // an ownership tag. Claiming it here would answer a different question
+    // with the same rule.
+    try std.testing.expectEqual(
+        @as(?resolve_methods.StdMethod, null),
+        resolve_methods.lookupStdIntoMethod(str_ref, string),
+    );
+}
+
+test "a crate From impl is what its own into call resolves to" {
+    // `impl<'a> From<PercentDecode<'a>> for Cow<'a, [u8]>` is what makes
+    // `percent_decode(..).into()` a `Cow<[u8]>` in percent-encoding, and the
+    // receiver's nominal names no std trait at all — the conversion lives in
+    // an impl block this crate wrote, so the callee is rebound to that impl's
+    // own `from`.
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    // `impl From<..> for Cow` names the trait by the short name the module
+    // imports, so the fixture has to import it: `userFromImplMethod` proves the
+    // trait by its full `core::convert::From` path resolved through the scope's
+    // use declarations, which is the same proof every other trait identity in
+    // the pipeline makes — and the reason a crate's OWN `trait From<T>` cannot
+    // answer this call.
+    const from_use = try addExternalUse(&g, a, root, "From", &.{ "core", "convert", "From" });
+    _ = try addEntity(&g, a, .struct_, "PercentDecode", root);
+    const decode = try addEntity(&g, a, .fn_, "decode", root);
+    const from_impl = try addEntity(&g, a, .impl_, "From<PercentDecode> for Cow", root);
+    const from_fn = try addEntity(&g, a, .fn_, "from", from_impl);
+    const into_ident = try addEntity(&g, a, .fn_, "into", root);
+
+    const decode_ty: types.Type = .{ .path = .{ .segments = &.{.{ .name = "PercentDecode", .id = null }} } };
+    const cow_ty: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{.{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } }},
+    } };
+
+    var bodies_store = [_]bodies.BodyKind{.none} ** 7;
+    var types_store = [_]types.Type{ decode_ty, cow_ty };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = decode, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = 1, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .value,
+            .method = into_ident,
+            .args = &.{},
+        } } },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &bodies_store,
+    };
+    bodies_store[from_impl] = .{ .impl_ = .{
+        .self_ty = cow_ty,
+        .trait_path = .{ .segments = &.{.{ .name = "From", .id = from_use }} },
+        .trait_args = &.{decode_ty},
+        .assoc_items = &.{from_fn},
+    } };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+
+    // The call survives AND is retargeted: `into` is the spelling, `from` is
+    // the implementation Rust picks for it, and a callee left as `into` would
+    // emit a call to a method no impl provides. The rebound callee is the whole
+    // observation — a tally would only restate that one call was counted.
+    try std.testing.expect(b.exprs[1].kind == .method_call);
+    try std.testing.expectEqual(@as(spine.EntityId, from_fn), b.exprs[1].kind.method_call.method);
+}
+
+test "an into with no target this pass recovered stays refused" {
+    // The same call without the type inference that settled its target. Rust
+    // would still resolve it, but only from a context this frontend cannot
+    // see; guessing the nearest std conversion here would emit a `Cow` the
+    // source never asked for, so the call keeps the reason it earned.
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const text = try addEntity(&g, a, .fn_, "text", root);
+    const into_ident = try addEntity(&g, a, .fn_, "into", root);
+
+    var types_store = [_]types.Type{
+        .{ .reference = &.{ .mut = false, .pointee = types.str_type } },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = text, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .shared,
+            .method = into_ident,
+            .args = &.{},
+        } } },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    _ = try resolve_methods.resolveMethods(&g, &b);
+    try expectUnsupportedReason(&b.exprs[1], "method dispatch unavailable");
+}
+
+// ── The allocator effect a `write_all` carries ─────────────────────────────
+
+test "only a std Write write_all is an allocating call" {
+    const a = std.testing.allocator;
+    var g = graph.CrateGraph.init(a);
+    defer g.deinit();
+
+    const root = try addEntity(&g, a, .module, "", null);
+    const read_use = try addExternalUse(&g, a, root, "Read", &.{ "std", "io", "Read" });
+    const write_use = try addExternalUse(&g, a, root, "Write", &.{ "std", "io", "Write" });
+    _ = try addEntity(&g, a, .struct_, "Sink", root);
+
+    const read_byte = try addEntity(&g, a, .fn_, "read_byte", root);
+    const input = try addEntity(&g, a, .field, "input", read_byte);
+    const write_byte = try addEntity(&g, a, .fn_, "write_byte", root);
+    const output = try addEntity(&g, a, .field, "output", write_byte);
+    const drain = try addEntity(&g, a, .fn_, "drain", root);
+    const sink = try addEntity(&g, a, .field, "sink", drain);
+
+    const read_exact_ident = try addEntity(&g, a, .fn_, "read_exact", root);
+    const write_all_ident = try addEntity(&g, a, .fn_, "write_all", root);
+
+    // 0: a `&mut dyn Read`. 1: a `&mut dyn Write`. 2: a crate-local `Sink`
+    // whose OWN `write_all` shadows the std name.
+    var read_dyn: DynReceiver = undefined;
+    read_dyn.init("Read", read_use);
+    var write_dyn: DynReceiver = undefined;
+    write_dyn.init("Write", write_use);
+    var types_store = [_]types.Type{
+        read_dyn.ty(),
+        write_dyn.ty(),
+        .{ .path = .{ .segments = &.{.{ .name = "Sink", .id = null }} } },
+    };
+    var exprs_store = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = input, .generic_args = &.{} } } },
+        .{ .id = 1, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 0,
+            .receiver_mode = .mutable,
+            .method = read_exact_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 2, .span = span, .ty = 1, .kind = .{ .path = .{ .def = output, .generic_args = &.{} } } },
+        .{ .id = 3, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 2,
+            .receiver_mode = .mutable,
+            .method = write_all_ident,
+            .args = &.{},
+        } } },
+        .{ .id = 4, .span = span, .ty = 2, .kind = .{ .path = .{ .def = sink, .generic_args = &.{} } } },
+        .{ .id = 5, .span = span, .ty = null, .kind = .{ .method_call = .{
+            .receiver = 4,
+            .receiver_mode = .value,
+            .method = write_all_ident,
+            .args = &.{},
+        } } },
+    };
+    var b: bodies.Bodies = .{
+        .exprs = &exprs_store,
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &types_store,
+        .bodies = &.{},
+    };
+
+    // Only the `std::io::Write` one. `read_exact` fills a buffer the caller
+    // already owns, so marking its caller allocating would invent an effect
+    // it does not have; and the crate's own `Sink::write_all` is not the std
+    // intrinsic, so the runtime's `gpa`-taking lowering is not what runs.
+    try std.testing.expect(!resolve_methods.stdIoWriteMethodAllocates(&g, &b, 1));
+    try std.testing.expect(resolve_methods.stdIoWriteMethodAllocates(&g, &b, 3));
+    try std.testing.expect(!resolve_methods.stdIoWriteMethodAllocates(&g, &b, 5));
+    // A node that is not a method call at all cannot name the method.
+    try std.testing.expect(!resolve_methods.stdIoWriteMethodAllocates(&g, &b, 0));
+    try std.testing.expect(!resolve_methods.stdIoWriteMethodAllocates(&g, &b, 99));
 }

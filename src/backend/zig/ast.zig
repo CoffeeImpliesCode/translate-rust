@@ -257,6 +257,8 @@ pub const Literal = union(enum) {
     bool_lit: bool,
     char_lit: u21,
     str: []const u8,
+    /// A Zig error-set value, distinct from a member of a user identifier.
+    error_tag: []const u8,
     null_lit,
     undefined_lit,
 };
@@ -286,8 +288,25 @@ pub const Expr = union(enum) {
     for_expr: ForExpr,
     range: Range,
     return_expr: ?*const Expr,
-    break_expr: ?*const Expr,
-    continue_expr: void,
+    break_expr: BreakExpr,
+    continue_expr: ContinueExpr,
+    /// The Zig `unreachable` keyword, for an exhaustive ordered match whose
+    /// last prong is never reached. It is control flow, not an identifier.
+    unreachable_: void,
+};
+
+/// A control exit from a loop or a labelled block.
+pub const BreakExpr = struct {
+    /// Value handed to the exit target. Null = exit carrying unit.
+    value: ?*const Expr = null,
+    /// Source label naming the target, or null for the innermost one.
+    label: ?[]const u8 = null,
+};
+
+/// A restart of a loop.
+pub const ContinueExpr = struct {
+    /// Source label naming the loop to restart, or null for the innermost one.
+    label: ?[]const u8 = null,
 };
 
 pub const FieldAccess = struct {
@@ -445,6 +464,13 @@ pub const IfExpr = struct {
     cond: *const Expr,
     then_body: *const Expr,
     else_body: ?*const Expr = null,
+    /// Payload bound by the `then` branch: `if (cond) |x| ...`. Zig captures
+    /// whatever the condition evaluated to, so this one binding covers both a
+    /// split optional and a split error union; null = no capture.
+    then_capture: ?Capture = null,
+    /// Payload bound by the `else` branch: `if (cond) |x| ... else |err| ...`.
+    /// Only meaningful together with an `else_body`.
+    else_capture: ?Capture = null,
 };
 
 pub const WhileExpr = struct {
@@ -454,6 +480,9 @@ pub const WhileExpr = struct {
     captures: ?[]const []const u8 = null,
     body: Block,
     else_body: ?*const Expr = null,
+    /// Source label on the loop itself. Zig labels a loop from outside, and a
+    /// labelled exit names the loop, never its body block.
+    label: ?[]const u8 = null,
 };
 
 pub const ForExpr = struct {
@@ -461,6 +490,9 @@ pub const ForExpr = struct {
     captures: []const Capture = &.{},
     body: Block,
     else_body: ?*const Expr = null,
+    /// Source label on the loop itself. Zig labels a loop from outside, and a
+    /// labelled exit names the loop, never its body block.
+    label: ?[]const u8 = null,
 };
 
 pub const Range = struct {
@@ -539,6 +571,7 @@ pub const ValidationError = error{
     AmbiguousMatchCapture,
     InvalidPointerAlignment,
     InvalidIdentifier,
+    ElseCaptureWithoutElseBody,
 };
 
 fn isIdentifier(name: []const u8) bool {
@@ -760,6 +793,7 @@ fn sameLiteral(left: Literal, right: Literal) bool {
         .bool_lit => |value| value == right.bool_lit,
         .char_lit => |value| value == right.char_lit,
         .str => |value| std.mem.eql(u8, value, right.str),
+        .error_tag => |value| std.mem.eql(u8, value, right.error_tag),
         .null_lit, .undefined_lit => true,
     };
 }
@@ -880,12 +914,17 @@ fn sameMatchArmSlice(left: []const MatchArm, right: []const MatchArm) bool {
         if (!samePatternSlice(left_arm.patterns, right_arm.patterns)) return false;
         if (left_arm.capture == null or right_arm.capture == null) {
             if (left_arm.capture != null or right_arm.capture != null) return false;
-        } else if (!sameCapture(left_arm.capture.?, right_arm.capture.?)) {
+        } else if (!sameOptionalCapture(left_arm.capture, right_arm.capture)) {
             return false;
         }
         if (!sameExpr(left_arm.body, right_arm.body)) return false;
     }
     return true;
+}
+
+fn sameOptionalCapture(left: ?Capture, right: ?Capture) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return sameCapture(left.?, right.?);
 }
 
 fn sameStmt(left: Stmt, right: Stmt) bool {
@@ -931,7 +970,7 @@ fn sameExpr(left: Expr, right: Expr) bool {
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
     return switch (left) {
         .lit => |literal| sameLiteral(literal, right.lit),
-        .unit, .continue_expr => true,
+        .unit => true,
         .ident => |name| std.mem.eql(u8, name, right.ident),
         .field_access => |field_access| {
             const other = right.field_access;
@@ -997,8 +1036,10 @@ fn sameExpr(left: Expr, right: Expr) bool {
         .if_expr => |if_expr| {
             const other = right.if_expr;
             return sameExpr(if_expr.cond.*, other.cond.*) and
+                sameOptionalCapture(if_expr.then_capture, other.then_capture) and
                 sameExpr(if_expr.then_body.*, other.then_body.*) and
-                sameOptionalExpr(if_expr.else_body, other.else_body);
+                sameOptionalExpr(if_expr.else_body, other.else_body) and
+                sameOptionalCapture(if_expr.else_capture, other.else_capture);
         },
         .while_expr => |while_expr| {
             const other = right.while_expr;
@@ -1006,14 +1047,16 @@ fn sameExpr(left: Expr, right: Expr) bool {
                 sameOptionalExpr(while_expr.continue_expr, other.continue_expr) and
                 sameOptionalStringSlice(while_expr.captures, other.captures) and
                 sameBlock(while_expr.body, other.body) and
-                sameOptionalExpr(while_expr.else_body, other.else_body);
+                sameOptionalExpr(while_expr.else_body, other.else_body) and
+                sameOptionalString(while_expr.label, other.label);
         },
         .for_expr => |for_expr| {
             const other = right.for_expr;
             return sameExprSlice(for_expr.inputs, other.inputs) and
                 sameCaptureSlice(for_expr.captures, other.captures) and
                 sameBlock(for_expr.body, other.body) and
-                sameOptionalExpr(for_expr.else_body, other.else_body);
+                sameOptionalExpr(for_expr.else_body, other.else_body) and
+                sameOptionalString(for_expr.label, other.label);
         },
         .range => |range| {
             const other = right.range;
@@ -1021,7 +1064,13 @@ fn sameExpr(left: Expr, right: Expr) bool {
                 sameOptionalExpr(range.end, other.end);
         },
         .return_expr => |value| sameOptionalExpr(value, right.return_expr),
-        .break_expr => |value| sameOptionalExpr(value, right.break_expr),
+        .break_expr => |break_expr| {
+            const other = right.break_expr;
+            return sameOptionalExpr(break_expr.value, other.value) and
+                sameOptionalString(break_expr.label, other.label);
+        },
+        .continue_expr => |continue_expr| sameOptionalString(continue_expr.label, right.continue_expr.label),
+        .unreachable_ => true,
     };
 }
 
@@ -1132,8 +1181,14 @@ fn validatePattern(pattern: Pattern) ValidationError!void {
     }
 }
 
+/// Statements and optional value of one translated block.
+///
+/// An empty block is legal: a Rust `for _ in xs {}` has no statements to
+/// translate and emits `{}`. Emptiness only means "nothing was translated"
+/// where the block IS the translation of a body the source requires — a
+/// function body, a test body, or an arm that owes a value — and those checks
+/// live where that position is known.
 fn validateBlock(block: Block) ValidationError!void {
-    if (block.stmts.len == 0 and block.expr == null) return error.EmptyTranslatedBody;
     if (block.label) |label| try validateName(label);
     for (block.stmts) |stmt| {
         switch (stmt) {
@@ -1274,8 +1329,16 @@ fn validateExpr(expr: Expr) ValidationError!void {
         .unsupported => return error.UnsupportedTranslationNode,
         .if_expr => |if_expr| {
             try validateExpr(if_expr.cond.*);
+            if (if_expr.then_capture) |capture| try validateName(capture.name);
             try validateExpr(if_expr.then_body.*);
-            if (if_expr.else_body) |else_body| try validateExpr(else_body.*);
+            if (if_expr.else_body) |else_body| {
+                if (if_expr.else_capture) |capture| try validateName(capture.name);
+                try validateExpr(else_body.*);
+            } else if (if_expr.else_capture != null) {
+                // An else payload reads the branch that is not there, so the
+                // AST cannot describe it as anything but a missing branch.
+                return error.ElseCaptureWithoutElseBody;
+            }
         },
         .while_expr => |while_expr| {
             try validateExpr(while_expr.cond.*);
@@ -1283,6 +1346,7 @@ fn validateExpr(expr: Expr) ValidationError!void {
             if (while_expr.captures) |captures| for (captures) |capture| try validateName(capture);
             try validateBlock(while_expr.body);
             if (while_expr.else_body) |else_body| try validateExpr(else_body.*);
+            if (while_expr.label) |label| try validateName(label);
         },
         .for_expr => |for_expr| {
             if (for_expr.inputs.len == 0 or for_expr.captures.len == 0) {
@@ -1292,14 +1356,21 @@ fn validateExpr(expr: Expr) ValidationError!void {
             for (for_expr.captures) |capture| try validateName(capture.name);
             try validateBlock(for_expr.body);
             if (for_expr.else_body) |else_body| try validateExpr(else_body.*);
+            if (for_expr.label) |label| try validateName(label);
         },
         .range => |range| {
             try validateExpr(range.start.*);
             if (range.end) |end| try validateExpr(end.*);
         },
         .return_expr => |value| if (value) |expr_ptr| try validateExpr(expr_ptr.*),
-        .break_expr => |value| if (value) |expr_ptr| try validateExpr(expr_ptr.*),
-        .continue_expr => {},
+        .break_expr => |break_expr| {
+            if (break_expr.value) |expr_ptr| try validateExpr(expr_ptr.*);
+            if (break_expr.label) |label| try validateName(label);
+        },
+        .continue_expr => |continue_expr| {
+            if (continue_expr.label) |label| try validateName(label);
+        },
+        .unreachable_ => {},
     }
 }
 
@@ -1427,6 +1498,12 @@ pub fn validateFileForTranslation(file: *const File) ValidationError!void {
     for (file.decls) |decl| try validateDecl(decl);
     for (file.tests) |test_decl| {
         if (test_decl.name.len == 0) return error.InvalidIdentifier;
+        // A test with no body translated is a test that was never lowered;
+        // an empty loop body is not, which is why the check is here and not in
+        // `validateBlock`.
+        if (test_decl.body.stmts.len == 0 and test_decl.body.expr == null) {
+            return error.EmptyTranslatedBody;
+        }
         try validateBlock(test_decl.body);
     }
 }
@@ -1496,7 +1573,7 @@ test "ast validation: distinguishes zero tests from empty test bodies" {
 test "ast validation: rejects missing std import for generated tests" {
     const file: File = .{
         .path = "src/root.zig",
-        .tests = &.{.{ .name = "test", .body = .{ .expr = &Expr{ .continue_expr = {} } } }},
+        .tests = &.{.{ .name = "test", .body = .{ .expr = &Expr{ .continue_expr = .{} } } }},
     };
     try std.testing.expectError(error.MissingStdImport, validateFileForTranslation(&file));
 }
@@ -1523,7 +1600,7 @@ test "ast validation: rejects empty functions, containers, match selectors, and 
 
     const unnamed_match: Expr = .{ .match_expr = .{
         .target = &Expr{ .ident = "value" },
-        .arms = &.{.{ .patterns = &.{.{ .struct_pat = .{} }}, .body = .{ .continue_expr = {} } }},
+        .arms = &.{.{ .patterns = &.{.{ .struct_pat = .{} }}, .body = .{ .continue_expr = .{} } }},
     } };
     try std.testing.expectError(error.UnnamedMatchSelector, validateExpr(unnamed_match));
 
@@ -1699,6 +1776,38 @@ test "ast validation: validates explicit captures and rejects ambiguous bindings
     try std.testing.expectError(error.AmbiguousMatchCapture, validateExpr(ambiguous));
 }
 
+test "ast validation: a conditional payload needs the branch it binds" {
+    const captured: Expr = .{ .if_expr = .{
+        .cond = &Expr{ .ident = "maybe" },
+        .then_capture = .{ .name = "ok" },
+        .then_body = &Expr{ .ident = "ok" },
+        .else_body = &Expr{ .ident = "fallback" },
+        .else_capture = .{ .name = "tag", .by_ref = true },
+    } };
+    try validateExpr(captured);
+
+    // An else payload reads the branch it belongs to, so a conditional
+    // without one cannot describe what that payload would bind.
+    const orphan_else_capture: Expr = .{ .if_expr = .{
+        .cond = &Expr{ .ident = "maybe" },
+        .then_body = &Expr{ .ident = "ok" },
+        .else_capture = .{ .name = "tag" },
+    } };
+    try std.testing.expectError(
+        error.ElseCaptureWithoutElseBody,
+        validateExpr(orphan_else_capture),
+    );
+
+    for ([_][]const u8{ "", "0tag", "tag*" }) |name| {
+        const malformed: Expr = .{ .if_expr = .{
+            .cond = &Expr{ .ident = "maybe" },
+            .then_capture = .{ .name = name },
+            .then_body = &Expr{ .ident = "ok" },
+        } };
+        try std.testing.expectError(error.InvalidIdentifier, validateExpr(malformed));
+    }
+}
+
 test "ast: instantiate AST DOM shapes" {
     const u8_ty: Type = .{ .prim = .u8 };
     const slice_ty: Type = .{ .slice = .{ .elem = &u8_ty, .is_const = true } };
@@ -1866,7 +1975,7 @@ test "ast validation: rejects a package whose root file declares nothing" {
         .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
         .tests = &.{.{
             .name = "regression",
-            .body = .{ .expr = &Expr{ .continue_expr = {} } },
+            .body = .{ .expr = &Expr{ .continue_expr = .{} } },
         }},
     };
     try std.testing.expectError(
@@ -1921,7 +2030,7 @@ test "ast validation: accepts a declared root that has no translated tests" {
         .files = &.{.{ .path = "src/root.zig", .decls = &.{.{ .fn_decl = .{
             .name = "run",
             .ret_type = .{ .void_type = {} },
-            .body = .{ .expr = &Expr{ .continue_expr = {} } },
+            .body = .{ .expr = &Expr{ .continue_expr = .{} } },
         } }} }},
     });
 }

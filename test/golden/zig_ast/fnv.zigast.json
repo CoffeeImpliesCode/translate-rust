@@ -41,7 +41,7 @@
                   "params": [],
                   "ret_type": {
                     "kind": "named",
-                    "name": "FnvHasher"
+                    "name": "root.FnvHasher"
                   },
                   "body": {
                     "label": null,
@@ -50,7 +50,7 @@
                       "kind": "struct_init",
                       "type_name": {
                         "kind": "named",
-                        "name": "FnvHasher"
+                        "name": "root.FnvHasher"
                       },
                       "fields": [
                         {
@@ -87,7 +87,7 @@
                   ],
                   "ret_type": {
                     "kind": "named",
-                    "name": "FnvHasher"
+                    "name": "root.FnvHasher"
                   },
                   "body": {
                     "label": null,
@@ -96,7 +96,7 @@
                       "kind": "struct_init",
                       "type_name": {
                         "kind": "named",
-                        "name": "FnvHasher"
+                        "name": "root.FnvHasher"
                       },
                       "fields": [
                         {
@@ -307,6 +307,7 @@
                             ],
                             "expr": null
                           },
+                          "label": null,
                           "else_body": null
                         }
                       },
@@ -324,7 +325,7 @@
                           "kind": "struct_init",
                           "type_name": {
                             "kind": "named",
-                            "name": "FnvHasher"
+                            "name": "root.FnvHasher"
                           },
                           "fields": [
                             {
@@ -367,6 +368,129 @@
                 }
               ],
               "args": []
+            }
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "FnvHashMap",
+            "is_pub": true,
+            "is_test": false,
+            "params": [],
+            "ret_type": {
+              "kind": "named",
+              "name": "type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "ident",
+                  "name": "r2z.collections.HashMap"
+                },
+                "generic_args": [
+                  {
+                    "kind": "named",
+                    "name": "K"
+                  },
+                  {
+                    "kind": "named",
+                    "name": "V"
+                  },
+                  {
+                    "kind": "named",
+                    "name": "FnvBuildHasher"
+                  }
+                ],
+                "args": []
+              }
+            },
+            "generic_params": [
+              {
+                "name": "K",
+                "is_comptime": true,
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                }
+              },
+              {
+                "name": "V",
+                "is_comptime": true,
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "kind": "fn_decl",
+          "value": {
+            "name": "FnvHashSet",
+            "is_pub": true,
+            "is_test": false,
+            "params": [],
+            "ret_type": {
+              "kind": "named",
+              "name": "type"
+            },
+            "body": {
+              "label": null,
+              "stmts": [],
+              "expr": {
+                "kind": "call",
+                "callee": {
+                  "kind": "ident",
+                  "name": "r2z.collections.HashSet"
+                },
+                "generic_args": [
+                  {
+                    "kind": "named",
+                    "name": "T"
+                  },
+                  {
+                    "kind": "named",
+                    "name": "FnvBuildHasher"
+                  }
+                ],
+                "args": []
+              }
+            },
+            "generic_params": [
+              {
+                "name": "T",
+                "is_comptime": true,
+                "ty": {
+                  "kind": "named",
+                  "name": "type"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "kind": "const_decl",
+          "value": {
+            "name": "root",
+            "is_pub": true,
+            "ty": null,
+            "init": {
+              "kind": "builtin",
+              "name": "import",
+              "args": [
+                {
+                  "kind": "lit",
+                  "value": {
+                    "kind": "str",
+                    "value": "./root.zig"
+                  }
+                }
+              ]
             }
           }
         }

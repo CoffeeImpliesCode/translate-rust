@@ -663,6 +663,103 @@ test "serialize: for captures preserve pointer mode" {
     try testing.expect(decoded.for_expr.captures[0].by_ref);
 }
 
+fn checkIfCaptureDecodeAllocations(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    const decoded = try serialize.decodeExpr(allocator, value);
+    try testing.expect(decoded == .if_expr);
+    defer {
+        const if_expr = decoded.if_expr;
+        allocator.free(if_expr.cond.*.ident);
+        allocator.destroy(@constCast(if_expr.cond));
+        allocator.free(if_expr.then_body.*.ident);
+        allocator.destroy(@constCast(if_expr.then_body));
+        allocator.free(if_expr.else_body.?.*.ident);
+        allocator.destroy(@constCast(if_expr.else_body.?));
+        allocator.free(if_expr.then_capture.?.name);
+        allocator.free(if_expr.else_capture.?.name);
+    }
+    try testing.expectEqualStrings("maybe", decoded.if_expr.cond.*.ident);
+    try testing.expectEqualStrings("ok", decoded.if_expr.then_capture.?.name);
+    try testing.expect(!decoded.if_expr.then_capture.?.by_ref);
+    try testing.expectEqualStrings("tag", decoded.if_expr.else_capture.?.name);
+    try testing.expect(decoded.if_expr.else_capture.?.by_ref);
+}
+
+test "serialize: conditional captures keep both payloads and every allocation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const encoded = try serialize.encodeExpr(arena.allocator(), .{
+        .if_expr = .{
+            .cond = &ast.Expr{ .ident = "maybe" },
+            .then_capture = .{ .name = "ok" },
+            .then_body = &ast.Expr{ .ident = "ok" },
+            .else_body = &ast.Expr{ .ident = "fallback" },
+            .else_capture = .{ .name = "tag", .by_ref = true },
+        },
+    });
+    const then_wire = encoded.object.get("then_capture").?.object;
+    try testing.expectEqualStrings("ok", then_wire.get("name").?.string);
+    try testing.expect(!then_wire.get("by_ref").?.bool);
+    const else_wire = encoded.object.get("else_capture").?.object;
+    try testing.expectEqualStrings("tag", else_wire.get("name").?.string);
+    try testing.expect(else_wire.get("by_ref").?.bool);
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkIfCaptureDecodeAllocations,
+        .{encoded},
+    );
+}
+
+test "serialize: an else capture without its branch is rejected" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        \\{"kind":"if_expr","cond":{"kind":"ident","name":"maybe"},"then_body":{"kind":"ident","name":"ok"},"else_body":null,"else_capture":{"name":"tag","by_ref":false}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try testing.expectError(
+        error.BadWireFormat,
+        serialize.decodeExpr(testing.allocator, parsed.value),
+    );
+}
+
+test "serialize: a conditional without captures keeps the wire it had without them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // A plain conditional is the whole wire: no capture key appears at all, so
+    // a sidecar written before payloads existed still describes it exactly.
+    const encoded = try serialize.encodeExpr(arena.allocator(), .{
+        .if_expr = .{
+            .cond = &ast.Expr{ .ident = "maybe" },
+            .then_body = &ast.Expr{ .ident = "ok" },
+            .else_body = &ast.Expr{ .ident = "fallback" },
+        },
+    });
+    try testing.expect(encoded.object.get("then_capture") == null);
+    try testing.expect(encoded.object.get("else_capture") == null);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        \\{"kind":"if_expr","cond":{"kind":"ident","name":"maybe"},"then_body":{"kind":"ident","name":"ok"},"else_body":{"kind":"ident","name":"fallback"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const decoded = try serialize.decodeExpr(arena.allocator(), parsed.value);
+    try testing.expect(decoded.if_expr.then_capture == null);
+    try testing.expect(decoded.if_expr.else_capture == null);
+    try testing.expectEqualStrings("maybe", decoded.if_expr.cond.*.ident);
+    try testing.expectEqualStrings("ok", decoded.if_expr.then_body.*.ident);
+    try testing.expectEqualStrings("fallback", decoded.if_expr.else_body.?.*.ident);
+}
+
 fn expectRangePatternEqual(expected: ast.Pattern, actual: ast.Pattern) !void {
     try testing.expect(actual == .range_pat);
     try testing.expectEqual(expected.range_pat.inclusive, actual.range_pat.inclusive);
@@ -845,4 +942,195 @@ test "serialize: malformed range pattern payloads are rejected" {
             serialize.decodePattern(testing.allocator, parsed.value),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `[e; N]` repeat counts
+// ---------------------------------------------------------------------------
+//
+// Preserve full-width counts in both array types and repeat expressions.
+// Counts beyond i64 can describe valid zero-sized Rust arrays.
+
+// Keep boundary counts as native JSON numbers; filter u64 cases on 32-bit targets.
+const i64_range_counts = [_]u64{
+    0, // an empty repeat is a legal count, not an absent one
+    4294967295, // u32::MAX
+    9007199254740993, // 2^53 + 1, first count f64 rounds
+    9223372036854775807, // i64::MAX
+};
+
+// Signed boundary, floating-point precision, and unsigned maximum.
+const above_i64_counts = [_]u64{
+    9223372036854775808, // 2^63
+    9223372036854775809, // 2^63 + 1
+    18446744073709551615, // usize::MAX
+};
+
+/// Exercise repeats with and without an explicit element type.
+/// Returned file and declaration slices must outlive this helper.
+fn repeatCountPackage(
+    allocator: std.mem.Allocator,
+    n: usize,
+    fill: ast.Expr,
+) !ast.Package {
+    const u8_ty = try allocator.create(ast.Type);
+    u8_ty.* = .{ .prim = .u8 };
+    const fill_node = try allocator.create(ast.Expr);
+    fill_node.* = fill;
+    const filled_body = try allocator.create(ast.Expr);
+    filled_body.* = .{ .repeat = .{ .type_name = u8_ty.*, .elem = fill_node, .len = n } };
+
+    const no_elements: []const ast.Type = &.{};
+    const unit_ty = try allocator.create(ast.Type);
+    unit_ty.* = .{ .tuple = no_elements };
+    const unit = try allocator.create(ast.Expr);
+    unit.* = .unit;
+    const zeros_body = try allocator.create(ast.Expr);
+    zeros_body.* = .{ .repeat = .{ .type_name = null, .elem = unit, .len = n } };
+
+    const decls = try allocator.alloc(ast.Decl, 2);
+    decls[0] = .{ .fn_decl = .{
+        .name = "filled",
+        .ret_type = .{ .array = .{ .elem = u8_ty, .len = n } },
+        .body = .{ .expr = filled_body },
+    } };
+    decls[1] = .{ .fn_decl = .{
+        .name = "zeros",
+        .ret_type = .{ .array = .{ .elem = unit_ty, .len = n } },
+        .body = .{ .expr = zeros_body },
+    } };
+
+    const files = try allocator.alloc(ast.File, 1);
+    files[0] = .{ .path = "src/root.zig", .decls = decls };
+
+    return .{ .name = "repeat_counts", .files = files };
+}
+
+/// Read the counts back out of the encoded bytes with a real JSON parser and
+/// require each one to still be a JSON integer. A quoted string would change
+/// the wire format, and a float would round the counts above 2^53.
+fn expectCountsAreJsonIntegers(
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+    n: usize,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    const expected: i64 = @intCast(n);
+    const files = parsed.value.object.get("files").?.array.items;
+    // One file holding the two repeat shapes, not two files.
+    try testing.expectEqual(@as(usize, 1), files.len);
+    for (files) |file_v| {
+        const decls = file_v.object.get("decls").?.array.items;
+        try testing.expectEqual(@as(usize, 2), decls.len);
+        for (decls) |decl_v| {
+            const fn_v = decl_v.object.get("value").?.object;
+
+            const ret_v = fn_v.get("ret_type").?;
+            try testing.expectEqualStrings("array", ret_v.object.get("kind").?.string);
+            const type_len = ret_v.object.get("len").?;
+            try testing.expect(type_len == .integer);
+            try testing.expectEqual(expected, type_len.integer);
+
+            const repeat_v = fn_v.get("body").?.object.get("expr").?;
+            try testing.expectEqualStrings("repeat", repeat_v.object.get("kind").?.string);
+            const repeat_len = repeat_v.object.get("len").?;
+            try testing.expect(repeat_len == .integer);
+            try testing.expectEqual(expected, repeat_len.integer);
+        }
+    }
+}
+
+fn expectFilledRepeatDecl(decl: ast.Decl, n: usize) !void {
+    try testing.expect(decl == .fn_decl);
+    const fn_decl = decl.fn_decl;
+    try testing.expectEqualStrings("filled", fn_decl.name);
+
+    try testing.expect(fn_decl.ret_type == .array);
+    try testing.expectEqual(n, fn_decl.ret_type.array.len);
+    try testing.expect(fn_decl.ret_type.array.elem.* == .prim);
+    try testing.expectEqual(ast.Prim.u8, fn_decl.ret_type.array.elem.*.prim);
+
+    const repeat = fn_decl.body.?.expr.?.*;
+    try testing.expect(repeat == .repeat);
+    try testing.expectEqual(n, repeat.repeat.len);
+    try testing.expect(repeat.repeat.type_name.? == .prim);
+    try testing.expectEqual(ast.Prim.u8, repeat.repeat.type_name.?.prim);
+    try testing.expect(repeat.repeat.elem.* == .lit);
+    try testing.expectEqual(@as(u128, 7), repeat.repeat.elem.*.lit.uint);
+}
+
+fn expectZerosRepeatDecl(decl: ast.Decl, n: usize) !void {
+    try testing.expect(decl == .fn_decl);
+    const fn_decl = decl.fn_decl;
+    try testing.expectEqualStrings("zeros", fn_decl.name);
+
+    try testing.expect(fn_decl.ret_type == .array);
+    try testing.expectEqual(n, fn_decl.ret_type.array.len);
+    try testing.expect(fn_decl.ret_type.array.elem.* == .tuple);
+    try testing.expectEqual(@as(usize, 0), fn_decl.ret_type.array.elem.*.tuple.len);
+
+    const repeat = fn_decl.body.?.expr.?.*;
+    try testing.expect(repeat == .repeat);
+    try testing.expectEqual(n, repeat.repeat.len);
+    try testing.expect(repeat.repeat.type_name == null);
+    try testing.expect(repeat.repeat.elem.* == .unit);
+}
+
+/// Encode a package and require the decoded repeat literals, their element
+/// types and their array types to come back with `n` unchanged. Returns the
+/// encoded bytes so a caller can also read the counts off the wire.
+fn expectRepeatCountRoundtrip(
+    allocator: std.mem.Allocator,
+    pkg: *const ast.Package,
+    n: usize,
+) ![]const u8 {
+    const json_bytes = try serialize.encode(allocator, pkg);
+
+    const decoded = try serialize.decode(allocator, json_bytes);
+    try testing.expectEqual(@as(usize, 1), decoded.files.len);
+    const decls = decoded.files[0].decls;
+    try testing.expectEqual(@as(usize, 2), decls.len);
+    try expectFilledRepeatDecl(decls[0], n);
+    try expectZerosRepeatDecl(decls[1], n);
+    return json_bytes;
+}
+
+test "serialize: repeat counts an i64 holds keep an exact numeric wire form" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    for (i64_range_counts) |raw| {
+        if (raw > std.math.maxInt(usize)) continue;
+        const n: usize = @intCast(raw);
+        const pkg = try repeatCountPackage(allocator, n, .{ .lit = .{ .uint = 7 } });
+        const json_bytes = try expectRepeatCountRoundtrip(allocator, &pkg, n);
+        try expectCountsAreJsonIntegers(allocator, json_bytes, n);
+    }
+}
+
+test "serialize: repeat counts wider than i64 roundtrip exactly and are released" {
+    if (@as(u128, std.math.maxInt(usize)) <= @as(u128, std.math.maxInt(i64))) {
+        return error.SkipZigTest;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    for (above_i64_counts) |raw| {
+        if (raw > std.math.maxInt(usize)) continue;
+        const n: usize = @intCast(raw);
+        const pkg = try repeatCountPackage(allocator, n, .{ .lit = .{ .uint = 7 } });
+        _ = try expectRepeatCountRoundtrip(allocator, &pkg, n);
+    }
+
+    // Non-allocating element encoding isolates ownership of wide count text.
+    // The checked allocator must see all temporary count text released.
+    const n: usize = @intCast(above_i64_counts[above_i64_counts.len - 1]);
+    const pkg = try repeatCountPackage(allocator, n, .{ .ident = "seed" });
+    const json_bytes = try serialize.encode(testing.allocator, &pkg);
+    testing.allocator.free(json_bytes);
 }

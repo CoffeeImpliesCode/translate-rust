@@ -63,6 +63,241 @@ pub fn isStr(ty: Type) bool {
     return std.mem.eql(u8, nominal.path[2], "str");
 }
 
+/// The type a value names once every carrier around it is peeled: `&T`,
+/// `&mut T`, `Box<T>` and `*T` all stand for the thing they carry. A receiver
+/// and a method's `Self` are the same thing once the carrier is gone, which is
+/// what lets a caller read a callee's `Self` as its own receiver.
+pub fn peelCarrier(ty: Type) ?Type {
+    var current = ty;
+    var depth: usize = 0;
+    while (depth < traversal_depth_max) : (depth += 1) {
+        switch (current) {
+            .reference => |reference| current = reference.pointee,
+            .raw_ptr => |raw_ptr| current = raw_ptr.pointee,
+            .boxed => |boxed| current = boxed.*,
+            else => return current,
+        }
+    }
+    return null;
+}
+
+/// Whether a type spells the `Self` of its own declaration: one segment named
+/// `Self`, which names the enclosing impl rather than any type a table holds.
+/// A longer path starting with `Self` is a projection the impl resolves, not a
+/// spelling of the type, so it is not a leaf.
+pub fn isSelfLeaf(ty: Type) bool {
+    return ty == .path and ty.path.segments.len == 1 and
+        std.mem.eql(u8, ty.path.segments[0].name, "Self");
+}
+
+/// Whether a type names `Self` anywhere inside it, answered without allocating.
+///
+/// Conservative in one direction only. A type nested past
+/// `traversal_depth_max` cannot be walked to its end, and this answers `true`
+/// for it rather than a `false` the walk never earned. A caller that acts on
+/// the answer hands the type to `replaceSelfLeaves`, which refuses such a type
+/// outright, so the guess here can only ever start a refusal — never let one
+/// through.
+pub fn mentionsSelf(ty: Type) bool {
+    return mentionsSelfAt(ty, 0) catch true;
+}
+
+/// The scan `replaceSelfLeaves` gates each subtree on.
+///
+/// Truncation is an error and not a `false` because every arm of that rewrite
+/// reads a child's null as "this subtree names no `Self`", and a walk that
+/// stopped at the bound has not earned that reading. The bound is the IR's own,
+/// the same `traversal_depth_max` that `validateForTranslation` and
+/// `serialize` walk a type against, and the refusal is that walk's own error
+/// rather than a second kind of "no".
+fn mentionsSelfAt(ty: Type, depth: usize) error{InvalidTypeTraversal}!bool {
+    if (depth >= traversal_depth_max) return error.InvalidTypeTraversal;
+    if (isSelfLeaf(ty)) return true;
+    return switch (ty) {
+        .reference => |value| try mentionsSelfAt(value.pointee, depth + 1),
+        .raw_ptr => |value| try mentionsSelfAt(value.pointee, depth + 1),
+        .boxed => |value| try mentionsSelfAt(value.*, depth + 1),
+        .slice => |value| try mentionsSelfAt(value.elem, depth + 1),
+        .array => |value| try mentionsSelfAt(value.elem, depth + 1),
+        .tuple => |values| try listMentionsSelf(values, depth),
+        .option => |value| try mentionsSelfAt(value.*, depth + 1),
+        // Both halves are walked and the first that names a `Self` ends it; a
+        // half that cannot be walked to its end is an error, not a `false`.
+        .result => |value| blk: {
+            if (try mentionsSelfAt(value.ok, depth + 1)) break :blk true;
+            break :blk try mentionsSelfAt(value.err, depth + 1);
+        },
+        .external_nominal => |value| try listMentionsSelf(value.args, depth),
+        .generic_inst => |value| try listMentionsSelf(value.args.params, depth),
+        .fn_ptr => |value| blk: {
+            if (try listMentionsSelf(value.params, depth)) break :blk true;
+            break :blk try mentionsSelfAt(value.ret, depth + 1);
+        },
+        // A trait bound is a claim about the type, not the type itself: `T:
+        // Clone` says nothing about what `T` is called, and `dyn Trait` names
+        // no `Self` to rewrite.
+        .path, .prim, .@"opaque", .dyn_trait, .unsupported => false,
+    };
+}
+
+fn listMentionsSelf(
+    elements: []const Type,
+    depth: usize,
+) error{InvalidTypeTraversal}!bool {
+    for (elements) |element| {
+        if (try mentionsSelfAt(element, depth + 1)) return true;
+    }
+    return false;
+}
+
+/// Every `Self` leaf in `declared` becomes `self_type`, and everything around
+/// the leaf is kept as it was.
+///
+/// `Self` is a statement about the type of the declaration that owns the impl
+/// block, and it is only meaningful there. A caller that carries the spelling
+/// into its own context has no impl in scope to resolve it against, so the
+/// `Self` has to become the type the CALL SITE already knows — the receiver's
+/// own type, with whatever generic arguments it carries. The signature around
+/// the leaf belongs to neither: `Option<Self>` on a `Foo<u8>` receiver is
+/// `Option<Foo<u8>>`, not `Foo<u8>`.
+///
+/// Null says `declared` names no `Self` anywhere, and the caller keeps exactly
+/// the type it already had. A type that needs no rewrite allocates nothing.
+///
+/// The rewrite is all or nothing, and the error set is what says so.
+/// `OutOfMemory` and `InvalidTypeTraversal` are errors rather than nulls
+/// because a null lets the caller keep the type it had, while either of them
+/// folded into a null would have let a HALF-REWRITTEN type through: the leaves
+/// that did get replaced, replaced, and a leaf the walk could not reach still
+/// saying `Self`. `InvalidTypeTraversal` is the IR's own refusal —
+/// `traversal_depth_max`, walked by `validateForTranslation` and by
+/// `serialize` against the same bound with the same error — reached here
+/// because a walk that cannot see the end of a type cannot say what the type
+/// names. So every arm below reads a child's null as "this subtree names no
+/// `Self`" and nothing else, and a sibling that needs no rewrite is carried
+/// over for the same reason.
+pub const SelfRewriteError = error{ OutOfMemory, InvalidTypeTraversal };
+
+pub fn replaceSelfLeaves(
+    alloc: std.mem.Allocator,
+    self_type: Type,
+    declared: Type,
+) SelfRewriteError!?Type {
+    return replaceSelfLeavesAt(alloc, self_type, declared, 0);
+}
+
+fn replaceSelfLeavesAt(
+    alloc: std.mem.Allocator,
+    self_type: Type,
+    declared: Type,
+    depth: usize,
+) SelfRewriteError!?Type {
+    if (isSelfLeaf(declared)) return self_type;
+    // Every arm below reads its children's null as "this subtree names no
+    // Self", so that reading has to hold before any of them runs. It does: a
+    // child that answers null genuinely names no `Self`, because a walk that
+    // could not see far enough is an error rather than a null.
+    if (!(try mentionsSelfAt(declared, depth))) return null;
+    return switch (declared) {
+        .reference => |value| blk: {
+            const pointee = try replaceSelfLeavesAt(alloc, self_type, value.pointee, depth + 1) orelse return null;
+            const reference = try alloc.create(Ref);
+            reference.* = .{ .mut = value.mut, .pointee = pointee };
+            break :blk Type{ .reference = reference };
+        },
+        .raw_ptr => |value| blk: {
+            const pointee = try replaceSelfLeavesAt(alloc, self_type, value.pointee, depth + 1) orelse return null;
+            const pointer = try alloc.create(RawPtr);
+            pointer.* = .{ .mut = value.mut, .pointee = pointee };
+            break :blk Type{ .raw_ptr = pointer };
+        },
+        .boxed => |value| blk: {
+            const inner = try replaceSelfLeavesAt(alloc, self_type, value.*, depth + 1) orelse return null;
+            const boxed = try alloc.create(Type);
+            boxed.* = inner;
+            break :blk Type{ .boxed = boxed };
+        },
+        .slice => |value| blk: {
+            const elem = try replaceSelfLeavesAt(alloc, self_type, value.elem, depth + 1) orelse return null;
+            const slice = try alloc.create(Slice);
+            slice.* = .{ .const_ = value.const_, .elem = elem };
+            break :blk Type{ .slice = slice };
+        },
+        .array => |value| blk: {
+            const elem = try replaceSelfLeavesAt(alloc, self_type, value.elem, depth + 1) orelse return null;
+            const array = try alloc.create(Array);
+            array.* = .{ .elem = elem, .len = value.len };
+            break :blk Type{ .array = array };
+        },
+        .tuple => |values| blk: {
+            const rebuilt = try replaceSelfLeavesInList(alloc, self_type, values, depth) orelse return null;
+            break :blk Type{ .tuple = rebuilt };
+        },
+        .option => |value| blk: {
+            const inner = try replaceSelfLeavesAt(alloc, self_type, value.*, depth + 1) orelse return null;
+            const option = try alloc.create(Type);
+            option.* = inner;
+            break :blk Type{ .option = option };
+        },
+        // Both halves rewrite independently, so neither decides for the other:
+        // `Result<Self, io::Error>` has a `Self` in its `ok` and a plain path in
+        // its `err`. The half that needs no rewrite is carried over — which is
+        // now a certainty rather than a guess, because the gate above proved
+        // this subtree mentions a `Self` and every failure, allocation or
+        // depth, is an error rather than a null.
+        .result => |value| blk: {
+            const ok = try replaceSelfLeavesAt(alloc, self_type, value.ok, depth + 1);
+            const err = try replaceSelfLeavesAt(alloc, self_type, value.err, depth + 1);
+            if (ok == null and err == null) return null;
+            const result = try alloc.create(Result);
+            result.* = .{
+                .ok = ok orelse value.ok,
+                .err = err orelse value.err,
+                .is_error_unionable = value.is_error_unionable,
+            };
+            break :blk Type{ .result = result };
+        },
+        .external_nominal => |value| blk: {
+            const args = try replaceSelfLeavesInList(alloc, self_type, value.args, depth) orelse return null;
+            break :blk Type{ .external_nominal = .{ .path = value.path, .args = args } };
+        },
+        .generic_inst => |value| blk: {
+            const params = try replaceSelfLeavesInList(alloc, self_type, value.args.params, depth) orelse return null;
+            break :blk Type{ .generic_inst = .{ .decl = value.decl, .args = .{ .params = params } } };
+        },
+        .fn_ptr => |value| blk: {
+            const params = try replaceSelfLeavesInList(alloc, self_type, value.params, depth);
+            const ret = try replaceSelfLeavesAt(alloc, self_type, value.ret, depth + 1);
+            if (params == null and ret == null) return null;
+            const function = try alloc.create(FnPtr);
+            function.* = .{ .params = params orelse value.params, .ret = ret orelse value.ret };
+            break :blk Type{ .fn_ptr = function };
+        },
+        .path, .prim, .@"opaque", .dyn_trait, .unsupported => return null,
+    };
+}
+
+fn replaceSelfLeavesInList(
+    alloc: std.mem.Allocator,
+    self_type: Type,
+    elements: []const Type,
+    depth: usize,
+) SelfRewriteError!?[]const Type {
+    var mentions_self = false;
+    for (elements) |element| {
+        if (try mentionsSelfAt(element, depth + 1)) {
+            mentions_self = true;
+            break;
+        }
+    }
+    if (!mentions_self) return null;
+    const rebuilt = try alloc.alloc(Type, elements.len);
+    for (elements, 0..) |element, index| {
+        rebuilt[index] = try replaceSelfLeavesAt(alloc, self_type, element, depth + 1) orelse element;
+    }
+    return rebuilt;
+}
+
 /// §4.1 — Primitives. `()` → `void`, `!` → `noreturn`; `char` → `u21` at emit.
 pub const Prim = enum {
     i8,
@@ -364,3 +599,99 @@ pub const WhereClause = struct {
     self_ty: Path,
     bounds: []const Bound,
 };
+
+test "types: replacing a Self leaf is all or nothing under allocation failure" {
+    // `(Self, Result<Self, Pair<u8>>)` is the shape that makes a partial rewrite
+    // observable, and it needs more than one allocation point and more than one
+    // leaf for the sweep below to have anything to catch. The outer list is
+    // allocated, then the inner `Result` is: a failure at the second of those
+    // arrives with the first element already rewritten. A rebuild that read a
+    // failure as "nothing to do here" would then hand back a tuple whose first
+    // element said `Receiver` and whose second still said `Self` — a type no
+    // caller can use, and the one the error set exists to rule out.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const receiver: Type = .{ .path = .{ .segments = &.{
+        .{ .name = "Receiver", .id = @as(?spine.EntityId, 3) },
+    } } };
+    const self_leaf: Type = .{ .path = .{ .segments = &.{
+        .{ .name = "Self", .id = @as(?spine.EntityId, 3) },
+    } } };
+    const pair_args = try arena.alloc(Type, 1);
+    pair_args[0] = .{ .prim = .u8 };
+    const pair: Type = .{ .generic_inst = .{
+        .decl = 7,
+        .args = .{ .params = pair_args },
+    } };
+    const inner = Type{ .result = blk: {
+        const result = try arena.create(Result);
+        result.* = .{
+            .ok = self_leaf,
+            .err = pair,
+            .is_error_unionable = true,
+        };
+        break :blk result;
+    } };
+    const declared = Type{ .tuple = blk: {
+        const elements = try arena.alloc(Type, 2);
+        elements[0] = self_leaf;
+        elements[1] = inner;
+        break :blk elements;
+    } };
+
+    // A type that names no `Self` comes back as the caller's own, and the
+    // allocator is never touched at all.
+    var untouched = std.testing.FailingAllocator.init(arena, .{});
+    try std.testing.expect((try replaceSelfLeaves(untouched.allocator(), receiver, pair)) == null);
+    try std.testing.expectEqual(@as(usize, 0), untouched.allocations);
+
+    // Paid for in full: no `Self` survives, the inner `Result` keeps the `Pair`
+    // it never named, and the outer tuple keeps its arity.
+    var funded = std.testing.FailingAllocator.init(arena, .{});
+    const whole = (try replaceSelfLeaves(funded.allocator(), receiver, declared)).?;
+    try std.testing.expect(!mentionsSelf(whole));
+    try std.testing.expectEqual(@as(usize, 2), whole.tuple.len);
+    try std.testing.expectEqual(receiver, whole.tuple[0]);
+    try std.testing.expectEqual(receiver, whole.tuple[1].result.ok);
+    try std.testing.expectEqual(pair, whole.tuple[1].result.err);
+
+    // Every failure point in between: an error, or a whole type. Never a type
+    // that still says `Self`, which is exactly what a mixed rebuild would leave.
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(arena, .{ .fail_index = fail_index });
+        const outcome = replaceSelfLeaves(failing.allocator(), receiver, declared) catch |err| switch (err) {
+            error.OutOfMemory => continue,
+            // `declared` sits a handful of edges from its root, so a refusal
+            // for depth would be the bound turning away a type nowhere near
+            // it, and this sweep is about allocation.
+            error.InvalidTypeTraversal => return error.TestUnexpectedResult,
+        };
+        if (outcome) |survivor| {
+            try std.testing.expect(!mentionsSelf(survivor));
+            try std.testing.expectEqual(receiver, survivor.tuple[0]);
+        }
+    }
+}
+
+test "types: truncated Self substitution refuses the entire mixed type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const self_leaf: Type = .{ .path = .{ .segments = &.{
+        .{ .name = "Self", .id = null },
+    } } };
+    var nested = self_leaf;
+    for (0..traversal_depth_max + 1) |_| {
+        const child = try alloc.create(Type);
+        child.* = nested;
+        nested = .{ .option = child };
+    }
+    const elements = [_]Type{ self_leaf, nested };
+    try std.testing.expectError(
+        error.InvalidTypeTraversal,
+        replaceSelfLeaves(alloc, .{ .prim = .u8 }, .{ .tuple = &elements }),
+    );
+}

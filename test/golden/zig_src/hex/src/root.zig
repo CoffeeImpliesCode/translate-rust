@@ -4,45 +4,46 @@ const @"error" = @import("./error.zig");
 const @"test" = @import("./test.zig");
 const r2z = @import("r2z");
 
-pub const FromHexError = error.FromHexError;
+pub const FromHexError = @"error".FromHexError;
 
-const HEX_CHARS_LOWER: [16]u8 = [_]u8{ 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102 };
+const HEX_CHARS_LOWER: *const [16]u8 = "0123456789abcdef";
 
-const HEX_CHARS_UPPER: [16]u8 = [_]u8{ 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 65, 66, 67, 68, 69, 70 };
+const HEX_CHARS_UPPER: *const [16]u8 = "0123456789ABCDEF";
 
 const BytesToHexChars = struct {
     const Self = @This();
 
     inner: r2z.SliceIter(u8),
-    table: [16]u8,
+    table: *const [16]u8,
     next_field: ?u21,
 
-    fn new(inner: []const u8, table: [16]u8) BytesToHexChars {
-        return BytesToHexChars{ .inner = r2z.sliceIter(u8, inner), .table = table, .next_field = @as(?u21, null) };
+    fn new(inner: []const u8, table: *const [16]u8) root.BytesToHexChars {
+        return root.BytesToHexChars{ .inner = r2z.sliceIter(u8, inner), .table = table, .next_field = @as(?u21, null) };
     }
 
     pub fn next(self: *BytesToHexChars) ?u21 {
         return __r2z_value_block_2: {
             const __r2z_option_match = __r2z_value_block_3: {
-                const __r2z_option_take_22: ?u21 = self.next_field;
+                const __r2z_option_take_40: ?u21 = self.next_field;
                 self.next_field = null;
-                break :__r2z_value_block_3 __r2z_option_take_22;
+                break :__r2z_value_block_3 __r2z_option_take_40;
             };
-            break :__r2z_value_block_2 switch ((__r2z_option_match != null)) {
+            break :__r2z_value_block_2 switch (__r2z_option_match != null) {
                 true => __r2z_value_block_4: {
                     const current = r2z.option.unwrap(__r2z_option_match);
                     break :__r2z_value_block_4 @as(?u21, current);
                 },
-                false => switch (self.inner.next()) {
-                    null => null,
-                    else => |__r2z_in_byte| __r2z_value_block_5: {
+                false => __r2z_value_block_4: {
+                    const __r2z_option_subject = self.inner.next();
+                    break :__r2z_value_block_4 if (__r2z_option_subject != null) __r2z_value_block_5: {
+                        const __r2z_in_byte = r2z.option.unwrap(__r2z_option_subject);
                         const byte = __r2z_in_byte;
                         break :__r2z_value_block_5 __r2z_value_block_6: {
-                            const current_1: u21 = @as(u21, self.table[@as(usize, (byte.* >> @intCast(4)))]);
-                            self.next_field = @as(?u21, @as(u21, self.table[@as(usize, (byte.* & 15))]));
+                            const current_1: u21 = @as(u21, self.table.*[@as(usize, byte.* >> @intCast(4))]);
+                            self.next_field = @as(?u21, @as(u21, self.table.*[@as(usize, byte.* & 15)]));
                             break :__r2z_value_block_6 current_1;
                         };
-                    },
+                    } else null;
                 },
             };
         };
@@ -54,46 +55,63 @@ const BytesToHexChars = struct {
     }
 
     pub fn len(self: *const BytesToHexChars) usize {
-        var length: usize = (self.inner.len() *% 2);
-        if ((self.next_field != null)) {
+        var length: usize = self.inner.len() *% 2;
+        if (self.next_field != null) {
             length +%= 1;
         }
         return length;
     }
 };
 
-fn encode_to_iter(comptime T: type, allocator: std.mem.Allocator, table: [16]u8, source: []const u8) !T {
+fn encode_to_iter(comptime T: type, allocator: std.mem.Allocator, table: *const [16]u8, source: []const u8) !T {
     var __r2z_owner: T = T.empty;
     errdefer __r2z_owner.deinit(allocator);
     var __r2z_iter = BytesToHexChars.new(source, table);
     while (__r2z_iter.next()) |__r2z_item| {
-        try __r2z_owner.append(allocator, __r2z_item);
+        const __r2z_item_value = __r2z_item;
+        if (@TypeOf(__r2z_owner) == r2z.alloc.String) {
+            try __r2z_owner.push(allocator, __r2z_item_value);
+        } else {
+            try __r2z_owner.append(allocator, __r2z_item_value);
+        }
     }
     return __r2z_owner;
 }
 
 fn val(c: u8, idx: usize) r2z.Result(u8, error_1.FromHexError) {
     return switch (c) {
-        65...70 => r2z.Result(u8, error_1.FromHexError){ .Ok = ((c -% 65) +% 10) },
-        97...102 => r2z.Result(u8, error_1.FromHexError){ .Ok = ((c -% 97) +% 10) },
-        48...57 => r2z.Result(u8, error_1.FromHexError){ .Ok = (c -% 48) },
+        65...70 => r2z.Result(u8, error_1.FromHexError){ .Ok = c -% 65 +% 10 },
+        97...102 => r2z.Result(u8, error_1.FromHexError){ .Ok = c -% 97 +% 10 },
+        48...57 => r2z.Result(u8, error_1.FromHexError){ .Ok = c -% 48 },
         else => r2z.Result(u8, error_1.FromHexError){ .Err = error_1.FromHexError{ .InvalidHexCharacter = .{ .c = @as(u21, c), .index = idx } } },
     };
 }
 
+pub fn encode(comptime T: type, allocator: std.mem.Allocator, data: T) !r2z.alloc.String {
+    return try encode_hex(T, r2z.alloc.String, allocator, &data);
+}
+
+pub fn encode_upper(comptime T: type, allocator: std.mem.Allocator, data: T) !r2z.alloc.String {
+    return try encode_hex_upper(T, r2z.alloc.String, allocator, &data);
+}
+
+pub fn decode(comptime T: type, allocator: std.mem.Allocator, data: T) !r2z.Result(std.ArrayListUnmanaged(u8), error_1.FromHexError) {
+    return try from_hex(T, allocator, data);
+}
+
 pub fn decode_to_slice(comptime T: type, data: T, out: []u8) r2z.Result(void, error_1.FromHexError) {
     const data_1: []const u8 = data;
-    if (((data_1.len % 2) != 0)) {
-        return r2z.Result(void, error_1.FromHexError){ .Err = error_1.FromHexError.OddLength };
+    if (data_1.len % 2 != 0) {
+        return r2z.Result(void, error_1.FromHexError){ .Err = error_1.FromHexError{ .OddLength = @as(void, {}) } };
     }
-    if (((data_1.len / 2) != out.len)) {
-        return r2z.Result(void, error_1.FromHexError){ .Err = error_1.FromHexError.InvalidStringLength };
+    if (data_1.len / 2 != out.len) {
+        return r2z.Result(void, error_1.FromHexError){ .Err = error_1.FromHexError{ .InvalidStringLength = @as(void, {}) } };
     }
     for (out[0..], 0..) |*byte, i| {
-        byte.* = ((switch (val(data_1[(2 *% i)], (2 *% i))) {
+        byte.* = (switch (val(data_1[2 *% i], 2 *% i)) {
             .Ok => |__r2z_try_ok| __r2z_try_ok,
             .Err => |__r2z_try_err| return r2z.Result(void, error_1.FromHexError){ .Err = __r2z_try_err },
-        } << @intCast(4)) | switch (val(data_1[((2 *% i) +% 1)], ((2 *% i) +% 1))) {
+        }) << @intCast(4) | (switch (val(data_1[2 *% i +% 1], 2 *% i +% 1)) {
             .Ok => |__r2z_try_ok| __r2z_try_ok,
             .Err => |__r2z_try_err| return r2z.Result(void, error_1.FromHexError){ .Err = __r2z_try_err },
         });
@@ -101,25 +119,25 @@ pub fn decode_to_slice(comptime T: type, data: T, out: []u8) r2z.Result(void, er
     return r2z.Result(void, error_1.FromHexError){ .Ok = @as(void, {}) };
 }
 
-fn generate_iter(len_1: usize) r2z.Zip(r2z.StepBy(r2z.Range), r2z.StepBy(r2z.Skip(r2z.Range))) {
+pub fn generate_iter(len_1: usize) r2z.Zip(r2z.StepBy(r2z.Range), r2z.StepBy(r2z.Skip(r2z.Range))) {
     return r2z.zip(r2z.stepBy(r2z.Range{ .start = 0, .end = len_1 }, 2), r2z.stepBy(r2z.skip(r2z.Range{ .start = 0, .end = len_1 }, 1), 2));
 }
 
-fn byte2hex(byte: u8, table: [16]u8) struct { u8, u8 } {
-    const high: u8 = table[@as(usize, ((byte & 240) >> @intCast(4)))];
-    const low: u8 = table[@as(usize, (byte & 15))];
+fn byte2hex(byte: u8, table: *const [16]u8) struct { u8, u8 } {
+    const high: u8 = table.*[@as(usize, (byte & 240) >> @intCast(4))];
+    const low: u8 = table.*[@as(usize, byte & 15)];
     return .{ high, low };
 }
 
 pub fn encode_to_slice(comptime T: type, input: T, output: []u8) r2z.Result(void, error_1.FromHexError) {
-    if (((input.len *% 2) != output.len)) {
-        return r2z.Result(void, error_1.FromHexError){ .Err = error_1.FromHexError.InvalidStringLength };
+    if (input.len *% 2 != output.len) {
+        return r2z.Result(void, error_1.FromHexError){ .Err = error_1.FromHexError{ .InvalidStringLength = @as(void, {}) } };
     }
     {
-        var __r2z_iter_1 = generate_iter((input.len *% 2));
-        for (input.*[0..]) |*byte| {
+        var __r2z_iter_1 = generate_iter(input.len *% 2);
+        for (input[0..]) |*byte| {
             const __r2z_pending_1 = __r2z_iter_1.next();
-            if ((__r2z_pending_1 == null)) {
+            if (__r2z_pending_1 == null) {
                 break;
             }
             const __r2z_tuple = r2z.option.unwrap(__r2z_pending_1);
@@ -136,14 +154,65 @@ pub fn encode_to_slice(comptime T: type, input: T, output: []u8) r2z.Result(void
 }
 
 pub fn encode_hex(comptime T: type, comptime U: type, allocator: std.mem.Allocator, self: *const T) !U {
-    return try encode_to_iter(U, allocator, HEX_CHARS_LOWER, self);
+    return try encode_to_iter(U, allocator, HEX_CHARS_LOWER, self.*[0..]);
 }
 
 pub fn encode_hex_upper(comptime T: type, comptime U: type, allocator: std.mem.Allocator, self: *const T) !U {
-    return try encode_to_iter(U, allocator, HEX_CHARS_UPPER, self);
+    return try encode_to_iter(U, allocator, HEX_CHARS_UPPER, self.*[0..]);
 }
 
-pub fn from_hex(comptime T: type, hex: T) r2z.Result([1]u8, error_1.FromHexError) {
+pub fn from_hex(comptime T: type, allocator: std.mem.Allocator, hex: T) !r2z.Result(std.ArrayListUnmanaged(u8), error_1.FromHexError) {
+    const hex_1: []const u8 = hex;
+    if (hex_1.len % 2 != 0) {
+        return r2z.Result(std.ArrayListUnmanaged(u8), error_1.FromHexError){ .Err = error_1.FromHexError{ .OddLength = @as(void, {}) } };
+    }
+    return __r2z_value_block_1: {
+        var __r2z_owner: std.ArrayListUnmanaged(u8) = std.ArrayListUnmanaged(u8).empty;
+        errdefer __r2z_owner.deinit(allocator);
+        var __r2z_collect_error: ?error_1.FromHexError = null;
+        var __r2z_enumerate_index_0: usize = 0;
+        __r2z_collect_exit: {
+            var __chunk_index: usize = 0;
+            while (hex_1.len > __chunk_index) : (__chunk_index += 2) {
+                const __r2z_item = hex_1[__chunk_index..@min(__chunk_index + 2, hex_1.len)];
+                {
+                    const __r2z_enumerate_item_0 = .{ __r2z_enumerate_index_0, __r2z_item };
+                    __r2z_enumerate_index_0 += 1;
+                    {
+                        const __r2z_tuple = __r2z_enumerate_item_0;
+                        const i = __r2z_tuple[0];
+                        const pair = __r2z_tuple[1];
+                        const __r2z_item_value: r2z.Result(u8, error_1.FromHexError) = r2z.Result(u8, error_1.FromHexError){ .Ok = (switch (val(pair[0], 2 *% i)) {
+                            .Ok => |__r2z_try_ok| __r2z_try_ok,
+                            .Err => |__r2z_try_err| {
+                                __r2z_collect_error = __r2z_try_err;
+                                break :__r2z_collect_exit;
+                            },
+                        }) << @intCast(4) | (switch (val(pair[1], 2 *% i +% 1)) {
+                            .Ok => |__r2z_try_ok| __r2z_try_ok,
+                            .Err => |__r2z_try_err| {
+                                __r2z_collect_error = __r2z_try_err;
+                                break :__r2z_collect_exit;
+                            },
+                        }) };
+                        if (__r2z_item_value.is_ok()) {
+                            try __r2z_owner.append(allocator, __r2z_item_value.unwrap(allocator));
+                        } else {
+                            __r2z_collect_error = __r2z_item_value.unwrap_err();
+                            break :__r2z_collect_exit;
+                        }
+                    }
+                }
+            }
+        }
+        break :__r2z_value_block_1 if (__r2z_collect_error != null) __r2z_collect_err: {
+            __r2z_owner.deinit(allocator);
+            break :__r2z_collect_err r2z.Result(std.ArrayListUnmanaged(u8), error_1.FromHexError){ .Err = r2z.option.unwrap(__r2z_collect_error) };
+        } else r2z.Result(std.ArrayListUnmanaged(u8), error_1.FromHexError){ .Ok = __r2z_owner };
+    };
+}
+
+pub fn from_hex__u8_1(comptime T: type, hex: T) r2z.Result([1]u8, error_1.FromHexError) {
     var out: [1]u8 = [_]u8{ 0 } ** 1;
     switch (decode_to_slice(T, hex, @as([]u8, &out))) {
         .Ok => @as(void, {}),
@@ -1574,6 +1643,16 @@ pub fn from_hex__u8_4294967296(comptime T: type, hex: T) r2z.Result([4294967296]
     return r2z.Result([4294967296]u8, error_1.FromHexError){ .Ok = out };
 }
 
+pub const root = @import("./root.zig");
+
+test "translated tests reachable through ./error.zig" {
+    _ = error_1;
+}
+
 test "translated tests reachable through ./test.zig" {
     _ = @"test";
+}
+
+test "translated tests reachable through ./root.zig" {
+    _ = root;
 }

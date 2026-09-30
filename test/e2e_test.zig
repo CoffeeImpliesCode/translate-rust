@@ -5,8 +5,8 @@
 //! run as normal processes. Zig's test runner (`--listen=-` protocol) cannot
 //! reliably spawn grandchildren, so this is intentionally an executable.
 //!
-//! The mini, fnv, compat, wyhash, adler, hex and multimod source fixtures are
-//! complete positive cases. Compat also runs through Rust IR and Zig AST
+//! The mini, fnv, compat, wyhash, adler, hex, multimod and xxhash-rust source
+//! fixtures are complete positive cases. Compat also runs through Rust IR and Zig AST
 //! serialization. Multimod covers the three-file, two-level module→file
 //! mapping (`foo.rs`→`foo.zig`, `foo/bar.rs`→`foo/bar.zig`,
 //! `custom.rs`→`custom_pub.zig`) that no other fixture exercises. A staged
@@ -14,9 +14,11 @@
 //! merely when the files exist. The legacy fnv and fletcher wire fixtures, and
 //! the source fixtures whose analysis, lowering or package shape is
 //! incomplete, must reject translation with a typed frontend, IR, or driver
-//! error and no package output. The test also exercises the fingerprint
-//! boundary with both failing and valid probes, and drives
-//! `driver.translateWithOptions` to a published package with non-default
+//! error and no package output. Each such source rejection is pinned to its
+//! exact typed error, so a change in which error a crate fails with fails the
+//! test instead of hiding behind a generic rejection. The test also
+//! exercises the fingerprint boundary with both failing and valid probes, and
+//! drives `driver.translateWithOptions` to a published package with non-default
 //! analysis options.
 
 const std = @import("std");
@@ -377,6 +379,74 @@ fn expectFnvSourceCrateTranslated(
     try deleteTreeIfExists(io, out_dir);
 }
 
+fn expectLeb128SourceCrateTranslated(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+) !void {
+    const out_dir = "zig-out/e2e-translated-source-leb128";
+    try deleteTreeIfExists(io, out_dir);
+    defer deleteTreeIfExists(io, out_dir) catch {};
+    try writeMsg(io, stdout, "e2e: translating leb128 and executing its original test module", .{});
+    try driver.translate(gpa, io, "test/crates/leb128", out_dir);
+    const original_tests = try std.process.run(gpa, io, .{
+        .argv = &.{
+            "zig",
+            "test",
+            "--dep",
+            "r2z",
+            "-Mroot=src/tests.zig",
+            "-Mr2z=../../r2z-core/src/root.zig",
+        },
+        .cwd = .{ .path = out_dir },
+    });
+    defer gpa.free(original_tests.stdout);
+    defer gpa.free(original_tests.stderr);
+    switch (original_tests.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    try stdout.writeStreamingAll(io, original_tests.stdout);
+    try std.Io.File.stderr().writeStreamingAll(io, original_tests.stderr);
+    return error.Leb128OriginalTestsFailed;
+}
+
+fn expectPercentEncodingSourceCrateTranslated(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+) !void {
+    const out_dir = "zig-out/e2e-translated-source-percent-encoding";
+    try deleteTreeIfExists(io, out_dir);
+    defer deleteTreeIfExists(io, out_dir) catch {};
+    try writeMsg(io, stdout, "e2e: translating percent-encoding and executing doctest and ownership consumers", .{});
+    try driver.translate(gpa, io, "test/crates/percent-encoding", out_dir);
+    const consumer = try std.process.run(gpa, io, .{
+        .argv = &.{
+            "zig",
+            "test",
+            "--dep",
+            "translated",
+            "--dep",
+            "r2z",
+            "-Mroot=test/percent_encoding_consumer.zig",
+            "--dep",
+            "r2z",
+            "-Mtranslated=zig-out/e2e-translated-source-percent-encoding/src/root.zig",
+            "-Mr2z=r2z-core/src/root.zig",
+        },
+    });
+    defer gpa.free(consumer.stdout);
+    defer gpa.free(consumer.stderr);
+    switch (consumer.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    try stdout.writeStreamingAll(io, consumer.stdout);
+    try std.Io.File.stderr().writeStreamingAll(io, consumer.stderr);
+    return error.PercentEncodingConsumerFailed;
+}
+
 fn expectCompatSourceCrateTranslated(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -701,7 +771,6 @@ fn expectAnalysisOptionsReachStagedPackage(
     );
 }
 
-
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const stdout = std.Io.File.stdout();
@@ -774,6 +843,33 @@ pub fn main(init: std.process.Init) !void {
             .{ .path = "src/custom_pub.zig", .minimum_items = 1 },
         },
     );
+
+    // `xxhash-rust` translates on the current tree: it is a promotion candidate,
+    // not a rejection. The fixture is a vendored v1-dialect copy whose manifest
+    // sets `default = ["xxh32"]`, so three modules survive cfg evaluation and
+    // the emitted `src/root.zig` carries their re-exports instead of nothing.
+    // The staged package holds exactly the four files below, measured at 3, 6,
+    // 9 and 9 top-level items; the floors are this file's usual ones, and the
+    // root floor is the positive form of the `EmptyRootFile` check this
+    // replaces. The earlier apparent failure was a pre-existing output
+    // directory (`DirNotEmpty`), not a translation failure. Do not confuse the
+    // fixture with the upstream 0.8.19 crate the wide corpus measured: that
+    // manifest declares no `default` feature, so cfg evaluation drops every
+    // module and the crate really does reduce to an empty root. That corpus
+    // row stands.
+    try expectSourceCrateTranslated(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/xxhash-rust",
+        "zig-out/e2e-translated-source-xxhash-rust",
+        &.{
+            .{ .path = "src/root.zig", .minimum_items = 2 },
+            .{ .path = "src/utils.zig", .minimum_items = 1 },
+            .{ .path = "src/xxh32_common.zig", .minimum_items = 1 },
+            .{ .path = "src/xxh32.zig", .minimum_items = 1 },
+        },
+    );
     try expectWireCrateTranslated(
         init.gpa,
         io,
@@ -783,6 +879,8 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectFnvSourceCrateTranslated(init.gpa, io, stdout);
     try expectCompatSourceCrateTranslated(init.gpa, io, stdout);
+    try expectLeb128SourceCrateTranslated(init.gpa, io, stdout);
+    try expectPercentEncodingSourceCrateTranslated(init.gpa, io, stdout);
     try expectSourceCrateRejectedWithError(
         init.gpa,
         io,
@@ -824,22 +922,60 @@ pub fn main(init: std.process.Init) !void {
         "zig-out/e2e-rejected-wire-mini-rustdoc",
         error.UnsupportedWireVersion,
     );
-    // `xxhash-rust` analyses and lowers, but its `src/root.zig` carries no
-    // declaration, so the package would publish a 0-byte root. Promotion must
-    // reject it with the typed AST error instead of reporting success.
+    // The source fixtures below are capability gaps, not defects: each one
+    // exercises a construct the frontend or the IR validator does not model
+    // yet, so the crate must reject rather than publish a wrong package. The
+    // contract pins the *exact* typed error, so a change in which error a
+    // crate fails with fails here instead of hiding inside a generic
+    // "it rejected" claim.
+    //
+    // `siphasher`: validation resolves every nominal type path against a
+    // declared entity, and one path in this crate does not resolve, so the
+    // crate stops with `UnresolvedTypePath` before lowering runs.
     try expectSourceCrateRejectedWithError(
         init.gpa,
         io,
         stdout,
-        "test/crates/xxhash-rust",
-        "zig-out/e2e-rejected-source-xxhash-rust",
-        error.EmptyRootFile,
+        "test/crates/siphasher",
+        "zig-out/e2e-rejected-source-siphasher",
+        error.UnresolvedTypePath,
+    );
+    // `itoa`: round 4 clears the earlier cast rejection, exposing a call
+    // target that the frontend cannot resolve.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/itoa",
+        "zig-out/e2e-rejected-source-itoa",
+        error.UnsupportedExpression,
+    );
+    // `atoi`: tuple provenance now exposes unresolved element metadata before
+    // the earlier unresolved-call marker. This remains a typed refusal.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/atoi",
+        "zig-out/e2e-rejected-source-atoi",
+        error.UnsupportedType,
+    );
+    // `seahash`: round 4 clears the earlier cast rejection. An operator still
+    // has a non-primitive operand; the independent slice-iterator `.rev()`
+    // capability gap also remains.
+    try expectSourceCrateRejectedWithError(
+        init.gpa,
+        io,
+        stdout,
+        "test/crates/seahash",
+        "zig-out/e2e-rejected-source-seahash",
+        error.UnsupportedExpression,
     );
     try expectAnalysisOptionsReachStagedPackage(init.gpa, io, stdout);
     try writeMsg(
         io,
         stdout,
-        "e2e: mini/fnv/wyhash/adler/compat/hex/multimod translated; fletcher/crc16/xxhash-rust reject; fnv/fletcher wire rejected; translateWithOptions honoured",
+        "e2e: mini/fnv/wyhash/adler/compat/hex/multimod/xxhash-rust/leb128/percent-encoding translated; source siphasher/itoa/atoi/seahash/fletcher/crc16 rejected with pinned typed errors; fnv/fletcher wire rejected; translateWithOptions honoured",
         .{},
     );
 }

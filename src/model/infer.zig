@@ -1,7 +1,5 @@
 //! infer — constraint generation & unification solver for P3.
 //!
-//! See notes/design/source-model-type-inference.md §2.2 + §3.1 + §3.2.
-//!
 //! Stage 1 (Gen): Walks the losslessly-lowered untyped body graph of each `.fn_`
 //! body and:
 //! (a) PINS authoritative `Expr.ty` slots (type annotations on `let`, suffixed

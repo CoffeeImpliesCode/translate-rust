@@ -57,6 +57,12 @@ const Ext = struct {
     /// enclosing fn is an associated method (`Self::method(...)` resolution).
     self_ty: ?spine.EntityId = null,
     locals: std.ArrayListUnmanaged(Local) = .empty,
+    /// Items (`fn`) declared by the blocks that enclose this body. Rust gives
+    /// an item the whole enclosing block as its scope, so a nested helper sees
+    /// the siblings declared beside it — including one written after the call
+    /// — while a `let` binding of the enclosing function stays invisible to it.
+    /// That is why the item scope is threaded apart from `locals`.
+    item_scope: []const Local = &.{},
 
     fn deinit(self: *Ext) void {
         self.locals.deinit(self.ctx.alloc);
@@ -283,6 +289,29 @@ fn resolveVariant(e: *const Ext, enum_id: spine.EntityId, variant: []const u8) ?
         if (ent.parent == enum_id) return ent.id;
     }
     return null;
+}
+
+/// Patterns must retain the selected variant, not only its owning enum.
+fn ensurePatternVariant(e: *Ext, def: spine.EntityId, raw_path: []const u8) !spine.EntityId {
+    const entity = e.ctx.g.symbol_table.get(def) orelse return def;
+    if (entity.kind != .enum_) return def;
+    const separator = std.mem.lastIndexOf(u8, raw_path, "::") orelse return def;
+    const name = std.mem.trim(u8, raw_path[separator + 2 ..], " \t\r\n");
+    if (!enumBodyHasVariant(e, def, name)) return def;
+    if (resolveVariant(e, def, name)) |variant| return variant;
+    const variant = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .variant,
+        .name = try e.ctx.alloc.dupe(u8, name),
+        .span = span_of,
+        .visibility = entity.visibility,
+        .parent = def,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    return variant;
 }
 
 /// Climb an fn entity's parent chain to its innermost owning type entity
@@ -761,6 +790,22 @@ fn qualifiedAssociatedPath(e: *const Ext, node: ts.Node) ?QualifiedAssociatedPat
     };
 }
 
+/// True when `trait_id` declares a method called `name` in its own body. A
+/// method a supertrait provides is not declared here, which is what makes the
+/// declaring trait — not the bound that was written — the owner of the
+/// reference `ensureTraitMethodRefEntity` mints.
+fn traitDeclaresMethod(e: *const Ext, trait_id: spine.EntityId, name: []const u8) bool {
+    if (trait_id >= e.ctx.bodies_list.items.len) return false;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.methods) |method| {
+        if (std.mem.eql(u8, method.name, name)) return true;
+    }
+    return false;
+}
+
 fn ensureTraitMethodRefEntity(
     e: *Ext,
     trait_id: spine.EntityId,
@@ -773,19 +818,7 @@ fn ensureTraitMethodRefEntity(
             return entity.id;
         }
     }
-    if (trait_id >= e.ctx.bodies_list.items.len) return null;
-    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
-        .trait_ => |body| body,
-        else => return null,
-    };
-    var declares_method = false;
-    for (trait_body.methods) |method| {
-        if (std.mem.eql(u8, method.name, name)) {
-            declares_method = true;
-            break;
-        }
-    }
-    if (!declares_method) return null;
+    if (!traitDeclaresMethod(e, trait_id, name)) return null;
     const id = try e.ctx.g.symbol_table.add(.{
         .id = 0,
         .kind = .method_ref,
@@ -1158,17 +1191,342 @@ fn ensureStandardPreludeVariant(
     };
 }
 
-/// Resolve an identifier: local scope first, then the current module scope.
+/// The variants a standard-library enum declares, for the external enums this
+/// translator admits in value position.
+///
+/// An enum outside the crate still has a shape, and the IR needs it:
+/// `io::ErrorKind::UnexpectedEof` names a unit variant OF AN ENUM, and lowering
+/// it as a bare name would lose which enum it belongs to — which enum is
+/// exactly what a consumer needs to pick the right representation. Same role as
+/// `standard_option_variants`, for the same reason.
+const std_enum_variants = [_]struct {
+    path: []const []const u8,
+    variants: []const []const u8,
+}{
+    .{ .path = &.{ "std", "io", "ErrorKind" }, .variants = &.{
+        "Other",
+        "NotFound",
+        "PermissionDenied",
+        "ConnectionRefused",
+        "ConnectionReset",
+        "HostUnreachable",
+        "NetworkUnreachable",
+        "ConnectionAborted",
+        "NotConnected",
+        "AddrInUse",
+        "AddrNotAvailable",
+        "NetworkDown",
+        "BrokenPipe",
+        "AlreadyExists",
+        "WouldBlock",
+        "InvalidInput",
+        "InvalidData",
+        "TimedOut",
+        "WriteZero",
+        "UnexpectedEof",
+        "Interrupted",
+        "Unsupported",
+        "OutOfMemory",
+    } },
+};
+
+fn stdEnumVariantNames(owner_path: []const []const u8) ?[]const []const u8 {
+    for (std_enum_variants) |entry| {
+        if (entry.path.len != owner_path.len) continue;
+        var equal = true;
+        for (entry.path, owner_path) |expected, actual| {
+            if (!std.mem.eql(u8, expected, actual)) {
+                equal = false;
+                break;
+            }
+        }
+        if (equal) return entry.variants;
+    }
+    return null;
+}
+
+/// The extern module chain an external path's module prefix names, built
+/// through the same `ensureExternalModule` the prelude variants use: `std`
+/// first, then `std::io` under it.
+fn ensureExternalModuleChain(
+    e: *Ext,
+    segments: []const []const u8,
+) anyerror!spine.EntityId {
+    var parent: ?spine.EntityId = null;
+    for (segments) |segment| {
+        parent = try ensureExternalModule(e, parent, segment);
+    }
+    return parent orelse error.MissingModuleEntity;
+}
+
+/// The enum entity an external path names, created on first use under the
+/// module that contains it and found again on every later use — the same
+/// find-or-create shape `ensureStandardPreludeVariant` uses for `Option`.
+fn ensureExternalEnumEntity(
+    e: *Ext,
+    module_id: spine.EntityId,
+    enum_name: []const u8,
+    variant_names: []const []const u8,
+) anyerror!spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind == .enum_ and ent.parent == module_id and
+            std.mem.eql(u8, ent.name, enum_name))
+        {
+            return ent.id;
+        }
+    }
+    const enum_id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .enum_,
+        .name = try e.ctx.alloc.dupe(u8, enum_name),
+        .span = span_of,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    const variants = try e.ctx.alloc.alloc(items.Variant, variant_names.len);
+    for (variant_names, 0..) |variant_name, index| {
+        variants[index] = .{
+            .name = try e.ctx.alloc.dupe(u8, variant_name),
+            .fields = .{ .none = {} },
+            .discriminant = null,
+        };
+    }
+    e.ctx.bodies_list.items[enum_id] = .{ .enum_ = .{
+        .kind = .data,
+        .generic_params = &.{},
+        .variants = variants,
+        .repr_int = null,
+        .non_exhaustive = false,
+    } };
+    try appendGraphModuleItem(e, module_id, enum_id);
+    return enum_id;
+}
+
+/// A path naming a variant of a standard-library enum: `io::ErrorKind::…`.
+///
+/// The owner is admitted only when it resolves to an external nominal whose
+/// enum this translator knows the shape of, and only when the trailing name is
+/// one of that enum's variants. A name it does not declare is refused rather
+/// than minted, so no variant can be invented for an enum that lacks it.
+fn lowerExternalEnumVariantPath(e: *Ext, node: ts.Node) anyerror!?exprs.NodeId {
+    const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
+    const separator = std.mem.lastIndexOf(u8, raw, "::") orelse return null;
+    const owner_text = std.mem.trim(u8, raw[0..separator], " \t\r\n");
+    const variant_name = std.mem.trim(u8, raw[separator + 2 ..], " \t\r\n");
+    if (owner_text.len == 0 or variant_name.len == 0) return null;
+
+    const owner = (try externalNominalForPath(e, owner_text)) orelse return null;
+    if (owner.path.len < 2) return null;
+    const names = stdEnumVariantNames(owner.path) orelse return null;
+    var declared = false;
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, variant_name)) {
+            declared = true;
+            break;
+        }
+    }
+    if (!declared) return null;
+
+    const module_id = try ensureExternalModuleChain(e, owner.path[0 .. owner.path.len - 1]);
+    const enum_id = try ensureExternalEnumEntity(
+        e,
+        module_id,
+        owner.path[owner.path.len - 1],
+        names,
+    );
+    return try appendExpr(e, .{ .enum_variant = .{
+        .def = enum_id,
+        .variant = try e.ctx.alloc.dupe(u8, variant_name),
+        .tuple_fields = &.{},
+        .named_fields = &.{},
+    } });
+}
+
+/// One parameter of a known standard-library associated function.
+const StdAssocParam = struct { name: []const u8, ty_param: []const u8 };
+
+/// An associated function of a standard-library type, recorded with the
+/// signature the standard library actually declares.
+///
+/// An entity in the graph carries a signature, and a wrong one is worse than
+/// no entity at all: the backend checks arity against `params` and reads the
+/// declared return when inferring the call. A placeholder would be a fabricated
+/// fact, not an admission. So only the functions this table names are admitted,
+/// and only with the signature it gives. Anything else keeps the refusal it
+/// already has — a typed `unsupported`, which is accurate — until its real
+/// declaration is known.
+///
+/// `std::io::Cursor::new` is, verbatim from the standard library:
+/// `impl<T> Cursor<T> { pub const fn new(inner: T) -> Cursor<T> }`.
+const StdAssocFn = struct {
+    owner: []const []const u8,
+    name: []const u8,
+    type_params: []const []const u8,
+    params: []const StdAssocParam,
+    ret_owner: []const []const u8,
+    ret_args: []const []const u8,
+};
+
+const std_assoc_fns = [_]StdAssocFn{.{
+    .owner = &.{ "std", "io", "Cursor" },
+    .name = "new",
+    .type_params = &.{"T"},
+    .params = &.{.{ .name = "inner", .ty_param = "T" }},
+    .ret_owner = &.{ "std", "io", "Cursor" },
+    .ret_args = &.{"T"},
+}};
+
+fn externalPathSlicesEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (!std.mem.eql(u8, a, b)) return false;
+    }
+    return true;
+}
+
+/// The known signature for `Owner::assoc`, or null when this function is not
+/// one this translator can declare. Matching is on the RESOLVED owner path, so
+/// a crate's own `Cursor` is never claimed by the standard library's.
+fn findStdAssocFn(owner_path: []const []const u8, assoc_name: []const u8) ?*const StdAssocFn {
+    for (&std_assoc_fns) |*entry| {
+        if (!std.mem.eql(u8, entry.name, assoc_name)) continue;
+        if (!externalPathSlicesEqual(entry.owner, owner_path)) continue;
+        return entry;
+    }
+    return null;
+}
+
+/// A type an entry's own type parameter names, in the representation every
+/// other generic signature in this file uses: a one-segment path with no
+/// entity, because a type parameter has none of its own until it is
+/// monomorphised.
+fn typeParamType(e: *Ext, name: []const u8) anyerror!types.Type {
+    const segments = try e.ctx.alloc.alloc(types.PathSegment, 1);
+    segments[0] = .{ .name = try e.ctx.alloc.dupe(u8, name), .id = null };
+    return .{ .path = .{ .segments = segments } };
+}
+
+/// The associated function of an external nominal, declared under the external
+/// module chain that holds the owner's module — the same chain the prelude
+/// enums and external enum variants already live in — with the signature the
+/// standard library declares.
+///
+/// Nothing is emitted for such an entity: it belongs to an external module, and
+/// no file is generated for one.
+fn ensureExternalAssociatedFn(
+    e: *Ext,
+    owner_path: []const []const u8,
+    assoc_name: []const u8,
+) anyerror!?spine.EntityId {
+    if (owner_path.len < 2 or assoc_name.len == 0) return null;
+    const known = findStdAssocFn(owner_path, assoc_name) orelse return null;
+
+    const module_id = try ensureExternalModuleChain(e, owner_path[0 .. owner_path.len - 1]);
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind == .fn_ and ent.parent == module_id and
+            std.mem.eql(u8, ent.name, assoc_name))
+        {
+            return ent.id;
+        }
+    }
+
+    const params = try e.ctx.alloc.alloc(items.Param, known.params.len);
+    for (known.params, 0..) |param, index| {
+        params[index] = .{
+            .name = try e.ctx.alloc.dupe(u8, param.name),
+            .ty = try typeParamType(e, param.ty_param),
+            .span = span_of,
+        };
+    }
+    const ret_path = try e.ctx.alloc.alloc([]const u8, known.ret_owner.len);
+    for (known.ret_owner, 0..) |name, index| {
+        ret_path[index] = try e.ctx.alloc.dupe(u8, name);
+    }
+    const ret_args = try e.ctx.alloc.alloc(types.Type, known.ret_args.len);
+    for (known.ret_args, 0..) |name, index| {
+        ret_args[index] = try typeParamType(e, name);
+    }
+    const generic_params = try e.ctx.alloc.alloc(types.GenericParam, known.type_params.len);
+    for (known.type_params, 0..) |name, index| {
+        generic_params[index] = .{ .type_ = .{
+            .name = try e.ctx.alloc.dupe(u8, name),
+            .bounds = &.{},
+        } };
+    }
+
+    const fn_id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try e.ctx.alloc.dupe(u8, assoc_name),
+        .span = span_of,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    // The SIGNATURE is real and comes from the standard library. The BODY is
+    // not: there is no source for it, and `body = 0` is the frontend-wide
+    // marker for "not lowered yet", which a finished foreign declaration must
+    // not carry. An empty block records that there is nothing here to walk.
+    const body = try appendExpr(e, .{ .block = .{
+        .statements = &.{},
+        .tail = null,
+        .labelled = null,
+    } });
+    e.ctx.bodies_list.items[fn_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = .{ .external_nominal = .{ .path = ret_path, .args = ret_args } },
+        .generic_params = try e.ctx.alloc.dupe([]const u8, known.type_params),
+        .generics = .{ .params = generic_params, .where_clauses = &.{} },
+        .body = body,
+    } };
+    try appendGraphModuleItem(e, module_id, fn_id);
+    return fn_id;
+}
+
+/// An `Owner::assoc(..)` call whose owner is an external nominal AND whose
+/// signature this translator knows. Anything else is left to the existing
+/// refusal rather than declared with a guessed shape.
+fn lowerExternalAssociatedCall(
+    e: *Ext,
+    raw_path: []const u8,
+    args: []const exprs.NodeId,
+) anyerror!?exprs.NodeId {
+    const separator = std.mem.lastIndexOf(u8, raw_path, "::") orelse return null;
+    const owner_text = std.mem.trim(u8, raw_path[0..separator], " \t\r\n");
+    const assoc_name = std.mem.trim(u8, raw_path[separator + 2 ..], " \t\r\n");
+    if (owner_text.len == 0 or assoc_name.len == 0) return null;
+    const owner = (try externalNominalForPath(e, owner_text)) orelse return null;
+    const fn_id = (try ensureExternalAssociatedFn(e, owner.path, assoc_name)) orelse return null;
+    return try appendExpr(e, .{ .call = .{
+        .call_kind = .{ .associated = fn_id },
+        .args = args,
+    } });
+}
+
 fn lookupModuleEntity(e: *const Ext, name: []const u8) ?spine.EntityId {
     const owner = owningModule(e, e.ctx.mod_id) orelse return null;
     return resolveModuleItem(e, owner, name);
 }
 
+/// Resolve an identifier: lexical `let` bindings first, then the enclosing
+/// blocks' items, and only then the current module scope.
 fn resolveName(e: *const Ext, name: []const u8) ?spine.EntityId {
     var i = e.locals.items.len;
     while (i > 0) {
         i -= 1;
         if (std.mem.eql(u8, e.locals.items[i].name, name)) return e.locals.items[i].def;
+    }
+    var j = e.item_scope.len;
+    while (j > 0) {
+        j -= 1;
+        if (std.mem.eql(u8, e.item_scope[j].name, name)) return e.item_scope[j].def;
     }
     if (lookupModuleEntity(e, name)) |def| return def;
     return null;
@@ -1318,6 +1676,421 @@ fn isSliceTypeNode(node: ts.Node) bool {
     return true;
 }
 
+/// Whether a `tuple_type` node really is a Rust tuple rather than a
+/// parenthesized type.
+///
+/// Rust groups a type with parentheses — `&(dyn Error + 'static)`, and the
+/// plain `(T)` that reads the same way — and needs a trailing comma to spell a
+/// one-element tuple: `(T,)`. The vendored grammar has no node for the
+/// grouping form, so both arrive as a `tuple_type` with one child and the
+/// comma is the only thing that separates them. More than one child is a
+/// tuple in either spelling.
+fn isTupleTypeNode(node: ts.Node, raw: []const u8) bool {
+    if (node.namedChildCount() != 1) return true;
+    const outer = std.mem.trim(u8, raw, " \t\r\n");
+    if (outer.len < 2 or !std.mem.endsWith(u8, outer, ")")) return true;
+    const inner = std.mem.trimEnd(u8, outer[0 .. outer.len - 1], " \t\r\n");
+    return std.mem.endsWith(u8, inner, ",");
+}
+
+/// The `Path` a trait bound names. A nominal that resolved to an external path
+/// (`std::io::Read`) has no entity ids, so its segments are rebuilt from the
+/// provenance path rather than borrowed.
+fn cstBoundPath(e: *Ext, ty: types.Type) anyerror!types.Path {
+    return switch (ty) {
+        .path => |path| path,
+        .external_nominal => |external| blk: {
+            const segments = try e.ctx.alloc.alloc(types.PathSegment, external.path.len);
+            errdefer e.ctx.alloc.free(segments);
+            for (external.path, 0..) |name, index| {
+                segments[index] = .{ .name = try e.ctx.alloc.dupe(u8, name), .id = null };
+            }
+            break :blk .{ .segments = segments };
+        },
+        else => error.InvalidType,
+    };
+}
+
+/// The `alloc`/`core`/`std` path a prelude name stands for, or null when the
+/// name is not one. A bare `Iterator` in a bound names no graph entity, so the
+/// full path is what lets a consumer tell it apart from a crate's own trait.
+///
+/// This table lives here, not in cst.zig, because the declaration pass imports
+/// this module and not the other way round: both passes read the same prelude
+/// names when they lower a `dyn Trait` bound or a generic parameter bound, and
+/// one table keeps those two readings identical.
+pub fn preludeExternalPath(name: []const u8) ?[]const []const u8 {
+    if (std.mem.eql(u8, name, "String")) return &.{ "alloc", "string", "String" };
+    if (std.mem.eql(u8, name, "Vec")) return &.{ "alloc", "vec", "Vec" };
+    if (std.mem.eql(u8, name, "From")) return &.{ "core", "convert", "From" };
+    if (std.mem.eql(u8, name, "Into")) return &.{ "core", "convert", "Into" };
+    if (std.mem.eql(u8, name, "TryFrom")) return &.{ "core", "convert", "TryFrom" };
+    if (std.mem.eql(u8, name, "TryInto")) return &.{ "core", "convert", "TryInto" };
+    if (std.mem.eql(u8, name, "AsRef")) return &.{ "core", "convert", "AsRef" };
+    if (std.mem.eql(u8, name, "AsMut")) return &.{ "core", "convert", "AsMut" };
+    if (std.mem.eql(u8, name, "Default")) return &.{ "core", "default", "Default" };
+    if (std.mem.eql(u8, name, "Clone")) return &.{ "core", "clone", "Clone" };
+    if (std.mem.eql(u8, name, "Copy")) return &.{ "core", "marker", "Copy" };
+    if (std.mem.eql(u8, name, "Send")) return &.{ "core", "marker", "Send" };
+    if (std.mem.eql(u8, name, "Sync")) return &.{ "core", "marker", "Sync" };
+    if (std.mem.eql(u8, name, "Sized")) return &.{ "core", "marker", "Sized" };
+    if (std.mem.eql(u8, name, "Unpin")) return &.{ "core", "marker", "Unpin" };
+    if (std.mem.eql(u8, name, "Fn")) return &.{ "core", "ops", "Fn" };
+    if (std.mem.eql(u8, name, "FnMut")) return &.{ "core", "ops", "FnMut" };
+    if (std.mem.eql(u8, name, "FnOnce")) return &.{ "core", "ops", "FnOnce" };
+    if (std.mem.eql(u8, name, "Drop")) return &.{ "core", "ops", "Drop" };
+    if (std.mem.eql(u8, name, "Iterator")) return &.{ "core", "iter", "Iterator" };
+    if (std.mem.eql(u8, name, "IntoIterator")) return &.{ "core", "iter", "IntoIterator" };
+    if (std.mem.eql(u8, name, "DoubleEndedIterator")) return &.{ "core", "iter", "DoubleEndedIterator" };
+    if (std.mem.eql(u8, name, "ExactSizeIterator")) return &.{ "core", "iter", "ExactSizeIterator" };
+    if (std.mem.eql(u8, name, "Extend")) return &.{ "core", "iter", "Extend" };
+    if (std.mem.eql(u8, name, "Debug")) return &.{ "core", "fmt", "Debug" };
+    if (std.mem.eql(u8, name, "Display")) return &.{ "core", "fmt", "Display" };
+    if (std.mem.eql(u8, name, "Hash")) return &.{ "core", "hash", "Hash" };
+    if (std.mem.eql(u8, name, "Hasher")) return &.{ "core", "hash", "Hasher" };
+    if (std.mem.eql(u8, name, "PartialEq")) return &.{ "core", "cmp", "PartialEq" };
+    if (std.mem.eql(u8, name, "Eq")) return &.{ "core", "cmp", "Eq" };
+    if (std.mem.eql(u8, name, "PartialOrd")) return &.{ "core", "cmp", "PartialOrd" };
+    if (std.mem.eql(u8, name, "Ord")) return &.{ "core", "cmp", "Ord" };
+    if (std.mem.eql(u8, name, "Add")) return &.{ "core", "ops", "Add" };
+    if (std.mem.eql(u8, name, "Sub")) return &.{ "core", "ops", "Sub" };
+    if (std.mem.eql(u8, name, "Mul")) return &.{ "core", "ops", "Mul" };
+    if (std.mem.eql(u8, name, "Div")) return &.{ "core", "ops", "Div" };
+    if (std.mem.eql(u8, name, "Rem")) return &.{ "core", "ops", "Rem" };
+    if (std.mem.eql(u8, name, "Not")) return &.{ "core", "ops", "Not" };
+    if (std.mem.eql(u8, name, "BitAnd")) return &.{ "core", "ops", "BitAnd" };
+    if (std.mem.eql(u8, name, "BitOr")) return &.{ "core", "ops", "BitOr" };
+    if (std.mem.eql(u8, name, "BitXor")) return &.{ "core", "ops", "BitXor" };
+    if (std.mem.eql(u8, name, "Shl")) return &.{ "core", "ops", "Shl" };
+    if (std.mem.eql(u8, name, "Shr")) return &.{ "core", "ops", "Shr" };
+    if (std.mem.eql(u8, name, "Neg")) return &.{ "core", "ops", "Neg" };
+    if (std.mem.eql(u8, name, "AddAssign")) return &.{ "core", "ops", "AddAssign" };
+    if (std.mem.eql(u8, name, "SubAssign")) return &.{ "core", "ops", "SubAssign" };
+    if (std.mem.eql(u8, name, "MulAssign")) return &.{ "core", "ops", "MulAssign" };
+    if (std.mem.eql(u8, name, "DivAssign")) return &.{ "core", "ops", "DivAssign" };
+    if (std.mem.eql(u8, name, "RemAssign")) return &.{ "core", "ops", "RemAssign" };
+    if (std.mem.eql(u8, name, "BitAndAssign")) return &.{ "core", "ops", "BitAndAssign" };
+    if (std.mem.eql(u8, name, "BitOrAssign")) return &.{ "core", "ops", "BitOrAssign" };
+    if (std.mem.eql(u8, name, "BitXorAssign")) return &.{ "core", "ops", "BitXorAssign" };
+    if (std.mem.eql(u8, name, "ShlAssign")) return &.{ "core", "ops", "ShlAssign" };
+    if (std.mem.eql(u8, name, "ShrAssign")) return &.{ "core", "ops", "ShrAssign" };
+    if (std.mem.eql(u8, name, "Index")) return &.{ "core", "ops", "Index" };
+    if (std.mem.eql(u8, name, "IndexMut")) return &.{ "core", "ops", "IndexMut" };
+    if (std.mem.eql(u8, name, "Deref")) return &.{ "core", "ops", "Deref" };
+    if (std.mem.eql(u8, name, "DerefMut")) return &.{ "core", "ops", "DerefMut" };
+    return null;
+}
+
+pub fn preludePathSegments(allocator: std.mem.Allocator, name: []const u8) !?[]const types.PathSegment {
+    const external = preludeExternalPath(name) orelse return null;
+    const segments = try allocator.alloc(types.PathSegment, external.len);
+    for (external, 0..) |seg_name, i| {
+        segments[i] = .{ .name = try allocator.dupe(u8, seg_name), .id = null };
+    }
+    return segments;
+}
+
+/// The path a trait-bound node names, with every segment the graph could
+/// resolve already resolved.
+///
+/// A bound is not a type position: it names a capability, and one the crate
+/// never declares — `Sized`, or a trait from an external crate that was not
+/// imported under its bare name — has no type to map to. Splitting the source
+/// text keeps the bound on record by name, which is what `boundPathMatches`
+/// then resolves through the module's `use`. This is why a bound survives
+/// where a parameter type of the same name would not.
+fn cstPathFromNode(e: *Ext, node: ts.Node) anyerror!types.Path {
+    if (mapCstType(e, node)) |mapped| {
+        if (cstBoundPath(e, mapped)) |path| return path else |_| {}
+    } else |_| {}
+    var source = std.mem.trim(u8, text(e, node), " \t\r\n");
+    if (std.mem.startsWith(u8, source, "::")) source = source[2..];
+    if (source.len == 0) return error.InvalidType;
+    var segments: std.ArrayListUnmanaged(types.PathSegment) = .empty;
+    errdefer {
+        for (segments.items) |segment| e.ctx.alloc.free(segment.name);
+        segments.deinit(e.ctx.alloc);
+    }
+    var parts = std.mem.splitSequence(u8, source, "::");
+    while (parts.next()) |part| {
+        // A qualified path can carry its arguments (`Trait<Item = u8>`); the
+        // arguments are the bound's `args`, not part of the name.
+        const head = if (std.mem.indexOfScalar(u8, part, '<')) |cut| part[0..cut] else part;
+        const name = std.mem.trim(u8, head, " \t\r\n");
+        if (name.len == 0) continue;
+        try segments.append(e.ctx.alloc, .{
+            .name = try e.ctx.alloc.dupe(u8, name),
+            .id = null,
+        });
+    }
+    if (segments.items.len == 0) return error.InvalidType;
+    return .{ .segments = try segments.toOwnedSlice(e.ctx.alloc) };
+}
+
+/// Parse one trait bound: `?Sized`, `Iterator<Item = u8>`, `std::io::Read`.
+///
+/// `optional` marks a relaxation bound (`?T`): it removes a bound rather than
+/// adding one, and a consumer must not read it as a capability.
+fn parseCstTraitBound(e: *Ext, node: ts.Node) anyerror!?types.Bound {
+    var actual_node = node;
+    var optional = false;
+    if (std.mem.eql(u8, node.kind(), "removed_trait_bound")) {
+        optional = true;
+        var i: u32 = 0;
+        var found: ?ts.Node = null;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            found = child;
+            break;
+        }
+        actual_node = found orelse return null;
+    }
+    if (std.mem.eql(u8, actual_node.kind(), "lifetime")) return null;
+
+    var args_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer args_list.deinit(e.ctx.alloc);
+    var assoc_list: std.ArrayListUnmanaged(types.AssociatedTypeBinding) = .empty;
+    errdefer assoc_list.deinit(e.ctx.alloc);
+
+    var trait_node = actual_node;
+    if (std.mem.eql(u8, actual_node.kind(), "generic_type")) {
+        trait_node = actual_node.childByFieldName("type") orelse return error.InvalidType;
+        const args_node = actual_node.childByFieldName("type_arguments") orelse
+            return error.InvalidType;
+        var i: u32 = 0;
+        while (args_node.namedChild(i)) |arg_child| : (i += 1) {
+            if (std.mem.eql(u8, arg_child.kind(), "lifetime")) continue;
+            if (std.mem.eql(u8, arg_child.kind(), "type_binding")) {
+                const binding_name = arg_child.childByFieldName("name") orelse
+                    return error.InvalidType;
+                const binding_type = arg_child.childByFieldName("type") orelse
+                    return error.InvalidType;
+                try assoc_list.append(e.ctx.alloc, .{
+                    .name = try e.ctx.alloc.dupe(u8, text(e, binding_name)),
+                    .ty = try mapCstType(e, binding_type),
+                });
+            } else {
+                try args_list.append(e.ctx.alloc, try mapCstType(e, arg_child));
+            }
+        }
+    }
+
+    var bound_path = try cstPathFromNode(e, trait_node);
+    // A bare prelude name (`Iterator`, `Sized`) stands for a full `core::`
+    // path. Only when nothing in the graph claims the name: a crate that
+    // declares its own `Debug` keeps it, which is the whole point of matching
+    // a bound by path rather than by its last segment.
+    if (bound_path.segments.len == 1 and bound_path.segments[0].id == null) {
+        if (preludePathSegments(e.ctx.alloc, bound_path.segments[0].name) catch null) |segs| {
+            bound_path.segments = segs;
+        }
+    }
+
+    return .{
+        .path = bound_path,
+        .args = try args_list.toOwnedSlice(e.ctx.alloc),
+        .associated_types = try assoc_list.toOwnedSlice(e.ctx.alloc),
+        .optional = optional,
+    };
+}
+
+/// Append one entry of a `dyn Trait + 'a`, `impl Trait`, or `T: Trait` bound
+/// list. `trait_bounds` wraps the whole `+`-separated list, so the walk
+/// descends through it and through a `bounded_type`; a lifetime bound names no
+/// trait. One parser serves all three spellings, so a bound written on a
+/// generic parameter and the same bound written on `dyn` cannot disagree.
+fn appendCstTraitBound(
+    e: *Ext,
+    node: ts.Node,
+    bounds: *std.ArrayListUnmanaged(types.Bound),
+) anyerror!void {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "lifetime")) return;
+    if (std.mem.eql(u8, kind, "bounded_type") or
+        std.mem.eql(u8, kind, "trait_bounds"))
+    {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |child| : (i += 1) {
+            try appendCstTraitBound(e, child, bounds);
+        }
+        return;
+    }
+    // `dyn Trait` and `impl Trait` both wrap their `+`-separated list behind a
+    // `trait` field. Without this arm `abstract_type` is read as a leaf, and
+    // reading its name means mapping it as a type — which lands back here, so
+    // a helper parameter spelled `impl Iterator` recursed until the stack ran
+    // out. Descent is what makes both wrappers terminate.
+    if (std.mem.eql(u8, kind, "dynamic_type") or
+        std.mem.eql(u8, kind, "abstract_type"))
+    {
+        const trait_node = node.childByFieldName("trait") orelse return error.InvalidType;
+        return appendCstTraitBound(e, trait_node, bounds);
+    }
+    if (std.mem.eql(u8, kind, "higher_ranked_trait_bound") or
+        std.mem.eql(u8, kind, "use_bounds"))
+    {
+        return error.InvalidType;
+    }
+    const bound = (try parseCstTraitBound(e, node)) orelse return error.InvalidType;
+    try bounds.append(e.ctx.alloc, bound);
+}
+
+/// The bounds a generic parameter declaration carries: `R: io::Read + ?Sized`
+/// on the parameter itself, or a `where R: ...` predicate.
+fn collectCstGenericBounds(e: *Ext, node: ts.Node) anyerror![]const types.Bound {
+    if (std.mem.eql(u8, node.kind(), "trait_bounds")) {
+        var wrapped: std.ArrayListUnmanaged(types.Bound) = .empty;
+        errdefer wrapped.deinit(e.ctx.alloc);
+        try appendCstTraitBound(e, node, &wrapped);
+        return wrapped.toOwnedSlice(e.ctx.alloc);
+    }
+    var bounds: std.ArrayListUnmanaged(types.Bound) = .empty;
+    errdefer bounds.deinit(e.ctx.alloc);
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        const kind = child.kind();
+        if (std.mem.eql(u8, kind, "trait_bounds") or std.mem.eql(u8, kind, "type_bound")) {
+            try appendCstTraitBound(e, child, &bounds);
+        }
+    }
+    return bounds.toOwnedSlice(e.ctx.alloc);
+}
+
+/// Read the `where` predicates of a function item into the same
+/// `WhereClause` rows the declaration pass writes, so a consumer that walks
+/// `generics.where_clauses` cannot tell the two passes apart.
+fn collectCstWhereClause(
+    e: *Ext,
+    where_node: ts.Node,
+    where_clauses: *std.ArrayListUnmanaged(types.WhereClause),
+) anyerror!void {
+    var i: u32 = 0;
+    while (where_node.namedChild(i)) |predicate| : (i += 1) {
+        if (!std.mem.eql(u8, predicate.kind(), "where_predicate")) continue;
+        const left_node = predicate.childByFieldName("left") orelse
+            (if (predicate.namedChildCount() > 0) predicate.namedChild(0) else null) orelse continue;
+        if (std.mem.eql(u8, left_node.kind(), "lifetime")) continue;
+        const self_path = try cstPathFromNode(e, left_node);
+        const bounds_node = predicate.childByFieldName("bounds") orelse blk: {
+            var j: u32 = 0;
+            while (predicate.namedChild(j)) |c| : (j += 1) {
+                if (std.mem.eql(u8, c.kind(), "trait_bounds")) break :blk c;
+            }
+            break :blk null;
+        };
+        const clause_bounds: []const types.Bound = if (bounds_node) |bn|
+            try collectCstGenericBounds(e, bn)
+        else
+            &.{};
+        try where_clauses.append(e.ctx.alloc, .{
+            .self_ty = self_path,
+            .bounds = clause_bounds,
+        });
+    }
+}
+
+/// Collect the full generic metadata of a function item: every type, const and
+/// lifetime parameter with its bounds, plus its `where` clauses.
+///
+/// This mirrors the declaration pass's collector and produces the same
+/// `types.Generics`. A block-local `fn` is a real item with a real signature,
+/// so its bounds have to be as complete as a module-level `fn`'s — a body that
+/// calls `r.read_exact(..)` through `R: ?Sized + io::Read` is exactly what those
+/// bounds authorise, and dropping them would refuse a call Rust accepts.
+fn collectCstGenerics(e: *Ext, item: ts.Node) anyerror!?types.Generics {
+    var params: std.ArrayListUnmanaged(types.GenericParam) = .empty;
+    errdefer params.deinit(e.ctx.alloc);
+    var where_clauses: std.ArrayListUnmanaged(types.WhereClause) = .empty;
+    errdefer where_clauses.deinit(e.ctx.alloc);
+    var found = false;
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        const ck = child.kind();
+        if (std.mem.eql(u8, ck, "type_parameters")) {
+            var j: u32 = 0;
+            while (child.namedChild(j)) |parameter| : (j += 1) {
+                const kind = parameter.kind();
+                if (std.mem.eql(u8, kind, "type_parameter")) {
+                    var name: []const u8 = "";
+                    var k: u32 = 0;
+                    while (parameter.namedChild(k)) |part| : (k += 1) {
+                        if (std.mem.eql(u8, part.kind(), "type_identifier")) {
+                            name = text(e, part);
+                            break;
+                        }
+                    }
+                    if (name.len == 0) continue;
+                    try params.append(e.ctx.alloc, .{ .type_ = .{
+                        .name = try e.ctx.alloc.dupe(u8, name),
+                        .bounds = try collectCstGenericBounds(e, parameter),
+                    } });
+                    found = true;
+                } else if (std.mem.eql(u8, kind, "const_parameter")) {
+                    var name: []const u8 = "";
+                    var ty_node: ?ts.Node = parameter.childByFieldName("type");
+                    var k: u32 = 0;
+                    while (parameter.namedChild(k)) |part| : (k += 1) {
+                        if (std.mem.eql(u8, part.kind(), "identifier")) name = text(e, part);
+                        if (ty_node == null and std.mem.eql(u8, part.kind(), "type")) ty_node = part;
+                    }
+                    if (name.len == 0 or ty_node == null) continue;
+                    try params.append(e.ctx.alloc, .{ .const_ = .{
+                        .name = try e.ctx.alloc.dupe(u8, name),
+                        .ty = try mapCstType(e, ty_node.?),
+                    } });
+                    found = true;
+                } else if (std.mem.eql(u8, kind, "lifetime_parameter")) {
+                    try params.append(e.ctx.alloc, .{ .lifetime = .{
+                        .name = try e.ctx.alloc.dupe(u8, text(e, parameter)),
+                    } });
+                    found = true;
+                }
+            }
+        } else if (std.mem.eql(u8, ck, "where_clause")) {
+            try collectCstWhereClause(e, child, &where_clauses);
+            found = true;
+        }
+    }
+    if (!found) {
+        params.deinit(e.ctx.alloc);
+        where_clauses.deinit(e.ctx.alloc);
+        return null;
+    }
+    return .{
+        .params = try params.toOwnedSlice(e.ctx.alloc),
+        .where_clauses = try where_clauses.toOwnedSlice(e.ctx.alloc),
+    };
+}
+
+/// The declared bounds of an `impl Trait`, `dyn Trait`, or `Box<dyn Trait>`
+/// inner type.
+///
+/// Both spellings wrap the same `+`-separated list behind a `trait` field, so
+/// they collect identically and differ only in the type they produce: `impl
+/// Trait` is an opaque type inference may still name concretely later, while
+/// `dyn Trait` is an erased trait object from the start. Reading one as the
+/// other loses that distinction, so the two wrappers stay apart here even
+/// though the rows beneath them are identical.
+fn cstTraitBoundList(e: *Ext, node: ts.Node) anyerror![]const types.Bound {
+    var bounds: std.ArrayListUnmanaged(types.Bound) = .empty;
+    errdefer bounds.deinit(e.ctx.alloc);
+    try appendCstTraitBound(e, node, &bounds);
+    if (bounds.items.len == 0) return error.InvalidType;
+    return bounds.toOwnedSlice(e.ctx.alloc);
+}
+
+/// `impl Trait`: the declared bounds are all the type says, and `concrete`
+/// stays empty for inference to fill. This is the shape the declaration pass
+/// writes for the same source.
+fn cstOpaqueType(e: *Ext, node: ts.Node) anyerror!types.Type {
+    return .{ .@"opaque" = .{ .bounds = try cstTraitBoundList(e, node) } };
+}
+
+/// `dyn Trait + 'a`, and the inner type of a `Box<dyn Trait>`: an erased trait
+/// object, which is what the IR's `dyn_trait` keeps.
+fn cstDynTraitType(e: *Ext, node: ts.Node) anyerror!types.Type {
+    return .{ .dyn_trait = try cstTraitBoundList(e, node) };
+}
+
 // ── type lowering ───────────────────────────────────────────────────────────
 
 /// Lower a tree-sitter type node to a wire `types.Type`. Handles primitives,
@@ -1366,13 +2139,6 @@ fn mapCstType(e: *Ext, node: ts.Node) anyerror!types.Type {
                 const slice_type = try cstSlice(e, elem, !mut);
                 return slice_type;
             }
-            if (std.mem.eql(u8, inn.kind(), "primitive_type") and
-                std.mem.eql(u8, text(e, inn), "str"))
-            {
-                const slice_type = try cstSlice(e, .{ .prim = .u8 }, !mut);
-                return slice_type;
-            }
-            if (std.mem.eql(u8, inn.kind(), "array_type")) return mapCstType(e, inn);
             const r = try e.ctx.alloc.create(types.Ref);
             r.* = .{ .mut = mut, .pointee = try mapCstType(e, inn) };
             return .{ .reference = r };
@@ -1439,6 +2205,14 @@ fn mapCstType(e: *Ext, node: ts.Node) anyerror!types.Type {
         const named_type = try mapCstNamedType(e, node);
         return named_type;
     }
+    if (std.mem.eql(u8, kind, "abstract_type")) {
+        return cstOpaqueType(e, node);
+    }
+    if (std.mem.eql(u8, kind, "dynamic_type") or
+        std.mem.eql(u8, kind, "bounded_type"))
+    {
+        return cstDynTraitType(e, node);
+    }
     if (std.mem.eql(u8, kind, "tuple_type") or std.mem.eql(u8, kind, "unit_type")) {
         var tup: std.ArrayListUnmanaged(types.Type) = .empty;
         defer tup.deinit(e.ctx.alloc);
@@ -1447,6 +2221,10 @@ fn mapCstType(e: *Ext, node: ts.Node) anyerror!types.Type {
             try tup.append(e.ctx.alloc, try mapCstType(e, c));
         }
         if (tup.items.len == 0) return .{ .prim = .unit };
+        if (tup.items.len == 1 and !isTupleTypeNode(node, text(e, node))) {
+            // `(T)` groups; only `(T,)` is a one-element tuple.
+            return tup.items[0];
+        }
         return .{ .tuple = try tup.toOwnedSlice(e.ctx.alloc) };
     }
     if (node.namedChildCount() > 0) return mapCstType(e, node.namedChild(0).?);
@@ -1583,8 +2361,7 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
     // nominal segment after it. This is the same guard the declaration
     // binder applies, and it keeps a bare `std` from resolving.
     const ext_root = segs.items.len > 1 and isExternalCrateRoot(segs.items[0].name);
-    if (ext_root)
-    {
+    if (ext_root) {
         const external_path = try e.ctx.alloc.alloc([]const u8, segs.items.len);
         for (segs.items, 0..) |segment, index| {
             if (segment.name.len == 0) return error.InvalidType;
@@ -2056,31 +2833,15 @@ fn cstRange(e: *const Ext, node: ts.Node) CstRange {
 }
 
 /// Peel a range node (`a..b`, `a..=b`, `a..`) into its iterator classification.
-/// Only `0..b` / `0..=b` are lowered (start must be the literal `0`); `..=b`
-/// lowers to the inclusive bound `b+1` which the backend emits as `0..(b+1)`.
+/// The iterable is the whole `.range` node rather than its end bound: that is
+/// the shape a `.range` iter_kind is validated against, and the shape the
+/// backend's `for` input path lowers.
 fn lowerRangeIter(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
     const range = cstRange(e, node);
-    if (range.left) |left| {
-        const start = std.mem.trim(u8, text(e, left), " \t\r\n");
-        if (!std.mem.eql(u8, start, "0")) return unsupportedIter(e, "range start");
-    }
-    const right = range.right orelse return unsupportedIter(e, "range no end");
-    var end_eid = try lowerExpr(e, right);
-    if (range.inclusive) {
-        const one = try appendExpr(e, .{ .literal = .{ .int = .{
-            .text = "1",
-            .value = 1,
-            .base = .dec,
-            .ty_suffix = null,
-        } } });
-        end_eid = try appendExpr(e, .{ .binary = .{
-            .op = .add,
-            .overflow = .wrapping,
-            .lhs = end_eid,
-            .rhs = one,
-        } });
-    }
-    return .{ .kind = .{ .range = {} }, .eid = end_eid };
+    if (range.right == null) return unsupportedIter(e, "range no end");
+    const range_id = try lowerRangeExpression(e, node);
+    if (e.ctx.exprs.items[range_id].kind != .range) return unsupportedIter(e, "range");
+    return .{ .kind = .{ .slice = {} }, .eid = range_id };
 }
 
 /// Lower a source range while retaining an absent end for open-ended slices.
@@ -2419,6 +3180,35 @@ fn isSliceIteratorSourceType(ty: types.Type) bool {
     };
 }
 
+/// Slice methods that hand back a chunked-slice iterator. Each takes a single
+/// `usize` size argument and names its carrier in `infer.zig`, so a chain may
+/// ROOT at one: `src.chunks(2).enumerate().map(..)`. `windows` is absent
+/// because no method lowering exists for it — a receiver's `.windows(n)` is
+/// refused long before it could become a chain.
+const chunked_iterator_methods = [_][]const u8{ "chunks", "chunks_exact" };
+
+fn isChunkedIteratorMethod(name: []const u8) bool {
+    for (chunked_iterator_methods) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+/// True when `current` is `slice.chunks(n)` or `slice.chunks_exact(n)` over a
+/// plain slice or array. The chunk iterator itself is the chain's SOURCE, not
+/// an adapter: the backend walks it with the same chunk loop a `for` over the
+/// same call uses.
+fn isChunkedIteratorSource(e: *Ext, node: ts.Node) bool {
+    const current = peelParenthesized(node);
+    if (!std.mem.eql(u8, current.kind(), "call_expression")) return false;
+    const method = methodNameOf(e, current) orelse return false;
+    if (!isChunkedIteratorMethod(method)) return false;
+    const receiver = receiverOf(current) orelse return false;
+    const arguments = argumentsOf(current) orelse return false;
+    return iteratorSingleArgument(arguments) != null and
+        isStandardIteratorSource(e, receiver);
+}
+
 fn isStandardIteratorSource(e: *Ext, node: ts.Node) bool {
     var current = peelParenthesized(node);
     while (std.mem.eql(u8, current.kind(), "reference_expression")) {
@@ -2427,8 +3217,95 @@ fn isStandardIteratorSource(e: *Ext, node: ts.Node) bool {
     if (std.mem.eql(u8, current.kind(), "array_expression")) return true;
     if (!std.mem.eql(u8, current.kind(), "identifier")) return false;
     const definition = resolveName(e, text(e, current)) orelse return false;
-    const source_type = localType(e, definition) orelse return false;
+    const source_type = localType(e, definition) orelse
+        return isAsRefByteSequenceLocal(e, definition);
     return isSliceIteratorSourceType(source_type);
+}
+
+/// The expression a `let` bound to `def` was initialized from, or null when
+/// nothing lowered so far binds `def`. The enclosing fn's own body block is
+/// still being lowered when a chain is recognised, so its block id is not
+/// written down yet and the statement table is what there is to read. A name
+/// only resolves to `def` inside the function that declares it, so a `let` in
+/// another function never matches.
+fn localInitializer(e: *const Ext, def: spine.EntityId) ?exprs.Expr {
+    for (e.ctx.stmts.items) |statement| {
+        if (statement.kind != .let) continue;
+        const binding = statement.kind.let;
+        if (binding.pattern >= e.ctx.pats.items.len) continue;
+        const pattern = e.ctx.pats.items[binding.pattern];
+        const name = switch (pattern.kind) {
+            .binding => |value| value.name,
+            else => continue,
+        };
+        if (resolveName(e, name) orelse continue != def) continue;
+        const init = binding.init orelse return null;
+        if (init >= e.ctx.exprs.items.len) return null;
+        return e.ctx.exprs.items[init];
+    }
+    return null;
+}
+
+/// Whether the enclosing function declares a byte-sequence `AsRef` bound on
+/// `source_def`'s own type — `fn f<T: AsRef<[u8]>>(source: T)`. The bound is
+/// the only statement in the source that the borrow is a byte sequence, and
+/// nothing in this pass can turn it into a type for the new local: the
+/// inference pass that reads generic bounds runs after this lowering.
+fn isByteSequenceAsRefValue(e: *const Ext, source_def: spine.EntityId) bool {
+    if (e.fn_id >= e.ctx.bodies_list.items.len) return false;
+    const generics = switch (e.ctx.bodies_list.items[e.fn_id]) {
+        .fn_ => |fn_body| fn_body.generics,
+        else => null,
+    } orelse return false;
+    const source_ty = localType(e, source_def) orelse return false;
+    const type_path = switch (source_ty) {
+        .path => |path| path,
+        else => return false,
+    };
+    if (type_path.segments.len != 1) return false;
+    for (generics.params) |param| {
+        if (param != .type_) continue;
+        if (!std.mem.eql(u8, param.type_.name, type_path.segments[0].name)) continue;
+        for (param.type_.bounds) |bound| {
+            if (bound.optional or bound.args.len != 1) continue;
+            const segments = bound.path.segments;
+            if (segments.len == 0) continue;
+            const bound_name = segments[segments.len - 1].name;
+            if (!std.mem.eql(u8, bound_name, "AsRef") and
+                !std.mem.eql(u8, bound_name, "AsMut"))
+            {
+                continue;
+            }
+            switch (bound.args[0]) {
+                .slice, .array => return true,
+                else => continue,
+            }
+        }
+    }
+    return false;
+}
+
+/// `let bytes = source.as_ref();` names a byte sequence exactly when the
+/// `AsRef` bound on `source`'s type says so. The local itself stays untyped
+/// here, so a chain rooted at it is recognised from the bound instead.
+fn isAsRefByteSequenceLocal(e: *const Ext, def: spine.EntityId) bool {
+    const init = localInitializer(e, def) orelse return false;
+    const call = switch (init.kind) {
+        .method_call => |method| method,
+        else => return false,
+    };
+    if (call.args.len != 0) return false;
+    const method = e.ctx.g.symbol_table.get(call.method) orelse return false;
+    if (!std.mem.eql(u8, method.name, "as_ref") and
+        !std.mem.eql(u8, method.name, "as_mut") and
+        !std.mem.eql(u8, method.name, "borrow"))
+    {
+        return false;
+    }
+    if (call.receiver >= e.ctx.exprs.items.len) return false;
+    const receiver = e.ctx.exprs.items[call.receiver];
+    if (receiver.kind != .path) return false;
+    return isByteSequenceAsRefValue(e, receiver.kind.path.def);
 }
 
 /// A user `Iterator` is a chain source too, even though it is neither a slice
@@ -2442,6 +3319,7 @@ fn isSimpleIteratorSource(e: *Ext, node: ts.Node) bool {
     const current = peelParenthesized(node);
     if (std.mem.eql(u8, current.kind(), "range_expression")) return true;
     if (isIteratorSourceNode(e, current)) return true;
+    if (isChunkedIteratorSource(e, current)) return true;
     if (!std.mem.eql(u8, current.kind(), "call_expression")) return false;
 
     const method = methodNameOf(e, current) orelse return false;
@@ -2519,6 +3397,10 @@ fn lowerIteratorSource(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
         return lowerExpr(e, current);
     }
+    // `slice.chunks(n)` and `slice.chunks_exact(n)` ARE the chain's source.
+    // The call is lowered whole, so the backend drives it with the same chunk
+    // loop a `for` over the same call emits.
+    if (isChunkedIteratorSource(e, current)) return lowerExpr(e, current);
     if (!std.mem.eql(u8, method, "copied") or !iteratorArgumentsEmpty(arguments)) {
         return error.UnsupportedIteratorChain;
     }
@@ -2562,7 +3444,7 @@ fn lowerIteratorChainParts(
     const arguments = argumentsOf(current) orelse return error.UnsupportedIteratorChain;
 
     if (std.mem.eql(u8, method, "iter") or std.mem.eql(u8, method, "iter_mut") or
-        std.mem.eql(u8, method, "copied"))
+        std.mem.eql(u8, method, "copied") or isChunkedIteratorMethod(method))
     {
         source.* = try lowerIteratorSource(e, current);
         return;
@@ -2655,6 +3537,16 @@ fn unsupportedIter(e: *Ext, reason: []const u8) anyerror!UnwrappedIter {
     return .{ .kind = .{ .slice = {} }, .eid = eid };
 }
 
+/// True when a `.method(..)` call's receiver is spelled as a range
+/// expression. Rust's `rev` is the one adapter whose wire form differs by
+/// source: `range.rev()` lowers to a direction flag on a Zig range, while
+/// `slice.iter().rev()` is an ordinary `core::iter::Rev` carrier the runtime
+/// already has.
+fn isRangeReceiver(node: ts.Node) bool {
+    const receiver = receiverOf(node) orelse return false;
+    return std.mem.eql(u8, peelParenthesized(receiver).kind(), "range_expression");
+}
+
 /// Classify a `for` iterable expression, peeling `.iter()`, `.iter_mut()`,
 /// `.as_ref()` and detecting `.enumerate()` / `.zip()` / ranges.
 fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
@@ -2666,8 +3558,12 @@ fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
     if (std.mem.eql(u8, k, "call_expression")) {
         const mname = methodNameOf(e, node);
         if (mname) |name| {
+            // `.rev()` over a RANGE is a chain adapter; over any other
+            // iterator it is an ordinary method call the runtime already
+            // models as a `core::iter::Rev` carrier.
             if ((std.mem.eql(u8, name, "map") or std.mem.eql(u8, name, "filter") or
-                std.mem.eql(u8, name, "flat_map") or std.mem.eql(u8, name, "rev")) and
+                std.mem.eql(u8, name, "flat_map") or
+                (std.mem.eql(u8, name, "rev") and isRangeReceiver(node))) and
                 isStandardIteratorChain(e, node))
             {
                 const chain = lowerIteratorChainData(e, node, .iterator) catch |err| {
@@ -2697,6 +3593,37 @@ fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
                 // preserve shared versus mutable iteration semantics.
                 return .{ .kind = .{ .slice = {} }, .eid = try lowerExpr(e, node) };
             }
+
+            if (std.mem.eql(u8, name, "copied")) {
+                // `xs.iter().copied()` hands out the elements themselves, and
+                // that is what a Zig `for` over `xs` already binds. Keeping the
+                // iterator would bind a borrow per element instead, and every
+                // use of the element against its own type would then fail.
+                const copied_recv = receiverOf(node);
+                if (copied_recv) |recv| {
+                    const iter_call = peelParenthesized(recv);
+                    if (std.mem.eql(u8, iter_call.kind(), "call_expression")) {
+                        if (methodNameOf(e, iter_call)) |iter_name| {
+                            if (std.mem.eql(u8, iter_name, "iter") or
+                                std.mem.eql(u8, iter_name, "iter_mut"))
+                            {
+                                const iter_recv = receiverOf(iter_call) orelse
+                                    return error.MalformedCst;
+                                return unwrapIterable(e, iter_recv);
+                            }
+                        }
+                    }
+                }
+                // Anything else — a `copied()` further along a chain, or over
+                // something that is not an iterator at all — is NOT a
+                // malformed iterable, and this arm used to say it was: it
+                // returned an error that abandoned the whole extraction on
+                // source which compiles. It falls through to the ordinary
+                // lowering below, which is where this receiver was already
+                // being read before, so a form this code can make sense of
+                // still gets made sense of and only one it cannot becomes the
+                // typed `unsupported` marker that lowering produces.
+            }
             if (std.mem.eql(u8, name, "as_ref") or std.mem.eql(u8, name, "clone")) {
                 const recv = receiverOf(node) orelse return error.MalformedCst;
                 return unwrapIterable(e, recv);
@@ -2718,6 +3645,9 @@ fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     var i: u32 = 0;
     while (node.namedChild(i)) |c| : (i += 1) {
+        // `'outer:` is the first named child of a labelled `for`. It names the
+        // loop, so it is neither the binding, nor the iterable, nor the body.
+        if (isSourceLabelNode(c)) continue;
         const k = c.kind();
         if (pat_node == null and isPatternNode(c)) {
             pat_node = c;
@@ -2753,7 +3683,10 @@ fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const it = try unwrapIterable(e, iter);
     const iter_eid = it.eid;
     const body = body_node orelse return error.MalformedCst;
-    const body_blk = try lowerBlock(e, body);
+    // The label belongs to the loop, and the backend reads a loop's label off
+    // the block its body is, so it is recorded there.
+    var body_blk = try lowerBlock(e, body);
+    body_blk.labelled = try controlLabel(e, node);
 
     return appendExpr(e, .{ .for_ = .{
         .pattern = pat_id,
@@ -2788,6 +3721,312 @@ fn isSemicolonTerminated(e: *const Ext, node: ts.Node) bool {
     return raw.len > 0 and raw[raw.len - 1] == ';';
 }
 
+/// The name a block-local helper is declared under in the emitted package.
+///
+/// Zig has no nested functions, so the helper is hoisted to module scope,
+/// where its source name no longer identifies it: two tests may each define
+/// `read`, and one function may define that name in two separate blocks. The
+/// dense entity id is assigned in source order, so it names the helper stably
+/// and without collision — the same device `__r2z_static_` uses for a
+/// function-local `static`.
+fn localFnEntityName(
+    alloc: std.mem.Allocator,
+    entity_id: spine.EntityId,
+    source_name: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(alloc, "__r2z_localfn_{d}_{s}", .{ entity_id, source_name });
+}
+
+/// Whether a CST node can carry the declared type of a parameter.
+fn isParameterTypeNodeKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "type") or
+        std.mem.eql(u8, kind, "primitive_type") or
+        std.mem.eql(u8, kind, "reference_type") or
+        std.mem.eql(u8, kind, "pointer_type") or
+        std.mem.eql(u8, kind, "generic_type") or
+        std.mem.eql(u8, kind, "type_identifier") or
+        std.mem.eql(u8, kind, "scoped_type_identifier") or
+        std.mem.eql(u8, kind, "array_type") or
+        std.mem.eql(u8, kind, "slice_type") or
+        std.mem.eql(u8, kind, "tuple_type") or
+        std.mem.eql(u8, kind, "unit_type") or
+        std.mem.eql(u8, kind, "abstract_type") or
+        std.mem.eql(u8, kind, "dynamic_type") or
+        std.mem.eql(u8, kind, "bounded_type");
+}
+
+fn collectCstPatternNames(
+    e: *const Ext,
+    node: ts.Node,
+    out: *std.ArrayListUnmanaged([]const u8),
+) anyerror!void {
+    if (std.mem.eql(u8, node.kind(), "identifier")) {
+        try out.append(e.ctx.alloc, text(e, node));
+    }
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        try collectCstPatternNames(e, child, out);
+    }
+}
+
+/// A parameter whose pattern has no single plain identifier binds under a
+/// synthetic name, chosen so it can never collide with a name the pattern
+/// itself introduces.
+fn syntheticLocalFnParamName(
+    e: *Ext,
+    ordinal: usize,
+    source_names: []const []const u8,
+) anyerror![]const u8 {
+    var candidate = try std.fmt.allocPrint(e.ctx.alloc, "__r2z_param_{d}", .{ordinal});
+    while (true) {
+        var collision = false;
+        for (source_names) |source_name| {
+            if (std.mem.eql(u8, candidate, source_name)) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision) return candidate;
+        const extended = try std.fmt.allocPrint(e.ctx.alloc, "{s}_", .{candidate});
+        e.ctx.alloc.free(candidate);
+        candidate = extended;
+    }
+}
+
+/// Map a block-local helper's parameter list. A `fn` item has no receiver, so
+/// only value parameters appear here.
+fn mapLocalFnParams(e: *Ext, params_node: ?ts.Node) anyerror![]const items.Param {
+    const pn = params_node orelse return &.{};
+    var params: std.ArrayListUnmanaged(items.Param) = .empty;
+    errdefer params.deinit(e.ctx.alloc);
+    var source_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer source_names.deinit(e.ctx.alloc);
+
+    var j: u32 = 0;
+    while (pn.namedChild(j)) |p| : (j += 1) {
+        if (!std.mem.eql(u8, p.kind(), "parameter")) continue;
+        const pattern = paramPatternNode(p) orelse continue;
+        try collectCstPatternNames(e, pattern, &source_names);
+    }
+
+    var ordinal: usize = 0;
+    j = 0;
+    while (pn.namedChild(j)) |p| : (j += 1) {
+        if (!std.mem.eql(u8, p.kind(), "parameter")) continue;
+        var pname: ?[]const u8 = null;
+        var synthetic = false;
+        var pty: ?types.Type = null;
+        var k: u32 = 0;
+        while (p.namedChild(k)) |c| : (k += 1) {
+            const kk = c.kind();
+            if (std.mem.eql(u8, kk, "identifier")) {
+                if (pname == null) pname = text(e, c);
+            } else if (isParameterTypeNodeKind(kk)) {
+                pty = try mapCstType(e, c);
+            }
+        }
+        if (paramPatternNode(p)) |pattern_node| {
+            pname = plainParamName(e, pattern_node);
+        }
+        if (pname == null) {
+            pname = try syntheticLocalFnParamName(e, ordinal, source_names.items);
+            synthetic = true;
+        }
+        ordinal += 1;
+        const param_name = pname orelse return error.MalformedParameter;
+        const param_ty = pty orelse return error.MalformedParameter;
+        try params.append(e.ctx.alloc, .{
+            .name = if (synthetic) param_name else try e.ctx.alloc.dupe(u8, param_name),
+            .ty = param_ty,
+            .span = span_of,
+        });
+    }
+    return params.toOwnedSlice(e.ctx.alloc);
+}
+
+/// The type node attached to a helper's `-> T` clause, or null when it returns
+/// unit. The grammar exposes `return_type` as a field and older revisions
+/// spell it as a node kind, so both are accepted.
+fn localFnReturnTypeNode(node: ts.Node) ?ts.Node {
+    if (node.childByFieldName("return_type")) |ret| return ret;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "return_type")) return child;
+    }
+    return null;
+}
+
+/// A helper's own type parameters (`fn pick<T>(..)`). Its body may name them
+/// and, being its own item, no enclosing function contributes any.
+fn localFnGenericParams(e: *Ext, node: ts.Node) anyerror![]const []const u8 {
+    var params: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer params.deinit(e.ctx.alloc);
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (!std.mem.eql(u8, child.kind(), "type_parameters")) continue;
+        var j: u32 = 0;
+        while (child.namedChild(j)) |parameter| : (j += 1) {
+            if (!std.mem.eql(u8, parameter.kind(), "type_parameter")) continue;
+            var name: []const u8 = "";
+            var k: u32 = 0;
+            while (parameter.namedChild(k)) |parameter_child| : (k += 1) {
+                if (std.mem.eql(u8, parameter_child.kind(), "type_identifier")) {
+                    name = text(e, parameter_child);
+                    break;
+                }
+            }
+            if (name.len == 0) continue;
+            try params.append(e.ctx.alloc, try e.ctx.alloc.dupe(u8, name));
+        }
+    }
+    return params.toOwnedSlice(e.ctx.alloc);
+}
+
+/// One declared block-local helper: its source binding name and its entity.
+const LocalFnDecl = struct { name: []const u8, def: spine.EntityId };
+
+/// Declare one block-local `fn` item.
+///
+/// The item becomes a `.fn_` entity parented to the enclosing callable, with
+/// its own `FnBody`, plus a lexical binding of its source name in this block.
+/// It is deliberately absent from every module's `items`, so a module-global
+/// lookup can never reach it: only the block that declared it and the blocks
+/// nested inside that one can name it. The entity carries the emitted identity
+/// rather than the source name, because the helper is declared at module
+/// scope where the source name may already be taken.
+///
+/// The body is lowered separately, after every item of the block is declared,
+/// so a call may name an item written below it.
+///
+/// The signature is complete: parameter types, return type, the type parameter
+/// names its body may use, and the full `generics` metadata — per-parameter
+/// bounds and `where` clauses — read through the same parser and the same
+/// `types.Generics` shape a module-level `fn` gets. A helper is a real item
+/// with a real signature, so `R: ?Sized + io::Read` on one authorises exactly
+/// what it authorises on any other function.
+fn declareLocalFn(e: *Ext, node: ts.Node) anyerror!LocalFnDecl {
+    const name = functionNodeName(e.ctx, node) orelse return error.MalformedLocalFunctionName;
+    var params_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (std.mem.eql(u8, child.kind(), "parameters")) params_node = child;
+    }
+    const generic_params = try localFnGenericParams(e, node);
+
+    // The entity and its body row are appended first: the signature resolves a
+    // name the helper OWNS — its own type parameter — against that row, so it
+    // has to exist before the signature is mapped. The row's body id stays 0,
+    // which is the frontend-wide "not lowered yet" placeholder.
+    const entity_id: spine.EntityId = @intCast(e.ctx.g.symbol_table.entities.items.len);
+    _ = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try localFnEntityName(e.ctx.alloc, entity_id, name),
+        .span = span_of,
+        .visibility = .private,
+        .parent = e.fn_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .generic_params = generic_params,
+        .generics = null,
+        .body = 0,
+    } });
+
+    // A signature is written in the enclosing block's scope, but the helper is
+    // the owner from here on, which is what makes its own `T` resolve.
+    var signature: Ext = .{ .ctx = e.ctx, .fn_id = entity_id, .item_scope = e.item_scope };
+    defer signature.deinit();
+    const params = try mapLocalFnParams(&signature, params_node);
+    const ret: types.Type = if (localFnReturnTypeNode(node)) |ret_node|
+        try mapCstType(&signature, ret_node)
+    else
+        .{ .prim = .unit };
+
+    const generics = try collectCstGenerics(&signature, node);
+    e.ctx.bodies_list.items[entity_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = ret,
+        .generic_params = generic_params,
+        .generics = generics,
+        .body = 0,
+    } };
+    try e.locals.append(e.ctx.alloc, .{ .name = name, .def = entity_id });
+    return .{ .name = name, .def = entity_id };
+}
+
+/// Lower one declared block-local helper: its parameter bindings and body.
+///
+/// A helper is a separate Rust item and does not capture the enclosing
+/// function's `let` bindings, so it gets its own `Ext` carrying only the item
+/// scope. Its own block declares the helpers nested inside it in turn.
+///
+/// The body id written here is always a freshly appended `.block` expression —
+/// `lowerBlock` allocates one even for an empty body — so it is never the 0
+/// that marks "not lowered yet". That is how the extraction driver tells a
+/// helper that is already lowered from one that still needs its body read.
+fn lowerLocalFnBody(e: *Ext, node: ts.Node, entity_id: spine.EntityId) anyerror!void {
+    var block: ?ts.Node = null;
+    var params_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        const k = child.kind();
+        if (std.mem.eql(u8, k, "block")) block = child;
+        if (std.mem.eql(u8, k, "parameters")) params_node = child;
+    }
+    const blk_node = block orelse return error.MalformedLocalFunctionBody;
+
+    var nested: Ext = .{ .ctx = e.ctx, .fn_id = entity_id, .item_scope = e.item_scope };
+    defer nested.deinit();
+
+    const params: []const items.Param = switch (e.ctx.bodies_list.items[entity_id]) {
+        .fn_ => |body| body.params,
+        else => return error.MalformedLocalFunctionBody,
+    };
+    var param_prelude: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer param_prelude.deinit(e.ctx.alloc);
+    if (params_node) |pn| {
+        var p: u32 = 0;
+        var param_index: usize = 0;
+        while (pn.namedChild(p)) |pnode| : (p += 1) {
+            if (!std.mem.eql(u8, pnode.kind(), "parameter")) continue;
+            if (param_index >= params.len) return error.MalformedCst;
+            try registerParamLocal(&nested, pnode, params[param_index], &param_prelude);
+            param_index += 1;
+        }
+        if (param_index != params.len) return error.MalformedCst;
+    }
+
+    const body_expr = try lowerExpr(&nested, blk_node);
+    if (param_prelude.items.len > 0) {
+        switch (e.ctx.exprs.items[body_expr].kind) {
+            .block => |*body| {
+                const old_statements = body.statements;
+                const merged = try e.ctx.alloc.alloc(
+                    exprs.NodeId,
+                    param_prelude.items.len + old_statements.len,
+                );
+                @memcpy(merged[0..param_prelude.items.len], param_prelude.items);
+                @memcpy(merged[param_prelude.items.len..], old_statements);
+                if (old_statements.len > 0) e.ctx.alloc.free(old_statements);
+                body.statements = merged;
+            },
+            else => return error.MalformedCst,
+        }
+    }
+
+    var fn_body = switch (e.ctx.bodies_list.items[entity_id]) {
+        .fn_ => |body| body,
+        else => return error.MalformedLocalFunctionBody,
+    };
+    fn_body.body = body_expr;
+    e.ctx.bodies_list.items[entity_id] = .{ .fn_ = fn_body };
+}
+
 /// Lower a block's children into a wire `BlockExpr`. A bare trailing
 /// expression (no `;`) becomes the block tail; `;`-terminated statements and
 /// item-like children become statements.
@@ -2797,6 +4036,43 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
     var stmt_ids: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
     defer stmt_ids.deinit(e.ctx.alloc);
     var tail: ?exprs.NodeId = null;
+
+    // A Rust `fn` item is in scope for the whole block that declares it, so
+    // every one of them is declared before the first statement runs. That is
+    // what lets a call name an item written further down the block.
+    var block_items: std.ArrayListUnmanaged(Local) = .empty;
+    defer block_items.deinit(e.ctx.alloc);
+    {
+        var scan: u32 = 0;
+        while (node.namedChild(scan)) |c| : (scan += 1) {
+            if (isBlockTrivia(c)) continue;
+            if (!std.mem.eql(u8, c.kind(), "function_item")) continue;
+            const declared = try declareLocalFn(e, c);
+            try block_items.append(e.ctx.alloc, .{
+                .name = declared.name,
+                .def = declared.def,
+            });
+        }
+    }
+    // A helper body sees the enclosing block's items, and nothing of the
+    // enclosing block's `let` bindings. The extended scope has to outlive the
+    // statement loop, so its lifetime is this function's: a `defer` inside the
+    // `if` that installs it would run at the end of that `if`, restoring and
+    // freeing the scope before the first statement is lowered.
+    const outer_item_scope = e.item_scope;
+    var block_scope: []const Local = &.{};
+    defer {
+        if (block_scope.len > 0) e.ctx.alloc.free(block_scope);
+    }
+    if (block_items.items.len > 0) {
+        const scope = try e.ctx.alloc.alloc(Local, e.item_scope.len + block_items.items.len);
+        @memcpy(scope[0..e.item_scope.len], e.item_scope);
+        @memcpy(scope[e.item_scope.len..], block_items.items);
+        block_scope = scope;
+        e.item_scope = scope;
+    }
+    defer e.item_scope = outer_item_scope;
+    var local_fn_ordinal: usize = 0;
 
     // Find the last value-bearing child so trivia cannot become the block tail.
     var last: ?ts.Node = null;
@@ -2820,6 +4096,13 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
         } else if (std.mem.eql(u8, k, "static_item")) {
             try lowerStaticItem(e, c);
             try stmt_ids.append(e.ctx.alloc, @intCast(e.ctx.stmts.items.len - 1));
+        } else if (std.mem.eql(u8, k, "function_item")) {
+            if (local_fn_ordinal >= block_items.items.len) return error.MalformedCst;
+            const declared = block_items.items[local_fn_ordinal];
+            local_fn_ordinal += 1;
+            const sid = try appendStmt(e, .{ .item = declared.def });
+            try stmt_ids.append(e.ctx.alloc, sid);
+            try lowerLocalFnBody(e, c, declared.def);
         } else if (std.mem.eql(u8, k, "let_declaration")) {
             try lowerLet(e, c);
             try stmt_ids.append(e.ctx.alloc, @intCast(e.ctx.stmts.items.len - 1));
@@ -2893,25 +4176,34 @@ fn controlBlock(node: ts.Node) ?ts.Node {
     return null;
 }
 
-fn controlLabel(e: *Ext, node: ts.Node) anyerror!?[]const u8 {
-    var label = node.childByFieldName("label");
-    if (label == null) {
-        var i: u32 = 0;
-        while (node.namedChild(i)) |child| : (i += 1) {
-            if (std.mem.eql(u8, child.kind(), "lifetime")) {
-                label = child;
-                break;
-            }
-        }
-    }
-    const raw = label orelse return null;
-    var name = std.mem.trim(u8, text(e, raw), " \t\r\n");
-    if (name.len > 0 and name[0] == '\'') name = name[1..];
-    if (name.len == 0) return null;
-    const owned_name = try e.ctx.alloc.dupe(u8, name);
-    return owned_name;
+/// A node that only names the construct around it: `'outer` in front of a
+/// loop, or after `break`/`continue`. It is never a value, a condition, or a
+/// body, and lowering it as one either invents an operand a bare `break` does
+/// not have or rejects the node as an unhandled construct.
+fn isSourceLabelNode(node: ts.Node) bool {
+    return std.mem.eql(u8, node.kind(), "label");
 }
 
+/// The source label a control construct carries, or null when it has none.
+///
+/// tree-sitter spells the node `label` and gives it NO field, so it is found
+/// by its kind among the named children. The node text carries the apostrophe
+/// it was written with, which is trimmed from BOTH ends: the source may spell
+/// `'outer` where a definition spells `outer`, and a label that keeps its
+/// punctuation can never be matched against the name an exit names.
+fn controlLabel(e: *Ext, node: ts.Node) anyerror!?[]const u8 {
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (!isSourceLabelNode(child)) continue;
+        const name = std.mem.trim(u8, text(e, child), "' \t\r\n");
+        if (name.len == 0) continue;
+        const label = try e.ctx.alloc.dupe(u8, name);
+        return label;
+    }
+    return null;
+}
+
+/// The operand of `break value`, or null when the `break` carries none.
 fn controlValue(e: *Ext, node: ts.Node) anyerror!?exprs.NodeId {
     if (node.childByFieldName("value")) |value| {
         const lowered = try lowerExpr(e, value);
@@ -2919,10 +4211,9 @@ fn controlValue(e: *Ext, node: ts.Node) anyerror!?exprs.NodeId {
     }
     var i: u32 = 0;
     while (node.namedChild(i)) |child| : (i += 1) {
-        if (!std.mem.eql(u8, child.kind(), "lifetime")) {
-            const lowered = try lowerExpr(e, child);
-            return lowered;
-        }
+        if (isSourceLabelNode(child) or isComment(child)) continue;
+        const lowered = try lowerExpr(e, child);
+        return lowered;
     }
     return null;
 }
@@ -3028,6 +4319,26 @@ fn rawPointeesCastCompatible(source_pointee: types.Type, target_pointee: types.T
     return true;
 }
 
+/// `&[T]` and `&mut [T]` lower to a slice, and a `*const [T]` / `*mut [T]`
+/// destination is a raw pointer to that same unsized slice: both carry the
+/// element AND the length, so the cast re-labels one as the other and keeps
+/// both. Only the fat destination can stand for a slice — a thin `*const u8`
+/// has nowhere to keep the length — and the mutability still has to hold: a
+/// shared slice cannot become a mutable pointer, while a mutable one can
+/// become either. Same rule as `sliceToRawPointerCompatible` in `infer.zig` and
+/// `sliceToRawPointerCompatible` in `ir/validate.zig`.
+fn sliceToRawPointerCompatible(
+    source_slice: *const types.Slice,
+    target_raw: *const types.RawPtr,
+) bool {
+    if (target_raw.mut and source_slice.const_) return false;
+    const target_slice = switch (target_raw.pointee) {
+        .slice => |value| value,
+        else => return false,
+    };
+    return infer.typeEqual(source_slice.elem, target_slice.elem);
+}
+
 fn isSupportedCastTarget(ty: types.Type) bool {
     // `x as _` names its destination with the inference placeholder, which is
     // a real type-table entry that solving fills in from the surrounding
@@ -3115,6 +4426,7 @@ fn knownCastCompatible(source: types.Type, target: types.Type) ?bool {
         switch (source) {
             .raw_ptr => |source_ptr| return rawPointeesCastCompatible(source_ptr.pointee, target.raw_ptr.pointee),
             .reference => |source_ref| return referenceToRawPointerCompatible(source_ref, target.raw_ptr),
+            .slice => |source_slice| return sliceToRawPointerCompatible(source_slice, target.raw_ptr),
             .prim => |source_prim| return isIntegerPrimitive(source_prim) and isThinRawPointer(target.raw_ptr),
             else => return false,
         }
@@ -3277,8 +4589,29 @@ fn knownCastOperandType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
             }
             break :blk null;
         },
+        // A core call's result is fixed by the function and its type
+        // arguments, not by the values it is applied to, so the frontend can
+        // answer this before inference runs. Without it a local bound to a
+        // core call has no type here, and everything downstream of an index
+        // into it — an array literal above all, which the Zig AST can only
+        // emit with a named element type — is left untyped.
+        .core_call => |call| coreCallResultType(call),
         else => null,
     };
+}
+
+/// The type a core call yields where its function and type arguments alone
+/// decide it. These are the same rules `infer.knownCoreCallType` applies, so
+/// the two passes cannot disagree; the remaining core functions depend on
+/// value arguments only inference can see, and stay unknown here.
+fn coreCallResultType(call: exprs.CoreCall) ?types.Type {
+    const result: ?types.Type = switch (call.function) {
+        .mem_transmute => if (call.generic_args.len == 2) call.generic_args[1] else null,
+        .default_value, .convert_from => if (call.generic_args.len == 1) call.generic_args[0] else null,
+        .mem_size_of, .mem_size_of_val => .{ .prim = .usize },
+        else => null,
+    };
+    return result;
 }
 
 fn pendingCastSourceType() types.Type {
@@ -3317,6 +4650,105 @@ fn appendPrimitiveFrom(
     } });
     e.ctx.exprs.items[cast].ty = target;
     return cast;
+}
+
+/// The byte width of an integer's native-endian byte image, or null for a
+/// type that has no fixed one. `usize` / `isize` are excluded on purpose:
+/// their image is as wide as the target pointer, which no IR type can name
+/// until monomorphization has picked one.
+fn nativeEndianByteWidth(primitive: types.Prim) ?u64 {
+    return switch (primitive) {
+        .i8, .u8 => 1,
+        .i16, .u16 => 2,
+        .i32, .u32 => 4,
+        .i64, .u64 => 8,
+        .i128, .u128 => 16,
+        else => null,
+    };
+}
+
+/// `[u8; N]`, the array an integer's native-endian byte image is written as.
+fn nativeEndianByteArray(e: *Ext, primitive: types.Prim) ?types.Type {
+    const width = nativeEndianByteWidth(primitive) orelse return null;
+    const array = e.ctx.alloc.create(types.Array) catch return null;
+    array.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = width } };
+    return .{ .array = array };
+}
+
+/// `core::mem::transmute` between an integer and the same value's bytes.
+/// `generic_args[0]` is the parameter and `generic_args[1]` the result, the
+/// order the runtime reads them in — which is the order Rust's own
+/// `transmute::<Src, Dst>` already spells, so no reordering happens here.
+fn appendNativeEndianTransmute(
+    e: *Ext,
+    parameter: types.Type,
+    result: types.Type,
+    operand: exprs.NodeId,
+) anyerror!exprs.NodeId {
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 2);
+    generic_args[0] = parameter;
+    generic_args[1] = result;
+    const args = try e.ctx.alloc.alloc(exprs.NodeId, 1);
+    args[0] = operand;
+    return appendExpr(e, .{ .core_call = .{
+        .function = .mem_transmute,
+        .generic_args = generic_args,
+        .args = args,
+    } });
+}
+
+/// The integer a receiver expression holds, looking through one reference
+/// layer because Rust's method call auto-derefs its receiver.
+fn integerReceiverType(ty: types.Type) ?types.Prim {
+    return switch (ty) {
+        .prim => |primitive| primitive,
+        .reference => |reference| switch (reference.pointee) {
+            .prim => |primitive| primitive,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// `receiver.to_ne_bytes()`, or null when this call is anything else.
+///
+/// The method is settled here rather than left to method dispatch because its
+/// result is an ARRAY, not a number: no numeric method names it, and the
+/// dispatch table keys on the receiver's primitive, so the spelling reaches
+/// the backend as an unresolvable call. The runtime's `memory.transmute` is
+/// already the operation — it copies the value's own bytes with `@memcpy`,
+/// which is native-endian by construction — so `to_ne_bytes` and its inverse
+/// are one core call each rather than a new runtime entry.
+fn appendToNeBytes(e: *Ext, receiver: exprs.NodeId) anyerror!?exprs.NodeId {
+    const declared = knownCastOperandType(e, receiver) orelse return null;
+    const primitive = integerReceiverType(declared) orelse return null;
+    const bytes = nativeEndianByteArray(e, primitive) orelse return null;
+    const operand = if (declared == .reference)
+        try appendExpr(e, .{ .unary = .{ .op = .deref, .operand = receiver } })
+    else
+        receiver;
+    const transmuted = try appendNativeEndianTransmute(e, .{ .prim = primitive }, bytes, operand);
+    return transmuted;
+}
+
+/// `u16::from_ne_bytes`, the associated-function spelling of the same bytes.
+fn primitiveFromNeBytesTarget(raw: []const u8) ?types.Prim {
+    const suffix = "::from_ne_bytes";
+    if (!std.mem.endsWith(u8, raw, suffix)) return null;
+    const primitive = mapPrim(raw[0 .. raw.len - suffix.len]) orelse return null;
+    return if (nativeEndianByteWidth(primitive) != null) primitive else null;
+}
+
+fn appendPrimitiveFromNeBytes(
+    e: *Ext,
+    target_primitive: types.Prim,
+    args: []const exprs.NodeId,
+) anyerror!exprs.NodeId {
+    defer e.ctx.alloc.free(args);
+    if (args.len != 1) return unsupported(e, "primitive from_ne_bytes call");
+    const bytes = nativeEndianByteArray(e, target_primitive) orelse
+        return unsupported(e, "primitive from_ne_bytes call");
+    return appendNativeEndianTransmute(e, bytes, .{ .prim = target_primitive }, args[0]);
 }
 fn primitiveTryFromTarget(raw: []const u8) ?types.Prim {
     const suffix = "::try_from";
@@ -3416,6 +4848,24 @@ fn lowerCast(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (knownCastCompatible(source_type, target_type)) |compatible| {
             if (!compatible) {
                 return unsupported(e, "cast target type");
+            }
+        }
+        // The operand is read twice: the conversion is judged against the
+        // source recorded on the cast, and a reader that re-derives the
+        // source from the operand has nothing to compare against unless the
+        // node carries one of its own. `knownCastOperandType` can answer from
+        // the binding the operand names, which leaves the node itself
+        // untyped — and an untyped operand under a raw-pointer destination is
+        // exactly what validation refuses. Pinning the type this very cast is
+        // judged by makes the two the same statement, and does not weaken the
+        // check: the source still has to agree with what the operand says.
+        // The type is INTERNED through the table's own find-or-append, not
+        // looked up: a parameter's type is not an entry until something asks
+        // for one, so a lookup alone would find nothing and silently leave the
+        // operand untyped.
+        if (e.ctx.exprs.items[operand].ty == null) {
+            if (try appendType(e, source_type)) |source_id| {
+                e.ctx.exprs.items[operand].ty = source_id;
             }
         }
     }
@@ -3636,6 +5086,13 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (try ensureStandardPreludePath(e, text(e, node))) |standard| {
             return lowerPathValue(e, standard.variant_id);
         }
+        // A variant of a standard-library enum, declared under the external
+        // module chain the same way the prelude's own enums are. Last, because
+        // it is the widest of these: everything above it resolves a real local
+        // entity first, so this only ever sees a path nothing local claims.
+        if (try lowerExternalEnumVariantPath(e, node)) |external_variant| {
+            return external_variant;
+        }
         return unsupported(e, "unresolved scoped path");
     }
     if (std.mem.eql(u8, kind, "mutable_specifier")) return error.MalformedCst;
@@ -3750,6 +5207,9 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         var body_node: ?ts.Node = null;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
+            // `'outer:` is the first named child of a labelled `while`. It
+            // names the loop; it is neither the condition nor the body.
+            if (isSourceLabelNode(c)) continue;
             if (std.mem.eql(u8, c.kind(), "block")) body_node = c else if (cond_node == null) cond_node = c;
         }
         const cond = cond_node orelse return error.MalformedCst;
@@ -3766,10 +5226,14 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         } else {
             cond_id = try lowerExpr(e, cond);
         }
+        // The label belongs to the loop, and the backend reads a loop's label
+        // off the block its body is, so it is recorded there.
+        var while_body = try lowerBlock(e, body);
+        while_body.labelled = try controlLabel(e, node);
         return appendExpr(e, .{ .while_ = .{
             .cond = cond_id,
             .capture = capture,
-            .body = try lowerBlock(e, body),
+            .body = while_body,
         } });
     }
     if (std.mem.eql(u8, kind, "block")) {
@@ -4146,20 +5610,19 @@ fn attachKnownTupleType(
     const tuple_types = try e.ctx.alloc.alloc(types.Type, elements.len);
     errdefer e.ctx.alloc.free(tuple_types);
     for (elements, 0..) |element, index| {
-        tuple_types[index] = sourceDeterminedExprType(e, element) orelse {
-            e.ctx.alloc.free(tuple_types);
-            return;
+        tuple_types[index] = sourceDeterminedExprType(e, element) orelse .{
+            .unsupported = .{ .reason = .cfg_gated, .message = "_", .span = span_of },
         };
     }
     const aggregate: types.Type = .{ .tuple = tuple_types };
-    if (!isConcreteDeclaredReturnType(aggregate)) {
-        e.ctx.alloc.free(tuple_types);
-        return;
-    }
-    if (infer.findTypeIndexInSlice(e.ctx.types.items, aggregate)) |existing| {
-        e.ctx.alloc.free(tuple_types);
-        e.ctx.exprs.items[tuple_id].ty = existing;
-        return;
+    // Partial tuple rows belong to this literal. The solver fills their
+    // unknown elements; sharing such a row would couple unrelated literals.
+    if (isConcreteDeclaredReturnType(aggregate)) {
+        if (infer.findTypeIndexInSlice(e.ctx.types.items, aggregate)) |existing| {
+            e.ctx.alloc.free(tuple_types);
+            e.ctx.exprs.items[tuple_id].ty = existing;
+            return;
+        }
     }
     const type_id: exprs.TypeId = @intCast(e.ctx.types.items.len);
     try e.ctx.types.append(e.ctx.alloc, aggregate);
@@ -4210,7 +5673,61 @@ fn hexDigit(value: u8) ?u8 {
     return null;
 }
 
-fn decodeEscapedBytes(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+/// Parse the `\u{...}` escape text — backslash through closing brace — into the
+/// scalar value it names.
+///
+/// Null when the text is not that escape, names no digits, or names something
+/// that is not a Unicode scalar value: a surrogate, or a code point past the
+/// end of the range. Rust rejects both at compile time, so neither may become
+/// a byte here either.
+fn decodeRustUnicodeEscape(escape: []const u8) ?u32 {
+    if (escape.len < 5 or escape[0] != '\\' or escape[1] != 'u' or escape[2] != '{') {
+        return null;
+    }
+    if (escape[escape.len - 1] != '}') return null;
+    const digits = escape[3 .. escape.len - 1];
+    if (digits.len == 0 or digits.len > 6) return null;
+    var value: u32 = 0;
+    for (digits) |digit| {
+        const nibble = hexDigit(digit) orelse return null;
+        value = value * 16 + @as(u32, nibble);
+    }
+    if (!isUnicodeScalar(value)) return null;
+    return value;
+}
+
+/// Append one scalar value as UTF-8.
+///
+/// Hand-rolled to mirror `decodeUtf8Codepoint` beside it: the same rules in
+/// both directions, so what this accepts and what that reads back agree.
+fn appendUtf8Codepoint(
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayListUnmanaged(u8),
+    value: u32,
+) !void {
+    if (!isUnicodeScalar(value)) return error.InvalidLiteral;
+    if (value < 0x80) {
+        try bytes.append(allocator, @intCast(value));
+    } else if (value < 0x800) {
+        try bytes.append(allocator, @intCast(0xc0 | (value >> 6)));
+        try bytes.append(allocator, @intCast(0x80 | (value & 0x3f)));
+    } else if (value < 0x10000) {
+        try bytes.append(allocator, @intCast(0xe0 | (value >> 12)));
+        try bytes.append(allocator, @intCast(0x80 | ((value >> 6) & 0x3f)));
+        try bytes.append(allocator, @intCast(0x80 | (value & 0x3f)));
+    } else {
+        try bytes.append(allocator, @intCast(0xf0 | (value >> 18)));
+        try bytes.append(allocator, @intCast(0x80 | ((value >> 12) & 0x3f)));
+        try bytes.append(allocator, @intCast(0x80 | ((value >> 6) & 0x3f)));
+        try bytes.append(allocator, @intCast(0x80 | (value & 0x3f)));
+    }
+}
+
+pub fn decodeEscapedBytes(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    allow_unicode: bool,
+) ![]const u8 {
     var bytes: std.ArrayListUnmanaged(u8) = .empty;
     defer bytes.deinit(allocator);
 
@@ -4240,9 +5757,26 @@ fn decodeEscapedBytes(allocator: std.mem.Allocator, body: []const u8) ![]const u
                 try bytes.append(allocator, high * 16 + low);
                 i += 2;
             },
-            '\n' => {},
-            '\r' => {
-                if (i + 1 < body.len and body[i + 1] == '\n') i += 1;
+            'u' => {
+                // `\u{...}` names a scalar value, so it contributes its UTF-8
+                // encoding to the string's bytes rather than one byte. A byte
+                // string has no such escape in Rust — `\u` there is rejected by
+                // rustc — so the byte path keeps refusing it.
+                if (!allow_unicode) return error.InvalidLiteral;
+                const closing = std.mem.indexOfScalarPos(u8, body, i + 1, '}') orelse
+                    return error.InvalidLiteral;
+                const scalar = decodeRustUnicodeEscape(body[i - 1 .. closing + 1]) orelse
+                    return error.InvalidLiteral;
+                try appendUtf8Codepoint(allocator, &bytes, scalar);
+                i = closing;
+            },
+            '\n', '\r' => {
+                i += 1;
+                while (i < body.len and switch (body[i]) {
+                    ' ', '\t', '\n', '\r' => true,
+                    else => false,
+                }) i += 1;
+                continue;
             },
             else => return error.InvalidLiteral,
         }
@@ -4309,20 +5843,10 @@ fn decodeRustCharCodepoint(raw: []const u8) ?u32 {
             const value = @as(u32, high) * 16 + @as(u32, low);
             break :blk if (value <= 0x7f) value else null;
         },
-        'u' => blk: {
-            if (body.len < 5 or body[2] != '{' or body[body.len - 1] != '}') {
-                break :blk null;
-            }
-            const digits = body[3 .. body.len - 1];
-            if (digits.len == 0 or digits.len > 6) break :blk null;
-            var value: u32 = 0;
-            for (digits) |digit| {
-                const nibble = hexDigit(digit) orelse break :blk null;
-                value = value * 16 + @as(u32, nibble);
-            }
-            if (!isUnicodeScalar(value)) break :blk null;
-            break :blk value;
-        },
+        // The one parser for `\u{...}`, shared with the string decoder so a
+        // char literal and a string literal cannot disagree about which code
+        // points are valid.
+        'u' => decodeRustUnicodeEscape(body) orelse null,
         else => null,
     };
 }
@@ -4359,7 +5883,7 @@ fn decodeRustByteLiteral(allocator: std.mem.Allocator, raw: []const u8) !?[]cons
         if (raw.len < prefix_len + 3) return null;
         const closing_quote = raw.len - 1;
         if (raw[closing_quote] != '\'') return null;
-        const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. closing_quote]);
+        const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. closing_quote], false);
         if (bytes.len == 1) return bytes;
         allocator.free(bytes);
         return null;
@@ -4368,8 +5892,21 @@ fn decodeRustByteLiteral(allocator: std.mem.Allocator, raw: []const u8) !?[]cons
     if (raw.len < prefix_len + 2) return null;
     const closing_quote = raw.len - 1;
     if (raw[closing_quote] != '"') return null;
-    const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. closing_quote]);
+    const bytes = try decodeEscapedBytes(allocator, raw[prefix_len + 1 .. closing_quote], false);
     return bytes;
+}
+
+/// Decode Rust raw strings (`r".."`, `r#".."#`, `r##"a"b#c"##`).
+///
+/// Every hashed spelling is the same kind of literal as the unquoted one — the
+/// hashes only decide where the body ends — so `r` alone is the test and
+/// `decodeRawBytes` reads the count off BOTH ends. A guard that required the
+/// quote right after the `r` turned every hashed spelling into an invalid
+/// string literal, though that decoder already reads all of them. A null
+/// result means that `raw` is not a raw string.
+fn decodeRustRawString(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    if (raw.len == 0 or raw[0] != 'r') return null;
+    return decodeRawBytes(allocator, raw, 1);
 }
 
 fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
@@ -4382,9 +5919,24 @@ fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return appendExpr(e, .{ .literal = .{ .byte_array = .{ .items = bytes } } });
     }
     if (is_byte) return unsupported(e, "invalid byte literal");
-    var s = raw;
-    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s = s[1 .. s.len - 1];
-    return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = try e.ctx.alloc.dupe(u8, s) } } });
+    // A raw string is its own bytes; nothing inside it is an escape.
+    const raw_string = decodeRustRawString(e.ctx.alloc, raw) catch
+        return unsupported(e, "invalid raw string");
+    if (raw_string) |raw_body| {
+        return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = raw_body } } });
+    }
+    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') {
+        return unsupported(e, "invalid string literal");
+    }
+    // The source spelling is not the value: `"a\\nb"` is `a\nb` with ONE
+    // backslash. Passing the spelling through emitted a Zig literal carrying
+    // two, so the translated string compared unequal to the Rust one — wrong
+    // output that still compiled. An escape this decoder does not know is
+    // refused, never passed through: a half-decoded literal is the same class
+    // of defect one level further on.
+    const bytes = decodeEscapedBytes(e.ctx.alloc, raw[1 .. raw.len - 1], true) catch
+        return unsupported(e, "unsupported string escape");
+    return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = bytes } } });
 }
 fn lowerFloatLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const t = text(e, node);
@@ -4790,10 +6342,11 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             }
         }
 
-        const def = def_opt orelse return appendPat(e, .{ .unsupported = .{
+        const resolved_def = def_opt orelse return appendPat(e, .{ .unsupported = .{
             .reason = "unresolved tuple struct pattern",
             .suggested_version = .v3,
         } });
+        const def = try ensurePatternVariant(e, resolved_def, raw_type);
 
         var field_pats: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
         defer field_pats.deinit(e.ctx.alloc);
@@ -4857,10 +6410,11 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             }
         }
 
-        const def = def_opt orelse return appendPat(e, .{ .unsupported = .{
+        const resolved_def = def_opt orelse return appendPat(e, .{ .unsupported = .{
             .reason = "unresolved struct pattern",
             .suggested_version = .v3,
         } });
+        const def = try ensurePatternVariant(e, resolved_def, raw_type);
         return appendPat(e, .{ .struct_pat = .{
             .def = def,
             .fields = try field_pats.toOwnedSlice(e.ctx.alloc),
@@ -5566,6 +7120,88 @@ fn declaringAssociatedConstTrait(
     return found;
 }
 
+/// The trait in `trait_id`'s supertrait closure that declares `name` as a
+/// method. A method reaches a generic parameter through whichever bound in
+/// that closure provides it, so the declaring trait — not the bound that was
+/// written — is what a trait method reference has to hang from.
+fn declaringAssociatedMethodTrait(
+    e: *const Ext,
+    trait_id: spine.EntityId,
+    name: []const u8,
+    depth: usize,
+) ?spine.EntityId {
+    if (depth >= e.ctx.g.symbol_table.entities.items.len) return null;
+    if (traitDeclaresMethod(e, trait_id, name)) return trait_id;
+    if (trait_id >= e.ctx.bodies_list.items.len) return null;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return null,
+    };
+    var found: ?spine.EntityId = null;
+    for (trait_body.supertraits) |supertrait| {
+        var raw = std.mem.trim(u8, supertrait, " \t\r\n");
+        if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| raw = raw[0..generic_start];
+        const super_name = if (std.mem.lastIndexOf(u8, raw, "::")) |separator|
+            raw[separator + 2 ..]
+        else
+            raw;
+        const super_id = resolveName(e, super_name) orelse continue;
+        const candidate = declaringAssociatedMethodTrait(e, super_id, name, depth + 1) orelse continue;
+        if (found) |existing| {
+            if (existing != candidate) return null;
+        } else {
+            found = candidate;
+        }
+    }
+    return found;
+}
+
+/// The one trait reachable from the bounds of the type parameter
+/// `receiver_name` that declares `method_name`. Two bounds providing the same
+/// method from different traits leave the choice to the source, which this
+/// path does not spell, so that stays unresolved rather than guessed.
+fn boundAssociatedMethodTrait(
+    e: *const Ext,
+    receiver_name: []const u8,
+    method_name: []const u8,
+) ?spine.EntityId {
+    const view = bodyView(e);
+    var found: ?spine.EntityId = null;
+    var current: ?spine.EntityId = e.fn_id;
+    var remaining = e.ctx.g.symbol_table.entities.items.len;
+    while (current) |entity_id| {
+        if (remaining == 0) return null;
+        remaining -= 1;
+        if (genericBodyParams(&view, entity_id)) |generics| {
+            for (generics.params) |param| {
+                if (param != .type_ or !std.mem.eql(u8, param.type_.name, receiver_name)) continue;
+                for (param.type_.bounds) |bound| {
+                    if (bound.optional) continue;
+                    const trait_id = boundTraitEntity(e, bound) orelse continue;
+                    const declaring = declaringAssociatedMethodTrait(e, trait_id, method_name, 0) orelse continue;
+                    if (!mergeAssociatedConstTrait(&found, declaring)) return null;
+                }
+            }
+            for (generics.where_clauses) |clause| {
+                if (clause.self_ty.segments.len != 1 or
+                    !std.mem.eql(u8, clause.self_ty.segments[0].name, receiver_name))
+                {
+                    continue;
+                }
+                for (clause.bounds) |bound| {
+                    if (bound.optional) continue;
+                    const trait_id = boundTraitEntity(e, bound) orelse continue;
+                    const declaring = declaringAssociatedMethodTrait(e, trait_id, method_name, 0) orelse continue;
+                    if (!mergeAssociatedConstTrait(&found, declaring)) return null;
+                }
+            }
+        }
+        const entity = e.ctx.g.symbol_table.get(entity_id) orelse return null;
+        current = entity.parent;
+    }
+    return found;
+}
+
 fn mergeAssociatedConstTrait(
     destination: *?spine.EntityId,
     candidate: spine.EntityId,
@@ -5695,6 +7331,26 @@ fn lowerBoundAssociatedConstPath(
     return result;
 }
 
+/// A standard-library container that `From` is admitted on when the source
+/// names it as the receiver of an associated call. `String` was the first;
+/// `Vec` is the same shape — a container built from a slice — so both live in
+/// one table rather than as separate arms.
+const std_from_receivers = [_]struct { name: []const u8, path: []const u8 }{
+    .{ .name = "String", .path = "alloc::string::String" },
+    .{ .name = "Vec", .path = "alloc::vec::Vec" },
+};
+
+/// The external nominal a `From` receiver name stands for, or null when the
+/// name is not one of the admitted containers.
+fn stdFromReceiverNominal(e: *Ext, name: []const u8) anyerror!?types.Type {
+    for (std_from_receivers) |entry| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+        const external = (try externalNominalForPath(e, entry.path)) orelse return null;
+        return .{ .external_nominal = external };
+    }
+    return null;
+}
+
 fn lowerBoundCoreAssociatedCall(
     e: *Ext,
     raw_path: []const u8,
@@ -5707,18 +7363,26 @@ fn lowerBoundCoreAssociatedCall(
     const method_name = std.mem.trim(u8, raw_path[separator + 2 ..], " \t\r\n");
     if (receiver_name.len == 0 or method_name.len == 0) return null;
 
+    // `Vec::from(..)` names its receiver, so there is no receiver expression
+    // to read a type from and no type parameter to look a bound up under. The
+    // std container is therefore admitted by NAME, and only when the crate has
+    // not declared something by that name itself — a local `Vec` keeps its own
+    // `from`. This is the same admission `String::from` already had, widened
+    // to every container `From` is written on, not a second path beside it.
     var receiver = try activeGenericReceiver(e, receiver_name);
-    if (receiver == null) {
-        if (std.mem.eql(u8, method_name, "from") and
-            std.mem.eql(u8, receiver_name, "String") and
-            resolveName(e, receiver_name) == null)
-        {
-            receiver = .{ .external_nominal = (try externalNominalForPath(e, "alloc::string::String")) orelse return null };
-        } else {
-            if (!std.mem.eql(u8, method_name, "default")) return null;
-            const primitive = mapPrim(receiver_name) orelse return null;
-            receiver = .{ .prim = primitive };
+    var named_receiver = false;
+    if (receiver == null and std.mem.eql(u8, method_name, "from") and
+        resolveName(e, receiver_name) == null)
+    {
+        if (try stdFromReceiverNominal(e, receiver_name)) |named| {
+            receiver = named;
+            named_receiver = true;
         }
+    }
+    if (receiver == null) {
+        if (!std.mem.eql(u8, method_name, "default")) return null;
+        const primitive = mapPrim(receiver_name) orelse return null;
+        receiver = .{ .prim = primitive };
     }
     const function: exprs.CoreFunction = if (std.mem.eql(u8, method_name, "default")) blk: {
         if (args.len != 0) return null;
@@ -5730,14 +7394,10 @@ fn lowerBoundCoreAssociatedCall(
         break :blk .default_value;
     } else if (std.mem.eql(u8, method_name, "from")) blk: {
         if (args.len != 1) return null;
-        const is_string_receiver = switch (receiver.?) {
-            .external_nominal => |external| external.path.len == 3 and
-                std.mem.eql(u8, external.path[0], "alloc") and
-                std.mem.eql(u8, external.path[1], "string") and
-                std.mem.eql(u8, external.path[2], "String"),
-            else => false,
-        };
-        if (!is_string_receiver and
+        // Admitted by name above, or by a `From` bound on a type parameter.
+        // Anything else is a `from` this translator has not admitted, and is
+        // refused rather than lowered as an arbitrary conversion.
+        if (!named_receiver and
             !(try genericHasStandardTraitBound(e, receiver.?, &.{ "core", "convert", "From" })))
         {
             return null;
@@ -5827,6 +7487,14 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 .rhs = rhs,
             } });
         }
+
+        // Rust `x.to_ne_bytes()` → the runtime's native-endian transmute.
+        if (std.mem.eql(u8, mname, "to_ne_bytes") and generic_args.len == 0 and
+            iteratorArgumentsEmpty(call_args))
+        {
+            if (try appendToNeBytes(e, try lowerExpr(e, recv))) |bytes| return bytes;
+        }
+
         const method_def = try pushMethodRef(e, mname);
         const args = try lowerArgs(e, call_args);
         // The turbofish on `recv.method::<T>(..)` is the callee's own, so it is
@@ -5885,6 +7553,13 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 return unsupported(e, "primitive from call");
             }
             return appendPrimitiveFrom(e, target_primitive, args);
+        }
+        if (primitiveFromNeBytesTarget(t)) |target_primitive| {
+            if (generic_args.len != 0) {
+                e.ctx.alloc.free(args);
+                return unsupported(e, "primitive from_ne_bytes call");
+            }
+            return appendPrimitiveFromNeBytes(e, target_primitive, args);
         }
         if (try traitMethodForPath(e, callee_base)) |method| {
             return appendGenericCall(e, .{ .associated = method }, args, generic_args);
@@ -5989,6 +7664,27 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 }
             }
         }
+        // `I::assoc(..)` where `I` is a type parameter of the enclosing fn or
+        // impl. Rust resolves it through the parameter's declared bounds, and
+        // `Self` in a bound is exactly that parameter, so the method hangs
+        // from whichever bound declares it. A bound this crate has no entity
+        // for — a trait from an external crate, say — resolves to nothing, and
+        // the path then keeps whatever refusal it had before this arm.
+        if ((try activeGenericReceiver(e, base_name)) != null) {
+            const trait_id = boundAssociatedMethodTrait(e, base_name, leaf);
+            const method_id = if (trait_id) |owner|
+                try ensureTraitMethodRefEntity(e, owner, leaf)
+            else
+                null;
+            if (method_id) |resolved| {
+                return appendGenericCall(
+                    e,
+                    .{ .associated = resolved },
+                    args,
+                    generic_args,
+                );
+            }
+        }
         if (std.mem.lastIndexOf(u8, t, "::")) |last_sep| {
             const owner_text = t[0..last_sep];
             const variant_name = t[last_sep + 2 ..];
@@ -6004,6 +7700,12 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             }
         }
 
+        // An associated function of an external nominal — `io::Cursor::new` —
+        // admitted last, after every local owner has had its chance. The
+        // backend decides whether it can lower it.
+        if (try lowerExternalAssociatedCall(e, t, args)) |external_call| {
+            return external_call;
+        }
         return unsupported(e, "unresolved call");
     }
 
@@ -6280,7 +7982,7 @@ fn decodeFormatLiteral(alloc: std.mem.Allocator, raw: []const u8) anyerror![]con
     if (literal[0] != '"' or literal.len < 2 or literal[literal.len - 1] != '"') {
         return error.InvalidFormatLiteral;
     }
-    return decodeEscapedBytes(alloc, literal[1 .. literal.len - 1]);
+    return decodeEscapedBytes(alloc, literal[1 .. literal.len - 1], true);
 }
 
 fn isBuiltinFormatMacroName(raw: []const u8, basename: []const u8) bool {
@@ -6639,6 +8341,11 @@ fn findFunctionNode(
                 }
             }
         }
+        // A function body holds no item whose body is extracted on its own:
+        // a `fn` written inside one is a block-local helper, lowered together
+        // with the function that holds it. Stopping here keeps such a helper
+        // from answering for the module-level item of the same name.
+        return null;
     }
 
     var i: u32 = 0;
@@ -6777,6 +8484,27 @@ test "decode byte character at length boundary" {
         return error.ExpectedByteCharacter;
     defer allocator.free(decoded);
     try std.testing.expectEqualSlices(u8, "a", decoded);
+}
+
+test "a unicode escape contributes its UTF-8 encoding to a string" {
+    const allocator = std.testing.allocator;
+
+    // U+00E9 is one escape in the source and two bytes in the value.
+    const bmp = try decodeEscapedBytes(allocator, "caf\\u{e9}", true);
+    defer allocator.free(bmp);
+    try std.testing.expectEqualStrings("caf\xC3\xA9", bmp);
+
+    // U+1F600 is past the BMP and four bytes wide — the case a decoder that
+    // spends one byte per escape, or one per code unit, gets wrong.
+    const astral = try decodeEscapedBytes(allocator, "\\u{1F600}", true);
+    defer allocator.free(astral);
+    try std.testing.expectEqualStrings("\xF0\x9F\x98\x80", astral);
+
+    // A unicode escape alongside the byte escapes the decoder already handled,
+    // and several of each in one literal.
+    const mixed = try decodeEscapedBytes(allocator, "a\\nb\\u{41}c\\u{7f}", true);
+    defer allocator.free(mixed);
+    try std.testing.expectEqualStrings("a\nb\x41c\x7f", mixed);
 }
 
 test "lower else-if branches exactly" {
@@ -7870,9 +9598,10 @@ test "lowerCall binds a trait method through an owner type that has no entity" {
     };
     // `Vec::from_hex("00").unwrap()` — the chain a real caller writes, and the
     // one whose receiver type decides whether `unwrap` resolves at all.
-    const unwrap = switch (tables.exprs_list.items[block.tail orelse
-        return error.MissingTailExpression].kind)
-    {
+    const unwrap = switch (tables.exprs_list.items[
+        block.tail orelse
+            return error.MissingTailExpression
+    ].kind) {
         .method_call => |value| value,
         else => return error.ExpectedMethodCall,
     };
@@ -7944,8 +9673,10 @@ test "lowerCall still rejects a trait method for a type no impl covers" {
         .block => |value| value,
         else => return error.ExpectedFunctionBlock,
     };
-    const lowered = tables.exprs_list.items[block.tail orelse
-        return error.MissingTailExpression];
+    const lowered = tables.exprs_list.items[
+        block.tail orelse
+            return error.MissingTailExpression
+    ];
     // No impl in this crate covers `String`, so the path still has to be
     // rejected — with the reason that says which construct failed.
     switch (lowered.kind) {
@@ -7990,8 +9721,10 @@ test "lowerCall rejects an owner type whose impls disagree on the method" {
         .block => |value| value,
         else => return error.ExpectedFunctionBlock,
     };
-    const lowered = tables.exprs_list.items[block.tail orelse
-        return error.MissingTailExpression];
+    const lowered = tables.exprs_list.items[
+        block.tail orelse
+            return error.MissingTailExpression
+    ];
     // Two impls both claim `from_hex` for `Vec<u8>`, so nothing in the path
     // chooses between them. Binding either one would emit a call into an
     // implementation the source never named.
@@ -9180,6 +10913,123 @@ test "reference to raw pointer with pointee mismatch is rejected for translation
     );
 }
 
+// `&[u8]` and `*const [u8]` are the same fat pointer under two names, so the
+// cast is legal Rust. The destination has to stay fat: a target that carried
+// only the element would drop the length and turn half the value into
+// nothing.
+test "a borrowed slice casts to a raw pointer to the same slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const byte_slice = try alloc.create(types.Slice);
+    byte_slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const params = try alloc.dupe(items.Param, &.{
+        .{ .name = "input", .ty = .{ .slice = byte_slice }, .span = span_of },
+    });
+    var fixture = try SourceTestFixture.init(
+        alloc,
+        "fat_pointer_cast",
+        \\fn fat_pointer_cast(input: &[u8]) {
+        \\    let fat = input as *const [u8];
+        \\}
+    ,
+        params,
+        .{ .prim = .unit },
+    );
+    defer fixture.deinit(alloc);
+    try fixture.validate();
+
+    const body_id = fixture.tables.bodies_list.items[fixture.function_id].fn_.body;
+    const block = switch (fixture.tables.exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    const let_statement = switch (fixture.tables.stmts_list.items[block.statements[0]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedSliceCastLet,
+    };
+    const cast = switch (fixture.tables.exprs_list.items[let_statement.init.?].kind) {
+        .cast => |cast| cast,
+        else => return error.ExpectedSlicePointerCast,
+    };
+    const source_slice = switch (cast.source_type) {
+        .slice => |slice| slice,
+        else => return error.ExpectedSlicePointerSource,
+    };
+    try std.testing.expect(source_slice.const_);
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, source_slice.elem);
+    const target_pointer = switch (fixture.tables.types_list.items[cast.target]) {
+        .raw_ptr => |pointer| pointer,
+        else => return error.ExpectedSlicePointerTarget,
+    };
+    try std.testing.expect(!target_pointer.mut);
+    const target_slice = switch (target_pointer.pointee) {
+        .slice => |slice| slice,
+        else => return error.ExpectedThinSlicePointerTarget,
+    };
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, target_slice.elem);
+}
+
+// A shared slice cannot become a mutable pointer, however wide the
+// destination's pointee is.
+test "a shared slice cast to a mutable pointer to slice is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const byte_slice = try alloc.create(types.Slice);
+    byte_slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const params = try alloc.dupe(items.Param, &.{
+        .{ .name = "input", .ty = .{ .slice = byte_slice }, .span = span_of },
+    });
+    var fixture = try SourceTestFixture.init(
+        alloc,
+        "reject_slice_mutability",
+        \\fn reject_slice_mutability(input: &[u8]) {
+        \\    let invalid = input as *mut [u8];
+        \\}
+    ,
+        params,
+        .{ .prim = .unit },
+    );
+    defer fixture.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedExpression, fixture.validate());
+}
+
+// A raw string is its own bytes and the hashes only decide where the body
+// ends, so `r##"a"b#c"##` is `a"b#c`: the inner quote and hash are content,
+// not an escape and not a terminator.
+test "a hashed raw string keeps its own bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fixture = try SourceTestFixture.init(
+        alloc,
+        "raw_text",
+        \\fn raw_text() {
+        \\    let text = r##"a"b#c"##;
+        \\}
+    ,
+        &.{},
+        .{ .prim = .unit },
+    );
+    defer fixture.deinit(alloc);
+
+    const body_id = fixture.tables.bodies_list.items[fixture.function_id].fn_.body;
+    const block = switch (fixture.tables.exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    const let_statement = switch (fixture.tables.stmts_list.items[block.statements[0]].kind) {
+        .let => |statement| statement,
+        else => return error.ExpectedRawStringLet,
+    };
+    const literal = switch (fixture.tables.exprs_list.items[let_statement.init.?].kind) {
+        .literal => |literal| literal,
+        else => return error.ExpectedRawStringLiteral,
+    };
+    try std.testing.expectEqualStrings("a\"b#c", literal.string.bytes);
+}
+
 test "preserve function block while refusing unsupported slice match pattern" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9635,7 +11485,6 @@ test "body type paths accept a leading global separator" {
         else => return error.ExpectedOptionType,
     }
 }
-
 
 test "resolved parent glob exposes body-visible declarations and terminates cycles" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -10347,6 +12196,695 @@ const SourceTestFixture = struct {
     }
 };
 
+/// The `.fn_` entities one function's body declared as block-local items.
+/// Entity ids are dense and assigned in source order, so this order is the
+/// order the `fn` items were written in.
+fn blockLocalFnEntities(
+    fixture: *const SourceTestFixture,
+    out: *std.ArrayListUnmanaged(spine.EntityId),
+) !void {
+    for (fixture.graph_store.symbol_table.entities.items) |ent| {
+        if (ent.kind != .fn_) continue;
+        if (ent.parent != fixture.function_id) continue;
+        try out.append(fixture.graph_store.symbol_table.allocator, ent.id);
+    }
+}
+
+/// The lowered block of a function body, which is never the empty body id a
+/// function entity carries before its body is walked.
+fn fnBodyBlock(tables: *const LookupTestTables, fn_id: spine.EntityId) !exprs.BlockExpr {
+    if (fn_id >= tables.bodies_list.items.len) return error.MissingBodyId;
+    const body_id = tables.bodies_list.items[fn_id].fn_.body;
+    if (body_id == 0 or body_id >= tables.exprs_list.items.len) return error.MissingFunctionBody;
+    return switch (tables.exprs_list.items[body_id].kind) {
+        .block => |block| block,
+        else => error.ExpectedBlockBody,
+    };
+}
+
+/// The callee of an expression that must be a call to a free function.
+fn freeCallTarget(tables: *const LookupTestTables, expr_id: exprs.NodeId) !spine.EntityId {
+    if (expr_id >= tables.exprs_list.items.len) return error.MissingExpressionNode;
+    return switch (tables.exprs_list.items[expr_id].kind) {
+        .call => |call| switch (call.call_kind) {
+            .free => |def| def,
+            else => error.ExpectedFreeCall,
+        },
+        else => error.ExpectedCall,
+    };
+}
+
+/// The integer a block's tail expression must evaluate to.
+fn blockTailInt(tables: *const LookupTestTables, block: exprs.BlockExpr) !i128 {
+    const tail = block.tail orelse return error.ExpectedTailExpression;
+    if (tail >= tables.exprs_list.items.len) return error.MissingExpressionNode;
+    return switch (tables.exprs_list.items[tail].kind) {
+        .literal => |literal| switch (literal) {
+            .int => |int| int.value,
+            else => error.ExpectedIntegerLiteral,
+        },
+        else => error.ExpectedLiteral,
+    };
+}
+
+/// The expression a statement evaluates, or the initializer a `let` binds.
+fn statementExpr(tables: *const LookupTestTables, stmt_id: exprs.NodeId) !exprs.NodeId {
+    if (stmt_id >= tables.stmts_list.items.len) return error.MissingStatement;
+    return switch (tables.stmts_list.items[stmt_id].kind) {
+        .expr => |expr_id| expr_id,
+        .let => |declaration| declaration.init orelse error.MissingInitializer,
+        else => error.ExpectedExpressionStatement,
+    };
+}
+
+/// Resolve a bare name the way a function body in `src` would, so a test can
+/// ask what module-global lookup reaches.
+fn moduleLookupFor(
+    fixture: *SourceTestFixture,
+    src: []const u8,
+    name: []const u8,
+) !?spine.EntityId {
+    var ctx: Ctx = .{
+        .alloc = fixture.graph_store.symbol_table.allocator,
+        .g = &fixture.graph_store,
+        .exprs = &fixture.tables.exprs_list,
+        .stmts = &fixture.tables.stmts_list,
+        .pats = &fixture.tables.pats_list,
+        .types = &fixture.tables.types_list,
+        .bodies_list = &fixture.tables.bodies_list,
+        .src = src,
+        .mod_id = fixture.graph_store.crates.items[0].root,
+    };
+    const ext: Ext = .{ .ctx = &ctx, .fn_id = fixture.function_id };
+    return lookupModuleEntity(&ext, name);
+}
+
+/// The full generic metadata of a declared function body.
+fn fnGenerics(tables: *const LookupTestTables, fn_id: spine.EntityId) !types.Generics {
+    if (fn_id >= tables.bodies_list.items.len) return error.MissingBodyId;
+    return switch (tables.bodies_list.items[fn_id]) {
+        .fn_ => |body| body.generics orelse return error.MissingGenerics,
+        else => error.ExpectedFunctionBody,
+    };
+}
+
+/// The bound whose terminal segment is `terminal`, or null.
+fn findBound(bounds: []const types.Bound, terminal: []const u8) ?types.Bound {
+    for (bounds) |bound| {
+        if (bound.path.segments.len == 0) continue;
+        const last = bound.path.segments[bound.path.segments.len - 1];
+        if (std.mem.eql(u8, last.name, terminal)) return bound;
+    }
+    return null;
+}
+
+test "a block-local fn is declared, callable, and out of module reach" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    fn helper() -> u8 { 7 }
+        \\    helper();
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    var helpers: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer helpers.deinit(alloc);
+    try blockLocalFnEntities(&fixture, &helpers);
+    try std.testing.expectEqual(@as(usize, 1), helpers.items.len);
+    const helper = helpers.items[0];
+
+    // The helper owns a body of its own rather than aliasing the enclosing one.
+    try std.testing.expect((try fnBodyBlock(&fixture.tables, helper)).tail != null);
+
+    // The bare call in the enclosing body resolves to that helper.
+    const outer_body = try fnBodyBlock(&fixture.tables, fixture.function_id);
+    const call_stmt = outer_body.statements[outer_body.statements.len - 1];
+    try std.testing.expectEqual(
+        helper,
+        try freeCallTarget(&fixture.tables, try statementExpr(&fixture.tables, call_stmt)),
+    );
+
+    // Nothing outside the declaring block can name it: it is no module item.
+    try std.testing.expectEqual(@as(?spine.EntityId, null), try moduleLookupFor(&fixture, src, "helper"));
+    try fixture.validate();
+}
+
+test "a block-local fn carries the same bound metadata a module-level fn does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    fn helper<R: ?Sized + Iterator>(value: R) -> R { value }
+        \\    helper(1u8);
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    var helpers: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer helpers.deinit(alloc);
+    try blockLocalFnEntities(&fixture, &helpers);
+    try std.testing.expectEqual(@as(usize, 1), helpers.items.len);
+    const helper = helpers.items[0];
+
+    const generics = try fnGenerics(&fixture.tables, helper);
+    try std.testing.expectEqual(@as(usize, 1), generics.params.len);
+    try std.testing.expectEqual(@as(usize, 0), generics.where_clauses.len);
+    const param = switch (generics.params[0]) {
+        .type_ => |value| value,
+        else => return error.ExpectedTypeParameter,
+    };
+    try std.testing.expectEqualStrings("R", param.name);
+
+    // Both bounds are on record, each against its full `core::` path: the
+    // relaxation `?Sized` and the capability `Iterator`.
+    try std.testing.expectEqual(@as(usize, 2), param.bounds.len);
+    const relaxed = findBound(param.bounds, "Sized") orelse return error.MissingSizedBound;
+    const capability = findBound(param.bounds, "Iterator") orelse return error.MissingIteratorBound;
+    try std.testing.expect(relaxed.optional);
+    try std.testing.expect(!capability.optional);
+    for ([_]types.Bound{ relaxed, capability }) |bound| {
+        try std.testing.expectEqual(@as(usize, 3), bound.path.segments.len);
+        try std.testing.expectEqualStrings("core", bound.path.segments[0].name);
+        for (bound.path.segments) |segment| {
+            // An external trait has no entity of its own; the path is what a
+            // consumer matches, so no segment may claim one.
+            try std.testing.expectEqual(@as(?spine.EntityId, null), segment.id);
+        }
+    }
+
+    const outer_block = try fnBodyBlock(&fixture.tables, fixture.function_id);
+    const call_stmt = outer_block.statements[outer_block.statements.len - 1];
+    try std.testing.expectEqual(
+        helper,
+        try freeCallTarget(&fixture.tables, try statementExpr(&fixture.tables, call_stmt)),
+    );
+    try fixture.validate();
+}
+
+test "an impl Trait on a helper parameter and return keeps its bounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    fn helper(value: impl Iterator) -> impl Iterator { value }
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    var helpers: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer helpers.deinit(alloc);
+    try blockLocalFnEntities(&fixture, &helpers);
+    try std.testing.expectEqual(@as(usize, 1), helpers.items.len);
+    const helper = helpers.items[0];
+
+    const signature = switch (fixture.tables.bodies_list.items[helper]) {
+        .fn_ => |body| body,
+        else => return error.ExpectedFunctionBody,
+    };
+    try std.testing.expectEqual(@as(usize, 1), signature.params.len);
+
+    // `impl Trait` is an opaque type whose declared bounds stay on the
+    // signature, NOT an erased `dyn Trait`. The two wrappers hold the same
+    // rows, so a test that only checked the bounds could not tell them apart —
+    // and reading `impl Trait` as a leaf sent the mapper back through itself
+    // until the stack ran out, which is why this fixture exists at all.
+    for ([_]types.Type{ signature.params[0].ty, signature.ret }) |declared| {
+        const bounds = switch (declared) {
+            .@"opaque" => |opaque_type| opaque_type.bounds,
+            else => return error.ExpectedOpaqueType,
+        };
+        try std.testing.expectEqual(@as(usize, 1), bounds.len);
+        const segments = bounds[0].path.segments;
+        try std.testing.expectEqual(@as(usize, 3), segments.len);
+        try std.testing.expectEqualStrings("core", segments[0].name);
+        try std.testing.expectEqualStrings("Iterator", segments[2].name);
+    }
+
+    // The body still reads the helper's own parameter.
+    var param_def: ?spine.EntityId = null;
+    for (fixture.graph_store.symbol_table.entities.items) |ent| {
+        if (ent.kind != .field or ent.parent != helper) continue;
+        param_def = ent.id;
+    }
+    const param = param_def orelse return error.MissingHelperParameter;
+    const block = try fnBodyBlock(&fixture.tables, helper);
+    const tail = block.tail orelse return error.ExpectedTailExpression;
+    try std.testing.expectEqual(
+        param,
+        switch (fixture.tables.exprs_list.items[tail].kind) {
+            .path => |path_expr| path_expr.def,
+            else => return error.ExpectedPathExpression,
+        },
+    );
+    try fixture.validate();
+}
+
+test "a block-local fn resolves a call written before its declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    let first = helper();
+        \\    fn helper() -> u8 { 3 }
+        \\    helper();
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    var helpers: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer helpers.deinit(alloc);
+    try blockLocalFnEntities(&fixture, &helpers);
+    try std.testing.expectEqual(@as(usize, 1), helpers.items.len);
+    const helper = helpers.items[0];
+
+    const outer_body = try fnBodyBlock(&fixture.tables, fixture.function_id);
+    // Statement order is `let`, then the item, then the trailing call.
+    const pre_declaration = outer_body.statements[0];
+    const post_declaration = outer_body.statements[outer_body.statements.len - 1];
+    try std.testing.expectEqual(
+        helper,
+        try freeCallTarget(&fixture.tables, try statementExpr(&fixture.tables, pre_declaration)),
+    );
+    try std.testing.expectEqual(
+        helper,
+        try freeCallTarget(&fixture.tables, try statementExpr(&fixture.tables, post_declaration)),
+    );
+    try fixture.validate();
+}
+
+test "same-named helpers in sibling blocks each resolve to their own item" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    {
+        \\        fn helper() -> u8 { 1 }
+        \\        helper();
+        \\    }
+        \\    fn helper() -> u8 { 2 }
+        \\    helper();
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    var helpers: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer helpers.deinit(alloc);
+    try blockLocalFnEntities(&fixture, &helpers);
+    try std.testing.expectEqual(@as(usize, 2), helpers.items.len);
+    // The enclosing block pre-declares its own item before the walk descends
+    // into the inner block, so the outer helper takes the lower id.
+    const outer_helper = helpers.items[0];
+    const inner_helper = helpers.items[1];
+    try std.testing.expect(inner_helper != outer_helper);
+
+    const outer_body = try fnBodyBlock(&fixture.tables, fixture.function_id);
+    // The inner block is statement 0; the outer call is the last statement.
+    const inner_block_stmt = outer_body.statements[0];
+    const inner_block_id = try statementExpr(&fixture.tables, inner_block_stmt);
+    const inner_body = switch (fixture.tables.exprs_list.items[inner_block_id].kind) {
+        .block => |block| block,
+        else => return error.ExpectedBlockBody,
+    };
+    const inner_call = inner_body.statements[inner_body.statements.len - 1];
+    const outer_call = outer_body.statements[outer_body.statements.len - 1];
+    try std.testing.expectEqual(
+        inner_helper,
+        try freeCallTarget(&fixture.tables, try statementExpr(&fixture.tables, inner_call)),
+    );
+    try std.testing.expectEqual(
+        outer_helper,
+        try freeCallTarget(&fixture.tables, try statementExpr(&fixture.tables, outer_call)),
+    );
+
+    // Sharing a source name does not make them interchangeable: the inner call
+    // reaches the helper written inside the inner block.
+    try std.testing.expectEqual(
+        @as(i128, 1),
+        try blockTailInt(&fixture.tables, try fnBodyBlock(&fixture.tables, inner_helper)),
+    );
+    try std.testing.expectEqual(
+        @as(i128, 2),
+        try blockTailInt(&fixture.tables, try fnBodyBlock(&fixture.tables, outer_helper)),
+    );
+    try fixture.validate();
+}
+
+test "a helper body sees the items declared beside it in the same block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    fn helper() -> u8 { sibling() }
+        \\    fn sibling() -> u8 { 9 }
+        \\    helper();
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    var helpers: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer helpers.deinit(alloc);
+    try blockLocalFnEntities(&fixture, &helpers);
+    try std.testing.expectEqual(@as(usize, 2), helpers.items.len);
+    const helper = helpers.items[0];
+    const sibling = helpers.items[1];
+
+    const helper_body = try fnBodyBlock(&fixture.tables, helper);
+    try std.testing.expectEqual(
+        sibling,
+        try freeCallTarget(&fixture.tables, helper_body.tail.?),
+    );
+    try fixture.validate();
+}
+
+test "a generic block-local helper keeps its own type parameter and body scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    fn identity<T>(value: T) -> T { value }
+        \\    identity(1u8);
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    var helpers: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer helpers.deinit(alloc);
+    try blockLocalFnEntities(&fixture, &helpers);
+    try std.testing.expectEqual(@as(usize, 1), helpers.items.len);
+    const helper = helpers.items[0];
+
+    // `T` is the helper's OWN parameter, so its return type names it without a
+    // resolved entity — no enclosing function contributes one.
+    const helper_body = switch (fixture.tables.bodies_list.items[helper]) {
+        .fn_ => |body| body,
+        else => return error.ExpectedFunctionBody,
+    };
+    try std.testing.expectEqual(@as(usize, 1), helper_body.generic_params.len);
+    try std.testing.expectEqualStrings("T", helper_body.generic_params[0]);
+    const ret_path = switch (helper_body.ret) {
+        .path => |path| path,
+        else => return error.ExpectedTypeParameterReturn,
+    };
+    try std.testing.expectEqual(@as(usize, 1), ret_path.segments.len);
+    try std.testing.expectEqualStrings("T", ret_path.segments[0].name);
+
+    // The body reads the helper's own parameter, not a binding of the caller.
+    var param_def: ?spine.EntityId = null;
+    for (fixture.graph_store.symbol_table.entities.items) |ent| {
+        if (ent.kind != .field or ent.parent != helper) continue;
+        param_def = ent.id;
+    }
+    const param = param_def orelse return error.MissingHelperParameter;
+    const block = try fnBodyBlock(&fixture.tables, helper);
+    const tail = block.tail orelse return error.ExpectedTailExpression;
+    try std.testing.expectEqual(
+        param,
+        switch (fixture.tables.exprs_list.items[tail].kind) {
+            .path => |path_expr| path_expr.def,
+            else => return error.ExpectedPathExpression,
+        },
+    );
+
+    const outer_block = try fnBodyBlock(&fixture.tables, fixture.function_id);
+    const call_stmt = outer_block.statements[outer_block.statements.len - 1];
+    try std.testing.expectEqual(
+        helper,
+        try freeCallTarget(&fixture.tables, try statementExpr(&fixture.tables, call_stmt)),
+    );
+    try fixture.validate();
+}
+
+test "a variant of a standard-library enum keeps the enum that owns it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    let kind = std::io::ErrorKind::UnexpectedEof;
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    const outer_body = try fnBodyBlock(&fixture.tables, fixture.function_id);
+    const let_stmt = outer_body.statements[0];
+    const init = switch (fixture.tables.stmts_list.items[let_stmt].kind) {
+        .let => |declaration| declaration.init orelse return error.MissingInitializer,
+        else => return error.ExpectedLetStatement,
+    };
+
+    // The path names a variant OF AN ENUM, so the enum is what the node carries.
+    // Lowering it to a bare name would lose which representation to pick.
+    const variant = switch (fixture.tables.exprs_list.items[init].kind) {
+        .enum_variant => |value| value,
+        else => return error.ExpectedEnumVariant,
+    };
+    try std.testing.expectEqualStrings("UnexpectedEof", variant.variant);
+
+    const enum_entity = fixture.graph_store.symbol_table.get(variant.def) orelse
+        return error.MissingEntityId;
+    try std.testing.expectEqual(spine.EntityKind.enum_, enum_entity.kind);
+    try std.testing.expectEqualStrings("ErrorKind", enum_entity.name);
+
+    // It hangs off the external module chain `std` -> `io`, built through the
+    // same `ensureExternalModule` the prelude enums use.
+    const io_module = enum_entity.parent orelse return error.MissingParentId;
+    const io_entity = fixture.graph_store.symbol_table.get(io_module) orelse
+        return error.MissingEntityId;
+    try std.testing.expectEqual(spine.EntityKind.module, io_entity.kind);
+    try std.testing.expectEqualStrings("io", io_entity.name);
+    const std_module = io_entity.parent orelse return error.MissingParentId;
+    const std_entity = fixture.graph_store.symbol_table.get(std_module) orelse
+        return error.MissingEntityId;
+    try std.testing.expectEqual(spine.EntityKind.module, std_entity.kind);
+    try std.testing.expectEqualStrings("std", std_entity.name);
+
+    // The enum keeps its declared shape, so the variant is not minted on the fly.
+    const enum_body = switch (fixture.tables.bodies_list.items[variant.def]) {
+        .enum_ => |value| value,
+        else => return error.ExpectedEnumBody,
+    };
+    var found = false;
+    for (enum_body.variants) |declared| {
+        if (std.mem.eql(u8, declared.name, "UnexpectedEof")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+    try fixture.validate();
+}
+
+test "a known external associated function is admitted with its declared signature" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn outer() {
+        \\    let cursor = std::io::Cursor::new([0u8; 1]);
+        \\}
+    ;
+
+    var fixture = try SourceTestFixture.init(alloc, "outer", src, &.{}, .{ .prim = .unit });
+    defer fixture.deinit(alloc);
+
+    const outer_body = try fnBodyBlock(&fixture.tables, fixture.function_id);
+    const let_stmt = outer_body.statements[0];
+    const init = switch (fixture.tables.stmts_list.items[let_stmt].kind) {
+        .let => |declaration| declaration.init orelse return error.MissingInitializer,
+        else => return error.ExpectedLetStatement,
+    };
+    const call = switch (fixture.tables.exprs_list.items[init].kind) {
+        .call => |value| value,
+        else => return error.ExpectedCall,
+    };
+    const fn_id = switch (call.call_kind) {
+        .associated => |def| def,
+        else => return error.ExpectedAssociatedCall,
+    };
+    try std.testing.expectEqual(@as(usize, 1), call.args.len);
+
+    // The entity hangs off the external `std` -> `io` chain and carries the
+    // associated function's own name, which together are the identity the
+    // backend matches. Nothing here claims the crate declared this function.
+    const fn_entity = fixture.graph_store.symbol_table.get(fn_id) orelse
+        return error.MissingEntityId;
+    try std.testing.expectEqual(spine.EntityKind.fn_, fn_entity.kind);
+    try std.testing.expectEqualStrings("new", fn_entity.name);
+    const io_id = fn_entity.parent orelse return error.MissingParentId;
+    const io_entity = fixture.graph_store.symbol_table.get(io_id) orelse
+        return error.MissingEntityId;
+    try std.testing.expectEqualStrings("io", io_entity.name);
+    const std_id = io_entity.parent orelse return error.MissingParentId;
+    const std_entity = fixture.graph_store.symbol_table.get(std_id) orelse
+        return error.MissingEntityId;
+    try std.testing.expectEqualStrings("std", std_entity.name);
+
+    // The signature is the one the standard library declares —
+    // `pub const fn new(inner: T) -> Cursor<T>` — and it is the part a
+    // fabricated one would have got wrong: the backend checks arity against
+    // `params` and reads the declared return when inferring the call.
+    const fn_body = switch (fixture.tables.bodies_list.items[fn_id]) {
+        .fn_ => |value| value,
+        else => return error.ExpectedFunctionBody,
+    };
+    try std.testing.expectEqual(@as(usize, 1), fn_body.params.len);
+    try std.testing.expectEqualStrings("inner", fn_body.params[0].name);
+    const inner_ty = switch (fn_body.params[0].ty) {
+        .path => |value| value,
+        else => return error.ExpectedTypeParameter,
+    };
+    try std.testing.expectEqual(@as(usize, 1), inner_ty.segments.len);
+    try std.testing.expectEqualStrings("T", inner_ty.segments[0].name);
+    try std.testing.expectEqual(@as(?spine.EntityId, null), inner_ty.segments[0].id);
+
+    // The return is `Cursor<T>`, which is the external nominal with one
+    // argument — the same shape `lowerType` already maps to the runtime
+    // cursor, so nothing new is needed to read it.
+    const ret = switch (fn_body.ret) {
+        .external_nominal => |value| value,
+        else => return error.ExpectedExternalNominal,
+    };
+    try std.testing.expectEqual(@as(usize, 3), ret.path.len);
+    try std.testing.expectEqualStrings("std", ret.path[0]);
+    try std.testing.expectEqualStrings("io", ret.path[1]);
+    try std.testing.expectEqualStrings("Cursor", ret.path[2]);
+    try std.testing.expectEqual(@as(usize, 1), ret.args.len);
+    const ret_arg = switch (ret.args[0]) {
+        .path => |value| value,
+        else => return error.ExpectedTypeParameter,
+    };
+    try std.testing.expectEqualStrings("T", ret_arg.segments[0].name);
+
+    // And `T` is the function's own type parameter, declared as such.
+    try std.testing.expectEqual(@as(usize, 1), fn_body.generic_params.len);
+    try std.testing.expectEqualStrings("T", fn_body.generic_params[0]);
+    const generics = fn_body.generics orelse return error.MissingGenerics;
+    try std.testing.expectEqual(@as(usize, 1), generics.params.len);
+
+    try fixture.validate();
+}
+
+test "parentheses group a type while a trailing comma makes a one-element tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\fn declares(pair: (u8,), grouped: (u8), erased: &(dyn std::error::Error + 'static)) {}
+    ;
+
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+    const root_id = try addLookupTestEntity(alloc, &g, .module, "", null, null);
+    const fn_id = try addLookupTestEntity(alloc, &g, .fn_, "declares", root_id, null);
+    try addLookupTestModule(alloc, &g, "", null, true, &.{fn_id});
+    try g.addCrate(.{
+        .name = try alloc.dupe(u8, "paren-test"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_id,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    try appendLookupTestBodies(alloc, &g, &tables.bodies_list);
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src = src,
+        .mod_id = root_id,
+    };
+    var ext: Ext = .{ .ctx = &ctx, .fn_id = fn_id };
+    defer ext.deinit();
+
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(rust.language());
+    const tree = parser.parseString(src, null) orelse return error.ParseFailed;
+    defer tree.destroy();
+    const fn_node = tree.rootNode().namedChild(0) orelse return error.MissingFunction;
+    var params_node: ?ts.Node = null;
+    var child_index: u32 = 0;
+    while (fn_node.namedChild(child_index)) |child| : (child_index += 1) {
+        if (std.mem.eql(u8, child.kind(), "parameters")) params_node = child;
+    }
+    const pn = params_node orelse return error.MissingParameters;
+
+    var mapped: [3]types.Type = undefined;
+    var count: usize = 0;
+    var i: u32 = 0;
+    while (pn.namedChild(i)) |parameter| : (i += 1) {
+        if (count == mapped.len) return error.UnexpectedParameter;
+        var type_node: ?ts.Node = null;
+        var k: u32 = 0;
+        while (parameter.namedChild(k)) |child| : (k += 1) {
+            if (isParameterTypeNodeKind(child.kind())) {
+                type_node = child;
+                break;
+            }
+        }
+        mapped[count] = try mapCstType(&ext, type_node orelse return error.MissingParameterType);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    // The comma is what makes a tuple: `(u8,)` keeps it, `(u8)` only groups.
+    const pair = switch (mapped[0]) {
+        .tuple => |members| members,
+        else => return error.ExpectedTupleType,
+    };
+    try std.testing.expectEqual(@as(usize, 1), pair.len);
+    try std.testing.expectEqual(types.Prim.u8, pair[0].prim);
+    try std.testing.expectEqual(types.Prim.u8, mapped[1].prim);
+
+    // A borrow of a parenthesized trait object is a borrow of the trait
+    // object, not of a one-element tuple wrapping it.
+    const erased = switch (mapped[2]) {
+        .reference => |reference| reference.pointee,
+        else => return error.ExpectedReferenceType,
+    };
+    const bounds = switch (erased) {
+        .dyn_trait => |declared| declared,
+        else => return error.ExpectedDynTraitType,
+    };
+    try std.testing.expectEqual(@as(usize, 1), bounds.len);
+    try std.testing.expectEqual(@as(usize, 3), bounds[0].path.segments.len);
+    try std.testing.expectEqualStrings("std", bounds[0].path.segments[0].name);
+    try std.testing.expectEqualStrings("Error", bounds[0].path.segments[2].name);
+}
+
 test "Wyhash open-ended byte slice validates without dropping its start" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -10543,10 +13081,23 @@ fn addExternalUseTestAlias(
     path: []const []const u8,
 ) !spine.EntityId {
     const use_id = try addLookupTestEntity(alloc, g, .use_, source_text, parent, null);
+    // CrateGraph owns both the path array and each segment.
+    const owned_path = try alloc.alloc([]const u8, path.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned_path[0..copied]) |segment| alloc.free(segment);
+        alloc.free(owned_path);
+    }
+    for (path) |segment| {
+        owned_path[copied] = try alloc.dupe(u8, segment);
+        copied += 1;
+    }
+    const owned_name = try alloc.dupe(u8, local_name);
+    errdefer alloc.free(owned_name);
     try g.addUse(.{
         .id = use_id,
-        .kind = .{ .external = .{ .path = try alloc.dupe([]const u8, path) } },
-        .local_name = try alloc.dupe(u8, local_name),
+        .kind = .{ .external = .{ .path = owned_path } },
+        .local_name = owned_name,
         .is_pub_export = false,
         .target = 0,
         .span = span_of,
@@ -10754,4 +13305,89 @@ test "a type argument placeholder lowers to the inference placeholder" {
     try std.testing.expectEqual(@as(usize, 1), placeholder.path.len);
     try std.testing.expectEqualStrings("_", placeholder.path[0]);
     try std.testing.expectEqual(@as(usize, 0), placeholder.args.len);
+}
+
+test "a source label names its loop and its exits and never becomes an operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+
+    const root_id = try addLookupTestEntity(alloc, &g, .module, "", null, null);
+    const fn_id = try addLookupTestEntity(alloc, &g, .fn_, "labelled", root_id, null);
+    const root_items = try alloc.dupe(spine.EntityId, &.{fn_id});
+    try addLookupTestModule(alloc, &g, "", null, true, root_items);
+
+    var tables: LookupTestTables = .{};
+    defer tables.deinit(alloc);
+    try appendLookupTestBodies(alloc, &g, &tables.bodies_list);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &tables.exprs_list,
+        .stmts = &tables.stmts_list,
+        .pats = &tables.pats_list,
+        .types = &tables.types_list,
+        .bodies_list = &tables.bodies_list,
+        .src =
+        \\fn labelled() -> u32 {
+        \\    'outer: loop {
+        \\        loop {
+        \\            continue 'outer;
+        \\            break 'outer 7;
+        \\        }
+        \\        break;
+        \\    }
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    var labelled_loops: usize = 0;
+    var plain_loops: usize = 0;
+    var labelled_continues: usize = 0;
+    var labelled_breaks: usize = 0;
+    var bare_breaks: usize = 0;
+    for (tables.exprs_list.items) |expression| {
+        switch (expression.kind) {
+            .loop_ => |loop_expr| {
+                if (loop_expr.body.labelled) |label| {
+                    try std.testing.expectEqualStrings("outer", label);
+                    labelled_loops += 1;
+                } else {
+                    plain_loops += 1;
+                }
+            },
+            .continue_ => |cont| {
+                const label = cont.label orelse return error.UnlabelledContinue;
+                try std.testing.expectEqualStrings("outer", label);
+                labelled_continues += 1;
+            },
+            .break_ => |brk| {
+                if (brk.label) |label| {
+                    try std.testing.expectEqualStrings("outer", label);
+                    // `break 'outer 7` hands the loop its value. A label on
+                    // its own never invents one, so the bare `break` below
+                    // stays valueless.
+                    if (brk.value == null) return error.LabelledBreakLostValue;
+                    labelled_breaks += 1;
+                } else {
+                    if (brk.value != null) return error.BareBreakGainedValue;
+                    bare_breaks += 1;
+                }
+            },
+            .unsupported => |marker| {
+                std.debug.print("unlowered node: {s}\n", .{marker.reason});
+                return error.LabelLoweredAsOperand;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), labelled_loops);
+    try std.testing.expectEqual(@as(usize, 1), plain_loops);
+    try std.testing.expectEqual(@as(usize, 1), labelled_continues);
+    try std.testing.expectEqual(@as(usize, 1), labelled_breaks);
+    try std.testing.expectEqual(@as(usize, 1), bare_breaks);
 }

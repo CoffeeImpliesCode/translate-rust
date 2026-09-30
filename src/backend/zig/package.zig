@@ -61,6 +61,43 @@ fn zonIdentName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return out;
 }
 
+/// The compiler's package name is a fixed-width enum, so `build.zig.zon`
+/// refuses any `.name` past this many bytes before the package is configured
+/// at all. A legal Rust crate name can be longer, so the writer has to shorten
+/// it rather than emit a manifest that cannot be read.
+const zon_name_max_len = 32;
+
+/// Hex digits of Wyhash appended to a shortened package name. They, the `_`
+/// that separates them from the prefix, and the prefix itself split the same
+/// 32-byte budget, so the `{x:0>8}` in `zonPackageName` and this width are one
+/// number written twice.
+const zon_hash_len = 8;
+
+/// Sanitize a crate name into a package name the compiler will accept.
+///
+/// Sanitization alone is not enough: `zonIdentName` maps one byte to one byte,
+/// so a 33-byte crate name still yields a 33-byte name. Cutting on length
+/// alone would map two crates that share a prefix onto one package identity,
+/// which is worse than the original failure — the second crate to reach the
+/// package cache would silently overwrite the first. The dropped tail is
+/// therefore replaced by a hash of the *whole* sanitized name, the byte string
+/// actually being shortened. The hash is a pure function of that input
+/// because the manifest is regenerated on every promotion and compared byte
+/// for byte against golden text.
+fn zonPackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const sanitized = try zonIdentName(allocator, name);
+    defer allocator.free(sanitized);
+    if (sanitized.len <= zon_name_max_len) return allocator.dupe(u8, sanitized);
+    // Wyhash returns 64 bits and `{x:0>8}` is a minimum width, so the full
+    // value can render as 16 digits and overrun the buffer. The low half is
+    // as well mixed as the whole after Wyhash's final avalanche.
+    const hash: u32 = @truncate(std.hash.Wyhash.hash(0, sanitized));
+    var out: [zon_name_max_len]u8 = undefined;
+    const prefix = sanitized[0 .. zon_name_max_len - zon_hash_len - 1];
+    const text = try std.fmt.bufPrint(&out, "{s}_{x:0>8}", .{ prefix, hash });
+    return allocator.dupe(u8, text);
+}
+
 // ---------------------------------------------------------------------------
 // build.zig / build.zig.zon generation
 // ---------------------------------------------------------------------------
@@ -203,32 +240,29 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
     );
 }
 
+/// Find the workspace `r2z-core` checkout by walking `anchor` and its parents.
+///
+/// `@src().file` cannot drive this walk. The compiler spells it relative to
+/// the directory it was invoked in, which is this module's root, not the
+/// process working directory or the executable: joining a runtime anchor to
+/// that relative path lands in a different tree, and the three-level climb
+/// that repairs an absolute path then overshoots by one. The anchor is the
+/// only runtime fact available here, so the search looks for `r2z-core`
+/// itself at each level instead.
 fn tryWorkspaceCoreFromAnchor(
     allocator: std.mem.Allocator,
     io: std.Io,
-    source_file: []const u8,
     anchor: []const u8,
 ) !?[:0]u8 {
     var cursor = try allocator.dupe(u8, anchor);
     defer allocator.free(cursor);
-    var cwd = std.Io.Dir.cwd();
+    const cwd = std.Io.Dir.cwd();
     while (true) {
-        const source_path = std.fs.path.resolvePosix(allocator, &.{ cursor, source_file }) catch {
-            return error.DependencySourceUnavailable;
-        };
-        const package_dir = std.fs.path.dirname(source_path) orelse {
-            allocator.free(source_path);
-            return null;
-        };
         const core_path = std.fs.path.resolvePosix(
             allocator,
-            &.{ package_dir, "../../..", "r2z-core" },
-        ) catch {
-            allocator.free(source_path);
-            return error.DependencySourceUnavailable;
-        };
-        allocator.free(source_path);
-        if (cwd.access(io, core_path, .{})) |_| {
+            &.{ cursor, "r2z-core" },
+        ) catch return error.DependencySourceUnavailable;
+        if (std.Io.Dir.accessAbsolute(io, core_path, .{})) |_| {
             const result = cwd.realPathFileAlloc(io, core_path, allocator) catch {
                 allocator.free(core_path);
                 return error.DependencySourceUnavailable;
@@ -270,14 +304,14 @@ fn workspaceCoreAbsolute(allocator: std.mem.Allocator, io: std.Io) ![:0]u8 {
     const cwd_anchor = std.process.currentPathAlloc(io, allocator) catch
         return error.DependencySourceUnavailable;
     defer allocator.free(cwd_anchor);
-    if (try tryWorkspaceCoreFromAnchor(allocator, io, source_file, cwd_anchor)) |path| {
+    if (try tryWorkspaceCoreFromAnchor(allocator, io, cwd_anchor)) |path| {
         return path;
     }
 
     const exe_anchor = std.process.executableDirPathAlloc(io, allocator) catch
         return error.DependencySourceUnavailable;
     defer allocator.free(exe_anchor);
-    if (try tryWorkspaceCoreFromAnchor(allocator, io, source_file, exe_anchor)) |path| {
+    if (try tryWorkspaceCoreFromAnchor(allocator, io, exe_anchor)) |path| {
         return path;
     }
     return error.DependencySourceUnavailable;
@@ -318,7 +352,7 @@ fn generateBuildZigZon(
     out_dir: []const u8,
 ) ![]const u8 {
     try validatePackageShape(pkg);
-    const zon_name = try zonIdentName(allocator, packageIdName(pkg));
+    const zon_name = try zonPackageName(allocator, packageIdName(pkg));
     defer allocator.free(zon_name);
 
     // Common single-package manifest (no dependencies).
@@ -520,11 +554,19 @@ pub const ResolveFingerprint = *const fn (
     result: *const BuildTestResult,
 ) anyerror!?u64;
 
+/// Sink for the output of a staged build that did not pass. Split out of
+/// `promoteWithHooks` so a test can read the diagnostics a user sees.
+pub const ReportBuildFailure = *const fn (
+    context: ?*anyopaque,
+    result: *const BuildTestResult,
+) void;
+
 pub const PromotionHooks = struct {
     context: ?*anyopaque = null,
     fill_nonce: FillPromotionNonce = fillPromotionNonce,
     run_build_test: RunBuildTest = runGeneratedBuildTest,
     resolve_fingerprint: ResolveFingerprint = resolveFingerprint,
+    report_build_failure: ReportBuildFailure = printBuildFailure,
 };
 
 /// Return a unique sibling path for the package staging directory.
@@ -729,7 +771,7 @@ fn runGeneratedBuildTest(
     _: ?*anyopaque,
     staging_dir: []const u8,
 ) anyerror!BuildTestResult {
-    var context = GeneratedGateContext{
+    var context: GeneratedGateContext = .{
         .io = io,
         .staging_dir = staging_dir,
     };
@@ -825,6 +867,30 @@ fn releaseBuildTestResult(allocator: std.mem.Allocator, result: BuildTestResult)
     allocator.free(result.stderr);
 }
 
+/// Report a staged build that did not pass. The compiler's own output is the
+/// only diagnostic a promotion failure carries, and it is reported on every
+/// failing pass: the retry pass always did, the first pass dropped it, so a
+/// one-pass compile error surfaced as a bare error with no message at all.
+fn printBuildFailure(_: ?*anyopaque, result: *const BuildTestResult) void {
+    var reported = false;
+    if (hasCapturedOutput(result.stdout)) {
+        std.debug.print("generated package build failed (stdout):\n{s}\n", .{result.stdout});
+        reported = true;
+    }
+    if (hasCapturedOutput(result.stderr)) {
+        std.debug.print("generated package build failed:\n{s}\n", .{result.stderr});
+        reported = true;
+    }
+    if (!reported) {
+        std.debug.print("generated package build failed: no compiler output captured\n", .{});
+    }
+}
+
+/// True when a captured stream carries anything but whitespace.
+fn hasCapturedOutput(bytes: []const u8) bool {
+    return std.mem.trim(u8, bytes, " \t\r\n").len != 0;
+}
+
 fn cleanupPromotion(
     io: std.Io,
     staging_dir: []const u8,
@@ -879,6 +945,7 @@ pub fn promoteWithHooks(
                 if (code == 0) break;
             },
             else => {
+                hooks.report_build_failure(hooks.context, &build_result);
                 releaseBuildTestResult(allocator, build_result);
                 return cleanupPromotion(
                     io,
@@ -888,7 +955,7 @@ pub fn promoteWithHooks(
             },
         }
         if (fingerprint_patched) {
-            std.debug.print("generated package build failed:\n{s}\n", .{build_result.stderr});
+            hooks.report_build_failure(hooks.context, &build_result);
             releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(
                 io,
@@ -904,12 +971,16 @@ pub fn promoteWithHooks(
             staging_dir,
             &build_result,
         ) catch |err| {
+            hooks.report_build_failure(hooks.context, &build_result);
             releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(io, staging_dir, err);
         };
-        releaseBuildTestResult(allocator, build_result);
-        const resolved_fingerprint = fingerprint orelse
+        const resolved_fingerprint = fingerprint orelse {
+            hooks.report_build_failure(hooks.context, &build_result);
+            releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(io, staging_dir, error.GeneratedPackageBuildFailed);
+        };
+        releaseBuildTestResult(allocator, build_result);
         patchManifestFingerprint(
             allocator,
             io,
@@ -1352,6 +1423,111 @@ test "generateBuildZigZon: allows a missing absolute output directory" {
     );
 }
 
+/// Render the manifest for a package called `name` and hand back the `.name`
+/// enum literal the writer emitted, copied out so the caller owns the buffer.
+fn zonNameLineFor(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    // The writer validates the package shape it is handed, so the fixture
+    // needs a real root file even though only its name is under test.
+    const marker_decl: ast.Decl = .{ .const_decl = .{
+        .name = "MARKER",
+        .init = ast.Expr{ .lit = .{ .int = 1 } },
+    } };
+    const pkg: ast.Package = .{
+        .name = name,
+        .version = "1.2.3",
+        .fingerprint = 0xabcd,
+        .files = &.{.{
+            .path = "src/root.zig",
+            .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+            .decls = &.{marker_decl},
+        }},
+    };
+    const zon = try generateBuildZigZon(allocator, std.testing.io, &pkg, ".");
+    defer allocator.free(zon);
+    const marker = "    .name = .";
+    const start = std.mem.indexOf(u8, zon, marker) orelse
+        return error.InvalidGeneratedManifest;
+    const rest = zon[start + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse
+        return error.InvalidGeneratedManifest;
+    return allocator.dupe(u8, std.mem.trimEnd(u8, rest[0..end], ","));
+}
+
+test "generateBuildZigZon: a name that exactly fills the package name budget is emitted verbatim" {
+    const allocator = std.testing.allocator;
+    // 32 bytes is the whole of the compiler's package name enum. A name that
+    // fits has no tail to trade away, so shortening it here would rename a
+    // package that already builds under the name its consumer expects.
+    const name = "r4_control_guard_labeled_continu";
+    try std.testing.expectEqual(zon_name_max_len, name.len);
+
+    const emitted = try zonNameLineFor(allocator, name);
+    defer allocator.free(emitted);
+    try std.testing.expectEqualStrings(name, emitted);
+}
+
+test "generateBuildZigZon: a name past the package name budget is shortened to a readable prefix" {
+    const allocator = std.testing.allocator;
+    // The unrepaired writer emitted this 33-byte name verbatim and produced a
+    // package that could not even be configured, so a legal Rust crate name
+    // translated to nothing at all.
+    const emitted = try zonNameLineFor(allocator, "r4_control_guard_labeled_continue");
+    defer allocator.free(emitted);
+
+    // The budget is filled exactly. One byte over is what the compiler
+    // rejects; the room left is what pays for the discriminator.
+    try std.testing.expectEqual(@as(usize, 32), emitted.len);
+    // Only the tail changes: the readable head of the crate name is still
+    // there, and what replaces the dropped tail is the discriminator.
+    const prefix_len = zon_name_max_len - zon_hash_len - 1;
+    try std.testing.expectEqualStrings(
+        "r4_control_guard_labeled_continue"[0..prefix_len],
+        emitted[0..prefix_len],
+    );
+    try std.testing.expectEqual(
+        @as(u8, '_'),
+        emitted[emitted.len - zon_hash_len - 1],
+    );
+}
+
+test "generateBuildZigZon: two long names sharing a prefix stay distinct packages" {
+    const allocator = std.testing.allocator;
+    // Cutting on length alone would give both crates one identity, and the
+    // second to reach the package cache would overwrite the first build.
+    const first_name = "r4_control_guard_labeled_continue";
+    const second_name = "r4_control_guard_labeled_continue2";
+
+    // The two crate names agree on every byte the 32-byte budget can hold, so
+    // the discriminator is the only thing that can keep them apart.
+    try std.testing.expectEqualStrings(
+        "r4_control_guard_labeled_continu",
+        first_name[0..zon_name_max_len],
+    );
+    try std.testing.expectEqualStrings(
+        first_name[0..zon_name_max_len],
+        second_name[0..zon_name_max_len],
+    );
+
+    const first = try zonNameLineFor(allocator, first_name);
+    defer allocator.free(first);
+    const second = try zonNameLineFor(allocator, second_name);
+    defer allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "generateBuildZigZon: shortening one long name twice is byte-identical" {
+    const allocator = std.testing.allocator;
+    // Promotion rewrites the manifest on every run and golden files compare it
+    // verbatim, so the discriminator may not drift between invocations.
+    const first = try zonNameLineFor(allocator, "r4_control_guard_labeled_continue");
+    defer allocator.free(first);
+    const second = try zonNameLineFor(allocator, "r4_control_guard_labeled_continue");
+    defer allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expectEqual(@as(usize, 32), first.len);
+}
+
 fn expectWriteValidationError(expected: anyerror, pkg: *const ast.Package) !void {
     const allocator = std.testing.allocator;
     const test_io = std.testing.io;
@@ -1465,10 +1641,14 @@ test "writeToDisk: rejects dependency names that collide after ZON sanitization"
 
 const PromotionTestMode = enum {
     compile_failure,
+    compile_failure_on_stdout,
     fingerprint_then_success,
+    fingerprint_then_failure,
     resolver_failure,
     success_without_fingerprint,
 };
+
+const reported_output_capacity = 256;
 
 const PromotionTestContext = struct {
     final_path: []const u8,
@@ -1477,6 +1657,11 @@ const PromotionTestContext = struct {
     resolver_calls: u32 = 0,
     resolver_saw_missing_fingerprint: bool = false,
     destination_visible_during_build: bool = false,
+    report_calls: u32 = 0,
+    reported_stdout: [reported_output_capacity]u8 = undefined,
+    reported_stdout_len: usize = 0,
+    reported_stderr: [reported_output_capacity]u8 = undefined,
+    reported_stderr_len: usize = 0,
 };
 
 fn fixedPromotionNonce(
@@ -1505,18 +1690,28 @@ fn fakePromotionBuildTest(
     context.build_calls += 1;
     const stderr = switch (context.mode) {
         .compile_failure => "generated source does not compile",
+        .compile_failure_on_stdout => "",
         .fingerprint_then_success, .resolver_failure => if (context.build_calls == 1)
             "fingerprint: 0x81677af28f9d3b4e"
         else
             "",
+        .fingerprint_then_failure => if (context.build_calls == 1)
+            "fingerprint: 0x81677af28f9d3b4e"
+        else
+            "optimized build still rejects the generated source",
         .success_without_fingerprint => "",
     };
+    const stdout_text = switch (context.mode) {
+        .compile_failure_on_stdout => "error: use of undeclared identifier 'undefined_value'",
+        else => "",
+    };
     const exit_code: u8 = switch (context.mode) {
-        .compile_failure, .resolver_failure => 1,
+        .compile_failure, .compile_failure_on_stdout, .resolver_failure => 1,
         .fingerprint_then_success => if (context.build_calls == 1) 1 else 0,
+        .fingerprint_then_failure => 1,
         .success_without_fingerprint => 0,
     };
-    const stdout = try allocator.dupe(u8, "");
+    const stdout = try allocator.dupe(u8, stdout_text);
     errdefer allocator.free(stdout);
     const stderr_copy = try allocator.dupe(u8, stderr);
     return .{
@@ -1544,11 +1739,29 @@ fn fakePromotionFingerprint(
         std.mem.indexOf(u8, zon, ".fingerprint") == null;
 
     return switch (context.mode) {
-        .compile_failure => null,
-        .fingerprint_then_success => 0x81677af28f9d3b4e,
+        .compile_failure, .compile_failure_on_stdout => null,
+        .fingerprint_then_success, .fingerprint_then_failure => 0x81677af28f9d3b4e,
         .resolver_failure => error.FingerprintResolverFailed,
         .success_without_fingerprint => null,
     };
+}
+
+fn copyReportedOutput(destination: []u8, source: []const u8) usize {
+    const kept = @min(destination.len, source.len);
+    @memcpy(destination[0..kept], source[0..kept]);
+    return kept;
+}
+
+/// Stand in for `printBuildFailure`, which writes to the process stderr a
+/// test cannot read back.
+fn recordBuildFailure(
+    opaque_context: ?*anyopaque,
+    result: *const BuildTestResult,
+) void {
+    const context: *PromotionTestContext = @ptrCast(@alignCast(opaque_context.?));
+    context.report_calls += 1;
+    context.reported_stdout_len = copyReportedOutput(&context.reported_stdout, result.stdout);
+    context.reported_stderr_len = copyReportedOutput(&context.reported_stderr, result.stderr);
 }
 
 const GateModeTestContext = struct {
@@ -1579,7 +1792,7 @@ fn fakeGateModeBuild(
 test "promotion gate compiles the staged package in Debug and ReleaseSafe" {
     const allocator = std.testing.allocator;
     const test_io = std.testing.io;
-    var context = GateModeTestContext{ .allocator = allocator };
+    var context: GateModeTestContext = .{ .allocator = allocator };
     defer context.flags.deinit(allocator);
 
     const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
@@ -1603,7 +1816,7 @@ test "promotion gate compiles the staged package in Debug and ReleaseSafe" {
 test "promotion gate returns the first failing mode output without running later modes" {
     const allocator = std.testing.allocator;
     const test_io = std.testing.io;
-    var context = GateModeTestContext{
+    var context: GateModeTestContext = .{
         .allocator = allocator,
         .fail_flag = "-Doptimize=Debug",
         .fail_stderr = "error: use this value: 0xdeadbeefcafebabe",
@@ -1626,7 +1839,7 @@ test "promotion gate returns the first failing mode output without running later
 test "promotion gate fails when the package breaks only under ReleaseSafe" {
     const allocator = std.testing.allocator;
     const test_io = std.testing.io;
-    var context = GateModeTestContext{
+    var context: GateModeTestContext = .{
         .allocator = allocator,
         .fail_flag = "-Doptimize=ReleaseSafe",
         .fail_stderr = "error: use of undeclared identifier 'undefined_value'",
@@ -1812,5 +2025,174 @@ test "promotion rejects a final package without a fingerprint" {
     try std.testing.expectEqual(@as(u32, 1), context.build_calls);
     try std.testing.expectEqual(@as(u32, 0), context.resolver_calls);
     try expectDirectoryAbsent(test_io, out_dir);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports the compiler output when the first build fails" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    const pkg = buildTestPackage();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .compile_failure,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // The first pass is the real build, and it is the pass a one-pass compile
+    // error dies on. It used to return a bare error with the compiler's
+    // output discarded, so a silent emission defect was only findable by
+    // hand-compiling the generated package. The error value is unchanged.
+    try std.testing.expectEqual(@as(u32, 1), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqualStrings(
+        "generated source does not compile",
+        context.reported_stderr[0..context.reported_stderr_len],
+    );
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports compiler output that arrives on stdout" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    const pkg = buildTestPackage();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .compile_failure_on_stdout,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // `resolveFingerprint` reads both streams for its hint, so a hint can
+    // arrive on either one. A failing build that writes nothing to stderr
+    // still has to say something.
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqualStrings(
+        "error: use of undeclared identifier 'undefined_value'",
+        context.reported_stdout[0..context.reported_stdout_len],
+    );
+    try std.testing.expectEqual(@as(usize, 0), context.reported_stderr_len);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports the compiler output of a retried build once" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var pkg = buildTestPackage();
+    pkg.fingerprint = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .fingerprint_then_failure,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // The manifest patch pass is not a defect: it is a fingerprint hint the
+    // resolver consumes. The retried build is, so its output is reported
+    // once, and the hint pass stays quiet.
+    try std.testing.expectEqual(@as(u32, 2), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqualStrings(
+        "optimized build still rejects the generated source",
+        context.reported_stderr[0..context.reported_stderr_len],
+    );
+    try expectDirectoryAbsent(test_io, out_dir);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "promotion reports nothing when the build passes" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var pkg = buildTestPackage();
+    pkg.fingerprint = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .fingerprint_then_success,
+    };
+    try promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+        .context = &context,
+        .fill_nonce = fixedPromotionNonce,
+        .run_build_test = fakePromotionBuildTest,
+        .resolve_fingerprint = fakePromotionFingerprint,
+        .report_build_failure = recordBuildFailure,
+    });
+
+    // A first pass that fails only to hand the resolver a fingerprint hint is
+    // part of a successful promotion, so it must not print a build failure.
+    try std.testing.expectEqual(@as(u32, 2), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.resolver_calls);
+    try std.testing.expectEqual(@as(u32, 0), context.report_calls);
     try expectDirectoryAbsent(test_io, staging_dir);
 }

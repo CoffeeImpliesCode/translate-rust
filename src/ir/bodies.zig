@@ -150,7 +150,24 @@ fn importedBoundMatches(prefix: []const []const u8, suffix: []const types.PathSe
     return true;
 }
 
-fn boundPathMatches(g: *const graph.CrateGraph, owner: spine.EntityId, path: types.Path, wanted: []const []const u8) bool {
+/// Whether `path` is exactly the trait at `wanted`, resolved the way Rust
+/// resolves a name in `owner`'s scope.
+///
+/// This is the canonical bound-identity test for the whole pipeline, and it is
+/// exported rather than wrapped so no second, weaker convention can grow
+/// beside it. A caller that proves a trait by comparing a path's LAST segment
+/// to a bare name accepts a crate's own homonym: a `trait From<T>` declared in
+/// the crate answers to `From` exactly as well as `core::convert::From` does,
+/// and the two are different traits with different impls. Every reader that
+/// needs trait identity should ask here instead.
+///
+/// The full path may be written out (`core::convert::From`), or given as a
+/// short name the scope imports (`use core::convert::From;`, then `From`), or
+/// carry the importing `use` declaration on its first segment — all three
+/// reach the same answer, because that is what the source means by all three.
+/// `core` and `std` are the same crate for this purpose: `use
+/// std::convert::From` proves `core::convert::From`, since std re-exports it.
+pub fn boundPathMatches(g: *const graph.CrateGraph, owner: spine.EntityId, path: types.Path, wanted: []const []const u8) bool {
     if (path.segments.len == 0) return false;
     const first = path.segments[0];
     if (first.id) |def| {
@@ -274,6 +291,12 @@ fn genericBoundForBounds(
 }
 
 /// Resolve a receiver's declared trait bound within its callable and impl scopes.
+///
+/// `receiver` may carry its bound itself — an `opaque` or a `dyn Trait`, both
+/// reached through any number of reference or box layers — or name a type
+/// parameter, whose bound is then read from the enclosing `fn`, `impl` or
+/// `trait` that declares it. The identity of the trait is always
+/// `boundPathMatches`, so a crate's own `Read` is never `std::io::Read`.
 pub fn genericBound(
     g: *const graph.CrateGraph,
     b: *const Bodies,
@@ -282,15 +305,32 @@ pub fn genericBound(
     trait_path: []const []const u8,
 ) ?types.Bound {
     var value = receiver;
-    for (0..128) |_| {
+    // The label is load-bearing. `else => break` inside the switch would break
+    // the SWITCH, not this loop, so the loop would spin its whole 128 turns on
+    // a receiver that is neither a reference nor a box and then fall into the
+    // `else` below and report no bound for every ordinary type parameter.
+    // `break :peel` leaves the loop, which is what makes the `for ... else`
+    // mean what it says: reached only by a reference chain that never ends.
+    peel: for (0..128) |_| {
         switch (value) {
             .reference => |reference| value = reference.pointee,
             .boxed => |boxed| value = boxed.*,
-            else => break,
+            else => break :peel,
         }
     } else return null;
     if (value == .@"opaque") {
         return genericBoundForBounds(g, b, owner, value.@"opaque".bounds, trait_path);
+    }
+    // A `dyn Trait` receiver is the bound itself rather than a type parameter
+    // some enclosing signature constrains, so it answers from the bounds the
+    // object type spells and nothing else has to be looked up. This is the
+    // same question the `opaque` arm above asks about the same declaration,
+    // read off the representation that keeps it: `fn f(r: &mut dyn Read)`
+    // admits `r.read_exact(..)` for exactly the reason `fn f<T: ?Sized +
+    // Read>(r: &mut T)` admits it, and `boundPathMatches` resolves the name
+    // through the same `use std::io::Read` in both.
+    if (value == .dyn_trait) {
+        return genericBoundForBounds(g, b, owner, value.dyn_trait, trait_path);
     }
     if (value != .path or value.path.segments.len != 1) return null;
     const name = value.path.segments[0].name;

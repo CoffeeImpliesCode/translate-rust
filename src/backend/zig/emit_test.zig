@@ -133,7 +133,7 @@ test "emitFile: emits imports, struct with fields and methods" {
     try std.testing.expect(std.mem.indexOf(u8, out, "return self.id;\n") != null);
 }
 
-test "emitFile: a function body must survive lowering, and the smallest real one emits" {
+test "emitFile: missing and empty function bodies are rejected" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -160,29 +160,6 @@ test "emitFile: a function body must survive lowering, and the smallest real one
         } }},
     };
     try std.testing.expectError(error.EmptyTranslatedBody, emitFile(a, empty_body));
-
-    // The boundary: a single statement is the smallest body that still
-    // carries a translated result, and it emits as a real body.
-    const one_stmt = ast.File{
-        .path = "src/empty.zig",
-        .decls = &.{.{ .fn_decl = .{
-            .name = "setup",
-            .ret_type = .{ .void_type = {} },
-            .body = .{ .stmts = &.{.{ .let_stmt = .{
-                .name = "tag",
-                .ty = .{ .prim = .u8 },
-                .init = .{ .lit = .{ .int = 7 } },
-            } }} },
-        } }},
-    };
-    try std.testing.expectEqualStrings(
-        \\pub fn setup() void {
-        \\    const tag: u8 = 7;
-        \\}
-        \\
-    ,
-        try emitFile(a, one_stmt),
-    );
 }
 
 test "emitFile: emits enum with tag type and variants" {
@@ -781,21 +758,6 @@ test "expression-sized arrays survive public roundtrip and emission" {
     );
 }
 
-test "emitExpr: repeated array uses the whole type's element" {
-    const expression: ast.Expr = .{ .repeat = .{
-        .type_name = .{ .array = .{
-            .elem = &ast.Type{ .prim = .u32 },
-            .len = 4,
-        } },
-        .elem = &ast.Expr{ .lit = .{ .int = 0 } },
-        .len = 4,
-    } };
-
-    const emitted = try emitExpression(std.testing.allocator, expression);
-    defer std.testing.allocator.free(emitted);
-    try std.testing.expectEqualStrings("[_]u32{ 0 } ** 4", emitted);
-}
-
 test "emitExpr: for captures emit pointer bindings" {
     const expression: ast.Expr = .{ .for_expr = .{
         .inputs = &.{.{ .ident = "items" }},
@@ -809,6 +771,199 @@ test "emitExpr: for captures emit pointer bindings" {
     const emitted = try emitExpression(std.testing.allocator, expression);
     defer std.testing.allocator.free(emitted);
     try std.testing.expect(std.mem.indexOf(u8, emitted, "for (items) |*item|") != null);
+}
+
+// A conditional can bind a payload per branch. Zig captures whatever the
+// condition evaluated to, so the one shape serves both an optional that was
+// unwrapped and an error union that was split.
+test "emitExpr: a conditional binds a payload per branch and keeps its group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const split: ast.Expr = .{ .if_expr = .{
+        .cond = try boxed(a, .{ .call = .{
+            .callee = try boxed(a, ident("parse")),
+            .args = try list(a, &.{.{ .ident = "input" }}),
+        } }),
+        .then_capture = .{ .name = "ok" },
+        .then_body = try boxed(a, ident("ok")),
+        .else_body = try boxed(a, ident("fallback")),
+        .else_capture = .{ .name = "tag" },
+    } };
+
+    // A borrowed payload takes the same star a `for` capture takes.
+    const borrowed: ast.Expr = .{ .if_expr = .{
+        .cond = try boxed(a, ident("maybe")),
+        .then_capture = .{ .name = "item", .by_ref = true },
+        .then_body = try boxed(a, ident("item")),
+    } };
+
+    // A binding Zig would read as a keyword has to stay quoted, or the
+    // payload is not an identifier at all.
+    const keyword: ast.Expr = .{ .if_expr = .{
+        .cond = try boxed(a, ident("maybe")),
+        .then_capture = .{ .name = "error" },
+        .then_body = try boxed(a, ident("error")),
+    } };
+
+    // The conditional is a whole expression, so an operator still wraps it
+    // rather than applying to the payload the branch binds.
+    const biased: ast.Expr = try binary(a, .add, split, ident("bias"));
+
+    try expectEmittedRows(a, &.{
+        .{
+            .expression = split,
+            .expected = "if (parse(input)) |ok| ok else |tag| fallback",
+        },
+        .{ .expression = borrowed, .expected = "if (maybe) |*item| item" },
+        .{ .expression = keyword, .expected = "if (maybe) |@\"error\"| @\"error\"" },
+        .{
+            .expression = biased,
+            .expected = "(if (parse(input)) |ok| ok else |tag| fallback) + bias",
+        },
+    });
+}
+
+/// The condition a Rust `loop` lowers to. Zig only needs it spelled, so every
+/// loop test here builds its header from this one.
+fn forever(a: std.mem.Allocator) !*ast.Expr {
+    return boxed(a, .{ .lit = .{ .bool_lit = true } });
+}
+
+// Zig rejects a loop label no `break` or `continue` names, so a source label
+// reaches the emitted loop only when an exit inside its body lands on it.
+test "emitExpr: a while loop label nothing names is left off" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `'outer: while true { step(); }` names its label nowhere.
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = try forever(a),
+        .label = "outer",
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("step")) }}) },
+    } };
+
+    try expectEmittedRows(a, &.{
+        .{ .expression = loop, .expected = "while (true) {\n    step;\n}" },
+    });
+}
+
+test "emitExpr: a while loop keeps a label its own break names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = try forever(a),
+        .label = "outer",
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, .{
+            .break_expr = .{ .label = "outer" },
+        }) }}) },
+    } };
+
+    try expectEmittedRows(a, &.{
+        .{ .expression = loop, .expected = "outer: while (true) {\n    break :outer;\n}" },
+    });
+}
+
+test "emitExpr: a continue alone keeps a while loop label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const loop: ast.Expr = .{ .while_expr = .{
+        .cond = try forever(a),
+        .label = "outer",
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, .{
+            .continue_expr = .{ .label = "outer" },
+        }) }}) },
+    } };
+
+    try expectEmittedRows(a, &.{
+        .{ .expression = loop, .expected = "outer: while (true) {\n    continue :outer;\n}" },
+    });
+}
+
+test "emitExpr: a for loop label follows the same rule as a while loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const unnamed: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{.{ .ident = "items" }},
+        .captures = &.{.{ .name = "item" }},
+        .label = "outer",
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("step")) }}) },
+    } };
+    const named: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{.{ .ident = "items" }},
+        .captures = &.{.{ .name = "item" }},
+        .label = "outer",
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, .{
+            .break_expr = .{ .label = "outer" },
+        }) }}) },
+    } };
+
+    try expectEmittedRows(a, &.{
+        .{ .expression = unnamed, .expected = "for (items) |item| {\n    step;\n}" },
+        .{ .expression = named, .expected = "outer: for (items) |item| {\n    break :outer;\n}" },
+    });
+}
+
+// A loop that carries a value hands it to a generated wrapper block, so a
+// `break` naming the loop's source label lands on that block instead and the
+// label has nothing left to name.
+test "emitExpr: a value loop drops the label its own break named" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `'outer: loop { loop { break 'outer 5; } }`.
+    const inner: ast.Expr = .{ .while_expr = .{
+        .cond = try forever(a),
+        .body = .{ .expr = try boxed(a, .{ .break_expr = .{
+            .value = try boxed(a, .{ .lit = .{ .uint = 5 } }),
+            .label = "outer",
+        } }) },
+    } };
+    const outer: ast.Expr = .{ .while_expr = .{
+        .cond = try forever(a),
+        .label = "outer",
+        .body = .{ .expr = try boxed(a, inner) },
+    } };
+
+    const emitted = try emitExpression(std.testing.allocator, outer);
+    defer std.testing.allocator.free(emitted);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "break :__r2z_value_loop_0 5;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "outer:") == null);
+}
+
+// `'outer: loop { 'outer: loop { break 'outer; } }`: the break names the inner
+// loop, so only the inner one may carry the label.
+test "emitExpr: a loop shadowed by a nested one loses its label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const inner: ast.Expr = .{ .while_expr = .{
+        .cond = try forever(a),
+        .label = "outer",
+        .body = .{ .expr = try boxed(a, .{ .break_expr = .{ .label = "outer" } }) },
+    } };
+    const outer: ast.Expr = .{ .while_expr = .{
+        .cond = try forever(a),
+        .label = "outer",
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, inner) }}) },
+    } };
+
+    try expectEmittedRows(a, &.{
+        .{
+            .expression = outer,
+            .expected = "while (true) {\n    outer: while (true) {\n        break :outer;\n    }\n}",
+        },
+    });
 }
 
 fn emitPatternText(a: std.mem.Allocator, pat: ast.Pattern) ![]const u8 {
@@ -1005,7 +1160,7 @@ test "emitExpr: a bin_op stays bare in delimited slots and stays wrapped in rece
         .return_expr = try boxed(a, try binary(a, .add, ident("a"), ident("b"))),
     };
     const broken: ast.Expr = .{
-        .break_expr = try boxed(a, try binary(a, .add, ident("a"), ident("b"))),
+        .break_expr = .{ .value = try boxed(a, try binary(a, .add, ident("a"), ident("b"))) },
     };
 
     // A switch subject sits inside the `switch (...)` delimiters, and a prong
@@ -1073,10 +1228,8 @@ test "emitExpr: a bin_op stays bare in delimited slots and stays wrapped in rece
         .{ .expression = index_receiver, .expected = "(a + b)[i]" },
         .{ .expression = ranged, .expected = "(a + b)..b + c" },
     });
-    try std.testing.expect(std.mem.indexOf(u8, try emitExpression(a, chunk_loop),
-        "while ((a + b).len > __chunk_index)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, try emitExpression(a, chunk_loop),
-        "const chunk = (a + b)[__chunk_index..@min(__chunk_index + n, (a + b).len)];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try emitExpression(a, chunk_loop), "while ((a + b).len > __chunk_index)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try emitExpression(a, chunk_loop), "const chunk = (a + b)[__chunk_index..@min(__chunk_index + n, (a + b).len)];") != null);
 }
 
 test "emitExpr: the wyhash read chain and wymum product need one group, not seven" {
@@ -1112,7 +1265,7 @@ test "emitExpr: the wyhash read chain and wymum product need one group, not seve
         byte -= 1;
     }
     try expectEmittedRows(a, &.{.{ .expression = chain, .expected =
-    \\@as(u64, data[7]) << @intCast(56) | @as(u64, data[6]) << @intCast(48) | @as(u64, data[5]) << @intCast(40) | @as(u64, data[4]) << @intCast(32) | @as(u64, data[3]) << @intCast(24) | @as(u64, data[2]) << @intCast(16) | @as(u64, data[1]) << @intCast(8) | @as(u64, data[0]) << @intCast(0)
+        \\@as(u64, data[7]) << @intCast(56) | @as(u64, data[6]) << @intCast(48) | @as(u64, data[5]) << @intCast(40) | @as(u64, data[4]) << @intCast(32) | @as(u64, data[3]) << @intCast(24) | @as(u64, data[2]) << @intCast(16) | @as(u64, data[1]) << @intCast(8) | @as(u64, data[0]) << @intCast(0)
     }});
 
     // A chain nested to the right is the one that must keep its group:

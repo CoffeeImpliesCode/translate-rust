@@ -28,12 +28,21 @@ fn freeValue(allocator: std.mem.Allocator, v: *Json) void {
             for (ar.items) |*item| freeValue(allocator, item);
             ar.deinit();
         },
+        // Only the encoder puts a `number_string` in a tree `freeValue` walks;
+        // one parsed out of JSON lives in the parser's own arena.
+        .number_string => allocator.free(v.number_string),
         else => {},
     }
 }
 
 fn mkInt(x: anytype) Json {
     return .{ .integer = @intCast(x) };
+}
+
+/// Preserve wide counts as unquoted decimal numbers, never through `f64`.
+fn mkCount(allocator: std.mem.Allocator, n: usize) !Json {
+    if (std.math.cast(i64, n)) |i| return .{ .integer = i };
+    return .{ .number_string = try std.fmt.allocPrint(allocator, "{d}", .{n}) };
 }
 
 fn encodeOptStr(s: ?[]const u8) Json {
@@ -86,6 +95,7 @@ fn reqUsize(o: ObjectMap, key: []const u8) !usize {
     const v = try req(o, key);
     return switch (v) {
         .integer => |i| @intCast(i),
+        .number_string => |s| std.fmt.parseInt(usize, s, 10),
         else => error.BadWireFormat,
     };
 }
@@ -238,7 +248,7 @@ fn freeDecodedTypeSlice(allocator: std.mem.Allocator, types: []const ast.Type) v
 
 fn freeDecodedLiteral(allocator: std.mem.Allocator, literal: ast.Literal) void {
     switch (literal) {
-        .str => |value| freeDecodedBytes(allocator, value),
+        .str, .error_tag => |value| freeDecodedBytes(allocator, value),
         .int, .uint, .float, .bool_lit, .char_lit, .null_lit, .undefined_lit => {},
     }
 }
@@ -395,6 +405,8 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
                 freeDecodedExpr(allocator, else_body.*);
                 allocator.destroy(@constCast(else_body));
             }
+            if (if_expr.then_capture) |capture| freeDecodedCapture(allocator, capture);
+            if (if_expr.else_capture) |capture| freeDecodedCapture(allocator, capture);
         },
         .while_expr => |while_expr| {
             freeDecodedExpr(allocator, while_expr.cond.*);
@@ -404,6 +416,7 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
                 allocator.destroy(@constCast(continue_expr));
             }
             if (while_expr.captures) |captures| freeDecodedStringSlice(allocator, captures);
+            if (while_expr.label) |label| freeDecodedBytes(allocator, label);
             freeDecodedBlock(allocator, while_expr.body);
             if (while_expr.else_body) |else_body| {
                 freeDecodedExpr(allocator, else_body.*);
@@ -413,6 +426,7 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
         .for_expr => |for_expr| {
             freeDecodedExprSlice(allocator, for_expr.inputs);
             freeDecodedCaptureSlice(allocator, for_expr.captures);
+            if (for_expr.label) |label| freeDecodedBytes(allocator, label);
             freeDecodedBlock(allocator, for_expr.body);
             if (for_expr.else_body) |else_body| {
                 freeDecodedExpr(allocator, else_body.*);
@@ -427,13 +441,23 @@ fn freeDecodedExpr(allocator: std.mem.Allocator, expr: ast.Expr) void {
                 allocator.destroy(@constCast(end));
             }
         },
-        .return_expr, .break_expr => |value| {
+        .return_expr => |value| {
             if (value) |expr_ptr| {
                 freeDecodedExpr(allocator, expr_ptr.*);
                 allocator.destroy(@constCast(expr_ptr));
             }
         },
-        .unit, .continue_expr => {},
+        .break_expr => |break_expr| {
+            if (break_expr.label) |label| freeDecodedBytes(allocator, label);
+            if (break_expr.value) |expr_ptr| {
+                freeDecodedExpr(allocator, expr_ptr.*);
+                allocator.destroy(@constCast(expr_ptr));
+            }
+        },
+        .continue_expr => |continue_expr| {
+            if (continue_expr.label) |label| freeDecodedBytes(allocator, label);
+        },
+        .unit, .unreachable_ => {},
     }
 }
 
@@ -1042,7 +1066,7 @@ pub fn encodeType(allocator: std.mem.Allocator, ty: ast.Type) anyerror!Json {
         .array => |arr| {
             try o.put(allocator, "kind", .{ .string = "array" });
             try o.put(allocator, "elem", try encodeType(allocator, arr.elem.*));
-            try o.put(allocator, "len", mkInt(arr.len));
+            try o.put(allocator, "len", try mkCount(allocator, arr.len));
         },
         .array_expr => |arr| {
             try o.put(allocator, "kind", .{ .string = "array_expr" });
@@ -1300,6 +1324,10 @@ pub fn encodeLiteral(allocator: std.mem.Allocator, lit: ast.Literal) anyerror!Js
             try o.put(allocator, "kind", .{ .string = "str" });
             try o.put(allocator, "value", .{ .string = v });
         },
+        .error_tag => |v| {
+            try o.put(allocator, "kind", .{ .string = "error_tag" });
+            try o.put(allocator, "name", .{ .string = v });
+        },
         .null_lit => {
             try o.put(allocator, "kind", .{ .string = "null_lit" });
         },
@@ -1337,6 +1365,8 @@ pub fn decodeLiteral(allocator: std.mem.Allocator, v: Json) anyerror!ast.Literal
     } else if (std.mem.eql(u8, kind, "str")) {
         const s = try reqStr(o, "value");
         return .{ .str = try allocator.dupe(u8, s) };
+    } else if (std.mem.eql(u8, kind, "error_tag")) {
+        return .{ .error_tag = try allocator.dupe(u8, try reqStr(o, "name")) };
     } else if (std.mem.eql(u8, kind, "null_lit")) {
         return .null_lit;
     } else if (std.mem.eql(u8, kind, "undefined_lit")) {
@@ -1685,7 +1715,7 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
                 try o.put(allocator, "type_name", .{ .null = {} });
             }
             try o.put(allocator, "elem", try encodeExpr(allocator, rp.elem.*));
-            try o.put(allocator, "len", .{ .integer = @intCast(rp.len) });
+            try o.put(allocator, "len", try mkCount(allocator, rp.len));
         },
         .builtin => |bc| {
             try o.put(allocator, "kind", .{ .string = "builtin" });
@@ -1698,6 +1728,9 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
         },
         .unit => {
             try o.put(allocator, "kind", .{ .string = "unit" });
+        },
+        .unreachable_ => {
+            try o.put(allocator, "kind", .{ .string = "unreachable" });
         },
         .panic_ => |message| {
             try o.put(allocator, "kind", .{ .string = "panic" });
@@ -1715,6 +1748,14 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
                 try o.put(allocator, "else_body", try encodeExpr(allocator, eb.*));
             } else {
                 try o.put(allocator, "else_body", .{ .null = {} });
+            }
+            // A capture is written only when there is one: a conditional that
+            // captures nothing keeps the exact wire it had before payloads.
+            if (ife.then_capture) |capture| {
+                try o.put(allocator, "then_capture", try encodeCapture(allocator, capture));
+            }
+            if (ife.else_capture) |capture| {
+                try o.put(allocator, "else_capture", try encodeCapture(allocator, capture));
             }
         },
         .while_expr => |we| {
@@ -1735,6 +1776,7 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
                 try o.put(allocator, "captures", .{ .null = {} });
             }
             try o.put(allocator, "body", try encodeBlock(allocator, we.body));
+            try o.put(allocator, "label", encodeOptStr(we.label));
             if (we.else_body) |eb| {
                 try o.put(allocator, "else_body", try encodeExpr(allocator, eb.*));
             } else {
@@ -1756,6 +1798,7 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
             try o.put(allocator, "captures", .{ .array = cap_arr });
 
             try o.put(allocator, "body", try encodeBlock(allocator, fe.body));
+            try o.put(allocator, "label", encodeOptStr(fe.label));
             if (fe.else_body) |eb| {
                 try o.put(allocator, "else_body", try encodeExpr(allocator, eb.*));
             } else {
@@ -1779,16 +1822,18 @@ pub fn encodeExpr(allocator: std.mem.Allocator, expr: ast.Expr) anyerror!Json {
                 try o.put(allocator, "value", .{ .null = {} });
             }
         },
-        .break_expr => |be| {
+        .break_expr => |break_expr| {
             try o.put(allocator, "kind", .{ .string = "break_expr" });
-            if (be) |val| {
+            if (break_expr.value) |val| {
                 try o.put(allocator, "value", try encodeExpr(allocator, val.*));
             } else {
                 try o.put(allocator, "value", .{ .null = {} });
             }
+            try o.put(allocator, "label", encodeOptStr(break_expr.label));
         },
-        .continue_expr => {
+        .continue_expr => |continue_expr| {
             try o.put(allocator, "kind", .{ .string = "continue_expr" });
+            try o.put(allocator, "label", encodeOptStr(continue_expr.label));
         },
     }
     return .{ .object = o };
@@ -2035,6 +2080,7 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
         elem_ptr.* = try decodeExpr(allocator, try req(o, "elem"));
         const len: usize = switch (try req(o, "len")) {
             .integer => |i| @intCast(@max(i, 0)),
+            .number_string => |s| try std.fmt.parseInt(usize, s, 10),
             else => return error.BadWireFormat,
         };
         return .{
@@ -2075,23 +2121,50 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
         const reason = try reqStr(o, "reason");
         return .{ .unsupported = try allocator.dupe(u8, reason) };
     } else if (std.mem.eql(u8, kind, "if_expr")) {
-        const cond_ptr = try allocator.create(ast.Expr);
-        cond_ptr.* = try decodeExpr(allocator, try req(o, "cond"));
-        const then_ptr = try allocator.create(ast.Expr);
-        then_ptr.* = try decodeExpr(allocator, try req(o, "then_body"));
+        const cond_expr = try decodeExpr(allocator, try req(o, "cond"));
+        errdefer freeDecodedExpr(allocator, cond_expr);
+        const then_expr = try decodeExpr(allocator, try req(o, "then_body"));
+        errdefer freeDecodedExpr(allocator, then_expr);
         const else_ptr: ?*const ast.Expr = if (o.get("else_body")) |eb| (switch (eb) {
             .null => null,
             else => blk: {
+                const else_expr = try decodeExpr(allocator, eb);
+                errdefer freeDecodedExpr(allocator, else_expr);
                 const ep = try allocator.create(ast.Expr);
-                ep.* = try decodeExpr(allocator, eb);
+                ep.* = else_expr;
                 break :blk ep;
             },
         }) else null;
+        errdefer if (else_ptr) |owned_else| {
+            freeDecodedExpr(allocator, owned_else.*);
+            allocator.destroy(@constCast(owned_else));
+        };
+        const then_capture: ?ast.Capture = if (o.get("then_capture")) |encoded_capture|
+            try decodeCapture(allocator, encoded_capture)
+        else
+            null;
+        errdefer if (then_capture) |capture| freeDecodedCapture(allocator, capture);
+        const else_capture: ?ast.Capture = if (o.get("else_capture")) |encoded_capture|
+            try decodeCapture(allocator, encoded_capture)
+        else
+            null;
+        errdefer if (else_capture) |capture| freeDecodedCapture(allocator, capture);
+        // An else payload binds the branch it names, so a wire that carries
+        // one without that branch is not a conditional this AST can hold.
+        if (else_capture != null and else_ptr == null) return error.BadWireFormat;
+        const cond_ptr = try allocator.create(ast.Expr);
+        errdefer allocator.destroy(cond_ptr);
+        cond_ptr.* = cond_expr;
+        const then_ptr = try allocator.create(ast.Expr);
+        errdefer allocator.destroy(then_ptr);
+        then_ptr.* = then_expr;
         return .{
             .if_expr = .{
                 .cond = cond_ptr,
                 .then_body = then_ptr,
                 .else_body = else_ptr,
+                .then_capture = then_capture,
+                .else_capture = else_capture,
             },
         };
     } else if (std.mem.eql(u8, kind, "while_expr")) {
@@ -2126,6 +2199,7 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 }
             }
         }
+        const label = if (try optStr(o, "label")) |text| try allocator.dupe(u8, text) else null;
         return .{
             .while_expr = .{
                 .cond = cond_ptr,
@@ -2133,6 +2207,7 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 .captures = if (caps_list.items.len > 0) try caps_list.toOwnedSlice(allocator) else null,
                 .body = body,
                 .else_body = else_ptr,
+                .label = label,
             },
         };
     } else if (std.mem.eql(u8, kind, "for_expr")) {
@@ -2177,12 +2252,14 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
         errdefer freeDecodedExprSlice(allocator, inputs);
         const captures = try cap_list.toOwnedSlice(allocator);
         errdefer freeDecodedCaptureSlice(allocator, captures);
+        const label = if (try optStr(o, "label")) |text| try allocator.dupe(u8, text) else null;
         return .{
             .for_expr = .{
                 .inputs = inputs,
                 .captures = captures,
                 .body = body,
                 .else_body = else_ptr,
+                .label = label,
             },
         };
     } else if (std.mem.eql(u8, kind, "range")) {
@@ -2216,9 +2293,16 @@ pub fn decodeExpr(allocator: std.mem.Allocator, v: Json) anyerror!ast.Expr {
                 break :blk p;
             },
         }) else null;
-        return .{ .break_expr = val_ptr };
+        return .{ .break_expr = .{
+            .value = val_ptr,
+            .label = if (try optStr(o, "label")) |text| try allocator.dupe(u8, text) else null,
+        } };
     } else if (std.mem.eql(u8, kind, "continue_expr")) {
-        return .{ .continue_expr = {} };
+        return .{ .continue_expr = .{
+            .label = if (try optStr(o, "label")) |text| try allocator.dupe(u8, text) else null,
+        } };
+    } else if (std.mem.eql(u8, kind, "unreachable")) {
+        return .{ .unreachable_ = {} };
     }
 
     return error.UnknownExprKind;

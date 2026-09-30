@@ -93,3 +93,73 @@ fn collectWithAllocationFailures(allocator: std.mem.Allocator) !void {
     const expected: [512]u8 = @splat(7);
     try std.testing.expectEqualSlices(u8, &expected, collection.items);
 }
+
+test "generated comparisons release only temporary owners and preserve branch order" {
+    const gpa = std.testing.allocator;
+    try compareWithAllocationFailures(gpa);
+    try std.testing.checkAllAllocationFailures(gpa, compareWithAllocationFailures, .{});
+
+    // A field-free error enum is a Zig error set, so the rejected arm has to
+    // arrive as the native tag itself and not as a user value that merely
+    // spells the same word.
+    try std.testing.expectEqual(@as(u8, 7), try translated.tagged_result(true));
+    try std.testing.expectError(error.Rejected, translated.tagged_result(false));
+
+    // The frame that builds this `Result` returns an `Option`, so the error
+    // it names comes from the local binding rather than the enclosing
+    // signature. Both arms still have to arrive as native: the payload bare,
+    // the rejection as the tag itself.
+    try std.testing.expectEqual(@as(u8, 7), try translated.contextual_tagged_result(true).?);
+    try std.testing.expectError(error.Rejected, translated.contextual_tagged_result(false).?);
+
+    // Here the payload and the error are the same type, so only the
+    // constructor says which side of the union the variant belongs to. The
+    // successful value is the user's own enum, not the tag that spells the
+    // same word, and the active tag is what tells the two apart.
+    try std.testing.expect(try translated.native_ok_variant() == .Accepted);
+
+    // The variant crosses an ordinary call before it reaches `Err`, so the
+    // callee is handed the user's enum and the union still names the tag.
+    try std.testing.expectError(error.Rejected, translated.native_dynamic_error());
+
+    var sequence: u32 = 0;
+    try std.testing.expect(!try translated.temporary_conditional(gpa, false, &sequence));
+    try std.testing.expectEqual(@as(u32, 0), sequence);
+    try std.testing.expect(try translated.temporary_conditional(gpa, true, &sequence));
+    try std.testing.expectEqual(@as(u32, 12), sequence);
+
+    var named = try translated.owned(gpa, "same");
+    defer named.deinit(gpa);
+    try std.testing.expect(try translated.temporary_borrowed_equal(gpa, &named));
+    try std.testing.expectEqualStrings("same", named.as_str());
+
+    var empty = try translated.temporary_empty_string(gpa);
+    defer empty.deinit(gpa);
+    try std.testing.expectEqualStrings("", empty.as_str());
+}
+
+fn compareWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    try std.testing.expect(try translated.temporary_equal(gpa, "same"));
+    try std.testing.expect(!try translated.temporary_equal(gpa, "different"));
+    try std.testing.expect(try translated.temporary_result_equal(gpa, "same"));
+    try std.testing.expect(!try translated.temporary_result_equal(gpa, "bad"));
+    try std.testing.expect(try translated.temporary_unwrap_equal(gpa, "same"));
+    try std.testing.expect(try translated.temporary_vec_equal(gpa, 7));
+    try std.testing.expect(!try translated.temporary_vec_equal(gpa, 8));
+    try std.testing.expect(try translated.temporary_user_error_caller(gpa, 7));
+    try std.testing.expect(!try translated.temporary_user_error_caller(gpa, 8));
+
+    // The `Ok` payload is handed over by move. Nothing here releases it a
+    // second time: the callee owns it from here on, and a second `deinit`
+    // would be a double free rather than a leak the allocator could report.
+    try std.testing.expect(try translated.temporary_moved_result_caller(
+        gpa,
+        .{ .Ok = try translated.owned(gpa, "same") },
+    ));
+    try std.testing.expect(!try translated.temporary_moved_result_caller(
+        gpa,
+        .{ .Ok = try translated.owned(gpa, "different") },
+    ));
+    try std.testing.expect(try translated.temporary_empty_equal(gpa, ""));
+    try std.testing.expect(!try translated.temporary_empty_equal(gpa, "other"));
+}
