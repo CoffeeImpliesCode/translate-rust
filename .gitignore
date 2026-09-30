@@ -1,8 +1,3 @@
-# devenv / direnv
-.devenv/
-.direnv/
-.envrc
-
 # zig
 .zig-cache/
 zig-out/
@@ -10,17 +5,14 @@ zig-pkg/
 .zig-global-cache/
 
 # tooling artifacts
-codedb.snapshot
-.codegraph/
-.omo/
-.opencode/
-graphify-out/
 node_modules/
-local:
 *.svg.tmp
-result-bin
 __pycache__/
 
 # cargo (fixture crates)
 target/
-/agent-notes
+
+# Private working notes and preserved local artifacts
+/.local/
+/test/crates/compat/Cargo.lock
+/test/crates/percent-encoding/Cargo.lock

@@ -3,7 +3,7 @@
 #
 # Dumps one Cargo package's crate as rustdoc JSON and copies it to a
 # crate-<name>.json sidecar artifact, the wire input of the model's JSON
-# boundary (notes/design/data-model-plan.md P1; data-model.md §4).
+# boundary (notes/design/data-model.md §4).
 #
 # Usage:
 #   tools/sidecar/rustdoc-json.sh <pkg-dir> [output-dir]

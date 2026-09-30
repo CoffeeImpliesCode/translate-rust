@@ -1,44 +1,117 @@
 # Notes index
 
-The repository research and design notes moved to a private agent-notes store. This index records their destinations without duplicating their content.
+`notes/` holds the exploration-phase records of this translator: dated research
+into Rust→Zig translation, and the design records that grew out of it.
 
-Use the [repository README](../README.md) for current implementation and coverage. These notes are references, not evidence of current support. Archived plans record historical intent only.
+**These notes are not a coverage claim.** They are documents about what was
+investigated and what was proposed, written in August 2026. Nothing in them says
+that `translate-rust` supports a Rust shape. For what the translator actually
+translates today, read the [repository README](../README.md); the fixtures and
+the pinned refusals it lists are the only statement of current coverage.
 
-Canonical links use the repository's ignored `agent-notes` symlink. They require the local private store and do not resolve in a fresh clone.
+Every link on this page is a relative link to a file in this repository, so the
+whole index resolves in a fresh clone.
 
-## Canonical notes
+## Research records (2026-08-17)
 
-These 16 notes are the live canonical copies.
+Dated research. Each note carries its own inline citations and an explicit
+version anchor; the facts were verified on the research date and may have
+changed since.
 
-| # | Original repository path | Canonical destination |
-|---:|---|---|
-| 1 | `notes/README.md` | [research-notes-translate-rust--n-ffe0cb4188b94761a11cdf0e58c9b3fb.md](../agent-notes/research-notes-translate-rust--n-ffe0cb4188b94761a11cdf0e58c9b3fb.md) |
-| 2 | `notes/design/architecture.md` | [translate-rust-architecture-decoupled-frontend-backend-design--n-4179ebd715f941baa9b6145eac057297.md](../agent-notes/translate-rust-architecture-decoupled-frontend-backend-design--n-4179ebd715f941baa9b6145eac057297.md) |
-| 3 | `notes/design/architecture/features-actionable.md` | [feature-translation-mechanics-actionable-milestone-roadmap--n-b1396538f0704435949b4baad7762803.md](../agent-notes/feature-translation-mechanics-actionable-milestone-roadmap--n-b1396538f0704435949b4baad7762803.md) |
-| 4 | `notes/design/architecture/pkg-dep-macros.md` | [package-generation-dependency-graph-and-macro-expansion-architecture--n-9dc0fd66713a4f13961f15737a314093.md](../agent-notes/package-generation-dependency-graph-and-macro-expansion-architecture--n-9dc0fd66713a4f13961f15737a314093.md) |
-| 5 | `notes/design/architecture/runtime-traits.md` | [runtime-trait-translation-architecture-r2z-core-trait-systems--n-1c30b5efabaa4eecb0db7cbb9d7a1cc1.md](../agent-notes/runtime-trait-translation-architecture-r2z-core-trait-systems--n-1c30b5efabaa4eecb0db7cbb9d7a1cc1.md) |
-| 6 | `notes/design/architecture/structure-memory.md` | [architecture-design-structure-memory-1-1-mapping-visibility-allocators-drop--n-110ac5c0b3c0492c9ce28e8bea8953b3.md](../agent-notes/architecture-design-structure-memory-1-1-mapping-visibility-allocators-drop--n-110ac5c0b3c0492c9ce28e8bea8953b3.md) |
-| 7 | `notes/design/data-model/crate-graph.md` | [data-model-crate-module-graph--n-af24c667c068421194a76582fd08b46b.md](../agent-notes/data-model-crate-module-graph--n-af24c667c068421194a76582fd08b46b.md) |
-| 8 | `notes/design/data-model/exprs-patterns.md` | [data-model-expr-pattern-statement-zig-lowering-hooks--n-9e0d3fde308847e9b0dd56c099cd851d.md](../agent-notes/data-model-expr-pattern-statement-zig-lowering-hooks--n-9e0d3fde308847e9b0dd56c099cd851d.md) |
-| 9 | `notes/design/data-model/items-types.md` | [data-model-items-types--n-1068ac51a2c54f568a4aad3aae2efb3a.md](../agent-notes/data-model-items-types--n-1068ac51a2c54f568a4aad3aae2efb3a.md) |
-| 10 | `notes/design/data-model/ownership-mem.md` | [data-model-ownership-borrowing-drop-allocator--n-f87f8a8079c34fd999d8f9d42e4994e4.md](../agent-notes/data-model-ownership-borrowing-drop-allocator--n-f87f8a8079c34fd999d8f9d42e4994e4.md) |
-| 11 | `notes/design/data-model/rustdoc-json-mapping.md` | [rustdoc-json-wire-format-mapping--n-47b6fc6356f14b1288b80381a0a50f64.md](../agent-notes/rustdoc-json-wire-format-mapping--n-47b6fc6356f14b1288b80381a0a50f64.md) |
-| 12 | `notes/design/data-model.md` | [data-model-the-rust-crate-ir-unified-design--n-6798e351c6614d1987a5d836e7cd30f3.md](../agent-notes/data-model-the-rust-crate-ir-unified-design--n-6798e351c6614d1987a5d836e7cd30f3.md) |
-| 13 | `notes/research/approaches.md` | [architectural-approaches-for-a-rust-zig-translator--n-08904bd6068e455fb45482ae518f0eb3.md](../agent-notes/architectural-approaches-for-a-rust-zig-translator--n-08904bd6068e455fb45482ae518f0eb3.md) |
-| 14 | `notes/research/idiom-mapping.md` | [idiom-mapping-rust-correct-proper-zig-0-16--n-cee1ee30e08d4528be3031619e1ebefc.md](../agent-notes/idiom-mapping-rust-correct-proper-zig-0-16--n-cee1ee30e08d4528be3031619e1ebefc.md) |
-| 15 | `notes/research/parsing-tooling.md` | [parsing-tooling-getting-a-rust-ast-semantic-info-into-zig--n-9181c9ca26e04488b9813c1f84028d61.md](../agent-notes/parsing-tooling-getting-a-rust-ast-semantic-info-into-zig--n-9181c9ca26e04488b9813c1f84028d61.md) |
-| 16 | `notes/research/prior-work.md` | [prior-work-rustzig-translation-and-analogous-transpilers--n-9f208a58147744d7b097250cc439dc5c.md](../agent-notes/prior-work-rustzig-translation-and-analogous-transpilers--n-9f208a58147744d7b097250cc439dc5c.md) |
+| Note | Question it answers |
+|------|---------------------|
+| [research/prior-work.md](research/prior-work.md) | What already existed for Rust→Zig, and what analogous transpilers teach |
+| [research/parsing-tooling.md](research/parsing-tooling.md) | How to get a Rust AST plus semantic information into a Zig program |
+| [research/idiom-mapping.md](research/idiom-mapping.md) | Per-feature mapping from the Rust language surface to idiomatic Zig 0.16 |
+| [research/approaches.md](research/approaches.md) | Five candidate translator architectures, and which one was recommended |
 
-The replacement for `notes/README.md` has provenance from `README--translate-rust.md`. Migration normalized it, so it is not a byte-identical copy.
+### What the research concluded (as recorded on 2026-08-17)
 
-## Archived historical plans
+- **Prior work**: exactly two source-level Rust→Zig transpilers exist —
+  `sanxiyn/rust2zig` (active; syn + rust-analyzer SCIP semantics; the natural
+  baseline) and a dead tokenizer. No `translate-rust` in ziglang/zig. c2rust
+  is the reference architecture (mechanical pass → deterministic refactor →
+  human/LLM); Cpp2Rust proves a runtime layer can bridge ownership; c2z shows
+  full C++→Zig collapses into bindings+glue.
+- **Tooling**: Zig's translate-c on master is 100% Aro (Zig's own C parser) —
+  no clang. The Rust analogue of "authoritative frontend" is rustc itself
+  (`rustc_interface`, nightly-pinned like c2rust); `rustdoc --output-format
+  json` is the cheap first milestone (public API + types, no bodies);
+  cargo expand is lossy, never ground truth; tree-sitter-rust/syn are
+  syntax-only.
+- **Idiom mapping**: 17-feature Rust→Zig map. Mechanical: modules, structs,
+  enums, unions, FFI. Moderate: generics→comptime, Option/Result→optional/
+  error unions, pattern matching, strings, collections, unsafe, static traits.
+  Hard: dyn Trait, ownership (Rc/Arc/RefCell/drop), custom iterators/closures,
+  async. Hard-block: procedural/derive macros and catch_unwind.
+- **Approaches**: five architectures lie on two axes (semantic source;
+  translated/untranslated boundary). Recommended: **(e) hybrid/incremental** —
+  syn + rust-analyzer SCIP behind a named `no_std`-ish dialect, everything
+  else pushed to an FFI boundary; referenced roadmap v0→v6.
 
-These three plans are in the dated private archive. They are not canonical notes and do not define current support.
+### What the research recommended next (recorded, not a task list)
 
-The local links require this workstation's private archive. If that archive is unavailable, run the matching `jj` command from the repository root.
+The research phase closed by recommending: fork the rust2zig dialect baseline;
+v0 = reproduce.com plus one example on Zig 0.16 (JSON IR sidecar → Zig emit →
+`zig fmt`, with differential `cargo test` ⇄ `zig test` verification); v1 = leaf
+`no_std` crate subset (structs, enums, fns, generics→comptime, Result, Drop).
+See [research/approaches.md](research/approaches.md) §6 for the full roadmap as
+it was written, and the `§Sources` section of each note for citations.
 
-| # | Original repository path | Local archive | Historical retrieval |
-|---:|---|---|---|
-| 17 | `notes/design/data-model-plan.md` | [data-model-plan.md](file://~/.agents/agent-notes-archive/round-2-2026-08-30/design/data-model-plan.md) | `jj file show -r74787c43 notes/design/data-model-plan.md` |
-| 18 | `notes/design/restructuring-plan.md` | [restructuring-plan.md](file://~/.agents/agent-notes-archive/round-2-2026-08-30/design/restructuring-plan.md) | `jj file show -r74787c43 notes/design/restructuring-plan.md` |
-| 19 | `notes/design/source-model-type-inference.md` | [source-model-type-inference.md](file://~/.agents/agent-notes-archive/round-2-2026-08-30/design/source-model-type-inference.md) | `jj file show -r74787c43 notes/design/source-model-type-inference.md` |
+This is a historical recommendation, not a backlog. What was actually built is
+in the [repository README](../README.md).
+
+### Open questions recorded at the close of the design phase (2026-08-18)
+
+These were left open. The notes record the question, not a resolution.
+
+1. **dyn Trait**: synthesize a vtable struct, or exclude from v1 (rust2zig
+   excludes it)?
+2. **Ownership model**: scoped allocator + defer/errdefer only, or also
+   synthesize Rc/Arc/RefCell refcount wrappers?
+3. **Macro expansion**: is running the Rust toolchain (cargo expand / pinned
+   rustc_driver) an acceptable mandatory front-end step for v1, or must the
+   translator stay syntax-only and reject macros?
+4. **Positioning**: deterministic translator, differential-testing oracle,
+   or first pass feeding an LLM refactor — the three roles differ
+   architecturally.
+
+## Design records (2026-08-18)
+
+Historical design specifications. Each one describes a system that was
+*proposed* during the exploration phase. None of them describes the translator
+in this tree, and none is a statement of what it supports. Read the
+[repository README](../README.md) for that.
+
+### Data model
+
+The lossless semantic IR the design proposed the translator would emit Zig
+from: a unified reference plus one note per axis.
+
+| Doc | Contents |
+|-----|----------|
+| [design/data-model.md](design/data-model.md) | Unified IR design — shared spine, node inventory, JSON boundary, v1 subset, open decisions |
+| [design/data-model/crate-graph.md](design/data-model/crate-graph.md) | Crate/module graph, visibility, paths, symbol table |
+| [design/data-model/items-types.md](design/data-model/items-types.md) | Items plus types plus generics/monomorphization |
+| [design/data-model/exprs-patterns.md](design/data-model/exprs-patterns.md) | Expressions, statements, patterns plus Zig-lowering hooks |
+| [design/data-model/ownership-mem.md](design/data-model/ownership-mem.md) | Ownership, Drop, allocator, unsoundness markers |
+| [design/data-model/rustdoc-json-mapping.md](design/data-model/rustdoc-json-mapping.md) | Field-by-field rustdoc JSON to wire-format mapping |
+
+### Architecture
+
+| Doc | Contents |
+|-----|----------|
+| [design/architecture.md](design/architecture.md) | Master architecture specification — package generation, `r2z-core`, macros, structural fidelity, traits/vtables, allocation, and the M1–M4 actionable roadmap |
+| [design/architecture/pkg-dep-macros.md](design/architecture/pkg-dep-macros.md) | Package emission, Cargo dependency graph mapping, and macro expansion pipeline |
+| [design/architecture/runtime-traits.md](design/architecture/runtime-traits.md) | `r2z-core` runtime library, static duck typing, dynamic `dyn Trait` vtables, and `@fieldParentPtr` supertrait upcasting |
+| [design/architecture/structure-memory.md](design/architecture/structure-memory.md) | 1:1 structural mapping, visibility, re-exports, allocator injection, and LIFO `defer`/`errdefer` RAII |
+| [design/architecture/features-actionable.md](design/architecture/features-actionable.md) | Enums/unions, dual-track error handling, match guards, raw pointers, and crate-by-crate actionable breakdown |
+
+## Using these notes
+
+- Cite them as dated research, with the version anchor the note itself carries.
+  Zig, rustc, and the transpilers surveyed have all moved since.
+- Do not read them as a description of the current code. The
+  [repository README](../README.md) and the source under `src/` are.
+- Do not read them as an implementation backlog. The research-phase roadmap is
+  quoted above as a historical record only.
