@@ -52,20 +52,24 @@ pub const ValidationError = error{
     IncompleteGenericMetadata,
     InvalidCoreCallArity,
     InvalidCoreFunctionArity,
+    InvalidCoreCallType,
+    InvalidCoreFunctionType,
 };
-/// Reason text of the most recent `.unsupported` expression this module
-/// rejected, or null when none is pending. The frontend records a precise
-/// reason per unsupported construct ("cast target type", "macro {s}", ...);
-/// without this the only thing a caller could ever see was the bare error.
-/// Thread-local so concurrent validations cannot cross-contaminate.
+/// Reason text of the most recent refusal this module raised, or null when
+/// none is pending. EVERY refusal records one — an unsupported expression, an
+/// unsupported pattern and an unsupported type alike — because a caller that
+/// only sees `error.UnsupportedPattern` cannot tell which of the crate's
+/// patterns was refused, and an error NAME is not a diagnosis. Thread-local so
+/// concurrent validations cannot cross-contaminate.
+///
 /// The reason is COPIED, not borrowed: the IR it names lives in an arena the
 /// failing translation releases before its caller reads the diagnosis back,
 /// and a slice read after that free is a wild pointer.
 threadlocal var pending_reason_buffer: [256]u8 = undefined;
 threadlocal var pending_unsupported_reason: ?[]const u8 = null;
 
-/// Read and clear the pending unsupported-expression reason. Returns null
-/// when the last validation failed for some other reason, or accepted the IR.
+/// Read and clear the pending refusal reason. Returns null when the last
+/// validation failed for some other reason, or accepted the IR.
 pub fn takeUnsupportedReason() ?[]const u8 {
     const reason = pending_unsupported_reason;
     pending_unsupported_reason = null;
@@ -980,11 +984,6 @@ fn validateEnumLiteralDefinition(ir: *const RustIr, id: spine.EntityId) Validati
     if (definition.kind != .enum_) return error.InvalidLiteralDefinition;
 }
 
-fn validateField(ir: *const RustIr, b: *const Bodies, field: items.Field, generic_names: GenericNames) ValidationError!void {
-    if (field.name.len == 0) return error.IncompleteGenericMetadata;
-    try validateType(ir, b, field.ty, generic_names);
-}
-
 fn validateGenericNames(names: GenericNames) ValidationError!void {
     for (names, 0..) |name, index| {
         if (name.len == 0) return error.IncompleteGenericMetadata;
@@ -1005,6 +1004,11 @@ fn validateGenericNames(names: GenericNames) ValidationError!void {
 /// crate, `fn f(x: crate::enc::Iter)` and `impl Iterator for crate::enc::Iter`
 /// alike. The terminal is what keeps this narrow: `enc::Missing` and a bare
 /// `Missing` are still `UnresolvedTypePath`.
+///
+/// A qualified projection is the one shape that does not follow from the
+/// segments alone: `T::Sealed::Buffer` names no declaration until the middle
+/// segment is checked against the trait it resolves to, so it is decided
+/// before the loop above rather than by it.
 fn validateNominalPathSegments(
     ir: *const RustIr,
     b: *const Bodies,
@@ -1013,6 +1017,7 @@ fn validateNominalPathSegments(
 ) ValidationError!void {
     if (path.segments.len == 0) return error.InvalidTypePath;
     if (try validateImplicitSelfPath(ir, b, path, context)) return;
+    if (try validateGenericProjectionPath(ir, b, path, context)) return;
     const terminal_resolved = path.segments[path.segments.len - 1].id != null;
     var generic_root = false;
     for (path.segments, 0..) |segment, index| {
@@ -1078,19 +1083,6 @@ fn isExternalTraitPath(ir: *const RustIr, path: types_mod.Path) bool {
         if (segment.id != null) return false;
     }
     return true;
-}
-
-fn validateTraitPath(
-    ir: *const RustIr,
-    path: types_mod.Path,
-    generic_names: GenericNames,
-    generic_params: []const types_mod.GenericParam,
-) ValidationError!void {
-    return validateTraitPathContext(
-        ir,
-        path,
-        .{ .names = generic_names, .params = generic_params },
-    );
 }
 
 fn validateTraitPathContext(
@@ -1178,20 +1170,6 @@ fn validateBoundContextDepth(
     try validateAssociatedTypeBindingsDepth(ir, b, bound.associated_types, context, depth);
 }
 
-fn validateGenerics(
-    ir: *const RustIr,
-    b: *const Bodies,
-    generics: types_mod.Generics,
-    generic_names: GenericNames,
-) ValidationError!void {
-    return validateGenericsContext(
-        ir,
-        b,
-        generics,
-        generic_names,
-        .{ .names = &.{} },
-    );
-}
 fn validateGenericsContext(
     ir: *const RustIr,
     b: *const Bodies,
@@ -1251,6 +1229,29 @@ const ContextSeen = struct {
     root_types: []bool,
     paired_types: []bool,
 };
+/// The arity rule, written once: how many type parameters a DECLARATION
+/// binds in its own right, or null when the slot holds no declaration.
+///
+/// Inherited parameters are deliberately not counted. An `impl<S> Hasher<S>`
+/// method binds `S`, but an instantiation names the DECLARATION its
+/// parameters appear in: `Hasher<S>` at `Sip24Rounds` is the struct's row.
+///
+/// This is the rule `declaredTypeParamCount` in frontend/infer.zig states
+/// over the same table and `nominalGenericCountForEntity` plus the
+/// instantiation loop in serialize.zig state for `--dump rustir`. Every
+/// count in this file reads this function, including the one that resolves a
+/// `.method_ref` to its declaring signature, so no caller can drift from
+/// another.
+fn declaredTypeParamCount(b: *const Bodies, id: spine.EntityId) ?usize {
+    if (@as(usize, id) >= b.bodies.len) return null;
+    return switch (b.bodies[id]) {
+        .fn_ => |body| body.generic_params.len,
+        .struct_ => |body| body.generic_params.len,
+        .enum_ => |body| body.generic_params.len,
+        else => null,
+    };
+}
+
 /// The declared generic-parameter count of `id`, or null when the entity
 /// carries none.
 ///
@@ -1273,12 +1274,7 @@ fn genericCountForEntity(ir: *const RustIr, id: spine.EntityId) ?usize {
         return 1;
     }
 
-    switch (ir.bodies.bodies[id]) {
-        .fn_ => |body| return body.generic_params.len,
-        .struct_ => |body| return body.generic_params.len,
-        .enum_ => |body| return body.generic_params.len,
-        else => {},
-    }
+    if (declaredTypeParamCount(&ir.bodies, id)) |count| return count;
     return methodRefGenericCount(ir, id);
 }
 
@@ -1333,10 +1329,7 @@ fn methodRefGenericCount(ir: *const RustIr, method_ref: spine.EntityId) ?usize {
         if (candidate.kind != .fn_) continue;
         if (!std.mem.eql(u8, candidate.name, entities[method_ref].name)) continue;
         if (index >= ir.bodies.bodies.len) continue;
-        return switch (ir.bodies.bodies[index]) {
-            .fn_ => |body| body.generic_params.len,
-            else => null,
-        };
+        return declaredTypeParamCount(&ir.bodies, @intCast(index));
     }
     return null;
 }
@@ -1524,8 +1517,30 @@ fn validateImplicitSelfPath(
     }
     if (path.segments.len == 1) return true;
     if (path.segments.len != 3) return error.InvalidTypePath;
-    const trait_segment = path.segments[1];
-    const assoc_segment = path.segments[2];
+    try validateAssociatedProjection(ir, b, path.segments[1], path.segments[2]);
+    return true;
+}
+
+/// What a `<receiver>::Trait::Assoc` step has to satisfy whichever receiver it
+/// is written on: the middle segment resolves to the trait it names, and the
+/// terminal stays a NULL id naming an associated type that trait declares.
+///
+/// One predicate for both receivers, so `Self::Sealed::Buffer` and
+/// `I::Sealed::Buffer` cannot disagree about what the pair means.
+///
+/// The null terminal is the load-bearing half. An `impl`'s own
+/// `type Buffer = ...` is this projection already carried out for ONE concrete
+/// `I`, so a resolved terminal would let the first impl's layout stand in for
+/// the generic the signature is still written on. The trait slot must therefore
+/// resolve to the trait itself — a module or a type that merely sits at that
+/// position is not a projection — and it must be the entity the segment names,
+/// or the segment is spelling a declaration it does not reach.
+fn validateAssociatedProjection(
+    ir: *const RustIr,
+    b: *const Bodies,
+    trait_segment: types_mod.PathSegment,
+    assoc_segment: types_mod.PathSegment,
+) ValidationError!void {
     const trait_id = trait_segment.id orelse return error.UnresolvedTypePath;
     const trait = try entity(ir, trait_id);
     if (trait.kind != .trait_ or
@@ -1540,9 +1555,41 @@ fn validateImplicitSelfPath(
         else => return error.InvalidTypePath,
     } else return error.InvalidEntityReference;
     for (trait_body.assoc_types) |assoc_type| {
-        if (std.mem.eql(u8, assoc_type.name, assoc_segment.name)) return true;
+        if (std.mem.eql(u8, assoc_type.name, assoc_segment.name)) return;
     }
     return error.UnresolvedTypePath;
+}
+
+/// The same step written on a generic parameter rather than on `Self`: `<I as
+/// private::Sealed>::Buffer` reaches the IR as `I::Sealed::Buffer`, the module
+/// prefix and the `as` clause already gone.
+///
+/// Exactly three segments, and the middle one is the only one allowed to carry
+/// an id. The head is a lexical parameter no declaration resolves, and the
+/// terminal stays the trait's own member name. Anything else is not this shape
+/// and keeps whatever the segment loop decided: a bare `T`, an unqualified
+/// `T::Assoc`, a `Self` receiver that `validateImplicitSelfPath` already owns,
+/// and every ordinary module path are untouched.
+///
+/// An unresolved middle segment is what keeps the rule narrow. `T::enc::Iter`
+/// spells a module prefix after a parameter, which no declaration produces, so
+/// it is not claimed here and is left as it was.
+fn validateGenericProjectionPath(
+    ir: *const RustIr,
+    b: *const Bodies,
+    path: types_mod.Path,
+    context: GenericContext,
+) ValidationError!bool {
+    if (path.segments.len != 3) return false;
+    const head = path.segments[0];
+    if (head.id != null) return false;
+    // `Self` is the implicit receiver, never a lexical parameter, and
+    // `validateImplicitSelfPath` decides it wherever it is in scope.
+    if (std.mem.eql(u8, head.name, "Self")) return false;
+    if (!contextGenericNameKnown(context, head.name)) return false;
+    if (path.segments[1].id == null) return false;
+    try validateAssociatedProjection(ir, b, path.segments[1], path.segments[2]);
+    return true;
 }
 
 fn validateType(
@@ -1638,7 +1685,7 @@ fn validateTypeContextDepth(
                 try validateBoundContextDepth(ir, b, bound, context, child_depth);
             }
         },
-        .unsupported => return error.UnsupportedType,
+        .unsupported => |unsupported| return rejectUnsupportedType(unsupported),
     }
 }
 
@@ -1650,13 +1697,60 @@ fn validateExternalNominal(
     depth: usize,
 ) ValidationError!void {
     if (external.path.len == 0) return error.InvalidTypePath;
-    if (!isExternalRoot(ir, external.path)) return error.UnsupportedExternalNominalType;
+    // A single-segment `_` is not an external nominal at all: it is the type
+    // table's stand-in for a Rust `_`, which inference rewrites in place once
+    // the constraints around it name a concrete type. Refusing it here names
+    // the wrong cause — it reports an unsupported external ROOT when nothing
+    // external is involved and the real question is which slot stayed
+    // unattributed — and it refuses a construct the frontend models on
+    // purpose. `IncompleteGenericMetadata` is the accurate answer: the row
+    // exists, its element does not.
+    if (external.path.len == 1 and std.mem.eql(u8, external.path[0], "_")) {
+        return error.IncompleteGenericMetadata;
+    }
+    if (!isExternalRoot(ir, external.path)) return rejectExternalNominal(external.path);
     for (external.path) |segment| {
         if (segment.len == 0) return error.InvalidTypePath;
     }
     for (external.args) |arg| {
         try validateTypeContextDepth(ir, b, arg, context, depth);
     }
+}
+
+/// An external nominal whose root no mapped crate declares. The path is
+/// printed in full: which root was unadmitted is the whole diagnosis, and the
+/// bare error name never said it.
+fn rejectExternalNominal(path: []const []const u8) ValidationError {
+    // The joined path and the full sentence share one stack scratch, with the
+    // path built at the FRONT and the sentence written BEHIND it — formatting
+    // a sentence whose argument points into its own destination would alias.
+    var scratch: [1024]u8 = undefined;
+    var path_length: usize = 0;
+    for (path, 0..) |segment, index| {
+        // A path that already fills the path half of the scratch has nothing
+        // left to say: stop joining rather than slice past the buffer's end.
+        if (path_length >= 512) break;
+        const chunk = std.fmt.bufPrint(scratch[path_length..512], "{s}{s}", .{
+            if (index == 0) "" else "::",
+            segment,
+        }) catch break;
+        path_length += chunk.len;
+    }
+    const sentence = std.fmt.bufPrint(
+        scratch[512..],
+        "external type {s}: root is not a mapped crate, this crate's module, or std/core/alloc",
+        .{scratch[0..path_length]},
+    ) catch blk: {
+        // A path too long to print still leaves its root, which is the part
+        // that decides whether the import is admissible at all.
+        break :blk std.fmt.bufPrint(
+            scratch[512..],
+            "external type root {s}: not a mapped crate or std/core/alloc",
+            .{path[0]},
+        ) catch "external type root: not a mapped crate or std/core/alloc";
+    };
+    recordRefusalReason(sentence);
+    return error.UnsupportedExternalNominalType;
 }
 
 fn validateExternalVariantOwner(
@@ -1732,15 +1826,30 @@ fn coreCallArity(function: exprs.CoreFunction) CoreCallArity {
         .cmp_max => .{ .generic_count = 1, .value_count = 2 },
         .default_value => .{ .generic_count = 1, .value_count = 0 },
         .convert_from => .{ .generic_count = 1, .value_count = 1 },
+        // `u64::from_le_bytes(bytes)` decodes the array named by its single
+        // generic argument, and `x.to_le_bytes()` encodes the value its single
+        // generic argument names. Both are the little-endian pair, so the
+        // generic argument is the INTEGER in both directions — not the array.
+        .prim_from_le_bytes => .{ .generic_count = 1, .value_count = 1 },
+        .prim_to_le_bytes => .{ .generic_count = 1, .value_count = 1 },
+        // The generic argument is T and the result is MaybeUninit<T>.
+        // Any repeated array is a separate `.array` node above the call.
+        // `MaybeUninit::uninit()` takes no value arguments.
+        .maybe_uninit_uninit => .{ .generic_count = 1, .value_count = 0 },
+        // `fill_bytes_via_next` fills `dest` in place and hands nothing back, so
+        // it is two value arguments and no generic ones: the receiver and the
+        // slice. Its identity is the `rand_core::impls` PATH, so there is no
+        // generic argument carrying the type — the receiver's own type is the
+        // only thing that names the generator.
+        .rng_fill_bytes_via_next => .{ .generic_count = 0, .value_count = 2 },
+        // One primitive type argument, two values (hasher and integer).
+        .hash_write_primitive => .{ .generic_count = 1, .value_count = 2 },
+        .numeric_min_value, .numeric_max_value, .numeric_zero, .numeric_one => .{ .generic_count = 1, .value_count = 0 },
     };
 }
 
 fn coreFunctionGenericCount(function: exprs.CoreFunction) usize {
-    return switch (function) {
-        .mem_transmute => 2,
-        .mem_size_of, .mem_size_of_val, .ptr_copy_nonoverlapping, .ptr_write_bytes, .ptr_read_unaligned, .slice_from_raw_parts, .slice_from_raw_parts_mut, .cmp_min, .cmp_max, .default_value, .convert_from => 1,
-        .str_from_utf8, .str_from_utf8_unchecked, .string_from_utf8, .string_from_utf8_lossy, .string_from_utf8_unchecked => 0,
-    };
+    return coreCallArity(function).generic_count;
 }
 
 fn validateCoreFunction(
@@ -1755,6 +1864,7 @@ fn validateCoreFunction(
     for (function.generic_args) |argument| {
         try validateTypeContext(ir, b, argument, context);
     }
+    try validateCoreFunctionTypes(function);
 }
 
 fn validateCoreCallShape(b: *const Bodies, call: exprs.CoreCall) ValidationError!void {
@@ -1781,6 +1891,172 @@ fn validateCoreCall(
     }
 }
 
+/// Shared by translated-IR validation and both v6 wire boundaries.
+/// Existing core operations retain their established nominal wire contract.
+pub fn validateCoreFunctionTypes(
+    function: exprs.CoreFunctionValue,
+) error{ InvalidCoreFunctionArity, InvalidCoreFunctionType }!void {
+    if (function.generic_args.len != coreFunctionGenericCount(function.function)) {
+        return error.InvalidCoreFunctionArity;
+    }
+    switch (function.function) {
+        .prim_from_le_bytes, .prim_to_le_bytes, .hash_write_primitive => {
+            const ty = function.generic_args[0];
+            if (ty != .prim or !isIntegerPrimitive(ty.prim)) {
+                return error.InvalidCoreFunctionType;
+            }
+        },
+        .numeric_min_value, .numeric_max_value, .numeric_zero, .numeric_one => {
+            if (!isNumericCoreType(function.generic_args[0])) {
+                return error.InvalidCoreFunctionType;
+            }
+        },
+        else => {},
+    }
+}
+
+fn isNumericCoreType(ty: Type) bool {
+    return switch (ty) {
+        .prim => |primitive| isIntegerPrimitive(primitive),
+        // Actual generic parameters and local trait implementors are resolved
+        // by the contextual type validator, not by an unattributed fallback.
+        .path, .generic_inst => true,
+        else => false,
+    };
+}
+
+fn coreExpressionType(b: *const Bodies, expression: exprs.Expr) ValidationError!Type {
+    const id = expression.ty orelse return error.InvalidCoreCallType;
+    try validateTypeRef(b, id);
+    return b.types[id];
+}
+
+fn coreArgumentType(b: *const Bodies, id: exprs.NodeId) ValidationError!Type {
+    try validateExprRef(b, id);
+    return coreExpressionType(b, b.exprs[id]);
+}
+
+fn isMutableCoreReceiver(ty: Type) bool {
+    return ty == .reference and ty.reference.mut;
+}
+
+fn isMutableByteSlice(ty: Type) bool {
+    const slice = switch (ty) {
+        .reference => |reference| blk: {
+            if (!reference.mut or reference.pointee != .slice) return false;
+            break :blk reference.pointee.slice;
+        },
+        .slice => |slice| blk: {
+            if (slice.const_) return false;
+            break :blk slice;
+        },
+        else => return false,
+    };
+    return slice.elem == .prim and slice.elem.prim == .u8;
+}
+
+fn isCoreByteImage(b: *const Bodies, ty: Type, primitive: types_mod.Prim) ValidationError!bool {
+    if (ty != .array or ty.array.elem != .prim or ty.array.elem.prim != .u8) return false;
+    switch (ty.array.len) {
+        .literal => |length| return switch (primitive) {
+            .u8, .i8 => length == 1,
+            .u16, .i16 => length == 2,
+            .u32, .i32 => length == 4,
+            .u64, .i64 => length == 8,
+            .u128, .i128 => length == 16,
+            // The IR carries no target configuration. A source literal width
+            // must not be compared with the translator host's pointer size.
+            .usize, .isize => true,
+            else => false,
+        },
+        .expression => |id| {
+            try validateExprRef(b, id);
+            const width = b.exprs[id];
+            const width_ty = try coreExpressionType(b, width);
+            if (width_ty != .prim or width_ty.prim != .usize or width.kind != .core_call) return false;
+            const size = width.kind.core_call;
+            return size.function == .mem_size_of and size.args.len == 0 and
+                size.generic_args.len == 1 and size.generic_args[0] == .prim and
+                size.generic_args[0].prim == primitive;
+        },
+        .generic => return false,
+    }
+}
+
+/// Check the typed contracts of the consumer-visible core operations.
+/// No types are invented here: inference must attribute calls and arguments.
+pub fn validateCoreCallTypes(b: *const Bodies, expression: exprs.Expr) ValidationError!void {
+    const call = switch (expression.kind) {
+        .core_call => |call| call,
+        else => return,
+    };
+    switch (call.function) {
+        .prim_from_le_bytes,
+        .prim_to_le_bytes,
+        .maybe_uninit_uninit,
+        .rng_fill_bytes_via_next,
+        .hash_write_primitive,
+        .numeric_min_value,
+        .numeric_max_value,
+        .numeric_zero,
+        .numeric_one,
+        => {},
+        else => return,
+    }
+    try validateCoreCallShape(b, call);
+    const result = try coreExpressionType(b, expression);
+    switch (call.function) {
+        .prim_from_le_bytes, .prim_to_le_bytes => {
+            const integer = call.generic_args[0];
+            if (integer != .prim or !isIntegerPrimitive(integer.prim)) return error.InvalidCoreCallType;
+            const argument = try coreArgumentType(b, call.args[0]);
+            const value = if (call.function == .prim_from_le_bytes) result else argument;
+            const bytes = if (call.function == .prim_from_le_bytes) argument else result;
+            if (!sameType(integer, value) or !try isCoreByteImage(b, bytes, integer.prim)) {
+                return error.InvalidCoreCallType;
+            }
+        },
+        .maybe_uninit_uninit => {
+            const owner = switch (result) {
+                .external_nominal => |value| value,
+                else => return error.InvalidCoreCallType,
+            };
+            if (owner.path.len != 3 or owner.args.len != 1 or
+                !std.mem.eql(u8, owner.path[0], "core") or
+                !std.mem.eql(u8, owner.path[1], "mem") or
+                !std.mem.eql(u8, owner.path[2], "MaybeUninit") or
+                !sameType(call.generic_args[0], owner.args[0]))
+            {
+                return error.InvalidCoreCallType;
+            }
+        },
+        .rng_fill_bytes_via_next => {
+            if (result != .prim or result.prim != .unit or
+                !isMutableCoreReceiver(try coreArgumentType(b, call.args[0])) or
+                !isMutableByteSlice(try coreArgumentType(b, call.args[1])))
+            {
+                return error.InvalidCoreCallType;
+            }
+        },
+        .hash_write_primitive => {
+            const integer = call.generic_args[0];
+            if (integer != .prim or !isIntegerPrimitive(integer.prim) or
+                result != .prim or result.prim != .unit or
+                !isMutableCoreReceiver(try coreArgumentType(b, call.args[0])) or
+                !sameType(integer, try coreArgumentType(b, call.args[1])))
+            {
+                return error.InvalidCoreCallType;
+            }
+        },
+        .numeric_min_value, .numeric_max_value, .numeric_zero, .numeric_one => {
+            if (!isNumericCoreType(call.generic_args[0]) or !sameType(call.generic_args[0], result)) {
+                return error.InvalidCoreCallType;
+            }
+        },
+        else => unreachable,
+    }
+}
+
 fn markBodyTypeSeen(context_seen: *ContextSeen, index: usize) void {
     context_seen.body_types[index] = true;
     if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
@@ -1803,7 +2079,7 @@ fn validateContextualTypeRef(
     context_seen: *ContextSeen,
 ) ValidationError!void {
     try validateTypeRef(b, id);
-    const index = @as(usize, id);
+    const index: usize = id;
     markBodyTypeSeen(context_seen, index);
     try validateTypeContext(ir, b, b.types[index], context);
     if (index < context_seen.paired_types.len and context_seen.paired_types[index]) {
@@ -1818,7 +2094,7 @@ fn validateContextualRootType(
     context: GenericContext,
     context_seen: *ContextSeen,
 ) ValidationError!void {
-    const index = @as(usize, id);
+    const index: usize = id;
     if (index >= ir.types.len) return error.InvalidTypeRef;
     markRootTypeSeen(context_seen, index);
     try validateTypeContext(ir, b, ir.types[index], context);
@@ -1842,6 +2118,44 @@ fn validateContextualClosure(
     }
 }
 
+/// The count a `vec![e; n]` repeats is `usize` by the language, so the node
+/// that produces it has to say so.
+///
+/// The type is read off the node and resolved in the OWNER's lexical scope
+/// before it is compared, exactly like every other operand type — a count
+/// written on a parameter is only that parameter if the owner binds the name.
+/// No type is invented for an unattributed count: inference owes that node one,
+/// and a count read without one would be a number the IR never established.
+fn validateVecRepeatCountType(
+    ir: *const RustIr,
+    b: *const Bodies,
+    count: exprs.NodeId,
+    context: GenericContext,
+    context_seen: *ContextSeen,
+) ValidationError!void {
+    try validateExprRef(b, count);
+    const type_id = b.exprs[count].ty orelse return error.IncompleteGenericMetadata;
+    try validateContextualTypeRef(ir, b, type_id, context, context_seen);
+    switch (b.types[type_id]) {
+        .prim => |primitive| if (primitive != .usize) {
+            return rejectUnsupportedTypeShape(
+                @as(usize, count),
+                "vec repeat count is typed {s}, not usize",
+                .{@tagName(primitive)},
+            );
+        },
+        // A parameter the owner binds arrives here as a path, and the
+        // contextual read above has already resolved it against that owner —
+        // the same answer `isNumericCoreType` gives an operand count.
+        .path, .generic_inst => {},
+        else => return rejectUnsupportedTypeShape(
+            @as(usize, count),
+            "vec repeat count is typed {s}, which no target evaluates as a length",
+            .{@tagName(b.types[type_id])},
+        ),
+    }
+}
+
 fn validateContextualExpr(
     ir: *const RustIr,
     b: *const Bodies,
@@ -1856,7 +2170,20 @@ fn validateContextualExpr(
         .path => |path| for (path.generic_args) |argument| {
             try validateTypeContext(ir, b, argument, context);
         },
-        .core_call => |call| try validateCoreCall(ir, b, call, context),
+        .vec_lit => |vector| if (vector.repeat) |repeat| switch (repeat) {
+            .expression => |count| try validateVecRepeatCountType(
+                ir,
+                b,
+                count,
+                context,
+                context_seen,
+            ),
+            .literal => {},
+        },
+        .core_call => |call| {
+            try validateCoreCall(ir, b, call, context);
+            try validateCoreCallTypes(b, expression);
+        },
         .core_function => |function| try validateCoreFunction(ir, b, function, context),
         .external_variant => |variant| try validateExternalVariant(ir, b, variant, context),
         .cast => |cast| {
@@ -1916,12 +2243,12 @@ fn validateContextualNode(
 ) ValidationError!void {
     switch (node) {
         .expression => |id| {
-            const index = @as(usize, id);
+            const index: usize = id;
             context_seen.expressions[index] = true;
             try validateContextualExpr(ir, b, b.exprs[index], context, context_seen);
         },
         .statement => |id| {
-            const index = @as(usize, id);
+            const index: usize = id;
             const statement = b.stmts[index];
             context_seen.statements[index] = true;
             if (statement.ty) |type_id| {
@@ -1937,7 +2264,7 @@ fn validateContextualNode(
             }
         },
         .pattern => |id| {
-            const index = @as(usize, id);
+            const index: usize = id;
             const pattern = b.pats[index];
             context_seen.patterns[index] = true;
             if (pattern.ty) |type_id| {
@@ -2228,15 +2555,133 @@ fn isValidCastType(kind: exprs.ConversionKind, source: Type, target: Type) bool 
     };
 }
 
-/// Record the reason the frontend gave for an unsupported expression, then
-/// return the catchable bare error. The reason stays out of the error NAME so
-/// every existing `error.UnsupportedExpression` match keeps working; a caller
-/// that wants the detail reads it back with `takeUnsupportedReason`.
-fn rejectUnsupportedMarker(reason: []const u8) ValidationError {
-    const kept = reason[0..@min(reason.len, pending_reason_buffer.len)];
+/// Copy `text` into the thread-local buffer and publish it as the pending
+/// refusal reason. A reason longer than the buffer is truncated to what fits
+/// rather than dropped: every refusal message leads with the node identity,
+/// so the prefix alone still says which node was refused.
+fn recordRefusalReason(text: []const u8) void {
+    const kept = text[0..@min(text.len, pending_reason_buffer.len)];
     @memcpy(pending_reason_buffer[0..kept.len], kept);
     pending_unsupported_reason = pending_reason_buffer[0..kept.len];
+}
+
+/// Record a refusal reason the frontend already wrote as prose, then return
+/// the catchable bare error. The reason stays out of the error NAME so every
+/// existing `error.UnsupportedExpression` match keeps working; a caller that
+/// wants the detail reads it back with `takeUnsupportedReason`.
+fn rejectUnsupportedMarker(reason: []const u8) ValidationError {
+    recordRefusalReason(reason);
     return error.UnsupportedExpression;
+}
+
+/// Format `"<level> <node>: <detail>"` into the pending-reason buffer.
+///
+/// Every refusal this module raises names the node or the construct it refuses
+/// and what about that node is not lowered, so `takeUnsupportedReason` answers
+/// for all three refusal levels. The level word and the node id are the part a
+/// reader needs first: the bare error name says a pattern or a type was
+/// refused, and this says WHICH one.
+fn refuseWithIndex(
+    err: ValidationError,
+    comptime level: []const u8,
+    node: usize,
+    comptime detail_fmt: []const u8,
+    args: anytype,
+) ValidationError {
+    var scratch: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(
+        &scratch,
+        "{s} {d}: " ++ detail_fmt,
+        .{ level, node } ++ args,
+    ) catch blk: {
+        // A reason longer than the scratch still names its node: the prefix
+        // is written directly into the pending buffer and truncates there.
+        const prefix = std.fmt.bufPrint(
+            &pending_reason_buffer,
+            "{s} {d}: ",
+            .{ level, node },
+        ) catch break :blk pending_reason_buffer[0..0];
+        pending_unsupported_reason = prefix;
+        return err;
+    };
+    recordRefusalReason(text);
+    return err;
+}
+
+/// A PATTERN-level refusal. The pattern row's own `.unsupported` marker
+/// already carries the frontend's reason ("slice pattern", "ref pattern", …);
+/// this attaches the node id so the operator can find the row. A marker that
+/// carries no reason still gets an honest message rather than a bare name.
+fn rejectUnsupportedPattern(index: usize, unsupported: exprs.Unsupported) ValidationError {
+    if (unsupported.reason.len == 0) {
+        return refuseWithIndex(
+            error.UnsupportedPattern,
+            "pattern",
+            index,
+            "this pattern shape is not lowered",
+            .{},
+        );
+    }
+    return refuseWithIndex(
+        error.UnsupportedPattern,
+        "pattern",
+        index,
+        "{s}",
+        .{unsupported.reason},
+    );
+}
+
+/// A TYPE-level refusal. A `.unsupported` type row carries a reason CLASS
+/// (`spine.UnsupportedReason`), a message and a source span; all three are
+/// printed, because the class says what kind of type it is and the span is
+/// the position an operator has to go look at. The type walk is recursive and
+/// carries no row index, so the span — not a table id — is what names the
+/// construct here.
+fn rejectUnsupportedType(unsupported: spine.Unsupported) ValidationError {
+    var scratch: [512]u8 = undefined;
+    const detail = if (unsupported.message.len == 0)
+        "this type shape is not lowered"
+    else
+        unsupported.message;
+    const text = std.fmt.bufPrint(
+        &scratch,
+        "type at {d}:{d}: {s}: {s}",
+        .{
+            unsupported.span.start_line,
+            unsupported.span.start_col,
+            @tagName(unsupported.reason),
+            detail,
+        },
+    ) catch blk: {
+        // A message too long to print still leaves the reason class and the
+        // position, which together identify the row.
+        break :blk std.fmt.bufPrint(
+            &scratch,
+            "type at {d}:{d}: {s}",
+            .{
+                unsupported.span.start_line,
+                unsupported.span.start_col,
+                @tagName(unsupported.reason),
+            },
+        ) catch @tagName(unsupported.reason);
+    };
+    recordRefusalReason(text);
+    return error.UnsupportedType;
+}
+
+/// A TYPE-level refusal this module raises without a `.unsupported` row to
+/// read: the shape is named instead, so the message still says which type
+/// shape the validator would not accept.
+fn rejectUnsupportedTypeShape(index: usize, comptime fmt: []const u8, args: anytype) ValidationError {
+    return refuseWithIndex(error.UnsupportedType, "type", index, fmt, args);
+}
+
+/// An EXPRESSION-level refusal this module raises without a marker to read.
+/// The bare `error.UnsupportedExpression` sites below are validator-side
+/// shape checks, so the message names the shape rather than a construct the
+/// frontend already refused.
+fn rejectUnsupportedExprShape(index: usize, comptime fmt: []const u8, args: anytype) ValidationError {
+    return refuseWithIndex(error.UnsupportedExpression, "expression", index, fmt, args);
 }
 
 fn validateAssertionMarker(b: *const Bodies, reason: []const u8) ValidationError!void {
@@ -2261,13 +2706,28 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
     switch (expr.kind) {
         .literal => {},
         .array => |array| for (array.elements) |id| try validateExprRef(b, id),
-        .vec_lit => |vector| for (vector.elements) |id| try validateExprRef(b, id),
+        .vec_lit => |vector| {
+            for (vector.elements) |id| try validateExprRef(b, id);
+            // A count the target evaluates is a node like any other, and the
+            // walker that would otherwise catch an out-of-bounds one does not
+            // run during validation. The optional is unwrapped first: an
+            // OPTIONAL tagged union is not a union, so no `null` prong is a
+            // shape `switch` can take.
+            if (vector.repeat) |repeat| switch (repeat) {
+                .expression => |count| try validateExprRef(b, count),
+                .literal => {},
+            };
+        },
         .range => |range| {
             try validateExprRef(b, range.start);
             if (range.end) |end| {
                 try validateExprRef(b, end);
             } else if (range.inclusive) {
-                return error.UnsupportedExpression;
+                return rejectUnsupportedExprShape(
+                    index,
+                    "range is inclusive but names no end node",
+                    .{},
+                );
             }
         },
         .path => |path| {
@@ -2283,10 +2743,24 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
         .block => |block| try validateBlock(ir, b, block, &.{}),
         .unit => {},
         .panic_ => {
-            const type_id = expr.ty orelse return error.UnsupportedExpression;
+            const type_id = expr.ty orelse return rejectUnsupportedExprShape(
+                index,
+                "panic expression carries no type, so its result is not never",
+                .{},
+            );
             switch (b.types[type_id]) {
-                .prim => |primitive| if (primitive != .never) return error.UnsupportedExpression,
-                else => return error.UnsupportedExpression,
+                .prim => |primitive| if (primitive != .never) {
+                    return rejectUnsupportedExprShape(
+                        index,
+                        "panic expression is typed {s}, not never",
+                        .{@tagName(primitive)},
+                    );
+                },
+                else => return rejectUnsupportedExprShape(
+                    index,
+                    "panic expression is typed {s}, not the never primitive",
+                    .{@tagName(b.types[type_id])},
+                ),
             }
         },
         .if_else => |if_expr| {
@@ -2383,20 +2857,42 @@ fn validateExpr(ir: *const RustIr, b: *const Bodies, expr: exprs.Expr, index: us
         .cast => |cast| {
             try validateExprRef(b, cast.operand);
             try validateTypeRef(b, cast.target);
-            if (expr.ty == null or expr.ty.? != cast.target) return error.UnsupportedExpression;
+            if (expr.ty == null or expr.ty.? != cast.target) {
+                return rejectUnsupportedExprShape(
+                    index,
+                    "cast result type is not the cast's own target type",
+                    .{},
+                );
+            }
 
             const target = if (cast.target < ir.types.len)
                 ir.types[cast.target]
             else
                 b.types[cast.target];
-            if (!isValidCastType(cast.kind, cast.source_type, target)) return error.UnsupportedExpression;
+            if (!isValidCastType(cast.kind, cast.source_type, target)) {
+                return rejectUnsupportedExprShape(
+                    index,
+                    "cast from {s} to {s} is not a conversion this target expresses",
+                    .{ @tagName(cast.source_type), @tagName(target) },
+                );
+            }
 
             if (b.exprs[cast.operand].ty) |source_id| {
                 try validateTypeRef(b, source_id);
                 const operand_type = b.types[source_id];
-                if (!sameType(cast.source_type, operand_type)) return error.UnsupportedExpression;
+                if (!sameType(cast.source_type, operand_type)) {
+                    return rejectUnsupportedExprShape(
+                        index,
+                        "cast declares a source type the operand does not have",
+                        .{},
+                    );
+                }
             } else switch (target) {
-                .raw_ptr => return error.UnsupportedExpression,
+                .raw_ptr => return rejectUnsupportedExprShape(
+                    index,
+                    "cast to a raw pointer from an operand with no type",
+                    .{},
+                ),
                 else => {},
             }
         },
@@ -2454,9 +2950,19 @@ fn validateIterKind(
         .range => {
             const range = switch (b.exprs[iterable].kind) {
                 .range => |value| value,
-                else => return error.UnsupportedExpression,
+                else => return rejectUnsupportedExprShape(
+                    @as(usize, iterable),
+                    "iterator range source is a {s} node, not a range",
+                    .{@tagName(b.exprs[iterable].kind)},
+                ),
             };
-            if (range.end == null) return error.UnsupportedExpression;
+            if (range.end == null) {
+                return rejectUnsupportedExprShape(
+                    @as(usize, iterable),
+                    "iterator range names no end node",
+                    .{},
+                );
+            }
         },
         .slice, .enumerate => {},
         .multi => |ids| for (ids) |id| try validateExprRef(b, id),
@@ -2473,7 +2979,11 @@ fn validateIteratorChain(ir: *const RustIr, b: *const Bodies, chain: exprs.Itera
             .flat_map => |closure| try validateClosure(ir, b, closure),
             .enumerate, .range_rev => {},
             .zip => |zip| try validateExprRef(b, zip.other),
-            .other => return error.UnsupportedExpression,
+            .other => |unsupported| return rejectUnsupportedExprShape(
+                @as(usize, chain.source),
+                "iterator adapter: {s}",
+                .{unsupported.reason},
+            ),
         }
     }
 }
@@ -2508,7 +3018,7 @@ fn validatePattern(ir: *const RustIr, b: *const Bodies, pattern: exprs.Pattern, 
             if (range.lo) |lo| try validateExprRef(b, lo);
             if (range.hi) |hi| try validateExprRef(b, hi);
         },
-        .unsupported => return error.UnsupportedPattern,
+        .unsupported => |unsupported| return rejectUnsupportedPattern(index, unsupported),
     }
 }
 
@@ -3630,10 +4140,13 @@ fn implOwnedItemIr(
     const method_id: spine.EntityId = 8;
     const assoc_id: spine.EntityId = 9;
 
+    // Every name and slice the returned IR keeps is allocator-owned: the graph
+    // frees its entity names on `deinit`, and a `&.{...}` literal holding a
+    // runtime value would be a stack temporary that dies with this frame.
     _ = try ir.graph.symbol_table.add(.{
         .id = 0,
         .kind = .impl_,
-        .name = "From for EmptyStruct",
+        .name = try allocator.dupe(u8, "From for EmptyStruct"),
         .span = test_span,
         .visibility = .public,
         .parent = struct_id,
@@ -3644,7 +4157,7 @@ fn implOwnedItemIr(
     _ = try ir.graph.symbol_table.add(.{
         .id = 0,
         .kind = .fn_,
-        .name = "from",
+        .name = try allocator.dupe(u8, "from"),
         .span = test_span,
         .visibility = .public,
         .parent = impl_id,
@@ -3655,7 +4168,7 @@ fn implOwnedItemIr(
     _ = try ir.graph.symbol_table.add(.{
         .id = 0,
         .kind = .type_alias,
-        .name = "Target",
+        .name = try allocator.dupe(u8, "Target"),
         .span = test_span,
         .visibility = .public,
         .parent = impl_id,
@@ -3664,22 +4177,29 @@ fn implOwnedItemIr(
         .attributes = &.{},
     });
 
-    const self_type: Type = .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } };
+    const self_segments = try allocator.alloc(types_mod.PathSegment, 1);
+    self_segments[0] = .{ .name = "Self", .id = null };
+    const self_type: Type = .{ .path = .{ .segments = self_segments } };
+    const impl_self_segments = try allocator.alloc(types_mod.PathSegment, 1);
+    impl_self_segments[0] = .{ .name = "EmptyStruct", .id = struct_id };
+    const trait_segments = try allocator.dupe(types_mod.PathSegment, &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "ops", .id = null },
+        .{ .name = "Deref", .id = null },
+    });
+    const generic_params = try allocator.dupe(types_mod.GenericParam, &.{
+        .{ .type_ = .{ .name = "I", .bounds = &.{} } },
+        .{ .type_ = .{ .name = "T", .bounds = &.{} } },
+    });
+    const assoc_items = try allocator.dupe(spine.EntityId, &.{ method_id, assoc_id });
     const old_bodies = ir.bodies.bodies;
     const body_table = try allocator.alloc(bodies_mod.BodyKind, old_bodies.len + 3);
     @memcpy(body_table[0..old_bodies.len], old_bodies);
     body_table[impl_id] = .{ .impl_ = .{
-        .self_ty = .{ .path = .{ .segments = &.{.{ .name = "EmptyStruct", .id = struct_id }} } },
-        .trait_path = .{ .segments = &.{
-            .{ .name = "core", .id = null },
-            .{ .name = "ops", .id = null },
-            .{ .name = "Deref", .id = null },
-        } },
-        .generics = .{ .params = &.{
-            .{ .type_ = .{ .name = "I", .bounds = &.{} } },
-            .{ .type_ = .{ .name = "T", .bounds = &.{} } },
-        }, .where_clauses = &.{} },
-        .assoc_items = &.{ method_id, assoc_id },
+        .self_ty = .{ .path = .{ .segments = impl_self_segments } },
+        .trait_path = .{ .segments = trait_segments },
+        .generics = .{ .params = generic_params, .where_clauses = &.{} },
+        .assoc_items = assoc_items,
     } };
     body_table[method_id] = .{ .fn_ = .{
         .params = &.{},
@@ -3691,15 +4211,20 @@ fn implOwnedItemIr(
     body_table[assoc_id] = .{ .type_alias = .{ .target = assoc_target } };
     ir.bodies.bodies = body_table;
 
-    const method: bodies_mod.StructMethod = .{
+    const method_params = try allocator.dupe(items.Param, &.{.{
+        .name = "into",
+        .ty = method_param_ty,
+        .span = test_span,
+    }});
+    const method_rows = try allocator.dupe(bodies_mod.StructMethod, &.{.{
         .name = "from",
-        .params = &.{.{ .name = "into", .ty = method_param_ty, .span = test_span }},
+        .params = method_params,
         .ret = self_type,
         .body = 0,
         .receiver = .owned,
-    };
+    }});
     var struct_body = ir.bodies.bodies[struct_id].struct_;
-    struct_body.methods = &.{method};
+    struct_body.methods = method_rows;
     @constCast(ir.bodies.bodies)[struct_id] = .{ .struct_ = struct_body };
     return ir;
 }
@@ -4093,6 +4618,119 @@ test "validation rejects explicit unsupported pattern and type" {
     try std.testing.expectError(error.UnsupportedType, validateForTranslation(&unsupported_type));
 }
 
+// The single largest obstacle to closing a corpus row used to be a bare
+// error NAME. Every refusal the translator raises now records a reason that
+// names the node or the construct, so the operator can tell which node was
+// refused and why — at all three levels.
+test "a refused pattern names the pattern row and the construct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var ir = try validReducedIr(allocator);
+    ir.bodies.pats = try allocator.dupe(exprs.Pattern, &.{.{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .unsupported = .{
+            .reason = "slice pattern",
+            .suggested_version = .v3,
+        } },
+    }});
+    try std.testing.expectError(error.UnsupportedPattern, validateForTranslation(&ir));
+    const reason = takeUnsupportedReason().?;
+    // The message is non-empty and names something actionable: the pattern
+    // row id and the construct the frontend refused.
+    try std.testing.expect(std.mem.indexOf(u8, reason, "pattern 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "slice pattern") != null);
+
+    // Reading it is a one-shot: a second read must not replay it.
+    try std.testing.expect(takeUnsupportedReason() == null);
+}
+
+test "a refused pattern with no recorded reason still says which node" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var ir = try validReducedIr(allocator);
+    ir.bodies.pats = try allocator.dupe(exprs.Pattern, &.{.{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .unsupported = .{
+            .reason = "",
+            .suggested_version = .v1,
+        } },
+    }});
+    try std.testing.expectError(error.UnsupportedPattern, validateForTranslation(&ir));
+    const reason = takeUnsupportedReason().?;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "pattern 0") != null);
+}
+
+test "a refused type names the position and the diagnostic class" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var ir = try validReducedIr(allocator);
+    ir.bodies.types = try allocator.dupe(types_mod.Type, &.{.{
+        .unsupported = .{
+            .reason = .std_prelude,
+            .message = "HashMap not yet mapped",
+            .span = .{
+                .start_line = 42,
+                .start_col = 7,
+                .end_line = 42,
+                .end_col = 14,
+            },
+        },
+    }});
+    try std.testing.expectError(error.UnsupportedType, validateForTranslation(&ir));
+    const reason = takeUnsupportedReason().?;
+    // The message is non-empty and names something actionable: the source
+    // position of the type, the frontend's reason class, and its message.
+    try std.testing.expect(std.mem.indexOf(u8, reason, "type at 42:7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "std_prelude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "HashMap not yet mapped") != null);
+}
+
+test "a validator-raised expression refusal names the node and the shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ir = try validReducedIr(arena.allocator());
+    @constCast(ir.bodies.exprs)[1].kind = .{ .range = .{
+        .start = 2,
+        .end = null,
+        .inclusive = true,
+    } };
+    try std.testing.expectError(error.UnsupportedExpression, validateForTranslation(&ir));
+    const reason = takeUnsupportedReason().?;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "expression 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "inclusive") != null);
+}
+
+test "a refused external nominal names the unadmitted root" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var ir = try validReducedIr(allocator);
+    ir.types = &.{.{
+        .external_nominal = .{
+            .path = &.{ "quickcheck", "TestResult" },
+            .args = &.{},
+        },
+    }};
+    try std.testing.expectError(
+        error.UnsupportedExternalNominalType,
+        validateForTranslation(&ir),
+    );
+    const reason = takeUnsupportedReason().?;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "quickcheck::TestResult") != null);
+}
+
 test "validation rejects incomplete generic metadata" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4195,7 +4833,7 @@ fn slicePointerCastIr(
     target: Type,
 ) !RustIr {
     var ir = try validReducedIr(allocator);
-    ir.bodies.types = &.{ source, target };
+    ir.bodies.types = try allocator.dupe(Type, &.{ source, target });
     @constCast(ir.bodies.exprs)[0].ty = 0;
     @constCast(ir.bodies.exprs)[0].kind.block.tail = 1;
     @constCast(ir.bodies.exprs)[1] = .{
@@ -4327,4 +4965,24 @@ test "validation rejects a qualified nominal whose terminal does not resolve" {
         .body = 0,
     } };
     try std.testing.expectError(error.UnresolvedTypePath, validateForTranslation(&ir));
+}
+
+// The arity rule has one copy in this file, and the wire validator reads the
+// same body table. A declaration that binds no type parameter but carries a
+// recorded instantiation row is refused by BOTH `validateForTranslation`
+// and `serialize.encode`, under the SAME error name, so neither can drift
+// into accepting what the other refuses. Change either count and one of the
+// two assertions below fails.
+//
+// Entity 2 is `EmptyStruct`, which declares no parameters, so the row is
+// refused on the ZERO-arity arm (`generic_count == 0`) rather than on the
+// mismatch arm.
+test "an instantiation of a zero-parameter declaration is refused on both sides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var ir = try validReducedIr(allocator);
+    ir.instantiations = &.{.{ .generic_id = 2, .args = .{ .params = &.{} }, .zig_suffix = "EmptyStruct" }};
+    try std.testing.expectError(error.IncompleteGenericMetadata, validateForTranslation(&ir));
+    try std.testing.expectError(error.IncompleteGenericMetadata, serialize.encode(allocator, &ir));
 }

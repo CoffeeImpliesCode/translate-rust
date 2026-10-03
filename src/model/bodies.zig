@@ -40,7 +40,20 @@ pub const StructMethod = struct {
 pub const StructBody = struct {
     generic_params: []const []const u8 = &.{},
     trait_bounds: []const []const u8 = &.{},
-    layout: items.struct_kind = .named,
+    /// The Rust SOURCE FORM of the declaration, never a fact about the fields
+    /// the row happens to carry:
+    ///
+    ///   `struct S;`          → `.unit`    no field list at all
+    ///   `struct S {}`        → `.named`   a named field list, empty
+    ///   `struct S();`        → `.tuple`   an ordered field list, empty
+    ///   `struct S(T);`       → `.tuple`, one field named `"0"`
+    ///   `struct S { t: T }`  → `.named`
+    ///
+    /// The field count cannot decide this. `struct S();` is an ordered list
+    /// holding nothing, and its constructor answers `S()`, not `S {}`. This
+    /// is the same contract the IR states in `src/ir/bodies.zig`; the two
+    /// models of a struct declaration have to agree on it.
+    layout: items.StructKind = .named,
     fields: []const items.Field = &.{},
     methods: []const StructMethod = &.{},
     has_dynamic_resources: bool = false,
@@ -48,9 +61,9 @@ pub const StructBody = struct {
 
 /// Body of an enum definition (kind, variants, optional integer repr, non_exhaustive).
 pub const EnumBody = struct {
-    kind: items.enum_kind = .c_like,
+    kind: items.EnumKind = .c_like,
     variants: []const items.Variant = &.{},
-    repr_int: ?items.int_repr = null,
+    repr_int: ?items.IntRepr = null,
     non_exhaustive: bool = false,
 };
 /// Trait method signature for VTable and TraitObject generation.

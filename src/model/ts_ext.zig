@@ -2011,7 +2011,7 @@ test "lower associated constructor through a compatible type alias" {
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{ fletcher_id, alias_id, caller_id },
+        .items = try alloc.dupe(spine.EntityId, &.{ fletcher_id, alias_id, caller_id }),
         .attributes = &.{},
     });
 
@@ -2153,7 +2153,7 @@ test "refuse rejected numeric and unknown unary expressions while preserving uni
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{function_id},
+        .items = try alloc.dupe(spine.EntityId, &.{function_id}),
         .attributes = &.{},
     });
 

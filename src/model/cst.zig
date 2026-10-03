@@ -69,12 +69,6 @@ fn addEntity(e: *Ctx, kind: spine.EntityKind, name: []const u8, parent: ?spine.E
     return id;
 }
 
-fn appendType(e: *Ctx, t: types.Type) !types.TypeId {
-    const id: types.TypeId = @intCast(e.types_list.items.len);
-    try e.types_list.append(e.alloc, t);
-    return id;
-}
-
 /// Visibility from a tree-sitter visibility_modifier node (or default priv).
 fn visOf(e: *const Ctx, item: ts.Node) spine.Visibility {
     var i: u32 = 0;
@@ -260,31 +254,6 @@ fn unsupportedTy() types.Type {
     return .{ .unsupported = .{ .reason = .cfg_gated, .message = "unsupported type", .span = span_of } };
 }
 
-// ── generics ────────────────────────────────────────────────────────────────
-
-fn collectGenerics(e: *Ctx, item: ts.Node) types.Generics {
-    var params: std.ArrayListUnmanaged(types.GenericParam) = .empty;
-    var i: u32 = 0;
-    while (item.namedChild(i)) |c| : (i += 1) {
-        if (std.mem.eql(u8, c.kind(), "type_parameters")) {
-            var j: u32 = 0;
-            while (c.namedChild(j)) |tp| : (j += 1) {
-                if (std.mem.eql(u8, tp.kind(), "type_parameter")) {
-                    var pname: []const u8 = "";
-                    var q: u32 = 0;
-                    while (tp.namedChild(q)) |cc| : (q += 1) {
-                        if (std.mem.eql(u8, cc.kind(), "type_identifier")) pname = text(e, cc);
-                    }
-                    params.append(e.alloc, .{ .type_ = .{ .name = pname, .bounds = &.{} } }) catch break;
-                } else if (std.mem.eql(u8, tp.kind(), "lifetime_parameter")) {
-                    params.append(e.alloc, .{ .lifetime = .{ .name = "lt" } }) catch break;
-                }
-            }
-        }
-    }
-    return .{ .params = params.toOwnedSlice(e.alloc) catch &.{}, .where_clauses = &.{} };
-}
-
 // ── item lowering ────────────────────────────────────────────────────────────
 
 /// Resolve the field list type for a field_declaration / ordered_field_list.
@@ -348,7 +317,19 @@ fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     }
     const eid = try addEntity(e, .struct_, name, parent);
     const fields = if (fields_node) |fn_| mapFields(e, fn_) else &.{};
-    const layout: items.struct_kind = if (fields.len == 0) .unit else if (tuple) .tuple else .named;
+    // The SOURCE FORM decides the layout, never the field count. Two of the
+    // three field-less forms spell no field at all and are still different
+    // declarations: `struct Unit;` writes no field list, `struct Empty {}`
+    // writes a named one, and `struct Pair();` writes an ordered one that
+    // happens to be empty. Deciding by `fields.len` answers `.unit` for all
+    // three, and an ordered list holding nothing has to stay a tuple — its
+    // constructor is `Pair()`.
+    const layout: items.StructKind = if (tuple)
+        .tuple
+    else if (fields_node == null)
+        .unit
+    else
+        .named;
     e.bodies_list.items[eid] = .{ .struct_ = .{
         .generic_params = &.{},
         .layout = layout,
@@ -367,14 +348,14 @@ fn enumItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     }
     const eid = try addEntity(e, .enum_, name, parent);
     var variants: std.ArrayListUnmanaged(items.Variant) = .empty;
-    var kind: items.enum_kind = .c_like;
+    var kind: items.EnumKind = .c_like;
     if (variants_node) |vn| {
         var j: u32 = 0;
         while (vn.namedChild(j)) |v| : (j += 1) {
             if (!std.mem.eql(u8, v.kind(), "enum_variant")) continue;
             var vname: []const u8 = "";
             var ffields: items.VariantFields = .none;
-            var vkind: items.enum_kind = .c_like;
+            var vkind: items.EnumKind = .c_like;
             var k: u32 = 0;
             while (v.namedChild(k)) |c| : (k += 1) {
                 const kk = c.kind();
@@ -882,4 +863,114 @@ pub fn extractFile(ctx: *Ctx) !void {
     const root = tree.rootNode();
     try mapItems(ctx, root, 0);
     try names.resolveGraph(ctx.alloc, ctx.g);
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+/// Lower one `struct` declaration and return the row the model recorded for
+/// the entity it named. The graph is the same one `extractFile` expects: a
+/// root module row at id 0 and a `.none` body slot for it.
+fn structLayoutOf(alloc: std.mem.Allocator, src: []const u8, name: []const u8) !items.StructKind {
+    var g = graph.CrateGraph.init(alloc);
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span_of,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span_of,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(alloc, .none);
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .src = src,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .base_dir = null,
+        .io = null,
+    };
+    try extractFile(&ctx);
+    // `addEntity` appends one body slot per symbol-table entity in the same
+    // order, so a row's index IS its entity id.
+    for (bodies_list.items, 0..) |row, index| {
+        if (row != .struct_) continue;
+        const entity = g.symbol_table.get(@intCast(index)) orelse continue;
+        if (!std.mem.eql(u8, entity.name, name)) continue;
+        return row.struct_.layout;
+    }
+    return error.StructNotFound;
+}
+
+test "a struct that spells no field list at all is a unit struct" {
+    // `struct Unit;` — the only form with no field list, so the only `.unit`.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    try std.testing.expectEqual(
+        items.StructKind.unit,
+        try structLayoutOf(alloc, "struct Unit;", "Unit"),
+    );
+}
+
+test "a struct with an empty braced field list is a named struct" {
+    // `struct Empty {}` — a named field list that happens to hold nothing. The
+    // field count is zero here too, and the constructor is `Empty {}`.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    try std.testing.expectEqual(
+        items.StructKind.named,
+        try structLayoutOf(alloc, "struct Empty {}", "Empty"),
+    );
+}
+
+test "a struct with an empty ordered field list is a tuple struct" {
+    // `struct Pair();` — an ordered field list holding nothing, and the exact
+    // form a field count cannot tell from `struct Empty {}`. Its constructor
+    // is `Pair()`, so it must stay a tuple.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    try std.testing.expectEqual(
+        items.StructKind.tuple,
+        try structLayoutOf(alloc, "struct Pair();", "Pair"),
+    );
+}
+
+test "the three field-less struct forms are three different declarations" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const src =
+        \\struct Unit;
+        \\struct Empty {}
+        \\struct Pair();
+    ;
+    const unit = try structLayoutOf(alloc, src, "Unit");
+    const named = try structLayoutOf(alloc, src, "Empty");
+    const tuple = try structLayoutOf(alloc, src, "Pair");
+    try std.testing.expectEqual(items.StructKind.unit, unit);
+    try std.testing.expectEqual(items.StructKind.named, named);
+    try std.testing.expectEqual(items.StructKind.tuple, tuple);
+    try std.testing.expect(unit != named);
+    try std.testing.expect(named != tuple);
+    try std.testing.expect(unit != tuple);
 }

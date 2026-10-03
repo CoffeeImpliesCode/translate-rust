@@ -39,14 +39,21 @@ pub const DefaultStrategy = struct {
             .reference => |r| makePtr(!r.mut, .one, try lowerTypeImpl(ctx, r.pointee)),
             .raw_ptr => |r| makePtr(!r.mut, .many, try lowerTypeImpl(ctx, r.pointee)),
             .slice => |s| makeSlice(s.const_, try lowerTypeImpl(ctx, s.elem)),
-            .array => |a| ast.Type{
-                .array = ast.Array{
-                    .elem = box(try lowerTypeImpl(ctx, a.elem)),
-                    .len = switch (a.len) {
-                        .literal => |n| n,
-                        .generic, .expression => return error.TypeRequiresExpressionContext,
+            // IR lengths and AST lengths are both `u64`: a count describes
+            // the target's array, so it must not be narrowed to whatever the
+            // translator's own pointer width happens to be.
+            .array => |a| blk: {
+                const elem_ty = try lowerTypeImpl(ctx, a.elem);
+                const target_len = switch (a.len) {
+                    .literal => |n| n,
+                    .generic, .expression => return error.TypeRequiresExpressionContext,
+                };
+                break :blk ast.Type{
+                    .array = ast.Array{
+                        .elem = box(elem_ty),
+                        .len = target_len,
                     },
-                },
+                };
             },
             .tuple => |elems| blk: {
                 const self: *DefaultStrategy = @ptrCast(@alignCast(ctx));

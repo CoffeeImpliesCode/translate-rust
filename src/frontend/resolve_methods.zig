@@ -6,6 +6,7 @@
 //! 1. Inherent `impl <SelfTy> { fn m }` blocks defined in the crate.
 //! 2. Trait `impl <Trait> for <SelfTy>` blocks defined in the crate.
 //! 3. Built-in std prelude type methods (`Option`, `Result`, slice/array, numerics).
+//! 4. Generic receiver bounds, including source-declared sealed supertraits.
 //!
 //! Ambiguity or unresolvable methods cleanly degrade to `.unsupported` per-node.
 //!
@@ -33,6 +34,7 @@ pub const StdMethod = enum {
     result_is_ok,
     result_is_err,
     result_ok,
+    result_err,
     result_unwrap,
     result_unwrap_err,
     /// Rust `Result::expect(msg)`. Returns the Ok arm, so its type is the Ok
@@ -55,6 +57,7 @@ pub const StdMethod = enum {
     slice_iter_mut,
     slice_split_at,
     slice_split_first,
+    slice_first,
     slice_chunks_exact,
     slice_chunks,
     slice_copy_from_slice,
@@ -133,6 +136,15 @@ pub const StdMethod = enum {
     /// Rust `FromUtf8Error::utf8_error`: the validation detail the error
     /// retains after `String::from_utf8` hands the bytes back separately.
     from_utf8_error_utf8_error,
+    /// Rust `core::str::Utf8Error::valid_up_to`: the byte length of the valid
+    /// UTF-8 prefix, borrowed out of the error's own validation detail.
+    ///
+    /// It is the same value `FromUtf8Error::utf8_error` hands back, and it is
+    /// a separate variant because the two are different receivers: this one
+    /// reads the detail through `&self` and gives the backend nothing to take
+    /// ownership of, while `utf8_error` moves the payload out of the error
+    /// that owns it.
+    utf8_error_valid_up_to,
 
     /// Rust `Into<Cow<'_, B>>` from a value that BORROWS `B`: the same bytes,
     /// tagged `Borrowed`. `&str` into `Cow<str>` and `&[T]` into
@@ -205,22 +217,145 @@ fn parseTraitImplName(name: []const u8) ?TraitImplParts {
     return .{ .trait_name = trait_name, .type_name = type_name };
 }
 
+/// What a receiver IS, as distinct from how it is spelled.
+///
+/// A name is not an identity. siphasher declares `struct Hasher<S>` in `sip`
+/// and again in `sip128`, and the `core::hash::Hasher` both of those modules
+/// import normalizes to the same three letters, so every lookup that matches
+/// on the bare name sees one type where the source wrote three. The declaration
+/// the receiver's own type RECORDS is what dispatch reads; the spelling is
+/// kept only for a receiver that records none, where it is all there is.
+pub const SourceReceiver = struct {
+    /// The type declaration this receiver IS, when its type carries one.
+    declaration: ?spine.EntityId = null,
+    /// That declaration's name, or — for a receiver with no declaration — the
+    /// normalized spelling the fallback lookups match on.
+    name: []const u8 = "",
+};
+
+/// The type declaration a nominal names, when the type RECORDS one.
+///
+/// A `path` records it on its last segment and a `generic_inst` on its `decl`,
+/// so neither is a spelling and neither needs to be re-resolved. An id naming a
+/// trait, a function, a module or a local binding is not a type declaration,
+/// and is refused here rather than handed to a lookup that would treat any
+/// entity as a receiver.
+pub fn nominalDeclarationId(g: *const graph.CrateGraph, t: types.Type) ?spine.EntityId {
+    const recorded: ?spine.EntityId = switch (t) {
+        .path => |path| if (path.segments.len == 0) null else path.segments[path.segments.len - 1].id,
+        .generic_inst => |instance| instance.decl,
+        else => null,
+    };
+    const declaration = recorded orelse return null;
+    const entity = g.symbol_table.get(declaration) orelse return null;
+    return switch (entity.kind) {
+        .struct_, .enum_, .union_, .type_alias => declaration,
+        else => null,
+    };
+}
+
+/// The receiver a declared type stands for: its declaration when the type
+/// records one, and its normalized spelling otherwise.
+///
+/// The peel is `unpeelReceiverType`'s, so this asks the same "what does this
+/// receiver really name" question every other predicate here asks. A raw
+/// pointer peels to nothing `getTypeName` will name, which is the point: it
+/// has no declaration of its own to dispatch on.
+pub fn declaredReceiver(g: *const graph.CrateGraph, t: types.Type) SourceReceiver {
+    const peeled = unpeelReceiverType(t) orelse return .{};
+    if (nominalDeclarationId(g, peeled)) |declaration| {
+        return receiverForDeclaration(g, declaration) orelse return .{};
+    }
+    const spelled = getTypeName(g, peeled) orelse return .{};
+    return .{ .name = normalizeNominalName(spelled) };
+}
+
+/// The receiver one declaration entity stands for, or null when that entity is
+/// not one of the kinds a type declaration takes. Both identity-carrying entry
+/// points build their answer here, so an entity that names a trait or a
+/// function can never become a receiver through one of them.
+fn receiverForDeclaration(
+    g: *const graph.CrateGraph,
+    declaration: spine.EntityId,
+) ?SourceReceiver {
+    const entity = g.symbol_table.get(declaration) orelse return null;
+    return switch (entity.kind) {
+        .struct_, .enum_, .union_, .type_alias => .{
+            .declaration = declaration,
+            .name = entity.name,
+        },
+        else => null,
+    };
+}
+
+/// The receiver a bare spelling stands for: no declaration, because a
+/// normalized name is exactly the thing that cannot stand for one.
+fn spelledReceiver(type_name: ?[]const u8) ?SourceReceiver {
+    const named = type_name orelse return null;
+    const normalized = normalizeNominalName(named);
+    if (normalized.len == 0) return null;
+    return .{ .name = normalized };
+}
+
+/// The receiver an impl block's own NAME declares, as a spelling. `null` for a
+/// blanket impl, which names no receiver at all.
+fn implNameReceiverText(name: []const u8) ?[]const u8 {
+    if (parseTraitImplName(name)) |parts| return parts.type_name;
+    return name;
+}
+
+/// Whether an impl block declares its methods FOR `receiver`.
+///
+/// A receiver that records its declaration is matched by DECLARATION, read
+/// from the impl's own `self_ty`. An impl whose self type names a different
+/// declaration is a different type that happens to share a spelling, and
+/// admitting it is exactly what makes two private modules look ambiguous — or,
+/// worse, binds one module's call to the other's method.
+///
+/// The declaration decides only when BOTH sides have one. A receiver that
+/// records none — the impl's own name is all a method call on an associated
+/// function or on a returned value carries — is decided by spelling, as is an
+/// impl that records none either way: no body in this graph, or a blanket impl
+/// over a type parameter. Every such match is counted, so two of them stay a
+/// refusal rather than a silent first match.
+fn implProvidesFor(
+    g: *const graph.CrateGraph,
+    b: ?*const bodies.Bodies,
+    ent: spine.Entity,
+    receiver: SourceReceiver,
+) bool {
+    const spelled = implNameReceiverText(ent.name) orelse return false;
+    if (b) |table| {
+        if (ent.id < table.bodies.len) {
+            if (table.bodies[ent.id] == .impl_) {
+                const self_declaration = nominalDeclarationId(g, table.bodies[ent.id].impl_.self_ty);
+                if (self_declaration) |declared| {
+                    if (receiver.declaration) |wanted| return declared == wanted;
+                }
+            }
+        }
+    }
+    return nominalNamesEqual(spelled, receiver.name);
+}
+
 fn lookupTraitMethodCandidates(
     g: *const graph.CrateGraph,
-    type_name: []const u8,
+    b: ?*const bodies.Bodies,
+    receiver: SourceReceiver,
     method_name: []const u8,
     trait_name: ?[]const u8,
 ) TraitMethodLookup {
     var lookup: TraitMethodLookup = .{};
-    if (normalizeNominalName(type_name).len == 0 or method_name.len == 0) return lookup;
+    if (method_name.len == 0) return lookup;
+    if (receiver.declaration == null and receiver.name.len == 0) return lookup;
 
     for (g.symbol_table.entities.items) |ent| {
         if (ent.kind != .impl_) continue;
         const parts = parseTraitImplName(ent.name) orelse continue;
-        if (!nominalNamesEqual(parts.type_name, type_name)) continue;
         if (trait_name) |wanted_trait| {
             if (!nominalNamesEqual(parts.trait_name, wanted_trait)) continue;
         }
+        if (!implProvidesFor(g, b, ent, receiver)) continue;
 
         for (g.symbol_table.entities.items) |child| {
             if (child.kind == .fn_ and child.parent == ent.id and
@@ -292,24 +427,135 @@ pub fn lookupInherentMethod(
     type_name: []const u8,
     method_name: []const u8,
 ) ?spine.EntityId {
-    std.debug.assert(type_name.len >= 0);
-    std.debug.assert(method_name.len >= 0);
-    if (normalizeNominalName(type_name).len == 0 or method_name.len == 0) return null;
+    return lookupInherentMethodFor(g, null, .{ .name = type_name }, method_name);
+}
 
+/// The one inherent method `receiver`'s own declaration provides, or null.
+///
+/// Two inherent impls of ONE type declaring one method is the duplicate
+/// definition rustc rejects, so there is no right answer to pick: returning
+/// the first is how one module's `self.short_write(..)` reached the other
+/// module's body without a marker anywhere.
+pub fn lookupInherentMethodFor(
+    g: *const graph.CrateGraph,
+    b: ?*const bodies.Bodies,
+    receiver: SourceReceiver,
+    method_name: []const u8,
+) ?spine.EntityId {
+    if (method_name.len == 0) return null;
+    if (receiver.declaration == null and receiver.name.len == 0) return null;
+
+    var found: ?spine.EntityId = null;
     for (g.symbol_table.entities.items) |ent| {
-        if (ent.kind == .impl_ and parseTraitImplName(ent.name) == null and
-            nominalNamesEqual(ent.name, type_name))
-        {
-            for (g.symbol_table.entities.items) |child| {
-                if (child.kind == .fn_ and child.parent == ent.id and
-                    std.mem.eql(u8, child.name, method_name))
-                {
-                    return child.id;
-                }
+        if (ent.kind != .impl_) continue;
+        if (parseTraitImplName(ent.name) != null) continue;
+        if (!implProvidesFor(g, b, ent, receiver)) continue;
+        for (g.symbol_table.entities.items) |child| {
+            if (child.kind == .fn_ and child.parent == ent.id and
+                std.mem.eql(u8, child.name, method_name))
+            {
+                if (found != null) return null;
+                found = child.id;
             }
         }
     }
-    return null;
+    return found;
+}
+
+/// Source dispatch identity shared by inference and final method resolution.
+/// Ambiguity is distinct from absence: callers must not fall back to a
+/// standard method when competing source traits declare the same method.
+pub const SourceMethodLookup = union(enum) {
+    inherent: spine.EntityId,
+    trait_: spine.EntityId,
+    ambiguous,
+    missing,
+};
+
+/// The method this crate declares for a receiver named only by its spelling,
+/// or the reason there is none to name. A receiver that records a declaration
+/// is dispatched by `lookupSourceMethodFor`, which is the same decision with
+/// the identity the type carries.
+pub fn lookupSourceMethod(
+    g: *const graph.CrateGraph,
+    type_name: []const u8,
+    method_name: []const u8,
+) SourceMethodLookup {
+    return lookupSourceMethodFor(g, null, .{ .name = type_name }, method_name);
+}
+
+/// The method this crate declares for `receiver`, or the reason there is none
+/// to name.
+///
+/// An inherent impl names its receiver as the impl ITSELF: `impl Source` is
+/// this crate declaring that `Source` has inherent methods, so a receiver that
+/// reads `Source` is reading that same declaration rather than guessing at
+/// one. A trait impl has no such entity — its receiver lives inside a longer
+/// name, `impl Default for Bar` — and what that receiver is comes from the
+/// impl's own `self_ty`, never from a parser's split of the text. A receiver
+/// this crate never declares therefore has nothing behind the name, and
+/// answering with the impl would bind the call to a type no declaration here
+/// stands for. That is the same rule `structBodyForNominal` applies before it
+/// hands a receiver a field list: a declaration, never a spelling.
+///
+/// A blanket impl is the case that declares no receiver and still answers,
+/// because `impl<T: Bound> Trait for T` does not name a type at all — it names
+/// a variable. It reaches the receiver through its bound instead, in
+/// `boundTraitMethod`, and never through this lookup.
+pub fn lookupSourceMethodFor(
+    g: *const graph.CrateGraph,
+    b: ?*const bodies.Bodies,
+    receiver: SourceReceiver,
+    method_name: []const u8,
+) SourceMethodLookup {
+    if (lookupInherentMethodFor(g, b, receiver, method_name)) |method| {
+        return .{ .inherent = method };
+    }
+    // A recorded declaration has already cleared this gate: `nominalDeclarationId`
+    // answers only for a struct, enum, union or alias. Only a spelling has to
+    // be proved against the crate's own type declarations.
+    if (receiver.declaration == null and !declaresNominalType(g, receiver.name)) return .missing;
+    const traits = lookupTraitMethodCandidates(g, b, receiver, method_name, null);
+    if (traits.count > 1) return .ambiguous;
+    if (traits.candidate) |method| return .{ .trait_ = method };
+    return .missing;
+}
+
+/// Whether this crate declares a type under `type_name`. Only the kinds a
+/// type declaration takes count: a struct, an enum, a union, or a type alias.
+/// A function, a constant or a module is not a type, and neither is a trait,
+/// so an impl that names one of those as its receiver is not an impl over a
+/// type this dispatch can stand on.
+///
+/// A PRIMITIVE is the one receiver this crate never declares and still stands
+/// on. `impl Label for u64` names its self type outright, and a receiver
+/// typed `u64` is that same type, so requiring a declaration here would
+/// refuse every impl a crate writes over a primitive — with no name to bind
+/// and nothing downstream able to recover one. The gate above is about a
+/// name that EXISTS and is the wrong kind of thing; a primitive is the
+/// language naming a type, which is a different case.
+fn declaresNominalType(g: *const graph.CrateGraph, type_name: []const u8) bool {
+    const name = normalizeNominalName(type_name);
+    if (name.len == 0) return false;
+    if (isPrimitiveTypeName(name)) return true;
+    for (g.symbol_table.entities.items) |entity| {
+        switch (entity.kind) {
+            .struct_, .enum_, .union_, .type_alias => {},
+            else => continue,
+        }
+        if (nominalNamesEqual(entity.name, type_name)) return true;
+    }
+    return false;
+}
+
+/// Whether `name` is a primitive the language itself spells. The spellings
+/// come from `types.Prim` rather than from a second list written here, so
+/// they cannot drift from the names a receiver of that type actually reports.
+fn isPrimitiveTypeName(name: []const u8) bool {
+    inline for (std.enums.values(types.Prim)) |primitive| {
+        if (std.mem.eql(u8, name, @tagName(primitive))) return true;
+    }
+    return false;
 }
 
 /// Lookup a trait method `impl <trait_name> for <type_name> { fn <method_name> }`.
@@ -320,12 +566,22 @@ pub fn lookupTraitMethod(
     type_name: []const u8,
     method_name: []const u8,
 ) ?spine.EntityId {
-    std.debug.assert(trait_name.len >= 0);
-    std.debug.assert(type_name.len >= 0);
-    std.debug.assert(method_name.len >= 0);
-    if (trait_name.len == 0 or type_name.len == 0 or method_name.len == 0) return null;
+    return lookupTraitMethodFor(g, null, trait_name, .{ .name = type_name }, method_name);
+}
 
-    const lookup = lookupTraitMethodCandidates(g, type_name, method_name, trait_name);
+/// `lookupTraitMethod` for a receiver that may record its own declaration, so
+/// two same-named types in two modules never answer for each other.
+pub fn lookupTraitMethodFor(
+    g: *const graph.CrateGraph,
+    b: ?*const bodies.Bodies,
+    trait_name: []const u8,
+    receiver: SourceReceiver,
+    method_name: []const u8,
+) ?spine.EntityId {
+    if (trait_name.len == 0 or method_name.len == 0) return null;
+    if (receiver.declaration == null and receiver.name.len == 0) return null;
+
+    const lookup = lookupTraitMethodCandidates(g, b, receiver, method_name, trait_name);
     if (lookup.count == 1) return lookup.candidate;
     return null;
 }
@@ -390,6 +646,20 @@ fn isExactStdIoType(external: types.ExternalNominal, leaf: []const u8) bool {
         std.mem.eql(u8, external.path[2], leaf);
 }
 
+/// Whether `external` is exactly `core::str::Utf8Error` (or the `std` spelling
+/// of the same type), with no generic arguments.
+///
+/// Full path, for the reason `isExactStdIoType` gives: `Utf8Error` is a name a
+/// crate can declare for something else entirely, and only the whole `str`
+/// module path says this is the validation detail the runtime holds.
+fn isExactStdStrUtf8Error(external: types.ExternalNominal) bool {
+    return external.args.len == 0 and external.path.len == 3 and
+        (std.mem.eql(u8, external.path[0], "core") or
+            std.mem.eql(u8, external.path[0], "std")) and
+        std.mem.eql(u8, external.path[1], "str") and
+        std.mem.eql(u8, external.path[2], "Utf8Error");
+}
+
 /// Whether `external` is exactly the `alloc` (or `std`) nominal the runtime
 /// owns, with the argument count its own std declaration fixes.
 ///
@@ -442,6 +712,7 @@ pub fn lookupStdMethod(
             if (std.mem.eql(u8, method_name, "is_ok")) return .result_is_ok;
             if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
             if (std.mem.eql(u8, method_name, "ok")) return .result_ok;
+            if (std.mem.eql(u8, method_name, "err")) return .result_err;
             if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
             // `unwrap_err` is NOT decided here: whether a `Result` receiver
             // has an error VALUE to hand back depends on how it lowers, not
@@ -470,6 +741,7 @@ pub fn lookupStdMethod(
             if (std.mem.eql(u8, method_name, "split_at")) return .slice_split_at;
             if (std.mem.eql(u8, method_name, "chunks_exact")) return .slice_chunks_exact;
             if (std.mem.eql(u8, method_name, "split_first")) return .slice_split_first;
+            if (std.mem.eql(u8, method_name, "first")) return .slice_first;
             if (std.mem.eql(u8, method_name, "chunks")) return .slice_chunks;
             if (std.mem.eql(u8, method_name, "copy_from_slice")) return .slice_copy_from_slice;
             // `impl<T: Clone> ToOwned for [T] { type Owned = Vec<T> }` is a
@@ -509,6 +781,8 @@ pub fn lookupStdMethod(
             if (is_result) {
                 if (std.mem.eql(u8, method_name, "is_ok")) return .result_is_ok;
                 if (std.mem.eql(u8, method_name, "is_err")) return .result_is_err;
+                if (std.mem.eql(u8, method_name, "ok")) return .result_ok;
+                if (std.mem.eql(u8, method_name, "err")) return .result_err;
                 if (std.mem.eql(u8, method_name, "unwrap")) return .result_unwrap;
                 if (std.mem.eql(u8, method_name, "unwrap_err")) return .result_unwrap_err;
                 if (std.mem.eql(u8, method_name, "expect")) return .result_expect;
@@ -564,6 +838,14 @@ pub fn lookupStdMethod(
             if (isExactAllocNominal(external, "vec", "Vec", 1)) {
                 if (std.mem.eql(u8, method_name, "push")) return .vec_push;
                 if (std.mem.eql(u8, method_name, "extend")) return .vec_extend;
+                // `len` counts the same elements `push` appends, and the
+                // runtime holds them in the storage a slice is read out of, so
+                // this is the slice length over that storage rather than a
+                // second operation with a second answer. Naming `slice_len`
+                // is what lets the backend lower it through the projection it
+                // already has, and it is the same answer `str` and a slice
+                // give for the same question.
+                if (std.mem.eql(u8, method_name, "len")) return .slice_len;
                 // Same blanket `ToOwned` as the string's, for the same reason.
                 if (std.mem.eql(u8, method_name, "to_owned")) return .clone;
             }
@@ -592,6 +874,15 @@ pub fn lookupStdMethod(
             // `core::str::Utf8Error` a direct `str::from_utf8` produces.
             if (isExactAllocNominal(external, "string", "FromUtf8Error", 0) and
                 std.mem.eql(u8, method_name, "utf8_error")) return .from_utf8_error_utf8_error;
+            // `core::str::Utf8Error` is the detail a direct `str::from_utf8`
+            // reports, and it is what `FromUtf8Error::utf8_error` above hands
+            // back. `valid_up_to` reads the length of the valid prefix through
+            // `&self`, so it borrows and gives the backend nothing to take.
+            // The whole path is the test for the same reason `FromUtf8Error`
+            // is: a crate that declares its own `Utf8Error` names a different
+            // type, and answering from the leaf alone would claim its method.
+            if (isExactStdStrUtf8Error(external) and
+                std.mem.eql(u8, method_name, "valid_up_to")) return .utf8_error_valid_up_to;
             // `std::io::Error::kind` is the one std `io` method the runtime
             // owns end to end: the receiver is `r2z.io.Error`, and what it
             // hands back is `r2z.io.ErrorKind`, a payload-free enum compared by
@@ -1003,7 +1294,16 @@ pub fn getTypeName(g: *const graph.CrateGraph, t: types.Type) ?[]const u8 {
         },
         .prim => |p| return @tagName(p),
         .reference => |r| return getTypeName(g, r.pointee),
-        .raw_ptr => |ptr| return getTypeName(g, ptr.pointee),
+        // A raw pointer is NOT the type it points at. Every reader here asks
+        // which DECLARED type a value has so it can reach THAT type's own
+        // impl, and `*const Foo` has none: core's `PartialOrd for *const T`
+        // compares the two POINTERS, so `a < b` over `*const Foo` is not the
+        // `PartialOrd for Foo` this would answer with. Peeling here is what
+        // let a pointer's operator, or its method call, dispatch to the
+        // pointee's declaration. Rust reaches a pointee by dereferencing, and
+        // a dereference is an EXPRESSION whose own type is the pointee, so a
+        // `*p` still names `Foo` without this pretending `p` already does.
+        .raw_ptr => return null,
         .boxed => |b| return getTypeName(g, b.*),
         .@"opaque" => |opaque_type| return if (opaque_type.concrete) |concrete|
             getTypeName(g, concrete.*)
@@ -1253,7 +1553,18 @@ const LocalInitializerFinder = struct {
             .try_ => |try_expr| self.visitExpr(try_expr.inner, depth + 1),
             .return_ => |return_expr| if (return_expr.value) |value| self.visitExpr(value, depth + 1),
             .array => |array| for (array.elements) |element| self.visitExpr(element, depth + 1),
-            .vec_lit => |vec| for (vec.elements) |element| self.visitExpr(element, depth + 1),
+            .vec_lit => |vec| {
+                for (vec.elements) |element| self.visitExpr(element, depth + 1);
+                // `vec![elem; count]` evaluates the element once and the
+                // count once, in that order. A `.literal` count is a number
+                // this pass already holds and has no node to visit; a
+                // `.expression` count is a real child that can bind a local,
+                // so it is visited at the same depth as the element.
+                if (vec.repeat) |repeat| switch (repeat) {
+                    .literal => {},
+                    .expression => |count| self.visitExpr(count, depth + 1),
+                };
+            },
             .range => |range| {
                 self.visitExpr(range.start, depth + 1);
                 if (range.end) |end| self.visitExpr(end, depth + 1);
@@ -1416,7 +1727,8 @@ fn arrayReceiverType(
     const array = g.allocator.create(types.Array) catch return null;
     array.* = .{
         .elem = b.types[element_id.?],
-        .len = .{ .literal = @intCast(array_expr.repeat orelse array_expr.elements.len) },
+        .len = .{ .literal = array_expr.repeat orelse
+            @as(u64, @intCast(array_expr.elements.len)) },
     };
     return .{ .array = array };
 }
@@ -1467,8 +1779,111 @@ fn receiverDeclaredTypeAt(
         // inference.
         .call => |call| callDeclaredReturnType(g, b, call),
         .method_call => methodCallResultType(g, b, receiver_node, depth),
+        // `self.field` is a value of the field's own declared type, and the
+        // struct that declares it is one declaration walk away from the base.
+        // That projection is what a canonical `std` method over a FIELD
+        // receiver is decided from: `self.tail.to_le_bytes()` inside
+        // `impl Hasher for SeaHasher` has a `u64` in the declaration the base
+        // names and nothing else to read it from.
+        .field => |field| fieldReceiverDeclaredType(g, b, field, depth),
         else => null,
     };
+}
+
+/// The declared type of a field read off a receiver that inference left
+/// untyped, taken from the declaration the base names.
+///
+/// It answers a DECLARATION, never a guess. A tuple base answers from its own
+/// element list at the position the source wrote; a nominal base answers from
+/// the struct that base names — through its recorded declaration when it has
+/// one — and only when that struct declares the field. Anything else leaves
+/// the field untyped, which is what keeps a receiver this pass cannot name
+/// refused rather than filled with a type that belongs to something else.
+fn fieldReceiverDeclaredType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    field: exprs.FieldExpr,
+    depth: usize,
+) ?types.Type {
+    const base = receiverDeclaredTypeAt(g, b, field.base, depth + 1) orelse return null;
+    // A tuple and a tuple struct are both addressed POSITIONALLY, and Rust has
+    // no identifier that is all digits, so an all-digit field name is
+    // unambiguously a position: `entry.0` over a `&(String, u8)` and `self.0`
+    // over a `struct Lane(u64)` are the same question.
+    const ordinal = std.fmt.parseInt(usize, field.field, 10) catch null;
+    const named = unpeelReceiverType(base) orelse return null;
+    switch (named) {
+        .tuple => |elements| {
+            const position = ordinal orelse return null;
+            if (position >= elements.len) return null;
+            return elements[position];
+        },
+        // A `generic_inst` is a declaration too: `Hasher<Sip13Rounds>` names
+        // exactly the struct `Hasher` names, and refusing it is what made
+        // `self.hasher.k0` unreadable — the one hop where the receiver is an
+        // instantiation rather than a bare path.
+        .path, .generic_inst => {
+            const structure = structBodyForNominal(g, b, named) orelse return null;
+            for (structure.fields) |declared| {
+                if (std.mem.eql(u8, declared.name, field.field)) return declared.ty;
+            }
+            const position = ordinal orelse return null;
+            if (structure.layout != .tuple or position >= structure.fields.len) return null;
+            return structure.fields[position].ty;
+        },
+        else => return null,
+    }
+}
+
+/// The struct body a nominal base names.
+///
+/// A base that RECORDS its declaration is read through that entity, which is
+/// the whole point: `sip::Hasher` and `sip128::Hasher` are one name over two
+/// layouts, and a field walk that cannot tell them apart hands the caller the
+/// other module's fields. A base that records none is read by name, and only
+/// when exactly one struct in the crate answers to it.
+fn structBodyForNominal(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    nominal: types.Type,
+) ?bodies.StructBody {
+    if (nominalDeclarationId(g, nominal)) |declaration| {
+        if (declaration >= b.bodies.len) return null;
+        return switch (b.bodies[declaration]) {
+            .struct_ => |structure| structure,
+            else => null,
+        };
+    }
+    const path = switch (nominal) {
+        .path => |value| value,
+        else => return null,
+    };
+    if (path.segments.len != 1) return null;
+    return structBodyForUniqueName(g, b, path.segments[0].name);
+}
+
+/// The body of the one struct in this crate that a nominal name declares.
+///
+/// Two declarations under one name are two different layouts, and picking
+/// either would hand a receiver a field list that is not its own, so an
+/// ambiguous name answers nothing.
+fn structBodyForUniqueName(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    type_name: []const u8,
+) ?bodies.StructBody {
+    var found: ?bodies.StructBody = null;
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.kind != .struct_) continue;
+        if (!nominalNamesEqual(entity.name, type_name)) continue;
+        if (found != null) return null;
+        if (entity.id >= b.bodies.len) continue;
+        switch (b.bodies[entity.id]) {
+            .struct_ => |structure| found = structure,
+            else => continue,
+        }
+    }
+    return found;
 }
 
 /// The nominal of the declaration that owns a variant or a struct literal,
@@ -1556,53 +1971,79 @@ fn closureTypeMarker(g: *const graph.CrateGraph) ?types.Type {
     return .{ .fn_ptr = signature };
 }
 
+/// The receiver a node dispatches on: its own declaration when its declared
+/// type records one, and its spelling otherwise. `null` means nothing at all
+/// can be named, which is a different answer from a name that matches no
+/// declaration.
+///
 /// `receiver_ty` is the receiver's declared type, passed in rather than
 /// derived here: every caller has already recovered it for the dispatch it is
 /// about to make, and re-walking the receiver's expression chain to ask the
 /// same question a second time is work for a value the caller holds.
-fn receiverNominalName(
+fn receiverSource(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
     receiver_node: exprs.NodeId,
     receiver_ty: ?types.Type,
-) ?[]const u8 {
+) ?SourceReceiver {
     if (receiver_node >= b.exprs.len) return null;
     const receiver = b.exprs[receiver_node];
+
+    // A value whose own declared type is a raw pointer names no nominal type
+    // in this crate's graph, and every fallback below would answer with the
+    // POINTEE's: an operator resolved against a pointee's `Add`, a method
+    // dispatched to a pointee's impl. Both are a different call over a
+    // different value, so the pointer answers none of them here. What a
+    // pointer DOES own — `add`, `offset`, `read_unaligned` — is decided from
+    // the receiver's type itself, on the arm that does not need a name.
+    if (receiver_ty) |ty| {
+        if (rawPointerType(g, b, ty) != null) return null;
+    }
 
     // The path's resolved EntityId is the local binding identity. Use its
     // declaration/inferred type directly; never infer a type from spelling.
     if (receiver_ty) |ty| {
-        if (getTypeName(g, ty)) |type_name| {
-            const nominal_name = normalizeNominalName(type_name);
-            if (nominal_name.len > 0) return nominal_name;
-        }
+        const declared = declaredReceiver(g, ty);
+        if (declared.declaration != null or declared.name.len > 0) return declared;
     }
 
     if (receiver.kind == .path) {
+        // The linkage below is the INITIALIZER's owner, so a local that is
+        // itself a pointer must not take it either: `let p = Foo::raw();` is a
+        // `*const T` whose nominal is nothing, not a `Foo`. The initializer's
+        // own declared return type says which case this is, and it is read on
+        // the same node the linkage below reads.
+        if (initializerReturnType(g, b, receiver.kind.path)) |ty| {
+            if (rawPointerType(g, b, ty) != null) return null;
+        }
         // A local initializer can carry the only available nominal linkage
         // when inference has not materialized a TypeId. Follow that exact
         // associated-call EntityId; never infer from the local's spelling.
         if (initializerNominalName(g, b, receiver.kind.path)) |type_name| {
             const nominal_name = normalizeNominalName(type_name);
-            if (nominal_name.len > 0) return nominal_name;
+            if (nominal_name.len > 0) return .{ .name = nominal_name };
         }
     }
 
-    return switch (receiver.kind) {
+    const receiver_source: ?SourceReceiver = switch (receiver.kind) {
         .call => |call| switch (call.call_kind) {
-            .associated => |target| inherentImplTypeName(g, target),
+            .associated => |target| spelledReceiver(inherentImplTypeName(g, target)),
             else => null,
         },
-        .method_call => |method| inherentImplTypeName(g, method.method),
+        .method_call => |method| spelledReceiver(inherentImplTypeName(g, method.method)),
         // `FromHexError::OddLength` is a `FromHexError`. A variant node names
         // the enum that owns it, so the receiver's type is recoverable even
-        // when inference left the node untyped.
-        .enum_variant => |variant| if (enumVariantOwner(g, variant.def)) |owner_id|
-            (g.symbol_table.get(owner_id) orelse return null).name
-        else
-            null,
+        // when inference left the node untyped — and by the OWNING entity,
+        // which is the identity the call dispatches on.
+        .enum_variant => |variant| receiverForDeclaration(
+            g,
+            enumVariantOwner(g, variant.def) orelse return null,
+        ),
         else => null,
     };
+    const named = receiver_source orelse return null;
+    if (named.declaration != null or named.name.len > 0) return named;
+    return null;
 }
 
 /// The enum that owns an `enum_variant` expression. The node names the
@@ -1949,6 +2390,9 @@ fn operandIsPrimitive(
         // own question. Asking here is what keeps the two halves from
         // disagreeing — a `len()` this pass names is `usize` to both.
         .method_call => isScalarOperandType(g, b, stdMethodResultType(g, b, node, 0) orelse return false),
+        // Match the resolved-type gate for source calls as well: the
+        // callee's declaration, not the missing inference pin, names its value.
+        .call => |call| isScalarOperandType(g, b, callDeclaredReturnType(g, b, call) orelse return false),
         .binary => |binary| operandIsPrimitive(g, b, binary.lhs) and operandIsPrimitive(g, b, binary.rhs),
         .cast => true,
         else => false,
@@ -2051,7 +2495,35 @@ fn isRetainedSliceIteratorMemberMethod(method_name: []const u8) bool {
         std.mem.eql(u8, method_name, "clone");
 }
 
-/// Whether `name` is one of the two `std::io` methods the runtime owns end to
+/// The `std::io` trait methods the runtime owns end to end, each with the one
+/// trait that declares it.
+///
+/// A trait method with no entity of its own has to be recognized by the trait
+/// that declares it, so the pair is the whole fact: `read_exact` is `Read`'s,
+/// `write_all` is `Write`'s, and `fill_buf`/`consume` are `BufRead`'s. Rust
+/// declares `fill_buf` on `BufRead` and not on `Read`, so a receiver bounded
+/// only by `Read` is not one this answers — which is exactly the distinction a
+/// name-keyed rule would lose, and the reason `stdIoWriteMethodAllocates`
+/// below asks this same table rather than a name of its own.
+///
+/// `BufRead: Read` is the supertrait relation, so a receiver bounded by
+/// `BufRead` also carries `read_exact`. That direction is not walked here: a
+/// source that declares only `BufRead` and calls `read_exact` is one the
+/// frontend cannot prove from the declaration alone, so it keeps its own
+/// refusal rather than being answered from a bound that was never written.
+const RuntimeIoMethod = struct { name: []const u8, trait_path: []const []const u8 };
+
+const runtime_io_methods = [_]RuntimeIoMethod{
+    .{ .name = "read_exact", .trait_path = &.{ "std", "io", "Read" } },
+    .{ .name = "write_all", .trait_path = &.{ "std", "io", "Write" } },
+    // `pub trait BufRead { fn fill_buf(&mut self) -> Result<&[u8]>; fn consume(&mut self, amt: usize); }`
+    // — both borrowed through `&mut self`, and `fill_buf` returns the same
+    // `io::Result` every other fallible `io` method returns.
+    .{ .name = "fill_buf", .trait_path = &.{ "std", "io", "BufRead" } },
+    .{ .name = "consume", .trait_path = &.{ "std", "io", "BufRead" } },
+};
+
+/// Whether `name` is one of the `std::io` methods the runtime owns end to
 /// end, called on a receiver that is proven to implement the trait that
 /// declares it.
 ///
@@ -2079,32 +2551,38 @@ fn isRuntimeIoMethod(
     receiver: types.Type,
     name: []const u8,
 ) bool {
-    const trait_path: []const []const u8 = if (std.mem.eql(u8, name, "read_exact"))
-        &.{ "std", "io", "Read" }
-    else if (std.mem.eql(u8, name, "write_all"))
-        &.{ "std", "io", "Write" }
-    else
-        return false;
+    // One std trait method, one std trait it hangs from, so the identity
+    // question is always the same one and it is asked against the receiver's
+    // DECLARED bound rather than the method's name.
+    const io_trait: []const []const u8 = for (runtime_io_methods) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) break entry.trait_path;
+    } else return false;
     if (g.symbol_table.get(method_id)) |method| {
         if (method.parent) |owner| {
-            if (bodies.genericBound(g, b, owner, receiver, trait_path) != null) return true;
+            if (bodies.genericBound(g, b, owner, receiver, io_trait) != null) return true;
         }
     }
     const owner = expressionOwner(g, b, receiver_node, 0) orelse return false;
-    return bodies.genericBound(g, b, owner, receiver, trait_path) != null;
+    return bodies.genericBound(g, b, owner, receiver, io_trait) != null;
 }
 
 /// Whether the expression at `node` is the general `std::io::Write::write_all`
 /// the runtime lowers through an explicit allocator.
 ///
-/// The two `std::io` methods are not alike here. `read_exact` fills a buffer
-/// the caller already owns and copies nothing, so a body that calls it
+/// The `read_exact`/`write_all` pair is not alike here. `read_exact` fills a
+/// buffer the caller already owns and copies nothing, so a body that calls it
 /// allocates nothing and must not be marked for it. `write_all` hands the
 /// writer's own bytes to `r2z.io.write_all`, which can grow a `Vec` and so
 /// needs a `gpa` the runtime has no way to invent; a body that calls it is
 /// allocating and the backend sources one. Marking the wrong one is not a
 /// missed effect but a fabricated one, so `read_exact` is not answered here at
 /// all.
+///
+/// `fill_buf` and `consume` are answered here at all: `fill_buf` borrows the
+/// reader's existing buffer and copies nothing, and `consume` only advances
+/// how much of it has been handed back. Neither allocates, and neither is
+/// named by this function, which is the point — this asks the table for the
+/// ONE method whose effect the runtime has to be handed an allocator for.
 ///
 /// The proof is `isRuntimeIoMethod` — the same one the dispatch in
 /// `resolveMethods` admits the call with — so the effect recorded here and the
@@ -2213,6 +2691,201 @@ pub fn stdResultCleanupAllocates(
     return is_expect_err;
 }
 
+pub const BoundTraitMethod = struct {
+    trait_id: spine.EntityId,
+    signature: bodies.TraitMethodSig,
+};
+
+const BoundMethodSearch = struct {
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    name: []const u8,
+    visited: [128]spine.EntityId = undefined,
+    visited_len: usize = 0,
+    result: ?BoundTraitMethod = null,
+    ambiguous: bool = false,
+
+    fn visit(self: *BoundMethodSearch, bounds: []const types.Bound) void {
+        for (bounds) |bound| {
+            if (bound.optional or bound.path.segments.len == 0) continue;
+            const terminal = bound.path.segments[bound.path.segments.len - 1];
+            var id = terminal.id orelse continue;
+            if (self.g.useById(id)) |use_decl| {
+                if (use_decl.kind == .external) continue;
+                id = use_decl.target;
+            }
+            const entity = self.g.symbol_table.get(id) orelse continue;
+            if (entity.kind != .trait_ or id >= self.b.bodies.len) continue;
+            var seen = false;
+            for (self.visited[0..self.visited_len]) |previous| {
+                if (previous == id) seen = true;
+            }
+            if (seen or self.visited_len == self.visited.len) continue;
+            self.visited[self.visited_len] = id;
+            self.visited_len += 1;
+            const trait_body = switch (self.b.bodies[id]) {
+                .trait_ => |value| value,
+                else => continue,
+            };
+            var declared = false;
+            for (trait_body.methods) |signature| {
+                if (!std.mem.eql(u8, signature.name, self.name)) continue;
+                if (self.result != null and self.result.?.trait_id != id) self.ambiguous = true;
+                self.result = .{ .trait_id = id, .signature = signature };
+                declared = true;
+            }
+            // A redeclared method shadows that name on its supertraits.
+            if (declared) continue;
+            if (trait_body.generics) |generics| {
+                for (generics.where_clauses) |clause| {
+                    if (clause.self_ty.segments.len == 1 and
+                        std.mem.eql(u8, clause.self_ty.segments[0].name, "Self"))
+                    {
+                        self.visit(clause.bounds);
+                    }
+                }
+            }
+        }
+    }
+};
+
+/// The source declaration providing a generic receiver's method. A bare
+/// parameter name is not evidence: only its bounds in the enclosing callable
+/// and impl scopes can reach a trait signature, including a sealed supertrait.
+pub fn boundTraitMethod(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    owner: spine.EntityId,
+    receiver: types.Type,
+    name: []const u8,
+) ?BoundTraitMethod {
+    var search: BoundMethodSearch = .{ .g = g, .b = b, .name = name };
+    var value = receiver;
+    peel: for (0..128) |_| {
+        switch (value) {
+            .reference => |reference| value = reference.pointee,
+            .boxed => |boxed| value = boxed.*,
+            else => break :peel,
+        }
+    } else return null;
+    switch (value) {
+        .dyn_trait => |bounds| search.visit(bounds),
+        .@"opaque" => |opaque_type| search.visit(opaque_type.bounds),
+        .path => |path| {
+            if (path.segments.len != 1) return null;
+            const parameter_name = path.segments[0].name;
+            var current: ?spine.EntityId = owner;
+            var remaining = g.symbol_table.entities.items.len;
+            while (current) |id| {
+                if (remaining == 0 or id >= b.bodies.len) break;
+                remaining -= 1;
+                const generics = switch (b.bodies[id]) {
+                    .fn_ => |function| function.generics,
+                    .impl_ => |implementation| implementation.generics,
+                    .trait_ => |trait_body| trait_body.generics,
+                    else => null,
+                };
+                if (generics) |parameters| {
+                    for (parameters.params) |parameter| {
+                        if (parameter == .type_ and
+                            std.mem.eql(u8, parameter.type_.name, parameter_name))
+                        {
+                            search.visit(parameter.type_.bounds);
+                        }
+                    }
+                    for (parameters.where_clauses) |clause| {
+                        if (clause.self_ty.segments.len == 1 and
+                            std.mem.eql(u8, clause.self_ty.segments[0].name, parameter_name))
+                        {
+                            search.visit(clause.bounds);
+                        }
+                    }
+                }
+                const entity = g.symbol_table.get(id) orelse break;
+                current = entity.parent;
+            }
+        },
+        else => return null,
+    }
+    return if (search.ambiguous) null else search.result;
+}
+
+/// The exact num_traits declaration for an overflow-checked operation.
+pub fn numericMethodTrait(name: []const u8) ?[]const []const u8 {
+    if (std.mem.eql(u8, name, "checked_add")) return &.{ "num_traits", "ops", "checked", "CheckedAdd" };
+    if (std.mem.eql(u8, name, "checked_sub")) return &.{ "num_traits", "ops", "checked", "CheckedSub" };
+    if (std.mem.eql(u8, name, "checked_mul")) return &.{ "num_traits", "ops", "checked", "CheckedMul" };
+    return null;
+}
+
+pub fn hasCheckedNumericBound(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    owner: spine.EntityId,
+    receiver: types.Type,
+    name: []const u8,
+) bool {
+    const canonical = numericMethodTrait(name) orelse return false;
+    if (bodies.genericBound(g, b, owner, receiver, canonical) != null) return true;
+    // num_traits publicly re-exports these same traits at its crate root.
+    const exported = [_][]const u8{ "num_traits", canonical[3] };
+    return bodies.genericBound(g, b, owner, receiver, &exported) != null;
+}
+
+fn methodBoundOwner(g: *const graph.CrateGraph, b: *const bodies.Bodies, method: exprs.MethodCall) ?spine.EntityId {
+    if (g.symbol_table.get(method.method)) |entity| {
+        if (entity.parent) |parent| {
+            if (g.symbol_table.get(parent)) |scope| {
+                if (scope.kind == .fn_ or scope.kind == .impl_) return parent;
+            }
+        }
+    }
+    return expressionOwner(g, b, method.receiver, 0);
+}
+
+/// Keep generic Hasher writes deferred until their actual receiver is known.
+/// A translated implementation may override the native-endian std default.
+pub fn hasHasherPrimitiveBound(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    owner: spine.EntityId,
+    receiver: types.Type,
+    name: []const u8,
+) bool {
+    const names = [_][]const u8{
+        "write_u8", "write_u16", "write_u32", "write_u64", "write_u128", "write_usize",
+        "write_i8", "write_i16", "write_i32", "write_i64", "write_i128", "write_isize",
+    };
+    for (names) |method_name| {
+        if (std.mem.eql(u8, method_name, name)) {
+            return bodies.genericBound(g, b, owner, receiver, &.{ "core", "hash", "Hasher" }) != null;
+        }
+    }
+    return false;
+}
+
+/// Standard Hash/Hasher signatures on a receiver whose own scope proves the
+/// trait. Keep the call deferred: translated Bytes::hash and Hasher overrides
+/// must still be selected when the generic receiver becomes concrete.
+pub fn boundHashMethodReturnType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    owner: spine.EntityId,
+    receiver: types.Type,
+    name: []const u8,
+) ?types.Type {
+    if (std.mem.eql(u8, name, "hash")) {
+        if (bodies.genericBound(g, b, owner, receiver, &.{ "core", "hash", "Hash" }) == null) return null;
+        return .{ .prim = .unit };
+    }
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "finish")) {
+        if (bodies.genericBound(g, b, owner, receiver, &.{ "core", "hash", "Hasher" }) == null) return null;
+        return .{ .prim = if (std.mem.eql(u8, name, "finish")) .u64 else .unit };
+    }
+    if (hasHasherPrimitiveBound(g, b, owner, receiver, name)) return .{ .prim = .unit };
+    return null;
+}
+
 fn isBoundStandardMethod(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
@@ -2225,15 +2898,17 @@ fn isBoundStandardMethod(
     // this bound is proven from the crate's own trait impls instead of from
     // the method's generic bounds.
     if (std.mem.eql(u8, name, "to_string")) {
-        const type_name = getTypeName(g, receiver) orelse return false;
         // Requiring the `fmt` member is deliberate: it is the evidence that a
         // `Display` path exists, and it is exactly what `r2z.format.write`
         // calls on the lowered type. `Debug` is not a substitute, because
-        // Rust declares only `impl<T: Display + ?Sized> ToString for T`.
-        return lookupTraitMethod(g, "Display", type_name, "fmt") != null;
+        // Rust declares only `impl<T: Display + ?Sized> ToString for T`. The
+        // impl is found through the receiver's own declaration when it has
+        // one, so two private types that share a name cannot lend each other
+        // a `fmt`.
+        return lookupTraitMethodFor(g, b, "Display", declaredReceiver(g, receiver), "fmt") != null;
     }
-    const method = g.symbol_table.get(expression.kind.method_call.method) orelse return false;
-    const owner = method.parent orelse return false;
+    const owner = methodBoundOwner(g, b, expression.kind.method_call) orelse return false;
+    if (hasCheckedNumericBound(g, b, owner, receiver, name)) return true;
     if (std.mem.eql(u8, name, "as_ref")) {
         return bodies.genericBound(g, b, owner, receiver, &.{ "core", "convert", "AsRef" }) != null;
     }
@@ -2484,8 +3159,9 @@ fn resolveAssociatedTraitCall(g: *const graph.CrateGraph, b: *const bodies.Bodie
     for (trait_body.methods) |signature| {
         if (!std.mem.eql(u8, signature.name, method.name)) continue;
         const receiver = associatedSelfType(signature.ret, b.types[result_id], 0) orelse return false;
-        const name = getTypeName(g, receiver) orelse return false;
-        const implementation = lookupTraitMethod(g, trait_entity.name, name, method.name) orelse return false;
+        const receiver_source = declaredReceiver(g, receiver);
+        if (receiver_source.declaration == null and receiver_source.name.len == 0) return false;
+        const implementation = lookupTraitMethodFor(g, b, trait_entity.name, receiver_source, method.name) orelse return false;
         expression.kind.call.call_kind = .{ .associated = implementation };
         return true;
     }
@@ -2566,8 +3242,8 @@ fn ioErrorKindType(g: *const graph.CrateGraph) ?types.Type {
 ///   still names the arm its own receiver has.
 /// - `len()` returns the element count of the sequence it is called on, and
 ///   `usize` is that count's type in every Rust build. A slice, a `[T; N]`,
-///   and an owned `String` are all a count of owned bytes, and all lower to a
-///   Zig `.len`.
+///   a `str`, an owned `String`, and a `Vec<T>` are all a count of what the
+///   receiver holds, and all lower to a Zig `.len` over that storage.
 /// - `String::as_bytes(&self) -> &[u8]` names the bytes the string owns. Only
 ///   the owned `String` receiver names it; a slice's own `as_bytes` and a
 ///   `&str` reach different runtime types and stay unresolved here. The shape
@@ -2609,10 +3285,15 @@ fn stdMethodResultType(
     if (is_len) {
         // The evidence is the dispatch the resolver admits the call on, so
         // this cannot name a `len` the resolver would refuse: only a receiver
-        // `lookupStdMethod` matches the slice `len` or the owned `String` one
-        // for is typed here. A `Vec` receiver, or an
-        // `ExactSizeIterator::len` on an iterator, keeps its own signature and
-        // stays unresolved.
+        // `lookupStdMethod` matches for is typed here. That is a slice and a
+        // `str`, through `slice_len`, the owned `String` through
+        // `string_len`, and a `Vec<T>` — whose elements live in the storage
+        // the slice length already reads — through the same `slice_len`. All
+        // of them count what the receiver holds and all answer `usize`.
+        //
+        // An `ExactSizeIterator::len` on an iterator is what stays unresolved:
+        // no runtime `len` backs it, it keeps its own signature, and naming a
+        // result for it would hand an operator a value nothing builds.
         const std_method = lookupStdMethod(receiver_ty, "len") orelse return null;
         if (std_method != .slice_len and std_method != .string_len) return null;
         return .{ .prim = .usize };
@@ -2778,23 +3459,29 @@ fn boundOperator(
         operandHasGenericBound(g, b, rhs, trait_path);
 }
 
-/// One edge of core's own supertrait graph, as `core/src/cmp.rs` declares it:
-/// `PartialOrd<Rhs>: PartialEq<Rhs>`, `Eq: PartialEq<Self>`, and
-/// `Ord: Eq + PartialOrd<Self>`.
+/// One edge of a std supertrait graph, as that std's own declaration spells
+/// it: `core/src/cmp.rs` gives `PartialOrd<Rhs>: PartialEq<Rhs>`,
+/// `Eq: PartialEq<Self>` and `Ord: Eq + PartialOrd<Self>`, and
+/// `num_traits/src/identities.rs` gives `Zero: Add<Self, Output = Self>`.
 ///
 /// These are the whole table because they are the supertraits this pass is
-/// asked about, and each edge is one std's own declaration spells out. A
+/// asked about, and each edge is one std's own declaration spelled out. A
 /// bound that reaches an operator trait through the table is therefore a
 /// bound Rust admits, which is what makes the operator valid source before it
 /// ever reaches this pass. Nothing here is an unrelated capability granted to
 /// a bound that does not have it: `Eq` buys `==` and not `<`, because only
 /// the edges below are walked.
 ///
-/// No crate trait appears in it. A crate's `trait Eq` is a different trait
-/// from `core::cmp::Eq` and nothing in this graph says what it requires, so
-/// `bodies.genericBound` — which a crate-local trait can never satisfy for a
-/// `core::` path, because its module is not an extern one — stays the only
-/// thing that decides whether a declared bound IS a core one.
+/// The `num_traits::Zero` edge is there because it is that crate's own
+/// declaration, and it is what a bound written `I: Zero` proves: atoi's `nth`
+/// is `fn nth<I: Zero + One>(..) { .. i = i + I::one(); .. }`, which is valid
+/// Rust because `Zero` already requires `Add`. Refusing it says the frontend
+/// does not know a supertrait, not that the source is wrong.
+///
+/// Every path in the table is EXTERNAL, which is what keeps a crate's own
+/// `trait Eq` — or its own `trait Zero` — out of it: `bodies.genericBound`
+/// decides through `boundPathMatches`, and a crate-local trait can never
+/// answer for a path rooted in another crate's module.
 const CoreSupertrait = struct {
     from: []const []const u8,
     to: []const []const u8,
@@ -2805,6 +3492,7 @@ const core_supertraits = [_]CoreSupertrait{
     .{ .from = &.{ "core", "cmp", "Eq" }, .to = &.{ "core", "cmp", "PartialEq" } },
     .{ .from = &.{ "core", "cmp", "Ord" }, .to = &.{ "core", "cmp", "Eq" } },
     .{ .from = &.{ "core", "cmp", "Ord" }, .to = &.{ "core", "cmp", "PartialOrd" } },
+    .{ .from = &.{ "num_traits", "Zero" }, .to = &.{ "core", "ops", "Add" } },
 };
 
 /// How deep the table is followed. Its longest chain is two edges, so this is
@@ -2981,6 +3669,20 @@ fn builtInEqualityType(b: *const bodies.Bodies, ty: types.Type) bool {
         .slice, .array, .option, .raw_ptr => true,
         .result => |result| equalityPayloadComparable(result.ok, 0) and
             equalityPayloadComparable(result.err, 0),
+        // A Rust tuple lowers to an anonymous Zig `struct`, and `r2z.ops.equal`
+        // is what every non-primitive operand already routes through: it
+        // compares a struct with `std.meta.eql` when the whole type is
+        // comparable and walks it FIELD BY FIELD when it is not. A tuple is
+        // comparable exactly when every element is, which is the same question
+        // the `Result` arm above asks of its two payloads and the same walk
+        // that reaches them.
+        //
+        // The tuple is the type `atoi`'s own `#[cfg(test)]` module compares:
+        // `assert_eq!((Some(255), 3), u8::from_radix_10_checked(b"255"))` is
+        // valid Rust, and the emitter spells it `r2z.ops.equal(.{ a, b }, .{
+        // c, d })` over two `struct { ?u8, usize }` values. Refusing it said the
+        // frontend does not know a tuple, not that the source was wrong.
+        .tuple => |elements| tupleElementsComparable(elements),
         // `std::io::ErrorKind` is a payload-free std enum the backend lowers to
         // `r2z.io.ErrorKind`, and Zig compares a tag by value. The path is
         // matched in full, so no other std `io` nominal and no crate's own
@@ -2996,6 +3698,27 @@ fn builtInEqualityType(b: *const bodies.Bodies, ty: types.Type) bool {
         .path => |path| enumVariantsComparable(b, path),
         else => false,
     };
+}
+
+/// Whether every element of a tuple is a value `r2z.ops.equal` can compare.
+///
+/// The tuple itself lowers to an anonymous Zig `struct`, so the walk the
+/// runtime performs is the one it performs for any other struct: it compares
+/// the whole value with `std.meta.eql` when every field is natively
+/// comparable, and otherwise descends field by field. Either way it reaches
+/// each element through the same `equal` this recursion asks about, so one
+/// element that carries no comparable value — a trait object, a function
+/// pointer — refuses the whole tuple, exactly as it refuses a `Result` that
+/// carries one.
+///
+/// The depth bound and the recursion are `equalityPayloadComparable`'s own: it
+/// is the same question the `Result` arm above asks, and the tuple only adds
+/// the step that asks it once per element.
+fn tupleElementsComparable(elements: []const types.Type) bool {
+    for (elements) |element| {
+        if (!equalityPayloadComparable(element, 0)) return false;
+    }
+    return true;
 }
 
 /// A crate enum, which the runtime compares as a tagged union: the tag first,
@@ -3060,7 +3783,14 @@ fn arrayElementType(ty: types.Type) ?types.Type {
 /// Repeat length of a local's `[element; N]` initializer, when the local has
 /// exactly that shape. `let mut output = [0; 4 * 2];` has no declared type,
 /// so its length is only recoverable from the initializer.
-fn repeatedArrayInitializerLen(g: *const graph.CrateGraph, b: *const bodies.Bodies, node: exprs.NodeId) ?usize {
+///
+/// The length is a target count and is `u64`; it is compared against an
+/// array type literal, which is `u64` too.
+fn repeatedArrayInitializerLen(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    node: exprs.NodeId,
+) ?u64 {
     if (node >= b.exprs.len) return null;
     const target = switch (b.exprs[node].kind) {
         .unary => |unary| unary.operand,
@@ -3100,6 +3830,78 @@ fn untypedArrayEqualityOperand(
     return builtInEqualityType(b, .{ .array = array });
 }
 
+/// The operators core implements over a raw pointer.
+///
+/// `impl PartialEq for *const T` and `impl PartialOrd for *const T` compare
+/// the two ADDRESSES, so a comparison of two `*const u8` is a typed binary
+/// operator over two values of the same pointer type — `end_ptr > ptr` in
+/// `seahash/src/buffer.rs:47` and `ptr == scope` in `syn/src/buffer.rs:137`
+/// are both this. Nothing else reads a pointer through a binary operator:
+/// Rust has no `Add`/`Sub`/`Mul`/`BitAnd` for one (`ptr + n` is `offset`), so
+/// every arithmetic spelling stays a method call the runtime owns and a
+/// pointer never becomes a scalar operand.
+fn isRawPointerComparison(op: exprs.BinaryOp) bool {
+    return switch (op) {
+        .eq, .ne, .lt, .le, .gt, .ge => true,
+        else => false,
+    };
+}
+
+/// The raw pointer a type is, behind the two layers that never change which
+/// pointer it names: a borrow of one, and a local `type` alias that stands for
+/// one. Both are followed exactly as `isScalarOperandType` follows them,
+/// because `&*const u8` and `type BytePtr = *const u8` are the same pointer
+/// value spelled two ways, and percent-encoding writes the second one.
+fn rawPointerType(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    t: types.Type,
+) ?types.RawPtr {
+    var current = t;
+    var hops: usize = 0;
+    while (hops < 128) : (hops += 1) {
+        switch (current) {
+            .reference => current = current.reference.pointee,
+            .path => current = aliasBodyType(g, b, current.path) orelse return null,
+            .raw_ptr => return current.raw_ptr.*,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// Whether a pointee is one the emitter writes as a single machine word.
+///
+/// `*const [T]` — a pointer to a slice — lowers to a Zig SLICE rather than to
+/// a pointer, and `*const dyn Trait` to a descriptor; Zig has no `<` for
+/// either, and neither is a thin pointer Rust could have compared by address
+/// alone. Every other pointee here is a value: a primitive, a slice's ELEMENT
+/// type, a nominal, a tuple, a reference. That is the boundary of what this
+/// rule admits, and a fat pointer comparison stays a refusal rather than a
+/// comparison the emitter cannot spell.
+fn isThinRawPointerPointee(pointee: types.Type) bool {
+    return switch (pointee) {
+        .slice, .dyn_trait => false,
+        .@"opaque" => |opaque_type| opaque_type.concrete != null,
+        else => true,
+    };
+}
+
+/// Whether both operands of a comparison are raw pointers this pass can name.
+///
+/// Both sides must name thin raw pointers after aliases and references are
+/// resolved. Pointee operators do not participate in address comparisons.
+fn rawPointerComparisonOperands(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    binary: exprs.BinaryExpr,
+) bool {
+    if (!isRawPointerComparison(binary.op)) return false;
+    const lhs = rawPointerType(g, b, operatorOperandType(g, b, binary.lhs) orelse return false) orelse return false;
+    const rhs = rawPointerType(g, b, operatorOperandType(g, b, binary.rhs) orelse return false) orelse return false;
+    return isThinRawPointerPointee(lhs.pointee) and isThinRawPointerPointee(rhs.pointee);
+}
+
 fn supportsBinaryOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, binary: exprs.BinaryExpr) bool {
     const operation: [3][]const u8 = switch (binary.op) {
         .add => .{ "ops", "Add", "add" },
@@ -3123,10 +3925,16 @@ fn supportsBinaryOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, b
         if (untypedArrayEqualityOperand(g, b, binary.lhs, binary.rhs)) return true;
         if (untypedArrayEqualityOperand(g, b, binary.rhs, binary.lhs)) return true;
     }
+    // Two raw pointers compare by ADDRESS, and that impl lives in core rather
+    // than in this crate's graph, so no trait lookup below can ever find it.
+    // The operator itself stays a binary node: nothing here rewrites it, and
+    // nothing here may hand it to the pointee's `PartialEq`/`PartialOrd`,
+    // which is a different comparison over different values.
+    if (rawPointerComparisonOperands(g, b, binary)) return true;
     if (boundOperator(g, b, binary.lhs, binary.rhs, operation[0], operation[1])) return true;
     if (coreSupertraitOperator(g, b, binary, operation[0], operation[1])) return true;
-    const receiver = receiverNominalName(g, b, binary.lhs, receiverDeclaredType(g, b, binary.lhs)) orelse return false;
-    return lookupTraitMethod(g, operation[1], receiver, operation[2]) != null;
+    const receiver = receiverSource(g, b, binary.lhs, receiverDeclaredType(g, b, binary.lhs)) orelse return false;
+    return lookupTraitMethodFor(g, b, operation[1], receiver, operation[2]) != null;
 }
 fn resolveAssignmentOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies, expression: *exprs.Expr) std.mem.Allocator.Error!bool {
     const assignment = expression.kind.assign;
@@ -3144,8 +3952,8 @@ fn resolveAssignmentOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies
         .shl => .{ "ShlAssign", "shl_assign" },
         .shr => .{ "ShrAssign", "shr_assign" },
     };
-    const receiver_name = receiverNominalName(g, b, assignment.target, receiverDeclaredType(g, b, assignment.target)) orelse return false;
-    const method = lookupTraitMethod(g, operation[0], receiver_name, operation[1]) orelse
+    const receiver = receiverSource(g, b, assignment.target, receiverDeclaredType(g, b, assignment.target)) orelse return false;
+    const method = lookupTraitMethodFor(g, b, operation[0], receiver, operation[1]) orelse
         return boundOperator(g, b, assignment.target, assignment.value, "ops", operation[0]);
     const args = try g.allocator.dupe(exprs.NodeId, &.{assignment.value});
     expression.kind = .{ .method_call = .{
@@ -3157,13 +3965,385 @@ fn resolveAssignmentOperator(g: *const graph.CrateGraph, b: *const bodies.Bodies
     return true;
 }
 
+const ResolveTableGrowth = struct {
+    exprs_owned: bool = false,
+    types_owned: bool = false,
+};
+
+fn internResolvedType(g: *const graph.CrateGraph, b: *bodies.Bodies, growth: *ResolveTableGrowth, ty: types.Type) !exprs.TypeId {
+    for (b.types, 0..) |existing, index| {
+        if (types.deepEqual(existing, ty)) return @intCast(index);
+    }
+    const table = if (growth.types_owned)
+        try g.allocator.realloc(@constCast(b.types), b.types.len + 1)
+    else table: {
+        const fresh = try g.allocator.alloc(types.Type, b.types.len + 1);
+        @memcpy(fresh[0..b.types.len], b.types);
+        break :table fresh;
+    };
+    growth.types_owned = true;
+    table[b.types.len] = ty;
+    const id: exprs.TypeId = @intCast(b.types.len);
+    b.types = table;
+    return id;
+}
+
+fn dereferenceCoreReceiver(
+    g: *const graph.CrateGraph,
+    b: *bodies.Bodies,
+    growth: *ResolveTableGrowth,
+    node: exprs.NodeId,
+    receiver: types.Type,
+) !exprs.NodeId {
+    var value = receiver;
+    var count: usize = 0;
+    while (value == .reference) {
+        count += 1;
+        value = value.reference.pointee;
+    }
+    if (count == 0) return node;
+    const original_len = b.exprs.len;
+    const source_span = b.exprs[node].span;
+    const expressions = if (growth.exprs_owned)
+        try g.allocator.realloc(@constCast(b.exprs), original_len + count)
+    else table: {
+        const fresh = try g.allocator.alloc(exprs.Expr, original_len + count);
+        @memcpy(fresh[0..original_len], b.exprs);
+        break :table fresh;
+    };
+    growth.exprs_owned = true;
+    b.exprs = expressions;
+    var operand = node;
+    value = receiver;
+    for (expressions[original_len..], original_len..) |*expression, index| {
+        value = value.reference.pointee;
+        const id: exprs.NodeId = @intCast(index);
+        expression.* = .{
+            .id = id,
+            .span = source_span,
+            .ty = try internResolvedType(g, b, growth, value),
+            .kind = .{ .unary = .{ .op = .deref, .operand = operand } },
+        };
+        operand = id;
+    }
+    return operand;
+}
+
+/// The byte width an integer's little-endian image always has, or null when
+/// the width belongs to the compilation target.
+///
+/// `usize` and `isize` are exactly the two whose image is the TARGET's width
+/// rather than a number the language fixes, and only the `mem_size_of` node
+/// the lowering layer builds for them carries that answer. Everything else
+/// has one width on every target, which is what lets this pass state it.
+fn fixedIntegerByteWidth(primitive: types.Prim) ?u64 {
+    return switch (primitive) {
+        .i8, .u8 => 1,
+        .i16, .u16 => 2,
+        .i32, .u32 => 4,
+        .i64, .u64 => 8,
+        .i128, .u128 => 16,
+        .usize, .isize => null,
+        // A float, a `char` and a `bool` have no byte image these operations
+        // produce, so there is no width to state for them at all.
+        else => null,
+    };
+}
+
+/// The integer a standard `Hasher` primitive writer writes, read from the
+/// method's own name. `null` for anything else: only the twelve integer
+/// spellings core declares are admitted, because `hash_write_primitive` takes
+/// an integer argument and a `write_f32` would build a call the IR's own
+/// validation refuses. The list is `hasHasherPrimitiveBound`'s, so the two
+/// readers of the same family cannot drift apart.
+fn hasherPrimitiveWriter(name: []const u8) ?types.Prim {
+    if (!std.mem.startsWith(u8, name, "write_")) return null;
+    const suffix = name["write_".len..];
+    // A runtime search over the twelve spellings, not an `inline for` over the
+    // enum's fields: the suffix is a runtime string, and comparing it against
+    // each tag name is ordinary runtime work rather than comptime control flow.
+    const writers = [_]types.Prim{
+        .u8, .u16, .u32, .u64, .u128, .usize,
+        .i8, .i16, .i32, .i64, .i128, .isize,
+    };
+    for (writers) |primitive| {
+        if (std.mem.eql(u8, suffix, @tagName(primitive))) return primitive;
+    }
+    return null;
+}
+
+/// The one `core::hash::Hasher` impl this crate writes for `receiver`'s own
+/// declaration, or null.
+///
+/// The trait identity is `boundPathMatches`, not the text of an impl name, so
+/// a crate's own `Hasher` never stands in for core's — siphasher imports
+/// `core::hash::Hasher as _` in both of its modules precisely so its two
+/// private `struct Hasher` declarations cannot answer for it. The receiver
+/// identity is the impl's own `self_ty`, so `sip::Hasher` never reaches
+/// sip128's impl. Two impls of core's `Hasher` for one declaration is the
+/// coherence error rustc rejects long before here, so it answers null rather
+/// than picking one.
+fn coreHasherImpl(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    receiver: SourceReceiver,
+) ?spine.EntityId {
+    const declaration = receiver.declaration orelse return null;
+    var found: ?spine.EntityId = null;
+    for (g.symbol_table.entities.items) |ent| {
+        if (ent.kind != .impl_ or ent.id >= b.bodies.len) continue;
+        const implementation = switch (b.bodies[ent.id]) {
+            .impl_ => |value| value,
+            else => continue,
+        };
+        const self_declaration = nominalDeclarationId(g, implementation.self_ty) orelse continue;
+        if (self_declaration != declaration) continue;
+        const trait_path = implementation.trait_path orelse continue;
+        if (!bodies.boundPathMatches(g, ent.id, trait_path, &.{ "core", "hash", "Hasher" })) continue;
+        if (found != null) return null;
+        found = ent.id;
+    }
+    return found;
+}
+
+/// The node a core call takes as its mutable hasher: the receiver itself when
+/// it is already a mutable borrow, and one borrow of it otherwise.
+///
+/// A `hash_write_primitive` hasher argument is a `&mut`, because that is what
+/// every one of core's writers takes. A receiver written `self.hasher` is a
+/// PLACE rather than a borrow, and `lowerHasherDefaultWrite` distinguishes
+/// the two by exactly this: a borrowed handle is passed through, a place is
+/// addressed. Stating the borrow here is what makes the node say which of the
+/// two it is.
+fn mutableHasherReceiver(
+    g: *const graph.CrateGraph,
+    b: *bodies.Bodies,
+    growth: *ResolveTableGrowth,
+    node: exprs.NodeId,
+    receiver: types.Type,
+) !exprs.NodeId {
+    if (receiver == .reference and receiver.reference.mut) return node;
+    const borrow = try g.allocator.create(types.Ref);
+    borrow.* = .{ .mut = true, .pointee = receiver };
+    const index = b.exprs.len;
+    const expressions = if (growth.exprs_owned)
+        try g.allocator.realloc(@constCast(b.exprs), index + 1)
+    else table: {
+        const fresh = try g.allocator.alloc(exprs.Expr, index + 1);
+        @memcpy(fresh[0..index], b.exprs);
+        break :table fresh;
+    };
+    growth.exprs_owned = true;
+    expressions[index] = .{
+        .id = @intCast(index),
+        .span = expressions[node].span,
+        .ty = try internResolvedType(g, b, growth, .{ .reference = borrow }),
+        .kind = .{ .unary = .{ .op = .{ .ref = .mutable }, .operand = node } },
+    };
+    b.exprs = expressions;
+    return @intCast(index);
+}
+
+/// Extraction cannot lower methods whose receiver type is only learned by
+/// inference. Finish those same admissions here, after source overrides have
+/// had precedence, using the existing cores and their original argument order.
+fn resolveTypedCoreMethod(
+    g: *const graph.CrateGraph,
+    b: *bodies.Bodies,
+    growth: *ResolveTableGrowth,
+    source_expression: *exprs.Expr,
+    receiver: types.Type,
+    name: []const u8,
+) !bool {
+    var replacement = source_expression.*;
+    const expression = &replacement;
+    const method = expression.kind.method_call;
+    if (std.mem.eql(u8, name, "copy_to_nonoverlapping")) {
+        if (method.args.len != 2) return false;
+        const pointer = rawPointerType(g, b, receiver) orelse return false;
+        const args = try g.allocator.alloc(exprs.NodeId, 3);
+        errdefer g.allocator.free(args);
+        args[0] = try dereferenceCoreReceiver(g, b, growth, method.receiver, receiver);
+        @memcpy(args[1..], method.args);
+        const generic_args = try g.allocator.dupe(types.Type, &.{pointer.pointee});
+        errdefer g.allocator.free(generic_args);
+        expression.ty = try internResolvedType(g, b, growth, .{ .prim = .unit });
+        expression.kind = .{ .core_call = .{
+            .function = .ptr_copy_nonoverlapping,
+            .generic_args = generic_args,
+            .args = args,
+        } };
+        @constCast(b.exprs)[replacement.id] = replacement;
+        return true;
+    }
+    const value = unpeelReceiverType(receiver) orelse return false;
+    if (std.mem.eql(u8, name, "to_vec")) {
+        if (method.args.len != 0) return false;
+        const element = switch (value) {
+            .slice => |slice| slice.elem,
+            .array => |array| array.elem,
+            else => return false,
+        };
+        var target_args_owned = false;
+        const target: types.Type = target: {
+            if (expression.ty) |id| {
+                if (id < b.types.len and b.types[id] == .external_nominal) {
+                    const nominal = b.types[id].external_nominal;
+                    if (isExactAllocNominal(nominal, "vec", "Vec", 1) and
+                        types.deepEqual(nominal.args[0], element)) break :target b.types[id];
+                }
+            }
+            const params = try g.allocator.dupe(types.Type, &.{element});
+            target_args_owned = true;
+            break :target .{ .external_nominal = .{
+                .path = &.{ "alloc", "vec", "Vec" },
+                .args = params,
+            } };
+        };
+        errdefer if (target_args_owned) g.allocator.free(target.external_nominal.args);
+        const generic_args = try g.allocator.dupe(types.Type, &.{target});
+        errdefer g.allocator.free(generic_args);
+        const args = try g.allocator.dupe(exprs.NodeId, &.{method.receiver});
+        errdefer g.allocator.free(args);
+        expression.ty = try internResolvedType(g, b, growth, target);
+        expression.kind = .{ .core_call = .{
+            .function = .convert_from,
+            .generic_args = generic_args,
+            .args = args,
+        } };
+        @constCast(b.exprs)[replacement.id] = replacement;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "to_le_bytes")) {
+        if (method.args.len != 0 or value != .prim) return false;
+        switch (value.prim) {
+            .u8,
+            .u16,
+            .u32,
+            .u64,
+            .u128,
+            .usize,
+            .i8,
+            .i16,
+            .i32,
+            .i64,
+            .i128,
+            .isize,
+            => {},
+            else => return false,
+        }
+        // `value.to_le_bytes()` is `[size_of::<T>()]u8`, and for a FIXED-width
+        // integer that length is a number this pass can state. Inference owns
+        // that record when it typed the call itself, and it stays
+        // authoritative here — including the symbolic `size_of::<usize>()` and
+        // `size_of::<isize>()` lengths, which are the TARGET's width and not a
+        // number this module may restate.
+        //
+        // What is not authoritative is its ABSENCE. A receiver whose own type
+        // only inference could recover — `self.tail` in a trait impl, where
+        // `&Self` is what the signature declares — leaves the lowering layer
+        // with nothing to measure at extraction time, so the call reaches this
+        // pass as a plain method call carrying no result type at all. The
+        // width is in the receiver all the same, so the admission is finished
+        // HERE rather than lost: without it `impl Hasher for SeaHasher`'s
+        // `finish` is refused as "method dispatch unavailable" over a call
+        // whose receiver is a `u64` and whose answer is `[u8; 8]`.
+        //
+        // Where the record IS there it has to AGREE: a literal length that is
+        // not this receiver's width is not this call's image, and emitting it
+        // would answer with a byte count the source never wrote. A length that
+        // is an expression states no number here, which is exactly the
+        // pointer-sized case this pass must not second-guess.
+        const width = fixedIntegerByteWidth(value.prim);
+        const result: exprs.TypeId = blk: {
+            if (expression.ty) |recorded| {
+                if (recorded >= b.types.len or b.types[recorded] != .array or
+                    !types.deepEqual(b.types[recorded].array.elem, .{ .prim = .u8 }))
+                {
+                    return false;
+                }
+                if (width) |expected| {
+                    switch (b.types[recorded].array.len) {
+                        .literal => |count| {
+                            if (count != expected) return false;
+                        },
+                        .generic, .expression => {},
+                    }
+                }
+                break :blk recorded;
+            }
+            const known_width = width orelse return false;
+            const image = try g.allocator.create(types.Array);
+            image.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = known_width } };
+            break :blk try internResolvedType(g, b, growth, .{ .array = image });
+        };
+        const generic_args = try g.allocator.dupe(types.Type, &.{value});
+        errdefer g.allocator.free(generic_args);
+        const source = try dereferenceCoreReceiver(g, b, growth, method.receiver, receiver);
+        const args = try g.allocator.dupe(exprs.NodeId, &.{source});
+        expression.ty = result;
+        expression.kind = .{ .core_call = .{
+            .function = .prim_to_le_bytes,
+            .generic_args = generic_args,
+            .args = args,
+        } };
+        @constCast(b.exprs)[replacement.id] = replacement;
+        return true;
+    }
+
+    // A primitive `Hasher` writer this crate's own impl does not declare is
+    // the TRAIT's default method, and Rust admits the call because the impl
+    // makes the receiver a `core::hash::Hasher` at all — not because any
+    // `write_u16` exists to bind. The default body writes the value's own
+    // native bytes through `write`, which is exactly what `hash_write_primitive`
+    // asks the runtime for, so the call becomes that core rather than a
+    // refusal. siphasher's `impl<S: Sip> hash::Hasher for Hasher<S>` declares
+    // `write_u8` and `write_u32` but no `write_u16`, and
+    // `self.hasher.write_u16(i)` is valid Rust for exactly that reason.
+    if (hasherPrimitiveWriter(name)) |written| {
+        if (method.args.len != 1) return false;
+        if (coreHasherImpl(g, b, declaredReceiver(g, receiver)) == null) return false;
+        const generic_args = try g.allocator.dupe(types.Type, &.{.{ .prim = written }});
+        errdefer g.allocator.free(generic_args);
+        // The core call takes the hasher by mutable borrow. A receiver the
+        // source already holds as one is passed as it stands; a receiver that
+        // is a PLACE takes the borrow Rust's `&mut self` would have taken,
+        // which is the shape `lowerHasherDefaultWrite` already lowers.
+        const hasher = try mutableHasherReceiver(g, b, growth, method.receiver, receiver);
+        const args = try g.allocator.dupe(exprs.NodeId, &.{ hasher, method.args[0] });
+        errdefer g.allocator.free(args);
+        // The payload is the integer the method NAME fixes, so the argument's
+        // own record is stated here rather than left to whatever inference
+        // pinned. The enclosing signature is core's own `write_u16(&mut self,
+        // i: u16)`, which is what says the argument is that integer.
+        @constCast(b.exprs)[method.args[0]].ty = try internResolvedType(g, b, growth, .{
+            .prim = written,
+        });
+        expression.ty = try internResolvedType(g, b, growth, .{ .prim = .unit });
+        expression.kind = .{ .core_call = .{
+            .function = .hash_write_primitive,
+            .generic_args = generic_args,
+            .args = args,
+        } };
+        @constCast(b.exprs)[replacement.id] = replacement;
+        return true;
+    }
+    return false;
+}
+
 /// Resolve all method calls in `b.exprs` using the crate graph and types table.
+/// If expression or type tables grow, their new slices are allocated by the
+/// graph allocator; the caller owns those slices and still owns the inputs.
 pub fn resolveMethods(
     g: *const graph.CrateGraph,
     b: *bodies.Bodies,
 ) std.mem.Allocator.Error!ResolutionStats {
     var stats: ResolutionStats = .{};
-    for (@constCast(b.exprs)) |*e| {
+    var growth: ResolveTableGrowth = .{};
+    const source_count = b.exprs.len;
+    var expression_index: usize = 0;
+    while (expression_index < source_count) : (expression_index += 1) {
+        const e = &@constCast(b.exprs)[expression_index];
         if (e.kind == .call and resolveAssociatedTraitCall(g, b, e)) {
             stats.trait_resolved += 1;
         }
@@ -3196,30 +4376,46 @@ pub fn resolveMethods(
                 continue;
             }
 
-            const receiver_name = receiverNominalName(g, b, receiver_node, receiver_ty);
+            const receiver_source = receiverSource(g, b, receiver_node, receiver_ty);
             var resolved = false;
-            if (receiver_name) |name| {
-                // Inherent methods have precedence over trait methods.
-                if (lookupInherentMethod(g, name, method_name)) |fn_id| {
-                    mc.method = fn_id;
-                    stats.inherent_resolved += 1;
-                    resolved = true;
-                }
-
-                if (!resolved) {
-                    const trait_lookup =
-                        lookupTraitMethodCandidates(g, name, method_name, null);
-                    if (trait_lookup.count > 1) {
+            if (receiver_source) |source| {
+                switch (lookupSourceMethodFor(g, b, source, method_name)) {
+                    .inherent => |fn_id| {
+                        mc.method = fn_id;
+                        stats.inherent_resolved += 1;
+                        resolved = true;
+                    },
+                    .trait_ => |fn_id| {
+                        mc.method = fn_id;
+                        stats.trait_resolved += 1;
+                        resolved = true;
+                    },
+                    .ambiguous => {
                         replaceWithUnsupported(e, reason_method_dispatch_ambiguous);
                         stats.unsupported_methods += 1;
                         continue;
-                    }
-                    if (trait_lookup.count == 1) {
-                        if (trait_lookup.candidate) |fn_id| {
-                            mc.method = fn_id;
-                            stats.trait_resolved += 1;
-                            resolved = true;
+                    },
+                    .missing => {},
+                }
+            }
+            if (!resolved) {
+                if (receiver_ty) |ty| {
+                    const owner = methodBoundOwner(g, b, mc.*);
+                    if (owner) |scope| {
+                        if (boundTraitMethod(g, b, scope, ty, method_name)) |bound_method| {
+                            if (bindBlanketImplMethod(g, mc.method, bound_method.trait_id)) {
+                                stats.trait_resolved += 1;
+                                resolved = true;
+                            }
                         }
+                    }
+                }
+            }
+            if (!resolved) {
+                if (receiver_ty) |ty| {
+                    if (try resolveTypedCoreMethod(g, b, &growth, e, ty, method_name)) {
+                        stats.std_resolved += 1;
+                        continue;
                     }
                 }
             }
@@ -3258,15 +4454,31 @@ pub fn resolveMethods(
                         stats.unsupported_methods += 1;
                         continue;
                     }
+                    const runtime_io = isRuntimeIoMethod(g, b, receiver_node, mc.method, ty, method_name);
+                    const bound_hash = if (methodBoundOwner(g, b, mc.*)) |owner|
+                        boundHashMethodReturnType(g, b, owner, ty, method_name)
+                    else
+                        null;
                     if (lookupStdMethod(ty, method_name) != null or
                         lookupResultRepresentationMethod(b, ty, method_name) != null or
                         isRuntimeIteratorMethod(ty, method_name) or
                         isRuntimeMemoryMethod(ty, method_name) or
                         isBoundStandardMethod(g, b, e.*, ty, method_name) or
-                        isRuntimeIoMethod(g, b, receiver_node, mc.method, ty, method_name))
+                        bound_hash != null or
+                        runtime_io)
                     {
+                        if (runtime_io) mc.receiver_mode = .mutable;
+                        if (bound_hash != null) {
+                            mc.receiver_mode = if (std.mem.eql(u8, method_name, "finish") or
+                                std.mem.eql(u8, method_name, "hash")) .shared else .mutable;
+                        }
                         stats.std_resolved += 1;
                         resolved = true;
+                        if (e.ty == null) {
+                            if (stdMethodResultType(g, b, @intCast(expression_index), 0)) |result_type| {
+                                e.ty = try internResolvedType(g, b, &growth, result_type);
+                            }
+                        }
                     }
 
                     // `x.into()` is written against the blanket
@@ -3311,12 +4523,17 @@ pub fn resolveMethods(
                 }
             }
             if (!resolved) {
-                const reason = if (receiver_name == null and receiver_ty == null)
+                const reason = if (receiver_source == null and receiver_ty == null)
                     reason_receiver_unavailable
                 else
                     reason_method_dispatch_unavailable;
                 replaceWithUnsupported(e, reason);
                 stats.unsupported_methods += 1;
+            }
+            if (resolved and e.ty == null and mc.method < b.bodies.len) {
+                if (b.bodies[mc.method] == .fn_ and b.bodies[mc.method].fn_.ret == .prim) {
+                    e.ty = try internResolvedType(g, b, &growth, b.bodies[mc.method].fn_.ret);
+                }
             }
         } else if (e.kind == .assign) {
             if (try resolveAssignmentOperator(g, b, e)) {
@@ -3343,6 +4560,13 @@ pub fn resolveMethods(
             {
                 replaceWithUnsupported(e, reason_operator_requires_primitives);
                 stats.unsupported_operators += 1;
+            }
+        }
+        if (e.kind == .call and e.ty == null) {
+            if (callDeclaredReturnType(g, b, e.kind.call)) |declared| {
+                if (declared == .prim) {
+                    e.ty = try internResolvedType(g, b, &growth, declared);
+                }
             }
         }
     }
@@ -3378,6 +4602,7 @@ const LateLetScope = struct {
 
     fn deinit(self: *LateLetScope) void {
         self.entries.deinit(self.allocator);
+        self.* = undefined;
     }
 };
 
@@ -3628,6 +4853,14 @@ fn resolveLateLetsInExpr(
             for (vector.elements) |element| {
                 try resolveLateLetsInExpr(b, element, scope, typed, depth + 1);
             }
+            // The count of `vec![elem; count]` is an ordinary expression, so
+            // a `let` bound inside it resolves here against the same enclosing
+            // scope the element already sees. A `.literal` count is a number
+            // with no node; `ArrayExpr` repeats keep their own `?u64` form.
+            if (vector.repeat) |repeat| switch (repeat) {
+                .literal => {},
+                .expression => |count| try resolveLateLetsInExpr(b, count, scope, typed, depth + 1),
+            };
         },
         .range => |range| {
             try resolveLateLetsInExpr(b, range.start, scope, typed, depth + 1);
@@ -3979,12 +5212,16 @@ fn typeParamDeclaresByteAsRef(
 /// implements, when that impl declares `method_name`, or null when none does.
 ///
 /// The answer is the TRAIT rather than the method because the trait is what
-/// the backend selects the impl from: it reads the trait off the call's
-/// `method_ref` (`methodRefTrait`) and finds the impl providing the method
-/// from it (`blanketImplFor`). The trait is taken from the impl body's own
-/// `trait_path`, the same linkage the backend reads, so the two cannot pick
-/// different traits. Two blanket impls providing the same method name the
-/// method ambiguously and stay refused.
+/// the backend selects the impl from. `blanketImplForMethod` is the one
+/// classifier over a blanket call, and for a call whose method is the trait's
+/// `method_ref` — the shape parenting that reference to the trait produces —
+/// it reads the trait off the reference's own parent and hands it, together
+/// with the method name, to `blanketImplFor`. That second step answers
+/// `unique`, `none`, or `ambiguous` rather than picking between candidates,
+/// which is the same refusal this function makes. The trait is taken from the
+/// impl body's own `trait_path`, the same linkage the backend reads, so the
+/// two cannot pick different traits. Two blanket impls providing the same
+/// method name the method ambiguously and stay refused.
 fn lookupBlanketAsRefBytesTrait(
     g: *const graph.CrateGraph,
     b: *const bodies.Bodies,
@@ -4559,7 +5796,14 @@ test "resolveMethods rejects unknown iterator projection" {
 }
 
 test "resolveMethods pass updates method_call entity id and gathers stats" {
-    const allocator = std.testing.allocator;
+    // Every allocation this fixture makes — the entity names the graph owns and
+    // the tables the pass grows — comes from one arena. `resolveMethods`
+    // grows `b.types` through the graph allocator and hands back no handle to
+    // free it with, which is the contract the pipeline's arena-backed graph
+    // already meets and a bare testing allocator does not.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
     var g = graph.CrateGraph.init(allocator);
     defer g.deinit();
     const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
@@ -4625,16 +5869,14 @@ test "resolveMethods pass updates method_call entity id and gathers stats" {
     });
 
     const seg = try allocator.alloc(types.PathSegment, 1);
-    defer allocator.free(seg);
     seg[0] = .{ .name = "Fletcher16", .id = null };
 
     const types_store = try allocator.alloc(types.Type, 2);
-    defer allocator.free(types_store);
     types_store[0] = .{ .path = .{ .segments = seg } };
     types_store[1] = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
 
     const exprs_store = try allocator.alloc(exprs.Expr, 6);
-    defer allocator.free(exprs_store);
+
     // Node 0: receiver (Fletcher16)
     exprs_store[0] = .{ .id = 0, .span = span, .ty = 0, .kind = .{ .unit = {} } };
     // Node 1: fletcher.update(...) -> inherent

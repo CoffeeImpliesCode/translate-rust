@@ -381,6 +381,125 @@ test "emitFile: emits comments" {
     try std.testing.expect(std.mem.indexOf(u8, out, "// Second line.\n") != null);
 }
 
+test "emitFile: places documentation on files, imports, declarations, and fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const file = ast.File{
+        .path = "src/doc.zig",
+        .documentation = "Encoding helpers.\nSecond line.",
+        .imports = &.{.{
+            .local_name = "std",
+            .module_or_path = "std",
+            .documentation = "Only the io and fmt modules are used.",
+        }},
+        .decls = &.{
+            .{ .struct_decl = .{
+                .name = "Counters",
+                .documentation = "Running totals.",
+                .fields = &.{
+                    .{
+                        .name = "total",
+                        .ty = .{ .prim = .u64 },
+                        .documentation = "Bytes seen so far.",
+                    },
+                    .{ .name = "runs", .ty = .{ .prim = .u32 } },
+                },
+            } },
+            .{ .enum_decl = .{
+                .name = "State",
+                .documentation = "Lifecycle states.",
+                .variants = &.{
+                    .{ .name = "Idle", .documentation = "Not started." },
+                    .{ .name = "Done" },
+                },
+            } },
+            .{ .union_decl = .{
+                .name = "Payload",
+                .fields = &.{.{
+                    .name = "count",
+                    .ty = .{ .prim = .u32 },
+                    .documentation = "How many.",
+                }},
+            } },
+            .{ .const_decl = .{
+                .name = "LIMIT",
+                .ty = .{ .prim = .u32 },
+                .init = .{ .lit = .{ .int = 7 } },
+                .documentation = "Never exceeded.",
+            } },
+        },
+    };
+
+    const out = try emitFile(a, file);
+
+    // File documentation is `//!` and leads the file. Import, declaration,
+    // field and tag documentation is `///` at the indentation of the thing
+    // it documents, immediately above it.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        out,
+        "//! Encoding helpers.\n//! Second line.\n\n",
+    ));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "/// Only the io and fmt modules are used.\nconst std = @import(\"std\");\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "/// Running totals.\npub const Counters = struct {\n" ++
+            "    /// Bytes seen so far.\n    total: u64,\n    runs: u32,\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "/// Lifecycle states.\npub const State = enum {\n" ++
+            "    /// Not started.\n    Idle,\n    Done,\n};\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "pub const Payload = union(enum) {\n    /// How many.\n    count: u32,\n};\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "/// Never exceeded.\npub const LIMIT: u32 = 7;\n",
+    ) != null);
+    // A declaration with no authored documentation emits no marker at all, so
+    // nothing is left dangling after the last declaration.
+    try std.testing.expect(std.mem.indexOf(u8, out, "///\n") == null);
+}
+
+test "emitFile: a blank line inside documentation becomes a bare marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const file = ast.File{
+        .path = "src/doc.zig",
+        .documentation = "First paragraph.\n\nSecond paragraph.",
+        .decls = &.{.{ .const_decl = .{
+            .name = "VALUE",
+            .ty = .{ .prim = .u8 },
+            .init = .{ .lit = .{ .int = 0 } },
+        } }},
+    };
+
+    const out = try emitFile(a, file);
+    try std.testing.expectEqualStrings(
+        \\//! First paragraph.
+        \\//!
+        \\//! Second paragraph.
+        \\
+        \\pub const VALUE: u8 = 0;
+        \\
+    , out);
+}
+
 test "emitType: unsupported type name is a valid Zig type" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
@@ -771,6 +890,42 @@ test "emitExpr: for captures emit pointer bindings" {
     const emitted = try emitExpression(std.testing.allocator, expression);
     defer std.testing.allocator.free(emitted);
     try std.testing.expect(std.mem.indexOf(u8, emitted, "for (items) |*item|") != null);
+}
+
+// `RustHashLayout.tuple` is `[]const type`, so the generic Hash walk has to
+// bind each child descriptor at comptime to satisfy its own `comptime C: type`
+// parameter. Zig unrolls that only under `inline for`; a plain `for` binds the
+// capture at runtime, where it names nothing. The second loop omits the flag
+// entirely, which is every source `for`, and pins that its bytes do not move.
+test "emitExpr: a comptime loop is spelled inline and a runtime one is not" {
+    // The shape the Hash walk actually builds: a two-input loop whose captures
+    // are the field and the slot, both bound at comptime. The flag has to
+    // survive the multi-input form, not just the simplest one.
+    const comptime_loop: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{ .{ .ident = "Fields" }, .{ .ident = "Slots" } },
+        .captures = &.{ .{ .name = "Field" }, .{ .name = "Slot" } },
+        .body = .{ .stmts = &.{} },
+        .is_inline = true,
+    } };
+    const runtime_loop: ast.Expr = .{ .for_expr = .{
+        .inputs = &.{.{ .ident = "items" }},
+        .captures = &.{.{ .name = "item" }},
+        .body = .{ .stmts = &.{} },
+    } };
+
+    const inlined = try emitExpression(std.testing.allocator, comptime_loop);
+    defer std.testing.allocator.free(inlined);
+    try std.testing.expectEqualStrings(
+        "inline for (Fields, Slots) |Field, Slot| {\n}",
+        inlined,
+    );
+
+    const runtime = try emitExpression(std.testing.allocator, runtime_loop);
+    defer std.testing.allocator.free(runtime);
+    try std.testing.expectEqualStrings(
+        "for (items) |item| {\n}",
+        runtime,
+    );
 }
 
 // A conditional can bind a payload per branch. Zig captures whatever the
@@ -1320,4 +1475,979 @@ test "emitExpr: the wyhash read chain and wymum product need one group, not seve
     try expectEmittedRows(a, &.{
         .{ .expression = tail, .expected = "r >> @intCast(64) ^ r" },
     });
+}
+
+test "emitFile: a type alias renders through emitType, not as an identifier" {
+    const byte = ast.Type{ .prim = .u8 };
+    const rows = ast.Type{ .slice = .{ .elem = &byte, .is_const = true } };
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{
+            .{ .const_decl = .{
+                .name = "BytePointer",
+                .init = .{ .type_value = .{ .ptr = .{
+                    .elem = &byte,
+                    .is_const = true,
+                    .size = .c,
+                } } },
+            } },
+            .{ .const_decl = .{
+                .name = "Rows",
+                .init = .{ .type_value = .{ .opt = &rows } },
+            } },
+        },
+    };
+    const output = try emitFile(std.testing.allocator, file);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(
+        std.mem.indexOf(u8, output, "pub const BytePointer = [*c]const u8;") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, output, "pub const Rows = ?[]const u8;") != null,
+    );
+}
+
+// A Rust `for` is `()`, so a block that ends in one hands out no value. The
+// chunk loop is the sharp case: `emitChunkLoop` writes a prelude and a
+// `while`, so a `break :label` prefixed onto it lands in the middle of the
+// `var` and the emitted file stops parsing there.
+test "emitExpr: a block ending in a unit loop is written as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chunk_loop: ast.Expr = .{ .for_expr = .{
+        .inputs = try list(a, &.{.{ .builtin = .{
+            .name = "sliceChunks",
+            .args = try list(a, &.{ ident("data"), ident("n") }),
+        } }}),
+        .captures = try listCaptures(a, &.{.{ .name = "chunk" }}),
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("use")) }}),
+            .expr = null,
+        },
+    } };
+    const chunk_tail: ast.Expr = .{ .block = .{
+        .stmts = try listStmts(a, &.{}),
+        .expr = try boxed(a, chunk_loop),
+    } };
+    // A Rust `while` is `()` too, so it is the same case by the same rule.
+    const while_tail: ast.Expr = .{ .block = .{
+        .stmts = try listStmts(a, &.{}),
+        .expr = try boxed(a, .{ .while_expr = .{
+            .cond = try boxed(a, ident("p")),
+            .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("step")) }}) },
+        } }),
+    } };
+
+    try expectEmittedRows(a, &.{
+        .{
+            .expression = chunk_tail,
+            .expected = "{\n" ++
+                "    var __chunk_index: usize = 0;\n" ++
+                "    while (data.len > __chunk_index) : (__chunk_index += n) {\n" ++
+                "        const chunk = data[__chunk_index..@min(__chunk_index + n, data.len)];\n" ++
+                "        use;\n" ++
+                "    }\n" ++
+                "}",
+        },
+        .{ .expression = while_tail, .expected = "{\n    while (p) {\n        step;\n    }\n}" },
+    });
+}
+
+// The other side of the same rule: a tail that really does carry a value still
+// leaves through the block's label, whatever shape it has.
+test "emitExpr: a block ending in a value still breaks out of its label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `{ step(); 5 }`.
+    const literal_tail: ast.Expr = .{ .block = .{
+        .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("step")) }}),
+        .expr = try boxed(a, .{ .lit = .{ .uint = 5 } }),
+    } };
+    // `{ loop { break 5; } }` — a Rust `loop` lowers to a value `while`.
+    const loop_tail: ast.Expr = .{ .block = .{
+        .stmts = try listStmts(a, &.{}),
+        .expr = try boxed(a, .{ .while_expr = .{
+            .cond = try forever(a),
+            .body = .{ .expr = try boxed(a, .{ .break_expr = .{
+                .value = try boxed(a, .{ .lit = .{ .uint = 5 } }),
+            } }) },
+        } }),
+    } };
+    // `{ { 5 } }` — a block tail carries a value when the block inside it does.
+    const block_tail: ast.Expr = .{ .block = .{
+        .stmts = try listStmts(a, &.{}),
+        .expr = try boxed(a, .{ .block = .{
+            .stmts = try listStmts(a, &.{}),
+            .expr = try boxed(a, .{ .lit = .{ .uint = 5 } }),
+        } }),
+    } };
+
+    try expectEmittedRows(a, &.{
+        .{
+            .expression = literal_tail,
+            .expected = "__r2z_value_block_0: {\n    step;\n    break :__r2z_value_block_0 5;\n}",
+        },
+        .{
+            .expression = block_tail,
+            .expected = "__r2z_value_block_0: {\n" ++
+                "    break :__r2z_value_block_0 __r2z_value_block_1: {\n" ++
+                "        break :__r2z_value_block_1 5;\n" ++
+                "    };\n" ++
+                "}",
+        },
+    });
+
+    // The value loop is the one tail whose own shape decides the classification,
+    // so it is checked against the emitted text rather than a row: the block
+    // keeps its label, the loop is handed to it whole, and the loop's own
+    // value-carrying `break` still names the loop. It is not demoted to a
+    // statement just because a `while` is one of the statement-like forms.
+    const loop_emitted = try emitExpression(a, loop_tail);
+    try std.testing.expect(std.mem.indexOf(u8, loop_emitted, "__r2z_value_block_0: {") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, loop_emitted, "break :__r2z_value_block_0 __r2z_value_loop_1:") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, loop_emitted, "break :__r2z_value_loop_1 5;") != null);
+}
+
+// `if bytes.is_empty() { .. } else { for bytes in bytes.chunks(n) { .. } }` —
+// the shape wyhash's `Hasher::write` lowers to. The `else` block ends in a
+// unit loop, so it is a statement on both sides of the `else`.
+test "emitExpr: an else branch ending in a chunk loop stays a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chunk_loop: ast.Expr = .{ .for_expr = .{
+        .inputs = try list(a, &.{.{ .builtin = .{
+            .name = "sliceChunks",
+            .args = try list(a, &.{ ident("data"), ident("n") }),
+        } }}),
+        .captures = try listCaptures(a, &.{.{ .name = "chunk" }}),
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("use")) }}),
+            .expr = null,
+        },
+    } };
+    const conditional: ast.Expr = .{ .if_expr = .{
+        .cond = try boxed(a, ident("p")),
+        .then_body = try boxed(a, .{ .block = .{
+            .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("mix")) }}),
+            .expr = null,
+        } }),
+        .else_body = try boxed(a, .{ .block = .{
+            .stmts = try listStmts(a, &.{}),
+            .expr = try boxed(a, chunk_loop),
+        } }),
+    } };
+
+    const emitted = try emitExpression(a, conditional);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "break :") == null);
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "while (data.len > __chunk_index)") != null);
+}
+
+// Zig rejects a parameter its body never reads; Rust allows one. Zig 0.16
+// accepts NO spelling for it: an unnamed parameter is `missing parameter name`
+// and a `_`-prefixed one is still `unused function parameter`. Both forms were
+// compiled to confirm it. The only form that compiles keeps the name and
+// discards it in the body, which is the same `_ = <name>;` this emitter already
+// writes for an unread `self` receiver and an unread local.
+test "emitFile: an unread parameter keeps its name and is discarded in the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const shape_code = ast.Decl{ .fn_decl = .{
+        .name = "shapeCode",
+        .params = &.{
+            .{ .name = "unit", .ty = byte },
+            .{ .name = "record", .ty = byte },
+            .{ .name = "choice", .ty = byte },
+        },
+        .ret_type = byte,
+        .body = .{ .expr = try boxed(a, ident("choice")) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/shape.zig", .decls = &.{shape_code} });
+    // Every parameter keeps the spelling the source declared, so the position
+    // and the generated documentation both still name it.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "pub fn shapeCode(unit: u8, record: u8, choice: u8) u8 {",
+    ) != null);
+    // The two unread ones are discarded in the body, and the read one is not.
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = unit;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = record;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = choice;") == null);
+    // Neither spelling Zig rejects may appear.
+    try std.testing.expect(std.mem.indexOf(u8, out, "_unit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_record") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return choice;") != null);
+}
+
+// A closure reaches the emitter already inlined at its call site — the Zig AST
+// has no closure node — so a read that happens only inside one arrives as a
+// block argument, and a loop payload arrives as an ordinary `for`. Both are
+// below the function body. Nothing is renamed any more, so the observable is
+// no longer a `_`-prefixed name but a `_ = <name>;` the walk would add to a
+// parameter it wrongly called unread: both of these stay live, so neither
+// discard may appear.
+test "emitFile: a parameter read only inside an inlined closure keeps its plain name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const closure_call = ast.Expr{
+        .call = .{
+            .callee = try boxed(a, ident("mapEach")),
+            .args = try list(a, &.{
+                ident("items"),
+                // The inlined closure body: a block whose tail is the read.
+                .{ .block = .{ .stmts = &.{}, .expr = try boxed(a, ident("scale")) } },
+            }),
+        },
+    };
+    const payload_loop = ast.Expr{ .for_expr = .{
+        .inputs = try list(a, &.{ident("items")}),
+        .captures = try listCaptures(a, &.{.{ .name = "item" }}),
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("scale")) }}),
+            .expr = null,
+        },
+    } };
+    const apply = ast.Decl{ .fn_decl = .{
+        .name = "apply",
+        .params = &.{
+            .{ .name = "items", .ty = byte },
+            .{ .name = "scale", .ty = byte },
+        },
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, closure_call) },
+            .{ .expr_stmt = try boxed(a, payload_loop) },
+        }) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/apply.zig", .decls = &.{apply} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "items: u8, scale: u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_scale") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_items") == null);
+    // A descent that stopped at the surface would call `scale` and `items`
+    // unread and write the discards the rule requires, which is a silent
+    // rewrite of the body rather than a compile error — so the absence of the
+    // discard is the property, not the spelling.
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = scale;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = items;") == null);
+}
+
+// A name that already begins with `_` is left exactly as it is. Under the
+// discard-in-the-body rule nothing is renamed at all, so the second-underscore
+// hazard cannot arise; this pins that the name survives untouched and is still
+// discarded, because Zig rejects an unread parameter whatever it is called.
+test "emitFile: a parameter already named with a leading underscore keeps its name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const measure = ast.Decl{ .fn_decl = .{
+        .name = "measure",
+        .params = &.{
+            .{ .name = "_unit", .ty = byte },
+            .{ .name = "record", .ty = byte },
+        },
+        .ret_type = byte,
+        .body = .{ .expr = try boxed(a, .{ .lit = .{ .int = 1 } }) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/measure.zig", .decls = &.{measure} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn measure(_unit: u8, record: u8) u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "__unit") == null);
+    // `_unit` is unread and `record` is unread, so BOTH are discarded in the body.
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = _unit;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = record;\n") != null);
+}
+
+// The discard is a body statement, not a signature change: the parameter keeps
+// its position AND its name, so the arity the source declared is still the
+// arity every call site supplies and every call site still names it.
+test "emitFile: a caller still passes every argument positionally" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const forwarded = ast.Expr{ .call = .{
+        .callee = try boxed(a, ident("pick")),
+        .args = try list(a, &.{ ident("choice"), .{ .lit = .{ .int = 1 } } }),
+    } };
+    const shape_code = ast.Decl{ .fn_decl = .{
+        .name = "shapeCode",
+        .params = &.{
+            .{ .name = "unit", .ty = byte },
+            .{ .name = "choice", .ty = byte },
+        },
+        .ret_type = byte,
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, forwarded) }}),
+            .expr = try boxed(a, .{ .lit = .{ .int = 0 } }),
+        },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/shape.zig", .decls = &.{shape_code} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn shapeCode(unit: u8, choice: u8) u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pick(choice, 1);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return 0;") != null);
+}
+
+// Rust introduces the local only after its initialiser is produced, so a
+// declaration that rebinds the parameter's name never reads the parameter.
+// Counting that declaration as a read would leave a genuinely unread
+// parameter with no discard in its body, which is exactly the Zig error.
+test "emitFile: a parameter the body shadows is still unread" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const shadowed = ast.Decl{ .fn_decl = .{
+        .name = "shadowed",
+        .params = &.{.{ .name = "unit", .ty = byte }},
+        .ret_type = byte,
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .let_stmt = .{
+                .name = "unit",
+                .init = .{ .lit = .{ .int = 3 } },
+            } }}),
+            .expr = try boxed(a, .{ .lit = .{ .int = 3 } }),
+        },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/shadowed.zig", .decls = &.{shadowed} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn shadowed(unit: u8) u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = unit;\n") != null);
+}
+
+// The other half of the same rule: the initialiser runs while the parameter is
+// still the only `unit` in scope, so this one IS a read and the plain name has
+// to survive.
+test "emitFile: a shadowing initialiser still reads the parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const shadowed = ast.Decl{ .fn_decl = .{
+        .name = "shadowed",
+        .params = &.{.{ .name = "unit", .ty = byte }},
+        .ret_type = byte,
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .let_stmt = .{
+                .name = "unit",
+                .init = ident("unit"),
+            } }}),
+            .expr = try boxed(a, .{ .lit = .{ .int = 0 } }),
+        },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/shadowed.zig", .decls = &.{shadowed} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn shadowed(unit: u8) u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_unit") == null);
+}
+
+// The bare `_` that spells an unread switch capture is a different Zig
+// construct, and the two rules must not collapse into one spelling: an arm
+// whose binding nothing reads writes no capture at all, while the unread
+// parameter beside it is discarded by a body statement.
+test "emitFile: the parameter prefix is not the switch capture spelling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const arm_body: ast.Expr = .{ .lit = .{ .int = 10 } };
+    const binding_arm = ast.MatchArm{ .patterns = &.{.{ .binding = "value" }}, .body = arm_body };
+    const shape_code = ast.Decl{ .fn_decl = .{
+        .name = "shapeCode",
+        .params = &.{
+            .{ .name = "record", .ty = byte },
+            .{ .name = "choice", .ty = byte },
+        },
+        .ret_type = byte,
+        .body = .{ .expr = try boxed(a, .{ .match_expr = .{
+            .target = try boxed(a, ident("choice")),
+            .arms = try listArms(a, &.{binding_arm}),
+        } }) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/shape.zig", .decls = &.{shape_code} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn shapeCode(record: u8, choice: u8) u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "else =>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "|value|") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = record;\n") != null);
+}
+
+// The `self` receiver answers the same question every ordinary parameter does,
+// and it is written by a second rule: the receiver is skipped when the
+// parameter list is walked, so its discard cannot also arrive as an ordinary
+// one. Rust allows a method that never mentions its receiver, and Zig reports
+// that as `unused function parameter`, so the discard has to be there.
+test "emitFile: an unread receiver is discarded once, and a read one is not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const greeter = ast.Type{ .named = "Greeter" };
+    const receiver = ast.FnParam{ .name = "self", .ty = .{ .ptr = .{ .elem = &greeter, .is_const = true } } };
+    const step = ast.Expr{ .call = .{
+        .callee = try boxed(a, ident("bump")),
+        .args = try list(a, &.{ident("tag")}),
+    } };
+    const forgetful = ast.Decl{ .fn_decl = .{
+        .name = "forgetful",
+        .params = &.{ receiver, .{ .name = "tag", .ty = byte } },
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, step) }}) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/greeter.zig", .decls = &.{forgetful} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn forgetful(self: *const Greeter, tag: u8) void {") != null);
+    // The receiver is the only unread name here: `bump(tag)` READS `tag`, so
+    // the ordinary parameter beside it is live and gets no discard. One
+    // `_ =` line, and the receiver is not among them twice.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "_ = self;\n"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "_ = tag;\n"));
+
+    // The same declaration with a body that reads the receiver writes no
+    // discard for it, which is the half a scan that always discarded would
+    // get wrong.
+    const aware = ast.Decl{ .fn_decl = .{
+        .name = "aware",
+        .params = &.{ receiver, .{ .name = "tag", .ty = byte } },
+        .ret_type = byte,
+        .body = .{ .expr = try boxed(a, .{ .field_access = .{
+            .target = try boxed(a, ident("self")),
+            .field_name = "id",
+        } }) },
+    } };
+    const read_out = try emitFile(a, .{ .path = "src/greeter.zig", .decls = &.{aware} });
+    try std.testing.expect(std.mem.indexOf(u8, read_out, "pub fn aware(self: *const Greeter, tag: u8) u8 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_out, "_ = self;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, read_out, "return self.id;\n") != null);
+}
+
+// A `comptime T: type` parameter is the one parameter whose references live in
+// the SIGNATURE (`bytes: []const T`), not in the body, so a body-only scan
+// would answer "unread" and discard a parameter the parameter list still
+// needs. The exemption is the `is_comptime` arm of the same walk, and this
+// pins it against the ordinary parameter beside it, which is discarded.
+test "emitFile: a comptime type parameter is exempt from the body discard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const named_t = ast.Type{ .named = "T" };
+    const head = ast.Decl{ .fn_decl = .{
+        .name = "head",
+        .params = &.{
+            .{ .name = "T", .ty = .{ .prim = .type_type }, .is_comptime = true },
+            .{ .name = "bytes", .ty = .{ .slice = .{ .elem = &named_t, .is_const = true } } },
+        },
+        .ret_type = byte,
+        .body = .{ .expr = try boxed(a, .{ .lit = .{ .int = 0 } }) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/head.zig", .decls = &.{head} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn head(comptime T: type, bytes: []const T) u8 {") != null);
+    // `T` is named by the parameter beside it and never by the body, so it is
+    // the one parameter here with no discard.
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = T;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = bytes;\n") != null);
+}
+
+// A `macro_rules!` body reaches the emitter already expanded, so there is no
+// macro node to descend into — what arrives is the statements the body spells.
+// The shapes only an expansion leaves behind are the bare block it wraps
+// itself in, the `defer` it drops in, and the `match` whose arms carry the
+// result; a read inside any of them is a read of the parameter. The positive
+// control is the sibling nothing reads: it must still be discarded, or an
+// absence proves nothing.
+test "emitFile: a parameter read only inside a macro-expanded body keeps its plain name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const expansion: ast.Expr = .{ .block = .{ .stmts = try listStmts(a, &.{
+        .{ .expr_stmt = try boxed(a, ident("scale")) },
+        .{ .defer_stmt = .{ .expr = ident("scale") } },
+    }) } };
+    const arm_body: ast.Expr = .{ .block = .{
+        .stmts = try listStmts(a, &.{}),
+        .expr = try boxed(a, ident("scale")),
+    } };
+    const dispatch: ast.Expr = .{ .match_expr = .{
+        .target = try boxed(a, ident("kind")),
+        .arms = try listArms(a, &.{.{ .patterns = &.{.{ .binding = "variant" }}, .body = arm_body }}),
+    } };
+    const apply = ast.Decl{ .fn_decl = .{
+        .name = "apply",
+        .params = &.{
+            .{ .name = "kind", .ty = byte },
+            .{ .name = "scale", .ty = byte },
+            .{ .name = "record", .ty = byte },
+        },
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, expansion) },
+            .{ .expr_stmt = try boxed(a, dispatch) },
+        }) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/apply.zig", .decls = &.{apply} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "kind: u8, scale: u8, record: u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = scale;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = kind;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = record;\n") != null);
+    // The read reached the emitter through all three shapes, so each one is
+    // still on the page naming the parameter it read. The match arm's label is
+    // depth-seeded, so the payload is checked from the break rather than from a
+    // suffix this file does not fix.
+    try std.testing.expect(std.mem.indexOf(u8, out, "scale;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "defer scale;") != null);
+    const arm_break = std.mem.indexOf(u8, out, "break :__r2z_value_block_").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, out, arm_break, " scale;") != null);
+}
+
+// A read that arrives through a qualified name, a cast operand or the right
+// side of an assignment reaches the walk through three different nodes, and
+// the qualified one only matches because the comparison is on the path's root.
+test "emitFile: a parameter read through a field, a cast and an assignment keeps its plain name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const widened = ast.Expr{ .cast = .{ .target = byte, .operand = try boxed(a, ident("scale")) } };
+    const carried = ast.Decl{ .fn_decl = .{
+        .name = "carried",
+        .params = &.{
+            .{ .name = "scale", .ty = byte },
+            .{ .name = "record", .ty = byte },
+        },
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, .{ .field_access = .{
+                .target = try boxed(a, ident("scale")),
+                .field_name = "len",
+            } }) },
+            .{ .expr_stmt = try boxed(a, widened) },
+            .{ .assign = .{
+                .target = ident("total"),
+                .val = ident("scale"),
+            } },
+        }) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/carried.zig", .decls = &.{carried} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = scale;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = record;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "scale.len;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "total = scale;") != null);
+}
+
+// The other half of a loop is its `else` arm, which the emitter writes outside
+// the body and inside the scope that owns the enclosing exit. A read that
+// happens only there is still a read of the parameter.
+test "emitFile: a parameter read only in a loop body or its else arm keeps its plain name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const byte = ast.Type{ .prim = .u8 };
+    const counted: ast.Expr = .{ .while_expr = .{
+        .cond = try boxed(a, ident("more")),
+        .body = .{ .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("scale")) }}) },
+        .else_body = try boxed(a, .{ .block = .{
+            .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("scale")) }}),
+        } }),
+    } };
+    const drained: ast.Expr = .{ .for_expr = .{
+        .inputs = try list(a, &.{ident("items")}),
+        .captures = try listCaptures(a, &.{.{ .name = "item" }}),
+        .body = .{ .stmts = try listStmts(a, &.{}), .expr = null },
+        .else_body = try boxed(a, .{ .block = .{
+            .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("scale")) }}),
+        } }),
+    } };
+    const tally = ast.Decl{ .fn_decl = .{
+        .name = "tally",
+        .params = &.{
+            .{ .name = "items", .ty = byte },
+            .{ .name = "scale", .ty = byte },
+            .{ .name = "record", .ty = byte },
+        },
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, counted) },
+            .{ .expr_stmt = try boxed(a, drained) },
+        }) },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/tally.zig", .decls = &.{tally} });
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = scale;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = items;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = record;\n") != null);
+    // Both `else` arms are written, and each one still names the parameter.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, " else "));
+    try std.testing.expect(std.mem.indexOf(u8, out, "while (more) {\n        scale;\n    } else ") != null);
+}
+
+// A labelled block reaches Zig in one position it accepts as a branch, and the
+// lowerer uses exactly that one: the collection error block and the guarded
+// match chain both land in an `if` arm. The spelling is pinned here — the label
+// leads the braces with nothing in front of it and nothing after them, because
+// a branch is already a whole statement and neither the `break :` a value tail
+// carries nor the `;` a value expression needs may be added to it.
+test "emitExpr: a labelled block is written bare in the branch that takes it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const branch: ast.Expr = .{ .block = .{
+        .label = "__r2z_collect_err",
+        .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, ident("release")) }}),
+        .expr = try boxed(a, .{ .lit = .{ .int = 7 } }),
+    } };
+    const conditional: ast.Expr = .{ .if_expr = .{
+        .cond = try boxed(a, ident("failed")),
+        .then_body = try boxed(a, branch),
+        .else_body = try boxed(a, .{ .lit = .{ .int = 0 } }),
+    } };
+
+    const out = try emitExpression(a, conditional);
+    try std.testing.expectEqualStrings(
+        "if (failed) __r2z_collect_err: {\n" ++
+            "    release;\n" ++
+            "    break :__r2z_collect_err 7;\n" ++
+            "} else 0",
+        out,
+    );
+    // The label leads the block and nothing terminates it: a branch is already
+    // a whole statement, so a `;` here is the Zig error this spelling avoids.
+    try std.testing.expect(std.mem.indexOf(u8, out, "__r2z_collect_err: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "} else 0") != null);
+}
+
+// The five emitter tests that used to live in `ast.zig`, read through helpers
+// there because that file has no test file of its own. They belong here: the
+// helpers they need — `emitExpression` and `emitFile` — already exist, and a
+// shape whose AST validates is not the same claim as a shape whose emitted Zig
+// is what the shape claims.
+//
+// Two of them needed their ASSERTION corrected as well as their home. A
+// self-valued labelled block written as a bare statement, and a guard chain
+// written as a function-body tail, are both positions the emitter no longer
+// emits: the label needs a carrier for the value it carries. Each test below
+// asserts the shape that is actually emitted, which is the shape that compiles.
+
+// A self-valued labelled block emits its own label and leaves through it. It
+// reaches Zig through a CARRIER — a `const` initializer here — because written
+// as a bare statement there is nothing for the block's value to attach to and
+// Zig reads the label as a statement label.
+test "emitFile: a self-valued labelled block is written as a labelled block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seven = try boxed(a, .{ .lit = .{ .uint = 7 } });
+    const bound = ast.Decl{ .fn_decl = .{
+        .name = "chainValue",
+        .ret_type = .{ .prim = .u8 },
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .let_stmt = .{
+                .name = "answer",
+                .init = .{ .block = .{ .label = "chain", .expr = seven } },
+            } }}),
+            .expr = try boxed(a, ident("answer")),
+        },
+    } };
+
+    const out = try emitFile(a, .{ .path = "src/chain.zig", .decls = &.{bound} });
+    // The label is the source's own and the value leaves through it: both
+    // bytes are the shape, because a block that emitted `break :` with no label
+    // would not parse.
+    try std.testing.expect(std.mem.indexOf(u8, out, "const answer = chain: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "break :chain 7;") != null);
+
+    // An unlabelled value block still gets a label of the emitter's own, and it
+    // is a DIFFERENT one — which is why the two are not the same shape and
+    // must not be emitted as one.
+    const generated = ast.Decl{ .fn_decl = .{
+        .name = "generatedValue",
+        .ret_type = .{ .prim = .u8 },
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .let_stmt = .{
+                .name = "answer",
+                .init = .{ .block = .{ .expr = seven } },
+            } }}),
+            .expr = try boxed(a, ident("answer")),
+        },
+    } };
+    const generated_out = try emitFile(a, .{ .path = "src/chain.zig", .decls = &.{generated} });
+    try std.testing.expect(
+        std.mem.indexOf(u8, generated_out, "const answer = __r2z_value_block_") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, generated_out, "break :") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated_out, "chain") == null);
+}
+
+// The ordered chain a guarded `match` lowers to: a labelled block whose arms
+// leave through `break :label`, closed by the `unreachable` that stands where
+// every value was already taken. It is bound to a local rather than moved into
+// the body's tail, because a labelled block needs the binding to be what gives
+// its value somewhere to go.
+test "emitFile: the guard chain keeps its label, its exits and its unreachable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const guarded_arm = ast.Expr{ .block = .{
+        .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, .{ .if_expr = .{
+            .cond = try boxed(a, ident("usable")),
+            .then_body = try boxed(a, .{ .block = .{
+                .stmts = try listStmts(a, &.{.{ .expr_stmt = try boxed(a, .{ .break_expr = .{
+                    .value = try boxed(a, ident("payload")),
+                    .label = "__r2z_match_block",
+                } }) }}),
+            } }),
+        } }) }}),
+    } };
+    const dispatch = ast.Expr{ .match_expr = .{
+        .target = try boxed(a, ident("input")),
+        .arms = try listArms(a, &.{
+            .{ .patterns = &.{.{ .enum_literal = "Found" }}, .body = guarded_arm },
+            .{ .patterns = &.{.wildcard}, .body = ident("fallback") },
+        }),
+    } };
+    const chain = ast.Expr{ .block = .{
+        .label = "__r2z_match_block",
+        .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, dispatch) },
+            .{ .expr_stmt = try boxed(a, .{ .unreachable_ = {} }) },
+        }),
+    } };
+
+    const classify = ast.Decl{ .fn_decl = .{
+        .name = "classify",
+        .ret_type = .{ .named = "Tag" },
+        .body = .{
+            .stmts = try listStmts(a, &.{.{ .let_stmt = .{
+                .name = "__r2z_chain",
+                .init = chain,
+            } }}),
+            .expr = try boxed(a, ident("__r2z_chain")),
+        },
+    } };
+    const out = try emitFile(a, .{ .path = "src/classify.zig", .decls = &.{classify} });
+
+    // The chain is bound, and the tail names the binding — so the label never
+    // reaches the one position it has no spelling for.
+    try std.testing.expect(
+        std.mem.indexOf(u8, out, "const __r2z_chain = __r2z_match_block: {") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "return __r2z_chain;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return __r2z_match_block") == null);
+    // The scrutinee is dispatched, the guard sits inside the arm's prong, and
+    // the arm's value leaves through the chain's own label — not through the
+    // arm block, which is not the carrier.
+    try std.testing.expect(std.mem.indexOf(u8, out, "switch (input) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".Found =>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "if (usable)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "break :__r2z_match_block payload;") != null);
+    // The chain closes where every value was already taken.
+    try std.testing.expect(std.mem.indexOf(u8, out, "unreachable;") != null);
+    // Exactly one label was written, and it is the chain's: a second one would
+    // be a redefinition Zig refuses.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, out, "__r2z_match_block: {"),
+    );
+}
+
+// The per-field destructure: each binding is read out of the captured payload
+// by the field it came from, and the arm's value leaves through the arm's own
+// generated label. Two fields binding one name would write two `const` of that
+// name in one block, which is why the AST refuses it — this pins the bytes the
+// refusal is protecting.
+test "emitExpr: a per-field destructure reads each field into its own binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const destructure = ast.Expr{ .match_expr = .{
+        .target = try boxed(a, ident("input")),
+        .arms = try listArms(a, &.{.{ .patterns = &.{.{ .struct_pat = .{
+            .name = "pair",
+            .fields = &.{
+                .{ .name = "left", .pat = .{ .binding = "left" } },
+                .{ .name = "right", .pat = .{ .binding = "right" } },
+            },
+        } }}, .body = .{ .bin_op = .{
+            .op = .add,
+            .lhs = try boxed(a, ident("left")),
+            .rhs = try boxed(a, ident("right")),
+        } } }}),
+    } };
+    const out = try emitExpression(a, destructure);
+
+    // The field is what each name is read from, so the pairing is the shape:
+    // swapping which field a name comes from moves two bytes and nothing else.
+    try std.testing.expect(
+        std.mem.indexOf(u8, out, "const left = __r2z_match_payload.left;") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, out, "const right = __r2z_match_payload.right;") != null,
+    );
+    // The arm's own value leaves through the arm's generated block, which is
+    // the one the emitter invents — not through the chain, and not through a
+    // `return`.
+    try std.testing.expect(
+        std.mem.indexOf(u8, out, "break :__r2z_match_arm left + right;") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "return") == null);
+
+    // The single positional field is NOT read this way: it takes the direct
+    // capture, so the payload is bound whole and no field access is written.
+    const positional = ast.Expr{ .match_expr = .{
+        .target = try boxed(a, ident("input")),
+        .arms = try listArms(a, &.{.{ .patterns = &.{.{ .struct_pat = .{
+            .name = "Some",
+            .fields = &.{.{ .name = "0", .pat = .{ .binding = "value" } }},
+        } }}, .body = ident("value") }}),
+    } };
+    const positional_out = try emitExpression(a, positional);
+    try std.testing.expect(
+        std.mem.indexOf(u8, positional_out, ".Some => |value| value") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, positional_out, "__r2z_match_payload") == null);
+}
+
+// The owner-position turbofish: the type argument is written by `emitType`
+// ahead of every value argument, because Zig's generic parameters are
+// comptime and come first. An owner instantiation therefore reads
+// `Vec(T).empty`, not `Vec.empty(T)`.
+test "emitExpr: an owner turbofish writes the type argument before any value argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const owner = ast.Expr{ .call = .{
+        .callee = try boxed(a, ident("std.ArrayListUnmanaged")),
+        .generic_args = &.{.{ .prim = .u8 }},
+    } };
+    const owner_init = ast.Expr{ .field_access = .{
+        .target = try boxed(a, owner),
+        .field_name = "empty",
+    } };
+    const out = try emitExpression(a, owner_init);
+    try std.testing.expectEqualStrings("std.ArrayListUnmanaged(u8).empty", out);
+
+    // With a value argument beside it, the type argument still comes first —
+    // that ordering is the shape, and moving it would bind `u8` to a value.
+    const with_value = ast.Expr{ .call = .{
+        .callee = try boxed(a, ident("std.ArrayListUnmanaged")),
+        .generic_args = &.{.{ .prim = .u8 }},
+        .args = try list(a, &.{ident("source")}),
+    } };
+    const value_out = try emitExpression(a, with_value);
+    try std.testing.expectEqualStrings("std.ArrayListUnmanaged(u8, source)", value_out);
+
+    // The same call with no type argument is a different shape and emits no
+    // parentheses where the turbofish wrote them.
+    const bare_out = try emitExpression(a, .{ .call = .{
+        .callee = try boxed(a, ident("std.ArrayListUnmanaged")),
+    } });
+    try std.testing.expectEqualStrings("std.ArrayListUnmanaged()", bare_out);
+}
+
+// The discard for an unread parameter: Zig has no spelling for one, so the
+// name is written verbatim in the parameter list and the `_ = <name>;` goes in
+// the body. Both halves are pinned together here because the pair is the whole
+// contract — a name without the discard is `unused function parameter`, and a
+// discard without the name is `missing parameter name`.
+test "emitFile: an underscore-prefixed parameter keeps its name and is still discarded in the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const consume = ast.Decl{ .fn_decl = .{
+        .name = "consume",
+        .params = &.{
+            .{ .name = "_unit", .ty = .{ .prim = .u8 } },
+            .{ .name = "read", .ty = .{ .prim = .u8 } },
+        },
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, .{ .unit = {} }) },
+        }) },
+    } };
+    const out = try emitFile(a, .{ .path = "src/consume.zig", .decls = &.{consume} });
+
+    // Both names are written in the parameter list: a parameter dropped from it
+    // is `missing parameter name`, and a `_`-prefixed one is not a discard —
+    // the `_` check belongs to the switch-capture spelling and has no say here.
+    try std.testing.expect(std.mem.indexOf(u8, out, "(_unit: u8, read: u8)") != null);
+    // Both are discarded in the body, `_unit` included, because both are unread.
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = _unit;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = read;\n") != null);
+
+    // A parameter the body DOES read keeps no discard, so the two cases are
+    // distinguished by the body rather than by the spelling of the name.
+    const aware = ast.Decl{ .fn_decl = .{
+        .name = "consume",
+        .params = &.{.{ .name = "read", .ty = .{ .prim = .u8 } }},
+        .ret_type = .{ .void_type = {} },
+        .body = .{ .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, ident("read")) },
+        }) },
+    } };
+    const read_out = try emitFile(a, .{ .path = "src/consume.zig", .decls = &.{aware} });
+    try std.testing.expect(std.mem.indexOf(u8, read_out, "(read: u8)") != null);
+    // The body names it, so no discard: the two cases differ by the body, not
+    // by the spelling of the name.
+    try std.testing.expect(std.mem.indexOf(u8, read_out, "_ = read;") == null);
+
+    // The `comptime T: type` parameter is exempt, because its references live in
+    // the signature and a body-only scan would discard one the parameter list
+    // still needs.
+    const head = ast.Decl{ .fn_decl = .{
+        .name = "head",
+        .params = &.{
+            .{ .name = "T", .ty = .{ .prim = .type_type }, .is_comptime = true },
+            .{ .name = "bytes", .ty = .{ .slice = .{
+                .elem = &ast.Type{ .named = "T" },
+                .is_const = true,
+            } } },
+        },
+        .ret_type = .{ .prim = .u8 },
+        .body = .{ .stmts = try listStmts(a, &.{
+            .{ .expr_stmt = try boxed(a, .{ .unit = {} }) },
+        }) },
+    } };
+    const type_out = try emitFile(a, .{ .path = "src/head.zig", .decls = &.{head} });
+    try std.testing.expect(
+        std.mem.indexOf(u8, type_out, "(comptime T: type, bytes: []const T)") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, type_out, "_ = T;\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, type_out, "_ = bytes;\n") != null);
 }

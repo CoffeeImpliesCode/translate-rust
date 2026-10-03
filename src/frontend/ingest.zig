@@ -538,9 +538,17 @@ pub fn loadCrateManifest(
             allocator.free(root_path);
             return dupe_err;
         };
+        // Duped rather than left as the "2021" literal so that every manifest
+        // this function returns OWNS each string it holds; `deinitLoadedManifest`
+        // then has no borrowed case to have to recognise.
+        const edition = allocator.dupe(u8, "2021") catch |dupe_err| {
+            allocator.free(name);
+            allocator.free(root_path);
+            return dupe_err;
+        };
         return .{
             .name = name,
-            .edition = "2021",
+            .edition = edition,
             .version = null,
             .root_path = root_path,
             .is_bin = is_bin,
@@ -623,6 +631,26 @@ pub fn loadCrateManifest(
     }
 
     return error.RootSourceNotFound;
+}
+
+/// Release a `Manifest` that `loadCrateManifest` handed back.
+///
+/// Named for its producer rather than for the type because `Manifest` also
+/// names BORROWED strings: `frontend.analyzeSourceWithOptions` builds one over
+/// the caller's `crate_name` and `edition`, and releasing that would free
+/// memory this module never allocated. A manifest out of `loadCrateManifest`
+/// owns every field it holds — including `root_path`, which is a joined path
+/// even when it is the fallback one — so this is total over its results.
+///
+/// Callers on an arena pay nothing: the arena ignores these frees.
+pub fn deinitLoadedManifest(allocator: std.mem.Allocator, manifest: Manifest) void {
+    allocator.free(manifest.name);
+    allocator.free(manifest.edition);
+    if (manifest.version) |version| allocator.free(version);
+    allocator.free(manifest.root_path);
+    freeDependencies(allocator, manifest.dependencies);
+    freeDependencies(allocator, manifest.dev_dependencies);
+    freeFeatures(allocator, manifest.features);
 }
 
 fn fileExists(io: std.Io, path: []const u8) !bool {

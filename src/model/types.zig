@@ -10,6 +10,9 @@ const spine = @import("spine.zig");
 /// §4 — The type tagged union every field/param/return references.
 pub const Type = union(enum) {
     path: Path,
+    /// A nominal type supplied by Rust `alloc`/`core`/`std`, not declared in this
+    /// crate. Its path is provenance-only: it has no graph entity id.
+    external_nominal: ExternalNominal,
     prim: Prim,
     reference: *const Ref,
     raw_ptr: *const RawPtr,
@@ -21,6 +24,11 @@ pub const Type = union(enum) {
     option: *const Type,
     result: *const Result,
     boxed: *const Type,
+    /// An opaque Rust type whose declared bounds remain available even when
+    /// inference has not yet recovered its concrete representation.
+    @"opaque": Opaque,
+    /// A dynamic trait object such as `dyn Error + 'static`.
+    dyn_trait: []const Bound,
     unsupported: spine.Unsupported,
 };
 
@@ -56,6 +64,16 @@ pub const Path = struct {
 pub const PathSegment = struct {
     name: []const u8,
     id: ?spine.EntityId,
+};
+
+/// A nominal Rust type outside the translated crate.
+///
+/// `path` retains every Rust segment, in source order. Unlike `Path`, the
+/// segments have no nullable `EntityId`; external names are never graph
+/// entities. Generic arguments remain first-class IR types.
+pub const ExternalNominal = struct {
+    path: []const []const u8,
+    args: []const Type = &.{},
 };
 
 /// §4.1 — `&T` → `*const T`, `&mut T` → `*T`. Lifetimes are erased at emit but
@@ -149,11 +167,51 @@ pub const LifetimeParam = struct {
     name: []const u8,
 };
 
+pub const AssociatedTypeBinding = struct {
+    name: []const u8,
+    ty: Type,
+};
+
 pub const Bound = struct {
     path: Path,
+    args: []const Type = &.{},
+    associated_types: []const AssociatedTypeBinding = &.{},
+    optional: bool = false,
+};
+
+/// An opaque Rust type. `concrete` is optional during extraction and inference;
+/// translation backends decide whether an unresolved value is representable.
+pub const Opaque = struct {
+    bounds: []const Bound,
+
+    concrete: ?*const Type = null,
 };
 
 pub const WhereClause = struct {
     self_ty: Path,
     bounds: []const Bound,
 };
+
+test "types — external nominal, opaque, and dyn_trait arms carry their payloads" {
+    const external_nominal: Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    const bound: Bound = .{
+        .path = .{ .segments = &.{
+            .{ .name = "Iterator", .id = 1 },
+            .{ .name = "Item", .id = null },
+        } },
+        .args = &.{.{ .prim = .u32 }},
+        .associated_types = &.{.{ .name = "Item", .ty = .{ .prim = .u32 } }},
+        .optional = true,
+    };
+    const opaque_type: Type = .{ .@"opaque" = .{
+        .bounds = &.{bound},
+        .concrete = &.{ .prim = .u32 },
+    } };
+    const dyn_trait: Type = .{ .dyn_trait = &.{bound} };
+    _ = external_nominal;
+    _ = opaque_type;
+    _ = dyn_trait;
+}

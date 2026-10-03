@@ -53,9 +53,56 @@ pub const StructMethod = struct {
 
 /// Body of a struct definition (generic parameters, layout, fields, inherent methods).
 pub const StructBody = struct {
+    /// The declaration's TYPE parameters, in source order, owned by the frontend
+    /// arena. A const or lifetime parameter contributes NO entry:
+    /// `struct Buf<const N: usize, T>` carries `&.{"T"}`.
+    ///
+    /// Nothing else belongs here. A name in this list binds in every type the
+    /// row owns, so one entry that the declaration does not declare turns a
+    /// const parameter's own type into an in-scope type parameter and answers
+    /// questions about a type that was never written.
+    ///
+    /// `validate` counts a declaration's parameters from THIS list
+    /// (`genericCountForEntity`) rather than from `generics`, which is why an
+    /// instantiation of a const-generic declaration is refused rather than
+    /// admitted with a missing value. See `types.GenericArgs`.
     generic_params: []const []const u8 = &.{},
+    /// The declaration's full generic metadata, the way `FnBody`,
+    /// `StructMethod`, `TraitMethodSig`, `TraitBody` and `ImplBody` carry it:
+    /// every parameter the source spells — type, const and lifetime alike —
+    /// with the bounds each carries, plus its `where` clauses.
+    /// `struct S<T: Copy> where T: Debug` records BOTH bounds here, and
+    /// `genericBound` reads them back through the owning declaration.
+    ///
+    /// `null` means the source spells no parameters and no `where` clause at
+    /// all, which is a fact `generic_params = &.{}` cannot state: an empty name
+    /// list is also what a declaration carrying only const or lifetime
+    /// parameters produces.
+    generics: ?types.Generics = null,
+    /// Bounds the source spells on the declaration, as it spells them
+    /// (`"T: Copy"`). Diagnostics only, and a strict subset of what `generics`
+    /// already carries: the resolved `types.Bound`s a reader needs live in
+    /// `generics.params[].type_.bounds` and `generics.where_clauses[].bounds`.
+    ///
+    /// The field stays because the wire format requires the key and `validate`
+    /// reads it. No producer fills it, so it is empty on every row the pipeline
+    /// builds; the producer obligation is the `generics` field above.
     trait_bounds: []const []const u8 = &.{},
-    layout: items.struct_kind = .named,
+    /// The Rust SOURCE FORM of the declaration, never a fact about the fields the
+    /// row happens to carry:
+    ///
+    ///   `struct S;`          → `.unit`    no field list at all
+    ///   `struct S {}`        → `.named`   a named field list, empty
+    ///   `struct S();`        → `.tuple`   an ordered field list, empty
+    ///   `struct S(T);`       → `.tuple`, one field named `"0"`
+    ///   `struct S { t: T }`  → `.named`
+    ///
+    /// The field count cannot decide this, and deciding it that way is the
+    /// mistake this field is here to prevent: `struct S();` is an ordered list
+    /// holding nothing, and its constructor answers `S()`, not `S {}`. A
+    /// `.tuple` row's fields are named by position — `"0"`, `"1"`, … — which is
+    /// what lets a reader recover the source form from the row alone.
+    layout: items.StructKind = .named,
     fields: []const items.Field = &.{},
     methods: []const StructMethod = &.{},
     has_dynamic_resources: bool = false,
@@ -63,10 +110,10 @@ pub const StructBody = struct {
 
 /// Body of an enum definition (kind, variants, optional integer repr, non_exhaustive).
 pub const EnumBody = struct {
-    kind: items.enum_kind = .c_like,
+    kind: items.EnumKind = .c_like,
     generic_params: []const []const u8 = &.{},
     variants: []const items.Variant = &.{},
-    repr_int: ?items.int_repr = null,
+    repr_int: ?items.IntRepr = null,
     non_exhaustive: bool = false,
 };
 /// Trait method signature for VTable and TraitObject generation.
@@ -343,6 +390,11 @@ pub fn genericBound(
             .fn_ => |function| function.generics,
             .impl_ => |implementation| implementation.generics,
             .trait_ => |trait_body| trait_body.generics,
+            // A `struct S<T: Copy>` bounds `T` for every method and field the
+            // declaration owns, exactly as an enclosing `fn` or `impl` does.
+            // Leaving `.struct_` out here is what made a struct's bounds
+            // unreachable no matter what the producer recorded on the row.
+            .struct_ => |structure| structure.generics,
             else => null,
         };
         if (generics) |parameters| {
@@ -380,4 +432,283 @@ test "bodies shapes instantiate" {
     _ = b;
     const k: BodyKind = .{ .none = {} };
     _ = k;
+}
+
+test "a struct row's layout is the source form, not its field count" {
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 2 };
+    const named_field = [_]items.Field{
+        .{ .name = "t", .ty = .{ .prim = .u32 }, .visibility = .public, .span = span },
+    };
+    const positional_field = [_]items.Field{
+        .{ .name = "0", .ty = .{ .prim = .u32 }, .visibility = .public, .span = span },
+    };
+
+    // The three source forms, each with the fields it spells. Two of the five
+    // spell no field at all and are still three different declarations.
+    const forms = [_]struct { source: []const u8, row: StructBody }{
+        .{ .source = "struct S;", .row = .{ .layout = .unit } },
+        .{ .source = "struct S {}", .row = .{ .layout = .named } },
+        .{ .source = "struct S();", .row = .{ .layout = .tuple } },
+        .{ .source = "struct S(T);", .row = .{ .layout = .tuple, .fields = &positional_field } },
+        .{ .source = "struct S { t: T }", .row = .{ .layout = .named, .fields = &named_field } },
+    };
+    for (forms) |form| {
+        // A row whose fields carry the source's identifiers is named; a row
+        // whose fields carry positions is a tuple; an empty ordered list is
+        // still the tuple its source wrote.
+        switch (form.row.layout) {
+            .tuple => {
+                for (form.row.fields, 0..) |field, index| {
+                    var expected: [8]u8 = undefined;
+                    try std.testing.expectEqualStrings(
+                        try std.fmt.bufPrint(&expected, "{d}", .{index}),
+                        field.name,
+                    );
+                }
+            },
+            .named => for (form.row.fields) |field| {
+                try std.testing.expect(!isPositionalFieldName(field.name));
+            },
+            .unit => try std.testing.expectEqual(@as(usize, 0), form.row.fields.len),
+        }
+    }
+
+    // The pair that a field count cannot tell apart, stated directly: an empty
+    // named list and an empty ordered list are different declarations.
+    const empty_named = forms[1].row;
+    const empty_tuple = forms[2].row;
+    try std.testing.expectEqual(@as(usize, 0), empty_named.fields.len);
+    try std.testing.expectEqual(@as(usize, 0), empty_tuple.fields.len);
+    try std.testing.expect(empty_named.layout != empty_tuple.layout);
+}
+
+/// Whether a field name is the position a tuple field is named by. A Rust
+/// identifier cannot start with a digit, so this is exactly "the row is a tuple
+/// field list".
+fn isPositionalFieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name.len == 1 and name[0] == '0') return true;
+    if (name[0] < '1' or name[0] > '9') return false;
+    for (name[1..]) |digit| {
+        if (digit < '0' or digit > '9') return false;
+    }
+    return true;
+}
+
+test "a struct row names the type parameters of its declaration and nothing else" {
+    // `struct Buf<'a, const N: usize, T: Copy, U>` as the declaration records
+    // it: two lifetimes/const parameters the row cannot hold, two type
+    // parameters it must.
+    const declaration: types.Generics = .{ .params = &.{
+        .{ .lifetime = .{ .name = "'a" } },
+        .{ .const_ = .{ .name = "N", .ty = .{ .prim = .usize } } },
+        .{ .type_ = .{ .name = "T", .bounds = &.{} } },
+        .{ .type_ = .{ .name = "U", .bounds = &.{} } },
+    }, .where_clauses = &.{} };
+    const row: StructBody = .{ .generic_params = &.{ "T", "U" } };
+
+    // The rule the producer owes: the row names every `.type_` parameter of the
+    // declaration, in source order, and nothing else — not the const parameter,
+    // not the lifetime.
+    var named: usize = 0;
+    for (declaration.params) |parameter| {
+        if (parameter != .type_) continue;
+        try std.testing.expect(named < row.generic_params.len);
+        try std.testing.expectEqualStrings(parameter.type_.name, row.generic_params[named]);
+        named += 1;
+    }
+    try std.testing.expectEqual(named, row.generic_params.len);
+    try std.testing.expectEqual(@as(usize, 2), named);
+    try std.testing.expectEqual(@as(usize, 4), declaration.params.len);
+}
+
+test "a struct row carries its declaration's generics and genericBound reads them back" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    const struct_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = "S",
+        .span = span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const method_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "value",
+        .span = span,
+        .visibility = .public,
+        .parent = struct_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // `struct S<T: Copy> where T: Debug` — one bound on the parameter itself
+    // and one in the where clause, both of which the row has to keep.
+    const parameter_name = [_]types.PathSegment{.{ .name = "T", .id = null }};
+    const copy_bound: types.Bound = .{
+        .path = .{ .segments = &.{.{ .name = "Copy", .id = null }} },
+    };
+    const debug_bound: types.Bound = .{
+        .path = .{ .segments = &.{.{ .name = "Debug", .id = null }} },
+    };
+    const row: Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{
+            .{ .none = {} },
+            .{ .struct_ = .{
+                .generic_params = &.{"T"},
+                .generics = .{
+                    .params = &.{.{ .type_ = .{ .name = "T", .bounds = &.{copy_bound} } }},
+                    .where_clauses = &.{.{ .self_ty = .{ .segments = &parameter_name }, .bounds = &.{debug_bound} }},
+                },
+            } },
+            .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u32 }, .body = 0 } },
+        },
+    };
+
+    // The name list still names the type parameters alone...
+    try std.testing.expectEqual(@as(usize, 1), row.bodies[1].struct_.generic_params.len);
+    try std.testing.expectEqualStrings("T", row.bodies[1].struct_.generic_params[0]);
+
+    // ...and both bounds reach a method that receives `T`, because the row is
+    // in the declaring scope's chain. A trait the declaration never spelled is
+    // still refused.
+    const receiver: types.Type = .{ .path = .{ .segments = &parameter_name } };
+    try std.testing.expect(genericBound(&g, &row, method_id, receiver, &.{"Copy"}) != null);
+    try std.testing.expect(genericBound(&g, &row, method_id, receiver, &.{"Debug"}) != null);
+    try std.testing.expect(genericBound(&g, &row, method_id, receiver, &.{"Clone"}) == null);
+}
+
+test "a fn row's bounds are read back from the declaring body itself" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    _ = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = "",
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    // The callee that DECLARES the bound. A receiver only answers from the
+    // body that introduces its name, so the declaration is the first scope the
+    // walk has to reach — a walk that skips it answers from an ancestor, or
+    // from nothing.
+    const wrapper_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "hash_of",
+        .span = span,
+        .visibility = .public,
+        .parent = 0,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // `fn hash_of<T: core::hash::Hash, H: core::hash::Hasher>(..)` — one
+    // parameter bounded by Hash, one by Hasher, so the two slots are told apart
+    // by the bound alone and neither answers for the other's trait.
+    const canonical_hash: types.Bound = .{ .path = .{ .segments = &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "hash", .id = null },
+        .{ .name = "Hash", .id = null },
+    } } };
+    const canonical_hasher: types.Bound = .{ .path = .{ .segments = &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "hash", .id = null },
+        .{ .name = "Hasher", .id = null },
+    } } };
+    const wanted_hash = [_][]const u8{ "core", "hash", "Hash" };
+    const wanted_hasher = [_][]const u8{ "core", "hash", "Hasher" };
+    const t_name = [_]types.PathSegment{.{ .name = "T", .id = null }};
+    const h_name = [_]types.PathSegment{.{ .name = "H", .id = null }};
+
+    const row: Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{
+            .{ .none = {} },
+            .{ .fn_ = .{
+                .params = &.{},
+                .ret = .{ .prim = .u64 },
+                .generic_params = &.{ "T", "H" },
+                .generics = .{ .params = &.{
+                    .{ .type_ = .{ .name = "T", .bounds = &.{canonical_hash} } },
+                    .{ .type_ = .{ .name = "H", .bounds = &.{canonical_hasher} } },
+                }, .where_clauses = &.{} },
+                .body = 0,
+            } },
+        },
+    };
+
+    const receiver_t: types.Type = .{ .path = .{ .segments = &t_name } };
+    const receiver_h: types.Type = .{ .path = .{ .segments = &h_name } };
+    // The bound the declaring body spells is the bound that answers, from the
+    // declaration itself.
+    try std.testing.expect(genericBound(&g, &row, wrapper_id, receiver_t, &wanted_hash) != null);
+    try std.testing.expect(genericBound(&g, &row, wrapper_id, receiver_h, &wanted_hasher) != null);
+    // Each slot answers only for its OWN bound: the matcher never degrades to
+    // the last segment, so `Hasher` is not `Hash` and neither is either of them
+    // `core::fmt::Debug`.
+    try std.testing.expect(genericBound(&g, &row, wrapper_id, receiver_t, &wanted_hasher) == null);
+    try std.testing.expect(genericBound(&g, &row, wrapper_id, receiver_h, &wanted_hash) == null);
+    try std.testing.expect(genericBound(&g, &row, wrapper_id, receiver_t, &.{"Debug"}) == null);
 }

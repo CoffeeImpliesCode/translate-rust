@@ -76,9 +76,16 @@ fn findCharEnd(s: []const u8, start: usize) ?usize {
                 i += 1;
                 if (i >= s.len or s[i] != '{') return null;
                 i += 1;
-                const digits_start = i;
-                while (i < s.len and std.ascii.isHex(s[i])) : (i += 1) {}
-                if (i == digits_start or i >= s.len or s[i] != '}') return null;
+                var digit_count: usize = 0;
+                while (i < s.len and (std.ascii.isHex(s[i]) or s[i] == '_')) : (i += 1) {
+                    if (std.ascii.isHex(s[i])) {
+                        digit_count += 1;
+                        if (digit_count > 6) return null;
+                    } else if (digit_count == 0) {
+                        return null;
+                    }
+                }
+                if (digit_count == 0 or i >= s.len or s[i] != '}') return null;
                 i += 1;
             },
             'x' => {
@@ -90,7 +97,9 @@ fn findCharEnd(s: []const u8, start: usize) ?usize {
             else => i += 1,
         }
     } else {
-        i += 1;
+        const byte_count = std.unicode.utf8ByteSequenceLength(s[i]) catch return null;
+        if (byte_count > s.len - i) return null;
+        i += byte_count;
     }
     if (i < s.len and s[i] == '\'') return i;
     return null;
@@ -338,11 +347,12 @@ pub fn splitMacroArgs(alloc: std.mem.Allocator, raw_tokens: []const u8) ![]const
     var start: usize = 0;
 
     var i: usize = 0;
-    while (i < text.len) : (i += 1) {
+    while (i < text.len) {
         const c: u8 = text[i];
 
         if (escape) {
             escape = false;
+            i += 1;
             continue;
         }
 
@@ -352,11 +362,22 @@ pub fn splitMacroArgs(alloc: std.mem.Allocator, raw_tokens: []const u8) ![]const
             } else if (c == '"') {
                 in_double_quote = false;
             }
+            i += 1;
+            continue;
+        }
+
+        // A comment or a raw string literal holds no argument of its own, yet
+        // it can hold a comma or a delimiter. Skipping it whole is what keeps
+        // `a /*,*/ b` one argument instead of three, and `[a /* ( */, b]` two
+        // elements instead of one.
+        if (skipTriviaOrRawString(text, i)) |resume_at| {
+            i = resume_at;
             continue;
         }
 
         if (c == '"') {
             in_double_quote = true;
+            i += 1;
             continue;
         }
 
@@ -364,7 +385,7 @@ pub fn splitMacroArgs(alloc: std.mem.Allocator, raw_tokens: []const u8) ![]const
             // Skip a char literal so commas inside its body (or its closing
             // quote) are not misread as argument separators.
             if (findCharEnd(text, i)) |end| {
-                i = end;
+                i = end + 1;
                 continue;
             }
         }
@@ -386,6 +407,7 @@ pub fn splitMacroArgs(alloc: std.mem.Allocator, raw_tokens: []const u8) ![]const
             try args_list.append(alloc, arg);
             start = i + 1;
         }
+        i += 1;
     }
 
     const last_arg: []const u8 = std.mem.trim(u8, text[start..text.len], " \t\r\n");
@@ -448,6 +470,42 @@ fn findRawStringEnd(text: []const u8, body_start: usize, hash_count: usize) ?usi
             matched_hashes += 1;
         }
         if (matched_hashes == hash_count) return i + hash_count;
+    }
+    return null;
+}
+
+/// Return the index just past a line comment, block comment, or raw string
+/// literal starting at `index`, or null when none starts there.
+///
+/// Every scanner that hunts for a top-level separator must skip these first.
+/// A comment and a raw string carry no items, but they do carry `,`, `;` and
+/// delimiter bytes; a scanner that reads them invents items that are not
+/// there and loses the ones that are — the token-level form of enumerating a
+/// node's named children and dropping the anonymous one.
+fn skipTriviaOrRawString(text: []const u8, index: usize) ?usize {
+    if (index >= text.len) return null;
+    if (text[index] == '/' and index + 1 < text.len) {
+        if (text[index + 1] == '/') {
+            var cursor = index + 2;
+            while (cursor < text.len and text[cursor] != '\n') : (cursor += 1) {}
+            return cursor;
+        }
+        if (text[index + 1] == '*') {
+            const close = findBlockCommentEnd(text, index) orelse return null;
+            return close + 1;
+        }
+    }
+    if (text[index] == 'r' or
+        (text[index] == 'b' and index + 1 < text.len and text[index + 1] == 'r'))
+    {
+        const prefix_len: usize = if (text[index] == 'r') 1 else 2;
+        var marker = index + prefix_len;
+        while (marker < text.len and text[marker] == '#') : (marker += 1) {}
+        if (marker < text.len and text[marker] == '"') {
+            const hash_count = marker - index - prefix_len;
+            const close = findRawStringEnd(text, marker + 1, hash_count) orelse return null;
+            return close + 1;
+        }
     }
     return null;
 }
@@ -969,18 +1027,42 @@ const Capture = struct {
 
 const CaptureList = std.ArrayListUnmanaged(Capture);
 
-fn pathHasPrefix(path: CapturePath, prefix: CapturePath) bool {
-    if (path.len < prefix.len) return false;
-    for (0..prefix.len) |index| {
-        if (path.indices[index] != prefix.indices[index]) return false;
+fn captureLowerBound(captures: []const Capture, path: []const usize) usize {
+    var low: usize = 0;
+    var high = captures.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const candidate = &captures[mid].path;
+        if (std.mem.order(usize, candidate.indices[0..candidate.len], path) == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
     }
-    return true;
+    return low;
+}
+
+fn capturePrefixEnd(captures: []const Capture, prefix: []const usize, first: usize) usize {
+    var low = first;
+    var high = captures.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const candidate = &captures[mid].path;
+        if (std.mem.startsWith(usize, candidate.indices[0..candidate.len], prefix)) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
 }
 
 pub const Bindings = struct {
     alloc: std.mem.Allocator,
     top_vars: std.StringHashMapUnmanaged([]const u8) = .empty,
     rep_vars: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    // Valid matchers bind each name once. Its captures have one depth and are
+    // lexicographically ordered by iteration; rollback only removes a suffix.
     captures: std.StringHashMapUnmanaged(CaptureList) = .empty,
     capture_log: std.ArrayListUnmanaged([]const u8) = .empty,
 
@@ -1039,35 +1121,34 @@ pub const Bindings = struct {
         return self.captures.get(name) != null;
     }
 
-    fn getCapture(self: *const Bindings, name: []const u8, path: CapturePath) ?[]const u8 {
-        const list = self.captures.get(name) orelse return null;
-        var index = list.items.len;
-        while (index > 0) {
-            index -= 1;
-            const capture = list.items[index];
-            if (capture.path.len <= path.len and pathHasPrefix(path, capture.path)) {
-                return capture.value;
-            }
-        }
-        return null;
+    fn getCapture(self: *const Bindings, name: []const u8, path: *const CapturePath) ?[]const u8 {
+        const captures = (self.captures.getPtr(name) orelse return null).items;
+        if (captures.len == 0) return null;
+        const depth = captures[0].path.len;
+        if (path.len < depth) return null;
+        const query = path.indices[0..depth];
+        const index = captureLowerBound(captures, query);
+        if (index == captures.len) return null;
+        const capture = &captures[index];
+        if (!std.mem.eql(usize, capture.path.indices[0..capture.path.len], query)) return null;
+        return capture.value;
     }
 
-    fn repetitionCount(self: *const Bindings, name: []const u8, prefix: CapturePath) ?usize {
-        const list = self.captures.get(name) orelse return null;
-        var found = false;
-        var count: usize = 0;
-        for (list.items) |capture| {
-            if (capture.path.len <= prefix.len or !pathHasPrefix(capture.path, prefix)) continue;
-            const index = capture.path.indices[prefix.len];
-            if (!found or index + 1 > count) count = index + 1;
-            found = true;
-        }
-        return if (found) count else null;
+    fn repetitionCount(self: *const Bindings, name: []const u8, prefix: *const CapturePath) ?usize {
+        const captures = (self.captures.getPtr(name) orelse return null).items;
+        if (captures.len == 0 or captures[0].path.len <= prefix.len) return null;
+        const query = prefix.indices[0..prefix.len];
+        const first = captureLowerBound(captures, query);
+        if (first == captures.len) return null;
+        const candidate = &captures[first].path;
+        if (!std.mem.startsWith(usize, candidate.indices[0..candidate.len], query)) return null;
+        const end = capturePrefixEnd(captures, query, first);
+        return captures[end - 1].path.indices[prefix.len] + 1;
     }
     pub fn getTop(self: *const Bindings, name: []const u8) ?[]const u8 {
         if (self.top_vars.get(name)) |value| return value;
         const path: CapturePath = .{};
-        return self.getCapture(name, path);
+        return self.getCapture(name, &path);
     }
 
     pub fn getRep(self: *const Bindings, name: []const u8, idx: usize) ?[]const u8 {
@@ -1077,7 +1158,7 @@ pub const Bindings = struct {
         var path: CapturePath = .{};
         path.len = 1;
         path.indices[0] = idx;
-        return self.getCapture(name, path);
+        return self.getCapture(name, &path);
     }
 
     pub fn hasRep(self: *const Bindings, name: []const u8) bool {
@@ -1087,7 +1168,7 @@ pub const Bindings = struct {
     pub fn getRepLen(self: *const Bindings, name: []const u8) usize {
         if (self.rep_vars.get(name)) |list| return list.items.len;
         const path: CapturePath = .{};
-        return self.repetitionCount(name, path) orelse 0;
+        return self.repetitionCount(name, &path) orelse 0;
     }
 };
 
@@ -1366,6 +1447,14 @@ fn scanUntilDelimited(
             i += 1;
             continue;
         }
+        // A fragment ends at a separator or at the token that follows it. A
+        // comma or a follow token written inside a comment or a raw string is
+        // not one, so skipping the whole literal keeps `a /*,*/ b` a single
+        // capture instead of a truncated one that fails to parse.
+        if (skipTriviaOrRawString(input_text, i)) |resume_at| {
+            i = resume_at;
+            continue;
+        }
         if (c == '"') {
             in_double_quote = true;
             i += 1;
@@ -1613,7 +1702,7 @@ fn templateRepetitionCount(
         switch (elem) {
             .text => {},
             .metavar => |var_name| {
-                if (bindings.repetitionCount(var_name, path)) |length| {
+                if (bindings.repetitionCount(var_name, &path)) |length| {
                     if (count) |existing| {
                         if (existing != length) return error.InvalidMacroRepetition;
                     } else {
@@ -1646,7 +1735,7 @@ fn expandTemplateElements(
         switch (elem) {
             .text => |text| try budget.append(alloc, out, text),
             .metavar => |var_name| {
-                const value = bindings.getCapture(var_name, path) orelse
+                const value = bindings.getCapture(var_name, &path) orelse
                     return if (bindings.hasRep(var_name))
                         error.UnboundMacroRepetition
                     else
@@ -2091,7 +2180,9 @@ fn sourceCfgAttributeAt(
         var in_string = false;
         var escaped = false;
         var separator: ?usize = null;
-        for (inner, 0..) |character, index| {
+        var index: usize = 0;
+        while (index < inner.len) {
+            const character = inner[index];
             if (in_string) {
                 if (escaped) {
                     escaped = false;
@@ -2100,6 +2191,13 @@ fn sourceCfgAttributeAt(
                 } else if (character == '"') {
                     in_string = false;
                 }
+                index += 1;
+                continue;
+            }
+            // A comment between the predicate and the payload may hold a
+            // comma; only a comma outside one separates the two halves.
+            if (skipTriviaOrRawString(inner, index)) |resume_at| {
+                index = resume_at;
                 continue;
             }
             if (character == '"') {
@@ -2113,6 +2211,7 @@ fn sourceCfgAttributeAt(
                 separator = index;
                 break;
             }
+            index += 1;
         }
         const split = separator orelse return error.UnsupportedCfgPredicate;
         const condition = std.mem.trim(u8, inner[0..split], " \t\r\n");

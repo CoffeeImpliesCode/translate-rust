@@ -129,7 +129,10 @@ pub const CrateGraph = struct {
                 a.free(d.extern_name);
                 a.free(d.local_alias);
                 for (d.features) |feature| a.free(feature);
-                a.free(d.features);
+                // Mirrors ir/graph.zig: `alloc(T, 0)` is the ordinary shape of
+                // "no features", not a sentinel, so it is freed like any other
+                // empty owned slice rather than treated as a distinct case.
+                if (d.features.len > 0) a.free(d.features);
             }
             a.free(c.deps);
         }
@@ -322,4 +325,41 @@ test "exportedSurface collects only public items" {
     defer allocator.free(surface);
     try std.testing.expectEqual(@as(usize, 1), surface.len);
     try std.testing.expectEqual(foo_id, surface[0]);
+}
+
+test "deinit frees a dependency whose feature list is a zero-length allocation" {
+    const allocator = std.testing.allocator;
+    var g = CrateGraph.init(allocator);
+
+    // "No features" reaches the graph as a real `alloc(T, 0)` slice rather than
+    // a `&.{}` literal, so the dep is built the way a parser that always calls
+    // `toOwnedSlice` builds it. Each allocation is armed with its own errdefer
+    // so a failure part-way through construction cannot leak; once `addCrate`
+    // succeeds `deinit` owns all of them, and the testing allocator reports any
+    // leftover.
+    const features = try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(features);
+    const deps = try allocator.alloc(CrateDep, 1);
+    errdefer allocator.free(deps);
+    const extern_name = try allocator.dupe(u8, "dep");
+    errdefer allocator.free(extern_name);
+    const local_alias = try allocator.dupe(u8, "dep");
+    errdefer allocator.free(local_alias);
+    deps[0] = .{
+        .extern_name = extern_name,
+        .local_alias = local_alias,
+        .id = 1,
+        .default_features = true,
+        .features = features,
+    };
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "root"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = 0,
+        .deps = deps,
+        .is_translated = true,
+    });
+
+    g.deinit();
 }

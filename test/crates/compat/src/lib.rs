@@ -15,6 +15,21 @@ fn numeric_check() {
     assert_eq!(narrow(256), None);
 }
 
+pub fn finite_float_extremes() -> [f64; 6] {
+    [1e300, 1e-300, 1.7976931348623157e308, 5e-324, 0.0, -0.0]
+}
+
+pub fn ignored_binding_effect() -> u64 {
+    let mut calls: u64 = 0;
+    let _ignored = { calls += 1; calls };
+    calls
+}
+
+#[test]
+fn ignored_binding_preserves_initialization() {
+    assert_eq!(ignored_binding_effect(), 1);
+}
+
 pub fn root_value() -> u32 {
     5
 }
@@ -72,9 +87,174 @@ pub fn render(f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     write!(f, "value={} {:?}", 42u32, '\n')
 }
 
+/// An integer with separate Display, Debug and inherent formatting operations.
+pub struct ApiFormat {
+    /// The integer to render.
+    pub value: i32,
+}
+
+impl ApiFormat {
+    /// Read the value through the inherent operation.
+    pub fn forward(&self) -> i32 { self.format() }
+    /// Read the value without writing it.
+    pub fn format(&self) -> i32 { self.value }
+}
+
+impl core::fmt::Display for ApiFormat {
+    /// Render the decimal value.
+    fn fmt(&self, writer: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(writer, "display={}", self.value)
+    }
+}
+
+impl core::fmt::Debug for ApiFormat {
+    /// Render the diagnostic value.
+    fn fmt(&self, writer: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(writer, "ApiFormat({})", self.value)
+    }
+}
+
+/// A fieldless enum with a native formatting hook.
+pub enum ApiChoice {
+    #[doc = "The only active state."]
+    Only,
+}
+impl core::fmt::Display for ApiChoice {
+    fn fmt(&self, writer: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(writer, "only")
+    }
+}
+
+pub fn render_api_debug(writer: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(writer, "{:?}", ApiFormat { value: 37 })
+}
+
+#[test]
+fn api_format_check() {
+    assert_eq!(ApiFormat { value: 37 }.forward(), 37);
+}
+
 pub fn owned(input: &str) -> String {
     String::from(input)
 }
+
+pub fn discard_result_error(value: String) -> Option<u8> {
+    let result: Result<u8, String> = Err(value);
+    result.ok()
+}
+
+pub fn discard_result_success(value: String) -> Option<u8> {
+    let result: Result<String, u8> = Ok(value);
+    result.err()
+}
+
+pub fn take_result_error(value: String) -> String {
+    let result: Result<u8, String> = Err(value);
+    result.unwrap_err()
+}
+
+pub fn pointer_relations(left: *const u8, right: *const u8) -> u8 {
+    let mut bits = 0u8;
+    if left < right { bits |= 1; }
+    if left <= right { bits |= 2; }
+    if left > right { bits |= 4; }
+    if left >= right { bits |= 8; }
+    if left == right { bits |= 16; }
+    if left != right { bits |= 32; }
+    bits
+}
+
+pub type BytePointer = *const u8;
+
+pub fn pointer_alias_less(left: BytePointer, right: BytePointer) -> bool {
+    left < right
+}
+
+pub fn pointer_borrowed_less(left: &*const u8, right: &*const u8) -> bool {
+    left < right
+}
+
+pub fn mutated_local_matches() -> bool {
+    let mut text = String::from("local");
+    text.push('!');
+    text == "local!"
+}
+
+pub fn discard_local_result() -> Option<u8> {
+    let payload = String::from("discarded");
+    let result: Result<u8, String> = Err(payload);
+    result.ok()
+}
+
+pub fn retain_local_error() -> String {
+    let payload = String::from("retained");
+    let result: Result<u8, String> = Err(payload);
+    result.unwrap_err()
+}
+
+pub fn local_pair_length() -> usize {
+    let first = String::from("first");
+    let second = String::from("second");
+    first.len() + second.len()
+}
+
+// A local handed to `vec!` by move: the finished vector owns the bytes once
+// the literal block hands it on, so the local must not release them on its
+// way out. A release that ran anyway would free what the caller reads, and a
+// second owner of the same allocation would free it twice.
+//
+// Nine elements is not decoration. The list reserves through
+// `ensureUnusedCapacity` one element at a time, and a `Vec<String>` grows at
+// the 1st, the 4th and the 9th, so the ninth reservation is the first one that
+// can fail with eight owned elements already in the list — the case a
+// list-level release has to reach, and one a short literal never produces.
+pub fn moved_vec_element() -> Vec<String> {
+    let first = String::from("vec-0");
+    vec![
+        first,
+        String::from("vec-1"),
+        String::from("vec-2"),
+        String::from("vec-3"),
+        String::from("vec-4"),
+        String::from("vec-5"),
+        String::from("vec-6"),
+        String::from("vec-7"),
+        String::from("vec-8"),
+    ]
+}
+
+// The same hand-off through a branch. Both arms move the one local, so
+// whichever arm runs returns that binding rather than a copy of it.
+pub fn moved_branch_value(upper: bool) -> String {
+    let text = String::from("branched");
+    if upper {
+        text
+    } else {
+        text
+    }
+}
+
+// And through a `match` arm, where the arm body is the local itself.
+pub fn moved_match_value(mode: u8) -> String {
+    let text = String::from("matched");
+    match mode {
+        0 => text,
+        _ => text,
+    }
+}
+
+// And through a `break`, which is the only way a loop hands its value on.
+pub fn moved_loop_value() -> String {
+    let text = String::from("looped");
+    let mut index = 0u32;
+    loop {
+        index += 1;
+        if index >= 2 {
+            break text;
+        }
+    }
+}
+
 pub fn lossy(input: &[u8]) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(input)
 }

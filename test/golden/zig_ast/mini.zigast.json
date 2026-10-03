@@ -6,6 +6,7 @@
   "files": [
     {
       "path": "src/root.zig",
+      "documentation": "Zig translation of Rust crate `mini`, module `crate root`.\n\nRust source documentation:\nmini — a tiny no_std crate exercising the v1 model surface.\ntranslate-rust P1 fixture: file-split module, struct, data-carrying enum,\nfn + match, and a `pub use` re-export.\n\nZig consumer contract:\nImport the registered `mini` module through a build dependency; child\nmodules are reached through the crate's exported namespaces.\nRequires Zig 0.16.0. Target and optimization options belong to the consumer.\nRust names are preserved except native protocol hooks and name collisions.\nZig field access and value copying do not enforce Rust privacy or moves.\nPointers, slices and erased interfaces borrow their backing storage.\nRelease returned owned runtime storage with its creating allocator;\nassignment is not a deep clone and does not create a second cleanup owner.\nThis package does not supply a borrow checker or a process-wide allocator.\n\n```zig\nconst library = @import(\"mini\");\n```",
       "imports": [],
       "decls": [
         {
@@ -35,7 +36,8 @@
               }
             ],
             "decls": [],
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Rust `Point` state with Zig value semantics."
           }
         },
         {
@@ -84,7 +86,8 @@
                 "is_pub": true
               }
             ],
-            "decls": []
+            "decls": [],
+            "documentation": "Alternatives of Rust `Shape`; the active tag determines the payload."
           }
         },
         {
@@ -198,7 +201,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `area`."
           }
         },
         {
@@ -245,7 +249,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `origin`."
           }
         },
         {
@@ -290,6 +295,7 @@
     },
     {
       "path": "src/util.zig",
+      "documentation": "Zig translation of Rust crate `mini`, module `util`.\n\nRust source documentation:\nA tiny submodule to exercise file-split modules and re-exports.\n\nZig consumer contract:\nImport the registered `mini` module through a build dependency; child\nmodules are reached through the crate's exported namespaces.\nRequires Zig 0.16.0. Target and optimization options belong to the consumer.\nRust names are preserved except native protocol hooks and name collisions.\nZig field access and value copying do not enforce Rust privacy or moves.\nPointers, slices and erased interfaces borrow their backing storage.\nRelease returned owned runtime storage with its creating allocator;\nassignment is not a deep clone and does not create a second cleanup owner.\nThis package does not supply a borrow checker or a process-wide allocator.\n\n```zig\nconst library = @import(\"mini\");\n```",
       "imports": [],
       "decls": [
         {
@@ -331,7 +337,8 @@
                 }
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `helper`."
           }
         }
       ],

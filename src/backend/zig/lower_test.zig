@@ -650,6 +650,11 @@ test "lower: rejects incomplete non-primitive return fixture topology" {
 /// - nested-module qualified re-export (`api::helper` imports `./util.zig` publicly)
 /// - same-module self-referential `pub use dup;` → skipped (no `pub const dup = dup;`)
 /// - `_` wildcard re-export → skipped
+///
+/// Every slice and name handed to `addModule`/`addUse` is retained by the
+/// graph (and freed by `CrateGraph.deinit`), so each one is duplicated into
+/// the caller's allocator: a stack-backed array literal would dangle as soon
+/// as this helper returns.
 fn buildUseModel(
     alloc: std.mem.Allocator,
     graph: *ir.graph.CrateGraph,
@@ -662,7 +667,7 @@ fn buildUseModel(
     const root_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .module,
-        .name = "",
+        .name = try alloc.dupe(u8, ""),
         .span = span,
         .visibility = .public,
         .parent = null,
@@ -673,7 +678,7 @@ fn buildUseModel(
     const util_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .module,
-        .name = "util",
+        .name = try alloc.dupe(u8, "util"),
         .span = span,
         .visibility = .public,
         .parent = root_id,
@@ -685,7 +690,7 @@ fn buildUseModel(
     const helper_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .fn_,
-        .name = "helper",
+        .name = try alloc.dupe(u8, "helper"),
         .span = span,
         .visibility = .public,
         .parent = util_id,
@@ -696,7 +701,7 @@ fn buildUseModel(
     const dup_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .fn_,
-        .name = "dup",
+        .name = try alloc.dupe(u8, "dup"),
         .span = span,
         .visibility = .public,
         .parent = root_id,
@@ -708,7 +713,7 @@ fn buildUseModel(
     const use_helper_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .use_,
-        .name = "",
+        .name = try alloc.dupe(u8, ""),
         .span = span,
         .visibility = .public,
         .parent = root_id,
@@ -720,7 +725,7 @@ fn buildUseModel(
         .id = use_helper_id,
         .kind = .{ .plain = helper_id },
         .target = helper_id,
-        .local_name = "helper",
+        .local_name = try alloc.dupe(u8, "helper"),
         .is_pub_export = true,
         .span = span,
     });
@@ -728,7 +733,7 @@ fn buildUseModel(
     const use_dup_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .use_,
-        .name = "",
+        .name = try alloc.dupe(u8, ""),
         .span = span,
         .visibility = .public,
         .parent = root_id,
@@ -740,7 +745,7 @@ fn buildUseModel(
         .id = use_dup_id,
         .kind = .{ .plain = dup_id },
         .target = dup_id,
-        .local_name = "dup",
+        .local_name = try alloc.dupe(u8, "dup"),
         .is_pub_export = true,
         .span = span,
     });
@@ -748,7 +753,7 @@ fn buildUseModel(
     const use_wild_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .use_,
-        .name = "",
+        .name = try alloc.dupe(u8, ""),
         .span = span,
         .visibility = .public,
         .parent = root_id,
@@ -760,7 +765,7 @@ fn buildUseModel(
         .id = use_wild_id,
         .kind = .{ .plain = helper_id },
         .target = helper_id,
-        .local_name = "_",
+        .local_name = try alloc.dupe(u8, "_"),
         .is_pub_export = true,
         .span = span,
     });
@@ -768,7 +773,7 @@ fn buildUseModel(
     const use_glob_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .use_,
-        .name = "",
+        .name = try alloc.dupe(u8, ""),
         .span = span,
         .visibility = .public,
         .parent = root_id,
@@ -780,7 +785,7 @@ fn buildUseModel(
         .id = use_glob_id,
         .kind = .glob,
         .target = util_id,
-        .local_name = "Foo",
+        .local_name = try alloc.dupe(u8, "Foo"),
         .is_pub_export = true,
         .span = span,
     });
@@ -788,7 +793,7 @@ fn buildUseModel(
     const api_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .module,
-        .name = "api",
+        .name = try alloc.dupe(u8, "api"),
         .span = span,
         .visibility = .public,
         .parent = root_id,
@@ -799,7 +804,7 @@ fn buildUseModel(
     const api_use_id = try graph.symbol_table.add(.{
         .id = 0,
         .kind = .use_,
-        .name = "",
+        .name = try alloc.dupe(u8, ""),
         .span = span,
         .visibility = .public,
         .parent = api_id,
@@ -811,7 +816,7 @@ fn buildUseModel(
         .id = api_use_id,
         .kind = .{ .plain = helper_id },
         .target = helper_id,
-        .local_name = "helper",
+        .local_name = try alloc.dupe(u8, "helper"),
         .is_pub_export = true,
         .span = span,
     });
@@ -847,41 +852,49 @@ fn buildUseModel(
     _ = try graph.addModule(.{
         .id = 0,
         .kind = .root,
-        .name = "",
+        .name = try alloc.dupe(u8, ""),
         .parent = null,
         .source_path = null,
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{ util_id, dup_id, use_helper_id, use_dup_id, use_wild_id, use_glob_id, api_id },
+        .items = try alloc.dupe(ir.spine.EntityId, &.{
+            util_id,
+            dup_id,
+            use_helper_id,
+            use_dup_id,
+            use_wild_id,
+            use_glob_id,
+            api_id,
+        }),
         .attributes = &.{},
     });
     _ = try graph.addModule(.{
         .id = 0,
         .kind = .@"inline",
-        .name = "util",
+        .name = try alloc.dupe(u8, "util"),
         .parent = root_id,
         .source_path = null,
         .is_crate = false,
         .is_extern = false,
         .span = span,
-        .items = &.{helper_id},
+        .items = try alloc.dupe(ir.spine.EntityId, &.{helper_id}),
         .attributes = &.{},
     });
     _ = try graph.addModule(.{
         .id = 0,
         .kind = .@"inline",
-        .name = "api",
+        .name = try alloc.dupe(u8, "api"),
         .parent = root_id,
         .source_path = null,
         .is_crate = false,
         .is_extern = false,
         .span = span,
-        .items = &.{api_use_id},
+        .items = try alloc.dupe(ir.spine.EntityId, &.{api_use_id}),
         .attributes = &.{},
     });
     try graph.addCrate(.{
-        .name = "usecrate",
+        .name = try alloc.dupe(u8, "usecrate"),
         .edition = 2021,
         .kind = .lib,
         .root = root_id,
@@ -1061,7 +1074,7 @@ test "lower: child module ignores resolved parent glob use" {
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{child_id},
+        .items = try alloc.dupe(ir.spine.EntityId, &.{child_id}),
         .attributes = &.{},
     });
     const child_module_id = try graph.addModule(.{
@@ -1073,7 +1086,7 @@ test "lower: child module ignores resolved parent glob use" {
         .is_crate = false,
         .is_extern = false,
         .span = span,
-        .items = &.{ glob_id, translated_id },
+        .items = try alloc.dupe(ir.spine.EntityId, &.{ glob_id, translated_id }),
         .attributes = &.{},
     });
     std.debug.assert(root_module_id == root_id);
@@ -1116,9 +1129,21 @@ test "lower: child module ignores resolved parent glob use" {
         }
     }
     const file = child_file orelse return error.ChildModuleMissing;
+    // The glob use resolved to the parent module, and a resolved use names
+    // nothing the child declares: `Translated` is the one declaration the file
+    // carries.
     try std.testing.expectEqual(@as(usize, 1), file.decls.len);
-    try std.testing.expect(file.decls[0] == .struct_decl);
-    try std.testing.expectEqualStrings("Translated", file.decls[0].struct_decl.name);
+    // A struct the source declared with no members has exactly one lowered
+    // form — a `const` naming the anonymous struct — because an empty
+    // `struct_decl` is not a container at all. The declaration is read by its
+    // name, which every memberless spelling shares.
+    if (file.decls[0] != .const_decl) return error.ChildModuleMissing;
+    try std.testing.expectEqualStrings("Translated", file.decls[0].const_decl.name);
+    if (file.decls[0].const_decl.init != .type_value or
+        file.decls[0].const_decl.init.type_value != .anon_struct)
+    {
+        return error.ChildModuleMissing;
+    }
 }
 
 fn buildSingleExternalUseModel(
@@ -1246,6 +1271,148 @@ test "lower: private alloc Vec imports have explicit no-emission policy" {
     }
 }
 
+// ── std and alloc spell ONE `Vec` ──────────────────────────────────────────
+
+// `test/crates/generic-owner-transfer/src/lib.rs:19-20` spells both of its
+// containers `std::`: `use std::string::String;` and `use std::vec::Vec;`. The
+// `String` import was admitted — `isRuntimeTypeImport`'s `is_alloc` arm covers
+// both roots — and the `Vec` one was not, because `isAllocVecPath` matched the
+// `alloc` root only. So the import fell past every arm of that function to
+// `return error.UnsupportedExternalUse` and refused a crate with ZERO
+// dependencies over a type this file lowers to `std.ArrayListUnmanaged` for the
+// other spelling.
+//
+// The pairs below are every container and element spelling the corpus imports,
+// and each pair has to import through the SAME policy — an admission that only
+// one root reaches would leave the other spelling a refusal dressed as
+// support.
+test "lower: the std and alloc spellings of every corpus container import alike" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const spellings = [_]struct { path: []const []const u8, name: []const u8 }{
+        // `std::vec::Vec` — generic-owner-transfer/src/lib.rs:20.
+        .{ .path = &.{ "std", "vec", "Vec" }, .name = "Vec" },
+        .{ .path = &.{ "alloc", "vec", "Vec" }, .name = "Vec" },
+        // `std::string::String` — generic-owner-transfer/src/lib.rs:19.
+        .{ .path = &.{ "std", "string", "String" }, .name = "String" },
+        .{ .path = &.{ "alloc", "string", "String" }, .name = "String" },
+        // hex/src/lib.rs:43 imports both of these through one `use alloc::{…}`.
+        .{ .path = &.{ "alloc", "string", "ToString" }, .name = "ToString" },
+        .{ .path = &.{ "std", "string", "ToString" }, .name = "ToString" },
+        // syn/tests/common/eq.rs:180 and syn/tests/test_round_trip.rs:38.
+        .{ .path = &.{ "std", "borrow", "Cow" }, .name = "Cow" },
+        .{ .path = &.{ "alloc", "borrow", "Cow" }, .name = "Cow" },
+        // cow-handoff/src/lib.rs, the mapped collections.
+        .{ .path = &.{ "std", "collections", "HashMap" }, .name = "HashMap" },
+        .{ .path = &.{ "alloc", "collections", "HashMap" }, .name = "HashMap" },
+        .{ .path = &.{ "core", "collections", "HashMap" }, .name = "HashMap" },
+        .{ .path = &.{ "std", "collections", "HashSet" }, .name = "HashSet" },
+        .{ .path = &.{ "alloc", "collections", "HashSet" }, .name = "HashSet" },
+        .{ .path = &.{ "core", "collections", "HashSet" }, .name = "HashSet" },
+        // The builder argument a map carries — `std::hash::{Hasher,
+        // BuildHasherDefault}` is the corpus's own spelling.
+        .{ .path = &.{ "std", "hash", "BuildHasherDefault" }, .name = "BuildHasherDefault" },
+        .{ .path = &.{ "core", "hash", "BuildHasherDefault" }, .name = "BuildHasherDefault" },
+    };
+    for (spellings) |case| {
+        var graph = ir.graph.CrateGraph.init(alloc);
+        var bodies: ir.bodies.Bodies = undefined;
+        try buildSingleExternalUseModel(alloc, &graph, &bodies, case.path, case.name, false);
+        const rust_ir = ir.RustIr{
+            .crate_name = "external_uses",
+            .edition = "2021",
+            .graph = graph,
+            .types = &.{},
+            .bodies = bodies,
+        };
+        // Admitting the import means DECLARING NOTHING: the nominal lowering
+        // is what adds the `r2z` import, and a lexical `use` of a runtime type
+        // has no declaration of its own to emit.
+        const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
+        for (pkg.files[0].imports) |import| {
+            try std.testing.expect(!std.mem.eql(u8, import.local_name, case.name));
+        }
+    }
+}
+
+// The import is only the first of the four answers that disagreed. A type
+// spelled `std::vec::Vec` also has to REACH a lowering: `lowerExternalNominal`
+// answers `alloc::vec::Vec` with `std.ArrayListUnmanaged` through the same
+// predicate, and a `std` spelling that missed it named nothing at all. The
+// parameter and the return are both the vector, so the fixture would be
+// incomplete if only one of them were checked.
+test "lower: a Vec declared through either root lowers to one and the same package" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The same function built twice, once with the spelling `use std::vec::Vec`
+    // writes and once with the spelling `use alloc::vec::Vec` writes. The two
+    // inputs differ in exactly the one thing the source changed, so every other
+    // byte of the generated package has to match — which is a stronger claim
+    // than checking either spelling alone, because it fails if EITHER root
+    // reaches a different arm anywhere in the pipeline.
+    var rendered: [2][]const u8 = undefined;
+    for ([_][]const u8{ "alloc", "std" }, 0..) |root, index| {
+        var graph = ir.graph.CrateGraph.init(alloc);
+        var model = Model.init(alloc);
+        const root_id = try addLowerEntity(&graph, .module, "", null);
+        const function_id = try addLowerEntity(&graph, .fn_, "take_list", root_id);
+
+        const vector_type: ir.types.Type = .{ .external_nominal = .{
+            .path = &.{ root, "vec", "Vec" },
+            .args = &.{.{ .prim = .u8 }},
+        } };
+        const body = try model.e(.unit);
+        try addBareCrate(&graph, alloc, "vec_spelling", root_id, &.{function_id});
+        while (model.bodies.items.len <= function_id) {
+            try model.bodies.append(model.a(), .{ .none = {} });
+        }
+        // `is_allocating` is left FALSE on purpose: an owned parameter makes the
+        // callable allocating on its own, and `paramsOwnRuntimeContainer` is
+        // that gate. Setting it here would hide the very decision under test,
+        // which is why the `std` spelling used to leak its allocation.
+        model.bodies.items[function_id] = .{ .fn_ = .{
+            .params = &.{.{
+                .name = "list",
+                .ty = vector_type,
+                .span = span,
+            }},
+            .ret = vector_type,
+            .body = body,
+            .is_allocating = false,
+        } };
+
+        const rust_ir = ir.RustIr{
+            .crate_name = "vec_spelling",
+            .edition = "2021",
+            .graph = graph,
+            .types = &.{},
+            .bodies = .{
+                .exprs = try model.exprs.toOwnedSlice(model.a()),
+                .stmts = try model.stmts.toOwnedSlice(model.a()),
+                .pats = try model.pats.toOwnedSlice(model.a()),
+                .types = &.{},
+                .bodies = try model.bodies.toOwnedSlice(model.a()),
+            },
+        };
+        const source = try emitRootSource(alloc, &rust_ir);
+
+        // The type the vector lowers to. BOTH the parameter and the return go
+        // through `lowerExternalNominal`, so both spellings have to reach it —
+        // and `lowerRuntimeGenericExternalType` is what adds the r2z import, so
+        // a lowering that missed it would leave the package naming nothing.
+        try std.testing.expect(std.mem.indexOf(u8, source, "std.ArrayListUnmanaged(u8)") != null);
+        // An owned parameter declares the allocator ahead of itself, and that
+        // argument count is what every call to this function is built against.
+        try std.testing.expect(std.mem.indexOf(u8, source, "allocator: std.mem.Allocator") != null);
+        rendered[index] = source;
+    }
+    try std.testing.expectEqualStrings(rendered[0], rendered[1]);
+}
+
 test "lower: private std::collections module import has explicit no-emission policy" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1354,6 +1521,195 @@ test "lower: mapped std::collections types import through the r2z runtime" {
     }
 }
 
+/// `buildSingleExternalUseModel` plus one DECLARED dependency, so the
+/// dependency-rooted arm has something to resolve the root against.
+///
+/// The dependency is declared in the crate manifest rather than recognised by
+/// its spelling: a crate this build has never heard of becomes a dependency
+/// because the manifest says so, not because its name looks like one.
+fn buildDependencyExternalUseModel(
+    alloc: std.mem.Allocator,
+    graph: *ir.graph.CrateGraph,
+    bodies: *ir.bodies.Bodies,
+    path: []const []const u8,
+    local_name: []const u8,
+    alias: []const u8,
+    package: []const u8,
+) !void {
+    try buildSingleExternalUseModel(alloc, graph, bodies, path, local_name, false);
+    // A dependency is DECLARED by name alone or BOUND at runtime, and only the
+    // second can carry a root this pipeline is able to drop: the bound form's
+    // surface already lives in `r2z`, so admitting the root admits nothing
+    // that has to be vendored. The proof is the version requirement plus the
+    // frontend's answer that this build's RESOLVED feature set for the
+    // dependency is certainly empty. Without both the declaration only says
+    // the crate is reachable, and the root still needs a source tree.
+    graph.crates.items[0].deps = try alloc.dupe(ir.graph.CrateDep, &.{.{
+        .extern_name = package,
+        .local_alias = alias,
+        .id = 1,
+        .version = "0.5",
+        .resolved_features_known_empty = true,
+    }});
+}
+
+// `std::io::BufRead` is a bound, not a type: the runtime reaches `fill_buf` and
+// `consume` through the receiver it already knows, so admitting the import is
+// admitting nothing. Refusing it would make every `BufRead` method
+// unrecognisable and drop the bound the source actually wrote.
+test "lower: a private std::io::BufRead import lowers with no declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var bodies: ir.bodies.Bodies = undefined;
+    try buildSingleExternalUseModel(
+        alloc,
+        &graph,
+        &bodies,
+        &.{ "std", "io", "BufRead" },
+        "BufRead",
+        false,
+    );
+    const rust_ir = ir.RustIr{
+        .crate_name = "external_uses",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
+    try std.testing.expectEqual(@as(usize, 0), pkg.files[0].decls.len);
+    for (pkg.files[0].imports) |import| {
+        try std.testing.expect(!std.mem.eql(u8, import.local_name, "BufRead"));
+    }
+}
+
+// `BufReader` IS a runtime type, but the import is still not what introduces
+// it: the nominal lowering adds `r2z.io.BufReader` where a `BufReader` is
+// actually named, and an import that named it here would double it.
+test "lower: a private std::io::BufReader import lowers with no declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var bodies: ir.bodies.Bodies = undefined;
+    try buildSingleExternalUseModel(
+        alloc,
+        &graph,
+        &bodies,
+        &.{ "std", "io", "BufReader" },
+        "BufReader",
+        false,
+    );
+    const rust_ir = ir.RustIr{
+        .crate_name = "external_uses",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
+    try std.testing.expectEqual(@as(usize, 0), pkg.files[0].decls.len);
+    for (pkg.files[0].imports) |import| {
+        try std.testing.expect(!std.mem.eql(u8, import.local_name, "BufReader"));
+    }
+}
+
+// Admitting the two above is not a namespace catch-all. `std::io::Seek` has no
+// bound and no runtime counterpart, so admitting it would turn a precise
+// refusal into a silently dropped import — and the generated package would
+// then name a type the translator never defined. This is the same invariant the
+// collections cases above keep for their own namespace.
+test "lower: an std::io item with no bound and no runtime counterpart is still refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var bodies: ir.bodies.Bodies = undefined;
+    try buildSingleExternalUseModel(
+        alloc,
+        &graph,
+        &bodies,
+        &.{ "std", "io", "Seek" },
+        "Seek",
+        false,
+    );
+    const rust_ir = ir.RustIr{
+        .crate_name = "external_uses",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    try std.testing.expectError(
+        error.UnsupportedExternalUse,
+        lower.lowerRustIr(alloc, &rust_ir, null),
+    );
+}
+
+// A declared dependency is admitted as a ROOT the manifest names, and still
+// declares nothing: the trait it brings is a bound the runtime resolves from
+// the receiver, exactly like `BufRead`. Both halves are asserted — no
+// declaration invented, and no import the root file did not ask for.
+test "lower: a dependency-rooted import declares nothing and still binds the crate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var bodies: ir.bodies.Bodies = undefined;
+    try buildDependencyExternalUseModel(
+        alloc,
+        &graph,
+        &bodies,
+        &.{ "rand_core", "RngCore" },
+        "RngCore",
+        "rand_core",
+        "rand_core",
+    );
+    const rust_ir = ir.RustIr{
+        .crate_name = "external_uses",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
+    try std.testing.expectEqual(@as(usize, 0), pkg.files[0].decls.len);
+    for (pkg.files[0].imports) |import| {
+        try std.testing.expect(!std.mem.eql(u8, import.local_name, "RngCore"));
+    }
+}
+
+// And that arm is bounded by the manifest, not by the spelling. A root that is
+// neither core/std/alloc nor a declared dependency stays a precise refusal.
+test "lower: an undeclared root is still refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var bodies: ir.bodies.Bodies = undefined;
+    try buildSingleExternalUseModel(
+        alloc,
+        &graph,
+        &bodies,
+        &.{ "not_a_dependency", "RngCore" },
+        "RngCore",
+        false,
+    );
+    const rust_ir = ir.RustIr{
+        .crate_name = "external_uses",
+        .edition = "2021",
+        .graph = graph,
+        .types = &.{},
+        .bodies = bodies,
+    };
+    try std.testing.expectError(
+        error.UnsupportedExternalUse,
+        lower.lowerRustIr(alloc, &rust_ir, null),
+    );
+}
+
 test "lower: private extern crate alloc is omitted beside a root declaration" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1447,136 +1803,6 @@ test "lower: private extern crate alloc is omitted beside a root declaration" {
         "FNV_OFFSET",
         pkg.files[0].decls[0].const_decl.name,
     );
-}
-
-test "lower: a trait impl method on an enum is hoisted into the enum" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-    const root_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .module,
-        .name = "",
-        .span = span,
-        .visibility = .public,
-        .parent = null,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    const color_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .enum_,
-        .name = "Color",
-        .span = span,
-        .visibility = .public,
-        .parent = root_id,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    const display_impl_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .impl_,
-        .name = "Display for Color",
-        .span = span,
-        .visibility = .public,
-        .parent = color_id,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    const fmt_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .fn_,
-        .name = "fmt",
-        .span = span,
-        .visibility = .public,
-        .parent = display_impl_id,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-
-    // `fn fmt(&self) {}` — the body is irrelevant here, only the hoist is.
-    const unit = try model.e(.{ .unit = {} });
-    const self_ref = try model.e(.{ .path = .{ .def = color_id, .generic_args = &.{} } });
-    const body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = unit,
-        .labelled = null,
-    } });
-    _ = self_ref;
-
-    const color_ty: ir.types.Type = .{ .path = .{ .segments = &.{.{ .name = "Color", .id = null }} } };
-    try model.bodies.append(alloc, .none);
-    try model.bodies.append(alloc, .{ .enum_ = .{
-        .kind = .c_like,
-        .variants = &.{
-            .{ .name = "red", .fields = .{ .none = {} }, .discriminant = null },
-        },
-    } });
-    try model.bodies.append(alloc, .{ .impl_ = .{
-        .self_ty = color_ty,
-        .trait_path = .{ .segments = &.{.{ .name = "Display", .id = null }} },
-    } });
-    try model.bodies.append(alloc, .{ .fn_ = .{
-        .params = &.{},
-        .ret = .{ .prim = .unit },
-        .body = body,
-    } });
-
-    const ir_bodies: ir.bodies.Bodies = .{
-        .exprs = try model.exprs.toOwnedSlice(alloc),
-        .stmts = try model.stmts.toOwnedSlice(alloc),
-        .pats = try model.pats.toOwnedSlice(alloc),
-        .types = &.{},
-        .bodies = try model.bodies.toOwnedSlice(alloc),
-    };
-    _ = try graph.addModule(.{
-        .id = 0,
-        .kind = .root,
-        .name = "",
-        .parent = null,
-        .source_path = null,
-        .is_crate = true,
-        .is_extern = false,
-        .span = span,
-        .items = try alloc.dupe(ir.spine.EntityId, &.{ color_id, display_impl_id, fmt_id }),
-        .attributes = &.{},
-    });
-    try graph.addCrate(.{
-        .name = "colors",
-        .edition = 2021,
-        .kind = .lib,
-        .root = root_id,
-        .deps = &.{},
-        .is_translated = true,
-    });
-    const rust_ir = ir.RustIr{
-        .crate_name = "colors",
-        .edition = "2021",
-        .graph = graph,
-        .types = &.{},
-        .bodies = ir_bodies,
-    };
-
-    const pkg = try lower.lowerRustIr(alloc, &rust_ir, null);
-    const enum_decl = for (pkg.files[0].decls) |decl| {
-        if (decl == .enum_decl and
-            std.mem.eql(u8, decl.enum_decl.name, "Color")) break decl;
-    } else return error.TestUnexpectedResult;
-
-    // The impl method must be attached to the enum, not dropped and not
-    // emitted twice.
-    var saw_fmt = false;
-    for (enum_decl.enum_decl.decls) |decl| {
-        if (decl == .fn_decl and std.mem.eql(u8, decl.fn_decl.name, "fmt")) saw_fmt = true;
-    }
-    try std.testing.expect(saw_fmt);
 }
 
 test "lower: a source trait declaration emits no Zig declaration" {
@@ -2487,7 +2713,7 @@ test "lower: const array + primitive initializers emit real Zig values" {
                 saw_multi = true;
             },
             .repeat => |rp| {
-                try std.testing.expectEqual(@as(usize, 256), rp.len);
+                try std.testing.expectEqual(@as(u64, 256), rp.len);
                 saw_repeat = true;
             },
             else => {},
@@ -2552,7 +2778,10 @@ test "lower: a vec literal makes the enclosing function allocate" {
     const repeated_vec = try model.e(.{
         .vec_lit = .{
             .elements = &.{first},
-            .repeat = 3,
+            // `VecLit.repeat` is a `?VecRepeatCount`, and a count the translator
+            // already holds is its `literal` arm. `ArrayExpr.repeat` is the
+            // plain `?u64` and needs no such wrapper.
+            .repeat = .{ .literal = 3 },
         },
     });
     model.exprs.items[repeated_vec].ty = 1;
@@ -3066,6 +3295,9 @@ const ClosureCombinatorFixture = struct {
     /// null → the body tail resolves to the parameter binding.
     capture_name: ?[]const u8 = null,
     capture_by_value: bool = false,
+    /// The declared type of the captured parameter. null → `u8`, which is not
+    /// an owner and so exercises the descriptor-copy path.
+    capture_ty: ?ir.types.Type = null,
     /// false → the argument is a plain literal, exercising the runtime call.
     closure_argument: bool = true,
     /// Element binding names for a destructured parameter (`|(a, b)| ..`).
@@ -3077,6 +3309,11 @@ const ClosureCombinatorFixture = struct {
     /// Further parameter bindings, so the closure takes more than one argument.
     /// The body tail still resolves to the first.
     extra_param_names: []const []const u8 = &.{},
+    /// Type the receiver EXPRESSION carries, when it is not the type the
+    /// enclosing signature declares. `null` → `receiver_ty`, which is what
+    /// every caller wants until it is testing a receiver the signature never
+    /// had to spell — the case where the two answers can disagree.
+    receiver_expr_ty: ?ir.types.Type = null,
 };
 
 /// Lower `receiver.<method>(|param| ..)` into a package. `capture_name` names
@@ -3174,8 +3411,12 @@ fn lowerClosureCombinatorPackage(
         element_ids = ids;
     }
 
-    const types_store = try alloc.alloc(ir.types.Type, 1);
-    types_store[0] = fixture.receiver_ty;
+    // 0: the receiver, 1: the captured parameter's own declared type. The
+    // capture record names the second one, because whether a capture is an
+    // OWNER is decided from its declared type and not from what it is called.
+    const types_store = try alloc.alloc(ir.types.Type, 2);
+    types_store[0] = fixture.receiver_expr_ty orelse fixture.receiver_ty;
+    types_store[1] = fixture.capture_ty orelse fixture.receiver_ty;
 
     const receiver_expr = try model.e(.{ .path = .{ .def = receiver_id, .generic_args = &.{} } });
     model.exprs.items[receiver_expr].ty = 0;
@@ -3219,7 +3460,7 @@ fn lowerClosureCombinatorPackage(
                 .by_value
             else
                 .by_ref,
-            .ty = 0,
+            .ty = 1,
         };
         captures = one;
     }
@@ -3259,7 +3500,7 @@ fn lowerClosureCombinatorPackage(
     if (fixture.capture_name != null) {
         const two = try alloc.alloc(ir.items.Param, 2);
         two[0] = params[0];
-        two[1] = .{ .name = fixture.capture_name.?, .ty = .{ .prim = .u8 }, .span = span };
+        two[1] = .{ .name = fixture.capture_name.?, .ty = fixture.capture_ty orelse .{ .prim = .u8 }, .span = span };
         params = two;
     }
     // The body table is indexed by EntityId, so the callable's own body has to
@@ -3477,6 +3718,141 @@ test "lower: Result::map with an inline closure rewraps the untouched arm" {
     {
         return error.ExpectedErrFieldFromCapture;
     }
+}
+
+// `String::from_utf8(..)` carries its `Result` as a `core::result::Result`
+// EXTERNAL NOMINAL, not as the IR's own `.result` descriptor, and that is the
+// spelling most corpus crates carry. `lookupRecognizedStdMethod` has always
+// classified the method on that spelling; `taggedResultType` is what the
+// combinator then asks for the payload pair, and it used to answer null here,
+// so `map_err(..)?` raised `error.UnsupportedStandardMethod` over a method the
+// frontend had already RESOLVED. Both answers now come from
+// `canonicalExternalMethodType`, so this is the positive case the fix exists
+// for: the Ok arm is re-wrapped rather than the whole call refused.
+test "lower: map_err on a core::result::Result nominal expands to a tagged rewrap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ok_ty: ir.types.Type = .{ .prim = .u8 };
+    // A payload-carrying error half, which is what `String::from_utf8` really
+    // carries: it can never be a Zig error set, so the rebuilt type is the
+    // tagged `r2z.Result` that HOLDS the error value rather than an error union
+    // that would drop it. The assertion on the re-wrap type below is what
+    // actually reads that distinction off the emitted AST.
+    const err_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "FromUtf8Error" },
+        .args = &.{},
+    } };
+    const result_args = [_]ir.types.Type{ ok_ty, err_ty };
+    const result_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "result", "Result" },
+        .args = &result_args,
+    } };
+
+    const expr = try lowerClosureCombinatorExpr(alloc, .{
+        .method_name = "map_err",
+        .receiver_ty = result_ty,
+        .param_name = "byte",
+    });
+    if (expr != .match_expr) return error.ExpectedResultMapErrSwitch;
+    const arms = expr.match_expr.arms;
+    if (arms.len != 2) return error.ExpectedTwoSwitchArms;
+    // `map_err` maps the Err arm and passes Ok through, so the mapped prong is
+    // FIRST here — the mirror of the `map` test above.
+    if (arms[0].patterns.len != 1 or arms[0].patterns[0] != .enum_literal or
+        !std.mem.eql(u8, arms[0].patterns[0].enum_literal, "Err"))
+    {
+        return error.ExpectedErrProng;
+    }
+    const err_capture = arms[0].capture orelse return error.ExpectedErrPayloadCapture;
+    if (!std.mem.eql(u8, err_capture.name, "__r2z_in_byte_err")) {
+        return error.ExpectedErrPayloadName;
+    }
+    if (arms[1].patterns.len != 1 or arms[1].patterns[0] != .enum_literal or
+        !std.mem.eql(u8, arms[1].patterns[0].enum_literal, "Ok"))
+    {
+        return error.ExpectedOkProng;
+    }
+    const ok_capture = arms[1].capture orelse return error.ExpectedOkPayloadCapture;
+    if (!std.mem.eql(u8, ok_capture.name, "__r2z_in_byte")) return error.ExpectedOkPayloadName;
+    if (arms[1].body != .struct_init) return error.ExpectedRewrappedOkArm;
+    const rewrapped = arms[1].body.struct_init;
+    // A field-bearing literal without a type name is not a valid AST node, and
+    // the named type is the only place the rebuilt pair is visible at all.
+    const rewrap_type = rewrapped.type_name orelse return error.ExpectedTypedResultLiteral;
+    if (rewrap_type != .generic) return error.ExpectedTaggedResultRewrap;
+    if (!std.mem.eql(u8, rewrap_type.generic.name, "r2z.Result")) {
+        return error.ExpectedResultUnionName;
+    }
+    if (rewrapped.fields.len != 1) return error.ExpectedSingleResultField;
+    if (!std.mem.eql(u8, rewrapped.fields[0].name, "Ok")) return error.ExpectedOkFieldName;
+    if (rewrapped.fields[0].expr != .ident or
+        !std.mem.eql(u8, rewrapped.fields[0].expr.ident, ok_capture.name))
+    {
+        return error.ExpectedOkFieldFromCapture;
+    }
+}
+
+// The other half of the same predicate, and the only refusal the new
+// `.external_nominal` arm owns outright. `lookupRecognizedStdMethod` and
+// `taggedResultType` now ask `canonicalExternalMethodType` the same question,
+// so a NOMINAL SPELLING can no longer make them disagree — the one place they
+// still differ is arity, which the path-only predicate does not look at.
+// A `core::result::Result` carrying one or three arguments is therefore
+// classified as a `Result` method and reaches the combinator, and there
+// `taggedResultType` must refuse rather than read `args[0]`/`args[1]` off a
+// list that does not hold them.
+//
+// The declared parameter keeps the well-formed two-argument type on purpose:
+// it is what makes this exercise `taggedResultType` rather than
+// `lowerExternalNominal`, which rejects a malformed arity on its own and
+// would otherwise raise first.
+test "lower: a core::result::Result nominal of the wrong arity refuses the rewrap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ok_ty: ir.types.Type = .{ .prim = .u8 };
+    const err_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "FromUtf8Error" },
+        .args = &.{},
+    } };
+    const well_formed = [_]ir.types.Type{ ok_ty, err_ty };
+
+    const one_arg = [_]ir.types.Type{ok_ty};
+    try std.testing.expectError(
+        error.UnsupportedStandardMethod,
+        lowerClosureCombinatorExpr(alloc, .{
+            .method_name = "map_err",
+            .receiver_ty = .{ .external_nominal = .{
+                .path = &.{ "core", "result", "Result" },
+                .args = &well_formed,
+            } },
+            .receiver_expr_ty = .{ .external_nominal = .{
+                .path = &.{ "core", "result", "Result" },
+                .args = &one_arg,
+            } },
+            .param_name = "byte",
+        }),
+    );
+
+    const three_args = [_]ir.types.Type{ ok_ty, err_ty, ok_ty };
+    try std.testing.expectError(
+        error.UnsupportedStandardMethod,
+        lowerClosureCombinatorExpr(alloc, .{
+            .method_name = "map_err",
+            .receiver_ty = .{ .external_nominal = .{
+                .path = &.{ "core", "result", "Result" },
+                .args = &well_formed,
+            } },
+            .receiver_expr_ty = .{ .external_nominal = .{
+                .path = &.{ "core", "result", "Result" },
+                .args = &three_args,
+            } },
+            .param_name = "byte",
+        }),
+    );
 }
 
 // Zig cannot `switch` an optional, so `Option::map` rides on
@@ -3766,7 +4142,7 @@ test "lower: generic methods resolve Self and associated type qualifiers" {
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{struct_id},
+        .items = try alloc.dupe(ir.spine.EntityId, &.{struct_id}),
         .attributes = &.{},
     });
     try graph.addCrate(.{
@@ -3952,7 +4328,7 @@ test "lower: qualifies unqualified inherent static calls with Self" {
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{struct_id},
+        .items = try alloc.dupe(ir.spine.EntityId, &.{struct_id}),
         .attributes = &.{},
     });
     try graph.addCrate(.{
@@ -4251,7 +4627,7 @@ fn lowerSourceFidelityFixture(alloc: std.mem.Allocator) !ast.Package {
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{ support_id, private_fn_id, test_fn_id, support_use_id },
+        .items = try alloc.dupe(ir.spine.EntityId, &.{ support_id, private_fn_id, test_fn_id, support_use_id }),
         .attributes = &.{},
     });
     const support_module_id = try graph.addModule(.{
@@ -4481,139 +4857,6 @@ test "lower: test attribute creates an AST test declaration" {
         if (decl != .fn_decl) continue;
         try std.testing.expect(!std.mem.eql(u8, decl.fn_decl.name, "checks_answer"));
     }
-}
-
-test "lower and emit: allocating tests receive a local allocator" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const file = try lowerTestAllocatorFixture(alloc, true, true);
-    const test_decl = try testDeclByName(file, "allocating_case");
-    try std.testing.expectEqual(@as(usize, 2), test_decl.body.stmts.len);
-
-    const allocator_stmt = switch (test_decl.body.stmts[0]) {
-        .let_stmt => |value| value,
-        else => return error.MissingTestAllocatorBinding,
-    };
-    try std.testing.expectEqualStrings("allocator", allocator_stmt.name);
-    const allocator_type = switch (allocator_stmt.ty orelse return error.MissingTestAllocatorType) {
-        .named => |name| name,
-        else => return error.UnexpectedTestAllocatorType,
-    };
-    try std.testing.expectEqualStrings("std.mem.Allocator", allocator_type);
-    const allocator_init = switch (allocator_stmt.init) {
-        .field_access => |value| value,
-        else => return error.MissingTestAllocatorInitializer,
-    };
-    try std.testing.expectEqualStrings("allocator", allocator_init.field_name);
-    const testing_access = switch (allocator_init.target.*) {
-        .field_access => |value| value,
-        else => return error.UnexpectedTestAllocatorInitializer,
-    };
-    try std.testing.expectEqualStrings("testing", testing_access.field_name);
-    const testing_name = switch (testing_access.target.*) {
-        .ident => |name| name,
-        else => return error.UnexpectedTestAllocatorNamespace,
-    };
-    try std.testing.expectEqualStrings("std", testing_name);
-
-    const call_stmt = switch (test_decl.body.stmts[1]) {
-        .expr_stmt => |value| value.*,
-        else => return error.MissingAllocatingTestCall,
-    };
-    const call_try = switch (call_stmt) {
-        .unary_op => |value| value,
-        else => return error.MissingAllocatingTestTry,
-    };
-    try std.testing.expectEqual(ast.UnaryOpKind.try_op, call_try.op);
-    const call = switch (call_try.operand.*) {
-        .call => |value| value,
-        else => return error.MissingAllocatingTestCall,
-    };
-    try std.testing.expectEqual(@as(usize, 1), call.args.len);
-    const call_allocator = switch (call.args[0]) {
-        .ident => |name| name,
-        else => return error.UnexpectedAllocatingTestArgument,
-    };
-    try std.testing.expectEqualStrings("allocator", call_allocator);
-    const tail = test_decl.body.expr orelse return error.MissingAllocatingTestTail;
-    const tail_block = switch (tail.*) {
-        .block => |value| value,
-        else => return error.UnexpectedAllocatingTestTail,
-    };
-    try std.testing.expectEqual(@as(usize, 1), tail_block.stmts.len);
-
-    const emitted = try emit.emitFile(alloc, &file);
-    const allocator_text = "const allocator: std.mem.Allocator = std.testing.allocator;";
-    try std.testing.expect(std.mem.indexOf(u8, emitted, allocator_text) != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "try allocating_helper(allocator);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "_ = 9;") != null);
-}
-
-test "lower and emit: dynamically allocating tests receive a local allocator" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const file = try lowerTestAllocatorFixture(alloc, false, true);
-    const test_decl = try testDeclByName(file, "dynamic_allocating_case");
-    try std.testing.expectEqual(@as(usize, 2), test_decl.body.stmts.len);
-
-    const allocator_stmt = switch (test_decl.body.stmts[0]) {
-        .let_stmt => |value| value,
-        else => return error.MissingTestAllocatorBinding,
-    };
-    try std.testing.expectEqualStrings("allocator", allocator_stmt.name);
-
-    const call_stmt = switch (test_decl.body.stmts[1]) {
-        .expr_stmt => |value| value.*,
-        else => return error.MissingAllocatingTestCall,
-    };
-    const call_try = switch (call_stmt) {
-        .unary_op => |value| value,
-        else => return error.MissingAllocatingTestTry,
-    };
-    try std.testing.expectEqual(ast.UnaryOpKind.try_op, call_try.op);
-    const call = switch (call_try.operand.*) {
-        .call => |value| value,
-        else => return error.MissingAllocatingTestCall,
-    };
-    try std.testing.expectEqual(@as(usize, 1), call.args.len);
-    const call_allocator = switch (call.args[0]) {
-        .ident => |name| name,
-        else => return error.UnexpectedAllocatingTestArgument,
-    };
-    try std.testing.expectEqualStrings("allocator", call_allocator);
-
-    const emitted = try emit.emitFile(alloc, &file);
-    const allocator_text = "const allocator: std.mem.Allocator = std.testing.allocator;";
-    const call_text = "try allocating_helper(allocator);";
-    try std.testing.expect(std.mem.indexOf(u8, emitted, allocator_text) != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, call_text) != null);
-}
-
-test "lower and emit: nonallocating tests keep their body unchanged" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const file = try lowerTestAllocatorFixture(alloc, false, false);
-    const test_decl = try testDeclByName(file, "plain_case");
-    try std.testing.expectEqual(@as(usize, 1), test_decl.body.stmts.len);
-    try std.testing.expect(test_decl.body.stmts[0] == .assign);
-    try std.testing.expect(test_decl.body.expr != null);
-
-    const emitted = try emit.emitFile(alloc, &file);
-    const expected_test =
-        "test \"plain_case\" {\n" ++
-        "    _ = 7;\n" ++
-        "    {\n" ++
-        "        _ = 9;\n" ++
-        "    }\n" ++
-        "}\n";
-    try std.testing.expect(std.mem.indexOf(u8, emitted, expected_test) != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "std.testing.allocator") == null);
 }
 
 test "lower: private source function remains non-public" {
@@ -6120,193 +6363,6 @@ test "lower: direct caller propagates allocating collector ABI" {
     }
 }
 
-fn lowerNestedAllocatorFixture(alloc: std.mem.Allocator) !ast.File {
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-
-    const test_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .fn_,
-        .name = "test_nested_wrapper",
-        .span = span,
-        .visibility = .private,
-        .parent = null,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{
-            .{ .name = "test", .meta = "", .known = true },
-        },
-    });
-    const wrapper_id = try addLowerEntity(&graph, .fn_, "wrapper", null);
-    const helper_id = try addLowerEntity(&graph, .fn_, "allocating_helper", null);
-    const unrelated_id = try addLowerEntity(&graph, .fn_, "unrelated", null);
-    const root_id = try addRootModule(&graph, .{
-        .crate_name = "nested_allocator",
-        .edition = 2021,
-        .items = &.{ test_id, wrapper_id, helper_id, unrelated_id },
-    });
-
-    const types_store = [_]ir.types.Type{.{ .prim = .unit }};
-
-    const helper_return = try model.e(.{ .return_ = .{ .value = null } });
-    const helper_body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = helper_return,
-        .labelled = null,
-    } });
-    const unrelated_return = try model.e(.{ .return_ = .{ .value = null } });
-    model.exprs.items[helper_return].ty = 0;
-    model.exprs.items[unrelated_return].ty = 0;
-    const helper_call = try model.e(.{ .call = .{
-        .call_kind = .{ .free = helper_id },
-        .args = &.{},
-    } });
-    model.exprs.items[helper_call].ty = 0;
-    const wrapper_body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = helper_call,
-        .labelled = null,
-    } });
-    const wrapper_call = try model.e(.{ .call = .{
-        .call_kind = .{ .free = wrapper_id },
-        .args = &.{},
-    } });
-    model.exprs.items[wrapper_call].ty = 0;
-    const wrapper_statement = try model.stmt(.{ .expr = wrapper_call });
-    const test_statements = [_]ir.exprs.NodeId{wrapper_statement};
-    const test_body = try model.e(.{ .block = .{
-        .statements = &test_statements,
-        .tail = null,
-        .labelled = null,
-    } });
-    const unrelated_body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = unrelated_return,
-        .labelled = null,
-    } });
-
-    while (model.bodies.items.len <= root_id) {
-        try model.bodies.append(model.a(), .{ .none = {} });
-    }
-    model.bodies.items[test_id] = .{ .fn_ = .{
-        .params = &.{},
-        .ret = .{ .prim = .unit },
-        .body = test_body,
-        .is_allocating = false,
-    } };
-    model.bodies.items[wrapper_id] = .{ .fn_ = .{
-        .params = &.{},
-        .ret = .{ .prim = .unit },
-        .body = wrapper_body,
-        .is_allocating = false,
-    } };
-    model.bodies.items[helper_id] = .{ .fn_ = .{
-        .params = &.{},
-        .ret = .{ .prim = .unit },
-        .body = helper_body,
-        .is_allocating = true,
-    } };
-    model.bodies.items[unrelated_id] = .{ .fn_ = .{
-        .params = &.{},
-        .ret = .{ .prim = .unit },
-        .body = unrelated_body,
-        .is_allocating = false,
-    } };
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "nested_allocator",
-        .edition = "2021",
-        .graph = graph,
-        .types = &types_store,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(model.a()),
-            .stmts = try model.stmts.toOwnedSlice(model.a()),
-            .pats = &.{},
-            .types = &types_store,
-            .bodies = try model.bodies.toOwnedSlice(model.a()),
-        },
-    };
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    return sourceFidelityRootFile(package);
-}
-
-test "lower: nested wrapper effects stabilize test allocator ABI before declarations" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const file = try lowerNestedAllocatorFixture(alloc);
-    const test_decl = try testDeclByName(file, "test_nested_wrapper");
-    try std.testing.expectEqual(@as(usize, 2), test_decl.body.stmts.len);
-
-    const allocator_stmt = switch (test_decl.body.stmts[0]) {
-        .let_stmt => |value| value,
-        else => return error.MissingTestAllocatorBinding,
-    };
-    try std.testing.expectEqualStrings("allocator", allocator_stmt.name);
-    const call_stmt = switch (test_decl.body.stmts[1]) {
-        .expr_stmt => |value| value.*,
-        else => return error.MissingNestedWrapperCall,
-    };
-    const call_try = switch (call_stmt) {
-        .unary_op => |value| value,
-        else => return error.MissingNestedWrapperTry,
-    };
-    try std.testing.expectEqual(ast.UnaryOpKind.try_op, call_try.op);
-    const wrapper_call = switch (call_try.operand.*) {
-        .call => |value| value,
-        else => return error.MissingNestedWrapperCall,
-    };
-    try std.testing.expectEqual(@as(usize, 1), wrapper_call.args.len);
-    const wrapper_allocator = switch (wrapper_call.args[0]) {
-        .ident => |name| name,
-        else => return error.UnexpectedNestedWrapperAllocator,
-    };
-    try std.testing.expectEqualStrings("allocator", wrapper_allocator);
-
-    var wrapper_decl: ?ast.FnDecl = null;
-    var helper_decl: ?ast.FnDecl = null;
-    var unrelated_decl: ?ast.FnDecl = null;
-    for (file.decls) |decl| {
-        const function = switch (decl) {
-            .fn_decl => |value| value,
-            else => continue,
-        };
-        if (std.mem.eql(u8, function.name, "wrapper")) {
-            wrapper_decl = function;
-        } else if (std.mem.eql(u8, function.name, "allocating_helper")) {
-            helper_decl = function;
-        } else if (std.mem.eql(u8, function.name, "unrelated")) {
-            unrelated_decl = function;
-        }
-    }
-
-    const wrapper = wrapper_decl orelse return error.MissingNestedWrapper;
-    try std.testing.expectEqual(@as(usize, 1), wrapper.params.len);
-    try std.testing.expectEqualStrings("allocator", wrapper.params[0].name);
-    _ = switch (wrapper.ret_type) {
-        .err_union => |value| value,
-        else => return error.NestedWrapperMissingErrorUnion,
-    };
-    const helper = helper_decl orelse return error.MissingAllocatingHelper;
-    try std.testing.expectEqual(@as(usize, 1), helper.params.len);
-    _ = switch (helper.ret_type) {
-        .err_union => |value| value,
-        else => return error.HelperMissingErrorUnion,
-    };
-    const unrelated = unrelated_decl orelse return error.MissingUnrelatedFunction;
-    try std.testing.expectEqual(@as(usize, 0), unrelated.params.len);
-    switch (unrelated.ret_type) {
-        .void_type => {},
-        .prim => |primitive| try std.testing.expectEqual(ast.Prim.void_type, primitive),
-        else => return error.UnrelatedFunctionChanged,
-    }
-    const emitted = try emit.emitFile(alloc, &file);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "try wrapper(allocator);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "try allocating_helper(allocator);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "fn unrelated() void") != null);
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "fn unrelated(allocator") == null);
-}
 test "lower: nested owned temporary blocks isolate preludes and names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6610,7 +6666,7 @@ test "lower: lazy owner import avoids temporary owner collision" {
         .is_crate = false,
         .is_extern = false,
         .span = span,
-        .items = &.{remote_id},
+        .items = try alloc.dupe(ir.spine.EntityId, &.{remote_id}),
         .attributes = &.{},
     });
     try graph.addCrate(.{
@@ -7015,7 +7071,7 @@ test "lower: associated allocating calls place allocator before the receiver" {
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{ struct_id, caller_id },
+        .items = try alloc.dupe(ir.spine.EntityId, &.{ struct_id, caller_id }),
         .attributes = &.{},
     });
     try graph.addCrate(.{
@@ -7636,127 +7692,6 @@ test "lower: integer unary logical_not lowers to bitwise not ~" {
     const source = try emit.emitFile(alloc, &package.files[0]);
 
     try std.testing.expect(std.mem.indexOf(u8, source, "~@as(usize, 31)") != null);
-}
-test "lower: binary operation autoderefs pointer operands" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    const test_span: ir.spine.Span = .{
-        .start_line = 1,
-        .start_col = 1,
-        .end_line = 1,
-        .end_col = 1,
-    };
-    const root_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .module,
-        .name = try alloc.dupe(u8, "root"),
-        .span = test_span,
-        .visibility = .public,
-        .parent = null,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    const fn_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .fn_,
-        .name = try alloc.dupe(u8, "bin_ptr_math"),
-        .span = test_span,
-        .visibility = .public,
-        .parent = root_id,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    const param_seed_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .field,
-        .name = try alloc.dupe(u8, "seed"),
-        .span = test_span,
-        .visibility = .public,
-        .parent = fn_id,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-
-    const root_items = try alloc.alloc(ir.spine.EntityId, 1);
-    root_items[0] = fn_id;
-    const root_module = try graph.addModule(.{
-        .id = root_id,
-        .kind = .root,
-        .name = "root",
-        .parent = null,
-        .source_path = null,
-        .is_crate = true,
-        .is_extern = false,
-        .span = test_span,
-        .items = root_items,
-        .attributes = &.{},
-    });
-    try graph.addCrate(.{
-        .name = "bin_ptr_test",
-        .edition = 2021,
-        .kind = .lib,
-        .root = root_module,
-        .deps = &.{},
-        .is_translated = true,
-    });
-
-    var model = Model.init(alloc);
-    const u64_ty = ir.types.Type{ .prim = .u64 };
-    const ptr_u64_ty = ir.types.Type{ .reference = try alloc.create(ir.types.Ref) };
-    @constCast(ptr_u64_ty.reference).* = .{ .mut = true, .pointee = u64_ty };
-    const types = [_]ir.types.Type{ u64_ty, ptr_u64_ty };
-
-    const p_seed = try model.e(.{ .path = .{ .def = param_seed_id, .generic_args = &.{} } });
-    model.exprs.items[p_seed].ty = 1;
-
-    const lit_one = try model.e(litInt(1));
-    model.exprs.items[lit_one].ty = 0;
-
-    const bin_expr = try model.e(.{ .binary = .{
-        .op = .add,
-        .lhs = p_seed,
-        .rhs = lit_one,
-        .overflow = .wrapping,
-    } });
-    model.exprs.items[bin_expr].ty = 0;
-
-    const max_bodies = @max(fn_id + 1, graph.symbol_table.count());
-    const body_table = try alloc.alloc(ir.bodies.BodyKind, max_bodies);
-    for (body_table) |*b| b.* = .none;
-    const fn_params = try alloc.alloc(ir.items.Param, 1);
-    fn_params[0] = .{ .name = "seed", .ty = ptr_u64_ty, .span = test_span };
-    body_table[fn_id] = .{ .fn_ = .{
-        .params = fn_params,
-        .ret = u64_ty,
-        .generic_params = &.{},
-        .body = bin_expr,
-        .is_allocating = false,
-    } };
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "bin_ptr_test",
-        .edition = "2021",
-        .graph = graph,
-        .types = &types,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(alloc),
-            .stmts = try model.stmts.toOwnedSlice(alloc),
-            .pats = try model.pats.toOwnedSlice(alloc),
-            .types = &types,
-            .bodies = body_table,
-        },
-    };
-
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    const source = try emit.emitFile(alloc, &package.files[0]);
-
-    try std.testing.expect(std.mem.indexOf(u8, source, "seed.* +% 1") != null);
 }
 
 // ── Range patterns ───────────────────────────────────────────────────────────
@@ -9290,100 +9225,731 @@ test "lower: to_string renders a Display receiver into an owned runtime string" 
     try std.testing.expect(std.mem.indexOf(u8, source, "r2z.alloc.String") != null);
 }
 
-// A Rust raw-pointer cast reinterprets one address under a different
-// pointee, so the pointee width is free to change. `utils.rs` in
-// xxhash-rust spells exactly this: a `*const u8` cursor cast to the
-// caller's `*const T`, where `T` is a generic parameter whose layout is not
-// known until monomorphization. Requiring both pointees to be primitives of
-// equal width rejected that cast outright, which made the whole crate
-// untranslatable. The source type is fully recovered here; only the target
-// pointee is a type parameter, and `lowerType` names it.
-test "lower: raw pointer cast to a generic pointee reinterprets the address" {
+/// The IR of `test/crates/hex/src/error.rs:47`: a data-carrying error enum,
+/// its `Display` impl, and a `#[test]` that asserts on `to_string()`.
+///
+/// The `to_string()` node carries NO type, and that is the whole point. Nothing
+/// in the source names the blanket `ToString::to_string` result — no signature
+/// in the crate declares it — so the frontend leaves the call unannotated and
+/// the comparison that consumes it has to learn from the lowering's OWN
+/// recognition of the method that the call BUILDS an owned `String`. Reading
+/// only the annotation hands that `String` to `r2z.ops.binary` by value, and
+/// nothing in the emitted test releases it: the assertions all pass and every
+/// one of them leaks a block the runtime handed over.
+fn lowerDisplayAssertionPackage(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    // No module entity of its own: `addRootModule` below creates the crate
+    // root and parents every item that has no parent yet, which is what hex's
+    // own sidecar shows for the `error` module. Declaring a second module
+    // entity with the same `(parent, name)` leaves two entities that both
+    // answer to the one root row, and `moduleEntityId` resolves the file's
+    // module id to whichever it meets first.
+    const fault_id = try addLowerEntity(&graph, .enum_, "Fault", null);
+    // The impl hangs off the TYPE, not off the module: `hoistTargetFor` answers
+    // an impl with its own parent, and that parent is what decides where the
+    // `format` hook lands. A module there makes it a module-scope free function,
+    // so `Fault` never declares `format` and `r2z.format`'s protocol refuses
+    // the value. This is hex's own topology — impl entity 9 is parented at the
+    // `FromHexError` entity 7.
+    const display_id = try addLowerEntity(&graph, .impl_, "fmt::Display for Fault", fault_id);
+    // `declaresDisplayFmt` reads the IMPL entity's name and looks for a `fmt`
+    // member under it, so this is the spelling hex's own source produces.
+    const fmt_id = try addLowerEntity(&graph, .fn_, "fmt", display_id);
+    const to_string_id = try addLowerEntity(&graph, .method_ref, "to_string", null);
+    const test_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "test_display",
+        .span = span,
+        .visibility = .private,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        // `#[test]`, not the `test_` in the name, is what makes a Zig test.
+        .attributes = &.{.{ .name = "test", .meta = "", .known = true }},
+    });
+    const writer_field = try addLowerEntity(&graph, .field, "f", fmt_id);
+
+    // `fmt` is an `impl` member, not a module item — hex's `error` module lists
+    // the enum and its `use` rows, and neither the impl nor `fmt` is among them.
+    // `lowerModule` walks the items and, unlike `lowerRootFileFromSymbolTable`,
+    // has no nested-method skip, so listing it emits a second module-scope
+    // `fmt` beside the `format` member `collectHoistedMethods` already hoisted
+    // onto `Fault`.
+    _ = try addRootModule(&graph, .{
+        .crate_name = "faults",
+        .edition = 2021,
+        .items = &.{ fault_id, display_id, test_id },
+    });
+
+    const fault_type: ir.types.Type = .{ .path = .{
+        .segments = try alloc.dupe(ir.types.PathSegment, &.{
+            .{ .name = "Fault", .id = fault_id },
+        }),
+    } };
+    const types_store = try alloc.alloc(ir.types.Type, 4);
+    types_store[0] = fault_type;
+    types_store[1] = .{ .reference = &.{ .mut = false, .pointee = fault_type } };
+    types_store[2] = .{ .reference = &.{ .mut = true, .pointee = .{ .external_nominal = .{
+        .path = &.{ "core", "fmt", "Formatter" },
+        .args = &.{},
+    } } } };
+    types_store[3] = .{ .external_nominal = .{
+        .path = &.{ "core", "fmt", "Result" },
+        .args = &.{},
+    } };
+
+    // `write!(f, "odd")`: the `Display` body, so the rendered value is exactly
+    // what the assertion names and a wrong release cannot hide behind it.
+    const writer = try model.e(.{ .path = .{ .def = writer_field, .generic_args = &.{} } });
+    const write_body = try model.e(.{ .format_write = .{
+        .writer = writer,
+        .template = "odd",
+        .args = &.{},
+    } });
+    const fmt_body = try model.e(.{ .block = .{
+        .statements = &.{},
+        .tail = write_body,
+        .labelled = null,
+    } });
+
+    const odd = try model.e(.{ .enum_variant = .{
+        .def = fault_id,
+        .variant = "Odd",
+        .tuple_fields = &.{},
+        .named_fields = &.{},
+    } });
+    const rendered = try model.e(.{ .method_call = .{
+        .receiver = odd,
+        .receiver_mode = .value,
+        .method = to_string_id,
+        .args = &.{},
+    } });
+    const expected = try model.e(.{ .literal = .{ .string = .{ .bytes = "odd" } } });
+    const condition = try model.e(.{ .binary = .{
+        .op = .eq,
+        .overflow = .wrapping,
+        .lhs = rendered,
+        .rhs = expected,
+    } });
+    const assertion_reason = try std.fmt.allocPrint(alloc, "assertion:{d}", .{condition});
+    const marker = try model.e(.{ .unsupported = .{
+        .reason = assertion_reason,
+        .suggested_version = .v1,
+    } });
+    // The marker is a STATEMENT, not the block's tail: `assert_eq!` reaches the
+    // backend as a statement whose value is the macro call, which is exactly
+    // what hex's own AST golden records for `test_display` — an `expr_stmt`
+    // beside the allocator binding in `body.stmts`, with no tail. A tail would
+    // park the whole claim these tests make — the release the comparison's
+    // owner carries — in the block's `expr`, where no walk of the test's
+    // statement list can see it.
+    const assertion = try model.stmt(.{ .expr = marker });
+    const test_body = try model.e(.{ .block = .{
+        .statements = try alloc.dupe(ir.exprs.NodeId, &.{assertion}),
+        .tail = null,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[fault_id] = .{ .enum_ = .{
+        .kind = .data,
+        .variants = try alloc.dupe(ir.items.Variant, &.{
+            .{ .name = "At", .discriminant = null, .fields = .{ .named = try alloc.dupe(ir.items.Field, &.{
+                .{
+                    .name = "index",
+                    .ty = .{ .prim = .usize },
+                    .visibility = .private,
+                    .span = span,
+                },
+            }) } },
+            .{ .name = "Odd", .discriminant = null, .fields = .{ .none = {} } },
+        }),
+    } };
+    body_rows[display_id] = .{ .impl_ = .{
+        .self_ty = fault_type,
+        .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+            .{ .name = "fmt", .id = null },
+            .{ .name = "Display", .id = null },
+        }) },
+        .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{fmt_id}),
+    } };
+    body_rows[fmt_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "self", .ty = types_store[1], .span = span },
+            .{ .name = "f", .ty = types_store[2], .span = span },
+        }),
+        .ret = types_store[3],
+        .body = fmt_body,
+    } };
+    body_rows[test_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = test_body,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "faults",
+        .edition = "2021",
+        .graph = graph,
+        .types = types_store,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = types_store,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// The owning half of the rule, read off the emitted AST rather than off text:
+// the `to_string()` result is bound to a MUTABLE local and a `defer` releases
+// it. A `defer`, not a statement after the comparison: the assertion returns
+// early when the comparison is false, so a release that ran only on the way
+// out of the success path would leak on the failure path too.
+test "lower: a comparison against an unannotated to_string call owns its result" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    const package = try lowerDisplayAssertionPackage(alloc);
+
+    const emitted = try emit.emitFile(alloc, &package.files[0]);
+    var bound_owned_operand = false;
+    var released_on_every_path = false;
+    for (package.files[0].tests) |test_decl| {
+        for (test_decl.body.stmts) |statement| {
+            const comparison = switch (statement) {
+                .expr_stmt => |expression| switch (expression.*) {
+                    .unary_op => |unary| switch (unary.operand.*) {
+                        .call => |call| switch (call.args[0]) {
+                            .block => |block| block,
+                            else => continue,
+                        },
+                        else => continue,
+                    },
+                    else => continue,
+                },
+                else => continue,
+            };
+            for (comparison.stmts) |inner| {
+                const binding = switch (inner) {
+                    .let_stmt => |let_stmt| let_stmt,
+                    else => continue,
+                };
+                const bound_type = switch (binding.ty orelse continue) {
+                    .named => |name| name,
+                    else => continue,
+                };
+                if (!std.mem.eql(u8, bound_type, "r2z.alloc.String")) continue;
+                // `dropTemporary` takes `*T` and `deinit` writes through it, so
+                // a binding the release cannot name is a binding that cannot
+                // be released.
+                if (!binding.is_mut) continue;
+                bound_owned_operand = true;
+                for (comparison.stmts) |release| {
+                    const deferred = switch (release) {
+                        .defer_stmt => |defer_stmt| defer_stmt,
+                        else => continue,
+                    };
+                    // `errdefer` runs on the error exits only. An assertion
+                    // that PASSES takes neither, so an `errdefer` release is
+                    // a release that never happens.
+                    if (deferred.is_errdefer) continue;
+                    const callee = switch (deferred.expr) {
+                        .call => |call| call.callee.*,
+                        else => continue,
+                    };
+                    const named = switch (callee) {
+                        .ident => |name| name,
+                        else => continue,
+                    };
+                    if (std.mem.eql(u8, named, "r2z.alloc.dropTemporary")) {
+                        released_on_every_path = true;
+                    }
+                }
+            }
+        }
+    }
+    // The emitted text is printed only to show WHERE the typed walk found
+    // nothing; the verdict itself is the walk above.
+    if (!bound_owned_operand or !released_on_every_path) {
+        std.debug.print("emitted:\n{s}\n", .{emitted});
+    }
+    try std.testing.expect(bound_owned_operand);
+    try std.testing.expect(released_on_every_path);
+}
+
+// The runtime half: the generated test is compiled and RUN, so
+// `std.testing.allocator` gets the last word. An emitted-text or typed-AST
+// assertion can only claim a release is PRESENT; only a run can say the block
+// the runtime handed over was actually given back EXACTLY ONCE, on the path
+// the source takes. A release armed over storage that has already moved out
+// aborts here, and so does one that was never armed at all.
+fn runGeneratedPackageTests(alloc: std.mem.Allocator, package: ast.Package) !void {
+    const test_io = std.testing.io;
+
+    // `std.testing.tmpDir` stages under `.zig-cache/tmp` relative to the working
+    // directory, which is local disk under this repository's documented
+    // workflow: `tools/zig-pinned.sh` moves both cache directories there and the
+    // README asks for a UID-owned local source copy precisely because the
+    // checkout itself is an NFSv3 mount, where Zig's atomic write is
+    // `renameat2(RENAME_EXCHANGE)` and aborts with EINVAL. The CHILD compiler's
+    // caches are redirected into this staging tree as well, so nothing it
+    // writes can land on the checkout.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var seed: [8]u8 = undefined;
+    test_io.random(&seed);
+    const nonce = try std.fmt.allocPrint(alloc, "r2z-generated-leak-{s}", .{std.fmt.bytesToHex(seed, .lower)});
+    try tmp.dir.createDirPath(test_io, nonce);
+    defer tmp.dir.deleteTree(test_io, nonce) catch {};
+    const staging = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{nonce});
+
+    var dir = std.Io.Dir.cwd();
+    for (package.files) |*file| {
+        const source = try emit.emitFile(alloc, file);
+        const path = try std.fs.path.join(alloc, &.{ staging, file.path });
+        if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(test_io, parent);
+        const out = try dir.createFile(test_io, path, .{});
+        defer out.close(test_io);
+        try out.writeStreamingAll(test_io, source);
+    }
+
+    const root_module = try std.fs.path.join(alloc, &.{ staging, "src/root.zig" });
+    const cache_dir = try std.fs.path.join(alloc, &.{ staging, ".zig-cache" });
+    const global_cache_dir = try std.fs.path.join(alloc, &.{ staging, ".zig-global-cache" });
+
+    // `-M<name>=<path>` in ONE argument, the spelling `build.zig` uses for
+    // every generated-package consumer, with `--dep r2z` in front of the module
+    // that imports it.
+    const root_arg = try std.fmt.allocPrint(alloc, "-Mroot={s}", .{root_module});
+    const result = try std.process.run(alloc, test_io, .{
+        .argv = &.{
+            @import("toolchain").zig_executable,
+            "test",
+            "--cache-dir",
+            cache_dir,
+            "--global-cache-dir",
+            global_cache_dir,
+            "--dep",
+            "r2z",
+            root_arg,
+            "--dep",
+            "r2z",
+            "-Mr2z=r2z-core/src/root.zig",
+        },
+    });
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.debug.print("generated package failed:\n{s}{s}\n", .{ result.stdout, result.stderr });
+    return error.GeneratedPackageTestFailed;
+}
+
+test "lower: the generated test for an unannotated to_string call leaks nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try runGeneratedPackageTests(alloc, try lowerDisplayAssertionPackage(alloc));
+}
+
+// ── A by-value owner PARAMETER spent by a consuming runtime accessor ────────
+
+/// Whether `expr` names the binding, or the address of it.
+///
+/// `r2z.alloc.takeOwned(T, &handle)` is handed the PLACE it empties, so the
+/// emitted argument is `&handle`; a by-value move names the binding bare.
+/// They are the same claim, and a walk that accepts only one spelling answers
+/// a question about a shape the lowering does not emit.
+fn placeNamesBinding(expr: ast.Expr, name: []const u8) bool {
+    return switch (expr) {
+        .ident => |value| std.mem.eql(u8, value, name),
+        .unary_op => |unary| unary.op == .addr_of and
+            placeNamesBinding(unary.operand.*, name),
+        else => false,
+    };
+}
+
+/// The expressions one statement evaluates, in the order it evaluates them.
+///
+/// A BINDING's initialiser counts. The transfer this walk is asked about sits
+/// inside the `let` a comparison makes of an owned operand — the emitted shape
+/// is `var x: T = r2z.alloc.takeOwned(T, &place).unwrap(allocator);` — so a
+/// walk that reads only `expr_stmt` cannot see the one call the claim is
+/// about.
+fn statementExpressions(stmt: ast.Stmt) [2]ast.Expr {
+    return switch (stmt) {
+        .expr_stmt => |expression| .{ expression.*, .unit },
+        .let_stmt => |let_stmt| .{ let_stmt.init, .unit },
+        .defer_stmt => |defer_stmt| .{ defer_stmt.expr, .unit },
+        .assign => |assign_stmt| .{ assign_stmt.val, assign_stmt.target },
+    };
+}
+
+/// Whether `expr` contains a call to `callee` that is handed `argument`.
+///
+/// The ownership claim these tests make is a CLAIM ABOUT THE EMITTED AST, so it
+/// is read off the AST: one call, one argument, placed at the named binding. It
+/// is deliberately not a search over rendered text, which would re-pin whatever
+/// spacing the emitter happens to produce today. The walk has to reach EVERY
+/// position the emitter can put a call in, or it answers "absent" for a frame
+/// that in fact empties its owner — the failure this test exists to catch,
+/// reported from the wrong side.
+fn callsWithArgument(expr: ast.Expr, callee: []const u8, argument: []const u8) bool {
+    switch (expr) {
+        .call => |call| {
+            const named = switch (call.callee.*) {
+                .ident => |name| name,
+                else => "",
+            };
+            if (std.mem.eql(u8, named, callee)) {
+                for (call.args) |arg| {
+                    if (placeNamesBinding(arg, argument)) return true;
+                }
+            }
+            // The callee is walked as well as the arguments: a member call
+            // carries its receiver there, and a consuming accessor emits the
+            // transfer that empties the owner as exactly that receiver —
+            // `r2z.alloc.takeOwned(T, &value).unwrap(allocator)`. An
+            // argument-only walk cannot see a call that is never an argument.
+            if (callsWithArgument(call.callee.*, callee, argument)) return true;
+            for (call.args) |arg| {
+                if (callsWithArgument(arg, callee, argument)) return true;
+            }
+        },
+        .unary_op => |unary| return callsWithArgument(unary.operand.*, callee, argument),
+        .field_access => |access| return callsWithArgument(access.target.*, callee, argument),
+        .block => |block| {
+            for (block.stmts) |stmt| {
+                for (statementExpressions(stmt)) |value| {
+                    if (callsWithArgument(value, callee, argument)) return true;
+                }
+            }
+            const value = block.expr orelse return false;
+            return callsWithArgument(value.*, callee, argument);
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// The IR of `test/crates/compat`'s `temporary_moved_result_equal` frame, the
+/// one forwarding layer above it, and the `#[test]` that drives them.
+///
+/// ```rust
+/// fn same_result() -> Result<String, u8> { Ok(String::from("same")) }
+///
+/// fn moved_result_equal(value: Result<String, u8>) -> bool {
+///     value.unwrap() == "same"
+/// }
+///
+/// fn moved_result_caller(value: Result<String, u8>) -> bool {
+///     moved_result_equal(value)
+/// }
+/// ```
+///
+/// The parameter is an owner this frame OWNS: Rust moved the bytes in, so the
+/// frame's body has to release them and the lowering arms
+/// `defer r2z.alloc.dropTemporary(allocator, &value)` over it. `Result::unwrap`
+/// declares `self`, so that call SPENDS the receiver, and the payload it hands
+/// back is the same allocation the alias still names. The runtime helper is a
+/// by-value method call, so it copies the union and empties nothing; reading
+/// the receiver as a borrow leaves the armed release pointed at storage the
+/// comparison's own release frees a second time. Every assertion still passes
+/// and the test allocator aborts on the double free.
+fn lowerMovedResultPackage(alloc: std.mem.Allocator) !ast.Package {
     var graph = ir.graph.CrateGraph.init(alloc);
-    const function_id = try addLowerEntity(&graph, .fn_, "chunk_ref", null);
-    _ = try addRootModule(&graph, .{
-        .crate_name = "generic_pointer_cast",
+    var model = Model.init(alloc);
+
+    const root_id = try addRootModule(&graph, .{
+        .crate_name = "moved_result",
         .edition = 2021,
-        .items = &.{function_id},
+        .items = &.{},
+    });
+    const core_id = try addLowerEntity(&graph, .module, "core", root_id);
+    const result_module_id = try addLowerEntity(&graph, .module, "result", core_id);
+    const result_enum_id = try addLowerEntity(&graph, .enum_, "Result", result_module_id);
+    const build_id = try addLowerEntity(&graph, .fn_, "same_result", root_id);
+    const equal_id = try addLowerEntity(&graph, .fn_, "moved_result_equal", root_id);
+    // A parameter binding is a `.field` under its own callable: that is what
+    // `LocalBindingNames` claims it by, and the owner release keys on the
+    // entity rather than on the spelling.
+    const equal_value_id = try addLowerEntity(&graph, .field, "value", equal_id);
+    const caller_id = try addLowerEntity(&graph, .fn_, "moved_result_caller", root_id);
+    const caller_value_id = try addLowerEntity(&graph, .field, "value", caller_id);
+    const check_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = "moved_result_check",
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{.{ .name = "test", .meta = "", .known = true }},
+    });
+    // `unwrap` has no declaration in the crate, so the backend has to classify
+    // it from the receiver's type alone — and so has to classify its ownership.
+    const unwrap_id = try addLowerEntity(&graph, .method_ref, "unwrap", null);
+
+    graph.modules.items[0].items = try alloc.dupe(
+        ir.spine.EntityId,
+        &.{ build_id, equal_id, caller_id, check_id },
+    );
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = "core",
+        .parent = root_id,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = true,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = "result",
+        .parent = core_id,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = true,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
     });
 
-    // The `*const T` pointee: a path with no resolved id names the generic
-    // parameter itself, exactly as the frontend records a type parameter.
-    const type_param_segments = [_]ir.types.PathSegment{.{ .name = "T", .id = null }};
-    const generic_pointee: ir.types.Type = .{ .path = .{
-        .segments = &type_param_segments,
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
     } };
+    const result_type: ir.types.Type = .{ .result = try alloc.create(ir.types.Result) };
+    @constCast(result_type.result).* = .{
+        .ok = string_ty,
+        .err = .{ .prim = .u8 },
+        // The error type is a primitive, so this `Result` is the tagged
+        // `r2z.Result` union and carries real methods — which is the whole
+        // point: the accessor has to be recognised from the receiver's type.
+        .is_error_unionable = false,
+    };
+    const types = try alloc.alloc(ir.types.Type, 2);
+    types[0] = result_type;
+    types[1] = string_ty;
 
-    const source_ptr: ir.types.Type = .{ .raw_ptr = try alloc.create(ir.types.RawPtr) };
-    @constCast(source_ptr.raw_ptr).* = .{ .mut = false, .pointee = .{ .prim = .u8 } };
-    const target_ptr: ir.types.Type = .{ .raw_ptr = try alloc.create(ir.types.RawPtr) };
-    @constCast(target_ptr.raw_ptr).* = .{ .mut = false, .pointee = generic_pointee };
-    const types = [_]ir.types.Type{ source_ptr, target_ptr, .{ .prim = .u8 } };
+    // `Ok(String::from("same"))`
+    const text = try typedExpr(&model, null, .{ .literal = .{ .string = .{ .bytes = "same" } } });
+    const built = try typedExpr(&model, 1, .{ .core_call = .{
+        .function = .convert_from,
+        .generic_args = &.{string_ty},
+        .args = &.{text},
+    } });
+    const ok_payload = try alloc.alloc(ir.exprs.NodeId, 1);
+    ok_payload[0] = built;
+    const ok_value = try typedExpr(&model, 0, .{ .enum_variant = .{
+        .def = result_enum_id,
+        .variant = "Ok",
+        .tuple_fields = ok_payload,
+        .named_fields = &.{},
+    } });
+    const build_body = try typedExpr(&model, null, .{ .block = .{
+        .statements = &.{},
+        .tail = ok_value,
+        .labelled = null,
+    } });
 
-    // The cast operand is a real function parameter, so `lowerPathExpr`
-    // resolves it to the declared identifier `cursor`.
-    const cursor_def = try addLowerEntity(&graph, .field, "cursor", function_id);
-    const cursor = ir.exprs.Expr{
-        .id = 0,
-        .span = span,
-        .ty = 0,
-        .kind = .{ .path = .{ .def = cursor_def, .generic_args = &.{} } },
+    // `value.unwrap() == "same"`
+    const equal_receiver = try typedExpr(&model, 0, .{ .path = .{
+        .def = equal_value_id,
+        .generic_args = &.{},
+    } });
+    const unwrapped = try typedExpr(&model, 1, .{ .method_call = .{
+        .receiver = equal_receiver,
+        .receiver_mode = .value,
+        .method = unwrap_id,
+        .args = &.{},
+    } });
+    const expected = try typedExpr(&model, null, .{ .literal = .{ .string = .{ .bytes = "same" } } });
+    const comparison = try typedExpr(&model, null, .{ .binary = .{
+        .op = .eq,
+        .overflow = .wrapping,
+        .lhs = unwrapped,
+        .rhs = expected,
+    } });
+    const equal_body = try typedExpr(&model, null, .{ .block = .{
+        .statements = &.{},
+        .tail = comparison,
+        .labelled = null,
+    } });
+
+    // `moved_result_equal(value)`
+    const caller_argument = try typedExpr(&model, 0, .{ .path = .{
+        .def = caller_value_id,
+        .generic_args = &.{},
+    } });
+    const forwarded_args = try alloc.alloc(ir.exprs.NodeId, 1);
+    forwarded_args[0] = caller_argument;
+    const forwarded = try typedExpr(&model, null, .{ .call = .{
+        .call_kind = .{ .free = equal_id },
+        .args = forwarded_args,
+    } });
+    const caller_body = try typedExpr(&model, null, .{ .block = .{
+        .statements = &.{},
+        .tail = forwarded,
+        .labelled = null,
+    } });
+
+    // `assert!(moved_result_caller(same_result()))`. `same_result` is declared
+    // with no value parameter — it BUILDS the result — so the call passes no
+    // argument either. Passing one would emit a call whose arity no
+    // declaration matches.
+    const built_call = try typedExpr(&model, null, .{ .call = .{
+        .call_kind = .{ .free = build_id },
+        .args = &.{},
+    } });
+    const called_args = try alloc.alloc(ir.exprs.NodeId, 1);
+    called_args[0] = built_call;
+    const called = try typedExpr(&model, null, .{ .call = .{
+        .call_kind = .{ .free = caller_id },
+        .args = called_args,
+    } });
+    const assertion_reason = try std.fmt.allocPrint(alloc, "assertion:{d}", .{called});
+    const marker = try typedExpr(&model, null, .{ .unsupported = .{
+        .reason = assertion_reason,
+        .suggested_version = .v1,
+    } });
+    const check_body = try typedExpr(&model, null, .{ .block = .{
+        .statements = &.{},
+        .tail = marker,
+        .labelled = null,
+    } });
+
+    const variants = try alloc.alloc(ir.items.Variant, 2);
+    variants[0] = .{
+        .name = "Ok",
+        .fields = .{ .tuple = try alloc.dupe(ir.types.Type, &.{string_ty}) },
+        .discriminant = null,
     };
-    const cast = ir.exprs.Expr{
-        .id = 1,
-        .span = span,
-        .ty = 1,
-        .kind = .{ .cast = .{
-            .kind = .as_,
-            .operand = 0,
-            .source_type = source_ptr,
-            .target = 1,
-        } },
+    variants[1] = .{
+        .name = "Err",
+        .fields = .{ .tuple = try alloc.dupe(ir.types.Type, &.{.{ .prim = .u8 }}) },
+        .discriminant = null,
     };
-    const body = ir.exprs.Expr{
-        .id = 2,
-        .span = span,
-        .ty = 1,
-        .kind = .{ .block = .{
-            .statements = &.{},
-            .tail = 1,
-            .labelled = null,
-        } },
-    };
-    const params = [_]ir.items.Param{.{ .name = "cursor", .ty = source_ptr, .span = span }};
-    const function_body = ir.bodies.BodyKind{ .fn_ = .{
-        .params = &params,
-        .ret = target_ptr,
-        .generic_params = &.{"T"},
-        .body = 2,
+
+    const owner_param = try alloc.dupe(ir.items.Param, &.{.{ .name = "value", .ty = result_type, .span = span }});
+
+    // The body table is indexed by EntityId, and the extern `core`/`result`
+    // module entities are entities too, so cover the whole symbol table.
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[result_enum_id] = .{ .enum_ = .{ .kind = .data, .variants = variants } };
+    body_rows[build_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = result_type,
+        .generic_params = &.{},
+        .body = build_body,
         .is_allocating = false,
     } };
-    const body_table = [_]ir.bodies.BodyKind{function_body};
-    const expressions = [_]ir.exprs.Expr{ cursor, cast, body };
+    body_rows[equal_id] = .{ .fn_ = .{
+        .params = owner_param,
+        .ret = .{ .prim = .bool },
+        .generic_params = &.{},
+        .body = equal_body,
+        .is_allocating = false,
+    } };
+    body_rows[caller_id] = .{ .fn_ = .{
+        .params = owner_param,
+        .ret = .{ .prim = .bool },
+        .generic_params = &.{},
+        .body = caller_body,
+        .is_allocating = false,
+    } };
+    body_rows[check_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = check_body,
+    } };
+
     const rust_ir = ir.RustIr{
-        .crate_name = "generic_pointer_cast",
+        .crate_name = "moved_result",
         .edition = "2021",
         .graph = graph,
-        .types = &types,
+        .types = types,
         .bodies = .{
-            .exprs = &expressions,
-            .stmts = &.{},
-            .pats = &.{},
-            .types = &types,
-            .bodies = &body_table,
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = types,
+            .bodies = body_rows,
         },
     };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
 
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    const source = try emit.emitFile(alloc, &package.files[0]);
-    // The address is reinterpreted, not converted: a `@ptrCast` to the
-    // generic pointee, with the source pointer type preserved on the cast.
-    try std.testing.expect(std.mem.indexOf(u8, source, "@ptrCast(cursor)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "[*]align(1) const T") != null);
+// The owning half, read off the emitted AST: the frame releases the parameter
+// it was handed, and the read that spends it goes through the transfer that
+// empties it, so the two never name the same allocation.
+test "lower: a Result parameter spent by unwrap is emptied before its own release" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const package = try lowerMovedResultPackage(alloc);
+    var frame: ?ast.Block = null;
+    for (package.files[0].decls) |decl| {
+        if (decl != .fn_decl) continue;
+        if (!std.mem.eql(u8, decl.fn_decl.name, "moved_result_equal")) continue;
+        frame = decl.fn_decl.body;
+    }
+    const body = frame orelse return error.MissingMovedResultFrame;
+
+    var released_parameter = false;
+    for (body.stmts) |stmt| {
+        const deferred = switch (stmt) {
+            .defer_stmt => |value| value,
+            else => continue,
+        };
+        // `errdefer` runs on the error exits only; this frame returns a plain
+        // `bool`, so an `errdefer` release is a release that never happens.
+        if (deferred.is_errdefer) continue;
+        const call = switch (deferred.expr) {
+            .call => |value| value,
+            else => continue,
+        };
+        const named = switch (call.callee.*) {
+            .ident => |name| name,
+            else => continue,
+        };
+        if (std.mem.eql(u8, named, "r2z.alloc.dropTemporary")) released_parameter = true;
+    }
+    try std.testing.expect(released_parameter);
+
+    const tail = body.expr orelse return error.MissingMovedResultTail;
+    try std.testing.expect(callsWithArgument(
+        tail.*,
+        "r2z.alloc.takeOwned",
+        "value",
+    ));
+}
+
+// The runtime half: the generated test is compiled and RUN under
+// `std.testing.allocator`, which aborts the moment the payload this frame was
+// handed is released twice — or the moment it is never released.
+test "lower: the generated moved-result test releases the payload exactly once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try runGeneratedPackageTests(alloc, try lowerMovedResultPackage(alloc));
 }
 
 // The widening must not become a blanket accept. A pointer to an unsized
@@ -10481,16 +11047,6 @@ test "lower: unwrap_err on a payload-carrying error reaches the runtime Result m
     );
 }
 
-test "lower: unwrap_err on a borrowed tagged Result dereferences the receiver" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const source = try unwrapErrFixtureSource(alloc, .payload_error, true, 0);
-    defer std.testing.allocator.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, ".*.unwrap_err()") != null);
-}
-
 // The negative that keeps the widening honest: a `Result` that really does
 // lower to a Zig error union has no error value, so `unwrap_err` stays
 // unrecognized there and must not reach the runtime Result method.
@@ -11188,6 +11744,421 @@ test "lower: collect on a receiver that is not an iterator is not the collector"
     );
 }
 
+// ── A turbofished trait-method call ─────────────────────────────────────────
+
+/// Which declaration the turbofish of a `.encode_hex::<String>()` call is
+/// checked against.
+///
+/// Every arm writes the SAME call — the same receiver, the same one-element
+/// turbofish — so the acceptance and the two refusals below differ only in
+/// what the callee declares. Nothing else moves.
+const TurbofishCallee = enum {
+    /// `trait ToHex { fn encode_hex<Out: FromIterator<char>>(&self) -> Out; }`
+    /// reached through the trait's `.method_ref`: a call-site reference with
+    /// no body of its own, whose signature lives on the trait that declares
+    /// it. hex/src/lib.rs:76 arrives in exactly this shape.
+    trait_method,
+    /// The same trait, its method declared with NO type parameter. The source
+    /// then names one where the callee takes none, which rustc refuses as
+    /// E0107 and so must this.
+    callee_takes_none,
+    /// A `.method_ref` no entity in the crate declares — the shape
+    /// `resolveMethods` deliberately leaves a standard-library method in.
+    /// There is no arity to check it against and none is owed.
+    undeclared,
+};
+
+/// `struct Bytes;` beside
+/// `trait ToHex { fn encode_hex<Out>(&self) -> Out; }` and
+/// `impl ToHex for Bytes`, with `fn render(x: &Bytes)` whose only statement
+/// is `x.encode_hex::<String>()`.
+///
+/// The receiver is a declared type rather than a literal, so the blanket-impl
+/// dispatch stays out of the way and the arity the callee is checked against is
+/// the one read off the `.method_ref`'s OWN owner. That is the shape whose
+/// count the backend used to answer as zero whatever the trait declared, which
+/// refused the call over a count `ir.validate` had already read as one.
+fn lowerTraitTurbofishFixture(
+    alloc: std.mem.Allocator,
+    callee: TurbofishCallee,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const trait_id = try addLowerEntity(&graph, .trait_, "ToHex", root);
+    const bytes_id = try addLowerEntity(&graph, .struct_, "Bytes", root);
+    const impl_id = try addLowerEntity(&graph, .impl_, "ToHex for Bytes", bytes_id);
+    const impl_fn_id = try addLowerEntity(&graph, .fn_, "encode_hex", impl_id);
+    const caller_id = try addLowerEntity(&graph, .fn_, "render", root);
+    const value_field = try addLowerEntity(&graph, .field, "x", caller_id);
+    const method_ref_id = try addLowerEntity(&graph, .method_ref, "encode_hex", switch (callee) {
+        .trait_method, .callee_takes_none => trait_id,
+        // Owned by the callable the call is written in, which declares no
+        // method of that name: nothing in this crate declares the callee.
+        .undeclared => caller_id,
+    });
+
+    // `addBareCrate` parents nothing itself, so the module items are named
+    // here. The impl's own `fn` is not one of them: it belongs to the impl,
+    // and the impl belongs to `Bytes`.
+    try addBareCrate(&graph, alloc, "trait_turbofish", root, &.{
+        trait_id,
+        bytes_id,
+        impl_id,
+        caller_id,
+    });
+
+    // 0: `Bytes`, 1: `&Bytes`, 2: the `String` the turbofish names,
+    // 3: `Out`, 4: unit for the impl's own body.
+    const bytes_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "Bytes", .id = bytes_id }},
+    ) } };
+    const bytes_ref: ir.types.Type = .{ .reference = &.{ .mut = false, .pointee = bytes_ty } };
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const out_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "Out", .id = null }},
+    ) } };
+    const types = [_]ir.types.Type{
+        bytes_ty,
+        bytes_ref,
+        string_ty,
+        out_ty,
+        .{ .prim = .unit },
+    };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+
+    // The trait holds the signature the `.method_ref` names; a `.method_ref`
+    // body is `.none` by construction, so this list is the only place the
+    // callee's arity is written down.
+    body_rows[trait_id] = .{ .trait_ = .{
+        .name = "ToHex",
+        .methods = try alloc.dupe(ir.bodies.TraitMethodSig, &.{.{
+            .name = "encode_hex",
+            .ret = out_ty,
+            .generic_params = if (callee == .callee_takes_none)
+                &.{}
+            else
+                try alloc.dupe([]const u8, &.{"Out"}),
+        }}),
+    } };
+    body_rows[bytes_id] = .{ .struct_ = .{ .layout = .unit } };
+    body_rows[impl_id] = .{ .impl_ = .{
+        .self_ty = bytes_ty,
+        .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = trait_id }} },
+        .assoc_items = &.{impl_fn_id},
+    } };
+
+    const unit_expr = try typedExpr(&model, 4, .{ .unit = {} });
+    const impl_body = try typedExpr(&model, 4, .{ .block = .{
+        .statements = &.{},
+        .tail = unit_expr,
+        .labelled = null,
+    } });
+    body_rows[impl_fn_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "self", .ty = bytes_ref, .span = span },
+        }),
+        .ret = out_ty,
+        .generic_params = if (callee == .callee_takes_none)
+            &.{}
+        else
+            try alloc.dupe([]const u8, &.{"Out"}),
+        .body = impl_body,
+        .is_allocating = false,
+    } };
+
+    const receiver = try typedExpr(&model, 1, .{ .path = .{
+        .def = value_field,
+        .generic_args = &.{},
+    } });
+    const call = try typedExpr(&model, 2, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .value,
+        .method = method_ref_id,
+        .generic_args = try alloc.dupe(ir.types.Type, &.{string_ty}),
+        .args = &.{},
+    } });
+    const caller_body = try typedExpr(&model, 2, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+    body_rows[caller_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "x", .ty = bytes_ref, .span = span },
+        }),
+        .ret = string_ty,
+        .body = caller_body,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "trait_turbofish",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The call `function` is written as, read back through whatever block and
+/// `try` the lowering wrapped it in on the way out.
+fn turbofishCall(file: ast.File, function: []const u8) !ast.Call {
+    for (file.decls) |decl| {
+        const fn_decl = switch (decl) {
+            .fn_decl => |value| value,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, fn_decl.name, function)) continue;
+        const body = fn_decl.body orelse return error.ExpectedTurbofishCallee;
+        return unwrapTurbofishCall((body.expr orelse return error.ExpectedTurbofishCallee).*);
+    }
+    return error.ExpectedTurbofishCallee;
+}
+
+fn unwrapTurbofishCall(expr: ast.Expr) !ast.Call {
+    var current = expr;
+    for (0..8) |_| {
+        switch (current) {
+            .block => |block| current = (block.expr orelse return error.ExpectedTurbofishCallee).*,
+            .unary_op => |unary_op| if (unary_op.op == .try_op) {
+                current = unary_op.operand.*;
+            } else return error.ExpectedTurbofishCallee,
+            .call => |call| return call,
+            else => return error.ExpectedTurbofishCallee,
+        }
+    }
+    return error.ExpectedTurbofishCallee;
+}
+
+// The source wrote one type argument and the callee declares one parameter,
+// so the emitted call carries exactly that one — in the callee's own
+// declaration order, which for a single parameter is the only order there is.
+// A backend that answered the `.method_ref`'s arity as zero would refuse the
+// crate here, before anything reached the emitted call at all.
+test "lower: a turbofished trait-method call keeps the argument the source named" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const package = try lowerTraitTurbofishFixture(alloc, .trait_method);
+    const call = try turbofishCall(package.files[0], "render");
+    try std.testing.expectEqual(@as(usize, 1), call.generic_args.len);
+    if (call.generic_args[0] != .named) return error.ExpectedTurbofishArgument;
+    try std.testing.expectEqualStrings("r2z.alloc.String", call.generic_args[0].named);
+}
+
+// The contract above must not become a blanket accept. `x.encode_hex::<String>()`
+// over a trait whose `encode_hex` declares no type parameter names one where
+// the callee takes none, and the lowering has to refuse rather than emit a
+// call with an argument the declaration never named.
+test "lower: a turbofish naming a parameter the trait method does not declare is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try std.testing.expectError(
+        error.GenericArgumentArityMismatch,
+        lowerTraitTurbofishFixture(alloc, .callee_takes_none),
+    );
+}
+
+// And a `.method_ref` this crate declares nothing for is the standard-library
+// shape: there is no arity to check it against and none is owed, so the count
+// stays zero and the same mismatch is still refused.
+test "lower: a turbofish on a method this crate does not declare is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try std.testing.expectError(
+        error.GenericArgumentArityMismatch,
+        lowerTraitTurbofishFixture(alloc, .undeclared),
+    );
+}
+
+/// `[0x66, 0x6f].encode_hex::<String>()` over
+/// `impl<T: AsRef<[u8]>> ToHex for T { fn encode_hex<Out>(&self) -> Out }`,
+/// which is hex/src/lib.rs:516 inside the blanket impl at :137.
+///
+/// The receiver is an UNSUFFIXED array literal, so inference has already
+/// written down `[2]i32` by the time the lowering reads it. That `i32` is the
+/// fallback Rust applies before any context can pin an element type, not a
+/// choice the source made: the bound's `u8` is what types the self type, the
+/// literal's own length is what sizes it, and the source's turbofish is what
+/// types the method's one parameter.
+fn lowerBlanketTurbofishFixture(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const trait_id = try addLowerEntity(&graph, .trait_, "ToHex", root);
+    const impl_id = try addLowerEntity(&graph, .impl_, "ToHex for T", root);
+    const impl_fn_id = try addLowerEntity(&graph, .fn_, "encode_hex", impl_id);
+    const caller_id = try addLowerEntity(&graph, .fn_, "render", root);
+    const method_ref_id = try addLowerEntity(&graph, .method_ref, "encode_hex", trait_id);
+
+    try addBareCrate(&graph, alloc, "blanket_turbofish", root, &.{
+        trait_id,
+        impl_id,
+        caller_id,
+    });
+
+    // 0: the `[2]i32` inference leaves on an unsuffixed literal, 1: the
+    // `String` the turbofish names, 2: `T`, 3: `Out`, 4: unit.
+    const fallback_array = ir.types.Array{
+        .elem = .{ .prim = .i32 },
+        .len = .{ .literal = 2 },
+    };
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const self_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "T", .id = null }},
+    ) } };
+    const out_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "Out", .id = null }},
+    ) } };
+    const types = [_]ir.types.Type{
+        .{ .array = &fallback_array },
+        string_ty,
+        self_ty,
+        out_ty,
+        .{ .prim = .unit },
+    };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+
+    body_rows[trait_id] = .{ .trait_ = .{
+        .name = "ToHex",
+        .methods = try alloc.dupe(ir.bodies.TraitMethodSig, &.{.{
+            .name = "encode_hex",
+            .ret = out_ty,
+            .generic_params = try alloc.dupe([]const u8, &.{"Out"}),
+        }}),
+    } };
+
+    // `T: AsRef<[u8]>` is the DECLARED bound, and the element type of the
+    // concrete self type is read from it rather than from the magnitudes of
+    // the values at the call site.
+    const bound_slice: ir.types.Type = .{ .slice = try alloc.create(ir.types.Slice) };
+    @constCast(bound_slice.slice).* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    body_rows[impl_id] = .{ .impl_ = .{
+        .self_ty = self_ty,
+        .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = trait_id }} },
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "T",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = &.{
+                .{ .name = "core", .id = null },
+                .{ .name = "convert", .id = null },
+                .{ .name = "AsRef", .id = null },
+            } }, .args = &.{bound_slice} }}),
+        } }}), .where_clauses = &.{} },
+        .assoc_items = &.{impl_fn_id},
+    } };
+
+    const unit_expr = try typedExpr(&model, 4, .{ .unit = {} });
+    const impl_body = try typedExpr(&model, 4, .{ .block = .{
+        .statements = &.{},
+        .tail = unit_expr,
+        .labelled = null,
+    } });
+    const self_ref: ir.types.Type = .{ .reference = try alloc.create(ir.types.Ref) };
+    @constCast(self_ref.reference).* = .{ .mut = false, .pointee = self_ty };
+    body_rows[impl_fn_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "self", .ty = self_ref, .span = span },
+        }),
+        .ret = out_ty,
+        .generic_params = try alloc.dupe([]const u8, &.{"Out"}),
+        .body = impl_body,
+        .is_allocating = false,
+    } };
+
+    const elements = try alloc.dupe(ir.exprs.NodeId, &.{
+        try model.e(litInt(0x66)),
+        try model.e(litInt(0x6f)),
+    });
+    const receiver = try typedExpr(&model, 0, .{ .array = .{
+        .elements = elements,
+        .repeat = null,
+    } });
+    const call = try typedExpr(&model, 1, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .value,
+        .method = method_ref_id,
+        .generic_args = try alloc.dupe(ir.types.Type, &.{string_ty}),
+        .args = &.{},
+    } });
+    const caller_body = try typedExpr(&model, 1, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+    body_rows[caller_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = string_ty,
+        .body = caller_body,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "blanket_turbofish",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// A blanket impl's method is hoisted as a free function carrying the impl's
+// own `T` and then the method's own parameters, and the receiver the call
+// passes is the SELF type — `[2]u8`, the bound's element with the literal's
+// own length. Both halves of that are load-bearing: a self type read off the
+// `i32` fallback would make the binding the call reads the receiver back
+// through a `[2]i32` the callee's `*const T` never accepts.
+test "lower: a blanket turbofished call types its receiver from the declared bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const package = try lowerBlanketTurbofishFixture(alloc);
+    const call = try turbofishCall(package.files[0], "render");
+    // The impl's inherited `T` leads, the method's own parameter follows, and
+    // the source named `String` for the second.
+    try std.testing.expectEqual(@as(usize, 2), call.generic_args.len);
+    if (call.generic_args[0] != .array) return error.ExpectedBlanketSelfType;
+    try std.testing.expectEqual(@as(u64, 2), call.generic_args[0].array.len);
+    if (call.generic_args[0].array.elem.* != .prim) return error.ExpectedBlanketSelfType;
+    try std.testing.expectEqual(ast.Prim.u8, call.generic_args[0].array.elem.*.prim);
+    if (call.generic_args[1] != .named) return error.ExpectedTurbofishArgument;
+    try std.testing.expectEqualStrings("r2z.alloc.String", call.generic_args[1].named);
+}
+
 // A blanket `impl<T: AsRef<[u8]>> ToHex for T` has no concrete self type, so
 // the frontend gives the impl the enclosing module as its target. Its methods
 // hoist onto that module and are emitted as free functions taking
@@ -11329,15 +12300,17 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
     // call site — an unsuffixed literal has no type until context fixes one.
     const bound_slice: ir.types.Type = .{ .slice = try alloc.create(ir.types.Slice) };
     @constCast(bound_slice.slice).* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    // The parameter record and its bounds are arena-owned: the lowering reads
+    // both out of the body row long after this literal's own storage is gone.
     const generics = ir.types.Generics{
-        .params = &.{.{ .type_ = .{
+        .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
             .name = "T",
-            .bounds = &.{.{ .path = .{ .segments = &.{
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = &.{
                 .{ .name = "core", .id = null },
                 .{ .name = "convert", .id = null },
                 .{ .name = "AsRef", .id = null },
-            } }, .args = &.{bound_slice} }},
-        } }},
+            } }, .args = &.{bound_slice} }}),
+        } }}),
         .where_clauses = &.{},
     };
     model.bodies.items[impl_id] = .{ .impl_ = .{
@@ -11619,91 +12592,6 @@ test "lower: every shift spelling narrows its amount to the Zig shift type" {
     try std.testing.expect(std.mem.indexOf(u8, source, "a << @intCast(y)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "a >> @intCast(y)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "x <<= @intCast(y)") != null);
-}
-
-// ── FIX H: a tuple-carrying variant is a value of its union ─────────────────
-
-test "lower: a tuple-carrying variant used as a value names its union" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    const root_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .module,
-        .name = "",
-        .span = span,
-        .visibility = .public,
-        .parent = null,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    const enum_id = try addLowerEntity(&graph, .enum_, "Kind", root_id);
-    const fn_id = try addLowerEntity(&graph, .fn_, "run", root_id);
-    try addBareCrate(&graph, alloc, "tuple_variant", root_id, &.{ enum_id, fn_id });
-
-    const u32_ty: ir.types.Type = .{ .prim = .u32 };
-    const segments = try alloc.alloc(ir.types.PathSegment, 1);
-    segments[0] = .{ .name = "Kind", .id = enum_id };
-    const kind_ty: ir.types.Type = .{ .path = .{ .segments = segments } };
-    const types = [_]ir.types.Type{ kind_ty, u32_ty };
-
-    var model = Model.init(alloc);
-    // `Kind::A(7)` — the variant carries a payload, so it is a union value
-    // rather than a bare name.
-    const payload = try model.e(litInt(7));
-    model.exprs.items[payload].ty = 2;
-    const tuple_fields = try alloc.alloc(ir.exprs.NodeId, 1);
-    tuple_fields[0] = payload;
-    const variant_expr = try model.e(.{ .enum_variant = .{
-        .def = enum_id,
-        .variant = "A",
-        .tuple_fields = tuple_fields,
-        .named_fields = &.{},
-    } });
-    model.exprs.items[variant_expr].ty = 1;
-    const ret_expr = try model.e(.{ .return_ = .{ .value = variant_expr } });
-    model.exprs.items[ret_expr].ty = 1;
-
-    const variant_rows = try alloc.alloc(ir.items.Variant, 1);
-    const variant_payload = try alloc.alloc(ir.types.Type, 1);
-    variant_payload[0] = u32_ty;
-    variant_rows[0] = .{
-        .name = "A",
-        .fields = .{ .tuple = variant_payload },
-        .discriminant = null,
-    };
-    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
-    for (body_rows) |*row| row.* = .none;
-    body_rows[enum_id] = .{ .enum_ = .{ .kind = .data, .variants = variant_rows } };
-    body_rows[fn_id] = .{ .fn_ = .{
-        .params = &.{},
-        .ret = kind_ty,
-        .generic_params = &.{},
-        .body = ret_expr,
-        .is_allocating = false,
-    } };
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "tuple_variant",
-        .edition = "2021",
-        .graph = graph,
-        .types = &.{},
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(alloc),
-            .stmts = try model.stmts.toOwnedSlice(alloc),
-            .pats = try model.pats.toOwnedSlice(alloc),
-            .types = &types,
-            .bodies = body_rows,
-        },
-    };
-
-    // The union names the variant as its single field, so the value has to
-    // carry the payload into `Kind{ .A = ... }`. A bare `A` names nothing.
-    const source = try emitRootSource(alloc, &rust_ir);
-    try std.testing.expect(std.mem.indexOf(u8, source, "return Kind{ .A = 7 };") != null);
 }
 
 // ── FIX I: indexing a lowered `Vec` reaches its storage ─────────────────────
@@ -12451,169 +13339,6 @@ test "lower: a binding a local closure captures by mutable reference stays a var
     const source = try emitRootSource(alloc, &rust_ir);
     try std.testing.expect(std.mem.indexOf(u8, source, "var t: u32 = a;") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "const t: u32 = a;") == null);
-}
-
-test "lower: a move closure capturing a local leaves the enclosing reassignment emitted" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    const root_id = try graph.symbol_table.add(.{
-        .id = 0,
-        .kind = .module,
-        .name = "",
-        .span = span,
-        .visibility = .public,
-        .parent = null,
-        .resolved = null,
-        .renamed_to = null,
-        .attributes = &.{},
-    });
-    const base_def = try addLowerEntity(&graph, .const_, "base", root_id);
-    const captured_def = try addLowerEntity(&graph, .const_, "captured", root_id);
-    const add_def = try addLowerEntity(&graph, .const_, "add", root_id);
-    const outer_fn = try addLowerEntity(&graph, .fn_, "outer", root_id);
-    try addBareCrate(&graph, alloc, "move_closure_capture", root_id, &.{outer_fn});
-
-    const u32_ty: ir.types.Type = .{ .prim = .u32 };
-    const types = [_]ir.types.Type{u32_ty};
-    var model = Model.init(alloc);
-
-    // `let mut captured = base; let add = move |x: u32| x + captured;
-    //  captured = 20; add(value) + captured`
-    //
-    // A `move` closure takes the captured value by value, so the closure body
-    // reads the `__r2z_capture_*` snapshot and never the enclosing binding.
-    // The only assignment to `captured` is the one in this block, and it has
-    // to be emitted: without it the local is a `var` nothing writes and Zig
-    // rejects the generated function.
-    const closure_captures = [_]ir.exprs.Capture{.{
-        .name = "captured",
-        .mode = .by_value,
-        .ty = 0,
-    }};
-    const param_x = try model.pat(.{ .binding = .{
-        .name = "x",
-        .mode = .value,
-        .mutable = false,
-    } });
-    const closure_param_ref = try model.e(.{ .path = .{ .def = add_def, .generic_args = &.{} } });
-    model.exprs.items[closure_param_ref].ty = 0;
-    const captured_in_closure = try model.e(.{ .path = .{ .def = captured_def, .generic_args = &.{} } });
-    model.exprs.items[captured_in_closure].ty = 0;
-    const closure_body_expr = try model.e(.{ .binary = .{
-        .op = .add,
-        .overflow = .checked,
-        .lhs = closure_param_ref,
-        .rhs = captured_in_closure,
-    } });
-    model.exprs.items[closure_body_expr].ty = 0;
-    const closure = try model.e(.{ .closure = .{
-        .captures = &closure_captures,
-        .params = &.{param_x},
-        .return_ty = 0,
-        .body = .{ .statements = &.{}, .tail = closure_body_expr, .labelled = null },
-        .trait = .@"fn",
-    } });
-    model.exprs.items[closure].ty = 0;
-
-    const bind_captured = try model.pat(.{ .binding = .{
-        .name = "captured",
-        .mode = .value,
-        .mutable = true,
-    } });
-    const init_captured = try model.e(.{ .path = .{ .def = base_def, .generic_args = &.{} } });
-    model.exprs.items[init_captured].ty = 0;
-    const let_captured = try model.stmt(.{ .let = .{
-        .pattern = bind_captured,
-        .init = init_captured,
-        .ty = null,
-    } });
-    const bind_add = try model.pat(.{ .binding = .{
-        .name = "add",
-        .mode = .value,
-        .mutable = false,
-    } });
-    const let_add = try model.stmt(.{ .let = .{
-        .pattern = bind_add,
-        .init = closure,
-        .ty = null,
-    } });
-
-    // `captured = 20;`
-    const assign_target = try model.e(.{ .path = .{ .def = captured_def, .generic_args = &.{} } });
-    model.exprs.items[assign_target].ty = 0;
-    const twenty = try model.e(.{ .literal = .{ .int = .{
-        .text = "20",
-        .value = 20,
-        .base = .dec,
-        .ty_suffix = null,
-    } } });
-    model.exprs.items[twenty].ty = 0;
-    const assign_expr = try model.e(.{ .assign = .{
-        .target = assign_target,
-        .op = .plain,
-        .value = twenty,
-        .overflow = .checked,
-    } });
-    model.exprs.items[assign_expr].ty = null;
-    const assign_stmt = try model.stmt(.{ .expr = assign_expr });
-
-    // The tail reads `captured` back, so the value the assignment writes is
-    // the one the function returns.
-    const tail = try model.e(.{ .path = .{ .def = captured_def, .generic_args = &.{} } });
-    model.exprs.items[tail].ty = 0;
-
-    const outer_statements = try alloc.alloc(ir.exprs.NodeId, 3);
-    outer_statements[0] = let_captured;
-    outer_statements[1] = let_add;
-    outer_statements[2] = assign_stmt;
-    const body = try model.e(.{ .block = .{
-        .statements = outer_statements,
-        .tail = tail,
-        .labelled = null,
-    } });
-
-    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
-    for (body_rows) |*row| row.* = .none;
-    const params = try alloc.alloc(ir.items.Param, 1);
-    params[0] = .{ .name = "base", .ty = u32_ty, .span = span };
-    body_rows[outer_fn] = .{ .fn_ = .{
-        .params = params,
-        .ret = u32_ty,
-        .generic_params = &.{},
-        .body = body,
-        .is_allocating = false,
-    } };
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "move_closure_capture",
-        .edition = "2021",
-        .graph = graph,
-        .types = &.{},
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(alloc),
-            .stmts = try model.stmts.toOwnedSlice(alloc),
-            .pats = try model.pats.toOwnedSlice(alloc),
-            .types = &types,
-            .bodies = body_rows,
-        },
-    };
-
-    const source = try emitRootSource(alloc, &rust_ir);
-
-    // The `move` closure reads the snapshot, so the enclosing binding is only
-    // written by the assignment below and stays a `var`.
-    try std.testing.expect(std.mem.indexOf(u8, source, "var captured: u32 = base;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "const captured: u32 = base;") == null);
-    // The assignment is emitted, and the local is read after it.
-    try std.testing.expect(std.mem.indexOf(u8, source, "captured = 20;") != null);
-    const assignment = std.mem.indexOf(u8, source, "captured = 20;").?;
-    const read_back = std.mem.lastIndexOf(u8, source, "captured").?;
-    try std.testing.expect(read_back > assignment);
-    // The closure body reads the snapshot, not the enclosing binding.
-    try std.testing.expect(std.mem.indexOf(u8, source, "__r2z_capture_add_captured") != null);
 }
 
 test "lower: a move closure capturing a local that is never reassigned binds a const" {
@@ -13418,26 +14143,6 @@ test "lower: a guard runs after its own payload is bound and the arm's value lea
     try std.testing.expect(std.mem.indexOf(u8, source, "unreachable;") != null);
 }
 
-test "lower: a false match guard leaves the arm and the arm behind it gets its turn" {
-    const source = try guardFixtureSource(.plain);
-    defer std.testing.allocator.free(source);
-    const label = try guardChainLabel(source);
-
-    // One dispatch per arm, in source order, and each carries its own value out
-    // of the same block. The literal selector cannot cover what follows it, so
-    // its dispatch steps past itself instead of swallowing the catch-all.
-    try std.testing.expectEqual(@as(usize, 2), countOccurrences(source, "switch ("));
-    var buf: [128]u8 = undefined;
-    const guarded = std.mem.indexOf(u8, source, try guardExit(&buf, label, "1")) orelse
-        return error.MissingGuardedArm;
-    buf = undefined;
-    const fallback = std.mem.indexOf(u8, source, try guardExit(&buf, label, "2")) orelse
-        return error.MissingFallbackArm;
-    try std.testing.expect(guarded < fallback);
-    try std.testing.expect(std.mem.indexOf(u8, source, "if (x == 0)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "unreachable;") != null);
-}
-
 // ── The ordered chain: one dispatch per arm, in a labeled value block ────
 
 /// The shapes that each break the ordered chain a different way.
@@ -13658,96 +14363,6 @@ fn buildGuardSceneSource(alloc: std.mem.Allocator, scene: GuardScene) ![]const u
     return emitRootSource(alloc, &rust_ir);
 }
 
-test "lower: a guarded match reads its scrutinee once and every dispatch reads the same value" {
-    const source = try guardSceneSource(.field_place);
-    defer std.testing.allocator.free(source);
-    const label = try guardChainLabel(source);
-
-    // One read of the place, whatever the number of dispatches: the scrutinee
-    // is bound ahead of the chain instead of being re-evaluated per arm.
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(source, "p.value"));
-    // Both dispatches name that one binding, and both leave through the chain's
-    // own label, so the fall-through reads what the first dispatch read.
-    try std.testing.expectEqual(@as(usize, 2), countOccurrences(source, "switch ("));
-    var buf: [128]u8 = undefined;
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        countOccurrences(source, try guardExitPrefix(&buf, label)),
-    );
-}
-
-test "lower: a reference capture keeps reading the source's own storage" {
-    const source = try guardSceneSource(.ref_capture);
-    defer std.testing.allocator.free(source);
-    const label = try guardChainLabel(source);
-
-    // The place is taken by address, and taken once. A copy would still read
-    // the place a single time, but the capture would then point into storage
-    // the source never sees.
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(source, "p.value"));
-    try std.testing.expect(std.mem.indexOf(u8, source, "&p.value") != null);
-    // The capture is still a pointer capture, so `v` names the matched value in
-    // the place the dispatches read, and the arm yields what it points at.
-    try std.testing.expect(std.mem.indexOf(u8, source, "|*v|") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "v.*") != null);
-    var buf: [128]u8 = undefined;
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        countOccurrences(source, try guardExitPrefix(&buf, label)),
-    );
-}
-
-test "lower: a repeated guarded selector leaves the arm behind it reachable" {
-    const source = try guardSceneSource(.repeated_selector);
-    defer std.testing.allocator.free(source);
-    const label = try guardChainLabel(source);
-
-    // The guarded arm and the plain arm behind it carry the same literal, so
-    // neither may swallow the other: three dispatches, each a selector of its
-    // own, each yielding its own value in the order Rust lists them.
-    try std.testing.expectEqual(@as(usize, 3), countOccurrences(source, "switch ("));
-    var buf: [128]u8 = undefined;
-    const guarded = std.mem.indexOf(u8, source, try guardExit(&buf, label, "10")) orelse
-        return error.MissingGuardedArm;
-    buf = undefined;
-    const repeated = std.mem.indexOf(u8, source, try guardExit(&buf, label, "11")) orelse
-        return error.MissingRepeatedArm;
-    buf = undefined;
-    const catch_all = std.mem.indexOf(u8, source, try guardExit(&buf, label, "12")) orelse
-        return error.MissingCatchAllArm;
-    try std.testing.expect(guarded < repeated);
-    try std.testing.expect(repeated < catch_all);
-    // The guard is still there: a false one is the only way the arm behind it
-    // gets its turn, so dropping it would hand the guarded arm every value.
-    try std.testing.expect(std.mem.indexOf(u8, source, "if (x == 1)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "unreachable;") != null);
-}
-
-test "lower: a constant guard still decides the arm and a constant scrutinee is still read once" {
-    const source = try guardSceneSource(.constant);
-    defer std.testing.allocator.free(source);
-    const label = try guardChainLabel(source);
-
-    // `if (false)` is the whole reason the second `7` arm runs, so it may not be
-    // folded away and may not be dropped: either would change which arm the
-    // scrutinee reaches.
-    try std.testing.expect(std.mem.indexOf(u8, source, "if (false)") != null);
-    try std.testing.expectEqual(@as(usize, 3), countOccurrences(source, "switch ("));
-    var buf: [128]u8 = undefined;
-    const guarded = std.mem.indexOf(u8, source, try guardExit(&buf, label, "10")) orelse
-        return error.MissingGuardedArm;
-    buf = undefined;
-    const repeated = std.mem.indexOf(u8, source, try guardExit(&buf, label, "11")) orelse
-        return error.MissingRepeatedArm;
-    buf = undefined;
-    const catch_all = std.mem.indexOf(u8, source, try guardExit(&buf, label, "12")) orelse
-        return error.MissingCatchAllArm;
-    try std.testing.expect(guarded < repeated);
-    try std.testing.expect(repeated < catch_all);
-    // A literal scrutinee is no exception: one binding, three dispatches.
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(source, "= 7;"));
-}
-
 test "lower: a break or continue in an arm body leaves the source loop, not the chain" {
     const source = try guardSceneSource(.nested_exit);
     defer std.testing.allocator.free(source);
@@ -13770,204 +14385,6 @@ test "lower: a break or continue in an arm body leaves the source loop, not the 
     try std.testing.expect(
         std.mem.indexOf(u8, source, try guardExit(&buf, label, "9")) != null,
     );
-}
-
-/// `match values[next_index(&mut index)] { Some(ref mut v) if (*v) == 0 => { *v = 5; *v }, _ => 0 }`
-///
-/// The index is a call, so reading the place has a side effect of its own, and
-/// the capture is a mutable reference, so the write in the guarded arm has to
-/// land in the slice element the source named. A chain that copied the element
-/// would read the place just as once and still swallow the write.
-fn indexedRefPlaceIr(alloc: std.mem.Allocator) !ir.RustIr {
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-    const slot_id = try addLowerEntity(&graph, .enum_, "Slot", null);
-    const some_id = try addLowerEntity(&graph, .variant, "Some", null);
-    const v_def = try addLowerEntity(&graph, .const_, "v", null);
-    const next_id = try addLowerEntity(&graph, .fn_, "next_index", null);
-    const classify_id = try addLowerEntity(&graph, .fn_, "classify", null);
-    const values_def = try addLowerEntity(&graph, .field, "values", classify_id);
-    const index_def = try addLowerEntity(&graph, .field, "index", classify_id);
-    _ = try addRootModule(&graph, .{
-        .crate_name = "indexed_ref_place",
-        .edition = 2021,
-        .items = &.{ slot_id, next_id, classify_id },
-    });
-
-    const u64_ty: ir.types.Type = .{ .prim = .u64 };
-    const bool_ty: ir.types.Type = .{ .prim = .bool };
-    const usize_ty: ir.types.Type = .{ .prim = .usize };
-    // Both arrays outlive this frame: the IR below returns them, and a stack
-    // slice read after the frame is gone is a wild pointer, not a type.
-    const slot_segments = try alloc.alloc(ir.types.PathSegment, 1);
-    slot_segments[0] = .{ .name = "Slot", .id = slot_id };
-    const slot_ty: ir.types.Type = .{ .path = .{ .segments = slot_segments } };
-    const slot_slice = try alloc.create(ir.types.Slice);
-    slot_slice.* = .{ .const_ = false, .elem = slot_ty };
-    const values_box = try alloc.create(ir.types.Ref);
-    values_box.* = .{ .mut = true, .pointee = .{ .slice = slot_slice } };
-    const index_box = try alloc.create(ir.types.Ref);
-    index_box.* = .{ .mut = true, .pointee = usize_ty };
-    const values_ty: ir.types.Type = .{ .reference = values_box };
-    const index_ty: ir.types.Type = .{ .reference = index_box };
-    // 0 = u64, 1 = bool, 2 = usize, 3 = Slot, 4 = `&mut [Slot]`, 5 = `&mut usize`.
-    const types = try alloc.alloc(ir.types.Type, 6);
-    @memcpy(types, &[_]ir.types.Type{ u64_ty, bool_ty, usize_ty, slot_ty, values_ty, index_ty });
-
-    // `values[next_index(&mut index)]`. The index is a call that borrows
-    // `index` mutably, so evaluating the place is not free.
-    const values_path = try model.e(.{ .path = .{ .def = values_def, .generic_args = &.{} } });
-    model.exprs.items[values_path].ty = 4;
-    const index_path = try model.e(.{ .path = .{ .def = index_def, .generic_args = &.{} } });
-    model.exprs.items[index_path].ty = 5;
-    const index_borrow = try model.e(.{ .unary = .{
-        .op = .{ .ref = .mutable },
-        .operand = index_path,
-    } });
-    model.exprs.items[index_borrow].ty = 5;
-    const borrow_args = try alloc.alloc(ir.exprs.NodeId, 1);
-    borrow_args[0] = index_borrow;
-    const next_call = try model.e(.{ .call = .{
-        .call_kind = .{ .free = next_id },
-        .args = borrow_args,
-    } });
-    model.exprs.items[next_call].ty = 2;
-    const scrutinee = try model.e(.{ .index = .{ .base = values_path, .index = next_call } });
-    model.exprs.items[scrutinee].ty = 3;
-
-    // `Some(ref mut v)`: the only pattern shape that yields a by-reference
-    // capture, and a mutable one is the only kind that can be written through.
-    const mut_binding = try model.pat(.{ .binding = .{
-        .name = "v",
-        .mode = .mut_ref,
-        .mutable = true,
-    } });
-    const some_fields = try alloc.alloc(ir.exprs.FieldPat, 1);
-    some_fields[0] = .{ .field = "0", .pat = mut_binding, .shorthand = false };
-    const some_pattern = try model.pat(.{ .struct_pat = .{
-        .def = some_id,
-        .fields = some_fields,
-        .rest = false,
-    } });
-    const any_pattern = try model.pat(.wildcard);
-
-    // `if (*v) == 0 { *v = 5; *v }`.
-    const v_path = try model.e(.{ .path = .{ .def = v_def, .generic_args = &.{} } });
-    model.exprs.items[v_path].ty = 0;
-    const v_pointee = try model.e(.{ .unary = .{ .op = .deref, .operand = v_path } });
-    model.exprs.items[v_pointee].ty = 0;
-    const guard = try typedEq(&model, v_pointee, try typedInt(&model, 0, 0));
-    const write = try model.e(.{ .assign = .{
-        .target = v_pointee,
-        .op = .plain,
-        .value = try typedInt(&model, 5, 0),
-        .overflow = .wrapping,
-    } });
-    model.exprs.items[write].ty = 0;
-    const write_stmts = try alloc.alloc(ir.exprs.NodeId, 1);
-    write_stmts[0] = try model.stmt(.{ .expr = write });
-    const guarded_body = try model.e(.{ .block = .{
-        .statements = write_stmts,
-        .tail = v_pointee,
-        .labelled = null,
-    } });
-    model.exprs.items[guarded_body].ty = 0;
-
-    const ir_arms = try alloc.alloc(ir.exprs.MatchArm, 2);
-    ir_arms[0] = .{
-        .patterns = try oneSelector(alloc, some_pattern),
-        .guard = guard,
-        .body = guarded_body,
-    };
-    ir_arms[1] = .{
-        .patterns = try oneSelector(alloc, any_pattern),
-        .guard = null,
-        .body = try typedInt(&model, 0, 0),
-    };
-    const match_expr = try model.e(.{ .match = .{
-        .scrutinee = scrutinee,
-        .arms = ir_arms,
-        .option_scrutinee = false,
-    } });
-    model.exprs.items[match_expr].ty = 0;
-    const classify_body = try model.e(.{ .block = .{
-        .statements = &.{},
-        .tail = match_expr,
-        .labelled = null,
-    } });
-
-    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
-    for (body_rows) |*row| row.* = .none;
-    const variants = try alloc.alloc(ir.items.Variant, 1);
-    variants[0] = .{
-        .name = "Some",
-        .fields = .{ .tuple = &.{u64_ty} },
-        .discriminant = null,
-    };
-    body_rows[slot_id] = .{ .enum_ = .{ .kind = .data, .variants = variants } };
-    const next_params = try alloc.alloc(ir.items.Param, 1);
-    next_params[0] = .{ .name = "index", .ty = index_ty, .span = span };
-    body_rows[next_id] = .{ .fn_ = .{
-        .params = next_params,
-        .ret = usize_ty,
-        .generic_params = &.{},
-        .body = try typedInt(&model, 0, 2),
-        .is_allocating = false,
-    } };
-    const classify_params = try alloc.alloc(ir.items.Param, 2);
-    classify_params[0] = .{ .name = "values", .ty = values_ty, .span = span };
-    classify_params[1] = .{ .name = "index", .ty = index_ty, .span = span };
-    body_rows[classify_id] = .{ .fn_ = .{
-        .params = classify_params,
-        .ret = u64_ty,
-        .generic_params = &.{},
-        .body = classify_body,
-        .is_allocating = false,
-    } };
-
-    return .{
-        .crate_name = "indexed_ref_place",
-        .edition = "2021",
-        .graph = graph,
-        .types = types,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(alloc),
-            .stmts = try model.stmts.toOwnedSlice(alloc),
-            .pats = try model.pats.toOwnedSlice(alloc),
-            .types = types,
-            .bodies = body_rows,
-        },
-    };
-}
-
-test "lower: a reference capture through an indexed place writes the source element" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const rust_ir = try indexedRefPlaceIr(alloc);
-    // The arena dies with this frame, so the caller must own the text.
-    const source = try std.testing.allocator.dupe(u8, try emitRootSource(alloc, &rust_ir));
-    defer std.testing.allocator.free(source);
-    const label = try guardChainLabel(source);
-
-    // The place is aliased, and aliased once. Reading it twice would advance
-    // `index` twice and match a different element than the source did; a copy
-    // would read it once too, and the write below would land in the copy.
-    try std.testing.expect(std.mem.indexOf(u8, source, "&values[") != null);
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(source, "values["));
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(source, "next_index(&index)"));
-    // The capture is a pointer capture over that alias, so the guarded arm
-    // writes through it into the slice, and what the chain carries out is the
-    // element the write just reached.
-    try std.testing.expect(std.mem.indexOf(u8, source, "|*v|") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "v.* = 5;") != null);
-    var buf: [128]u8 = undefined;
-    try std.testing.expect(
-        std.mem.indexOf(u8, source, try guardExit(&buf, label, "v.*")) != null,
-    );
-    // The write sits inside the guard: a false guard reaches the arm behind it
-    // without touching the element.
-    try std.testing.expect(std.mem.indexOf(u8, source, "if (v.* == 0)") != null);
 }
 
 test "lower: a match without a guard keeps its plain switch shape" {
@@ -14354,191 +14771,6 @@ test "lower: a chained String receiver is bound to mutable storage before into_b
         std.mem.count(u8, lowered.source, "r2z.alloc.String.from_str("),
     );
     try std.testing.expect(std.mem.indexOf(u8, lowered.source, ").into_bytes()") == null);
-}
-
-test "lower: an owned String binding takes mutable storage for the transfer" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var entities = try StringReceiverEntities.init(alloc);
-    var model = Model.init(alloc);
-    const types = [_]ir.types.Type{entities.string_ty};
-
-    const text = try typedExpr(&model, null, .{ .literal = .{ .string = .{ .bytes = "foobar" } } });
-    const built = try typedExpr(&model, 0, .{ .core_call = .{
-        .function = .convert_from,
-        .generic_args = &.{entities.string_ty},
-        .args = &.{text},
-    } });
-    // `let s = String::from("foobar");` — immutable in the source, because
-    // `into_bytes` consumes it by value rather than through `&mut s`.
-    const pattern = try model.pat(.{ .binding = .{
-        .name = "s",
-        .mode = .value,
-        .mutable = false,
-    } });
-    const binding_stmt = try model.stmt(.{ .let = .{
-        .pattern = pattern,
-        .init = built,
-        .ty = null,
-    } });
-    const receiver = try typedExpr(&model, 0, .{ .path = .{
-        .def = entities.bound,
-        .generic_args = &.{},
-    } });
-    // `s.into_bytes()`
-    const consumed = try typedExpr(&model, null, .{ .method_call = .{
-        .receiver = receiver,
-        .receiver_mode = .value,
-        .method = entities.into_bytes,
-        .args = &.{},
-    } });
-
-    const lowered = try lowerStringReceiver(
-        alloc,
-        &entities,
-        &model,
-        &types,
-        &.{binding_stmt},
-        consumed,
-        entities.bytes_ty,
-    );
-
-    // The binding itself has to be `var`: `const` storage is what made Zig
-    // reject the call with "cast discards const qualifier".
-    try std.testing.expectEqual(@as(usize, 1), lowered.body.stmts.len);
-    const bound = switch (lowered.body.stmts[0]) {
-        .let_stmt => |value| value,
-        else => return error.ExpectedOwnedBinding,
-    };
-    try std.testing.expect(bound.is_mut);
-    try std.testing.expectEqualStrings("s", bound.name);
-    const bound_type = switch (bound.ty orelse return error.ExpectedReceiverType) {
-        .named => |ty| ty,
-        else => return error.ExpectedReceiverType,
-    };
-    try std.testing.expectEqualStrings("r2z.alloc.String", bound_type);
-
-    // The call stays on the binding. A by-value alias would copy the string and
-    // leave `s` holding an allocation the transfer already handed away.
-    const tail = lowered.body.expr orelse return error.ExpectedRenderTail;
-    const shape = try expectMethodCall(tail);
-    try std.testing.expectEqualStrings("into_bytes", shape.shape.method);
-    try std.testing.expectEqualStrings("s", shape.shape.receiver);
-    try std.testing.expect(std.mem.indexOf(u8, lowered.source, "__r2z_string_receiver") == null);
-}
-
-test "lower: a shared String method keeps the receiver it was given" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var entities = try StringReceiverEntities.init(alloc);
-    var model = Model.init(alloc);
-    const types = [_]ir.types.Type{entities.string_ty};
-
-    const text = try typedExpr(&model, null, .{ .literal = .{ .string = .{ .bytes = "foobar" } } });
-    const built = try typedExpr(&model, 0, .{ .core_call = .{
-        .function = .convert_from,
-        .generic_args = &.{entities.string_ty},
-        .args = &.{text},
-    } });
-    const pattern = try model.pat(.{ .binding = .{
-        .name = "s",
-        .mode = .value,
-        .mutable = false,
-    } });
-    const binding_stmt = try model.stmt(.{ .let = .{
-        .pattern = pattern,
-        .init = built,
-        .ty = null,
-    } });
-    const receiver = try typedExpr(&model, 0, .{ .path = .{
-        .def = entities.bound,
-        .generic_args = &.{},
-    } });
-    // `s.as_str()` — `r2z.alloc.String` spells that receiver
-    // `self: *const String`, so it needs no storage of its own.
-    const viewed = try typedExpr(&model, null, .{ .method_call = .{
-        .receiver = receiver,
-        .receiver_mode = .shared,
-        .method = entities.as_str,
-        .args = &.{},
-    } });
-
-    const lowered = try lowerStringReceiver(
-        alloc,
-        &entities,
-        &model,
-        &types,
-        &.{binding_stmt},
-        viewed,
-        entities.string_ty,
-    );
-
-    // No receiver prelude: the shared call is left exactly as it was written.
-    // The second statement is the binding's own scope release, which is what
-    // a local `String` gets when nothing takes it.
-    try std.testing.expectEqual(@as(usize, 2), lowered.body.stmts.len);
-    const tail = lowered.body.expr orelse return error.ExpectedRenderTail;
-    const shape = try expectMethodCall(tail);
-    try std.testing.expectEqualStrings("as_str", shape.shape.method);
-    try std.testing.expectEqualStrings("s", shape.shape.receiver);
-    try std.testing.expect(std.mem.indexOf(u8, lowered.source, "__r2z_string_receiver") == null);
-    try std.testing.expect(std.mem.indexOf(u8, lowered.source, "deinit(allocator)") != null);
-}
-
-test "lower: an owned String binding nothing transfers stays immutable" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var entities = try StringReceiverEntities.init(alloc);
-    var model = Model.init(alloc);
-    const types = [_]ir.types.Type{entities.string_ty};
-
-    const text = try typedExpr(&model, null, .{ .literal = .{ .string = .{ .bytes = "foobar" } } });
-    const built = try typedExpr(&model, 0, .{ .core_call = .{
-        .function = .convert_from,
-        .generic_args = &.{entities.string_ty},
-        .args = &.{text},
-    } });
-    const pattern = try model.pat(.{ .binding = .{
-        .name = "s",
-        .mode = .value,
-        .mutable = false,
-    } });
-    // `let s = String::from("foobar");` with nothing reaching `s` afterwards.
-    const binding_stmt = try model.stmt(.{ .let = .{
-        .pattern = pattern,
-        .init = built,
-        .ty = null,
-    } });
-    const unit = try typedExpr(&model, null, .unit);
-
-    const lowered = try lowerStringReceiver(
-        alloc,
-        &entities,
-        &model,
-        &types,
-        &.{binding_stmt},
-        unit,
-        .{ .prim = .unit },
-    );
-
-    // The mutable storage is only there for a transfer that happens. With
-    // none, the binding goes back to `const` instead of leaving a `var` that
-    // reads as a mutable owner nobody owns.
-    // The release that follows is the binding's own drop; it runs on an alias,
-    // so the binding itself stays the `const` the source wrote.
-    try std.testing.expectEqual(@as(usize, 2), lowered.body.stmts.len);
-    const bound = switch (lowered.body.stmts[0]) {
-        .let_stmt => |value| value,
-        else => return error.ExpectedOwnedBinding,
-    };
-    try std.testing.expect(!bound.is_mut);
-    try std.testing.expectEqualStrings("s", bound.name);
 }
 
 test "lower: a consuming String receiver in argument position transfers once" {
@@ -14997,83 +15229,10 @@ fn lowerBlanketWrapperFixture(
     return lower.lowerRustIr(alloc, &rust_ir, null);
 }
 
-// A generic wrapper that reaches a blanket impl's method must dispatch to the
-// hoisted free function, and it must do so whichever of the two declarations
-// the resolver attached to the call: the impl's own `fn`, or a synthesized
-// trait `.method_ref` parented to the trait the impl provides. Selecting that
-// branch on the entity's kind refused the `fn` half and left it emitting
-// `data.encode_hex(..)` as a Zig member call, which no `[]const u8` has a
-// field for.
-test "lower: a blanket impl method call dispatches to the hoisted function from either declaration" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    for ([_]BlanketCallShape{ .impl_fn, .trait_method_ref }) |call_shape| {
-        const pkg = try lowerBlanketWrapperFixture(alloc, call_shape, 0);
-
-        // The impl's own parameter leads the hoisted signature, then the
-        // method's, then the allocator the allocating method takes, then the
-        // receiver.
-        const hoisted = try findFnDecl(pkg.files[0], "encode_hex");
-        try std.testing.expectEqual(@as(usize, 4), hoisted.params.len);
-        try std.testing.expectEqualStrings("U", hoisted.params[0].name);
-        try std.testing.expect(hoisted.params[0].is_comptime);
-        try std.testing.expectEqualStrings("Out", hoisted.params[1].name);
-        try std.testing.expect(hoisted.params[1].is_comptime);
-        try std.testing.expectEqualStrings("allocator", hoisted.params[2].name);
-        try std.testing.expectEqualStrings("self", hoisted.params[3].name);
-        const receiver_ty = hoisted.params[3].ty;
-        if (receiver_ty != .ptr) return error.ExpectedReceiverPointer;
-        try std.testing.expect(receiver_ty.ptr.is_const);
-        try std.testing.expectEqualStrings("U", try expectNamedType(receiver_ty.ptr.elem.*));
-
-        // The wrapper is generic in the CALLER's `T`, and the hoisted call
-        // passes that `T` — not the impl's `U` — as the self type argument.
-        const wrapper = try findFnDecl(pkg.files[0], "encode");
-        try std.testing.expectEqual(@as(usize, 3), wrapper.params.len);
-        try std.testing.expectEqualStrings("T", wrapper.params[0].name);
-        try std.testing.expect(wrapper.params[0].is_comptime);
-        // The allocating method forces the wrapper to declare an allocator of
-        // its own, ahead of its value parameter.
-        try std.testing.expectEqualStrings("allocator", wrapper.params[1].name);
-        try std.testing.expectEqualStrings("data", wrapper.params[2].name);
-
-        const body = wrapper.body orelse return error.MissingWrapperBody;
-        const tail = body.expr orelse return error.MissingWrapperTail;
-        if (tail.* != .unary_op or tail.unary_op.op != .try_op) {
-            return error.ExpectedFallibleHoistedCall;
-        }
-        const call = tail.unary_op.operand.*;
-        if (call != .call) return error.ExpectedDirectHoistedCall;
-        // A Zig member call would carry the receiver as a `field_access`
-        // callee instead of naming the hoisted function.
-        try std.testing.expectEqualStrings("encode_hex", try expectIdent(call.call.callee.*));
-
-        const generic_args = call.call.generic_args;
-        try std.testing.expectEqual(@as(usize, 2), generic_args.len);
-        try std.testing.expectEqualStrings("T", try expectNamedType(generic_args[0]));
-        try std.testing.expectEqualStrings(
-            "r2z.alloc.String",
-            try expectNamedType(generic_args[1]),
-        );
-
-        // The allocator leads, then the receiver by address: the hoisted
-        // declaration puts it immediately before the first value parameter.
-        try std.testing.expectEqual(@as(usize, 2), call.call.args.len);
-        try std.testing.expectEqualStrings("allocator", try expectIdent(call.call.args[0]));
-        const receiver = call.call.args[1];
-        if (receiver != .unary_op or receiver.unary_op.op != .addr_of) {
-            return error.ExpectedAddressOfReceiver;
-        }
-        try std.testing.expectEqualStrings("data", try expectIdent(receiver.unary_op.operand.*));
-    }
-}
-
-// Two blanket impls of one trait provide `encode_hex` for the same receiver
-// shape, so the call names its method ambiguously. Dispatching either of them
-// would call a declaration the source never named.
-test "lower: two blanket impls of one trait leave the call undispatched" {
+// This deliberately hostile raw IR has overlapping blanket impls and an
+// unbounded caller parameter: it is not a program Rust would accept. The
+// backend must diagnose the ambiguity, never choose one source declaration.
+test "lower: overlapping blanket impl raw IR reports ambiguity without dispatch" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -15082,16 +15241,20 @@ test "lower: two blanket impls of one trait leave the call undispatched" {
 
     const wrapper = try findFnDecl(pkg.files[0], "encode");
     const body = wrapper.body orelse return error.MissingWrapperBody;
-    const tail = body.expr orelse return error.MissingWrapperTail;
-    const call = switch (tail.*) {
-        .unary_op => |unary| unary.operand.*,
-        else => tail.*,
-    };
-    if (call != .call) return error.ExpectedCall;
-    // No impl was chosen, so the call is still the receiver member call the
-    // general path emits — the shape the resolver refuses upstream.
-    if (call.call.callee.* != .field_access) return error.ExpectedUndispatchedCall;
-    try std.testing.expectEqualStrings("encode_hex", call.call.callee.field_access.field_name);
+    // A sole compile-error expression proves there is no chosen impl call in
+    // a prelude, branch, callee, or argument. A generic missing-impl refusal
+    // is not an ambiguity diagnostic.
+    try std.testing.expectEqual(@as(usize, 0), body.stmts.len);
+    const refusal = body.expr orelse return error.MissingAmbiguityDiagnostic;
+    if (refusal.* != .builtin) return error.ExpectedAmbiguityDiagnostic;
+    try std.testing.expectEqualStrings("compileError", refusal.builtin.name);
+    try std.testing.expectEqual(@as(usize, 1), refusal.builtin.args.len);
+    const diagnostic = refusal.builtin.args[0];
+    if (diagnostic != .lit or diagnostic.lit != .str) return error.ExpectedAmbiguityMessage;
+    try std.testing.expectEqualStrings(
+        "ambiguous source trait method implementation for instantiated receiver",
+        diagnostic.lit.str,
+    );
 }
 
 // ── A shift is typed by its left operand ─────────────────────────────────────
@@ -15741,15 +15904,6 @@ fn emittedStatementAfter(source: []const u8, at: usize) ![]const u8 {
     return std.mem.trim(u8, source[line_end + 1 ..], " \t");
 }
 
-/// The one emitted function, so a test that asks whether the collect returns
-/// from ITS function does not trip over the ones it calls or is called by.
-fn emittedFunction(source: []const u8, name: []const u8) ![]const u8 {
-    const start = std.mem.indexOf(u8, source, name) orelse return error.MissingFunction;
-    const end = std.mem.indexOfPos(u8, source, start + name.len, "\n}") orelse
-        return error.MissingFunction;
-    return source[start..end];
-}
-
 /// How many loops the emitted text opens. A bare `break` claims the nearest
 /// one, so what an exit has to step over is counted rather than assumed.
 fn countEmittedLoops(source: []const u8) usize {
@@ -15797,29 +15951,6 @@ test "lower: an empty Result collect reaches the Ok answer and releases nothing"
 // the loop the collect owns. The exit names the block OUTSIDE both, so it
 // leaves the adapter's as well: what used to need a guard after every nested
 // loop is one label now, and the nesting can be any depth.
-test "lower: a flat_map adapter's inner loop cannot swallow an item error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const source = try collectResultFixtureSource(alloc, .result_flat_map);
-    const record = std.mem.indexOf(
-        u8,
-        source,
-        "__r2z_collect_error = __r2z_item_value.unwrap_err();",
-    ) orelse return error.MissingItemError;
-    const exit = try collectExitLabel(alloc, source, record);
-    // Both loops are inside the one block the exit names, and the exit is
-    // inside both: the adapter's loop and the collect's own.
-    const block_at = try collectExitBlockAt(alloc, source, exit);
-    try std.testing.expect(countEmittedLoops(source[block_at..record]) >= 2);
-    // One decision about the outcome and no guard after the nested loop: there
-    // is nothing left for a guard to catch.
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        countOccurrences(source, "if (__r2z_collect_error != null)"),
-    );
-}
 
 // A `?` in an adapter body leaves the CLOSURE in Rust, and `collect` turns
 // that into the collection's own `Err`. Emitting a function-level `return`
@@ -16380,7 +16511,7 @@ fn emitReceiverWriteFixture(
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{struct_id},
+        .items = try alloc.dupe(ir.spine.EntityId, &.{struct_id}),
         .attributes = &.{},
     });
     try graph.addCrate(.{
@@ -16720,18 +16851,19 @@ const StringParamUse = enum {
 };
 
 /// Lower `fn use_string(s: T)` with the use named by `use`, and return the
-/// emitted source. The parameter is an owned `String` unless the use asks for
-/// `&mut`. `shadowed` adds a body binding spelled `_s`, which the copy's
-/// signature name has to step past.
-fn emitStringParamUseFixture(
-    backing: std.mem.Allocator,
+/// package the lowering built. The parameter is an owned `String` unless the
+/// use asks for `&mut`. `shadowed` adds a body binding spelled `_s`, which the
+/// copy's signature name has to step past.
+///
+/// The tree is allocated from `alloc`, which the caller owns and keeps: the
+/// owner contract below is a relation between DECLARATIONS and the expressions
+/// that name them, and a match on emitted text cannot say which declaration a
+/// name belongs to.
+fn lowerStringParamUseFixture(
+    alloc: std.mem.Allocator,
     use: StringParamUse,
     shadowed: bool,
-) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(backing);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
+) !ast.Package {
     var graph = ir.graph.CrateGraph.init(alloc);
     var model = Model.init(alloc);
     const root_id = try addLowerEntity(&graph, .module, "", null);
@@ -16843,9 +16975,20 @@ fn emitStringParamUseFixture(
             .bodies = body_table,
         },
     };
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// Lower the fixture above and return the emitted source.
+fn emitStringParamUseFixture(
+    backing: std.mem.Allocator,
+    use: StringParamUse,
+    shadowed: bool,
+) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const package = try lowerStringParamUseFixture(arena.allocator(), use, shadowed);
     // The arena dies with this frame, so the caller must own the text.
-    return backing.dupe(u8, try emit.emitFile(alloc, &package.files[0]));
+    return backing.dupe(u8, try emit.emitFile(arena.allocator(), &package.files[0]));
 }
 
 // `s.into_bytes()` transfers the string's storage out through `self: *String`.
@@ -16872,14 +17015,36 @@ test "lower: an owned String parameter mutated by clear takes mutable storage" {
     try std.testing.expect(std.mem.indexOf(u8, source, "s.clear()") != null);
 }
 
-// `s.len()` takes `*const String`, which a Zig parameter already is. A copy
-// here would be a `var` no call ever reaches.
-test "lower: an owned String parameter only read keeps the plain parameter" {
-    const source = try emitStringParamUseFixture(std.testing.allocator, .len, false);
-    defer std.testing.allocator.free(source);
-    try std.testing.expect(std.mem.indexOf(u8, source, "s: r2z.alloc.String") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "_s:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "var s") == null);
+/// The one parameter a source parameter arrives in, read off an emitted
+/// signature without assuming what the lowering spelled it. A comptime type
+/// parameter is an artefact of the generic lowering rather than a source
+/// parameter, and a second value parameter would make "the parameter"
+/// ambiguous — both are refused here instead of guessed at.
+fn soleValueParameter(decl: ast.FnDecl) !ast.FnParam {
+    var found: ?ast.FnParam = null;
+    for (decl.params) |param| {
+        if (param.is_comptime) continue;
+        if (found != null) return error.AmbiguousValueParameter;
+        found = param;
+    }
+    return found orelse error.MissingValueParameter;
+}
+
+/// The identifier an expression reads its receiver through. A method call
+/// spells the receiver in the callee's field access and a bare field read is
+/// that field access itself, so both name the same place; every other shape
+/// reads no receiver and answers null.
+fn receiverIdent(expression: ast.Expr) ?[]const u8 {
+    const target: *const ast.Expr = switch (expression) {
+        .field_access => |access| access.target,
+        .call => |call_expr| switch (call_expr.callee.*) {
+            .field_access => |access| access.target,
+            else => return null,
+        },
+        else => return null,
+    };
+    if (target.* != .ident) return null;
+    return target.ident;
 }
 
 // `&mut String` arrives as `*String`, and Zig writes through it from an
@@ -16892,6 +17057,30 @@ test "lower: a String parameter reached through &mut String stays borrowed" {
     try std.testing.expect(std.mem.indexOf(u8, source, "_s:") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "var s") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "s.clear()") != null);
+
+    // The same rule read off the tree, so it cannot pass by spelling: the
+    // parameter keeps its own name, is a POINTER to the runtime string, and
+    // the frame declares nothing and releases nothing. A borrow owns no
+    // allocation, so a `defer` here would free what the caller still holds.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const package = try lowerStringParamUseFixture(alloc, .reference_clear, false);
+    const decl = try findFnDecl(package.files[0], "use_string");
+    const parameter = try soleValueParameter(decl);
+    try std.testing.expect(parameter.ty == .ptr);
+    const body = decl.body orelse return error.EmptyTranslatedBody;
+    var body_expr: ?*const ast.Expr = null;
+    for (body.stmts) |statement| {
+        if (statement == .defer_stmt) return error.BorrowedParameterIsReleased;
+        if (statement == .let_stmt) return error.BorrowedParameterIsCopied;
+        if (statement == .expr_stmt) body_expr = statement.expr_stmt;
+    }
+    // The method reaches the borrow through the parameter itself, so the
+    // plain signature is load-bearing rather than decorative.
+    const receiver = receiverIdent((body_expr orelse return error.EmptyTranslatedBody).*) orelse
+        return error.BodyReadHasNoReceiver;
+    try std.testing.expectEqualStrings(parameter.name, receiver);
 }
 
 // A body binding spelled `_s` already owns that identifier, so the parameter's
@@ -16905,139 +17094,6 @@ test "lower: a consumed String parameter steps past a body binding named _s" {
     try std.testing.expect(std.mem.indexOf(u8, source, "_s_1: r2z.alloc.String") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "var s: r2z.alloc.String = _s_1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "s.into_bytes()") != null);
-}
-
-// ── A copied parameter keeps its identity when the copy is renamed ----------
-// `fn take(pair: (u64, u64)) -> u64 { let _pair = 7; pair.0 = 1; let (a, _) =
-// pair; a }` — the body binding `_pair` pushes the parameter's immutable copy
-// to `_pair_1`, and the destructuring still has to see `pair` as a parameter.
-// Treating the parameter as an ordinary expression instead binds its value to
-// a `_tuple` alias, which for an owned value is a second name for it.
-
-/// Lower the fixture above and return the emitted source.
-fn emitTupleParamCopyFixture(backing: std.mem.Allocator) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(backing);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-    const root_id = try addLowerEntity(&graph, .module, "", null);
-    const callable_id = try addLowerEntity(&graph, .fn_, "take", root_id);
-    const param_def = try addLowerEntity(&graph, .field, "pair", callable_id);
-    _ = try addLowerEntity(&graph, .field, "_pair", callable_id);
-    const first_def = try addLowerEntity(&graph, .field, "a", callable_id);
-    const element_def = try addLowerEntity(&graph, .field, "0", null);
-
-    const u64_ty: ir.types.Type = .{ .prim = .u64 };
-    const tuple_ty: ir.types.Type = .{ .tuple = &.{ u64_ty, u64_ty } };
-    // 0: (u64, u64), 1: u64.
-    const types = [_]ir.types.Type{ tuple_ty, u64_ty };
-
-    const param_path = try model.e(.{ .path = .{ .def = param_def, .generic_args = &.{} } });
-    model.exprs.items[param_path].ty = 0;
-    const element = try model.e(.{ .field = .{
-        .base = param_path,
-        .field = "0",
-        .resolved = element_def,
-    } });
-    model.exprs.items[element].ty = 1;
-    const one = try model.e(litInt(1));
-    model.exprs.items[one].ty = 1;
-    const assignment = try model.e(.{ .assign = .{
-        .target = element,
-        .op = .plain,
-        .value = one,
-        .overflow = .wrapping,
-    } });
-    model.exprs.items[assignment].ty = 1;
-
-    const shadow_pat = try model.pat(.{ .binding = .{
-        .name = "_pair",
-        .mode = .value,
-        .mutable = false,
-    } });
-    const seven = try model.e(litInt(7));
-    model.exprs.items[seven].ty = 1;
-    const shadow_stmt = try model.stmt(.{ .let = .{
-        .pattern = shadow_pat,
-        .init = seven,
-        .ty = null,
-    } });
-
-    const first_pat = try model.pat(.{ .binding = .{
-        .name = "a",
-        .mode = .value,
-        .mutable = false,
-    } });
-    const ignored_pat = try model.pat(.{ .wildcard = {} });
-    const pair_pat = try model.pat(.{ .tuple = .{
-        .elements = &.{ first_pat, ignored_pat },
-        .rest = false,
-    } });
-    const destructure = try model.stmt(.{ .let = .{
-        .pattern = pair_pat,
-        .init = param_path,
-        .ty = null,
-    } });
-
-    const first_path = try model.e(.{ .path = .{ .def = first_def, .generic_args = &.{} } });
-    model.exprs.items[first_path].ty = 1;
-
-    const statements = try alloc.alloc(ir.exprs.NodeId, 3);
-    statements[0] = shadow_stmt;
-    statements[1] = try model.stmt(.{ .expr = assignment });
-    statements[2] = destructure;
-    const body = try model.e(.{ .block = .{
-        .statements = statements,
-        .tail = first_path,
-        .labelled = null,
-    } });
-    model.exprs.items[body].ty = 1;
-
-    const callable_params = try alloc.alloc(ir.items.Param, 1);
-    callable_params[0] = .{ .name = "pair", .ty = tuple_ty, .span = span };
-    const body_table = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
-    for (body_table) |*slot| slot.* = .none;
-    body_table[callable_id] = .{ .fn_ = .{
-        .params = callable_params,
-        .ret = u64_ty,
-        .body = body,
-        .is_allocating = false,
-    } };
-    try addBareCrate(&graph, alloc, "tuple_param_copy", root_id, &.{callable_id});
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "tuple_param_copy",
-        .edition = "2021",
-        .graph = graph,
-        .types = &types,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(alloc),
-            .stmts = try model.stmts.toOwnedSlice(alloc),
-            .pats = try model.pats.toOwnedSlice(alloc),
-            .types = &types,
-            .bodies = body_table,
-        },
-    };
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    // The arena dies with this frame, so the caller must own the text.
-    return backing.dupe(u8, try emit.emitFile(alloc, &package.files[0]));
-}
-
-test "lower: a renamed parameter copy still destructures the parameter itself" {
-    const source = try emitTupleParamCopyFixture(std.testing.allocator);
-    defer std.testing.allocator.free(source);
-    // The copy stepped past the body binding, and the write reached the copy.
-    // A tuple element is a field named after its index, which Zig writes
-    // `@"0"`.
-    try std.testing.expect(std.mem.indexOf(u8, source, "_pair_1: struct { u64, u64 }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "var pair: struct { u64, u64 } = _pair_1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "pair.@\"0\" = 1;") != null);
-    // The destructuring read the parameter instead of aliasing it into a
-    // `_tuple` local, which `pair[0]` and the missing alias show.
-    try std.testing.expect(std.mem.indexOf(u8, source, "= pair[0];") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "_tuple") == null);
 }
 
 // ── Owned containers: cow copies, transfers, and iterator extends ──
@@ -17119,6 +17175,106 @@ fn cowMethodFixture(alloc: std.mem.Allocator, method_name: []const u8) !ast.Expr
     const body = decl.fn_decl.body orelse return error.ExpectedFunctionBody;
     const expr = body.expr orelse return error.ExpectedBodyExpression;
     return expr.*;
+}
+
+/// Lower a shared `len()` read from a const-reference sequence parameter.
+fn borrowedSequenceLenFixture(alloc: std.mem.Allocator, sequence_ty: ir.types.Type) !ast.FnDecl {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const run = try addLowerEntity(&graph, .fn_, "run", root);
+    const value = try addLowerEntity(&graph, .field, "value", run);
+    const len = try addLowerEntity(&graph, .method_ref, "len", null);
+    try addBareCrate(&graph, alloc, "borrowed_sequence_len", root, &.{run});
+
+    const borrowed_ty: ir.types.Type = .{ .reference = &.{ .mut = false, .pointee = sequence_ty } };
+    const usize_ty: ir.types.Type = .{ .prim = .usize };
+    const types = [_]ir.types.Type{ borrowed_ty, usize_ty };
+    const receiver = try typedExpr(&model, 0, .{ .path = .{ .def = value, .generic_args = &.{} } });
+    const call = try typedExpr(&model, 1, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .shared,
+        .method = len,
+        .args = &.{},
+    } });
+    const block = try typedExpr(&model, 1, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[run] = .{ .fn_ = .{
+        .params = &.{.{ .name = "value", .ty = borrowed_ty, .span = span }},
+        .ret = usize_ty,
+        .generic_params = &.{},
+        .body = block,
+        .is_allocating = false,
+    } };
+    const rust_ir = ir.RustIr{
+        .crate_name = "borrowed_sequence_len",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(model.a()),
+            .stmts = try model.stmts.toOwnedSlice(model.a()),
+            .pats = try model.pats.toOwnedSlice(model.a()),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
+    return findFnDecl(package.files[0], "run");
+}
+
+test "lower: borrowed Vec len reads the original parameter items without allocation or copying" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const decl = try borrowedSequenceLenFixture(arena.allocator(), .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = &.{u8_ty},
+    } });
+    // The only parameter is the source borrow: no allocator is introduced.
+    try std.testing.expectEqual(@as(usize, 1), decl.params.len);
+    try std.testing.expectEqualStrings("value", decl.params[0].name);
+    const body = decl.body orelse return error.ExpectedFunctionBody;
+    try std.testing.expectEqual(@as(usize, 0), body.stmts.len);
+    const result = body.expr orelse return error.ExpectedBodyExpression;
+    const length = switch (result.*) {
+        .field_access => |field| field,
+        else => return error.ExpectedLengthField,
+    };
+    try std.testing.expectEqualStrings("len", length.field_name);
+    const items = switch (length.target.*) {
+        .field_access => |field| field,
+        else => return error.ExpectedVecItemsField,
+    };
+    try std.testing.expectEqualStrings("items", items.field_name);
+    // A direct source identifier rules out a runtime call or temporary copy.
+    try std.testing.expectEqualStrings(decl.params[0].name, try expectIdent(items.target.*));
+}
+
+test "lower: borrowed slice len reads the original parameter directly without allocation or copying" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const decl = try borrowedSequenceLenFixture(arena.allocator(), .{ .slice = &.{
+        .const_ = true,
+        .elem = .{ .prim = .u8 },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), decl.params.len);
+    try std.testing.expectEqualStrings("value", decl.params[0].name);
+    const body = decl.body orelse return error.ExpectedFunctionBody;
+    try std.testing.expectEqual(@as(usize, 0), body.stmts.len);
+    const result = body.expr orelse return error.ExpectedBodyExpression;
+    const length = switch (result.*) {
+        .field_access => |field| field,
+        else => return error.ExpectedLengthField,
+    };
+    try std.testing.expectEqualStrings("len", length.field_name);
+    // Unlike Vec, a slice has its length on the source itself, not `.items`.
+    try std.testing.expectEqualStrings(decl.params[0].name, try expectIdent(length.target.*));
 }
 
 /// Lower `fn run(value: Vec<u8>, source: <source_ty>) { value.extend(source); }`
@@ -17340,4 +17496,6873 @@ test "lower: an owned receiver is handed to the runtime by address, never copied
     };
     try std.testing.expectEqual(ast.UnaryOpKind.addr_of, destination.op);
     try std.testing.expectEqualStrings("value", operandIdent(destination.operand.*) orelse return error.ExpectedReceiverOperand);
+}
+
+// ── A `BufRead` receiver is reached by the handle it actually has ───────────
+// Both halves of the runtime's pair write through a pointer: the slice arm
+// does `reader.* = reader.*[count..]` and the object arm calls a `*Self`
+// method. So the emitted argument is a pointer — but WHICH spelling depends on
+// the representation the receiver actually has, and `&` alone does not say it:
+// `lowerType` spells `&[u8]` as the `[]const u8` descriptor itself, and a bare
+// type parameter says nothing at all.
+
+/// What shape of `BufRead` receiver the fixture hands the runtime.
+const BufReadReceiver = enum {
+    /// `fn drain<R: BufRead>(mut reader: R)` — one emitted body must serve
+    /// thin pointer handles, owned readers, and slice descriptor values.
+    generic_parameter,
+    /// `fn drain<R: BufRead>(reader: &mut R)` — the declared bound identifies
+    /// the method while the thin reference is already its mutable handle.
+    explicit_pointer,
+    /// A resolved `impl BufRead` whose concrete representation is `&[u8]`.
+    /// The descriptor itself belongs to this frame and needs mutable storage.
+    slice_descriptor,
+};
+
+/// Lower `fn drain(..)` calling `fill_buf` followed by `consume(1)`, with the
+/// receiver's representation and declared bound named by `kind`.
+fn emitBufReadReceiverFixture(
+    backing: std.mem.Allocator,
+    kind: BufReadReceiver,
+) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root_id = try addLowerEntity(&graph, .module, "", null);
+    const callable_id = try addLowerEntity(&graph, .fn_, "drain", root_id);
+    const param_def = try addLowerEntity(&graph, .field, "reader", callable_id);
+    const consume = try addLowerEntity(&graph, .method_ref, "consume", callable_id);
+    const fill_buf = try addLowerEntity(&graph, .method_ref, "fill_buf", callable_id);
+
+    const byte_slice: ir.types.Type = .{ .slice = &.{
+        .const_ = true,
+        .elem = .{ .prim = .u8 },
+    } };
+    // 0: R, 1: byte slice, 2: &mut R, 3: bound-carrying slice descriptor,
+    // 4: usize, 5: unit.
+    const generic_param: ir.types.Type = .{ .path = .{ .segments = &.{
+        .{ .name = "R", .id = null },
+    } } };
+    const slice_reference: ir.types.Ref = .{ .mut = false, .pointee = byte_slice };
+    const reader_reference: ir.types.Ref = .{ .mut = true, .pointee = generic_param };
+    const buf_read_bound: ir.types.Bound = .{
+        .path = .{ .segments = &.{
+            .{ .name = "std", .id = null },
+            .{ .name = "io", .id = null },
+            .{ .name = "BufRead", .id = null },
+        } },
+        .args = &.{},
+    };
+    const types = [_]ir.types.Type{
+        generic_param,
+        byte_slice,
+        .{ .reference = &reader_reference },
+        // `ir.types.Opaque` is a VALUE, not a pointer: `bounds` and `concrete`
+        // are the ones that are spelled through a reference.
+        .{ .@"opaque" = .{
+            .bounds = &.{buf_read_bound},
+            .concrete = &.{ .reference = &slice_reference },
+        } },
+        .{ .prim = .usize },
+        .{ .prim = .unit },
+    };
+
+    const param_type: ir.types.Type = switch (kind) {
+        .generic_parameter => generic_param,
+        .explicit_pointer => types[2],
+        .slice_descriptor => types[3],
+    };
+    const receiver_type_id: ir.exprs.TypeId = switch (kind) {
+        .generic_parameter => 0,
+        .explicit_pointer => 2,
+        .slice_descriptor => 3,
+    };
+    const generic_params = [_][]const u8{"R"};
+    const generics: ir.types.Generics = .{
+        .params = &.{.{ .type_ = .{
+            .name = "R",
+            .bounds = &.{buf_read_bound},
+        } }},
+        .where_clauses = &.{},
+    };
+
+    const param_path = try model.e(.{ .path = .{ .def = param_def, .generic_args = &.{} } });
+    model.exprs.items[param_path].ty = receiver_type_id;
+    const one = try model.e(litInt(1));
+    model.exprs.items[one].ty = 4;
+    const call = try model.e(.{ .method_call = .{
+        .receiver = param_path,
+        .receiver_mode = .mutable,
+        .method = consume,
+        .args = &.{one},
+    } });
+    model.exprs.items[call].ty = 5;
+    const call_stmt = try model.stmt(.{ .expr = call });
+    const fill_call = try model.e(.{ .method_call = .{
+        .receiver = param_path,
+        .receiver_mode = .mutable,
+        .method = fill_buf,
+        .args = &.{},
+    } });
+    const fill_stmt = try model.stmt(.{ .expr = fill_call });
+    const body = try model.e(.{ .block = .{
+        .statements = try alloc.dupe(ir.exprs.NodeId, &.{ fill_stmt, call_stmt }),
+        .tail = null,
+        .labelled = null,
+    } });
+    model.exprs.items[body].ty = 5;
+
+    const callable_params = try alloc.alloc(ir.items.Param, 1);
+    callable_params[0] = .{ .name = "reader", .ty = param_type, .span = span };
+    const body_table = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_table) |*slot| slot.* = .none;
+    body_table[callable_id] = .{ .fn_ = .{
+        .params = callable_params,
+        .ret = .{ .prim = .unit },
+        .body = body,
+        .generic_params = &generic_params,
+        .generics = generics,
+        .is_allocating = false,
+    } };
+    try addBareCrate(&graph, alloc, "bufread_receiver", root_id, &.{callable_id});
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "bufread_receiver",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_table,
+        },
+    };
+    return backing.dupe(u8, try emitRootSource(alloc, &rust_ir));
+}
+
+// Generic readers select their representation at comptime. Thin pointers pass
+// the signature argument itself; owned values and slices get mutable local
+// storage. The pointer instantiation's local is void, not a copied handle.
+test "lower: a generic BufRead receiver selects pointer or mutable value storage at comptime" {
+    const source = try emitBufReadReceiverFixture(std.testing.allocator, .generic_parameter);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "_reader: R") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "@typeInfo(@TypeOf(_reader))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, ".pointer =>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, ".slice => false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "@as(void, {})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "else _reader") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "else &reader") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.io.fill_buf(if (") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "_reader: *R") == null);
+}
+
+// A thin pointer to a sized reader is itself the handle, and its address would
+// be a pointer to a pointer.
+test "lower: a BufRead receiver that is already a pointer is passed through untouched" {
+    const source = try emitBufReadReceiverFixture(std.testing.allocator, .explicit_pointer);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.io.consume(reader, 1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "&reader") == null);
+}
+
+// `&[u8]` is a descriptor VALUE in Zig, not a pointer: `lowerType` spells the
+// fat borrow as the `[]const u8` itself, so the runtime writes THROUGH it
+// (`reader.* = reader.*[count..]`). This frame therefore owns the descriptor
+// it advances and needs mutable storage for it — reading the IR's
+// `.reference` alone would have called it a pointer and emitted a call the
+// runtime cannot serve.
+test "lower: a fat-borrow BufRead receiver is a descriptor, so it is reached by address" {
+    const source = try emitBufReadReceiverFixture(std.testing.allocator, .slice_descriptor);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "_reader: []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "var reader: []const u8 = _reader;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.io.consume(&reader, 1)") != null);
+}
+
+fn emitPrimitiveBuiltinFixture(backing: std.mem.Allocator, function: ir.exprs.CoreFunction) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "primitive", root);
+    const parameter = try addLowerEntity(&graph, .field, "value", callable);
+    const integer: ir.types.Type = .{ .prim = .u64 };
+    const bytes: ir.types.Type = .{ .array = &.{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .literal = 8 },
+    } };
+    const types = [_]ir.types.Type{ integer, bytes };
+    const decoding = function == .prim_from_le_bytes;
+    const uninit = function == .maybe_uninit_uninit;
+    const value = try model.e(.{ .path = .{ .def = parameter, .generic_args = &.{} } });
+    model.exprs.items[value].ty = if (decoding) 1 else 0;
+    const body = try model.e(.{ .core_call = .{
+        .function = function,
+        .generic_args = &.{integer},
+        .args = if (uninit) &.{} else &.{value},
+    } });
+    model.exprs.items[body].ty = if (decoding or uninit) 0 else 1;
+    const rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (rows) |*row| row.* = .none;
+    rows[callable] = .{ .fn_ = .{
+        .params = if (uninit) &.{} else &.{.{
+            .name = "value",
+            .ty = if (decoding) bytes else integer,
+            .span = span,
+        }},
+        .ret = if (decoding or uninit) integer else bytes,
+        .body = body,
+    } };
+    try addBareCrate(&graph, alloc, "primitive_builtin", root, &.{callable});
+    const rust_ir = ir.RustIr{
+        .crate_name = "primitive_builtin",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = rows,
+        },
+    };
+    return backing.dupe(u8, try emitRootSource(alloc, &rust_ir));
+}
+
+test "lower: integer LE byte conversions select explicit endian on every target" {
+    inline for (.{ ir.exprs.CoreFunction.prim_from_le_bytes, ir.exprs.CoreFunction.prim_to_le_bytes }) |function| {
+        const source = try emitPrimitiveBuiltinFixture(std.testing.allocator, function);
+        defer std.testing.allocator.free(source);
+        try std.testing.expect(std.mem.indexOf(u8, source, "std.builtin.Endian.little") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, if (function == .prim_from_le_bytes) "std.mem.readInt" else "std.mem.writeInt") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "transmute") == null);
+    }
+}
+
+test "lower: MaybeUninit uninit remains typed uninitialized storage" {
+    const source = try emitPrimitiveBuiltinFixture(std.testing.allocator, .maybe_uninit_uninit);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "@as(u64, undefined)") != null);
+}
+
+fn emitTraitBuiltinFixture(backing: std.mem.Allocator, function: ir.exprs.CoreFunction) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "trait_builtin", root);
+    const receiver_def = try addLowerEntity(&graph, .field, "receiver", callable);
+    const value_def = try addLowerEntity(&graph, .field, "value", callable);
+    const receiver_type: ir.types.Type = .{ .reference = &.{
+        .mut = true,
+        .pointee = .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } },
+    } };
+    const value_type: ir.types.Type = if (function == .hash_write_primitive)
+        .{ .prim = .u64 }
+    else
+        .{ .reference = &.{
+            .mut = true,
+            .pointee = .{ .slice = &.{ .const_ = false, .elem = .{ .prim = .u8 } } },
+        } };
+    const unit: ir.types.Type = .{ .prim = .unit };
+    const types = [_]ir.types.Type{ receiver_type, value_type, unit };
+    const receiver = try model.e(.{ .path = .{ .def = receiver_def, .generic_args = &.{} } });
+    model.exprs.items[receiver].ty = 0;
+    const value = try model.e(.{ .path = .{ .def = value_def, .generic_args = &.{} } });
+    model.exprs.items[value].ty = 1;
+    const body = try model.e(.{ .core_call = .{
+        .function = function,
+        .generic_args = if (function == .hash_write_primitive) &.{.{ .prim = .u64 }} else &.{},
+        .args = &.{ receiver, value },
+    } });
+    model.exprs.items[body].ty = 2;
+    const rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (rows) |*row| row.* = .none;
+    rows[callable] = .{ .fn_ = .{
+        .params = &.{
+            .{ .name = "receiver", .ty = receiver_type, .span = span },
+            .{ .name = "value", .ty = value_type, .span = span },
+        },
+        .ret = unit,
+        .generic_params = &.{"T"},
+        .body = body,
+    } };
+    try addBareCrate(&graph, alloc, "trait_builtin", root, &.{callable});
+    const rust_ir = ir.RustIr{
+        .crate_name = "trait_builtin",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = rows,
+        },
+    };
+    return backing.dupe(u8, try emitRootSource(alloc, &rust_ir));
+}
+
+test "lower: Hasher default primitive write uses native bytes without an allocator" {
+    const source = try emitTraitBuiltinFixture(std.testing.allocator, .hash_write_primitive);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "receiver.write(std.mem.asBytes(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, ": u64 = value;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "Endian.little") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "allocator:") == null);
+}
+
+test "lower: RngCore fill default calls the runtime implementation without allocation" {
+    const source = try emitTraitBuiltinFixture(std.testing.allocator, .rng_fill_bytes_via_next);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.random.fill_bytes_via_next(receiver, value)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "allocator:") == null);
+}
+
+// ── Shared assertions for canonical trait defaults ─────────────────────────
+
+/// The NAME an emitted call reaches: `Counter.zero()` answers `zero`, a hoisted
+/// module-scope function answers its own declaration name, and a generic
+/// parameter answers the parameter.
+///
+/// Every assertion below is about WHICH declaration answers a source default,
+/// so it reads the target's identity rather than a full spelling that is free
+/// to change without changing the program.
+fn calleeName(target: ast.Expr) ?[]const u8 {
+    return switch (target) {
+        .ident => |name| name,
+        .field_access => |access| access.field_name,
+        else => null,
+    };
+}
+
+/// The `.named` type an expression carries in `type_value` position: the
+/// lexical parameter, or the concrete type a comptime branch selects.
+fn typeValueName(expr: ast.Expr) ?[]const u8 {
+    if (expr != .type_value) return null;
+    return switch (expr.type_value) {
+        .named => |name| name,
+        else => null,
+    };
+}
+
+/// Whether `expr` is the comptime type comparison that keeps a source
+/// implementation reachable only for the instantiation it is written for.
+fn isTypeSelection(expr: ast.Expr, param: []const u8, self_type: []const u8) bool {
+    if (expr != .bin_op) return false;
+    const comparison = expr.bin_op;
+    if (comparison.op != .equal) return false;
+    const lhs = typeValueName(comparison.lhs.*) orelse return false;
+    const rhs = typeValueName(comparison.rhs.*) orelse return false;
+    return std.mem.eql(u8, lhs, param) and std.mem.eql(u8, rhs, self_type);
+}
+
+/// Whether `expr` is an `if` whose condition selects a source implementation for
+/// exactly one instantiation of a still-generic receiver.
+fn typeSelectionBranches(expr: ast.Expr, param: []const u8, self_type: []const u8) ?struct { ast.Expr, ast.Expr } {
+    if (expr != .if_expr) return null;
+    const selection = expr.if_expr;
+    if (!isTypeSelection(selection.cond.*, param, self_type)) return null;
+    const otherwise = selection.else_body orelse return null;
+    return .{ selection.then_body.*, otherwise.* };
+}
+
+/// The integer arm of the `@typeInfo` guard a GENERIC numeric default is
+/// wrapped in, or the expression itself when the receiver was already known to
+/// be an integer and no guard was needed.
+///
+/// The guard exists because a type parameter may instantiate to a custom
+/// source type, where a built-in integer default means nothing. Both shapes
+/// answer the same question, so an assertion about the fallback reads whichever
+/// one was emitted and checks the guard separately where the guard is the
+/// contract.
+fn integerFallbackOf(expr: ast.Expr) ast.Expr {
+    if (expr != .match_expr) return expr;
+    const guarded = expr.match_expr;
+    if (guarded.target.* != .builtin) return expr;
+    if (!std.mem.eql(u8, guarded.target.builtin.name, "typeInfo")) return expr;
+    if (guarded.arms.len != 2) return expr;
+    return guarded.arms[0].body;
+}
+
+/// The custom-type arm of that guard: a `@compileError` carrying one message.
+/// A source type with no `Zero`/`One`/`Bounded` implementation has to fail to
+/// instantiate, not silently answer with an integer default.
+fn expectCustomTypeRefusal(expr: ast.Expr) !void {
+    if (expr != .match_expr) return error.ExpectedCustomNumericTypeGuard;
+    const guarded = expr.match_expr;
+    if (guarded.target.* != .builtin) return error.ExpectedCustomNumericTypeGuard;
+    if (!std.mem.eql(u8, guarded.target.builtin.name, "typeInfo")) return error.ExpectedCustomNumericTypeGuard;
+    if (guarded.arms.len != 2) return error.ExpectedCustomNumericTypeGuard;
+    if (guarded.arms[0].patterns.len != 1 or guarded.arms[1].patterns.len != 1)
+        return error.ExpectedCustomNumericTypeGuard;
+    switch (guarded.arms[0].patterns[0]) {
+        .enum_literal => |name| if (!std.mem.eql(u8, name, "int"))
+            return error.ExpectedCustomNumericTypeGuard,
+        else => return error.ExpectedCustomNumericTypeGuard,
+    }
+    switch (guarded.arms[1].patterns[0]) {
+        .wildcard => {},
+        else => return error.ExpectedCustomNumericTypeGuard,
+    }
+    const refusal = guarded.arms[1].body;
+    if (refusal != .builtin) return error.ExpectedCustomNumericTypeGuard;
+    if (!std.mem.eql(u8, refusal.builtin.name, "compileError")) return error.ExpectedCustomNumericTypeGuard;
+    if (refusal.builtin.args.len != 1) return error.ExpectedCustomNumericTypeGuard;
+    if (refusal.builtin.args[0] != .lit or refusal.builtin.args[0].lit != .str)
+        return error.ExpectedCustomNumericTypeGuard;
+    if (refusal.builtin.args[0].lit.str.len == 0) return error.ExpectedCustomNumericTypeGuard;
+}
+
+/// The single expression a lowered callable body evaluates to.
+fn fnBodyExpr(decl: ast.FnDecl) !ast.Expr {
+    const body = decl.body orelse return error.EmptyTranslatedBody;
+    return (body.expr orelse return error.EmptyTranslatedBody).*;
+}
+
+/// The statements of a lowered callable body, for the defaults that bind a
+/// temporary rather than evaluate to one expression.
+fn fnBodyStmts(decl: ast.FnDecl) ![]const ast.Stmt {
+    const body = decl.body orelse return error.EmptyTranslatedBody;
+    if (body.expr != null) return error.ExpectedStatementBody;
+    if (body.stmts.len == 0) return error.EmptyTranslatedBody;
+    return body.stmts;
+}
+
+/// The built-in answer for a `num_traits` default: `std.math.minInt`/`maxInt`
+/// for the bounded pair, a typed zero or one for the identity pair.
+fn expectNumericFallback(expr: ast.Expr, case: NumericTagCase, type_name: []const u8) !void {
+    const fallback = integerFallbackOf(expr);
+    const target = if (case.zig_call) |zig_call| blk: {
+        if (fallback != .call) return error.ExpectedNumericFallback;
+        if (fallback.call.args.len != 0) return error.ExpectedNumericFallback;
+        if (fallback.call.generic_args.len != 1) return error.ExpectedNumericFallback;
+        try std.testing.expectEqualStrings(zig_call, calleeName(fallback.call.callee.*) orelse
+            return error.ExpectedNumericFallback);
+        break :blk fallback.call.generic_args[0];
+    } else blk: {
+        if (fallback != .cast) return error.ExpectedNumericFallback;
+        if (fallback.cast.operand.* != .lit or fallback.cast.operand.lit != .int)
+            return error.ExpectedNumericFallback;
+        try std.testing.expectEqual(case.literal, fallback.cast.operand.lit.int);
+        break :blk fallback.cast.target;
+    };
+    // The fallback is asked about ONE type: a concrete integer at a call site,
+    // the lexical parameter inside a generic one. A fallback that had resolved
+    // the type to something else would answer a question nobody asked.
+    switch (target) {
+        .named => |name| try std.testing.expectEqualStrings(type_name, name),
+        .prim => |primitive| try std.testing.expectEqualStrings(type_name, @tagName(primitive)),
+        else => return error.ExpectedNumericFallback,
+    }
+}
+
+/// The four canonical `num_traits` defaults and the source identity each one
+/// resolves through. `zig_call` is null exactly when the built-in answer is a
+/// typed literal rather than a Zig intrinsic.
+const NumericTagCase = struct {
+    function: ir.exprs.CoreFunction,
+    /// The source method a `num_traits` implementation declares for it.
+    method: []const u8,
+    /// The trait identity such an implementation has to prove.
+    trait_name: []const u8,
+    /// The module `num_traits` keeps that trait under.
+    module_name: []const u8,
+    zig_call: ?[]const u8,
+    literal: i128,
+};
+
+const numeric_tag_cases = [_]NumericTagCase{
+    .{
+        .function = .numeric_min_value,
+        .method = "min_value",
+        .trait_name = "Bounded",
+        .module_name = "bounds",
+        .zig_call = "std.math.minInt",
+        .literal = 0,
+    },
+    .{
+        .function = .numeric_max_value,
+        .method = "max_value",
+        .trait_name = "Bounded",
+        .module_name = "bounds",
+        .zig_call = "std.math.maxInt",
+        .literal = 0,
+    },
+    .{
+        .function = .numeric_zero,
+        .method = "zero",
+        .trait_name = "Zero",
+        .module_name = "identities",
+        .zig_call = null,
+        .literal = 0,
+    },
+    .{
+        .function = .numeric_one,
+        .method = "one",
+        .trait_name = "One",
+        .module_name = "identities",
+        .zig_call = null,
+        .literal = 1,
+    },
+};
+
+/// The receiver a canonical numeric default is asked about, and the source
+/// graph that stands beside it.
+const NumericTagScene = enum {
+    /// `fn limit() -> u8`: the answer is already known to be an integer.
+    concrete_integer,
+    /// `fn limit<I>() -> I`, whose instantiation the file still has to make.
+    lexical_parameter,
+    /// The lexical parameter plus `impl num_traits::<Trait> for Counter`.
+    source_impl_canonical,
+    /// The same implementation reached through `num_traits::<module>::<Trait>`.
+    source_impl_module_path,
+    /// The same implementation, reached through a crate-local trait that merely
+    /// shares the name. Two different traits; only the canonical one answers.
+    local_trait_homonym,
+    /// `fn counter_min() -> Counter`: the receiver IS the implemented type, so
+    /// there is nothing left to select at comptime.
+    concrete_source_type,
+    /// A type that is neither an integer nor implemented at all.
+    non_numeric_argument,
+    /// A value argument the tag never takes, which the arity check refuses.
+    unexpected_value_argument,
+    /// No type argument at all.
+    missing_type_argument,
+};
+
+/// The trait path an `impl` in `scene` writes to prove it implements the
+/// canonical trait. Identity is resolved from the path, so a crate-local trait
+/// of the same name answers with its OWN id and is a different trait.
+fn sourceTraitSegments(
+    alloc: std.mem.Allocator,
+    case: NumericTagCase,
+    scene: NumericTagScene,
+    local_trait: ?ir.spine.EntityId,
+) ![]const ir.types.PathSegment {
+    const segments: []const ir.types.PathSegment = switch (scene) {
+        .local_trait_homonym => &.{.{ .name = case.trait_name, .id = local_trait }},
+        .source_impl_module_path => &.{
+            .{ .name = "num_traits", .id = null },
+            .{ .name = case.module_name, .id = null },
+            .{ .name = case.trait_name, .id = null },
+        },
+        else => &.{
+            .{ .name = "num_traits", .id = null },
+            .{ .name = case.trait_name, .id = null },
+        },
+    };
+    return alloc.dupe(ir.types.PathSegment, segments);
+}
+
+/// `fn limit(..) -> T` whose only statement asks the canonical numeric-trait
+/// default for `T`, with the receiver and the surrounding source graph named by
+/// `scene`.
+///
+/// The lexical scenes also carry `limit_u8`, `limit_i32` and `limit_usize`,
+/// which instantiate the generic at an unsigned, a signed and a
+/// target-dependent width. The comptime branch is only a real consumer of the
+/// emitted default once something instantiates it.
+fn numericTagFixture(
+    alloc: std.mem.Allocator,
+    case: NumericTagCase,
+    scene: NumericTagScene,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const limit = try addLowerEntity(&graph, .fn_, "limit", root);
+
+    const generic = scene == .lexical_parameter or scene == .source_impl_canonical or
+        scene == .source_impl_module_path or scene == .local_trait_homonym;
+    const concrete_impl = scene == .source_impl_canonical or
+        scene == .source_impl_module_path or scene == .local_trait_homonym or
+        scene == .concrete_source_type;
+    const instantiation_widths = [_]ir.types.Prim{ .u8, .i32, .usize };
+
+    // ── Entities ─────────────────────────────────────────────────────────
+    // Every entity is declared before the body table is sized: the table is
+    // indexed by entity id, so a row added after the fact has nowhere to land.
+    const items = try alloc.alloc(ir.spine.EntityId, 8);
+    items[0] = limit;
+    var item_count: usize = 1;
+    var counter: ir.spine.EntityId = 0;
+    var impl_id: ir.spine.EntityId = 0;
+    var impl_method: ir.spine.EntityId = 0;
+    var local_trait: ir.spine.EntityId = 0;
+    if (concrete_impl) {
+        counter = try addLowerEntity(&graph, .struct_, "Counter", root);
+        const impl_name = try std.fmt.allocPrint(alloc, "{s} for Counter", .{case.trait_name});
+        impl_id = try addLowerEntity(&graph, .impl_, impl_name, counter);
+        impl_method = try addLowerEntity(&graph, .fn_, case.method, impl_id);
+        items[item_count] = counter;
+        item_count += 1;
+        items[item_count] = impl_id;
+        item_count += 1;
+        if (scene == .local_trait_homonym) {
+            local_trait = try addLowerEntity(&graph, .trait_, case.trait_name, root);
+            items[item_count] = local_trait;
+            item_count += 1;
+        }
+    }
+    var callers: [instantiation_widths.len]ir.spine.EntityId = undefined;
+    if (generic) {
+        for (instantiation_widths, 0..) |prim, index| {
+            callers[index] = try addLowerEntity(&graph, .fn_, try std.fmt.allocPrint(
+                alloc,
+                "limit_{s}",
+                .{@tagName(prim)},
+            ), root);
+            items[item_count] = callers[index];
+            item_count += 1;
+        }
+    }
+
+    // ── Types ────────────────────────────────────────────────────────────
+    // 0: the type the tag is asked about, 1: unit, 2: the local
+    // implementation's self type, 3..: one instantiation record per width.
+    var types = [_]ir.types.Type{
+        switch (scene) {
+            .concrete_integer => .{ .prim = .u8 },
+            .non_numeric_argument => .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } },
+            .concrete_source_type => .{ .path = .{ .segments = &.{} } },
+            else => .{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                &.{.{ .name = "I", .id = null }},
+            ) } },
+        },
+        .{ .prim = .unit },
+        .{ .path = .{ .segments = &.{} } },
+        .{ .prim = .u8 },
+        .{ .prim = .u8 },
+        .{ .prim = .u8 },
+    };
+    if (concrete_impl) {
+        types[2] = .{ .path = .{ .segments = try alloc.dupe(
+            ir.types.PathSegment,
+            &.{.{ .name = "Counter", .id = counter }},
+        ) } };
+        if (scene == .concrete_source_type) types[0] = types[2];
+    }
+    const source_type = types[0];
+
+    // ── Expressions ──────────────────────────────────────────────────────
+    const tag_generic_args: []const ir.types.Type = if (scene == .missing_type_argument)
+        &.{}
+    else
+        try alloc.dupe(ir.types.Type, &.{source_type});
+    const literal = try typedExpr(&model, 1, litInt(0));
+    const tag_args: []const ir.exprs.NodeId = if (scene == .unexpected_value_argument)
+        &.{literal}
+    else
+        &.{};
+    const tag = try typedExpr(&model, 0, .{ .core_call = .{
+        .function = case.function,
+        .generic_args = tag_generic_args,
+        .args = tag_args,
+    } });
+    const limit_body = try typedExpr(&model, 0, .{ .block = .{
+        .statements = &.{},
+        .tail = tag,
+        .labelled = null,
+    } });
+
+    // The record on the instantiation call is what tells the backend which
+    // instantiation the source asked for, exactly as `limit::<u8>()` does.
+    var caller_bodies: [instantiation_widths.len]ir.exprs.NodeId = undefined;
+    for (instantiation_widths, 0..) |prim, index| {
+        types[index + 3] = .{ .generic_inst = .{
+            .decl = limit,
+            .args = .{ .params = try alloc.dupe(ir.types.Type, &.{.{ .prim = prim }}) },
+        } };
+        const call = try typedExpr(&model, @intCast(index + 3), .{ .call = .{
+            .call_kind = .{ .free = limit },
+            .args = &.{},
+        } });
+        caller_bodies[index] = try typedExpr(&model, null, .{ .block = .{
+            .statements = &.{},
+            .tail = call,
+            .labelled = null,
+        } });
+    }
+
+    var impl_method_body: ir.exprs.NodeId = 0;
+    if (concrete_impl) {
+        const value = try typedExpr(&model, 2, .{ .struct_lit = .{ .def = counter, .fields = &.{}, .base = null } });
+        impl_method_body = try typedExpr(&model, 2, .{ .block = .{
+            .statements = &.{},
+            .tail = value,
+            .labelled = null,
+        } });
+    }
+
+    // ── Bodies ───────────────────────────────────────────────────────────
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[limit] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = source_type,
+        .generic_params = if (generic) &.{"I"} else &.{},
+        .generics = if (generic) .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "I",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{
+                .segments = try sourceTraitSegments(alloc, case, if (scene == .source_impl_module_path)
+                    .source_impl_module_path
+                else
+                    .source_impl_canonical, null),
+            } }}),
+        } }}), .where_clauses = &.{} } else null,
+        .body = limit_body,
+    } };
+    if (concrete_impl) {
+        body_rows[counter] = .{ .struct_ = .{
+            .methods = try alloc.dupe(ir.bodies.StructMethod, &.{.{
+                .name = case.method,
+                .visibility = .public,
+                .params = &.{},
+                .ret = types[2],
+                .body = impl_method_body,
+                .receiver = null,
+            }}),
+        } };
+        body_rows[impl_method] = .{ .fn_ = .{
+            .params = &.{},
+            .ret = types[2],
+            .body = impl_method_body,
+        } };
+        body_rows[impl_id] = .{ .impl_ = .{
+            .self_ty = types[2],
+            .trait_path = .{ .segments = try sourceTraitSegments(
+                alloc,
+                case,
+                scene,
+                if (scene == .local_trait_homonym) local_trait else null,
+            ) },
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{impl_method}),
+        } };
+    }
+    if (scene == .local_trait_homonym) {
+        body_rows[local_trait] = .{ .trait_ = .{ .name = case.trait_name } };
+    }
+    if (generic) {
+        for (instantiation_widths, 0..) |prim, index| {
+            body_rows[callers[index]] = .{ .fn_ = .{
+                .params = &.{},
+                .ret = .{ .prim = prim },
+                .body = caller_bodies[index],
+            } };
+        }
+    }
+
+    try addBareCrate(&graph, alloc, "numeric_tag", root, items[0..item_count]);
+    const rust_ir = ir.RustIr{
+        .crate_name = "numeric_tag",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// ── Canonical numeric-trait defaults ───────────────────────────────────────
+
+// `u8::MIN`, `u8::MAX`, `T::zero()` and `T::one()` on a concrete integer are
+// the Zig answer and nothing else: there is no receiver to dispatch on and no
+// implementation to prefer.
+test "lower: every canonical numeric default answers a concrete integer with the built-in value" {
+    inline for (numeric_tag_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const pkg = try numericTagFixture(alloc, case, .concrete_integer);
+        const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "limit"));
+        try expectNumericFallback(body, case, "u8");
+
+        // A receiver that is already an integer needs no comptime guard, and
+        // the emitted file says so in Zig rather than in a trace form.
+        const source = try emit.emitFile(alloc, &pkg.files[0]);
+        try std.testing.expect(std.mem.indexOf(u8, source, "@typeInfo") == null);
+        if (case.zig_call) |zig_call| {
+            try std.testing.expect(std.mem.indexOf(u8, source, zig_call) != null);
+        }
+    }
+}
+
+// `I` may instantiate to a type that is not an integer. `std.math.minInt(I)`
+// and `@as(I, 0)` mean nothing there, so the built-in answer is reached only
+// for an actual integer and a custom type fails with a message instead of
+// silently receiving an integer default.
+test "lower: a generic numeric default is guarded so a custom source type cannot answer with an integer" {
+    inline for (numeric_tag_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const pkg = try numericTagFixture(alloc, case, .lexical_parameter);
+        const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "limit"));
+        try expectCustomTypeRefusal(body);
+        try expectNumericFallback(body, case, "I");
+    }
+}
+
+// A crate's own `num_traits` implementation is the answer the source asked
+// for. The default is only what happens when nothing else claims the type, so
+// it has to sit behind the selection rather than replace it — and the module
+// `num_traits` keeps the trait under names the same implementation.
+test "lower: a canonical num_traits implementation is selected before the built-in numeric default" {
+    inline for (numeric_tag_cases) |case| {
+        inline for ([_]NumericTagScene{ .source_impl_canonical, .source_impl_module_path }) |scene| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const pkg = try numericTagFixture(alloc, case, scene);
+            const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "limit"));
+            const branches = typeSelectionBranches(body, "I", "Counter") orelse
+                return error.ExpectedSourceTypeSelection;
+            // The branch reaches the SOURCE function, and takes no receiver:
+            // the type it returns IS the instantiation.
+            if (branches[0] != .call) return error.ExpectedSourceOverride;
+            try std.testing.expectEqualStrings(case.method, calleeName(branches[0].call.callee.*) orelse
+                return error.ExpectedSourceOverride);
+            try std.testing.expectEqual(@as(usize, 0), branches[0].call.args.len);
+            // Everything the branch did not claim keeps the built-in answer,
+            // guard included.
+            try expectCustomTypeRefusal(branches[1]);
+            try expectNumericFallback(branches[1], case, "I");
+        }
+    }
+}
+
+// The selection is assembled from the answer it wraps, so the two must not
+// share storage: an `else` that IS the slot the `if` is being written into has
+// already lost one of the two answers before anything reads them. The pointers
+// below are read back through the declaration AFTER a second crate has been
+// lowered into the same arena, so a tree that only held together while the
+// builder was on the stack cannot pass.
+test "lower: a bounded numeric source selection keeps its fallback in its own storage" {
+    inline for (numeric_tag_cases) |case| {
+        // `min_value` and `max_value` are the bounded pair: the defaults whose
+        // built-in answer is a `std.math` helper rather than a typed literal.
+        if (case.zig_call) |zig_call| {
+            inline for ([_]NumericTagScene{ .source_impl_canonical, .source_impl_module_path }) |scene| {
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+
+                const pkg = try numericTagFixture(alloc, case, scene);
+                // The declaration's own slot, not a copy of the tail: every
+                // assertion below is about the storage the builder returns.
+                const limit = try findFnDecl(pkg.files[0], "limit");
+                const body = limit.body orelse return error.EmptyTranslatedBody;
+                const root = body.expr orelse return error.EmptyTranslatedBody;
+                // The answer the SOURCE asked for is the root. The built-in
+                // default only survives behind that selection.
+                if (root.* != .if_expr) return error.ExpectedSourceTypeSelection;
+                const selection = root.*.if_expr;
+                const fallback = selection.else_body orelse return error.ExpectedElseBranch;
+                // Three answers, three slots. A fallback that IS the root, or
+                // the branch, is a second reading of one overwritten node.
+                try std.testing.expect(fallback != root);
+                try std.testing.expect(selection.then_body != root);
+                try std.testing.expect(selection.then_body != fallback);
+                // WHICH declaration answers each side: the branch is the source
+                // implementation the crate itself wrote, the fallback is the
+                // guarded built-in default every other instantiation keeps.
+                const branches = typeSelectionBranches(root.*, "I", "Counter") orelse
+                    return error.ExpectedSourceTypeSelection;
+                if (branches[0] != .call) return error.ExpectedSourceOverride;
+                try std.testing.expectEqualStrings(case.method, calleeName(branches[0].call.callee.*) orelse
+                    return error.ExpectedSourceOverride);
+                try std.testing.expectEqual(@as(usize, 0), branches[0].call.args.len);
+                // The fallback is a `@typeInfo` guard whose integer arm asks the
+                // helper about ONE type, held in that arm's own generic slot.
+                try expectCustomTypeRefusal(branches[1]);
+                try expectNumericFallback(branches[1], case, "I");
+                var std_imports: usize = 0;
+                for (pkg.files[0].imports) |import| {
+                    if (std.mem.eql(u8, import.local_name, "std") and
+                        std.mem.eql(u8, import.module_or_path, "std"))
+                    {
+                        std_imports += 1;
+                    }
+                }
+                try std.testing.expectEqual(@as(usize, 1), std_imports);
+
+                // Another crate — the other bounded default, asked of a
+                // concrete integer, so its root is a plain helper call with no
+                // selection and no guard — is lowered through the same builder
+                // into the SAME arena before the first package is read again.
+                inline for (numeric_tag_cases) |other| {
+                    if (other.zig_call != null and !std.mem.eql(u8, other.method, case.method)) {
+                        _ = try numericTagFixture(alloc, other, .concrete_integer);
+                    }
+                }
+
+                // What the builder returned is still finite, still its own
+                // storage, and still answers the same two questions.
+                if (root.* != .if_expr) return error.ExpectedSourceTypeSelection;
+                try std.testing.expect(fallback != root);
+                try expectCustomTypeRefusal(fallback.*);
+                try expectNumericFallback(fallback.*, case, "I");
+
+                const source = try emit.emitFile(alloc, &pkg.files[0]);
+                const std_import = "const std = @import(\"std\");";
+                try std.testing.expect(std.mem.indexOf(u8, source, "I == Counter") != null);
+                try std.testing.expect(std.mem.indexOf(u8, source, zig_call) != null);
+                try std.testing.expect(std.mem.indexOf(u8, source, std_import) != null);
+            }
+        }
+    }
+}
+
+// A crate that declares its own `trait Bounded` is a different trait that
+// happens to share a name. Selecting its implementation would hand a custom
+// type the built-in integer default the guard exists to withhold.
+test "lower: a crate-local trait that shares a numeric trait's name never answers it" {
+    inline for (numeric_tag_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const pkg = try numericTagFixture(alloc, case, .local_trait_homonym);
+        const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "limit"));
+        try std.testing.expect(typeSelectionBranches(body, "I", "Counter") == null);
+        try expectCustomTypeRefusal(body);
+        try expectNumericFallback(body, case, "I");
+
+        // The homonym is a real declaration and still emits, but nothing calls
+        // it through a `Counter` value: identity, not spelling, decides.
+        const source = try emit.emitFile(alloc, &pkg.files[0]);
+        try std.testing.expect(std.mem.indexOf(u8, source, "Counter.") == null);
+    }
+}
+
+// When the receiver IS the implemented type there is nothing left to select:
+// the comptime comparison would be a constant the emitter already knows.
+test "lower: a concrete implemented type answers its own trait implementation directly" {
+    inline for (numeric_tag_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const pkg = try numericTagFixture(alloc, case, .concrete_source_type);
+        const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "limit"));
+        if (body != .call) return error.ExpectedSourceOverride;
+        try std.testing.expectEqualStrings(case.method, calleeName(body.call.callee.*) orelse
+            return error.ExpectedSourceOverride);
+        try std.testing.expectEqual(@as(usize, 0), body.call.args.len);
+    }
+}
+
+// A type that is neither an integer nor implemented has no honest answer, and
+// the guard can only report it once the instantiation is known. Refusing is
+// what keeps `@as(I, 0)` from being emitted for a type it cannot hold.
+test "lower: a numeric default for a type that is neither an integer nor implemented is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.UnsupportedNumericTraitImpl,
+        numericTagFixture(arena.allocator(), numeric_tag_cases[0], .non_numeric_argument),
+    );
+}
+
+// Every one of these tags is a type-level constant: it takes a type and no
+// value. A value argument or a missing type argument is malformed IR, not a
+// translation choice.
+test "lower: a numeric default refuses a value argument or a missing type argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    inline for (numeric_tag_cases) |case| {
+        try std.testing.expectError(
+            error.InvalidCoreCallArity,
+            numericTagFixture(alloc, case, .unexpected_value_argument),
+        );
+        try std.testing.expectError(
+            error.InvalidCoreCallArity,
+            numericTagFixture(alloc, case, .missing_type_argument),
+        );
+    }
+}
+
+// The emitted comptime branch is only a real consumer of the default once
+// something instantiates it. These callers are that something: an unsigned
+// width, a signed width, and a pointer-sized one whose extent is the target's.
+test "lower: the generic numeric default is instantiated at signed, unsigned and target widths" {
+    inline for (numeric_tag_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const pkg = try numericTagFixture(alloc, case, .lexical_parameter);
+        const source = try emit.emitFile(alloc, &pkg.files[0]);
+        try std.testing.expect(std.mem.indexOf(u8, source, "comptime I: type") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "limit(u8)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "limit(i32)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "limit(usize)") != null);
+    }
+}
+
+// ── `<[T]>::first` is one shared optional borrow ───────────────────────────
+
+/// Where the borrow `first()` returns comes from.
+const SliceFirstReceiver = enum {
+    /// `fn head(bytes: &[T]) -> Option<&T>` — the borrow as it arrived.
+    borrowed_param,
+    /// `fn head(state: &State) -> Option<&T> { state.bytes.first() }` — the
+    /// same borrow reached through a field, so the binding has to name the
+    /// PLACE rather than re-derive a value from it.
+    field_place,
+};
+
+/// Lower `fn head(..) -> Option<&T>` whose only statement is `first()`, over
+/// `element` elements reached the way `receiver` describes.
+fn sliceFirstPackage(
+    alloc: std.mem.Allocator,
+    element: ir.types.Prim,
+    receiver: SliceFirstReceiver,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const head = try addLowerEntity(&graph, .fn_, "head", root);
+    const bytes_field = try addLowerEntity(&graph, .field, "bytes", head);
+    const state_field = try addLowerEntity(&graph, .field, "state", head);
+    const first = try addLowerEntity(&graph, .method_ref, "first", head);
+
+    const element_ty: ir.types.Type = .{ .prim = element };
+    const slice_ty: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = element_ty } };
+    // 0: T, 1: `&[T]`, 2: the borrowed parameter, 3: `Option<&T>`,
+    // 4: `State`, 5: `&State`.
+    var types = [_]ir.types.Type{
+        element_ty,
+        slice_ty,
+        .{ .reference = &.{ .mut = false, .pointee = slice_ty } },
+        .{ .option = &.{ .reference = &.{ .mut = false, .pointee = element_ty } } },
+        .{ .path = .{ .segments = &.{} } },
+        .{ .reference = &.{ .mut = false, .pointee = .{ .path = .{ .segments = &.{} } } } },
+    };
+    var state_id: ir.spine.EntityId = 0;
+    if (receiver == .field_place) {
+        state_id = try addLowerEntity(&graph, .struct_, "State", root);
+        types[4] = .{ .path = .{ .segments = try alloc.dupe(
+            ir.types.PathSegment,
+            &.{.{ .name = "State", .id = state_id }},
+        ) } };
+        types[5] = .{ .reference = &.{ .mut = false, .pointee = types[4] } };
+    }
+
+    const receiver_node = switch (receiver) {
+        .borrowed_param => try typedExpr(&model, 2, .{ .path = .{ .def = bytes_field, .generic_args = &.{} } }),
+        .field_place => blk: {
+            const state = try typedExpr(&model, 5, .{ .path = .{ .def = state_field, .generic_args = &.{} } });
+            break :blk try typedExpr(&model, 1, .{ .field = .{
+                .base = state,
+                .field = "bytes",
+                .resolved = bytes_field,
+            } });
+        },
+    };
+    const call = try typedExpr(&model, 3, .{ .method_call = .{
+        .receiver = receiver_node,
+        .receiver_mode = .shared,
+        .method = first,
+        .args = &.{},
+    } });
+    const body = try typedExpr(&model, 3, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    const params = try alloc.alloc(ir.items.Param, 1);
+    params[0] = switch (receiver) {
+        .borrowed_param => .{ .name = "bytes", .ty = types[2], .span = span },
+        .field_place => .{ .name = "state", .ty = types[5], .span = span },
+    };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[head] = .{ .fn_ = .{
+        .params = params,
+        .ret = types[3],
+        .body = body,
+    } };
+    if (receiver == .field_place) {
+        body_rows[state_id] = .{ .struct_ = .{ .fields = try alloc.dupe(ir.items.Field, &.{
+            .{ .name = "bytes", .ty = types[1], .visibility = .public, .span = span },
+        }) } };
+    }
+
+    try addBareCrate(&graph, alloc, "slice_first", root, if (receiver == .field_place)
+        try alloc.dupe(ir.spine.EntityId, &.{ head, state_id })
+    else
+        try alloc.dupe(ir.spine.EntityId, &.{head}));
+    const rust_ir = ir.RustIr{
+        .crate_name = "slice_first",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// The same contract when the borrow is reached through a field. What the
+// returned pointer names is the field's storage, so the binding has to spell
+// the place rather than lower the receiver a second time.
+test "lower: a slice first through a field keeps the borrow identity of that field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sliceFirstPackage(alloc, .u8, .field_place);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "head"));
+    if (body != .block or body.block.stmts.len != 1) return error.ExpectedSharedSliceBinding;
+    const binding = body.block.stmts[0];
+    if (binding != .let_stmt) return error.ExpectedSharedSliceBinding;
+    const place = binding.let_stmt.init;
+    if (place != .field_access) return error.ExpectedReceiverIdentity;
+    try std.testing.expectEqualStrings("bytes", place.field_access.field_name);
+    try std.testing.expectEqualStrings("state", operandIdent(place.field_access.target.*) orelse
+        return error.ExpectedReceiverIdentity);
+
+    const optional = body.block.expr.?.*;
+    if (optional != .cast or optional.cast.target != .opt) return error.ExpectedOptionalFirst;
+    const otherwise = optional.cast.operand.*.if_expr.else_body orelse return error.ExpectedOptionalFirst;
+    const element_zero = otherwise.unary_op.operand.*;
+    try std.testing.expectEqualStrings(binding.let_stmt.name, operandIdent(element_zero.builtin.args[0]) orelse
+        return error.ExpectedReceiverIdentity);
+}
+
+// The emitted file is Zig, and this is the shape it has to have for a
+// borrowed parameter: the optional pointer is the value, `len` decides which
+// arm answers, and nothing copies the sequence.
+test "lower: a slice first emits an optional pointer over the receiver's own slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sliceFirstPackage(alloc, .u8, .borrowed_param);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "?*const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "bytes.len == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "[0]") != null);
+}
+
+// ── Checked arithmetic on a generic bound ───────────────────────────────────
+
+/// One `num_traits` checked operation and the runtime helper that answers it.
+const CheckedCase = struct {
+    method: []const u8,
+    trait_name: []const u8,
+    runtime: []const u8,
+};
+
+const checked_cases = [_]CheckedCase{
+    .{ .method = "checked_add", .trait_name = "CheckedAdd", .runtime = "r2z.checkedAdd" },
+    .{ .method = "checked_sub", .trait_name = "CheckedSub", .runtime = "r2z.checkedSub" },
+    .{ .method = "checked_mul", .trait_name = "CheckedMul", .runtime = "r2z.checkedMul" },
+};
+
+/// Which spelling of the checked bound the source declares, or the crate-local
+/// trait that merely shares its name.
+const CheckedBound = enum {
+    /// `num_traits::ops::checked::CheckedAdd` and its siblings.
+    canonical_ops_module,
+    /// `num_traits::CheckedAdd` — the same trait at its root.
+    canonical_root,
+    /// A trait this crate declares, which is a different trait.
+    local_homonym,
+};
+
+/// Lower `fn checked<I: ..>(a: &I, b: &I) -> Option<I> { a.checked_*(b) }`
+/// plus one caller per concrete width, so the emitted comptime branch is a
+/// real instantiation at a signed, an unsigned and a target-dependent width.
+fn checkedArithmeticPackage(
+    alloc: std.mem.Allocator,
+    case: CheckedCase,
+    bound: CheckedBound,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "checked", root);
+    const a_def = try addLowerEntity(&graph, .field, "a", callable);
+    const b_def = try addLowerEntity(&graph, .field, "b", callable);
+
+    var local_trait: ir.spine.EntityId = 0;
+    var method_parent = callable;
+    if (bound == .local_homonym) {
+        local_trait = try addLowerEntity(&graph, .trait_, case.trait_name, root);
+        // The method the source wrote resolves through the trait it declared,
+        // so the callee entity belongs to THAT trait and to nothing else.
+        method_parent = local_trait;
+    }
+    const method = try addLowerEntity(&graph, .method_ref, case.method, method_parent);
+
+    const instantiation_widths = [_]ir.types.Prim{ .u8, .i32, .usize };
+    var callers: [instantiation_widths.len]ir.spine.EntityId = undefined;
+    var caller_a: [instantiation_widths.len]ir.exprs.NodeId = undefined;
+    var caller_b: [instantiation_widths.len]ir.exprs.NodeId = undefined;
+    var caller_calls: [instantiation_widths.len]ir.exprs.NodeId = undefined;
+    for (instantiation_widths, 0..) |prim, index| {
+        callers[index] = try addLowerEntity(&graph, .fn_, try std.fmt.allocPrint(
+            alloc,
+            "checked_{s}",
+            .{@tagName(prim)},
+        ), root);
+        caller_a[index] = try addLowerEntity(&graph, .field, "a", callers[index]);
+        caller_b[index] = try addLowerEntity(&graph, .field, "b", callers[index]);
+    }
+
+    const lexical = ir.types.Type{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "I", .id = null }},
+    ) } };
+    const borrow: ir.types.Type = .{ .reference = &.{ .mut = false, .pointee = lexical } };
+    const result: ir.types.Type = .{ .option = &lexical };
+    // 0: I, 1: `&I`, 2: `Option<I>`, 3..: the per-width borrows, results and
+    // instantiation records the callers need.
+    const width_entries: usize = instantiation_widths.len * 3;
+    const types = try alloc.alloc(ir.types.Type, 3 + width_entries);
+    types[0] = lexical;
+    types[1] = borrow;
+    types[2] = result;
+    for (instantiation_widths, 0..) |prim, index| {
+        // Every carrier here is arena-backed rather than a block-scoped
+        // temporary: the type table outlives this loop and outlives this frame's
+        // inner blocks, and a pointer to a per-iteration local would not.
+        const wide = try alloc.create(ir.types.Type);
+        wide.* = .{ .prim = prim };
+        const wide_ref = try alloc.create(ir.types.Ref);
+        wide_ref.* = .{ .mut = false, .pointee = wide.* };
+        const wide_result = try alloc.create(ir.types.Type);
+        wide_result.* = .{ .option = wide };
+        types[3 + index] = .{ .reference = wide_ref };
+        types[3 + instantiation_widths.len + index] = wide_result.*;
+        types[3 + 2 * instantiation_widths.len + index] = .{ .generic_inst = .{
+            .decl = callable,
+            .args = .{ .params = try alloc.dupe(ir.types.Type, &.{wide.*}) },
+        } };
+    }
+
+    const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = a_def, .generic_args = &.{} } });
+    const argument = try typedExpr(&model, 1, .{ .path = .{ .def = b_def, .generic_args = &.{} } });
+    const call = try typedExpr(&model, 2, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .shared,
+        .method = method,
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{argument}),
+    } });
+    const body = try typedExpr(&model, 2, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    for (instantiation_widths, 0..) |_, index| {
+        const wide_borrow: ir.exprs.TypeId = @intCast(3 + index);
+        const wide_result: ir.exprs.TypeId = @intCast(3 + instantiation_widths.len + index);
+        const wide_inst: ir.exprs.TypeId = @intCast(3 + 2 * instantiation_widths.len + index);
+        const left = try typedExpr(&model, wide_borrow, .{ .path = .{ .def = caller_a[index], .generic_args = &.{} } });
+        const right = try typedExpr(&model, wide_borrow, .{ .path = .{ .def = caller_b[index], .generic_args = &.{} } });
+        const instantiated = try typedExpr(&model, wide_inst, .{ .call = .{
+            .call_kind = .{ .free = callable },
+            .args = try alloc.dupe(ir.exprs.NodeId, &.{ left, right }),
+        } });
+        caller_calls[index] = try typedExpr(&model, wide_result, .{ .block = .{
+            .statements = &.{},
+            .tail = instantiated,
+            .labelled = null,
+        } });
+    }
+
+    const bound_segments: []const ir.types.PathSegment = switch (bound) {
+        .local_homonym => &.{.{ .name = case.trait_name, .id = local_trait }},
+        .canonical_root => &.{
+            .{ .name = "num_traits", .id = null },
+            .{ .name = case.trait_name, .id = null },
+        },
+        .canonical_ops_module => &.{
+            .{ .name = "num_traits", .id = null },
+            .{ .name = "ops", .id = null },
+            .{ .name = "checked", .id = null },
+            .{ .name = case.trait_name, .id = null },
+        },
+    };
+    const params = try alloc.alloc(ir.items.Param, 2);
+    params[0] = .{ .name = "a", .ty = types[1], .span = span };
+    params[1] = .{ .name = "b", .ty = types[1], .span = span };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = params,
+        .ret = types[2],
+        .generic_params = &.{"I"},
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "I",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                bound_segments,
+            ) } }}),
+        } }}), .where_clauses = &.{} },
+        .body = body,
+    } };
+    if (bound == .local_homonym) {
+        body_rows[local_trait] = .{ .trait_ = .{ .name = case.trait_name } };
+    }
+    for (instantiation_widths, 0..) |_, index| {
+        const caller_params = try alloc.alloc(ir.items.Param, 2);
+        caller_params[0] = .{ .name = "a", .ty = types[3 + index], .span = span };
+        caller_params[1] = .{ .name = "b", .ty = types[3 + index], .span = span };
+        body_rows[callers[index]] = .{ .fn_ = .{
+            .params = caller_params,
+            .ret = types[3 + instantiation_widths.len + index],
+            .body = caller_calls[index],
+        } };
+    }
+
+    const items = try alloc.alloc(ir.spine.EntityId, 1 + instantiation_widths.len + @intFromBool(bound == .local_homonym));
+    items[0] = callable;
+    @memcpy(items[1..][0..instantiation_widths.len], &callers);
+    if (bound == .local_homonym) items[items.len - 1] = local_trait;
+    try addBareCrate(&graph, alloc, "checked_arithmetic", root, items);
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "checked_arithmetic",
+        .edition = "2021",
+        .graph = graph,
+        .types = types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// `a.checked_add(b)` on a `&I` is one runtime helper, named for the lexical
+// type: the helper is generic in `I` and has to be instantiated with the same
+// `I` the receiver was declared with. Both arguments arrive borrowed, so what
+// the helper reads are the values behind them.
+test "lower: a generic checked operation reaches the runtime helper with the lexical type argument" {
+    inline for (checked_cases) |case| {
+        inline for ([_]CheckedBound{ .canonical_ops_module, .canonical_root }) |bound| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+
+            const pkg = try checkedArithmeticPackage(alloc, case, bound);
+            const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "checked"));
+            // A type parameter may instantiate to something the runtime cannot
+            // overflow-check, so the helper is reached only for an integer.
+            try expectCustomTypeRefusal(body);
+            const helper = integerFallbackOf(body);
+            if (helper != .call) return error.ExpectedCheckedRuntimeCall;
+            try std.testing.expectEqualStrings(case.runtime, calleeName(helper.call.callee.*) orelse
+                return error.ExpectedCheckedRuntimeCall);
+            try std.testing.expectEqual(@as(usize, 1), helper.call.generic_args.len);
+            try std.testing.expectEqualStrings("I", try expectNamedType(helper.call.generic_args[0]));
+            try std.testing.expectEqual(@as(usize, 2), helper.call.args.len);
+            // Both arguments were borrowed, and the helper wants the values.
+            const names = [_][]const u8{ "a", "b" };
+            for (helper.call.args, names) |argument, name| {
+                if (argument != .unary_op or argument.unary_op.op != .deref)
+                    return error.ExpectedBorrowedCheckedArgument;
+                try std.testing.expectEqualStrings(name, operandIdent(argument.unary_op.operand.*) orelse
+                    return error.ExpectedBorrowedCheckedArgument);
+            }
+        }
+    }
+}
+
+// A trait this crate declares that happens to share a checked trait's name is
+// a different trait with different impls. Reaching the runtime helper for it
+// would answer a source method that was never written.
+test "lower: a crate-local trait that shares a checked trait's name never reaches the runtime helper" {
+    inline for (checked_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const pkg = try checkedArithmeticPackage(alloc, case, .local_homonym);
+        const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "checked"));
+        if (body != .builtin) return error.ExpectedSourceTraitRefusal;
+        try std.testing.expectEqualStrings("compileError", body.builtin.name);
+        if (body.builtin.args.len != 1 or body.builtin.args[0] != .lit or body.builtin.args[0].lit != .str)
+            return error.ExpectedSourceTraitRefusal;
+        if (body.builtin.args[0].lit.str.len == 0) return error.ExpectedSourceTraitRefusal;
+
+        const source = try emit.emitFile(alloc, &pkg.files[0]);
+        try std.testing.expect(std.mem.indexOf(u8, source, "r2z.checked") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "compileError") != null);
+    }
+}
+
+// The comptime branch is only a real consumer once something instantiates it.
+// These callers instantiate it at an unsigned, a signed and a pointer-sized
+// width, which is exactly the set of widths the helper has to be generic in.
+test "lower: the generic checked helper is instantiated at signed, unsigned and target widths" {
+    inline for (checked_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const pkg = try checkedArithmeticPackage(alloc, case, .canonical_ops_module);
+        const source = try emit.emitFile(alloc, &pkg.files[0]);
+        try std.testing.expect(std.mem.indexOf(u8, source, "comptime I: type") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "checked(u8, a, b)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "checked(i32, a, b)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "checked(usize, a, b)") != null);
+        // The helper is the runtime's own, so the file has to import it.
+        try std.testing.expectEqual(@as(usize, 1), runtimeImportCount(pkg.files[0]));
+    }
+}
+
+// ── `Hasher::write_N` on a generic receiver ────────────────────────────────
+
+/// One `core::hash::Hasher` method and the shape of the call that reaches it.
+const HasherMethodCase = struct {
+    method: []const u8,
+    /// The primitive the default `write_N` body writes, or null for the two
+    /// methods that carry no integer of their own.
+    primitive: ?ir.types.Prim,
+    /// The declared type of the value argument, or null when the call takes
+    /// none at all.
+    argument: ?ir.types.Prim,
+    /// Whether the argument is the borrowed byte sequence `write` takes.
+    argument_is_slice: bool = false,
+};
+
+const hasher_method_cases = [_]HasherMethodCase{
+    .{ .method = "write_u64", .primitive = .u64, .argument = .u64 },
+    .{ .method = "write_u8", .primitive = .u8, .argument = .u8 },
+    .{ .method = "write", .primitive = null, .argument = .u8, .argument_is_slice = true },
+    .{ .method = "finish", .primitive = null, .argument = null },
+};
+
+/// What the source's own `core::hash::Hasher` implementation declares beside
+/// the call. Every implementation also supplies required `write` and `finish`.
+const HasherSource = enum {
+    /// Nothing: the default is the only answer there is.
+    none,
+    /// The primitive write the call names.
+    primitive_write,
+    /// No primitive override: the default routes through byte-level `write`.
+    byte_write,
+    /// Both, where the primitive write is the one that answers.
+    both,
+    /// The method that carries no integer at all.
+    finish_only,
+    /// The byte-level `write` on a self type with no declaration of its own,
+    /// so the method lands at module scope under its own emitted name.
+    byte_write_hoisted,
+};
+
+/// Lower `fn hash<H: core::hash::Hasher>(state: &mut H, value: ..)` with the
+/// named method call beside the source implementation `source` describes.
+/// A `finish` scene returns its u64 instead of discarding it.
+fn genericHasherPackage(
+    alloc: std.mem.Allocator,
+    case: HasherMethodCase,
+    source: HasherSource,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const hash = try addLowerEntity(&graph, .fn_, "hash", root);
+    const state_def = try addLowerEntity(&graph, .field, "state", hash);
+    const value_def = try addLowerEntity(&graph, .field, "value", hash);
+    // The method_ref belongs to no trait THIS crate declares: the bound is the
+    // external `core::hash::Hasher`, so the source's own impl is what has to be
+    // found by identity rather than by where the callee hangs.
+    const method = try addLowerEntity(&graph, .method_ref, case.method, hash);
+
+    const unit: ir.types.Type = .{ .prim = .unit };
+    const byte_slice: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    // 0: H, 1: `&mut H`, 2: the value argument, 3: unit, 4: the implementation's
+    // self type, 5: `&mut Self`, 6: the borrowed bytes `write` takes, 7: u64.
+    var types = [_]ir.types.Type{
+        .{ .path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{.{ .name = "H", .id = null }}) } },
+        .{ .reference = &.{ .mut = true, .pointee = .{ .path = .{ .segments = &.{} } } } },
+        .{ .prim = case.argument orelse .u8 },
+        unit,
+        .{ .path = .{ .segments = &.{} } },
+        .{ .reference = &.{ .mut = true, .pointee = .{ .path = .{ .segments = &.{} } } } },
+        byte_slice,
+        .{ .prim = .u64 },
+    };
+    types[1] = .{ .reference = &.{ .mut = true, .pointee = types[0] } };
+    if (case.argument_is_slice) types[2] = byte_slice;
+    if (case.primitive) |primitive| types[2] = .{ .prim = primitive };
+
+    // ── The source implementation ───────────────────────────────────────
+    var self_type: ir.spine.EntityId = 0;
+    var impl_id: ir.spine.EntityId = 0;
+    var declared: [3]ir.spine.EntityId = undefined;
+    var declared_count: usize = 0;
+    const hoisted_self = source == .byte_write_hoisted;
+    if (source != .none) {
+        if (hoisted_self) {
+            // `ir.types.Type.array` is a POINTER, so the record is allocated
+            // directly rather than through a helper that already wrapped it.
+            const array = try alloc.create(ir.types.Array);
+            array.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = 8 } };
+            types[4] = .{ .array = array };
+        } else {
+            self_type = try addLowerEntity(&graph, .struct_, "SeaHasher", root);
+            types[4] = .{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                &.{.{ .name = "SeaHasher", .id = self_type }},
+            ) } };
+        }
+        types[5] = .{ .reference = &.{ .mut = true, .pointee = types[4] } };
+        impl_id = try addLowerEntity(&graph, .impl_, if (hoisted_self)
+            "Hasher for [u8; 8]"
+        else
+            "Hasher for SeaHasher", if (hoisted_self) root else self_type);
+    }
+
+    const declares_primitive = source == .primitive_write or source == .both;
+    // `write` and `finish` are required even when this scene exercises only
+    // the primitive override or the finish call.
+    const declares_byte_write = source != .none;
+    const declares_finish = source != .none;
+    const unit_tail = try typedExpr(&model, 3, .{ .unit = {} });
+    const zero_tail = try typedExpr(&model, 7, litInt(0));
+    const returns_hash = std.mem.eql(u8, case.method, "finish");
+    const result_type: ir.exprs.TypeId = if (returns_hash) 7 else 3;
+    if (declares_primitive) {
+        declared[declared_count] = try addLowerEntity(&graph, .fn_, case.method, impl_id);
+        declared_count += 1;
+    }
+    if (declares_byte_write) {
+        declared[declared_count] = try addLowerEntity(&graph, .fn_, "write", impl_id);
+        declared_count += 1;
+    }
+    if (declares_finish) {
+        declared[declared_count] = try addLowerEntity(&graph, .fn_, "finish", impl_id);
+        declared_count += 1;
+    }
+
+    // ── The call ────────────────────────────────────────────────────────
+    const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = state_def, .generic_args = &.{} } });
+    const argument: ?ir.exprs.NodeId = if (case.argument == null) null else try typedExpr(&model, 2, .{
+        .path = .{ .def = value_def, .generic_args = &.{} },
+    });
+    const call = try typedExpr(&model, result_type, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = if (returns_hash) .shared else .mutable,
+        .method = method,
+        .args = if (argument) |node|
+            try alloc.dupe(ir.exprs.NodeId, &.{node})
+        else
+            &.{},
+    } });
+    const body = try typedExpr(&model, result_type, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    // ── Bodies ──────────────────────────────────────────────────────────
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    const hash_params = try alloc.alloc(ir.items.Param, if (case.argument == null) 1 else 2);
+    hash_params[0] = .{ .name = "state", .ty = types[1], .span = span };
+    if (case.argument != null) hash_params[1] = .{ .name = "value", .ty = types[2], .span = span };
+    body_rows[hash] = .{ .fn_ = .{
+        .params = hash_params,
+        .ret = types[result_type],
+        .generic_params = &.{"H"},
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "H",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                &.{
+                    .{ .name = "core", .id = null },
+                    .{ .name = "hash", .id = null },
+                    .{ .name = "Hasher", .id = null },
+                },
+            ) } }}),
+        } }}), .where_clauses = &.{} },
+        .body = body,
+    } };
+
+    if (source != .none) {
+        const items = try alloc.alloc(ir.spine.EntityId, 3);
+        items[0] = hash;
+        items[1] = impl_id;
+        items[2] = if (hoisted_self) root else self_type;
+        try addBareCrate(&graph, alloc, "generic_hasher", root, items[0..(if (hoisted_self) 2 else 3)]);
+        body_rows[impl_id] = .{ .impl_ = .{
+            .self_ty = types[4],
+            .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+                .{ .name = "core", .id = null },
+                .{ .name = "hash", .id = null },
+                .{ .name = "Hasher", .id = null },
+            }) },
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, declared[0..declared_count]),
+        } };
+        const mirrors = try alloc.alloc(ir.bodies.StructMethod, if (hoisted_self) 0 else declared_count);
+        for (declared[0..declared_count], 0..) |decl, index| {
+            const name = graph.symbol_table.get(decl).?.name;
+            // Each declared method keeps the signature the trait gives it: the
+            // primitive write takes that integer, `write` takes borrowed
+            // bytes, and `finish` takes nothing at all.
+            const takes_nothing = std.mem.eql(u8, name, "finish");
+            const value_ty: ir.types.Type = if (std.mem.eql(u8, name, "write"))
+                types[6]
+            else
+                .{ .prim = case.primitive orelse .u64 };
+            const declared_params = try alloc.alloc(ir.items.Param, if (takes_nothing) 1 else 2);
+            declared_params[0] = .{
+                .name = "self",
+                .ty = if (takes_nothing)
+                    .{ .reference = &.{ .mut = false, .pointee = types[4] } }
+                else
+                    types[5],
+                .span = span,
+            };
+            if (!takes_nothing) declared_params[1] = .{ .name = "bytes", .ty = value_ty, .span = span };
+            const method_body = try typedExpr(&model, if (takes_nothing) 7 else 3, .{ .block = .{
+                .statements = &.{},
+                .tail = if (takes_nothing) zero_tail else unit_tail,
+                .labelled = null,
+            } });
+            body_rows[decl] = .{ .fn_ = .{
+                .params = declared_params,
+                .ret = if (takes_nothing) types[7] else unit,
+                .body = method_body,
+            } };
+            if (!hoisted_self) mirrors[index] = .{
+                .name = name,
+                .visibility = .public,
+                .params = declared_params[1..],
+                .ret = body_rows[decl].fn_.ret,
+                .body = method_body,
+                .receiver = if (takes_nothing) .ref_ else .mut_ref,
+            };
+        }
+        if (!hoisted_self) body_rows[self_type] = .{ .struct_ = .{ .methods = mirrors } };
+    } else {
+        try addBareCrate(&graph, alloc, "generic_hasher", root, try alloc.dupe(
+            ir.spine.EntityId,
+            &.{hash},
+        ));
+    }
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "generic_hasher",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The `receiver.write(bytes)` a Hasher default body ends with, checked against
+/// the receiver it borrowed and the binding whose own storage the bytes are.
+fn hasherWriteCall(stmt: ast.Stmt, receiver_name: []const u8, value_binding: []const u8) !ast.Call {
+    if (stmt != .expr_stmt) return error.ExpectedHasherWrite;
+    const call = stmt.expr_stmt.*;
+    if (call != .call) return error.ExpectedHasherWrite;
+    const write = call.call;
+    if (write.callee.* != .field_access) return error.ExpectedHasherWrite;
+    if (!std.mem.eql(u8, write.callee.field_access.field_name, "write")) return error.ExpectedHasherWrite;
+    const receiver = calleeName(write.callee.field_access.target.*) orelse return error.ExpectedHasherWrite;
+    if (!std.mem.eql(u8, receiver, receiver_name)) return error.ExpectedHasherWrite;
+    if (write.args.len != 1 or write.args[0] != .call) return error.ExpectedHasherWrite;
+    const bytes = write.args[0].call;
+    if (bytes.callee.* != .ident or !std.mem.eql(u8, bytes.callee.ident, "std.mem.asBytes"))
+        return error.ExpectedHasherWrite;
+    if (bytes.args.len != 1 or bytes.args[0] != .unary_op or bytes.args[0].unary_op.op != .addr_of)
+        return error.ExpectedHasherWrite;
+    // The bytes are the storage of the value that was bound for exactly this
+    // write, so `std.mem.asBytes` is handed its address and not a copy.
+    const addressed = operandIdent(bytes.args[0].unary_op.operand.*) orelse return error.ExpectedHasherWrite;
+    if (!std.mem.eql(u8, addressed, value_binding)) return error.ExpectedHasherWrite;
+    return write;
+}
+
+// Rust's `Hasher::write_uN` default writes the value's OWN bytes, which are
+// native-endian. There is no endian conversion to emit and nothing to
+// allocate: the value is bound at its own declared type and its address is
+// handed to the hasher the source borrowed.
+test "lower: a generic Hasher write_N default writes the value's own native bytes" {
+    inline for ([_]ir.types.Prim{ .u64, .u8, .usize }) |primitive| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const case = HasherMethodCase{
+            .method = try std.fmt.allocPrint(alloc, "write_{s}", .{@tagName(primitive)}),
+            .primitive = primitive,
+            .argument = primitive,
+        };
+        const pkg = try genericHasherPackage(alloc, case, .none);
+        const stmts = try fnBodyStmts(try findFnDecl(pkg.files[0], "hash"));
+        try std.testing.expectEqual(@as(usize, 2), stmts.len);
+        const binding = stmts[0];
+        if (binding != .let_stmt) return error.ExpectedNativeByteBinding;
+        if (binding.let_stmt.ty == null or binding.let_stmt.ty.? != .prim)
+            return error.ExpectedNativeByteBinding;
+        try std.testing.expectEqual(@as(ast.Prim, @field(ast.Prim, @tagName(primitive))), binding.let_stmt.ty.?.prim);
+        try std.testing.expectEqualStrings("value", operandIdent(binding.let_stmt.init) orelse
+            return error.ExpectedNativeByteBinding);
+        _ = try hasherWriteCall(stmts[1], "state", binding.let_stmt.name);
+
+        const source = try emit.emitFile(alloc, &pkg.files[0]);
+        try std.testing.expect(std.mem.indexOf(u8, source, "std.mem.asBytes") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "Endian") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "nativeToLittle") == null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "allocator:") == null);
+        try std.testing.expectEqual(@as(usize, 0), runtimeImportCount(pkg.files[0]));
+    }
+}
+
+// A source implementation of the primitive write is the answer the crate wrote
+// down. It has to win only for its own receiver, and everything else still
+// gets the default bytes — which is why the default sits in the else arm of a
+// comptime type comparison rather than replacing the call.
+test "lower: a source Hasher implementation answers write_N before the default bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try genericHasherPackage(alloc, hasher_method_cases[0], .both);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "hash"));
+    const branches = typeSelectionBranches(body, "H", "SeaHasher") orelse
+        return error.ExpectedHasherTypeSelection;
+    if (branches[0] != .call) return error.ExpectedSourceOverride;
+    try std.testing.expectEqualStrings("write_u64", calleeName(branches[0].call.callee.*) orelse
+        return error.ExpectedSourceOverride);
+    try std.testing.expectEqual(@as(usize, 1), branches[0].call.args.len);
+    // The branch calls the source's own method ON THE RECEIVER, which is the
+    // only thing that can be a `Hasher` for this instantiation.
+    if (branches[0].call.callee.* != .field_access) return error.ExpectedSourceOverride;
+    try std.testing.expectEqualStrings("state", operandIdent(branches[0].call.callee.field_access.target.*) orelse
+        return error.ExpectedSourceOverride);
+
+    // Everything the branch did not claim keeps the default bytes.
+    if (branches[1] != .block) return error.ExpectedNativeByteDefault;
+    const fallback = branches[1].block;
+    if (fallback.stmts.len != 2) return error.ExpectedNativeByteDefault;
+    const binding = fallback.stmts[0];
+    if (binding != .let_stmt) return error.ExpectedNativeByteBinding;
+    _ = try hasherWriteCall(fallback.stmts[1], "state", binding.let_stmt.name);
+
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write_u64(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write(") != null);
+}
+
+// With no primitive write of its own, the crate's `write` is still the answer
+// for its own hasher. Its self type here has no declaration, so the method
+// landed at module scope under its own emitted name. Only the matching array
+// instantiation can call that declaration; every other H reaches its own
+// `write` member with the same native bytes.
+test "lower: an absent write_N reaches the source's own hoisted write declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try genericHasherPackage(alloc, hasher_method_cases[0], .byte_write_hoisted);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "hash"));
+    if (body != .if_expr) return error.ExpectedHasherTypeSelection;
+    const selection = body.if_expr;
+    if (selection.cond.* != .bin_op or selection.cond.bin_op.op != .equal)
+        return error.ExpectedHasherTypeSelection;
+    try std.testing.expectEqualStrings("H", typeValueName(selection.cond.bin_op.lhs.*) orelse
+        return error.ExpectedHasherTypeSelection);
+    // The self type this branch claims is the one the impl declared, and it is
+    // compared as a type rather than by name.
+    if (selection.cond.bin_op.rhs.* != .type_value) return error.ExpectedHasherTypeSelection;
+    if (selection.cond.bin_op.rhs.type_value != .array) return error.ExpectedHasherTypeSelection;
+    try std.testing.expectEqual(@as(u64, 8), selection.cond.bin_op.rhs.type_value.array.len);
+    const array_element = selection.cond.bin_op.rhs.type_value.array.elem.*;
+    if (array_element != .prim) return error.ExpectedHasherTypeSelection;
+    try std.testing.expectEqual(ast.Prim.u8, array_element.prim);
+
+    // Both arms borrow the exact primitive binding. Only the array arm can
+    // hand the receiver to the source's module-hoisted array declaration.
+    for ([_]*const ast.Expr{ selection.then_body, selection.else_body orelse return error.ExpectedHasherWrite }, 0..) |arm, index| {
+        if (arm.* != .block or arm.block.stmts.len != 2) return error.ExpectedNativeByteDefault;
+        const binding = arm.block.stmts[0];
+        if (binding != .let_stmt) return error.ExpectedNativeByteBinding;
+        if (binding.let_stmt.ty == null or binding.let_stmt.ty.? != .prim)
+            return error.ExpectedNativeByteBinding;
+        try std.testing.expectEqual(ast.Prim.u64, binding.let_stmt.ty.?.prim);
+        try std.testing.expectEqualStrings("value", operandIdent(binding.let_stmt.init) orelse
+            return error.ExpectedNativeByteBinding);
+        if (index == 1) {
+            // The fallback is the actual instantiated H, never the array.
+            _ = try hasherWriteCall(arm.block.stmts[1], "state", binding.let_stmt.name);
+            continue;
+        }
+        const write_stmt = arm.block.stmts[1];
+        if (write_stmt != .expr_stmt or write_stmt.expr_stmt.* != .call) return error.ExpectedHasherWrite;
+        const write = write_stmt.expr_stmt.call;
+        // The selected array declaration takes this receiver's own storage.
+        if (write.callee.* != .ident or !std.mem.eql(u8, write.callee.ident, "write"))
+            return error.ExpectedHoistedWriteTarget;
+        try std.testing.expectEqual(@as(usize, 2), write.args.len);
+        if (write.args[0] != .unary_op or write.args[0].unary_op.op != .addr_of)
+            return error.ExpectedHoistedWriteTarget;
+        // `state` is already a pointer: borrow its pointee, not the handle.
+        const addressed_receiver = write.args[0].unary_op.operand.*;
+        if (addressed_receiver != .unary_op or addressed_receiver.unary_op.op != .deref)
+            return error.ExpectedHoistedWriteTarget;
+        try std.testing.expectEqualStrings("state", operandIdent(addressed_receiver.unary_op.operand.*) orelse
+            return error.ExpectedHoistedWriteTarget);
+        if (write.args[1] != .call or write.args[1].call.callee.* != .ident or
+            !std.mem.eql(u8, write.args[1].call.callee.ident, "std.mem.asBytes"))
+        {
+            return error.ExpectedHoistedWriteTarget;
+        }
+        const bytes = write.args[1].call;
+        if (bytes.args.len != 1 or bytes.args[0] != .unary_op or bytes.args[0].unary_op.op != .addr_of)
+            return error.ExpectedHoistedWriteTarget;
+        try std.testing.expectEqualStrings(binding.let_stmt.name, operandIdent(write.args[1].call.args[0].unary_op.operand.*) orelse
+            return error.ExpectedHoistedWriteTarget);
+    }
+
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "Endian") == null);
+}
+
+// `write` and `finish` carry no integer of their own, so there is no default
+// body to reach for: the receiver answers them directly, and a crate that
+// implements them gets its own method for its own receiver.
+test "lower: a generic Hasher write and finish stay the receiver's own methods" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // No source implementation: no selection, no default, just the call.
+    for ([_]HasherMethodCase{ hasher_method_cases[2], hasher_method_cases[3] }) |case| {
+        var scene = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scene.deinit();
+        const pkg = try genericHasherPackage(scene.allocator(), case, .none);
+        const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "hash"));
+        if (body != .call) return error.ExpectedMemberCall;
+        try std.testing.expectEqualStrings(case.method, calleeName(body.call.callee.*) orelse
+            return error.ExpectedMemberCall);
+        if (body.call.callee.* != .field_access) return error.ExpectedMemberCall;
+        try std.testing.expectEqualStrings("state", operandIdent(body.call.callee.field_access.target.*) orelse
+            return error.ExpectedMemberCall);
+    }
+
+    // With a source implementation the same call is claimed for that hasher.
+    const pkg = try genericHasherPackage(alloc, hasher_method_cases[3], .finish_only);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "hash"));
+    const branches = typeSelectionBranches(body, "H", "SeaHasher") orelse
+        return error.ExpectedHasherTypeSelection;
+    if (branches[0] != .call) return error.ExpectedSourceOverride;
+    try std.testing.expectEqualStrings("finish", calleeName(branches[0].call.callee.*) orelse
+        return error.ExpectedSourceOverride);
+    try std.testing.expectEqual(@as(usize, 0), branches[0].call.args.len);
+    if (branches[1] != .call) return error.ExpectedMemberCall;
+    try std.testing.expectEqualStrings("finish", calleeName(branches[1].call.callee.*) orelse
+        return error.ExpectedMemberCall);
+}
+
+// ── A source trait's associated function ───────────────────────────────────
+
+/// The implementations a `I::digits()` call can be answered by.
+const AssociatedImplShape = enum {
+    /// `impl DigitCount for Counter { fn digits() -> usize }`
+    concrete,
+    /// `impl<T: DigitBase> DigitCount for T { fn digits() -> usize }` — the
+    /// unique blanket that answers for EVERY instantiation.
+    blanket,
+    /// Two blanket impls of the same associated function.
+    two_blankets,
+    /// A blanket impl beside a concrete one for the same function.
+    blanket_and_concrete,
+};
+
+/// Lower `fn count<I: DigitCount>() -> usize { I::digits() }`, where the call
+/// records its Self type on the generic instantiation record the way the
+/// frontend does for a bound-associated function.
+fn sourceAssociatedPackage(alloc: std.mem.Allocator, shape: AssociatedImplShape) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const count = try addLowerEntity(&graph, .fn_, "count", root);
+    const trait_id = try addLowerEntity(&graph, .trait_, "DigitCount", root);
+    // The method belongs to the trait, which is what makes this an associated
+    // function of `Self` rather than a free function.
+    const assoc_method = try addLowerEntity(&graph, .method_ref, "digits", trait_id);
+
+    // Only the impls this SHAPE declares exist. An impl block the crate never
+    // wrote has no entity and no body row, and hoisting walks the whole symbol
+    // table rather than a module's item list — so an entity left here without a
+    // body is a declaration the lowering reaches and has nothing to lower.
+    const declares_concrete = shape == .concrete or shape == .blanket_and_concrete;
+    const declares_blanket_one = shape == .blanket or shape == .two_blankets or
+        shape == .blanket_and_concrete;
+    const declares_blanket_two = shape == .two_blankets;
+
+    var counter: ir.spine.EntityId = 0;
+    var concrete_impl: ir.spine.EntityId = 0;
+    var concrete_fn: ir.spine.EntityId = 0;
+    if (declares_concrete) {
+        counter = try addLowerEntity(&graph, .struct_, "Counter", root);
+        // A trait impl over a type THIS crate declares is parented to it and
+        // named `Trait for Self`, which is what lets `digits` be a member of
+        // `Counter` rather than a free function beside an empty nominal.
+        concrete_impl = try addLowerEntity(&graph, .impl_, "DigitCount for Counter", counter);
+        concrete_fn = try addLowerEntity(&graph, .fn_, "digits", concrete_impl);
+    }
+    // `impl<T: DigitBase> DigitCount for T` resolves `T` to no declaration, so
+    // the frontend leaves the impl parented to the module that declares it.
+    var blanket_one: ir.spine.EntityId = 0;
+    var blanket_one_fn: ir.spine.EntityId = 0;
+    if (declares_blanket_one) {
+        blanket_one = try addLowerEntity(&graph, .impl_, "DigitCount for T", root);
+        blanket_one_fn = try addLowerEntity(&graph, .fn_, "digits", blanket_one);
+    }
+    var blanket_two: ir.spine.EntityId = 0;
+    var blanket_two_fn: ir.spine.EntityId = 0;
+    if (declares_blanket_two) {
+        blanket_two = try addLowerEntity(&graph, .impl_, "DigitCount for T", root);
+        blanket_two_fn = try addLowerEntity(&graph, .fn_, "digits", blanket_two);
+    }
+
+    const usize_ty: ir.types.Type = .{ .prim = .usize };
+    const lexical: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "I", .id = null }},
+    ) } };
+    // 0: I, 1: usize, 2: `Counter`, 3: the blanket self type, 4: the call's own
+    // instantiation record — the generic_inst of the TRAIT METHOD it names,
+    // which is what tells the backend which `Self` the call was written for.
+    const types = [_]ir.types.Type{
+        lexical,
+        usize_ty,
+        .{ .path = .{ .segments = try alloc.dupe(
+            ir.types.PathSegment,
+            &.{.{ .name = "Counter", .id = if (declares_concrete) counter else null }},
+        ) } },
+        .{ .path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{.{ .name = "T", .id = null }}) } },
+        .{ .generic_inst = .{
+            .decl = assoc_method,
+            .args = .{ .params = try alloc.dupe(ir.types.Type, &.{lexical}) },
+        } },
+    };
+
+    const call = try typedExpr(&model, 4, .{ .call = .{
+        .call_kind = .{ .associated = assoc_method },
+        .args = &.{},
+    } });
+    const body = try typedExpr(&model, 1, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    const digits_tail = try typedExpr(&model, 1, litInt(3));
+    const digits_body = try typedExpr(&model, 1, .{ .block = .{
+        .statements = &.{},
+        .tail = digits_tail,
+        .labelled = null,
+    } });
+
+    const trait_path = ir.types.Path{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+        .{ .name = "DigitCount", .id = trait_id },
+    }) };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[count] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = usize_ty,
+        .generic_params = &.{"I"},
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "I",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                trait_path.segments,
+            ) } }}),
+        } }}), .where_clauses = &.{} },
+        .body = body,
+    } };
+    body_rows[trait_id] = .{ .trait_ = .{
+        .name = "DigitCount",
+        .methods = &.{.{ .name = "digits", .ret = usize_ty }},
+    } };
+    const declared_functions = [_]struct { ir.spine.EntityId, bool }{
+        .{ concrete_fn, declares_concrete },
+        .{ blanket_one_fn, declares_blanket_one },
+        .{ blanket_two_fn, declares_blanket_two },
+    };
+    for (declared_functions) |entry| {
+        if (!entry[1]) continue;
+        body_rows[entry[0]] = .{ .fn_ = .{
+            .params = &.{},
+            .ret = usize_ty,
+            .body = digits_body,
+        } };
+    }
+    if (declares_concrete) {
+        // `struct Counter;` — a unit struct, which the frontend records with
+        // `.layout = .unit` and no fields — plus the `digits` its impl
+        // contributes. The member is what gives the nominal something to
+        // render; a unit struct with no methods is an empty container, and an
+        // empty container is not a Zig declaration. An associated function has
+        // no `self`, so the record carries no receiver.
+        const counter_methods = try alloc.alloc(ir.bodies.StructMethod, 1);
+        counter_methods[0] = .{
+            .name = "digits",
+            .visibility = .public,
+            .params = &.{},
+            .ret = usize_ty,
+            .body = digits_body,
+        };
+        body_rows[counter] = .{ .struct_ = .{
+            .layout = .unit,
+            .methods = counter_methods,
+        } };
+    }
+    // Arena-owned, like every other generic record in this file: the parameter
+    // list outlives the literal the fixture writes it from, and a slice of a
+    // stack temporary is not storage the lowering may read.
+    const blanket_generics: ir.types.Generics = .{
+        .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "T",
+            .bounds = &.{},
+        } }}),
+        .where_clauses = &.{},
+    };
+    if (declares_concrete) {
+        body_rows[concrete_impl] = .{ .impl_ = .{
+            .self_ty = types[2],
+            .trait_path = trait_path,
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{concrete_fn}),
+        } };
+    }
+    if (declares_blanket_one) {
+        body_rows[blanket_one] = .{ .impl_ = .{
+            .self_ty = types[3],
+            .trait_path = trait_path,
+            .generics = blanket_generics,
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{blanket_one_fn}),
+        } };
+    }
+    if (declares_blanket_two) {
+        body_rows[blanket_two] = .{ .impl_ = .{
+            .self_ty = types[3],
+            .trait_path = trait_path,
+            .generics = blanket_generics,
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{blanket_two_fn}),
+        } };
+    }
+
+    var items: std.ArrayListUnmanaged(ir.spine.EntityId) = .empty;
+    defer items.deinit(alloc);
+    try items.appendSlice(alloc, &.{ count, trait_id });
+    if (declares_concrete) {
+        try items.appendSlice(alloc, &.{ counter, concrete_impl });
+    }
+    if (declares_blanket_one) {
+        try items.append(alloc, blanket_one);
+    }
+    if (declares_blanket_two) {
+        try items.append(alloc, blanket_two);
+    }
+    try addBareCrate(&graph, alloc, "source_associated", root, items.items);
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "source_associated",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// `I::digits()` records the `Self` type on the call, so the answer is chosen by
+// the instantiation rather than by what the method returns or by a same-named
+// function in another impl. A concrete implementation answers for its own type
+// and refuses every other one: there is no built-in default for a source trait.
+test "lower: a source trait's associated function is selected by the instantiated Self type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sourceAssociatedPackage(alloc, .concrete);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "count"));
+    const branches = typeSelectionBranches(body, "I", "Counter") orelse
+        return error.ExpectedSelfTypeSelection;
+    if (branches[0] != .call) return error.ExpectedSourceOverride;
+    try std.testing.expectEqualStrings("digits", calleeName(branches[0].call.callee.*) orelse
+        return error.ExpectedSourceOverride);
+    // An associated function of `Self` takes no receiver: the type it is
+    // written for IS the receiver.
+    try std.testing.expectEqual(@as(usize, 0), branches[0].call.args.len);
+    // The else arm is a refusal, not an integer-shaped answer.
+    if (branches[1] != .builtin or !std.mem.eql(u8, branches[1].builtin.name, "compileError"))
+        return error.ExpectedAssociatedRefusal;
+    if (branches[1].builtin.args.len != 1 or branches[1].builtin.args[0] != .lit or
+        branches[1].builtin.args[0].lit != .str or branches[1].builtin.args[0].lit.str.len == 0)
+    {
+        return error.ExpectedAssociatedRefusal;
+    }
+
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "compileError") != null);
+    // The implementation is the crate's own declaration, reached through the
+    // type it was written for. That is the SHAPE of the callee, not the way it
+    // is spelled: a field access whose target is the instantiated `Self` type
+    // itself, so no other impl of the same trait could have answered the name.
+    if (branches[0].call.callee.* != .field_access) return error.ExpectedSourceOverride;
+    const implementation = branches[0].call.callee.field_access;
+    try std.testing.expectEqualStrings("digits", implementation.field_name);
+    if (implementation.target.* != .type_value) return error.ExpectedSourceOverride;
+    try std.testing.expectEqualStrings("Counter", try expectNamedType(implementation.target.type_value));
+}
+
+// A blanket impl IS every instantiation of the receiver, so there is no type
+// comparison left to make and no arm that could refuse. The call names the
+// hoisted declaration and instantiates it with the lexical `Self`.
+test "lower: a unique blanket impl answers the associated function for every instantiation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sourceAssociatedPackage(alloc, .blanket);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "count"));
+    if (body != .call) return error.ExpectedBlanketAssociatedCall;
+    try std.testing.expectEqualStrings("digits", calleeName(body.call.callee.*) orelse
+        return error.ExpectedBlanketAssociatedCall);
+    try std.testing.expectEqual(@as(usize, 0), body.call.args.len);
+    try std.testing.expectEqual(@as(usize, 1), body.call.generic_args.len);
+    try std.testing.expectEqualStrings("I", try expectNamedType(body.call.generic_args[0]));
+}
+
+// Two answers for one function is not a choice the backend may make. Choosing
+// the first would silently pick an implementation the source never preferred,
+// and choosing the last would depend on declaration order.
+test "lower: two impls that both answer one associated function are ambiguous" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expectError(
+        error.AmbiguousTraitImplMatch,
+        sourceAssociatedPackage(alloc, .two_blankets),
+    );
+    // A blanket beside a concrete one is the same question: the blanket already
+    // answers for the concrete type's instantiation.
+    try std.testing.expectError(
+        error.AmbiguousTraitImplMatch,
+        sourceAssociatedPackage(alloc, .blanket_and_concrete),
+    );
+}
+
+// ── The receiver a default body has to reach ───────────────────────────────
+
+/// How the receiver a default body is handed is spelled: a thin pointer the
+/// source borrowed, an owned place this frame owns, or an owned value this
+/// frame built.
+const ReceiverShape = struct {
+    /// The source parameter the receiver is reached through, and whether that
+    /// parameter is itself the handle.
+    param: []const u8,
+    borrowed_pointer: bool,
+};
+
+/// Lower `fn record(..)` whose only statement is the canonical Hasher
+/// primitive-write tag over the receiver `shape` describes.
+///
+/// The receiver shapes differ in what has to survive the write: a thin pointer
+/// is already the handle and is forwarded unchanged, an owned place keeps its
+/// storage through the address of the place itself, and an owned value this
+/// frame built has no storage to borrow and is bound as a variable.
+fn receiverShapePackage(alloc: std.mem.Allocator, shape: ReceiverShape) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const record = try addLowerEntity(&graph, .fn_, "record", root);
+    const handle_def = try addLowerEntity(&graph, .field, shape.param, record);
+    const value_def = try addLowerEntity(&graph, .field, "value", record);
+    const sea = try addLowerEntity(&graph, .struct_, "SeaHasher", root);
+    const wrapper = try addLowerEntity(&graph, .struct_, "Wrapper", root);
+    const inner_def = try addLowerEntity(&graph, .field, "inner", wrapper);
+
+    const unit: ir.types.Type = .{ .prim = .unit };
+    const bytes: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const sea_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "SeaHasher", .id = sea }},
+    ) } };
+    const wrapper_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "Wrapper", .id = wrapper }},
+    ) } };
+    // 0: u64, 1: `SeaHasher`, 2: `&SeaHasher`, 3: `Wrapper`, 4: unit,
+    // 5: the borrowed bytes a `write` takes.
+    const types = [_]ir.types.Type{
+        .{ .prim = .u64 },
+        sea_ty,
+        .{ .reference = &.{ .mut = true, .pointee = sea_ty } },
+        wrapper_ty,
+        unit,
+        bytes,
+    };
+
+    const receiver: ir.exprs.NodeId = switch (shape.borrowed_pointer) {
+        true => try typedExpr(&model, 2, .{ .path = .{ .def = handle_def, .generic_args = &.{} } }),
+        false => blk: {
+            // An owned place: a field of the wrapper the frame was handed.
+            const owner = try typedExpr(&model, 3, .{ .path = .{ .def = handle_def, .generic_args = &.{} } });
+            break :blk try typedExpr(&model, 1, .{ .field = .{
+                .base = owner,
+                .field = "inner",
+                .resolved = inner_def,
+            } });
+        },
+    };
+    const value = try typedExpr(&model, 0, .{ .path = .{ .def = value_def, .generic_args = &.{} } });
+    const call = try typedExpr(&model, 4, .{ .core_call = .{
+        .function = .hash_write_primitive,
+        .generic_args = try alloc.dupe(ir.types.Type, &.{.{ .prim = .u64 }}),
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{ receiver, value }),
+    } });
+    const body = try typedExpr(&model, 4, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    const params = try alloc.dupe(ir.items.Param, &.{
+        // The receiver parameter is the handle itself when the source borrowed
+        // one, and an owned value this frame has to bind otherwise.
+        .{ .name = shape.param, .ty = types[if (shape.borrowed_pointer) 2 else 3], .span = span },
+        .{ .name = "value", .ty = types[0], .span = span },
+    });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[record] = .{ .fn_ = .{
+        .params = params,
+        .ret = unit,
+        .body = body,
+    } };
+    // A `write` the receiver's own type declares, so the member call the
+    // default body emits has a declaration to reach.
+    const write_body = try typedExpr(&model, 4, .{ .block = .{
+        .statements = &.{},
+        .tail = try typedExpr(&model, 4, .{ .unit = {} }),
+        .labelled = null,
+    } });
+    const write_method: ir.bodies.StructMethod = .{
+        .name = "write",
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "bytes", .ty = types[5], .span = span },
+        }),
+        .ret = unit,
+        .body = write_body,
+        .receiver = .mut_ref,
+    };
+    body_rows[sea] = .{ .struct_ = .{
+        .methods = try alloc.dupe(ir.bodies.StructMethod, &.{write_method}),
+    } };
+    body_rows[wrapper] = .{ .struct_ = .{ .fields = try alloc.dupe(ir.items.Field, &.{
+        .{ .name = "inner", .ty = types[1], .visibility = .public, .span = span },
+    }) } };
+
+    try addBareCrate(&graph, alloc, "receiver_shape", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{ record, sea, wrapper },
+    ));
+    const rust_ir = ir.RustIr{
+        .crate_name = "receiver_shape",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// A `&mut T` parameter IS the handle in Zig. Reading through it and handing
+// the value on would produce `*const T` where the source promised `&mut`, and
+// the runtime helpers that advance the reader write through it.
+test "lower: a default body forwards a borrowed pointer receiver unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try receiverShapePackage(alloc, .{ .param = "state", .borrowed_pointer = true });
+    const stmts = try fnBodyStmts(try findFnDecl(pkg.files[0], "record"));
+    // No rebinding at all: the receiver arrives as the parameter did.
+    try std.testing.expectEqual(@as(usize, 2), stmts.len);
+    const binding = stmts[0];
+    if (binding != .let_stmt) return error.ExpectedNativeByteBinding;
+    try std.testing.expectEqualStrings("value", operandIdent(binding.let_stmt.init) orelse
+        return error.ExpectedNativeByteBinding);
+    const write = stmts[1];
+    if (write != .expr_stmt or write.expr_stmt.* != .call) return error.ExpectedHasherWrite;
+    const callee = write.expr_stmt.call.callee.*;
+    if (callee != .field_access or !std.mem.eql(u8, callee.field_access.field_name, "write"))
+        return error.ExpectedHasherWrite;
+    const target = callee.field_access.target.*;
+    // The pointer, not the value it points at.
+    if (target != .ident) return error.ExpectedReceiverIdentity;
+    try std.testing.expectEqualStrings("state", target.ident);
+}
+
+// An owned place is not a handle: the write needs the hasher, and the frame
+// owns it, so the default binds a POINTER to the place rather than a copy of
+// what it holds. A copy would write into storage the caller still owns.
+test "lower: a default body binds an owned place by address instead of copying it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try receiverShapePackage(alloc, .{ .param = "holder", .borrowed_pointer = false });
+    const stmts = try fnBodyStmts(try findFnDecl(pkg.files[0], "record"));
+    try std.testing.expectEqual(@as(usize, 3), stmts.len);
+    const receiver_binding = stmts[0];
+    if (receiver_binding != .let_stmt) return error.ExpectedReceiverIdentity;
+    // The frame owns the place but does not write to it through this binding.
+    try std.testing.expect(!receiver_binding.let_stmt.is_mut);
+    const place = receiver_binding.let_stmt.init;
+    if (place != .unary_op or place.unary_op.op != .addr_of) return error.ExpectedReceiverIdentity;
+    if (place.unary_op.operand.* != .field_access) return error.ExpectedReceiverIdentity;
+    try std.testing.expectEqualStrings("inner", place.unary_op.operand.field_access.field_name);
+    try std.testing.expectEqualStrings("holder", operandIdent(place.unary_op.operand.field_access.target.*) orelse
+        return error.ExpectedReceiverIdentity);
+
+    const value_binding = stmts[1];
+    if (value_binding != .let_stmt) return error.ExpectedNativeByteBinding;
+    _ = try hasherWriteCall(stmts[2], receiver_binding.let_stmt.name, value_binding.let_stmt.name);
+}
+
+// ── A reader parameter that names a generated binding ──────────────────────
+
+/// Lower `fn drain(..) -> ()` calling `fill_buf` then `consume(1)` on a
+/// `BufRead` receiver whose parameter is spelled `param` and is either the
+/// handle itself or a value the frame has to bind.
+fn bufReadPointerPackage(
+    alloc: std.mem.Allocator,
+    param: []const u8,
+    borrowed_pointer: bool,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const drain = try addLowerEntity(&graph, .fn_, "drain", root);
+    const reader_def = try addLowerEntity(&graph, .field, param, drain);
+    const consume = try addLowerEntity(&graph, .method_ref, "consume", drain);
+    const fill_buf = try addLowerEntity(&graph, .method_ref, "fill_buf", drain);
+
+    const lexical: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "R", .id = null }},
+    ) } };
+    const byte_slice: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const bound: ir.types.Bound = .{ .path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+        .{ .name = "std", .id = null },
+        .{ .name = "io", .id = null },
+        .{ .name = "BufRead", .id = null },
+    }) }, .args = &.{} };
+    // 0: R, 1: the byte slice, 2: `&mut R`, 3: usize, 4: unit.
+    const types = [_]ir.types.Type{
+        lexical,
+        byte_slice,
+        .{ .reference = &.{ .mut = true, .pointee = lexical } },
+        .{ .prim = .usize },
+        .{ .prim = .unit },
+    };
+
+    const receiver = try typedExpr(&model, if (borrowed_pointer) 2 else 0, .{
+        .path = .{ .def = reader_def, .generic_args = &.{} },
+    });
+    const one = try typedExpr(&model, 3, litInt(1));
+    const consume_call = try typedExpr(&model, 4, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .mutable,
+        .method = consume,
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{one}),
+    } });
+    const fill_call = try typedExpr(&model, 4, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .mutable,
+        .method = fill_buf,
+        .args = &.{},
+    } });
+    const body = try typedExpr(&model, 4, .{ .block = .{
+        .statements = try alloc.dupe(ir.exprs.NodeId, &.{
+            try model.stmt(.{ .expr = fill_call }),
+            try model.stmt(.{ .expr = consume_call }),
+        }),
+        .tail = null,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[drain] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{ .name = param, .ty = types[if (borrowed_pointer) 2 else 0], .span = span }}),
+        .ret = types[4],
+        .generic_params = &.{"R"},
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "R",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{bound}),
+        } }}), .where_clauses = &.{} },
+        .body = body,
+    } };
+    try addBareCrate(&graph, alloc, "bufread_pointer", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{drain},
+    ));
+    const rust_ir = ir.RustIr{
+        .crate_name = "bufread_pointer",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// `&mut R` is the handle: the runtime helpers advance the reader through it,
+// so the original pointer is what reaches them and not a value read out of it.
+test "lower: a BufRead receiver that is already a pointer is forwarded to the runtime unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try bufReadPointerPackage(alloc, "reader", true);
+    const decl = try findFnDecl(pkg.files[0], "drain");
+    // `R` is emitted as a comptime type parameter of its own, so the SOURCE
+    // parameter is the one beside it. Reading index 0 would compare the
+    // runtime's reader argument against the generic's spelling.
+    if (decl.params.len != 2) return error.ExpectedReceiverParameter;
+    if (!decl.params[0].is_comptime or decl.params[1].is_comptime) return error.ExpectedReceiverParameter;
+    const reader_param = decl.params[1];
+    const stmts = try fnBodyStmts(decl);
+    try std.testing.expectEqual(@as(usize, 2), stmts.len);
+    var advanced: usize = 0;
+    for (stmts) |stmt| {
+        if (stmt != .expr_stmt or stmt.expr_stmt.* != .call) return error.ExpectedRuntimeCall;
+        const call = stmt.expr_stmt.call;
+        const callee = calleeName(call.callee.*) orelse return error.ExpectedRuntimeCall;
+        if (!std.mem.startsWith(u8, callee, "r2z.io.")) return error.ExpectedRuntimeCall;
+        // `fill_buf` hands back a view and takes the reader by address inside
+        // its own expression; `consume` names the reader as its own argument,
+        // and it is the one that proves nothing read out of the pointer.
+        if (call.args.len != 2) continue;
+        advanced += 1;
+        if (call.args[0] != .ident) return error.ExpectedReceiverIdentity;
+        try std.testing.expectEqualStrings(reader_param.name, call.args[0].ident);
+    }
+    try std.testing.expectEqual(@as(usize, 1), advanced);
+}
+
+/// The capture the `@typeInfo` guard a conditional reader copy is selected by
+/// binds, or null when `expr` is not that guard.
+///
+/// The guard asks whether the receiver already IS a thin pointer, which only
+/// reflection can answer, and it answers it in a capture the emitter mints.
+/// That capture is the emitter's OWN binding: it shares a namespace with every
+/// name the source wrote, so a source that already claimed the spelling is
+/// exactly the case this name has to survive.
+fn bufReadThinPointerCapture(expr: ast.Expr) ?[]const u8 {
+    if (expr != .match_expr) return null;
+    const guarded = expr.match_expr;
+    if (guarded.target.* != .builtin) return null;
+    if (!std.mem.eql(u8, guarded.target.builtin.name, "typeInfo")) return null;
+    if (guarded.target.builtin.args.len != 1) return null;
+    if (guarded.target.builtin.args[0] != .builtin) return null;
+    if (!std.mem.eql(u8, guarded.target.builtin.args[0].builtin.name, "TypeOf")) return null;
+    if (guarded.arms.len != 2) return null;
+    const pointer = guarded.arms[0];
+    if (pointer.patterns.len != 1) return null;
+    if (pointer.patterns[0] != .enum_literal) return null;
+    if (!std.mem.eql(u8, pointer.patterns[0].enum_literal, "pointer")) return null;
+    return (pointer.capture orelse return null).name;
+}
+
+// A Rust parameter is allowed to be called anything, including the name the
+// emitter wants to use for the binding it introduces. Reusing it would shadow
+// the parameter and make the body read — and write — a different reader.
+test "lower: a source parameter named like a generated reader binding is alpha-renamed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const reserved = "__r2z_bufread_pointer";
+    const pkg = try bufReadPointerPackage(alloc, reserved, false);
+    const decl = try findFnDecl(pkg.files[0], "drain");
+    // `R` is emitted as a comptime type parameter of its own, so the SOURCE
+    // parameter is the one beside it.
+    if (decl.params.len != 2) return error.ExpectedReceiverParameter;
+    if (!decl.params[0].is_comptime or decl.params[1].is_comptime) return error.ExpectedReceiverParameter;
+    const reader_param = decl.params[1];
+
+    // The frame owns the reader by value, so it binds it in the BODY, under the
+    // name the source gave it. The signature keeps a name of its own: one
+    // identifier cannot be both the parameter and the local that shadows it,
+    // and a body reading that local would read — and write — a reader the
+    // caller never passed.
+    const stmts = try fnBodyStmts(decl);
+    if (stmts.len != 3) return error.ExpectedReceiverBinding;
+    const binding = stmts[0];
+    if (binding != .let_stmt) return error.ExpectedReceiverBinding;
+    try std.testing.expectEqualStrings(reserved, binding.let_stmt.name);
+    try std.testing.expect(!std.mem.eql(u8, reader_param.name, binding.let_stmt.name));
+
+    // The copy itself is CONDITIONAL, because a bare type parameter may
+    // instantiate as a thin pointer and a thin pointer is already its own
+    // handle: a copy of it would be a pointer to a pointer. So the pointer
+    // instantiation's storage is void and every other one is the parameter
+    // itself — the guard the sibling generic-reader scene pins.
+    const selection = binding.let_stmt.init;
+    if (selection != .if_expr) return error.ExpectedReceiverBinding;
+    if (selection.if_expr.then_body.* != .unit) return error.ExpectedReceiverBinding;
+    const otherwise = selection.if_expr.else_body orelse return error.ExpectedReceiverBinding;
+    try std.testing.expectEqualStrings(reader_param.name, operandIdent(otherwise.*) orelse
+        return error.ExpectedReceiverBinding);
+
+    // And the guard's own capture is minted fresh: the source parameter has
+    // already claimed the spelling the emitter wanted for it.
+    const capture = bufReadThinPointerCapture(selection.if_expr.cond.*) orelse
+        return error.ExpectedReceiverBinding;
+    try std.testing.expect(std.mem.startsWith(u8, capture, reserved));
+    try std.testing.expect(!std.mem.eql(u8, capture, reserved));
+}
+
+// ── A generic `H: core::hash::Hasher` and the hashers that answer it ────────
+
+/// The source graph standing beside a `H: core::hash::Hasher` receiver.
+///
+/// Every scene retains the canonical bound and canonical method provenance.
+/// The homonym scene also declares and implements a different local trait for
+/// SeaHasher; that legal impl must never supply the canonical call.
+const SourceHasherScene = enum {
+    /// `impl core::hash::Hasher for SeaHasher` declaring `write_u64`, `write`
+    /// and `finish`. The primitive write is the source's own answer.
+    primitive_override,
+    /// The same implementation WITHOUT the primitive write: the default bytes
+    /// have to route through the `write` it does declare.
+    byte_write_only,
+    /// Canonical byte-write implementations coexist with a local Hasher trait
+    /// whose genuine `write_u64` implementation must not hijack the default.
+    local_trait_homonym,
+};
+
+/// Lower `pub fn digest<H: core::hash::Hasher>(state: &mut H, value: u64)`
+/// whose only statement is `state.write_u64(value)`, beside two real hashers
+/// and the two callers that instantiate the generic at each of them.
+fn sourceHasherPackage(alloc: std.mem.Allocator, scene: SourceHasherScene) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const digest = try addLowerEntity(&graph, .fn_, "digest", root);
+    const state_def = try addLowerEntity(&graph, .field, "state", digest);
+    const value_def = try addLowerEntity(&graph, .field, "value", digest);
+
+    var local_trait: ir.spine.EntityId = 0;
+    if (scene == .local_trait_homonym)
+        local_trait = try addLowerEntity(&graph, .trait_, "Hasher", root);
+    // Like genericHasherPackage, this reference comes from the external
+    // canonical trait, never from the crate-local homonym.
+    const write_u64_ref = try addLowerEntity(&graph, .method_ref, "write_u64", digest);
+
+    const sea = try addLowerEntity(&graph, .struct_, "SeaHasher", root);
+    const checksum = try addLowerEntity(&graph, .struct_, "Checksum", root);
+    const sea_impl = try addLowerEntity(&graph, .impl_, "Hasher for SeaHasher", sea);
+    const checksum_impl = try addLowerEntity(&graph, .impl_, "Hasher for Checksum", checksum);
+    const homonym_impl = if (scene == .local_trait_homonym)
+        try addLowerEntity(&graph, .impl_, "Hasher for SeaHasher", sea)
+    else
+        0;
+    const sea_write_u64 = if (scene == .primitive_override)
+        try addLowerEntity(&graph, .fn_, "write_u64", sea_impl)
+    else
+        0;
+    const sea_write = try addLowerEntity(&graph, .fn_, "write", sea_impl);
+    const sea_finish = try addLowerEntity(&graph, .fn_, "finish", sea_impl);
+    const checksum_write = try addLowerEntity(&graph, .fn_, "write", checksum_impl);
+    const checksum_finish = try addLowerEntity(&graph, .fn_, "finish", checksum_impl);
+    const homonym_write_u64 = if (scene == .local_trait_homonym)
+        try addLowerEntity(&graph, .fn_, "write_u64", homonym_impl)
+    else
+        0;
+
+    const sea_caller = try addLowerEntity(&graph, .fn_, "digest_sea", root);
+    const checksum_caller = try addLowerEntity(&graph, .fn_, "digest_checksum", root);
+    const sea_state = try addLowerEntity(&graph, .field, "state", sea_caller);
+    const sea_value = try addLowerEntity(&graph, .field, "value", sea_caller);
+    const checksum_state = try addLowerEntity(&graph, .field, "state", checksum_caller);
+    const checksum_value = try addLowerEntity(&graph, .field, "value", checksum_caller);
+
+    const lexical: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "H", .id = null }},
+    ) } };
+    const u64_ty: ir.types.Type = .{ .prim = .u64 };
+    const bytes: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    // 0: H, 1: `&mut H`, 2: u64, 3: `SeaHasher`, 4: `&mut SeaHasher`,
+    // 5: `Checksum`, 6: `&mut Checksum`, 7: `&[u8]`, 8: unit,
+    // 9/10: the instantiation record each caller records.
+    var types = [_]ir.types.Type{
+        lexical,
+        .{ .reference = &.{ .mut = true, .pointee = lexical } },
+        u64_ty,
+        .{ .path = .{ .segments = try alloc.dupe(
+            ir.types.PathSegment,
+            &.{.{ .name = "SeaHasher", .id = sea }},
+        ) } },
+        undefined,
+        .{ .path = .{ .segments = try alloc.dupe(
+            ir.types.PathSegment,
+            &.{.{ .name = "Checksum", .id = checksum }},
+        ) } },
+        undefined,
+        bytes,
+        .{ .prim = .unit },
+        undefined,
+        undefined,
+    };
+    // The borrows and the instantiation records both name the hasher they are
+    // about, so they are filled in after the table itself exists rather than
+    // out of its own initializer.
+    types[4] = .{ .reference = &.{ .mut = true, .pointee = types[3] } };
+    types[6] = .{ .reference = &.{ .mut = true, .pointee = types[5] } };
+    types[9] = .{ .generic_inst = .{
+        .decl = digest,
+        .args = .{ .params = try alloc.dupe(ir.types.Type, &.{types[3]}) },
+    } };
+    types[10] = .{ .generic_inst = .{
+        .decl = digest,
+        .args = .{ .params = try alloc.dupe(ir.types.Type, &.{types[5]}) },
+    } };
+
+    const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = state_def, .generic_args = &.{} } });
+    const value = try typedExpr(&model, 2, .{ .path = .{ .def = value_def, .generic_args = &.{} } });
+    const call = try typedExpr(&model, 8, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .mutable,
+        .method = write_u64_ref,
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{value}),
+    } });
+    const body = try typedExpr(&model, 8, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    // Each declared hasher method keeps the signature the trait gives it, so
+    // the emitted file is a program a caller could actually have written.
+    const unit_tail = try typedExpr(&model, 8, .{ .unit = {} });
+    const zero_tail = try typedExpr(&model, 2, litInt(0));
+    var caller_bodies: [2]ir.exprs.NodeId = undefined;
+    const caller_specs = [_]struct {
+        caller: ir.spine.EntityId,
+        state: ir.spine.EntityId,
+        value: ir.spine.EntityId,
+        handle_type: ir.exprs.TypeId,
+        record: ir.exprs.TypeId,
+    }{
+        .{ .caller = sea_caller, .state = sea_state, .value = sea_value, .handle_type = 4, .record = 9 },
+        .{ .caller = checksum_caller, .state = checksum_state, .value = checksum_value, .handle_type = 6, .record = 10 },
+    };
+    for (caller_specs, 0..) |spec, index| {
+        const left = try typedExpr(&model, spec.handle_type, .{
+            .path = .{ .def = spec.state, .generic_args = &.{} },
+        });
+        const right = try typedExpr(&model, 2, .{ .path = .{ .def = spec.value, .generic_args = &.{} } });
+        const site = try typedExpr(&model, spec.record, .{ .call = .{
+            .call_kind = .{ .free = digest },
+            .args = try alloc.dupe(ir.exprs.NodeId, &.{ left, right }),
+        } });
+        caller_bodies[index] = try typedExpr(&model, 8, .{ .block = .{
+            .statements = &.{},
+            .tail = site,
+            .labelled = null,
+        } });
+    }
+
+    const bound_segments: []const ir.types.PathSegment = &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "hash", .id = null },
+        .{ .name = "Hasher", .id = null },
+    };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[digest] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "state", .ty = types[1], .span = span },
+            .{ .name = "value", .ty = types[2], .span = span },
+        }),
+        .ret = types[8],
+        .generic_params = &.{"H"},
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "H",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                bound_segments,
+            ) } }}),
+        } }}), .where_clauses = &.{} },
+        .body = body,
+    } };
+
+    // Both hashers really implement `core::hash::Hasher`, and `finish` has NO
+    // default in that trait: an implementation that declared only `write`
+    // would not be a `Hasher` at all.
+    const declared: []const struct { ir.spine.EntityId, ir.exprs.TypeId, ir.exprs.NodeId, ir.types.Type } = blk: {
+        var list = std.ArrayListUnmanaged(struct {
+            ir.spine.EntityId,
+            ir.exprs.TypeId,
+            ir.exprs.NodeId,
+            ir.types.Type,
+        }).empty;
+        defer list.deinit(alloc);
+        if (scene == .primitive_override) {
+            try list.append(alloc, .{ sea_write_u64, 4, unit_tail, types[2] });
+        }
+        try list.append(alloc, .{ sea_write, 4, unit_tail, types[7] });
+        try list.append(alloc, .{ sea_finish, 4, zero_tail, types[2] });
+        try list.append(alloc, .{ checksum_write, 6, unit_tail, types[7] });
+        try list.append(alloc, .{ checksum_finish, 6, zero_tail, types[2] });
+        break :blk try list.toOwnedSlice(alloc);
+    };
+    var sea_methods: std.ArrayListUnmanaged(ir.bodies.StructMethod) = .empty;
+    var checksum_methods: std.ArrayListUnmanaged(ir.bodies.StructMethod) = .empty;
+    for (declared) |entry| {
+        const entity = graph.symbol_table.get(entry[0]).?;
+        const is_finish = std.mem.eql(u8, entity.name, "finish");
+        // `finish` takes nothing beyond `self`; every other method takes the
+        // bytes or the integer it is declared with.
+        const params = try alloc.alloc(ir.items.Param, if (is_finish) 1 else 2);
+        params[0] = .{
+            .name = "self",
+            .ty = if (is_finish)
+                .{ .reference = &.{ .mut = false, .pointee = types[entry[1]].reference.pointee } }
+            else
+                types[entry[1]],
+            .span = span,
+        };
+        if (!is_finish) params[1] = .{ .name = "bytes", .ty = entry[3], .span = span };
+        body_rows[entry[0]] = .{ .fn_ = .{
+            .params = params,
+            .ret = if (is_finish) types[2] else types[8],
+            .body = try typedExpr(&model, if (is_finish) 2 else 8, .{
+                .block = .{ .statements = &.{}, .tail = entry[2], .labelled = null },
+            }),
+        } };
+        const mirror: ir.bodies.StructMethod = .{
+            .name = entity.name,
+            .visibility = .public,
+            .params = params[1..],
+            .ret = body_rows[entry[0]].fn_.ret,
+            .body = body_rows[entry[0]].fn_.body,
+            .receiver = if (is_finish) .ref_ else .mut_ref,
+        };
+        if (entry[1] == 4)
+            try sea_methods.append(alloc, mirror)
+        else
+            try checksum_methods.append(alloc, mirror);
+    }
+
+    const trait_path = ir.types.Path{ .segments = try alloc.dupe(ir.types.PathSegment, bound_segments) };
+    body_rows[sea_impl] = .{ .impl_ = .{
+        .self_ty = types[3],
+        .trait_path = trait_path,
+        .assoc_items = try alloc.dupe(ir.spine.EntityId, if (scene == .primitive_override)
+            &.{ sea_write_u64, sea_write, sea_finish }
+        else
+            &.{ sea_write, sea_finish }),
+    } };
+    body_rows[checksum_impl] = .{ .impl_ = .{
+        .self_ty = types[5],
+        .trait_path = trait_path,
+        .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{ checksum_write, checksum_finish }),
+    } };
+    if (scene == .local_trait_homonym) {
+        body_rows[local_trait] = .{ .trait_ = .{
+            .name = "Hasher",
+            .methods = &.{.{
+                .name = "write_u64",
+                .params = &.{.{ .name = "value", .ty = types[2], .span = span }},
+                .ret = types[8],
+                .receiver = .mut_ref,
+            }},
+        } };
+        body_rows[homonym_impl] = .{ .impl_ = .{
+            .self_ty = types[3],
+            .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{.{ .name = "Hasher", .id = local_trait }}) },
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{homonym_write_u64}),
+        } };
+        body_rows[homonym_write_u64] = .{ .fn_ = .{
+            .params = try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "self", .ty = types[4], .span = span },
+                .{ .name = "value", .ty = types[2], .span = span },
+            }),
+            .ret = types[8],
+            .body = try typedExpr(&model, 8, .{ .block = .{
+                .statements = &.{},
+                .tail = unit_tail,
+                .labelled = null,
+            } }),
+        } };
+        try sea_methods.append(alloc, .{
+            .name = "write_u64",
+            .visibility = .public,
+            .params = body_rows[homonym_write_u64].fn_.params[1..],
+            .ret = types[8],
+            .body = body_rows[homonym_write_u64].fn_.body,
+            .receiver = .mut_ref,
+        });
+    }
+    body_rows[sea] = .{ .struct_ = .{ .methods = try sea_methods.toOwnedSlice(alloc) } };
+    body_rows[checksum] = .{ .struct_ = .{ .methods = try checksum_methods.toOwnedSlice(alloc) } };
+
+    for (caller_specs, 0..) |spec, index| {
+        body_rows[spec.caller] = .{ .fn_ = .{
+            .params = try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "state", .ty = types[spec.handle_type], .span = span },
+                .{ .name = "value", .ty = types[2], .span = span },
+            }),
+            .ret = types[8],
+            .body = caller_bodies[index],
+        } };
+    }
+
+    const items = try alloc.alloc(ir.spine.EntityId, if (scene == .local_trait_homonym) 9 else 8);
+    items[0] = digest;
+    items[1] = sea;
+    items[2] = sea_impl;
+    items[3] = checksum;
+    items[4] = checksum_impl;
+    items[5] = sea_caller;
+    items[6] = checksum_caller;
+    var item_count: usize = 7;
+    if (scene == .local_trait_homonym) {
+        items[item_count] = local_trait;
+        item_count += 1;
+        items[item_count] = homonym_impl;
+        item_count += 1;
+    }
+    try addBareCrate(&graph, alloc, "source_hasher", root, items[0..item_count]);
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "source_hasher",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// A `@compileError` carrying one message: the instantiation has no answer,
+/// and saying so is the only honest emission.
+fn expectCompileErrorRefusal(expr: ast.Expr) !void {
+    if (expr != .builtin) return error.ExpectedCompileErrorRefusal;
+    if (!std.mem.eql(u8, expr.builtin.name, "compileError")) return error.ExpectedCompileErrorRefusal;
+    if (expr.builtin.args.len != 1 or expr.builtin.args[0] != .lit or expr.builtin.args[0].lit != .str)
+        return error.ExpectedCompileErrorRefusal;
+    if (expr.builtin.args[0].lit.str.len == 0) return error.ExpectedCompileErrorRefusal;
+}
+
+/// The refusal a receiver with no implementation ends in: a bare
+/// `@compileError`, or the fallback arm of a chain that forwards what it can
+/// first. Both answer the same question, and the chain is the better program
+/// when it is there.
+fn expectUnknownReceiverRefusal(expr: ast.Expr) !void {
+    if (expr == .match_expr) {
+        const guarded = expr.match_expr;
+        if (guarded.arms.len == 0) return error.ExpectedCompileErrorRefusal;
+        return expectCompileErrorRefusal(guarded.arms[guarded.arms.len - 1].body);
+    }
+    if (expr == .if_expr) {
+        const otherwise = expr.if_expr.else_body orelse return error.ExpectedCompileErrorRefusal;
+        return expectUnknownReceiverRefusal(otherwise.*);
+    }
+    return expectCompileErrorRefusal(expr);
+}
+
+// The generic is a contract only once real source reaches it. `digest_sea` and
+// `digest_checksum` are two ordinary callers that instantiate it at the two
+// hashers the crate really declares, and they are what makes the comptime
+// branch something a compiler has to answer rather than something nobody asked.
+test "lower: a generic Hasher is instantiated by the callers that parameterise the source's hashers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sourceHasherPackage(alloc, .primitive_override);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "comptime H: type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "digest(SeaHasher, ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "digest(Checksum, ") != null);
+    // Both hashers really implement the canonical trait, so both have a `write`
+    // to answer the default through.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "pub fn write("));
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn finish(") != null);
+}
+
+// The source's own primitive write is the answer the crate wrote down, and it
+// wins only for the hasher it was written for. Everything else still gets the
+// default bytes, which is why the default sits behind the selection.
+test "lower: a generic Hasher prefers the source's primitive write to the default bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sourceHasherPackage(alloc, .primitive_override);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "digest"));
+    var selection = body;
+    while (selection == .if_expr and !isTypeSelection(selection.if_expr.cond.*, "H", "SeaHasher"))
+        selection = (selection.if_expr.else_body orelse return error.ExpectedHasherTypeSelection).*;
+    const branches = typeSelectionBranches(selection, "H", "SeaHasher") orelse
+        return error.ExpectedHasherTypeSelection;
+    if (branches[0] != .call) return error.ExpectedSourceOverride;
+    try std.testing.expectEqualStrings("write_u64", calleeName(branches[0].call.callee.*) orelse
+        return error.ExpectedSourceOverride);
+    try std.testing.expectEqual(@as(usize, 1), branches[0].call.args.len);
+    if (branches[0].call.callee.* != .field_access) return error.ExpectedSourceOverride;
+    // The call is made on the hasher the source borrowed, which is the only
+    // thing that can be a `Hasher` for this instantiation.
+    try std.testing.expectEqualStrings("state", operandIdent(branches[0].call.callee.field_access.target.*) orelse
+        return error.ExpectedSourceOverride);
+    var otherwise = branches[1];
+    while (otherwise == .if_expr)
+        otherwise = (otherwise.if_expr.else_body orelse return error.ExpectedNativeByteDefault).*;
+    if (otherwise != .block) return error.ExpectedNativeByteDefault;
+    const fallback = otherwise.block;
+    if (fallback.stmts.len != 2) return error.ExpectedNativeByteDefault;
+    const binding = fallback.stmts[0];
+    if (binding != .let_stmt) return error.ExpectedNativeByteBinding;
+    _ = try hasherWriteCall(fallback.stmts[1], "state", binding.let_stmt.name);
+}
+
+// A hasher that declares only the byte-level `write` still owns the answer for
+// its own type. Its `write_u64` has no source declaration, so the default goes
+// through ITS `write` rather than through whatever `write_u64` the
+// instantiation happens to expose.
+test "lower: a generic Hasher routes the default bytes through the source's own write" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sourceHasherPackage(alloc, .byte_write_only);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write_u64(") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "pub fn write("));
+    // The bytes are still the value's own; only their destination changed.
+    try std.testing.expect(std.mem.indexOf(u8, source, "std.mem.asBytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "digest(SeaHasher, ") != null);
+}
+
+// A crate-local `trait Hasher` is a different trait that happens to share a
+// name. Its implementation is a real declaration and still emits, but the
+// canonical bound never promised it, so the canonical route must not reach it.
+test "lower: a crate-local trait that shares the Hasher trait's name never answers it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try sourceHasherPackage(alloc, .local_trait_homonym);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "digest"));
+    // Canonical source implementations remain selectable. Even for SeaHasher,
+    // the local primitive method must not replace the canonical byte default.
+    var selection = body;
+    while (selection == .if_expr and !isTypeSelection(selection.if_expr.cond.*, "H", "SeaHasher"))
+        selection = (selection.if_expr.else_body orelse return error.ExpectedHasherTypeSelection).*;
+    const branches = typeSelectionBranches(selection, "H", "SeaHasher") orelse
+        return error.ExpectedHasherTypeSelection;
+    if (branches[0] != .block or branches[0].block.stmts.len != 2)
+        return error.ExpectedNativeByteDefault;
+    const binding = branches[0].block.stmts[0];
+    if (binding != .let_stmt or binding.let_stmt.ty == null or binding.let_stmt.ty.? != .prim)
+        return error.ExpectedNativeByteBinding;
+    try std.testing.expectEqual(ast.Prim.u64, binding.let_stmt.ty.?.prim);
+    _ = try hasherWriteCall(branches[0].block.stmts[1], "state", binding.let_stmt.name);
+    var fallback = branches[1];
+    while (fallback == .if_expr)
+        fallback = (fallback.if_expr.else_body orelse return error.ExpectedNativeByteDefault).*;
+    if (fallback != .block or fallback.block.stmts.len != 2)
+        return error.ExpectedNativeByteDefault;
+    const fallback_binding = fallback.block.stmts[0];
+    if (fallback_binding != .let_stmt) return error.ExpectedNativeByteBinding;
+    _ = try hasherWriteCall(fallback.block.stmts[1], "state", fallback_binding.let_stmt.name);
+
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write_u64(") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "pub fn write("));
+    try std.testing.expect(std.mem.indexOf(u8, source, "std.mem.asBytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "state.write_u64(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "SeaHasher.write_u64(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "allocator:") == null);
+    try std.testing.expectEqual(@as(usize, 0), runtimeImportCount(pkg.files[0]));
+}
+
+// ── The `write_N` core tag: the source override, then the default ──────────
+
+/// What the source declares beside a `Hasher::write_N` core tag.
+const PrimitiveTagScene = enum {
+    /// Nothing: the default writes the value's own bytes and that is all.
+    none,
+    /// This primitive override beside the trait's required `write` and `finish`.
+    primitive_override,
+    /// No primitive override: the default routes through required `write`.
+    byte_write_only,
+};
+
+/// Lower `fn record(state: SeaHasher, value: P)` whose only statement is the
+/// `write_N` core tag for the primitive `primitive`.
+fn hasherPrimitiveTagPackage(
+    alloc: std.mem.Allocator,
+    primitive: ir.types.Prim,
+    scene: PrimitiveTagScene,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const record = try addLowerEntity(&graph, .fn_, "record", root);
+    const state_def = try addLowerEntity(&graph, .field, "state", record);
+    const value_def = try addLowerEntity(&graph, .field, "value", record);
+    const sea = try addLowerEntity(&graph, .struct_, "SeaHasher", root);
+
+    const unit: ir.types.Type = .{ .prim = .unit };
+    const primitive_ty: ir.types.Type = .{ .prim = primitive };
+    const bytes: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const sea_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "SeaHasher", .id = sea }},
+    ) } };
+    // 0: the primitive, 1: `SeaHasher`, 2: `&mut SeaHasher`, 3: unit,
+    // 4: the borrowed bytes a `write` takes, 5: finish's u64.
+    const types = [_]ir.types.Type{
+        primitive_ty,
+        sea_ty,
+        .{ .reference = &.{ .mut = true, .pointee = sea_ty } },
+        unit,
+        bytes,
+        .{ .prim = .u64 },
+    };
+
+    var impl_id: ir.spine.EntityId = 0;
+    var declared: ir.spine.EntityId = 0;
+    var required_write: ir.spine.EntityId = 0;
+    var finish: ir.spine.EntityId = 0;
+    if (scene != .none) {
+        impl_id = try addLowerEntity(&graph, .impl_, "Hasher for SeaHasher", sea);
+        declared = try addLowerEntity(&graph, .fn_, if (scene == .primitive_override)
+            try std.fmt.allocPrint(alloc, "write_{s}", .{@tagName(primitive)})
+        else
+            "write", impl_id);
+        required_write = if (scene == .primitive_override)
+            try addLowerEntity(&graph, .fn_, "write", impl_id)
+        else
+            declared;
+        finish = try addLowerEntity(&graph, .fn_, "finish", impl_id);
+    }
+
+    const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = state_def, .generic_args = &.{} } });
+    const value = try typedExpr(&model, 0, .{ .path = .{ .def = value_def, .generic_args = &.{} } });
+    const call = try typedExpr(&model, 3, .{ .core_call = .{
+        .function = .hash_write_primitive,
+        .generic_args = try alloc.dupe(ir.types.Type, &.{primitive_ty}),
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{ receiver, value }),
+    } });
+    const body = try typedExpr(&model, 3, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    var declared_body: ir.exprs.NodeId = 0;
+    if (scene != .none) {
+        declared_body = try typedExpr(&model, 3, .{ .block = .{
+            .statements = &.{},
+            .tail = try typedExpr(&model, 3, .{ .unit = {} }),
+            .labelled = null,
+        } });
+    }
+
+    const params = try alloc.dupe(ir.items.Param, &.{
+        .{ .name = "state", .ty = types[1], .span = span },
+        .{ .name = "value", .ty = types[0], .span = span },
+    });
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[record] = .{ .fn_ = .{
+        .params = params,
+        .ret = unit,
+        .body = body,
+    } };
+    // `struct SeaHasher;` in the scene that declares no `Hasher` impl: a unit
+    // struct, which is what the frontend records for a declaration with no
+    // field list. The type still has to exist — it is the receiver's own.
+    body_rows[sea] = .{ .struct_ = .{ .layout = .unit } };
+    if (scene != .none) {
+        // The declared method keeps the signature the trait gives it: the
+        // primitive write takes that integer, `write` takes borrowed bytes.
+        body_rows[declared] = .{ .fn_ = .{
+            .params = try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "self", .ty = types[2], .span = span },
+                .{ .name = "bytes", .ty = if (scene == .primitive_override) types[0] else types[4], .span = span },
+            }),
+            .ret = unit,
+            .body = declared_body,
+        } };
+        if (required_write != declared) body_rows[required_write] = .{ .fn_ = .{
+            .params = try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "self", .ty = types[2], .span = span },
+                .{ .name = "bytes", .ty = types[4], .span = span },
+            }),
+            .ret = unit,
+            .body = declared_body,
+        } };
+        body_rows[finish] = .{ .fn_ = .{
+            .params = &.{.{ .name = "self", .ty = .{ .reference = &.{ .mut = false, .pointee = sea_ty } }, .span = span }},
+            .ret = types[5],
+            .body = try typedExpr(&model, 5, .{ .block = .{
+                .statements = &.{},
+                .tail = try typedExpr(&model, 5, litInt(0)),
+                .labelled = null,
+            } }),
+        } };
+        const methods: []const ir.spine.EntityId = if (required_write == declared)
+            &.{ declared, finish }
+        else
+            &.{ declared, required_write, finish };
+        const mirrors = try alloc.alloc(ir.bodies.StructMethod, methods.len);
+        for (methods, 0..) |method_id, index| {
+            const method_fn = body_rows[method_id].fn_;
+            mirrors[index] = .{
+                .name = graph.symbol_table.get(method_id).?.name,
+                .visibility = .public,
+                .params = method_fn.params[1..],
+                .ret = method_fn.ret,
+                .body = method_fn.body,
+                .receiver = if (method_id == finish) .ref_ else .mut_ref,
+            };
+        }
+        body_rows[sea] = .{ .struct_ = .{ .layout = .unit, .methods = mirrors } };
+        body_rows[impl_id] = .{ .impl_ = .{
+            .self_ty = types[1],
+            .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+                .{ .name = "core", .id = null },
+                .{ .name = "hash", .id = null },
+                .{ .name = "Hasher", .id = null },
+            }) },
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, methods),
+        } };
+    }
+
+    const items = try alloc.alloc(ir.spine.EntityId, 3);
+    items[0] = record;
+    items[1] = sea;
+    items[2] = impl_id;
+    try addBareCrate(
+        &graph,
+        alloc,
+        "hasher_primitive_tag",
+        root,
+        items[0..(if (scene == .none) @as(usize, 2) else 3)],
+    );
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "hasher_primitive_tag",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// The primitive the tag names is the primitive that is written. A `usize`
+// value is pointer-sized and a `u64` value is not, so binding the value at
+// anything but its own type hands the hasher a different number of bytes on a
+// different target — a program that compiles and computes the wrong value.
+test "lower: the primitive write tag binds its value at the exact primitive it was asked for" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    inline for ([_]ir.types.Prim{ .u8, .u64, .usize, .i32 }) |primitive| {
+        const pkg = try hasherPrimitiveTagPackage(alloc, primitive, .none);
+        const stmts = try fnBodyStmts(try findFnDecl(pkg.files[0], "record"));
+        try std.testing.expectEqual(@as(usize, 2), stmts.len);
+        const binding = stmts[0];
+        if (binding != .let_stmt) return error.ExpectedNativeByteBinding;
+        if (binding.let_stmt.ty == null or binding.let_stmt.ty.? != .prim)
+            return error.ExpectedNativeByteBinding;
+        try std.testing.expectEqual(
+            @as(ast.Prim, @field(ast.Prim, @tagName(primitive))),
+            binding.let_stmt.ty.?.prim,
+        );
+        // `std.mem.asBytes` is handed the ADDRESS of that binding, so the bytes
+        // are the value's own and exactly as wide as it is.
+        _ = try hasherWriteCall(stmts[1], "state", binding.let_stmt.name);
+
+        const source = try emit.emitFile(alloc, &pkg.files[0]);
+        try std.testing.expect(std.mem.indexOf(u8, source, "std.mem.asBytes") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "Endian") == null);
+    }
+}
+
+// The source's own primitive write is the answer the crate wrote down, so the
+// default bytes are not reached at all for that hasher. The default belongs to
+// the hasher types the source never claimed.
+test "lower: the primitive write tag prefers the source's own override to the default bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try hasherPrimitiveTagPackage(alloc, .u64, .primitive_override);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write_u64(") != null);
+    // The override replaces the default rather than preceding it: a file that
+    // still writes the raw bytes would hash two things.
+    try std.testing.expect(std.mem.indexOf(u8, source, "std.mem.asBytes") == null);
+}
+
+// A source that declares only the byte-level `write` still owns the answer for
+// its own hasher: the default bytes go through ITS declaration rather than
+// through whatever `write` the instantiation happens to expose.
+test "lower: the primitive write tag routes through the source's byte write when it declares no primitive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try hasherPrimitiveTagPackage(alloc, .u64, .byte_write_only);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write_u64(") == null);
+    // The bytes are still the value's own; only their destination changed.
+    try std.testing.expect(std.mem.indexOf(u8, source, "std.mem.asBytes") != null);
+}
+
+// With nothing in the source to claim the answer, nothing in the emitted file
+// may claim a `write` the crate never declared.
+test "lower: the primitive write tag invents no hasher method of its own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try hasherPrimitiveTagPackage(alloc, .u64, .none);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "pub fn write_u64(") == null);
+    try std.testing.expectEqual(@as(usize, 0), runtimeImportCount(pkg.files[0]));
+}
+
+// ── A generic `T: core::hash::Hash` hashing into a generic `H: Hasher` ───────
+
+/// What the source declares beside a `T: core::hash::Hash` receiver.
+const GenericHashScene = enum {
+    /// Nothing: every instantiation is a primitive, and an unknown one is
+    /// refused.
+    no_source_hash,
+    /// `impl core::hash::Hash for Bytes { fn hash(&self, state: &mut SeaHasher) }`
+    /// forwarding to the hasher's own `write`.
+    source_hash_forwards_write,
+    /// The same implementation answering with an exact primitive write instead.
+    source_hash_exact_write,
+};
+
+/// One primitive a generic `Hash` receiver can forward.
+const HashPrimitiveCase = struct {
+    /// The Rust primitive the source names, and the exact identity the
+    /// descriptor's `scalar` tag has to carry for it.
+    ir: ir.types.Prim,
+    /// The Zig type the descriptor carries for it. `lowerPrim` spells Rust's
+    /// `char` as `u21`; every other primitive keeps its own name.
+    zig: ast.Prim,
+};
+
+/// The primitives a generic `Hash` receiver can forward.
+const hash_primitive_cases = [_]HashPrimitiveCase{
+    .{ .ir = .u8, .zig = .u8 },
+    .{ .ir = .u64, .zig = .u64 },
+    .{ .ir = .usize, .zig = .usize },
+    .{ .ir = .i32, .zig = .i32 },
+    .{ .ir = .bool, .zig = .bool },
+    // `char` is a 32-bit code point in Rust and a `u21` in Zig, so the runtime
+    // type it reaches through is `u21` while the tag stays `char`.
+    .{ .ir = .char, .zig = .u21 },
+};
+
+/// Lower `pub fn hash_of<T: core::hash::Hash, H: core::hash::Hasher>(value: &T,
+/// state: &mut H) -> u64` whose only statement is `value.hash(state)`, beside a
+/// real `SeaHasher`, a real `Bytes` that implements `Hash`, and the callers that
+/// instantiate the generic at each primitive.
+fn genericHashPackage(alloc: std.mem.Allocator, scene: GenericHashScene) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "hash_of", root);
+    const value_def = try addLowerEntity(&graph, .field, "value", callable);
+    const state_def = try addLowerEntity(&graph, .field, "state", callable);
+    const hash_ref = try addLowerEntity(&graph, .method_ref, "hash", callable);
+    // `Hash::hash` returns nothing, so the wrapper that returns `u64` finishes
+    // the hasher itself. That is what puts the dispatch in statement position
+    // and leaves `finish` as the body tail.
+    const finish_ref = try addLowerEntity(&graph, .method_ref, "finish", callable);
+
+    // `struct SeaHasher;` is a unit nominal, and its `Hasher` implementation is
+    // parented to it: the shape `finalizePendingImpls` leaves behind, where the
+    // impl's methods are recorded on the struct's own body and the struct renders
+    // them rather than the module hoisting them beside it.
+    const sea = try addLowerEntity(&graph, .struct_, "SeaHasher", root);
+    const sea_impl = try addLowerEntity(&graph, .impl_, "Hasher for SeaHasher", sea);
+    const sea_write = try addLowerEntity(&graph, .fn_, "write", sea_impl);
+    // The primitive write is in the crate only in the scene whose `Hash`
+    // implementation names it. An absent method stays absent rather than leaving
+    // a reference with nothing declared behind it.
+    const sea_write_u64 = if (scene == .source_hash_exact_write)
+        try addLowerEntity(&graph, .fn_, "write_u64", sea_impl)
+    else
+        0;
+    const sea_finish = try addLowerEntity(&graph, .fn_, "finish", sea_impl);
+
+    // `struct Bytes { data: &'static [u8], tag: u64 }` — the value whose own
+    // `Hash` implementation the scenes write, and whose fields are what that
+    // implementation forwards.
+    const bytes = try addLowerEntity(&graph, .struct_, "Bytes", root);
+    const data_field = try addLowerEntity(&graph, .field, "data", bytes);
+    const tag_field = try addLowerEntity(&graph, .field, "tag", bytes);
+
+    // `impl core::hash::Hash for Bytes`, parented to the MODULE rather than to
+    // `Bytes`, so `hash` hoists to module scope and its call hands the receiver
+    // over BY ADDRESS ahead of the source arguments. The `no_source_hash` scene
+    // declares no implementation at all, and therefore no method with it.
+    var bytes_impl: ir.spine.EntityId = 0;
+    var bytes_hash: ir.spine.EntityId = 0;
+    var hash_self: ir.spine.EntityId = 0;
+    var hash_state: ir.spine.EntityId = 0;
+    var write_ref: ir.spine.EntityId = 0;
+    var write_u64_ref: ir.spine.EntityId = 0;
+    if (scene != .no_source_hash) {
+        bytes_impl = try addLowerEntity(&graph, .impl_, "Hash for Bytes", root);
+        bytes_hash = try addLowerEntity(&graph, .fn_, "hash", bytes_impl);
+        hash_self = try addLowerEntity(&graph, .field, "self", bytes_hash);
+        hash_state = try addLowerEntity(&graph, .field, "state", bytes_hash);
+        write_ref = try addLowerEntity(&graph, .method_ref, "write", bytes_hash);
+        write_u64_ref = try addLowerEntity(&graph, .method_ref, "write_u64", bytes_hash);
+    }
+
+    var caller_ids: [hash_primitive_cases.len]ir.spine.EntityId = undefined;
+    var caller_value: [hash_primitive_cases.len]ir.exprs.NodeId = undefined;
+    var caller_state: [hash_primitive_cases.len]ir.exprs.NodeId = undefined;
+    for (hash_primitive_cases, 0..) |case, index| {
+        caller_ids[index] = try addLowerEntity(&graph, .fn_, try std.fmt.allocPrint(
+            alloc,
+            "hash_{s}",
+            .{@tagName(case.ir)},
+        ), root);
+        caller_value[index] = try addLowerEntity(&graph, .field, "value", caller_ids[index]);
+        caller_state[index] = try addLowerEntity(&graph, .field, "state", caller_ids[index]);
+    }
+
+    const lexical_t: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "T", .id = null }},
+    ) } };
+    const lexical_h: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "H", .id = null }},
+    ) } };
+    const u64_ty: ir.types.Type = .{ .prim = .u64 };
+    const bytes_ty: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const sea_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "SeaHasher", .id = sea }},
+    ) } };
+    const bytes_ty_nominal: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "Bytes", .id = bytes }},
+    ) } };
+    // 0: T, 1: `&T`, 2: H, 3: `&mut H`, 4: u64, 5: `SeaHasher`, 6: `&mut
+    // SeaHasher`, 7: `Bytes`, 8: `&Bytes`, 9: `&[u8]`, 10: unit, 11: `&SeaHasher`
+    // — the receiver `finish` is declared over — and from 12 one borrowed
+    // primitive plus one instantiation record per caller.
+    const caller_type_count = 2 * hash_primitive_cases.len;
+    var types = [_]ir.types.Type{
+        lexical_t,
+        .{ .reference = &.{ .mut = false, .pointee = lexical_t } },
+        lexical_h,
+        .{ .reference = &.{ .mut = true, .pointee = lexical_h } },
+        u64_ty,
+        sea_ty,
+        .{ .reference = &.{ .mut = true, .pointee = sea_ty } },
+        bytes_ty_nominal,
+        .{ .reference = &.{ .mut = false, .pointee = bytes_ty_nominal } },
+        bytes_ty,
+        .{ .prim = .unit },
+        .{ .reference = &.{ .mut = false, .pointee = sea_ty } },
+    } ++ ([_]ir.types.Type{.{ .prim = .u8 }} ** caller_type_count);
+
+    const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = value_def, .generic_args = &.{} } });
+    const state = try typedExpr(&model, 3, .{ .path = .{ .def = state_def, .generic_args = &.{} } });
+    const call = try typedExpr(&model, 4, .{
+        .method_call = .{
+            .receiver = receiver,
+            .receiver_mode = .shared,
+            .method = hash_ref,
+            .args = try alloc.dupe(ir.exprs.NodeId, &.{state}),
+            // `Hash::hash<H: Hasher>` names its own parameter, and `state` is the
+            // argument that fills it.
+            .generic_args = try alloc.dupe(ir.types.Type, &.{lexical_h}),
+        },
+    });
+    // `Hash::hash` returns nothing, so a wrapper that returns `u64` does it in
+    // two statements and finishes the hasher once at the end. That is what puts
+    // the dispatch in STATEMENT position and leaves `finish` as the body tail.
+    const finish_call = try typedExpr(&model, 4, .{ .method_call = .{
+        .receiver = state,
+        .receiver_mode = .mutable,
+        .method = finish_ref,
+        .args = &.{},
+    } });
+    const body = try typedExpr(&model, 4, .{ .block = .{
+        .statements = try alloc.dupe(ir.exprs.NodeId, &.{try model.stmt(.{ .expr = call })}),
+        .tail = finish_call,
+        .labelled = null,
+    } });
+
+    var caller_bodies: [hash_primitive_cases.len]ir.exprs.NodeId = undefined;
+    for (hash_primitive_cases, 0..) |case, index| {
+        const wide = try alloc.create(ir.types.Type);
+        wide.* = .{ .prim = case.ir };
+        const wide_ref = try alloc.create(ir.types.Ref);
+        wide_ref.* = .{ .mut = false, .pointee = wide.* };
+        types[12 + 2 * index] = .{ .reference = wide_ref };
+        types[13 + 2 * index] = .{ .generic_inst = .{
+            .decl = callable,
+            .args = .{ .params = try alloc.dupe(ir.types.Type, &.{ wide.*, types[5] }) },
+        } };
+        const left = try typedExpr(&model, @intCast(12 + 2 * index), .{
+            .path = .{ .def = caller_value[index], .generic_args = &.{} },
+        });
+        const right = try typedExpr(&model, 6, .{
+            .path = .{ .def = caller_state[index], .generic_args = &.{} },
+        });
+        const site = try typedExpr(&model, @intCast(13 + 2 * index), .{ .call = .{
+            .call_kind = .{ .free = callable },
+            .args = try alloc.dupe(ir.exprs.NodeId, &.{ left, right }),
+        } });
+        caller_bodies[index] = try typedExpr(&model, 4, .{ .block = .{
+            .statements = &.{},
+            .tail = site,
+            .labelled = null,
+        } });
+    }
+
+    const unit_tail = try typedExpr(&model, 10, .{ .unit = {} });
+    const zero_tail = try typedExpr(&model, 4, litInt(0));
+    // `Bytes::hash<H: Hasher>` takes the SAME hasher parameter the trait names;
+    // it cannot specialise it, and it returns nothing.
+    var bytes_body: ir.exprs.NodeId = 0;
+    if (scene != .no_source_hash) {
+        const state_read = try typedExpr(&model, 3, .{ .path = .{
+            .def = hash_state,
+            .generic_args = &.{},
+        } });
+        // The value the source forwards is the receiver's OWN storage, read off
+        // the `&Bytes` the trait hands it: the bytes for the `write` scene, the
+        // tag for the exact-primitive one. Both `Hasher` methods take exactly ONE
+        // value, so a call that passed nothing was never a call the trait's own
+        // signature admits.
+        const exact = scene == .source_hash_exact_write;
+        const payload = try typedExpr(&model, if (exact) 4 else 9, .{ .field = .{
+            .base = try typedExpr(&model, 8, .{ .path = .{
+                .def = hash_self,
+                .generic_args = &.{},
+            } }),
+            .field = if (exact) "tag" else "data",
+            .resolved = if (exact) tag_field else data_field,
+        } });
+        bytes_body = try typedExpr(&model, 10, .{ .block = .{
+            .statements = &.{},
+            .tail = try typedExpr(&model, 10, .{ .method_call = .{
+                .receiver = state_read,
+                .receiver_mode = .mutable,
+                .method = if (exact) write_u64_ref else write_ref,
+                .args = try alloc.dupe(ir.exprs.NodeId, &.{payload}),
+            } }),
+            .labelled = null,
+        } });
+    }
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "value", .ty = types[1], .span = span },
+            .{ .name = "state", .ty = types[3], .span = span },
+        }),
+        .ret = types[4],
+        .generic_params = &.{ "T", "H" },
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{
+            .{ .type_ = .{
+                .name = "T",
+                .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                    ir.types.PathSegment,
+                    &.{
+                        .{ .name = "core", .id = null },
+                        .{ .name = "hash", .id = null },
+                        .{ .name = "Hash", .id = null },
+                    },
+                ) } }}),
+            } },
+            .{ .type_ = .{
+                .name = "H",
+                .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                    ir.types.PathSegment,
+                    &.{
+                        .{ .name = "core", .id = null },
+                        .{ .name = "hash", .id = null },
+                        .{ .name = "Hasher", .id = null },
+                    },
+                ) } }}),
+            } },
+        }), .where_clauses = &.{} },
+        .body = body,
+    } };
+    // `Bytes` declares the fields the source's own `Hash` implementation reads,
+    // so the emitted type carries them whether or not a scene writes that
+    // implementation. A named struct with fields is not a unit one, and saying
+    // otherwise would describe a type the source never declared.
+    body_rows[bytes] = .{ .struct_ = .{
+        .fields = try alloc.dupe(ir.items.Field, &.{
+            .{ .name = "data", .ty = types[9], .visibility = .public, .span = span },
+            .{ .name = "tag", .ty = types[4], .visibility = .public, .span = span },
+        }),
+    } };
+    body_rows[sea_write] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "self", .ty = types[6], .span = span },
+            .{ .name = "bytes", .ty = types[9], .span = span },
+        }),
+        .ret = types[10],
+        .body = try typedExpr(&model, 10, .{ .block = .{
+            .statements = &.{},
+            .tail = unit_tail,
+            .labelled = null,
+        } }),
+    } };
+    body_rows[sea_finish] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "self", .ty = types[11], .span = span },
+        }),
+        .ret = types[4],
+        .body = try typedExpr(&model, 4, .{ .block = .{
+            .statements = &.{},
+            .tail = zero_tail,
+            .labelled = null,
+        } }),
+    } };
+    // `core::hash::Hasher::write_uN(&mut self, value: uN)` is a real method over
+    // a real value, not a tag: it takes the integer the trait names.
+    if (scene == .source_hash_exact_write) {
+        body_rows[sea_write_u64] = .{ .fn_ = .{
+            .params = try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "self", .ty = types[6], .span = span },
+                .{ .name = "value", .ty = types[4], .span = span },
+            }),
+            .ret = types[10],
+            .body = try typedExpr(&model, 10, .{ .block = .{
+                .statements = &.{},
+                .tail = unit_tail,
+                .labelled = null,
+            } }),
+        } };
+    }
+    // The impl's own methods, recorded on the struct body the way
+    // `finalizePendingImpls` records them: same name, same signature without the
+    // receiver, same body node. That record is what makes the struct render them
+    // itself instead of leaving a unit nominal beside hoisted free functions.
+    var sea_method_ids: std.ArrayListUnmanaged(ir.spine.EntityId) = .empty;
+    if (scene == .source_hash_exact_write) try sea_method_ids.append(alloc, sea_write_u64);
+    try sea_method_ids.append(alloc, sea_write);
+    try sea_method_ids.append(alloc, sea_finish);
+    var sea_methods: std.ArrayListUnmanaged(ir.bodies.StructMethod) = .empty;
+    for (sea_method_ids.items) |method_id| {
+        const method = body_rows[method_id].fn_;
+        try sea_methods.append(alloc, .{
+            .name = graph.symbol_table.get(method_id).?.name,
+            .visibility = .public,
+            .params = method.params[1..],
+            .ret = method.ret,
+            .body = method.body,
+            // `finish` is the one method `Hasher` declares over `&self`; both
+            // writes are over `&mut self`.
+            .receiver = if (method_id == sea_finish) .ref_ else .mut_ref,
+        });
+    }
+    body_rows[sea] = .{ .struct_ = .{
+        .layout = .unit,
+        .methods = try sea_methods.toOwnedSlice(alloc),
+    } };
+    body_rows[sea_impl] = .{ .impl_ = .{
+        .self_ty = types[5],
+        .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+            .{ .name = "core", .id = null },
+            .{ .name = "hash", .id = null },
+            .{ .name = "Hasher", .id = null },
+        }) },
+        .assoc_items = try sea_method_ids.toOwnedSlice(alloc),
+    } };
+    if (scene != .no_source_hash) {
+        // `impl core::hash::Hash for Bytes` names the trait it implements and the
+        // type it answers for. That body is the only thing the source override is
+        // found through — `blanketImplMethod` walks `assoc_items`, and the impl
+        // loop in `lowerGenericSourceMethodCall` reads `trait_path` — so without
+        // it the crate declares no `Hash` implementation at all and the scene
+        // lowers to the primitive chain alone.
+        body_rows[bytes_impl] = .{ .impl_ = .{
+            .self_ty = types[7],
+            .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+                .{ .name = "core", .id = null },
+                .{ .name = "hash", .id = null },
+                .{ .name = "Hash", .id = null },
+            }) },
+            .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{bytes_hash}),
+        } };
+        // `core::hash::Hash::hash<H: Hasher>(&self, state: &mut H)` returns
+        // nothing, and the implementation names its own `H` because that is the
+        // signature the trait declares.
+        body_rows[bytes_hash] = .{ .fn_ = .{
+            .params = try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "self", .ty = types[8], .span = span },
+                .{ .name = "state", .ty = types[3], .span = span },
+            }),
+            .ret = types[10],
+            .generic_params = &.{"H"},
+            .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+                .name = "H",
+                .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                    ir.types.PathSegment,
+                    &.{
+                        .{ .name = "core", .id = null },
+                        .{ .name = "hash", .id = null },
+                        .{ .name = "Hasher", .id = null },
+                    },
+                ) } }}),
+            } }}), .where_clauses = &.{} },
+            .body = bytes_body,
+        } };
+    }
+    for (hash_primitive_cases, 0..) |_, index| {
+        body_rows[caller_ids[index]] = .{ .fn_ = .{
+            .params = try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "value", .ty = types[12 + 2 * index], .span = span },
+                .{ .name = "state", .ty = types[6], .span = span },
+            }),
+            .ret = types[4],
+            .body = caller_bodies[index],
+        } };
+    }
+
+    // The crate's own items are the wrapper, the hasher and its `Hasher` impl,
+    // the hashed type, one caller per primitive case, and — for every scene
+    // but `no_source_hash` — the `Hash` impl the source wrote. The list is
+    // built by appending because its length is the caller count PLUS that
+    // impl, and sizing the storage from the callers alone left the last write
+    // one past the end.
+    var item_list: std.ArrayListUnmanaged(ir.spine.EntityId) = .empty;
+    try item_list.appendSlice(alloc, &.{ callable, sea, sea_impl, bytes });
+    try item_list.appendSlice(alloc, &caller_ids);
+    if (scene != .no_source_hash) try item_list.append(alloc, bytes_impl);
+    try addBareCrate(&graph, alloc, "generic_hash", root, item_list.items);
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "generic_hash",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// A crate's own `Hash` implementation is the answer the source wrote down, so
+// what a consumer of it is owed is the boundary it is reached through: the
+// implementation keeps the trait's own hasher parameter, the storage it reads
+// keeps the types the source declared, and a receiver nobody implemented fails
+// to compile rather than being answered by an accident of the descriptor.
+test "lower: a generic Hash receiver keeps the source's own Hash implementation reachable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try genericHashPackage(alloc, .source_hash_forwards_write);
+
+    // `impl Hash for Bytes` is published with the trait's OWN hasher parameter:
+    // it cannot specialise `H`, because the answer it gives has to be the same
+    // implementation for every instantiation the generic reaches. A hasher
+    // pinned to one type here would leave every other `T` unhashable.
+    const implementation = try findFnDecl(pkg.files[0], "hash");
+    // A lowered free function declares its type parameters as `comptime`
+    // parameters — the very `comptime H: type` a call site spells — so the
+    // hasher parameter the trait names is read there.
+    const implementation_generics = try comptimeTypeParams(alloc, implementation);
+    try std.testing.expectEqual(@as(usize, 1), implementation_generics.len);
+    try std.testing.expectEqualStrings("H", implementation_generics[0]);
+
+    // The storage that implementation reads is the storage the source declared,
+    // at the types it declared: what a consumer ends up hashing is a real
+    // borrowed byte view and a real `u64`, not a descriptor the source never
+    // wrote and not a by-value copy that aliased the owner's own allocation.
+    const hashed = try findStructDecl(pkg.files[0], "Bytes");
+    var bytes_view: ?ast.Type = null;
+    var bytes_tag: ?ast.Type = null;
+    for (hashed.fields) |field| {
+        if (std.mem.eql(u8, field.name, "data")) bytes_view = field.ty;
+        if (std.mem.eql(u8, field.name, "tag")) bytes_tag = field.ty;
+    }
+    const view = bytes_view orelse return error.MissingHashedStorage;
+    if (view != .slice) return error.ExpectedHashedStorageAbi;
+    try std.testing.expect(view.slice.is_const);
+    if (view.slice.elem.* != .prim) return error.ExpectedHashedStorageAbi;
+    try std.testing.expectEqual(ast.Prim.u8, view.slice.elem.prim);
+    const tag = bytes_tag orelse return error.MissingHashedStorage;
+    if (tag != .prim) return error.ExpectedHashedStorageAbi;
+    try std.testing.expectEqual(ast.Prim.u64, tag.prim);
+
+    // A receiver nobody implemented is REFUSED where the walk switches on the
+    // layout, with a compile error and a message, rather than hashed by an
+    // integer default no `Hash` implementation ever wrote.
+    try expectUnknownReceiverRefusal(try derivedWalkOf((try hashPairIn(pkg.files[0])).value));
+}
+
+// An implementation the crate wrote does not have to stop at `write`: when it
+// names an exact primitive write, the hasher is still reached through the ONE
+// boundary `core::hash::Hasher` declares, and that boundary is what a consumer
+// implements. Each method keeps the trait's own parameter type, so what the
+// implementation hands over is exactly what the consumer's method receives.
+test "lower: the hasher a source Hash implementation writes through keeps the trait's own ABI" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try genericHashPackage(alloc, .source_hash_exact_write);
+
+    // `write` takes the borrowed bytes and nothing else. `write_u64` takes the
+    // integer ITSELF — not a pointer to it and not a `usize`, which is the one
+    // value a Rust `Hash` implementation holding a `u64` field can forward.
+    // `finish` takes no value at all and answers `u64`.
+    const hasher = try findStructDecl(pkg.files[0], "SeaHasher");
+    // A Zig member keeps the receiver, so what the trait declares is everything
+    // AFTER it — and that receiver is a pointer to the hasher the source wrote.
+    const byte_write = try findStructMethod(hasher, "write");
+    try expectHasherReceiver(byte_write, "SeaHasher");
+    const byte_write_params = traitParamsOf(byte_write);
+    try std.testing.expectEqual(@as(usize, 1), byte_write_params.len);
+    if (byte_write_params[0].ty != .slice) return error.ExpectedByteWriteAbi;
+    try std.testing.expect(byte_write_params[0].ty.slice.is_const);
+    if (byte_write_params[0].ty.slice.elem.* != .prim) return error.ExpectedByteWriteAbi;
+    try std.testing.expectEqual(ast.Prim.u8, byte_write_params[0].ty.slice.elem.prim);
+    const primitive_write = try findStructMethod(hasher, "write_u64");
+    try expectHasherReceiver(primitive_write, "SeaHasher");
+    const primitive_write_params = traitParamsOf(primitive_write);
+    try std.testing.expectEqual(@as(usize, 1), primitive_write_params.len);
+    if (primitive_write_params[0].ty != .prim) return error.ExpectedPrimitiveWriteAbi;
+    try std.testing.expectEqual(ast.Prim.u64, primitive_write_params[0].ty.prim);
+    const finished = try findStructMethod(hasher, "finish");
+    try expectHasherReceiver(finished, "SeaHasher");
+    try std.testing.expectEqual(@as(usize, 0), traitParamsOf(finished).len);
+    if (finished.ret_type != .prim) return error.ExpectedFinishAbi;
+    try std.testing.expectEqual(ast.Prim.u64, finished.ret_type.prim);
+
+    // The exact primitive write is reachable from OUTSIDE the package only
+    // because it is a method of the hasher the source declared. A scene whose
+    // implementation stops at `write` publishes no such method at all, so the
+    // one above is the source's own answer and not a method the lowering
+    // invented for it.
+    var forwarding_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer forwarding_arena.deinit();
+    const forwarding = try genericHashPackage(
+        forwarding_arena.allocator(),
+        .source_hash_forwards_write,
+    );
+    try std.testing.expectError(
+        error.MissingStructMethod,
+        findStructMethod(try findStructDecl(forwarding.files[0], "SeaHasher"), "write_u64"),
+    );
+}
+
+// The chain only means something once the primitives are really instantiated.
+// The callee declares `T: core::hash::Hash`, so EVERY caller's `T` slot is the
+// descriptor that callee bound asks for — a bare `u8` there would be the wrong
+// type. Each slot therefore carries the runtime type and the layout that type
+// has, and the `H` slot stays the plain declared struct it always was.
+test "lower: the generic Hash chain is instantiated at every primitive the source can name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try genericHashPackage(alloc, .no_source_hash);
+    const wrapper = try findFnDecl(pkg.files[0], "hash_of");
+    // The signature keeps the PARAMETER: forwarding `T` forwards the
+    // descriptor, and only the body is projected. Both names ride as comptime
+    // type parameters, ahead of `value` and `state`.
+    const wrapper_generics = try comptimeTypeParams(alloc, wrapper);
+    try std.testing.expectEqual(@as(usize, 2), wrapper_generics.len);
+    try std.testing.expectEqualStrings("T", wrapper_generics[0]);
+    try std.testing.expectEqualStrings("H", wrapper_generics[1]);
+    try std.testing.expect(wrapper.params[0].is_comptime);
+    try std.testing.expect(wrapper.params[1].is_comptime);
+
+    // Every primitive the source can name is instantiated at the descriptor
+    // that names it. `usize` and `u64` are two different descriptors even where
+    // the Zig runtime type erases the difference, because the two reach two
+    // different `Hasher` writes — and `bool` and `char` reach neither the width
+    // nor the signedness their name suggests.
+    for (hash_primitive_cases) |case| {
+        const decl = try findFnDecl(pkg.files[0], try std.fmt.allocPrint(
+            alloc,
+            "hash_{s}",
+            .{@tagName(case.ir)},
+        ));
+        const body = try fnBodyExpr(decl);
+        if (body != .call) return error.ExpectedInstantiationCall;
+        try std.testing.expectEqual(@as(usize, 2), body.call.generic_args.len);
+        try expectScalarHashDescriptor(body.call.generic_args[0], case.zig, @tagName(case.ir));
+        // The hasher slot is a declared struct, not a Hash bound, so it is the
+        // plain name and nothing else.
+        try std.testing.expectEqualStrings("SeaHasher", try expectNamedType(body.call.generic_args[1]));
+    }
+}
+
+/// The declaration a file emits for a source nominal, as the emitter spells a
+/// container that has something to hold.
+fn findStructDecl(file: ast.File, name: []const u8) !ast.StructDecl {
+    for (file.decls) |decl| {
+        if (decl != .struct_decl) continue;
+        if (std.mem.eql(u8, decl.struct_decl.name, name)) return decl.struct_decl;
+    }
+    return error.MissingStructDeclaration;
+}
+
+/// One method a lowered nominal renders inside its own body.
+fn findStructMethod(owner: ast.StructDecl, name: []const u8) !ast.FnDecl {
+    for (owner.decls) |decl| {
+        if (decl != .fn_decl) continue;
+        if (std.mem.eql(u8, decl.fn_decl.name, name)) return decl.fn_decl;
+    }
+    return error.MissingStructMethod;
+}
+
+/// The names of the `comptime T: type` parameters a lowered declaration
+/// declares.
+///
+/// A Rust type parameter reaches a lowered free function or a lowered method as
+/// a comptime PARAMETER — the emitter fills `FnDecl.generic_params` only for the
+/// two Hash helpers it generates itself — so this is where what a declaration is
+/// generic over is read from.
+fn comptimeTypeParams(alloc: std.mem.Allocator, decl: ast.FnDecl) ![][]const u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (decl.params) |param| {
+        if (!param.is_comptime) continue;
+        if (param.ty != .named or !std.mem.eql(u8, param.ty.named, "type")) continue;
+        try names.append(alloc, param.name);
+    }
+    return names.toOwnedSlice(alloc);
+}
+
+/// The parameters a trait declares for a lowered member, the receiver removed.
+///
+/// A Zig member keeps its receiver: Rust spells `&self`/`&mut self` as the
+/// method's own first parameter, so the trait's parameter list is everything
+/// after it and never the receiver itself.
+fn traitParamsOf(method: ast.FnDecl) []const ast.FnParam {
+    if (method.params.len == 0) return &.{};
+    return method.params[1..];
+}
+
+/// The receiver a `core::hash::Hasher` member is reached through: a thin
+/// pointer to the hasher the source declared.
+fn expectHasherReceiver(method: ast.FnDecl, owner: []const u8) !void {
+    if (method.params.len == 0) return error.ExpectedHasherReceiver;
+    if (method.params[0].ty != .ptr) return error.ExpectedHasherReceiver;
+    try std.testing.expectEqualStrings(owner, try expectNamedType(method.params[0].ty.ptr.elem.*));
+}
+
+/// A scalar `RustHashType`: the runtime type the descriptor carries, and a
+/// layout whose `scalar` field names WHICH primitive that runtime type is.
+///
+/// The layout cannot be a `void` tag, because `usize` and `u64` would then be
+/// the same layout and a target that differs between them would hash as one.
+/// The field therefore reads the enum's own member for the primitive — its
+/// exact Rust identity — rather than carrying the value.
+fn expectScalarHashDescriptor(ty: ast.Type, runtime: ast.Prim, tag: []const u8) !void {
+    if (ty != .expr) return error.ExpectedHashDescriptor;
+    const built = ty.expr.*;
+    if (built != .call) return error.ExpectedHashDescriptor;
+    const descriptor = built.call;
+    if (descriptor.callee.* != .ident) return error.ExpectedHashDescriptor;
+    try std.testing.expectEqual(@as(usize, 1), descriptor.generic_args.len);
+    if (descriptor.generic_args[0] != .prim) return error.ExpectedHashDescriptor;
+    try std.testing.expectEqual(runtime, descriptor.generic_args[0].prim);
+    if (descriptor.args.len != 1) return error.ExpectedHashDescriptor;
+    if (descriptor.args[0] != .struct_init) return error.ExpectedHashDescriptor;
+    const layout = descriptor.args[0].struct_init;
+    try std.testing.expectEqual(@as(usize, 1), layout.fields.len);
+    // The layout field is named for the LAYOUT, and its value names the
+    // primitive: `RustHashLayout{ .scalar = @FieldType(RustHashLayout, "scalar").<prim> }`.
+    try std.testing.expectEqualStrings("scalar", layout.fields[0].name);
+    // The layout names the RUST primitive, which is not always the Zig one it
+    // lowers to: Rust's `char` is a `u21` in Zig and stays `char` here.
+    try expectScalarLayoutTag(layout.fields[0].expr, tag);
+}
+
+/// `@FieldType(r2z.RustHashLayout, "scalar").<tag>` — the enum member the
+/// scalar's own identity names, read back out of the AST.
+fn expectScalarLayoutTag(expr: ast.Expr, tag: []const u8) !void {
+    if (expr != .field_access) return error.ExpectedHashLayoutTag;
+    if (!std.mem.eql(u8, expr.field_access.field_name, tag)) return error.ExpectedHashLayoutTag;
+    if (expr.field_access.target.* != .builtin) return error.ExpectedHashLayoutTag;
+    const query = expr.field_access.target.builtin;
+    if (!std.mem.eql(u8, query.name, "FieldType")) return error.ExpectedHashLayoutTag;
+    if (query.args.len != 2) return error.ExpectedHashLayoutTag;
+    if (query.args[0] != .type_value or query.args[0].type_value != .named) return error.ExpectedHashLayoutTag;
+    if (query.args[1] != .lit or query.args[1].lit != .str) return error.ExpectedHashLayoutTag;
+    if (!std.mem.eql(u8, query.args[1].lit.str, "scalar")) return error.ExpectedHashLayoutTag;
+}
+
+// ── Releasing an owner: a container walks its elements ─────────────────────
+
+/// Lower `fn release_it(..) -> ()` whose body is empty, over a by-value owner.
+fn ownerReleasePackage(alloc: std.mem.Allocator, container: bool) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "release_it", root);
+    const item_field = try addLowerEntity(&graph, .field, "item", callable);
+
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    // 0: `String`, 1: `Vec<String>`, 2: unit.
+    const types = [_]ir.types.Type{
+        string_ty,
+        .{ .external_nominal = .{
+            .path = &.{ "alloc", "vec", "Vec" },
+            .args = try alloc.dupe(ir.types.Type, &.{string_ty}),
+        } },
+        .{ .prim = .unit },
+    };
+    const item_ty = if (container) types[1] else types[0];
+    const read = try typedExpr(&model, if (container) 1 else 0, .{
+        .path = .{ .def = item_field, .generic_args = &.{} },
+    });
+    const body = try typedExpr(&model, 2, .{ .block = .{
+        .statements = try alloc.dupe(ir.exprs.NodeId, &.{try model.stmt(.{ .expr = read })}),
+        .tail = null,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{ .name = "item", .ty = item_ty, .span = span }}),
+        .ret = types[2],
+        .body = body,
+    } };
+    try addBareCrate(&graph, alloc, "owner_release", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{callable},
+    ));
+    const rust_ir = ir.RustIr{
+        .crate_name = "owner_release",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// A container holds owners of its own, and freeing the slab alone would leak
+// every element in it. The release therefore goes through the runtime helper
+// that knows how to walk them, rather than the container's own `deinit`.
+test "lower: a container owner is released through the runtime helper that walks its elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try ownerReleasePackage(alloc, true);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.alloc.dropTemporary(allocator, &item)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "defer item.deinit(allocator);") == null);
+}
+
+// A scalar owner has no elements, so there is nothing to walk and the loop is
+// resolved away at comptime. The plain release is both correct and cheaper.
+test "lower: a scalar owner is released without a runtime element walk" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try ownerReleasePackage(alloc, false);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "defer item.deinit(allocator);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "dropTemporary") == null);
+}
+
+// ── A closure created inside another closure's body ────────────────────────
+
+/// Lower `fn run() -> String` whose body is
+/// `let text = seed; let outer = move |_| { let inner = move |_| text; inner(()) }; outer(())`.
+fn nestedCapturePackage(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const run = try addLowerEntity(&graph, .fn_, "run", root);
+    const seed = try addLowerEntity(&graph, .const_, "seed", root);
+    const text_entity = try addLowerEntity(&graph, .const_, "text", root);
+    const outer_entity = try addLowerEntity(&graph, .const_, "outer", root);
+    const inner_entity = try addLowerEntity(&graph, .const_, "inner", root);
+
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const unit_ty: ir.types.Type = .{ .prim = .unit };
+    // 0: `String`, 1: unit.
+    const types = [_]ir.types.Type{ string_ty, unit_ty };
+
+    // Both closures take exactly one unit parameter and move `text` by value,
+    // which is what the source `move |_| text` writes.
+    const captures = try alloc.dupe(ir.exprs.Capture, &.{
+        .{ .name = "text", .mode = .by_value, .ty = 0 },
+    });
+    // `ClosureExpr.params` is a slice; the closure takes exactly one unit, and a
+    // Rust closure parameter may be the wildcard `_`.
+    const unit_param = try alloc.dupe(ir.exprs.NodeId, &.{try model.pat(.{
+        .binding = .{ .name = "_", .mode = .value, .mutable = false },
+    })});
+    const inner_closure = try typedExpr(&model, 0, .{
+        .closure = .{
+            .captures = captures,
+            .params = unit_param,
+            .return_ty = null,
+            .body = .{ .statements = &.{}, .tail = try typedExpr(&model, 0, .{ .path = .{
+                .def = text_entity,
+                .generic_args = &.{},
+            } }), .labelled = null },
+            // `move |_| text` hands the capture back, so the closure is `FnOnce`.
+            .trait = .fn_once,
+        },
+    });
+    const inner_call = try typedExpr(&model, 0, .{ .call = .{
+        .call_kind = .{ .free = inner_entity },
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{try typedExpr(&model, 1, .{ .unit = {} })}),
+    } });
+    const outer_closure = try typedExpr(&model, 0, .{
+        .closure = .{
+            .captures = captures,
+            .params = unit_param,
+            .return_ty = null,
+            .body = .{
+                .statements = try alloc.dupe(ir.exprs.NodeId, &.{try model.stmt(.{ .let = .{
+                    .pattern = try model.pat(.{ .binding = .{
+                        .name = "inner",
+                        .mode = .value,
+                        .mutable = false,
+                    } }),
+                    .init = inner_closure,
+                    .ty = null,
+                } })}),
+                .tail = inner_call,
+                .labelled = null,
+            },
+            // `move |_| { .. }` captures by value as well, so it is `FnOnce` too.
+            .trait = .fn_once,
+        },
+    });
+    const outer_call = try typedExpr(&model, 0, .{ .call = .{
+        .call_kind = .{ .free = outer_entity },
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{try typedExpr(&model, 1, .{ .unit = {} })}),
+    } });
+    const body = try typedExpr(&model, 0, .{ .block = .{
+        .statements = try alloc.dupe(ir.exprs.NodeId, &.{
+            try model.stmt(.{ .let = .{
+                .pattern = try model.pat(.{ .binding = .{
+                    .name = "text",
+                    .mode = .value,
+                    .mutable = false,
+                } }),
+                .init = try typedExpr(&model, 0, .{ .path = .{ .def = seed, .generic_args = &.{} } }),
+                .ty = null,
+            } }),
+            try model.stmt(.{ .let = .{
+                .pattern = try model.pat(.{ .binding = .{
+                    .name = "outer",
+                    .mode = .value,
+                    .mutable = false,
+                } }),
+                .init = outer_closure,
+                .ty = null,
+            } }),
+        }),
+        .tail = outer_call,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[run] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = types[0],
+        .body = body,
+    } };
+    try addBareCrate(&graph, alloc, "nested_capture", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{run},
+    ));
+    const rust_ir = ir.RustIr{
+        .crate_name = "nested_capture",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// Every handle a `r2z.alloc.takeOwned(r2z.alloc.String, &x)` transfers, in the
+/// order the emitted file performs them.
+fn stringTransferTargets(
+    source: []const u8,
+    backing: std.mem.Allocator,
+) ![][]const u8 {
+    const needle = "r2z.alloc.takeOwned(r2z.alloc.String, &";
+    var targets: std.ArrayListUnmanaged([]const u8) = .empty;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, needle)) |at| {
+        const start = at + needle.len;
+        const rest = source[start..];
+        // The handle is the call's own argument, so the closing paren ends it.
+        // Reading on to the statement's `;` instead reports the name and the
+        // `)` that follows it as one token, and that is not a name anything can
+        // be compared against.
+        const end = std.mem.indexOfScalar(u8, rest, ')') orelse
+            std.mem.indexOfScalar(u8, rest, ';') orelse
+            return error.MalformedOwnerTransfer;
+        try targets.append(backing, rest[0..end]);
+        cursor = start + end;
+    }
+    return targets.toOwnedSlice(backing);
+}
+
+// A closure created inside another closure's body captures the OUTER
+// SNAPSHOT, not the original binding: the name `text` already resolves through
+// the override the outer creation installed, and a capture that read the
+// original instead would empty it a second time. The chain is therefore
+// original -> outer alias -> inner alias, and each step is its own name.
+test "lower: a nested closure captures the outer snapshot rather than the original binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try nestedCapturePackage(alloc);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    const targets = try stringTransferTargets(source, alloc);
+
+    // The owner moves once into the outer snapshot, once into the inner one,
+    // and once out through the inner body. Three transfers, three names.
+    try std.testing.expectEqual(@as(usize, 3), targets.len);
+    // The first is the ORIGINAL place: the only take the source itself can see.
+    try std.testing.expectEqualStrings("text", targets[0]);
+    // The second is the outer snapshot, which is not the original name.
+    try std.testing.expect(!std.mem.eql(u8, targets[1], targets[0]));
+    // The third is the inner snapshot, distinct from both.
+    try std.testing.expect(!std.mem.eql(u8, targets[2], targets[0]));
+    try std.testing.expect(!std.mem.eql(u8, targets[2], targets[1]));
+
+    // Each snapshot is released in the scope its own closure was created in.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, ".deinit(allocator);"));
+}
+
+// ── What the Hash bound is, decided by the bound and nothing else ──────────
+
+/// Lower one of two `describe` functions beside the `run` that instantiates it.
+///
+/// They differ only in WHICH trait the source wrote, which is the whole
+/// question: the descriptor answer belongs to the canonical trait alone.
+///
+/// - local homonym: `trait Hash { fn digest(&self) -> usize; }` declared by
+///   THIS crate, `impl Hash for Tag`, `pub fn describe<T: Hash>(v: &T) -> usize
+///   { v.digest() }`, and `pub fn run(value: &Tag) -> usize { describe(value) }`.
+/// - ordinary: `pub fn describe<T: Copy>(v: &T) -> T { *v }`, and
+///   `pub fn run(value: &u8) -> u8 { describe(value) }`.
+///
+/// Both callers really instantiate the generic, so the call carries the
+/// instantiation record the callee's signature requires.
+fn hashBoundClassifierPackage(alloc: std.mem.Allocator, local_homonym: bool) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "describe", root);
+    const value_def = try addLowerEntity(&graph, .field, "value", callable);
+
+    // The crate's own `Hash`, and the `Tag` that implements it. A different
+    // trait that happens to share a name; it declares the method the source
+    // actually calls.
+    var local_trait: ir.spine.EntityId = 0;
+    var method_parent = callable;
+    if (local_homonym) {
+        local_trait = try addLowerEntity(&graph, .trait_, "Hash", root);
+        method_parent = local_trait;
+    }
+    const digest_ref = try addLowerEntity(&graph, .method_ref, "digest", method_parent);
+    const tag = try addLowerEntity(&graph, .struct_, "Tag", root);
+    const tag_impl = try addLowerEntity(&graph, .impl_, "Hash", root);
+    const tag_digest = try addLowerEntity(&graph, .fn_, "digest", tag_impl);
+
+    const caller = try addLowerEntity(&graph, .fn_, "run", root);
+    const caller_value = try addLowerEntity(&graph, .field, "value", caller);
+
+    const lexical: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "T", .id = null }},
+    ) } };
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const usize_ty: ir.types.Type = .{ .prim = .usize };
+    const unit_ty: ir.types.Type = .{ .prim = .unit };
+    const tag_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "Tag", .id = tag }},
+    ) } };
+    // 0: T, 1: `&T`, 2: usize, 3: unit, 4: the concrete caller type, 5: the
+    // borrow of it, 6: the caller's own instantiation record.
+    var types = [_]ir.types.Type{
+        lexical,
+        .{ .reference = &.{ .mut = false, .pointee = lexical } },
+        usize_ty,
+        unit_ty,
+        undefined,
+        undefined,
+        undefined,
+    };
+    const concrete: ir.types.Type = if (local_homonym) tag_ty else u8_ty;
+    types[4] = concrete;
+    types[5] = .{ .reference = &.{ .mut = false, .pointee = concrete } };
+    types[6] = .{ .generic_inst = .{
+        .decl = callable,
+        .args = .{ .params = try alloc.dupe(ir.types.Type, &.{concrete}) },
+    } };
+
+    // Each body is exactly what its own bound admits. The homonym reaches the
+    // method its trait declares; the ordinary bound reads the parameter through
+    // a dereference and hands the value back.
+    const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = value_def, .generic_args = &.{} } });
+    const result_ty: ir.exprs.TypeId = if (local_homonym) 2 else 0;
+    const result = if (local_homonym)
+        try typedExpr(&model, result_ty, .{ .method_call = .{
+            .receiver = receiver,
+            .receiver_mode = .shared,
+            .method = digest_ref,
+            .args = &.{},
+        } })
+    else
+        try typedExpr(&model, result_ty, .{ .unary = .{
+            .op = .deref,
+            .operand = receiver,
+        } });
+    const body = try typedExpr(&model, result_ty, .{ .block = .{
+        .statements = &.{},
+        .tail = result,
+        .labelled = null,
+    } });
+
+    // `run` names the instantiation, so the callee's generic parameter is
+    // filled exactly as a monomorphised signature requires.
+    const caller_site = try typedExpr(&model, 6, .{ .call = .{
+        .call_kind = .{ .free = callable },
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{try typedExpr(&model, 5, .{
+            .path = .{ .def = caller_value, .generic_args = &.{} },
+        })}),
+    } });
+    const caller_body = try typedExpr(&model, result_ty, .{ .block = .{
+        .statements = &.{},
+        .tail = caller_site,
+        .labelled = null,
+    } });
+
+    const one_tail = try typedExpr(&model, 2, litInt(1));
+    const tag_body = try typedExpr(&model, 2, .{ .block = .{
+        .statements = &.{},
+        .tail = one_tail,
+        .labelled = null,
+    } });
+
+    const bound_segments: []const ir.types.PathSegment = if (local_homonym)
+        &.{.{ .name = "Hash", .id = local_trait }}
+    else
+        &.{
+            .{ .name = "core", .id = null },
+            .{ .name = "marker", .id = null },
+            .{ .name = "Copy", .id = null },
+        };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{ .name = "value", .ty = types[1], .span = span }}),
+        .ret = types[result_ty],
+        .generic_params = &.{"T"},
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+            .name = "T",
+            .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                bound_segments,
+            ) } }}),
+        } }}), .where_clauses = &.{} },
+        .body = body,
+    } };
+    body_rows[tag] = .{ .struct_ = .{} };
+    // `impl Hash for Tag { fn digest(&self) -> usize }`, and `run` returning
+    // exactly what `describe` returns.
+    body_rows[tag_digest] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{ .name = "self", .ty = types[5], .span = span }}),
+        .ret = types[2],
+        .body = tag_body,
+    } };
+    body_rows[tag_impl] = .{ .impl_ = .{
+        .self_ty = types[4],
+        .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{.{ .name = "Hash", .id = local_trait }}) },
+        .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{tag_digest}),
+    } };
+    if (local_homonym) {
+        // The trait declares the method the source actually calls, with the
+        // receiver it takes and the value it produces.
+        body_rows[local_trait] = .{ .trait_ = .{
+            .name = "Hash",
+            .methods = &.{.{ .name = "digest", .ret = types[2], .receiver = .ref_ }},
+        } };
+    }
+    body_rows[caller] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{ .name = "value", .ty = types[5], .span = span }}),
+        .ret = types[result_ty],
+        .body = caller_body,
+    } };
+
+    const items = try alloc.alloc(ir.spine.EntityId, if (local_homonym) 5 else 3);
+    items[0] = callable;
+    items[1] = tag;
+    items[2] = caller;
+    var item_count: usize = 3;
+    if (local_homonym) {
+        items[item_count] = local_trait;
+        item_count += 1;
+        items[item_count] = tag_impl;
+        item_count += 1;
+    }
+    try addBareCrate(&graph, alloc, "hash_bound_classifier", root, items[0..item_count]);
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "hash_bound_classifier",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// A crate's own `trait Hash` is a different trait that happens to share a name.
+// Treating it as the canonical one would replace an ordinary type parameter
+// with a descriptor, which changes every position the parameter appears in —
+// the signature, the borrow, and the caller's argument — for a bound that never
+// asked for it.
+test "lower: a crate-local trait that shares the Hash name is not a descriptor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try hashBoundClassifierPackage(alloc, true);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    // Nothing about the parameter becomes descriptor-shaped.
+    try std.testing.expect(std.mem.indexOf(u8, source, "RustHashType") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "RustHashRef") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "RustHashLayout") == null);
+    // It stays an ordinary type parameter all the way through: the signature
+    // keeps the parameter and the borrow keeps the pointer it always was.
+    try std.testing.expect(std.mem.indexOf(u8, source, "comptime T: type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "*const T") != null);
+    // And the body is not projected onto a payload.
+    try std.testing.expect(std.mem.indexOf(u8, source, "T.Type") == null);
+
+    // The caller really instantiates the generic, so it carries the type
+    // argument its signature requires — and that argument is the PLAIN type the
+    // homonym bound asks for, read from the call AST rather than a spelling.
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "run"));
+    if (body != .call) return error.ExpectedInstantiationCall;
+    try std.testing.expectEqual(@as(usize, 1), body.call.generic_args.len);
+    try std.testing.expectEqualStrings("Tag", try expectNamedType(body.call.generic_args[0]));
+    try std.testing.expectEqual(@as(usize, 1), body.call.args.len);
+    try std.testing.expectEqualStrings("value", operandIdent(body.call.args[0]) orelse
+        return error.ExpectedInstantiationCall);
+    // `describe` and `run` both answer `usize`, and so does the trait method.
+    for ([_][]const u8{ "describe", "run" }) |name| {
+        const ret_type = (try findFnDecl(pkg.files[0], name)).ret_type;
+        if (ret_type != .prim) return error.ExpectedPrimitiveReturnType;
+        try std.testing.expectEqual(ast.Prim.usize, ret_type.prim);
+    }
+}
+
+// An ordinary bound leaves every ordinary position alone. `&I` for a
+// `Copy` parameter is a pointer to the parameter's own type — not a borrowed
+// descriptor — and the caller's slot for it is a plain type.
+test "lower: an ordinary type parameter keeps its reference and its caller argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try hashBoundClassifierPackage(alloc, false);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "RustHashType") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "RustHashRef") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "comptime T: type") != null);
+    // `&T` is still `*const T`: the borrow is unchanged by any of this.
+    try std.testing.expect(std.mem.indexOf(u8, source, "*const T") != null);
+
+    // The caller instantiates the generic, and the slot is the plain type.
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "run"));
+    if (body != .call) return error.ExpectedInstantiationCall;
+    try std.testing.expectEqual(@as(usize, 1), body.call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 1), body.call.args.len);
+    try std.testing.expectEqualStrings("value", operandIdent(body.call.args[0]) orelse
+        return error.ExpectedInstantiationCall);
+    // `describe` returns its own parameter and `run` returns what `describe`
+    // gave it, so both keep the type parameter itself. A concrete `u8` would
+    // describe only the one instantiation this fixture makes, and a descriptor
+    // is the shape an ordinary bound's parameter is not.
+    for ([_][]const u8{ "describe", "run" }) |name| {
+        try std.testing.expectEqualStrings("T", try expectNamedType(
+            (try findFnDecl(pkg.files[0], name)).ret_type,
+        ));
+    }
+}
+
+// ── Moving an array owner whose length is a comptime expression ────────────
+
+/// How a zero-length `String` array reaches the caller.
+const ZeroArrayScene = enum {
+    /// `fn take(a: [String; 0]) -> [String; 0] { a }` — a by-value owner the
+    /// frame owns, so returning it transfers it out.
+    borrowed_parameter,
+    /// `fn make() -> [String; 0] { [] }` — an array literal with no elements,
+    /// which owns nothing and has no handle to empty.
+    literal_expression,
+};
+
+/// Lower one of the two, exactly as written.
+fn zeroArrayOwnerPackage(alloc: std.mem.Allocator, scene: ZeroArrayScene) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, switch (scene) {
+        .borrowed_parameter => "take",
+        .literal_expression => "make",
+    }, root);
+    const param_def = try addLowerEntity(&graph, .field, "a", callable);
+
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const usize_ty: ir.types.Type = .{ .prim = .usize };
+    const unit_ty: ir.types.Type = .{ .prim = .unit };
+    // The length is written as a comptime EXPRESSION that happens to evaluate to
+    // zero. A Rust array always carries its length in its type; what the IR may
+    // do is hand the length over as an expression, which is what forces the
+    // emitted type to be an `array_expr` rather than a plain array.
+    const count = try typedExpr(&model, 2, litInt(0));
+    // 0: `String`, 1: `[String; <expression>]`, 2: usize, 3: unit,
+    // 4: `[String; 0]` with the length written outright.
+    const types = [_]ir.types.Type{
+        string_ty,
+        .{ .array = &.{ .elem = string_ty, .len = .{ .expression = count } } },
+        usize_ty,
+        unit_ty,
+        .{ .array = &.{ .elem = string_ty, .len = .{ .literal = 0 } } },
+    };
+
+    const result_id: ir.exprs.TypeId = if (scene == .borrowed_parameter) 1 else 4;
+    const body = try typedExpr(&model, result_id, switch (scene) {
+        .borrowed_parameter => .{ .path = .{ .def = param_def, .generic_args = &.{} } },
+        // Rust's `[]`, whose element type comes from the return position.
+        .literal_expression => .{ .array = .{ .elements = &.{}, .repeat = null } },
+    });
+    const fn_body = try typedExpr(&model, result_id, .{ .block = .{
+        .statements = &.{},
+        .tail = body,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = switch (scene) {
+            .borrowed_parameter => try alloc.dupe(ir.items.Param, &.{
+                .{ .name = "a", .ty = types[1], .span = span },
+            }),
+            .literal_expression => &.{},
+        },
+        .ret = types[result_id],
+        .body = fn_body,
+    } };
+    try addBareCrate(&graph, alloc, "zero_array_owner", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{callable},
+    ));
+    const rust_ir = ir.RustIr{
+        .crate_name = "zero_array_owner",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// An array's length is not in its Zig type, so a plain copy could move no
+// storage at all. The transfer therefore asks the runtime whether the concrete
+// payload really owns something: if it does it takes the handle, and if it does
+// not the handle itself is the answer. Either way the frame's release still
+// runs, and finds the handle empty.
+//
+// The payload here is spelled from a comptime EXPRESSION length, so the emitted
+// type is an `array_expr` whose length is an expression — and the payload the
+// runtime is asked about is that expression-carrying type, not a plain array.
+test "lower: moving an array owner is conditional on the runtime proving it owns storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try zeroArrayOwnerPackage(alloc, .borrowed_parameter);
+    const decl = try findFnDecl(pkg.files[0], "take");
+    const block = decl.body orelse return error.EmptyTranslatedBody;
+    const body = (block.expr orelse return error.EmptyTranslatedBody).*;
+    if (body != .if_expr) return error.ExpectedOwnedMoveGuard;
+    const guard = body.if_expr;
+
+    // The question is asked of the PAYLOAD type, with no argument: it is a
+    // comptime question about that type alone.
+    if (guard.cond.* != .call) return error.ExpectedOwnedMoveGuard;
+    const question = guard.cond.call;
+    try std.testing.expectEqualStrings("r2z.alloc.supportsOwnedMove", calleeName(question.callee.*) orelse
+        return error.ExpectedOwnedMoveGuard);
+    try std.testing.expectEqual(@as(usize, 1), question.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 0), question.args.len);
+    // The payload is the array whose length is an EXPRESSION, so it lowers to
+    // an `array_expr` and not to a plain array.
+    const payload = question.generic_args[0];
+    if (payload != .array_expr) return error.ExpectedOwnedMoveGuard;
+    if (payload.array_expr.len.* != .lit or payload.array_expr.len.lit != .int)
+        return error.ExpectedOwnedMoveGuard;
+    try std.testing.expectEqual(@as(i128, 0), payload.array_expr.len.lit.int);
+
+    // The `then` arm is the transfer itself, asked about the same type and
+    // addressed at the handle the frame holds.
+    if (guard.then_body.* != .call) return error.ExpectedOwnedMoveGuard;
+    const transfer = guard.then_body.call;
+    try std.testing.expectEqualStrings("r2z.alloc.takeOwned", calleeName(transfer.callee.*) orelse
+        return error.ExpectedOwnedMoveGuard);
+    try std.testing.expectEqual(@as(usize, 1), transfer.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 1), transfer.args.len);
+    if (transfer.args[0] != .unary_op or transfer.args[0].unary_op.op != .addr_of)
+        return error.ExpectedOwnedMoveGuard;
+    const alias = operandIdent(transfer.args[0].unary_op.operand.*) orelse return error.ExpectedOwnedMoveGuard;
+
+    // The `else` arm is that same handle, so the two answers are one type.
+    if (guard.else_body == null) return error.ExpectedOwnedMoveGuard;
+    if (guard.else_body.?.* != .ident) return error.ExpectedOwnedMoveGuard;
+    try std.testing.expectEqualStrings(alias, guard.else_body.?.*.ident);
+
+    // An array has no `deinit`: its elements own storage, so the release goes
+    // through the runtime helper that knows how to walk them.
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "dropTemporary") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        try std.fmt.allocPrint(alloc, "defer r2z.alloc.dropTemporary(allocator, &{s});", .{alias}),
+    ) != null);
+}
+
+// An array literal with no elements owns nothing and has no handle, so there is
+// no alias to declare, nothing to take and nothing to release. A guard here
+// would be a question about a type that cannot answer it.
+test "lower: a zero-length array literal is never treated as an owner to move" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try zeroArrayOwnerPackage(alloc, .literal_expression);
+    const source = try emit.emitFile(alloc, &pkg.files[0]);
+    try std.testing.expect(std.mem.indexOf(u8, source, "supportsOwnedMove") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "takeOwned") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "dropTemporary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "deinit(allocator)") == null);
+
+    // The literal is still the array the source wrote, and it is still
+    // returned: what it is not is an owner.
+    const decl = try findFnDecl(pkg.files[0], "make");
+    if (decl.ret_type != .array) return error.ExpectedZeroArrayReturn;
+    try std.testing.expectEqual(@as(u64, 0), decl.ret_type.array.len);
+    try std.testing.expectEqual(@as(usize, 0), decl.params.len);
+}
+
+// ── Refusing a move the ABI cannot make safe ───────────────────────────────
+
+/// The payload shape a root tuple is refused for, or one it accepts.
+const TaggedPayloadScene = enum {
+    /// `(String, UserEnum(String))` — the tag's payload is itself an owner.
+    tagged_owner_payload,
+    /// `(String, UserEnum(u8))` — the tag's payload is a leaf, so the tag is
+    /// only a tag and the whole tuple moves normally.
+    tagged_leaf_payload,
+    /// `[String; N]` with `N` a comptime parameter the lowering cannot resolve
+    /// here, so the array's existing ABI is a borrowed slice.
+    generic_length_array,
+    /// `(String, UserEnum([String; 0]))` — the tag's payload is an array of
+    /// OWNERS that is empty, so its length says it holds none of them.
+    tagged_zero_array_payload,
+};
+
+/// Lower `fn take(payload: Root) -> Root { payload }` for one of the shapes.
+fn taggedPayloadPackage(alloc: std.mem.Allocator, scene: TaggedPayloadScene) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "take", root);
+    const param_def = try addLowerEntity(&graph, .field, "payload", callable);
+
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+
+    // The declared `N` of the generic-length array: a type parameter, so the
+    // length is written as `.generic` rather than as a number.
+    const n_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "N", .id = null }},
+    ) } };
+
+    // The user enum, declared once and instantiated with whichever payload the
+    // scene needs.
+    const user_enum = try addLowerEntity(&graph, .enum_, "UserEnum", root);
+    // 0: `String`, 1: u8, 2: `N`, 3: the root tuple or array this scene moves,
+    // 4: `UserEnum<String>`, 5: `UserEnum<u8>`, 6: `UserEnum<[u8; 0]>`.
+    const enum_args = try alloc.dupe(ir.types.Type, &.{string_ty});
+    const leaf_args = try alloc.dupe(ir.types.Type, &.{u8_ty});
+    // The zero length is on an array of OWNERS, not of bytes: a byte element
+    // would prove nothing, because a leaf was never at risk in the first place.
+    const zero_args = try alloc.dupe(ir.types.Type, &.{.{ .array = &.{
+        .elem = string_ty,
+        .len = .{ .literal = 0 },
+    } }});
+    var types = [_]ir.types.Type{
+        string_ty,
+        u8_ty,
+        n_ty,
+        undefined,
+        .{ .generic_inst = .{ .decl = user_enum, .args = .{ .params = enum_args } } },
+        .{ .generic_inst = .{ .decl = user_enum, .args = .{ .params = leaf_args } } },
+        .{ .generic_inst = .{ .decl = user_enum, .args = .{ .params = zero_args } } },
+    };
+    types[3] = switch (scene) {
+        .tagged_owner_payload, .tagged_leaf_payload => .{ .tuple = try alloc.dupe(ir.types.Type, &.{
+            types[0],
+            if (scene == .tagged_owner_payload) types[4] else types[5],
+        }) },
+        .generic_length_array => .{ .array = &.{ .elem = types[0], .len = .{ .generic = 0 } } },
+        .tagged_zero_array_payload => .{ .tuple = try alloc.dupe(ir.types.Type, &.{
+            types[0],
+            types[6],
+        }) },
+    };
+
+    const body = try typedExpr(&model, 3, .{ .path = .{ .def = param_def, .generic_args = &.{} } });
+    const fn_body = try typedExpr(&model, 3, .{ .block = .{
+        .statements = &.{},
+        .tail = body,
+        .labelled = null,
+    } });
+
+    // The enum declares the payload the source's instantiation spells. Its own
+    // body is `Payload`, so the argument is substituted per instantiation.
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    // `[String; N]`'s length indexes a REAL const slot the source declares, so
+    // `N` is in scope where the array is spelled rather than free.
+    const const_generics: ?ir.types.Generics = if (scene == .generic_length_array)
+        .{ .params = try alloc.dupe(ir.types.GenericParam, &.{
+            .{ .const_ = .{ .name = "N", .ty = types[2] } },
+        }), .where_clauses = &.{} }
+    else
+        null;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{ .name = "payload", .ty = types[3], .span = span }}),
+        .ret = types[3],
+        .generic_params = if (scene == .generic_length_array) &.{"N"} else &.{},
+        .generics = const_generics,
+        .body = fn_body,
+    } };
+    body_rows[user_enum] = .{ .enum_ = .{
+        .kind = .data,
+        .generic_params = &.{"Payload"},
+        .variants = try alloc.dupe(ir.items.Variant, &.{
+            .{ .name = "Leaf", .fields = .{ .tuple = try alloc.dupe(ir.types.Type, &.{try lexParam(alloc, "Payload")}) }, .discriminant = 0 },
+            .{ .name = "Nothing", .fields = .{ .none = {} }, .discriminant = 1 },
+        }),
+    } };
+    try addBareCrate(&graph, alloc, "tagged_payload", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{ callable, user_enum },
+    ));
+    const rust_ir = ir.RustIr{
+        .crate_name = "tagged_payload",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// A bare type-parameter path, for a generic declaration's own body.
+fn lexParam(alloc: std.mem.Allocator, name: []const u8) !ir.types.Type {
+    return .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = name, .id = null }},
+    ) } };
+}
+
+// A tag whose payload is itself an owner has no safe move. The tag is erased at
+// runtime, so moving the payload would take storage the tag cannot describe —
+// and a `String` inside it is exactly that. The refusal happens BEFORE any
+// emission, so there is no half-built program to reason about.
+test "lower: a user tag carrying an owner is refused before any move is emitted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.UnsupportedOwnedTaggedPayload,
+        taggedPayloadPackage(arena.allocator(), .tagged_owner_payload),
+    );
+}
+
+// An array whose length the lowering cannot resolve here has a borrowed-slice
+// ABI: its storage is not the value. Copying it as though it were would alias
+// two handles onto one buffer, so the shape is refused by name.
+test "lower: an owned array of unresolved length is refused before any move is emitted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.UnsupportedOwnedGenericArrayRepresentation,
+        taggedPayloadPackage(arena.allocator(), .generic_length_array),
+    );
+}
+
+// A tag whose payload is a leaf is only a tag. The tuple around it is still an
+// owner, and it moves directly: a tuple states its own length, so there is no
+// runtime question to ask before the transfer is safe.
+test "lower: a user tag carrying a leaf moves through a direct transfer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try taggedPayloadPackage(alloc, .tagged_leaf_payload);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "take"));
+    // Asked about the TUPLE, which is the whole owner being moved — and asked
+    // DIRECTLY, with no `supportsOwnedMove` guard in front of it.
+    try expectDirectOwnerTransfer(body);
+}
+
+// A zero-length array of owners holds none of them, so neither gate applies to
+// it — even inside a tag, and even though the source really did write one. The
+// element is a `String` on purpose: a byte element was never at risk, so it
+// would prove nothing about the length doing the work.
+test "lower: a zero-length array of owners inside a user tag skips both refusal gates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try taggedPayloadPackage(alloc, .tagged_zero_array_payload);
+    const body = try fnBodyExpr(try findFnDecl(pkg.files[0], "take"));
+    // Both gates declined, so the move is reached at all — and asked directly.
+    try expectDirectOwnerTransfer(body);
+}
+
+/// `r2z.alloc.takeOwned(<the owner>, &<handle>)` with no guard in front of it.
+///
+/// Only an owner whose length the lowering cannot state needs to ask the
+/// runtime first; anything that states its own length moves directly.
+fn expectDirectOwnerTransfer(body: ast.Expr) !void {
+    if (body != .call) return error.ExpectedDirectOwnerTransfer;
+    const transfer = body.call;
+    try std.testing.expectEqualStrings("r2z.alloc.takeOwned", calleeName(transfer.callee.*) orelse
+        return error.ExpectedDirectOwnerTransfer);
+    try std.testing.expectEqual(@as(usize, 1), transfer.generic_args.len);
+    // The payload is the whole owner, not one field of it.
+    if (transfer.generic_args[0] != .tuple) return error.ExpectedDirectOwnerTransfer;
+    try std.testing.expectEqual(@as(usize, 1), transfer.args.len);
+    if (transfer.args[0] != .unary_op or transfer.args[0].unary_op.op != .addr_of)
+        return error.ExpectedDirectOwnerTransfer;
+    // Addressed at the handle the frame holds, never at a copy of the value.
+    if (operandIdent(transfer.args[0].unary_op.operand.*) == null)
+        return error.ExpectedDirectOwnerTransfer;
+}
+
+// ── The recursive Hash pair ────────────────────────────────────────────────
+
+/// Lower `pub fn digest_root<T: core::hash::Hash, H: core::hash::Hasher>(state:
+/// &mut SeaHasher, value: &T)` whose only statement is `value.hash(state)`,
+/// plus TWO callers that both instantiate it at the same tuple.
+///
+/// Two callers sharing one module is the case that makes "one pair per owning
+/// module" observable: a per-call pair would emit two.
+fn hashPairPackage(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const callable = try addLowerEntity(&graph, .fn_, "digest_root", root);
+    const state_def = try addLowerEntity(&graph, .field, "state", callable);
+    const value_def = try addLowerEntity(&graph, .field, "value", callable);
+    const hash_ref = try addLowerEntity(&graph, .method_ref, "hash", callable);
+
+    const sea = try addLowerEntity(&graph, .struct_, "SeaHasher", root);
+    // `impl Hasher for SeaHasher` over a type THIS crate declares: the
+    // frontend parents the impl to the self type and names it `Trait for Self`,
+    // and `resolvePendingImpls` records the impl's methods on that struct's own
+    // body. Parented to the module instead, the methods hoist beside the
+    // module and `SeaHasher` is left a nominal with nothing in it.
+    const sea_impl = try addLowerEntity(&graph, .impl_, "Hasher for SeaHasher", sea);
+    const sea_write = try addLowerEntity(&graph, .fn_, "write", sea_impl);
+    const sea_finish = try addLowerEntity(&graph, .fn_, "finish", sea_impl);
+
+    var caller_ids: [2]ir.spine.EntityId = undefined;
+    var caller_state: [2]ir.exprs.NodeId = undefined;
+    var caller_value: [2]ir.exprs.NodeId = undefined;
+    for (0..2) |index| {
+        caller_ids[index] = try addLowerEntity(&graph, .fn_, try std.fmt.allocPrint(
+            alloc,
+            "digest_pair{d}",
+            .{index},
+        ), root);
+        caller_state[index] = try addLowerEntity(&graph, .field, "state", caller_ids[index]);
+        caller_value[index] = try addLowerEntity(&graph, .field, "value", caller_ids[index]);
+    }
+
+    const lexical_t: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "T", .id = null }},
+    ) } };
+    const lexical_h: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "H", .id = null }},
+    ) } };
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const unit_ty: ir.types.Type = .{ .prim = .unit };
+    const bytes: ir.types.Type = .{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } };
+    const sea_ty: ir.types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = "SeaHasher", .id = sea }},
+    ) } };
+    // The concrete receiver is a TUPLE, which is what makes the walk recurse:
+    // a scalar receiver needs no pair.
+    const tuple_ty: ir.types.Type = .{ .tuple = try alloc.dupe(ir.types.Type, &.{
+        string_ty,
+        u8_ty,
+    }) };
+    // 0: T, 1: `&T`, 2: H, 3: `&mut H`, 4: u64, 5: `SeaHasher`, 6: `&mut
+    // SeaHasher`, 7: the tuple, 8: `&tuple`, 9: `&[u8]`, 10: unit,
+    // 11/12: one instantiation record per caller.
+    const types = [_]ir.types.Type{
+        lexical_t,
+        .{ .reference = &.{ .mut = false, .pointee = lexical_t } },
+        lexical_h,
+        .{ .reference = &.{ .mut = true, .pointee = lexical_h } },
+        .{ .prim = .u64 },
+        sea_ty,
+        .{ .reference = &.{ .mut = true, .pointee = sea_ty } },
+        tuple_ty,
+        .{ .reference = &.{ .mut = false, .pointee = tuple_ty } },
+        bytes,
+        unit_ty,
+        .{ .generic_inst = .{
+            .decl = callable,
+            .args = .{ .params = try alloc.dupe(ir.types.Type, &.{ tuple_ty, sea_ty }) },
+        } },
+        .{ .generic_inst = .{
+            .decl = callable,
+            .args = .{ .params = try alloc.dupe(ir.types.Type, &.{ tuple_ty, sea_ty }) },
+        } },
+    };
+
+    const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = value_def, .generic_args = &.{} } });
+    const state = try typedExpr(&model, 3, .{ .path = .{ .def = state_def, .generic_args = &.{} } });
+    const call = try typedExpr(&model, 4, .{ .method_call = .{
+        .receiver = receiver,
+        .receiver_mode = .shared,
+        .method = hash_ref,
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{state}),
+        .generic_args = try alloc.dupe(ir.types.Type, &.{lexical_h}),
+    } });
+    const body = try typedExpr(&model, 10, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+
+    const unit_tail = try typedExpr(&model, 10, .{ .unit = {} });
+    const zero_tail = try typedExpr(&model, 4, litInt(0));
+    var caller_bodies: [2]ir.exprs.NodeId = undefined;
+    for (0..2) |index| {
+        const left = try typedExpr(&model, 6, .{
+            .path = .{ .def = caller_state[index], .generic_args = &.{} },
+        });
+        const right = try typedExpr(&model, 8, .{
+            .path = .{ .def = caller_value[index], .generic_args = &.{} },
+        });
+        const site = try typedExpr(&model, @intCast(11 + index), .{ .call = .{
+            .call_kind = .{ .free = callable },
+            .args = try alloc.dupe(ir.exprs.NodeId, &.{ left, right }),
+        } });
+        // The caller's block carries the type its tail produces, which is the
+        // `u64` `digest_root` declares. A caller that declared `()` instead
+        // would hand the block's own annotation to the tail-return inference,
+        // and that annotation is the call's INSTANTIATION RECORD: a
+        // `generic_inst` naming the generic FUNCTION `digest_root`, which is
+        // exactly what the frontend records on a call to a generic
+        // (`ts_ext.appendGenericCall`). `lowerType` answers a type DEFINITION
+        // there and refuses a function, so the two declarations have to agree
+        // or the call site is asked to be a type it never was.
+        caller_bodies[index] = try typedExpr(&model, 4, .{ .block = .{
+            .statements = &.{},
+            .tail = site,
+            .labelled = null,
+        } });
+    }
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "state", .ty = types[3], .span = span },
+            .{ .name = "value", .ty = types[1], .span = span },
+        }),
+        .ret = types[4],
+        .generic_params = &.{ "T", "H" },
+        .generics = .{ .params = try alloc.dupe(ir.types.GenericParam, &.{
+            .{ .type_ = .{ .name = "T", .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                &.{
+                    .{ .name = "core", .id = null },
+                    .{ .name = "hash", .id = null },
+                    .{ .name = "Hash", .id = null },
+                },
+            ) } }}) } },
+            .{ .type_ = .{ .name = "H", .bounds = try alloc.dupe(ir.types.Bound, &.{.{ .path = .{ .segments = try alloc.dupe(
+                ir.types.PathSegment,
+                &.{
+                    .{ .name = "core", .id = null },
+                    .{ .name = "hash", .id = null },
+                    .{ .name = "Hasher", .id = null },
+                },
+            ) } }}) } },
+        }), .where_clauses = &.{} },
+        .body = body,
+    } };
+    body_rows[sea_write] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "self", .ty = types[6], .span = span },
+            .{ .name = "bytes", .ty = types[9], .span = span },
+        }),
+        .ret = types[10],
+        .body = try typedExpr(&model, 10, .{ .block = .{
+            .statements = &.{},
+            .tail = unit_tail,
+            .labelled = null,
+        } }),
+    } };
+    body_rows[sea_finish] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{ .name = "self", .ty = types[6], .span = span }}),
+        .ret = types[4],
+        .body = try typedExpr(&model, 4, .{ .block = .{
+            .statements = &.{},
+            .tail = zero_tail,
+            .labelled = null,
+        } }),
+    } };
+    // The impl's own methods, recorded on the struct body the way
+    // `resolvePendingImpls` records them: same name, same signature without the
+    // receiver, same body node. That record is what makes the struct render
+    // them itself, rather than leaving the nominal an empty container.
+    const sea_methods = try alloc.alloc(ir.bodies.StructMethod, 2);
+    sea_methods[0] = .{
+        .name = "write",
+        .visibility = .public,
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "bytes", .ty = types[9], .span = span },
+        }),
+        .ret = types[10],
+        .body = body_rows[sea_write].fn_.body,
+        .receiver = .mut_ref,
+    };
+    sea_methods[1] = .{
+        .name = "finish",
+        .visibility = .public,
+        .params = &.{},
+        .ret = types[4],
+        .body = body_rows[sea_finish].fn_.body,
+        .receiver = .ref_,
+    };
+    body_rows[sea] = .{ .struct_ = .{ .layout = .unit, .methods = sea_methods } };
+    body_rows[sea_impl] = .{ .impl_ = .{
+        .self_ty = types[5],
+        .trait_path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+            .{ .name = "core", .id = null },
+            .{ .name = "hash", .id = null },
+            .{ .name = "Hasher", .id = null },
+        }) },
+        .assoc_items = try alloc.dupe(ir.spine.EntityId, &.{ sea_write, sea_finish }),
+    } };
+    for (0..2) |index| {
+        body_rows[caller_ids[index]] = .{
+            .fn_ = .{
+                .params = try alloc.dupe(ir.items.Param, &.{
+                    .{ .name = "state", .ty = types[6], .span = span },
+                    .{ .name = "value", .ty = types[8], .span = span },
+                }),
+                // What `digest_root` returns. A `()` here would send the tail's
+                // instantiation record to the tail-return inference instead.
+                .ret = types[4],
+                .body = caller_bodies[index],
+            },
+        };
+    }
+
+    // Exactly the items the module declares. A module row carrying an id the
+    // symbol table never minted is refused on sight, so the list is sized from
+    // what it holds rather than left one slot past its own last write. `write`
+    // and `finish` are not module items: they belong to the impl, and the impl
+    // belongs to `SeaHasher`.
+    try addBareCrate(&graph, alloc, "hash_pair", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{ callable, sea, sea_impl, caller_ids[0], caller_ids[1] },
+    ));
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "hash_pair",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The private value/slice pair a module emits, found by the prefix each of
+/// them is minted under rather than by a whole name — a collision in the source
+/// may suffix either one, and the tests below read the names back out of the
+/// declarations instead of assuming them.
+const HashPair = struct { value: ast.FnDecl, slice: ast.FnDecl };
+
+fn hashPairIn(file: ast.File) !HashPair {
+    var value_decls: usize = 0;
+    var slice_decls: usize = 0;
+    var found: HashPair = undefined;
+    for (file.decls) |decl| {
+        const function = switch (decl) {
+            .fn_decl => |value| value,
+            else => continue,
+        };
+        if (std.mem.startsWith(u8, function.name, "__r2z_hash_value")) {
+            value_decls += 1;
+            found.value = function;
+        }
+        if (std.mem.startsWith(u8, function.name, "__r2z_hash_slice")) {
+            slice_decls += 1;
+            found.slice = function;
+        }
+    }
+    // ONE pair per owning module, not one per call site. Two callers reaching
+    // the same module must still see one.
+    try std.testing.expectEqual(@as(usize, 1), value_decls);
+    try std.testing.expectEqual(@as(usize, 1), slice_decls);
+    return found;
+}
+
+/// The arm of a `switch` that names `tag`, or its wildcard arm.
+fn matchArm(expr: ast.Expr, tag: ?[]const u8) !ast.MatchArm {
+    if (expr != .match_expr) return error.ExpectedLayoutSwitch;
+    for (expr.match_expr.arms) |arm| {
+        if (arm.patterns.len != 1) continue;
+        switch (arm.patterns[0]) {
+            .wildcard => if (tag == null) return arm,
+            .enum_literal => |name| {
+                if (tag) |wanted| {
+                    if (std.mem.eql(u8, name, wanted)) return arm;
+                }
+                continue;
+            },
+            else => continue,
+        }
+    }
+    return error.ExpectedLayoutArm;
+}
+
+// The pair is PRIVATE and lives in the module, not in the type it walks. Two
+// callers that share a module share the pair, because one pair of functions is
+// what keeps the borrowed value and its slice view the same storage.
+test "lower: one private value and slice pair backs every Hash walk in a module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pkg = try hashPairPackage(alloc);
+    const pair = try hashPairIn(pkg.files[0]);
+    try std.testing.expect(!pair.value.is_pub);
+    try std.testing.expect(!pair.slice.is_pub);
+    // Both are generic in the hasher, and the value side is generic in the
+    // descriptor it walks.
+    try std.testing.expectEqual(@as(usize, 2), pair.value.generic_params.len);
+    try std.testing.expectEqual(@as(usize, 2), pair.slice.generic_params.len);
+    try std.testing.expectEqualStrings("D", pair.value.generic_params[0].name);
+    try std.testing.expectEqualStrings("H", pair.value.generic_params[1].name);
+    try std.testing.expectEqualStrings("C", pair.slice.generic_params[0].name);
+    try std.testing.expectEqualStrings("H", pair.slice.generic_params[1].name);
+}
+
+// The value is BORROWED, never taken: the walk reads the caller's own storage
+// and must not consume it, so the borrow is the runtime's own descriptor
+// reference and not a plain pointer.
+test "lower: the Hash walk borrows the value through the runtime reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pair = try hashPairIn((try hashPairPackage(alloc)).files[0]);
+    var value_param: ?ast.FnParam = null;
+    for (pair.value.params) |param| {
+        if (std.mem.eql(u8, param.name, "value")) value_param = param;
+    }
+    const borrowed = value_param orelse return error.ExpectedBorrowedValue;
+    // The parameter's type is built by a CALL, not spelled: no plain pointer can
+    // carry the descriptor.
+    if (borrowed.ty != .expr) return error.ExpectedBorrowedValue;
+    const built = borrowed.ty.expr.*;
+    if (built != .call) return error.ExpectedBorrowedValue;
+    const reference = built.call;
+    try std.testing.expectEqualStrings("r2z.RustHashRef", calleeName(reference.callee.*) orelse
+        return error.ExpectedBorrowedValue);
+    try std.testing.expectEqual(@as(usize, 1), reference.generic_args.len);
+    // Asked about the descriptor this pair is generic in.
+    try std.testing.expectEqualStrings("D", try expectNamedType(reference.generic_args[0]));
+    // And it is not mutable: a walk that could write would not be a walk.
+    try std.testing.expectEqual(@as(usize, 1), reference.args.len);
+    if (reference.args[0] != .lit or reference.args[0].lit != .bool_lit)
+        return error.ExpectedBorrowedValue;
+    try std.testing.expect(!reference.args[0].lit.bool_lit);
+}
+
+// The slice side receives a view of the SAME element type, not a copy of it and
+// not a `[]const u8`: its element is the element descriptor's own type, which is
+// what lets each element keep its own layout.
+test "lower: the Hash slice view carries the element descriptor's own type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pair = try hashPairIn((try hashPairPackage(alloc)).files[0]);
+    var items_param: ?ast.FnParam = null;
+    for (pair.slice.params) |param| {
+        if (std.mem.eql(u8, param.name, "items")) items_param = param;
+    }
+    const items = items_param orelse return error.ExpectedItemsView;
+    if (items.ty != .slice) return error.ExpectedItemsView;
+    try std.testing.expect(items.ty.slice.is_const);
+    // The element is an EXPRESSION — `C.Type` — not a named type the emitter
+    // had to invent.
+    if (items.ty.slice.elem.* != .expr) return error.ExpectedItemsView;
+    const element = items.ty.slice.elem.*.expr.*;
+    if (element != .field_access) return error.ExpectedItemsView;
+    try std.testing.expectEqualStrings("Type", element.field_access.field_name);
+    try std.testing.expectEqualStrings("C", operandIdent(element.field_access.target.*) orelse
+        return error.ExpectedItemsView);
+}
+
+// The two ends of the recursion borrow the ORIGINAL value, never a copy of it:
+// a tuple field is `&@field(value.*, Slot.name)` and each element is forwarded
+// as the bare `item` the loop captured. The loop over the fields is inlined, so
+// no runtime iterator is created for a walk the compiler can finish itself.
+test "lower: the Hash walk borrows the original field and each element in place" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pair = try hashPairIn((try hashPairPackage(alloc)).files[0]);
+
+    // The tuple arm: a `std.meta.fields` binding, then an inline loop over the
+    // fields and slots, whose body forwards the address of the field itself.
+    const walk = try tupleWalkArm(pair.value);
+    // The arm is a BLOCK: the inline loop's second input is the binding the
+    // first statement makes, so the loop is its second statement and not the
+    // whole arm. Inlining is a property of the `ForExpr` itself — there is no
+    // arm-level flag to read.
+    if (walk.body != .block) return error.ExpectedInlineFieldLoop;
+    if (walk.body.block.stmts.len != 2) return error.ExpectedInlineFieldLoop;
+    if (walk.body.block.stmts[0] != .let_stmt) return error.ExpectedInlineFieldLoop;
+    const slots = walk.body.block.stmts[0].let_stmt;
+    try std.testing.expectEqualStrings("Slots", slots.name);
+    try std.testing.expect(!slots.is_mut);
+    // The binding asks for the fields of the ORIGINAL value's own type: the
+    // walk never copies the tuple out to learn what is in it.
+    if (slots.init != .call) return error.ExpectedInlineFieldLoop;
+    if (slots.init.call.callee.* != .field_access) return error.ExpectedInlineFieldLoop;
+    const meta_fields = slots.init.call.callee.field_access;
+    try std.testing.expectEqualStrings("fields", meta_fields.field_name);
+    if (meta_fields.target.* != .field_access) return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("meta", meta_fields.target.field_access.field_name);
+    try std.testing.expectEqualStrings("std", operandIdent(meta_fields.target.field_access.target.*) orelse
+        return error.ExpectedInlineFieldLoop);
+    try std.testing.expectEqual(@as(usize, 1), slots.init.call.args.len);
+    if (slots.init.call.args[0] != .builtin or
+        !std.mem.eql(u8, slots.init.call.args[0].builtin.name, "TypeOf"))
+    {
+        return error.ExpectedInlineFieldLoop;
+    }
+    try std.testing.expectEqual(@as(usize, 1), slots.init.call.args[0].builtin.args.len);
+    if (slots.init.call.args[0].builtin.args[0] != .unary_op or
+        slots.init.call.args[0].builtin.args[0].unary_op.op != .deref)
+    {
+        return error.ExpectedInlineFieldLoop;
+    }
+    try std.testing.expectEqualStrings("value", operandIdent(
+        slots.init.call.args[0].builtin.args[0].unary_op.operand.*,
+    ) orelse return error.ExpectedInlineFieldLoop);
+    if (walk.body.block.stmts[1] != .expr_stmt or
+        walk.body.block.stmts[1].expr_stmt.* != .for_expr)
+    {
+        return error.ExpectedInlineFieldLoop;
+    }
+    const fields = walk.body.block.stmts[1].expr_stmt.for_expr;
+    try std.testing.expect(fields.is_inline);
+    try std.testing.expectEqual(@as(usize, 2), fields.captures.len);
+    try std.testing.expectEqualStrings("Field", fields.captures[0].name);
+    try std.testing.expectEqualStrings("Slot", fields.captures[1].name);
+    try std.testing.expectEqual(@as(usize, 2), fields.inputs.len);
+    try std.testing.expectEqualStrings("Fields", operandIdent(fields.inputs[0]) orelse
+        return error.ExpectedInlineFieldLoop);
+    try std.testing.expectEqualStrings("Slots", operandIdent(fields.inputs[1]) orelse
+        return error.ExpectedInlineFieldLoop);
+    if (fields.body.stmts.len != 1) return error.ExpectedInlineFieldLoop;
+    if (fields.body.stmts[0] != .expr_stmt or fields.body.stmts[0].expr_stmt.* != .call)
+        return error.ExpectedInlineFieldLoop;
+    const forwarded = fields.body.stmts[0].expr_stmt.call;
+    // Each FIELD is forwarded to the VALUE pair, not to the slice pair: a
+    // tuple field is not necessarily a slice, and routing an array field
+    // through the bulk helper would hand it a `[]const C.Type` it does not have.
+    try std.testing.expectEqualStrings(pair.value.name, calleeName(forwarded.callee.*) orelse
+        return error.ExpectedInlineFieldLoop);
+    const argument = forwarded.args[forwarded.args.len - 1];
+    if (argument != .unary_op or argument.unary_op.op != .addr_of)
+        return error.ExpectedInlineFieldLoop;
+    if (argument.unary_op.operand.* != .builtin) return error.ExpectedInlineFieldLoop;
+    const field_query = argument.unary_op.operand.builtin;
+    try std.testing.expectEqualStrings("field", field_query.name);
+    try std.testing.expectEqual(@as(usize, 2), field_query.args.len);
+    // Off the ORIGINAL value, read through the descriptor — not through a
+    // binding that already copied it out.
+    if (field_query.args[0] != .unary_op or field_query.args[0].unary_op.op != .deref)
+        return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("value", operandIdent(field_query.args[0].unary_op.operand.*) orelse
+        return error.ExpectedInlineFieldLoop);
+    if (field_query.args[1] != .field_access) return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("name", field_query.args[1].field_access.field_name);
+    try std.testing.expectEqualStrings("Slot", operandIdent(field_query.args[1].field_access.target.*) orelse
+        return error.ExpectedInlineFieldLoop);
+
+    // The element side: the loop captures each item BY REFERENCE and forwards
+    // that same item, so the walk reads the slice's storage rather than a copy
+    // of each element.
+    const elements = try matchArm(try sliceProng(pair.slice), null);
+    if (elements.body != .for_expr) return error.ExpectedElementLoop;
+    const loop = elements.body.for_expr;
+    try std.testing.expectEqual(@as(usize, 1), loop.captures.len);
+    try std.testing.expectEqualStrings("item", loop.captures[0].name);
+    try std.testing.expect(loop.captures[0].by_ref);
+    try std.testing.expectEqual(@as(usize, 1), loop.inputs.len);
+    try std.testing.expectEqualStrings("items", operandIdent(loop.inputs[0]) orelse
+        return error.ExpectedElementLoop);
+    if (loop.body.stmts.len != 1) return error.ExpectedElementLoop;
+    if (loop.body.stmts[0] != .expr_stmt or loop.body.stmts[0].expr_stmt.* != .call)
+        return error.ExpectedElementLoop;
+    const element_forward = loop.body.stmts[0].expr_stmt.call;
+    try std.testing.expectEqualStrings(pair.value.name, calleeName(element_forward.callee.*) orelse
+        return error.ExpectedElementLoop);
+    try std.testing.expectEqualStrings("item", operandIdent(element_forward.args[element_forward.args.len - 1]) orelse
+        return error.ExpectedElementLoop);
+}
+
+/// The tuple arm of the value declaration, whose body holds the field loop.
+fn tupleWalkArm(value_fn: ast.FnDecl) !ast.MatchArm {
+    const derived = try derivedWalkOf(value_fn);
+    return matchArm(derived, "tuple");
+}
+
+/// The scalar/bulk arm of the slice declaration, whose wildcard holds the
+/// element loop.
+fn sliceProng(slice_fn: ast.FnDecl) !ast.Expr {
+    const derived = try derivedWalkOf(slice_fn);
+    const arm = try matchArm(derived, "scalar");
+    return arm.body;
+}
+
+/// The `switch` a pair declaration reaches.
+///
+/// The declaration's one expression is whatever answered the receiver. With no
+/// source implementation to claim it, that IS the walk. With one, the
+/// declaration selects it first and the walk is the arm that did not match.
+fn derivedWalkOf(decl: ast.FnDecl) !ast.Expr {
+    const block = decl.body orelse return error.EmptyTranslatedBody;
+    if (block.stmts.len != 1) return error.ExpectedSingleDerivedWalk;
+    const statement = block.stmts[0];
+    if (statement != .expr_stmt) return error.ExpectedSingleDerivedWalk;
+    const answered = statement.expr_stmt.*;
+    if (answered == .match_expr) return answered;
+    if (answered != .if_expr) return error.ExpectedSingleDerivedWalk;
+    const otherwise = answered.if_expr.else_body orelse return error.ExpectedSingleDerivedWalk;
+    return otherwise.*;
+}
+
+// Every integer whose bytes ARE its payload is handed over in one call: no
+// length prefix, no loop, no guard — an empty view has no bytes to describe and
+// `sliceAsBytes` of it is empty, which is the same answer.
+//
+// The kinds that are NOT whole bytes get no bulk arm of their own; the wildcard
+// sends them through the element loop, which forwards each item on its own
+// terms.
+test "lower: an integer element is hashed as one bulk byte write and any other one at a time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const pair = try hashPairIn((try hashPairPackage(alloc)).files[0]);
+    const bulk = try sliceProng(pair.slice);
+    if (bulk != .match_expr) return error.ExpectedBulkSwitch;
+    const switch_expr = bulk.match_expr;
+    if (switch_expr.target.* != .ident) return error.ExpectedBulkSwitch;
+    try std.testing.expectEqualStrings("Primitive", switch_expr.target.ident);
+
+    // Twelve kinds have bytes of their own, and the wildcard is the thirteenth
+    // arm. There is no explicit `bool`, `char` or `unit` arm.
+    const bulk_kinds = [_][]const u8{
+        "u8", "u16", "u32", "u64", "u128", "usize",
+        "i8", "i16", "i32", "i64", "i128", "isize",
+    };
+    try std.testing.expectEqual(bulk_kinds.len + 1, switch_expr.arms.len);
+
+    // Every bulk arm names one of them — the twelve BY NAME, not a count of
+    // twelve arms that could be anything.
+    for (bulk_kinds) |kind| {
+        var present = false;
+        for (switch_expr.arms[0..bulk_kinds.len]) |arm| {
+            if (arm.patterns.len != 1) continue;
+            switch (arm.patterns[0]) {
+                .enum_literal => |name| present = present or std.mem.eql(u8, name, kind),
+                else => {},
+            }
+        }
+        try std.testing.expect(present);
+    }
+
+    // The bulk body is ONE canonical `write` of the view's own bytes, with no
+    // length prefix and no comptime guard in front of it.
+    try expectBulkByteWrite(switch_expr.arms[0].body);
+
+    // And the wildcard is the element loop, which is what the kinds without a
+    // byte layout are answered by.
+    const fallback = switch_expr.arms[bulk_kinds.len];
+    if (fallback.patterns.len != 1 or fallback.patterns[0] != .wildcard)
+        return error.ExpectedBulkSwitch;
+    if (fallback.body != .for_expr) return error.ExpectedElementLoop;
+    const loop = fallback.body.for_expr;
+    try std.testing.expectEqual(@as(usize, 1), loop.captures.len);
+    try std.testing.expectEqualStrings("item", loop.captures[0].name);
+    try std.testing.expect(loop.captures[0].by_ref);
+}
+
+/// The bulk body: the canonical `Hasher::write` reached with
+/// `std.mem.sliceAsBytes(items)` and nothing else.
+///
+/// The source-first dispatcher wraps the call in a type selection when the
+/// crate implements `Hasher` for the state type, so the write is reached
+/// through the arm that matched rather than at the top.
+fn expectBulkByteWrite(body: ast.Expr) !void {
+    var write = body;
+    if (write == .if_expr) write = write.if_expr.then_body.*;
+    if (write != .call) return error.ExpectedBulkByteWrite;
+    const call = write.call;
+    try std.testing.expectEqualStrings("write", calleeName(call.callee.*) orelse
+        return error.ExpectedBulkByteWrite);
+    // The bytes are the VIEW's own: `sliceAsBytes(items)`, over the whole view
+    // rather than over an element of it.
+    var payload: ast.Expr = undefined;
+    for (call.args) |argument| {
+        switch (argument) {
+            .call => |candidate| {
+                if (candidate.callee.* == .field_access and
+                    std.mem.eql(u8, candidate.callee.field_access.field_name, "sliceAsBytes"))
+                {
+                    payload = argument;
+                }
+            },
+            else => {},
+        }
+    }
+    if (payload != .call) return error.ExpectedBulkByteWrite;
+    const view = payload.call;
+    if (view.args.len != 1) return error.ExpectedBulkByteWrite;
+    try std.testing.expectEqualStrings("items", operandIdent(view.args[0]) orelse
+        return error.ExpectedBulkByteWrite);
+}
+
+// ── One allocator rule, asked from both ends of a call ─────────────────────
+// `lowerFnEntity` declares the `allocator` parameter and every call site hands
+// one over, so both ends read `callPassesAllocator` and nothing else. The two
+// fixtures below differ in exactly ONE declaration line — the callee's
+// declared return — and pin both answers to it.
+
+/// Which value a declaration's return names.
+const AllocatorRuleReturn = enum {
+    /// `fn encode(data: &[u8]) -> String`: the returned value is one the
+    /// callee BUILT, so the allocator that released it has to reach it.
+    /// hex/src/lib.rs:259 is this shape, and its body reaches a blanket
+    /// trait's method through `data: T` — a dispatch that resolves outside
+    /// the call graph the effect table walks, so the table never records the
+    /// allocation and the declaration learned it only while its own body
+    /// lowered.
+    owned,
+    /// `fn encode(data: &[u8]) -> &[u8]`: a borrow of storage the caller
+    /// still owns, which builds nothing and obliges nobody.
+    borrowed,
+};
+
+fn lowerAllocatorRulePackage(
+    alloc: std.mem.Allocator,
+    returned: AllocatorRuleReturn,
+) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const root = try addLowerEntity(&graph, .module, "", null);
+    const encode_id = try addLowerEntity(&graph, .fn_, "encode", root);
+    const use_id = try addLowerEntity(&graph, .fn_, "use_hex", root);
+    const data_field = try addLowerEntity(&graph, .field, "data", use_id);
+    try addBareCrate(&graph, alloc, "allocator_rule", root, &.{ encode_id, use_id });
+
+    const slice_info = try alloc.create(ir.types.Slice);
+    slice_info.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const byte_slice: ir.types.Type = .{ .slice = slice_info };
+    const bytes_ref: ir.types.Type = .{ .reference = &.{ .mut = false, .pointee = byte_slice } };
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    // 0: `&[u8]`, 1: whatever `encode` returns, 2: `String`, 3: unit.
+    const types = [_]ir.types.Type{
+        bytes_ref,
+        switch (returned) {
+            .owned => string_ty,
+            .borrowed => bytes_ref,
+        },
+        string_ty,
+        .{ .prim = .unit },
+    };
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+
+    // The callee's body is a stand-in for the one the effect table cannot
+    // read: it records no effect and reaches nothing, which is the state a
+    // blanket-trait dispatch leaves the precomputed table in. What it does NOT
+    // do is stand in for a body that allocates — hex's own `encode` is the
+    // case where the declaration discovers that late, and a fixture that
+    // seeded the table itself would pin nothing.
+    const unit_expr = try typedExpr(&model, 3, .{ .unit = {} });
+    const callee_body = try typedExpr(&model, 3, .{ .block = .{
+        .statements = &.{},
+        .tail = unit_expr,
+        .labelled = null,
+    } });
+    body_rows[encode_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "data", .ty = bytes_ref, .span = span },
+        }),
+        .ret = types[1],
+        .body = callee_body,
+        .is_allocating = false,
+    } };
+
+    const argument = try typedExpr(&model, 0, .{ .path = .{
+        .def = data_field,
+        .generic_args = &.{},
+    } });
+    const call = try typedExpr(&model, 1, .{ .call = .{
+        .call_kind = .{ .free = encode_id },
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{argument}),
+    } });
+    const caller_body = try typedExpr(&model, 1, .{ .block = .{
+        .statements = &.{},
+        .tail = call,
+        .labelled = null,
+    } });
+    body_rows[use_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "data", .ty = bytes_ref, .span = span },
+        }),
+        .ret = types[1],
+        .body = caller_body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "allocator_rule",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = &.{},
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The call a declaration's tail expression is, read back through whatever
+/// block or `try` the lowering wrapped it in on the way out.
+fn unwrapTailCall(function: ast.FnDecl) !ast.Call {
+    const body = function.body orelse return error.MissingCallTail;
+    var current = (body.expr orelse return error.MissingCallTail).*;
+    for (0..4) |_| {
+        switch (current) {
+            .block => |block| current = (block.expr orelse return error.MissingCallTail).*,
+            .unary_op => |unary| if (unary.op == .try_op) {
+                current = unary.operand.*;
+            } else return error.MissingCallTail,
+            .call => |call| return call,
+            else => return error.MissingCallTail,
+        }
+    }
+    return error.MissingCallTail;
+}
+
+// The declaration carries the parameter and the call site names one, in the
+// position the declaration reads it. A call site that asked only what the body
+// provably allocated emitted `encode([]const u8, "foobar")` against
+// `encode(comptime T: type, allocator: std.mem.Allocator, data: T)` and Zig
+// rejected the package with "expected 3 argument(s), found 2".
+test "lower: a call to an owned-returning declaration passes the allocator that declaration carries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const package = try lowerAllocatorRulePackage(alloc, .owned);
+
+    const encode = try findFnDecl(package.files[0], "encode");
+    try std.testing.expectEqual(@as(usize, 2), encode.params.len);
+    try std.testing.expectEqualStrings("allocator", encode.params[0].name);
+    try std.testing.expectEqualStrings(
+        "std.mem.Allocator",
+        try expectNamedType(encode.params[0].ty),
+    );
+    try std.testing.expectEqualStrings("data", encode.params[1].name);
+    // The owned return is what the declaration was asked about, and it is
+    // spelled as the runtime owner it is.
+    try std.testing.expectEqualStrings("r2z.alloc.String", try expectNamedType(encode.ret_type));
+
+    const caller = try findFnDecl(package.files[0], "use_hex");
+    try std.testing.expectEqual(@as(usize, 2), caller.params.len);
+    try std.testing.expectEqualStrings("allocator", caller.params[0].name);
+    try std.testing.expectEqualStrings("data", caller.params[1].name);
+
+    const call = try unwrapTailCall(caller);
+    try std.testing.expectEqualStrings("encode", calleeName(call.callee.*) orelse
+        return error.UnexpectedCallee);
+    try std.testing.expectEqual(@as(usize, 2), call.args.len);
+    try std.testing.expectEqualStrings("allocator", operandIdent(call.args[0]) orelse
+        return error.UnexpectedArgument);
+    try std.testing.expectEqualStrings("data", operandIdent(call.args[1]) orelse
+        return error.UnexpectedArgument);
+}
+
+// The same fixture with a borrowed return, which changes nothing but one line.
+// An allocator added here would be a parameter the body never uses and an
+// argument the declaration never reads, and the enclosing callable would
+// declare a local allocator for it.
+test "lower: a call to a borrowed-returning declaration passes no allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const package = try lowerAllocatorRulePackage(alloc, .borrowed);
+
+    const encode = try findFnDecl(package.files[0], "encode");
+    try std.testing.expectEqual(@as(usize, 1), encode.params.len);
+    try std.testing.expectEqualStrings("data", encode.params[0].name);
+    // A borrow is the caller's own storage: nothing is built, so the
+    // declaration invents no allocator and no error union either.
+    switch (encode.ret_type) {
+        .err_union => return error.UnexpectedErrorUnion,
+        else => {},
+    }
+
+    const caller = try findFnDecl(package.files[0], "use_hex");
+    try std.testing.expectEqual(@as(usize, 1), caller.params.len);
+    try std.testing.expectEqualStrings("data", caller.params[0].name);
+
+    const call = try unwrapTailCall(caller);
+    try std.testing.expectEqualStrings("encode", calleeName(call.callee.*) orelse
+        return error.UnexpectedCallee);
+    try std.testing.expectEqual(@as(usize, 1), call.args.len);
+    try std.testing.expectEqualStrings("data", operandIdent(call.args[0]) orelse
+        return error.UnexpectedArgument);
+}
+
+// ── A guarded chain whose block is the value the caller hands back ──────────
+
+/// A function whose value is a guarded `match` reached through a conditional.
+///
+/// This is the shape `test/crates/compat`'s `or_payload` has, and it is where
+/// the chain's result has to survive: the chain is the branch of an `if` whose
+/// value the function returns, so the block that declares the label the arms
+/// leave through is a block an enclosing `return` reads.
+fn lowerGuardedBranchPackage(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const root = try addRootModule(&graph, .{
+        .crate_name = "guard_branch",
+        .edition = 2021,
+        .items = &.{},
+    });
+    const fn_id = try addLowerEntity(&graph, .fn_, "classify", root);
+    const flag_id = try addLowerEntity(&graph, .field, "flag", fn_id);
+    const x_id = try addLowerEntity(&graph, .field, "x", fn_id);
+    graph.modules.items[0].items = try alloc.dupe(ir.spine.EntityId, &.{fn_id});
+
+    // 0: u8, 1: bool.
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const bool_ty: ir.types.Type = .{ .prim = .bool };
+    const types = [_]ir.types.Type{ u8_ty, bool_ty };
+
+    const flag = try typedExpr(&model, 1, .{ .path = .{ .def = flag_id, .generic_args = &.{} } });
+    const x = try typedExpr(&model, 0, .{ .path = .{ .def = x_id, .generic_args = &.{} } });
+    const guard_rhs = try typedInt(&model, 1, 0);
+    const guard = try typedEq(&model, try typedExpr(&model, 0, .{
+        .path = .{ .def = x_id, .generic_args = &.{} },
+    }), guard_rhs);
+
+    // `match x { 0 if x == 1 => 1, _ => 2 }`: a guarded arm whose body
+    // produces a value, followed by the catch-all that yields the chain's
+    // other exit.
+    const guarded_arms = try alloc.alloc(ir.exprs.MatchArm, 2);
+    guarded_arms[0] = .{
+        .patterns = try literalSelectors(alloc, &model, 0),
+        .guard = guard,
+        .body = try typedInt(&model, 1, 0),
+    };
+    guarded_arms[1] = .{
+        .patterns = try oneSelector(alloc, try model.pat(.wildcard)),
+        .guard = null,
+        .body = try typedInt(&model, 2, 0),
+    };
+    const guarded_match = try typedExpr(&model, 0, .{ .match = .{
+        .scrutinee = x,
+        .arms = guarded_arms,
+        .option_scrutinee = false,
+    } });
+
+    // The other branch is an ordinary unguarded match, so the conditional is
+    // `u8` on both sides and the function returns it.
+    const plain_arms = try alloc.alloc(ir.exprs.MatchArm, 2);
+    plain_arms[0] = .{
+        .patterns = try literalSelectors(alloc, &model, 0),
+        .guard = null,
+        .body = try typedInt(&model, 3, 0),
+    };
+    plain_arms[1] = .{
+        .patterns = try oneSelector(alloc, try model.pat(.wildcard)),
+        .guard = null,
+        .body = try typedInt(&model, 4, 0),
+    };
+    const plain_match = try typedExpr(&model, 0, .{ .match = .{
+        .scrutinee = x,
+        .arms = plain_arms,
+        .option_scrutinee = false,
+    } });
+
+    const conditional = try typedExpr(&model, 0, .{ .if_else = .{
+        .cond = flag,
+        .then_ = .{ .statements = &.{}, .tail = guarded_match, .labelled = null },
+        .@"else" = .{ .block = .{
+            .statements = &.{},
+            .tail = plain_match,
+            .labelled = null,
+        } },
+    } });
+    const body = try typedExpr(&model, 0, .{ .block = .{
+        .statements = &.{},
+        .tail = conditional,
+        .labelled = null,
+    } });
+
+    const params = try alloc.alloc(ir.items.Param, 2);
+    params[0] = .{ .name = "flag", .ty = bool_ty, .span = span };
+    params[1] = .{ .name = "x", .ty = u8_ty, .span = span };
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[fn_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u8_ty,
+        .body = body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "guard_branch",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The emitted Zig for the guarded-branch fixture.
+fn guardedBranchSource() ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const inner = arena.allocator();
+    const package = try lowerGuardedBranchPackage(inner);
+    return std.testing.allocator.dupe(u8, try emit.emitFile(inner, &package.files[0]));
+}
+
+// The chain is a labelled block, and every arm leaves it by naming that block.
+// Before, the block the arms' `break`s named was the conditional's branch, and
+// the flattening `lowerBlock` does for a statements-only tail dropped the
+// label on the way: `test/crates/compat` emitted `break n_1 +% 1;` inside a
+// bare switch prong, and Zig rejected it as a break outside any loop.
+test "lower: a guarded arm's value leaves a block that is declared around it" {
+    const source = try guardedBranchSource();
+    defer std.testing.allocator.free(source);
+
+    // The label the exits name is a block label, so `guardChainLabel` — which
+    // reads the `<label>: {` that opens it — resolves. A `break :<label>` with
+    // no such block is the defect this pins.
+    const label = try guardChainLabel(source);
+    var value_buf: [128]u8 = undefined;
+    try std.testing.expect(
+        std.mem.indexOf(u8, source, try guardExit(&value_buf, label, "1")) != null,
+    );
+    value_buf = undefined;
+    try std.testing.expect(
+        std.mem.indexOf(u8, source, try guardExit(&value_buf, label, "2")) != null,
+    );
+    // Both arms leave the chain and neither leaves it twice, so there are
+    // exactly two exits and they all name it.
+    var prefix_buf: [128]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countOccurrences(source, try guardExitPrefix(&prefix_buf, label)),
+    );
+    // Nothing in the function breaks out of anything but that block. An
+    // unlabeled `break` reads as one out of the innermost enclosing loop, and
+    // there is no loop here, which is exactly what Zig rejected.
+    try std.testing.expectEqual(
+        countOccurrences(source, "break "),
+        countOccurrences(source, "break :"),
+    );
+    // The chain is the branch the function returns, not a body that falls off
+    // the end: the fall-through past the last dispatch is spelled, and the
+    // enclosing `return` is what hands the block's value back.
+    try std.testing.expect(std.mem.indexOf(u8, source, "unreachable;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "return ") != null);
+}
+
+// ── A guarded chain that is the whole value a function returns ──────────────
+
+/// A function whose value is a guarded `match` with nothing around it.
+///
+/// This is the shape `test/crates/guarded-owned-fallthrough`'s
+/// `guarded_fallthrough` has, and it is where the label the chain's arms leave
+/// through has nowhere to go. The chain is a labelled value block whose arms
+/// end on `break :<label> <value>`, and a Zig FUNCTION BODY is written
+/// `{ … }` with no label in front of it: moving the chain's statements into the
+/// body left the label behind, so every arm's exit resolved to no block at all
+/// and the package emitted a bare `break r2z.alloc.takeOwned(…);` that Zig
+/// rejected as a break outside any loop.
+fn lowerGuardedTailPackage(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const root = try addRootModule(&graph, .{
+        .crate_name = "guard_tail",
+        .edition = 2021,
+        .items = &.{},
+    });
+    const fn_id = try addLowerEntity(&graph, .fn_, "classify", root);
+    const x_id = try addLowerEntity(&graph, .field, "x", fn_id);
+    graph.modules.items[0].items = try alloc.dupe(ir.spine.EntityId, &.{fn_id});
+
+    // 0: u8.
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const types = [_]ir.types.Type{u8_ty};
+
+    const x = try typedExpr(&model, 0, .{ .path = .{ .def = x_id, .generic_args = &.{} } });
+
+    // `match x { 0 if x == 1 => 1, _ => 2 }`: the guarded arm and the
+    // catch-all behind it are the chain's two exits.
+    const guarded_arms = try alloc.alloc(ir.exprs.MatchArm, 2);
+    guarded_arms[0] = .{
+        .patterns = try literalSelectors(alloc, &model, 0),
+        .guard = try typedEq(&model, try typedExpr(&model, 0, .{
+            .path = .{ .def = x_id, .generic_args = &.{} },
+        }), try typedInt(&model, 1, 0)),
+        .body = try typedInt(&model, 1, 0),
+    };
+    guarded_arms[1] = .{
+        .patterns = try oneSelector(alloc, try model.pat(.wildcard)),
+        .guard = null,
+        .body = try typedInt(&model, 2, 0),
+    };
+    const guarded_match = try typedExpr(&model, 0, .{ .match = .{
+        .scrutinee = x,
+        .arms = guarded_arms,
+        .option_scrutinee = false,
+    } });
+
+    // The chain IS the body's tail. Nothing else in the body precedes it, so a
+    // fix that only worked for a chain reached through a conditional would not
+    // be exercised here.
+    const body = try typedExpr(&model, 0, .{ .block = .{
+        .statements = &.{},
+        .tail = guarded_match,
+        .labelled = null,
+    } });
+
+    const params = try alloc.alloc(ir.items.Param, 1);
+    params[0] = .{ .name = "x", .ty = u8_ty, .span = span };
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[fn_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = u8_ty,
+        .body = body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "guard_tail",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The emitted Zig for the guarded-tail fixture.
+fn guardedTailSource() ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const inner = arena.allocator();
+    const package = try lowerGuardedTailPackage(inner);
+    return std.testing.allocator.dupe(u8, try emit.emitFile(inner, &package.files[0]));
+}
+
+test "lower: a guarded chain used as a function-body tail is bound to a local, not promoted into return position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const package = try lowerGuardedTailPackage(arena.allocator());
+
+    // The typed AST is the claim: the body keeps the chain WHOLE, bound to a
+    // local in STATEMENT position, and hands the value back by name. Promoting
+    // it into the tail wrote `return <label>: { … };`, which is not a grammar
+    // production — a labelled block is legal only as an `if`/`else` branch or
+    // under a carrier — and the tail is emitted through an empty `EmitContext`,
+    // so every `break :<label>` inside it resolved against no exit scope.
+    const classify = try findFnDecl(package.files[0], "classify");
+    const frame = classify.body orelse return error.ExpectedFunctionBody;
+    const chain_name = try expectIdent((frame.expr orelse
+        return error.ExpectedFunctionTail).*);
+    if (frame.stmts.len == 0) return error.ExpectedGuardChainBinding;
+    const binding = switch (frame.stmts[frame.stmts.len - 1]) {
+        .let_stmt => |let_stmt| let_stmt,
+        else => return error.ExpectedGuardChainBinding,
+    };
+    // The tail reads the local back, so the binding and the tail name one thing.
+    try std.testing.expectEqualStrings(chain_name, binding.name);
+    const chain = switch (binding.init) {
+        .block => |block| block,
+        else => return error.ExpectedGuardChainTail,
+    };
+    if (chain.label == null) return error.MissingGuardChainLabel;
+    try std.testing.expect(chain.expr == null);
+
+    const source = try guardedTailSource();
+    defer std.testing.allocator.free(source);
+    const label = try guardChainLabel(source);
+
+    // Both arms leave the chain by naming it, so the exits resolve to the block
+    // the local was bound to.
+    var value_buf: [128]u8 = undefined;
+    try std.testing.expect(
+        std.mem.indexOf(u8, source, try guardExit(&value_buf, label, "1")) != null,
+    );
+    value_buf = undefined;
+    try std.testing.expect(
+        std.mem.indexOf(u8, source, try guardExit(&value_buf, label, "2")) != null,
+    );
+    var prefix_buf: [128]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countOccurrences(source, try guardExitPrefix(&prefix_buf, label)),
+    );
+    // Nothing breaks out of anything but that block. An unlabeled `break` reads
+    // as one out of the innermost enclosing loop, and there is no loop here —
+    // which is exactly what Zig rejected.
+    try std.testing.expectEqual(
+        countOccurrences(source, "break "),
+        countOccurrences(source, "break :"),
+    );
+    // The label rides on a block sitting in a statement's initializer, which is
+    // one of the positions Zig spells, and the value leaves by name.
+    var bind_buf: [256]u8 = undefined;
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            source,
+            try std.fmt.bufPrint(&bind_buf, "const {s} = {s}: {{", .{ chain_name, label }),
+        ) != null,
+    );
+    var return_buf: [128]u8 = undefined;
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            source,
+            try std.fmt.bufPrint(&return_buf, "return {s};", .{chain_name}),
+        ) != null,
+    );
+    // NEGATIVE: the chain is not in return position at all. `return <label>: {`
+    // is the shape the promotion emitted, and its absence is the property — a
+    // body whose chain was flattened into its own statements emitted neither
+    // the `const` binding nor the `return`, and a promoted one emitted this.
+    var promoted_buf: [128]u8 = undefined;
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            source,
+            try std.fmt.bufPrint(&promoted_buf, "return {s}: {{", .{label}),
+        ) == null,
+    );
+    // The fall-through past the last dispatch is spelled rather than falling
+    // off the end of the block.
+    try std.testing.expect(std.mem.indexOf(u8, source, "unreachable;") != null);
+}
+
+// ── The declared return, once the body has answered ─────────────────────────
+
+/// The two declarations `test/crates/compat` emits an unused `allocator`
+/// parameter for, plus a caller that reads the same rule.
+///
+///     pub fn borrowed_bytes(input: &[u8]) -> Cow<'_, [u8]> { Cow::Borrowed(input) }
+///     pub fn user_error() -> Result<String, UserError> { Err(UserError { code: 7 }) }
+///
+/// Both declare storage they own and both bodies build none: a `Cow::Borrowed`
+/// is the caller's own slice under another name, and an `Err` arm never reaches
+/// the `String` the `Result` declares. Neither may carry an allocator, and
+/// because both ends of a call read one rule, the caller passes none either.
+fn lowerAllocatorObligationPackage(alloc: std.mem.Allocator) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+
+    const root = try addRootModule(&graph, .{
+        .crate_name = "allocator_obligation",
+        .edition = 2021,
+        .items = &.{},
+    });
+    // `Err(..)` is a variant of the prelude's own `Result`, so the fixture
+    // needs the module chain `syntheticExternalType` walks to recognise it.
+    const core_id = try addLowerEntity(&graph, .module, "core", root);
+    const result_module_id = try addLowerEntity(&graph, .module, "result", core_id);
+    const result_enum_id = try addLowerEntity(&graph, .enum_, "Result", result_module_id);
+    const error_id = try addLowerEntity(&graph, .struct_, "UserError", root);
+    const borrowed_id = try addLowerEntity(&graph, .fn_, "borrowed_bytes", root);
+    const user_error_id = try addLowerEntity(&graph, .fn_, "user_error", root);
+    const caller_id = try addLowerEntity(&graph, .fn_, "use_bytes", root);
+    const borrowed_input_id = try addLowerEntity(&graph, .field, "input", borrowed_id);
+    const caller_data_id = try addLowerEntity(&graph, .field, "data", caller_id);
+    graph.modules.items[0].items = try alloc.dupe(ir.spine.EntityId, &.{
+        error_id, borrowed_id, user_error_id, caller_id,
+    });
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = "core",
+        .parent = root,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = true,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    _ = try graph.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = "result",
+        .parent = core_id,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = true,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+
+    const slice_info = try alloc.create(ir.types.Slice);
+    slice_info.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const byte_slice: ir.types.Type = .{ .slice = slice_info };
+    const bytes_ref: ir.types.Type = .{ .reference = &.{ .mut = false, .pointee = byte_slice } };
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const cow_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "borrow", "Cow" },
+        .args = try alloc.dupe(ir.types.Type, &.{byte_slice}),
+    } };
+    const err_segments = try alloc.alloc(ir.types.PathSegment, 1);
+    err_segments[0] = .{ .name = "UserError", .id = error_id };
+    const error_ty: ir.types.Type = .{ .path = .{ .segments = err_segments } };
+    const result_ty: ir.types.Type = .{ .result = try alloc.create(ir.types.Result) };
+    @constCast(result_ty.result).* = .{
+        .ok = string_ty,
+        .err = error_ty,
+        .is_error_unionable = false,
+    };
+    // 0: `&[u8]`, 1: `Cow<[u8]>`, 2: `Result<String, UserError>`, 3: `UserError`,
+    // 4: u8.
+    const types = [_]ir.types.Type{ bytes_ref, cow_ty, result_ty, error_ty, u8_ty };
+
+    // `Cow::Borrowed(input)`
+    const borrowed_input = try typedExpr(&model, 0, .{
+        .path = .{ .def = borrowed_input_id, .generic_args = &.{} },
+    });
+    const borrowed_arm = try typedExpr(&model, 1, .{ .external_variant = .{
+        .owner = cow_ty.external_nominal,
+        .variant = "Borrowed",
+        .tuple_fields = try alloc.dupe(ir.exprs.NodeId, &.{borrowed_input}),
+    } });
+    const borrowed_body = try typedExpr(&model, 1, .{ .block = .{
+        .statements = &.{},
+        .tail = borrowed_arm,
+        .labelled = null,
+    } });
+
+    // `Err(UserError { code: 7 })`
+    const code_value = try typedExpr(&model, 4, litInt(7));
+    const code_fields = try alloc.alloc(ir.exprs.FieldInit, 1);
+    code_fields[0] = .{ .field = "code", .value = code_value, .shorthand = false };
+    const error_literal = try typedExpr(&model, 3, .{ .struct_lit = .{
+        .def = error_id,
+        .fields = code_fields,
+        .base = null,
+    } });
+    const err_arm = try typedExpr(&model, 2, .{ .enum_variant = .{
+        .def = result_enum_id,
+        .variant = "Err",
+        .tuple_fields = try alloc.dupe(ir.exprs.NodeId, &.{error_literal}),
+        .named_fields = &.{},
+    } });
+    const user_error_body = try typedExpr(&model, 2, .{ .block = .{
+        .statements = &.{},
+        .tail = err_arm,
+        .labelled = null,
+    } });
+
+    // `use_bytes(data) { borrowed_bytes(data) }`
+    const caller_data = try typedExpr(&model, 0, .{
+        .path = .{ .def = caller_data_id, .generic_args = &.{} },
+    });
+    const borrow_call = try typedExpr(&model, 1, .{ .call = .{
+        .call_kind = .{ .free = borrowed_id },
+        .args = try alloc.dupe(ir.exprs.NodeId, &.{caller_data}),
+    } });
+    const caller_body = try typedExpr(&model, 1, .{ .block = .{
+        .statements = &.{},
+        .tail = borrow_call,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[error_id] = .{ .struct_ = .{
+        .fields = try alloc.dupe(ir.items.Field, &.{
+            .{ .name = "code", .ty = u8_ty, .visibility = .public, .span = span },
+        }),
+        .methods = &.{},
+    } };
+    body_rows[borrowed_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "input", .ty = bytes_ref, .span = span },
+        }),
+        .ret = cow_ty,
+        .body = borrowed_body,
+        .is_allocating = false,
+    } };
+    body_rows[user_error_id] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = result_ty,
+        .body = user_error_body,
+        .is_allocating = false,
+    } };
+    body_rows[caller_id] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{
+            .{ .name = "data", .ty = bytes_ref, .span = span },
+        }),
+        .ret = cow_ty,
+        .body = caller_body,
+        .is_allocating = false,
+    } };
+
+    const rust_ir = ir.RustIr{
+        .crate_name = "allocator_obligation",
+        .edition = "2021",
+        .graph = graph,
+        .types = &types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = &types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+// The signature the source declared, and nothing more: no `allocator` a body
+// that builds no storage would leave unused, which Zig rejects as an unused
+// function parameter.
+test "lower: a declared owned return a body that builds nothing obliges no allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const package = try lowerAllocatorObligationPackage(alloc);
+    try std.testing.expectEqual(@as(usize, 1), package.files.len);
+
+    // `Cow::Borrowed(input)` is the caller's own slice under another name.
+    const borrowed = try findFnDecl(package.files[0], "borrowed_bytes");
+    try std.testing.expectEqual(@as(usize, 1), borrowed.params.len);
+    try std.testing.expectEqualStrings("input", borrowed.params[0].name);
+    // The declared return still reaches the declaration spelled as the runtime
+    // owner it is — a `Cow` of a byte slice instantiates the runtime's generic.
+    const borrowed_return = switch (borrowed.ret_type) {
+        .generic => |generic| generic,
+        else => return error.ExpectedNamedType,
+    };
+    try std.testing.expectEqualStrings("r2z.alloc.CowSlice", borrowed_return.name);
+    try std.testing.expectEqual(@as(usize, 1), borrowed_return.params.len);
+
+    // `Err(UserError { .. })` never reaches the `String` the `Result` declares.
+    const user_error = try findFnDecl(package.files[0], "user_error");
+    try std.testing.expectEqual(@as(usize, 0), user_error.params.len);
+
+    // The call site reads the same rule, so it hands over nothing either.
+    const caller = try findFnDecl(package.files[0], "use_bytes");
+    try std.testing.expectEqual(@as(usize, 1), caller.params.len);
+    try std.testing.expectEqualStrings("data", caller.params[0].name);
+    const call = try unwrapTailCall(caller);
+    try std.testing.expectEqualStrings("borrowed_bytes", calleeName(call.callee.*) orelse
+        return error.UnexpectedCallee);
+    try std.testing.expectEqual(@as(usize, 1), call.args.len);
+    try std.testing.expectEqualStrings("data", operandIdent(call.args[0]) orelse
+        return error.UnexpectedArgument);
+}
+
+// ── A named struct pattern in `let` position ──────────────────────────────
+
+/// Which `let S { .. } = ..` the fixture carries.
+const StructPatternScene = enum {
+    /// `let State { written, mut a, b } = state;` over three `u64` fields,
+    /// followed by the one write that makes `mut a` observable.
+    leaf_fields,
+    /// `let Holder { tag, text } = holder;` where `text` is a `String`, so the
+    /// binding is a transfer out of `holder` rather than a copy of it.
+    owned_field,
+};
+
+/// One field the pattern names, with the type the struct declares for it and
+/// the `mut` the source wrote beside it.
+const StructPatternFieldPlan = struct {
+    name: []const u8,
+    ty: ir.types.Type,
+    mutable: bool,
+};
+
+/// Lower `let S { .. } = <param>;` plus whatever the scene needs to make its
+/// bindings observable.
+///
+/// `.leaf_fields` is test/crates/seahash/src/buffer.rs:211 in miniature: the
+/// source marked one field `mut` and the body writes exactly that one. The
+/// write is what survives `lowerBlock`'s downgrade of an untouched `var`, so a
+/// fixture that only bound `a` and read it would prove nothing about `mut`.
+/// The other two fields are read, which is what keeps them `const`.
+///
+/// `.owned_field` hands the moved binding straight back, so the tail is the
+/// move site that empties the handle the scope release was armed on.
+fn structPatternPackage(alloc: std.mem.Allocator, scene: StructPatternScene) !ast.Package {
+    var graph = ir.graph.CrateGraph.init(alloc);
+    var model = Model.init(alloc);
+    const root = try addLowerEntity(&graph, .module, "", null);
+
+    const u64_ty: ir.types.Type = .{ .prim = .u64 };
+    const u8_ty: ir.types.Type = .{ .prim = .u8 };
+    const string_ty: ir.types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    const struct_name: []const u8 = switch (scene) {
+        .leaf_fields => "State",
+        .owned_field => "Holder",
+    };
+    const callable_name: []const u8 = switch (scene) {
+        .leaf_fields => "finalize",
+        .owned_field => "take",
+    };
+    const param_name: []const u8 = if (scene == .leaf_fields) "state" else "holder";
+    const plan: []const StructPatternFieldPlan = switch (scene) {
+        .leaf_fields => &.{
+            .{ .name = "written", .ty = u64_ty, .mutable = false },
+            .{ .name = "a", .ty = u64_ty, .mutable = true },
+            .{ .name = "b", .ty = u64_ty, .mutable = false },
+        },
+        .owned_field => &.{
+            .{ .name = "tag", .ty = u8_ty, .mutable = false },
+            .{ .name = "text", .ty = string_ty, .mutable = false },
+        },
+    };
+
+    const struct_id = try addLowerEntity(&graph, .struct_, struct_name, root);
+    const callable = try addLowerEntity(&graph, .fn_, callable_name, root);
+
+    // The struct declares the same fields, so every slot's type comes from the
+    // declaration the source wrote rather than from the pattern.
+    const declared = try alloc.alloc(ir.items.Field, plan.len);
+    const types = try alloc.alloc(ir.types.Type, plan.len + 1);
+    types[0] = .{ .path = .{ .segments = try alloc.dupe(
+        ir.types.PathSegment,
+        &.{.{ .name = struct_name, .id = struct_id }},
+    ) } };
+    for (plan, 0..) |field, index| {
+        declared[index] = .{
+            .name = field.name,
+            .ty = field.ty,
+            .visibility = .private,
+            .span = span,
+        };
+        types[index + 1] = field.ty;
+    }
+
+    const param_def = try addLowerEntity(&graph, .field, param_name, callable);
+    const initializer = try typedExpr(&model, 0, .{
+        .path = .{ .def = param_def, .generic_args = &.{} },
+    });
+
+    // One binding entity per field, in the order the pattern names them: a
+    // binding's emitted name is claimed against the entity that declares it,
+    // so a field the pattern introduces needs one of its own.
+    const binding_defs = try alloc.alloc(ir.spine.EntityId, plan.len);
+    const pattern_fields = try alloc.alloc(ir.exprs.FieldPat, plan.len);
+    for (plan, 0..) |field, index| {
+        binding_defs[index] = try addLowerEntity(&graph, .field, field.name, callable);
+        pattern_fields[index] = .{
+            .field = field.name,
+            .pat = try model.pat(.{ .binding = .{
+                .name = field.name,
+                .mode = .{ .value = {} },
+                .mutable = field.mutable,
+            } }),
+            .shorthand = true,
+        };
+    }
+    const destructure = try model.stmt(.{ .let = .{
+        .pattern = try model.pat(.{ .struct_pat = .{
+            .def = struct_id,
+            .fields = pattern_fields,
+            .rest = false,
+        } }),
+        .init = initializer,
+        .ty = null,
+    } });
+
+    var statements = try alloc.dupe(ir.exprs.NodeId, &.{destructure});
+    const tail: ir.exprs.NodeId = switch (scene) {
+        .leaf_fields => blk: {
+            const write = try model.e(.{ .assign = .{
+                .target = try model.e(.{ .path = .{ .def = binding_defs[1], .generic_args = &.{} } }),
+                .op = .plain,
+                .value = try model.e(.{ .path = .{ .def = binding_defs[2], .generic_args = &.{} } }),
+                .overflow = .wrapping,
+            } });
+            statements = try alloc.dupe(ir.exprs.NodeId, &.{ destructure, try model.stmt(.{ .expr = write }) });
+            break :blk try model.e(.{ .path = .{ .def = binding_defs[0], .generic_args = &.{} } });
+        },
+        .owned_field => try model.e(.{ .path = .{ .def = binding_defs[1], .generic_args = &.{} } }),
+    };
+    const block = try model.e(.{ .block = .{
+        .statements = statements,
+        .tail = tail,
+        .labelled = null,
+    } });
+
+    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
+    for (body_rows) |*row| row.* = .none;
+    body_rows[callable] = .{ .fn_ = .{
+        .params = try alloc.dupe(ir.items.Param, &.{.{
+            .name = param_name,
+            .ty = types[0],
+            .span = span,
+        }}),
+        .ret = if (scene == .leaf_fields) u64_ty else string_ty,
+        .body = block,
+    } };
+    body_rows[struct_id] = .{ .struct_ = .{ .layout = .named, .fields = declared } };
+    try addBareCrate(&graph, alloc, "struct_pattern", root, try alloc.dupe(
+        ir.spine.EntityId,
+        &.{ callable, struct_id },
+    ));
+    const rust_ir = ir.RustIr{
+        .crate_name = "struct_pattern",
+        .edition = "2021",
+        .graph = graph,
+        .types = types,
+        .bodies = .{
+            .exprs = try model.exprs.toOwnedSlice(alloc),
+            .stmts = try model.stmts.toOwnedSlice(alloc),
+            .pats = try model.pats.toOwnedSlice(alloc),
+            .types = types,
+            .bodies = body_rows,
+        },
+    };
+    return lower.lowerRustIr(alloc, &rust_ir, null);
+}
+
+/// The `r2z.alloc.takeOwned(T, &<owner>.<field>)` a body performed, with the
+/// handle it installed the payload into and the PLACE it emptied to do it.
+///
+/// Owner and field are kept apart because the whole question is whether the
+/// transfer reads the storage the source handed in or a copy of it: a copy
+/// would name a temporary this pass never declared, and would leave the
+/// original field still holding the allocation.
+const StructFieldTransfer = struct {
+    handle: []const u8,
+    owner: []const u8,
+    field: []const u8,
+};
+
+fn structFieldTransfer(stmts: []const ast.Stmt) ?StructFieldTransfer {
+    for (stmts) |stmt| {
+        if (stmt != .let_stmt) continue;
+        const transfer = stmt.let_stmt.init;
+        if (transfer != .call) continue;
+        const callee = calleeName(transfer.call.callee.*) orelse continue;
+        if (!std.mem.eql(u8, callee, "r2z.alloc.takeOwned")) continue;
+        if (transfer.call.args.len != 1) continue;
+        const place = transfer.call.args[0];
+        if (place != .unary_op or place.unary_op.op != .addr_of) continue;
+        const target = place.unary_op.operand.*;
+        if (target != .field_access) continue;
+        const owner = operandIdent(target.field_access.target.*) orelse continue;
+        return .{
+            .handle = stmt.let_stmt.name,
+            .owner = owner,
+            .field = target.field_access.field_name,
+        };
+    }
+    return null;
+}
+
+/// Every handle a scope release is armed on, in the order the body arms them.
+///
+/// A body that released the place a transfer emptied as well as the handle the
+/// payload moved into would name two slots here, and the second one to run
+/// would free bytes the caller now owns.
+fn armedReleaseHandles(stmts: []const ast.Stmt, backing: std.mem.Allocator) ![][]const u8 {
+    var handles: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer handles.deinit(backing);
+    for (stmts) |stmt| {
+        if (stmt != .defer_stmt) continue;
+        const release = stmt.defer_stmt.expr;
+        if (release != .call) continue;
+        const callee = release.call.callee.*;
+        if (callee != .field_access) continue;
+        if (!std.mem.eql(u8, callee.field_access.field_name, "deinit")) continue;
+        const name = operandIdent(callee.field_access.target.*) orelse continue;
+        try handles.append(backing, name);
+    }
+    return handles.toOwnedSlice(backing);
+}
+
+// A named struct pattern binds ONE NAME PER FIELD, in the order the source
+// named them, over the initializer's OWN place. `mut` is the source's own and
+// not a rule this pass invented: the binding it marked stays a `var` and the
+// rest stay `const`. The initializer here is the parameter itself, so no
+// carrier stands between the bindings and the storage they read.
+test "lower: a named multi-field struct pattern binds one name per field and honours mut" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const package = try structPatternPackage(alloc, .leaf_fields);
+    const block = (try findFnDecl(package.files[0], "finalize")).body orelse
+        return error.EmptyTranslatedBody;
+
+    // Three bindings and then the one write that keeps `mut` observable.
+    try std.testing.expectEqual(@as(usize, 4), block.stmts.len);
+    const expected = [_]struct { name: []const u8, mutable: bool }{
+        .{ .name = "written", .mutable = false },
+        .{ .name = "a", .mutable = true },
+        .{ .name = "b", .mutable = false },
+    };
+    for (expected, block.stmts[0..expected.len]) |want, stmt| {
+        if (stmt != .let_stmt) return error.ExpectedFieldBinding;
+        try std.testing.expectEqualStrings(want.name, stmt.let_stmt.name);
+        try std.testing.expectEqual(want.mutable, stmt.let_stmt.is_mut);
+        // Its OWN field of the parameter, so the source's initializer is read
+        // where it wrote it and each binding is independent of the others.
+        if (stmt.let_stmt.init != .field_access) return error.ExpectedFieldAccess;
+        const place = stmt.let_stmt.init.field_access;
+        try std.testing.expectEqualStrings("state", operandIdent(place.target.*) orelse
+            return error.ExpectedParameterPlace);
+        try std.testing.expectEqualStrings(want.name, place.field_name);
+    }
+
+    // The body really does write the binding the source marked `mut`, which is
+    // what keeps it a `var` rather than a `const` nothing reaches.
+    if (block.stmts[expected.len] != .assign) return error.ExpectedFieldWrite;
+    try std.testing.expectEqualStrings("a", operandIdent(block.stmts[expected.len].assign.target) orelse
+        return error.ExpectedFieldWrite);
+}
+
+// ── The move a named struct pattern performs, executed ────────────────────
+
+/// Every allocation the frames under test make, counted by ADDRESS.
+///
+/// The claim is about how many times ONE payload's bytes are released, and a
+/// leak-checking allocator cannot answer that on its own: a payload that MOVED
+/// is released by whoever holds it now, so a frame that released it as well
+/// would still leave the testing allocator balanced — one free too many,
+/// against an allocation the caller also freed, and reported as no leak at
+/// all. And a release that reached an already-emptied handle frees nothing, so
+/// the second release a wrong lowering performs is a silent no-op rather than
+/// a crash. `Ledger` exists for that gap: it counts every allocation by
+/// address and every release of that address, so "exactly once" is a number a
+/// test reads rather than an absence it infers.
+///
+/// The ledger allocates nothing itself; a genuine double free still panics in
+/// the allocator underneath and a genuine leak is still reported when the
+/// test ends.
+const Ledger = struct {
+    /// One payload is live at a time in every test here, so an eighth is
+    /// headroom for a frame that legitimately builds more than one owned
+    /// value; running past it is counted rather than ignored, so an
+    /// under-count cannot pass silently.
+    const capacity = 8;
+
+    const Record = struct {
+        address: usize,
+        releases: u16,
+    };
+
+    child: std.mem.Allocator,
+    records: [capacity]Record,
+    count: usize,
+    /// Allocations made with no room left to record them.
+    overflows: usize,
+    /// Frees of an address this ledger never handed out.
+    unowned_releases: usize,
+
+    fn init(child: std.mem.Allocator) Ledger {
+        return .{
+            .child = child,
+            .records = undefined,
+            .count = 0,
+            .overflows = 0,
+            .unowned_releases = 0,
+        };
+    }
+
+    fn allocator(self: *Ledger) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = allocSlot,
+        .resize = resizeSlot,
+        .remap = remapSlot,
+        .free = freeSlot,
+    };
+
+    /// The index of the record for `address`, released or not. A record
+    /// outlives its release on purpose: a second free of the same address has
+    /// to find it again and count twice, which is the whole point.
+    fn find(self: *const Ledger, address: usize) ?usize {
+        for (self.records[0..self.count], 0..) |record, index| {
+            if (record.address == address) return index;
+        }
+        return null;
+    }
+
+    /// How many of the recorded allocations have not been released.
+    fn liveCount(self: *const Ledger) usize {
+        var count: usize = 0;
+        for (self.records[0..self.count]) |record| {
+            if (record.releases == 0) count += 1;
+        }
+        return count;
+    }
+
+    /// The only address still held, or null when the count is not exactly one.
+    fn onlyLiveAddress(self: *const Ledger) ?usize {
+        if (self.liveCount() != 1) return null;
+        for (self.records[0..self.count]) |record| {
+            if (record.releases == 0) return record.address;
+        }
+        return null;
+    }
+
+    /// How many times `address` has been freed.
+    fn releasesOf(self: *const Ledger, address: usize) u16 {
+        const index = self.find(address) orelse return 0;
+        return self.records[index].releases;
+    }
+
+    /// Every release the ledger saw, recorded or not.
+    fn totalReleases(self: *const Ledger) usize {
+        var total = self.unowned_releases;
+        for (self.records[0..self.count]) |record| total += record.releases;
+        return total;
+    }
+
+    fn allocSlot(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *Ledger = @ptrCast(@alignCast(context));
+        const result = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        if (self.count == capacity) {
+            self.overflows += 1;
+            return result;
+        }
+        self.records[self.count] = .{ .address = @intFromPtr(result), .releases = 0 };
+        self.count += 1;
+        return result;
+    }
+
+    fn resizeSlot(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *Ledger = @ptrCast(@alignCast(context));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remapSlot(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *Ledger = @ptrCast(@alignCast(context));
+        const result = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        // A remap that moved the allocation releases the old address and hands
+        // back this one, so the record follows it. One that did not move keeps
+        // the address it already has.
+        const relocated = @intFromPtr(result);
+        if (@intFromPtr(memory.ptr) != relocated) {
+            if (self.find(@intFromPtr(memory.ptr))) |index| {
+                self.records[index].address = relocated;
+            }
+        }
+        return result;
+    }
+
+    fn freeSlot(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *Ledger = @ptrCast(@alignCast(context));
+        // A zero-length free releases nothing, so it is not a release of any
+        // address and must not be counted as one.
+        if (memory.len != 0) {
+            if (self.find(@intFromPtr(memory.ptr))) |index| {
+                self.records[index].releases += 1;
+            } else {
+                self.unowned_releases += 1;
+            }
+        }
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// One owned field as the emitted code holds it: a handle over bytes that a
+/// transfer empties in place.
+const OwnedSlot = struct {
+    bytes: []u8 = &.{},
+
+    fn isEmpty(self: OwnedSlot) bool {
+        return self.bytes.len == 0;
+    }
+};
+
+/// What `r2z.alloc.takeOwned(T, &place)` does: the bytes move into the handle
+/// the pattern bound, and the place they came from is left empty.
+fn transferInPlace(place: *OwnedSlot) OwnedSlot {
+    const taken = OwnedSlot{ .bytes = place.bytes };
+    place.bytes = &.{};
+    return taken;
+}
+
+/// What `handle.deinit(allocator)` does: the bytes go back to the allocator
+/// that produced them, and a handle already emptied frees nothing — which is
+/// what lets the scope release run unconditionally on both exits.
+fn releaseInPlace(gpa: std.mem.Allocator, handle: *OwnedSlot) void {
+    if (handle.bytes.len == 0) return;
+    gpa.free(handle.bytes);
+    handle.bytes = &.{};
+}
+
+// What the emitted statements DO is the only thing the ownership claim is
+// worth, so this runs them. The payload is allocated once through a
+// per-address ledger, the transfer the lowering emitted empties the field it
+// was read from and installs the bytes in the handle the pattern bound, and
+// every release the lowering armed runs in the order it armed it. A copy
+// instead of a transfer is what this rules out: the original field would
+// still name the allocation, and the release armed on the moved handle would
+// free bytes the source's own field still holds.
+test "lower: a struct pattern's owned field moves out of its place exactly once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The shape, read off the typed AST: what was transferred, out of WHICH
+    // place, and which handle the scope release was armed on.
+    const package = try structPatternPackage(alloc, .owned_field);
+    const block = (try findFnDecl(package.files[0], "take")).body orelse
+        return error.EmptyTranslatedBody;
+    const transfer = structFieldTransfer(block.stmts) orelse
+        return error.NoStructFieldTransfer;
+    try std.testing.expectEqualStrings("text", transfer.handle);
+    // The ORIGINAL field of the parameter, not a copy of it.
+    try std.testing.expectEqualStrings("holder", transfer.owner);
+    try std.testing.expectEqualStrings("text", transfer.field);
+    // `tag` owns nothing, so the body arms exactly ONE release, and it is
+    // armed on the handle that holds the bytes.
+    const armed = try armedReleaseHandles(block.stmts, alloc);
+    try std.testing.expectEqual(@as(usize, 1), armed.len);
+    try std.testing.expectEqualStrings("text", armed[0]);
+
+    var ledger = Ledger.init(std.testing.allocator);
+    const gpa = ledger.allocator();
+
+    // The frame under test: the owned field the source destructured out of
+    // its parameter. It stays the owner until the transfer runs.
+    var original = OwnedSlot{ .bytes = try gpa.dupe(u8, "nested") };
+    const address = ledger.onlyLiveAddress() orelse
+        return error.PayloadBytesNotHeldOnce;
+
+    // Nothing may be released before the transfer: the payload is live and
+    // the frame still owns it.
+    try std.testing.expectEqual(@as(usize, 0), ledger.totalReleases());
+
+    // The transfer. The source field is left EMPTY, so a release that reached
+    // it afterwards would free nothing at all.
+    var moved = transferInPlace(&original);
+    try std.testing.expect(original.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), ledger.totalReleases());
+
+    // The one release the body armed, on the handle that holds the bytes.
+    releaseInPlace(gpa, &moved);
+    // Then the two defects this shape is built to survive: a frame that also
+    // released the place it had moved out of, and a second release of the
+    // handle that now holds the payload. Both reach storage that is already
+    // gone, and neither may show up as a release.
+    releaseInPlace(gpa, &original);
+    releaseInPlace(gpa, &moved);
+
+    try std.testing.expectEqual(@as(usize, 0), ledger.liveCount());
+    try std.testing.expectEqual(@as(u16, 1), ledger.releasesOf(address));
+    try std.testing.expectEqual(@as(usize, 1), ledger.totalReleases());
+    try std.testing.expectEqual(@as(usize, 0), ledger.unowned_releases);
+    try std.testing.expectEqual(@as(usize, 0), ledger.overflows);
 }

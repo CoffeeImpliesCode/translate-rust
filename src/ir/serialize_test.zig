@@ -90,6 +90,10 @@ fn initDependencyIr(allocator: std.mem.Allocator) !serialize.RustIr {
         .optional = false,
         .default_features = null,
         .features = &.{},
+        // No declared features and no `default-features` key, in a fixture
+        // whose consuming crate forwards nothing: the one shape the frontend
+        // may call certainly empty.
+        .resolved_features_known_empty = true,
     };
     deps[1] = .{
         .extern_name = try allocator.dupe(u8, "disabled"),
@@ -101,6 +105,9 @@ fn initDependencyIr(allocator: std.mem.Allocator) !serialize.RustIr {
         .optional = false,
         .default_features = false,
         .features = disabled_features,
+        // `default-features = false` already removed the defaults, so the
+        // resolved set is not certainly empty even with no declared features.
+        .resolved_features_known_empty = false,
     };
     deps[2] = .{
         .extern_name = try allocator.dupe(u8, "enabled"),
@@ -112,6 +119,8 @@ fn initDependencyIr(allocator: std.mem.Allocator) !serialize.RustIr {
         .optional = true,
         .default_features = true,
         .features = enabled_features,
+        // A declared feature is on whatever anything forwards.
+        .resolved_features_known_empty = false,
     };
     crate_graph.crates.items[0].deps = deps;
 
@@ -603,7 +612,7 @@ fn initSemanticNodesIr(allocator: std.mem.Allocator) !serialize.RustIr {
             .exprs = expression_table,
             .stmts = &.{},
             .pats = pattern_table,
-            .types = &.{.{ .array = array_type }},
+            .types = try allocator.dupe(types.Type, &.{.{ .array = array_type }}),
             .bodies = body_table,
         },
     };
@@ -705,6 +714,1555 @@ test "core calls round-trip with canonical wire tags" {
 
     const reencoded = try serialize.encode(allocator, &decoded);
     try std.testing.expectEqualStrings(encoded, reencoded);
+}
+
+// ── Typed core calls ────────────────────────────────────────────────────────
+
+const core_span: spine.Span = .{
+    .start_line = 1,
+    .start_col = 1,
+    .end_line = 1,
+    .end_col = 1,
+};
+
+/// `[N]u8`, the byte image both little-endian conversions carry. A fixed-width
+/// integer spells its length as a literal; `usize`/`isize` name the target's
+/// own `mem_size_of` expression instead, so a width only the compilation
+/// target knows is never the translator host's.
+fn coreByteImage(allocator: std.mem.Allocator, len: types.ArrayLen) !types.Type {
+    return coreArrayOf(allocator, .{ .prim = .u8 }, len);
+}
+
+/// The `core_call` payload of `expr`, or the refusal to read one.
+fn coreCallAt(expr: exprs.Expr) !exprs.CoreCall {
+    return switch (expr.kind) {
+        .core_call => |value| value,
+        else => error.ExpectedCoreCallExpression,
+    };
+}
+
+/// The child of the canonical semantic wrapper, not its erased backend layout.
+fn maybeUninitChild(ty: types.Type) !types.Type {
+    const wrapper = switch (ty) {
+        .external_nominal => |value| value,
+        else => return error.ExpectedMaybeUninitResultType,
+    };
+    try std.testing.expectEqual(@as(usize, 3), wrapper.path.len);
+    try std.testing.expectEqualStrings("core", wrapper.path[0]);
+    try std.testing.expectEqualStrings("mem", wrapper.path[1]);
+    try std.testing.expectEqualStrings("MaybeUninit", wrapper.path[2]);
+    try std.testing.expectEqual(@as(usize, 1), wrapper.args.len);
+    return wrapper.args[0];
+}
+
+/// The body type table row an expression names.
+fn bodyTypeAt(ir: serialize.RustIr, id: exprs.TypeId) !types.Type {
+    if (@as(usize, id) >= ir.bodies.types.len) return error.InvalidTypeRef;
+    return ir.bodies.types[id];
+}
+
+/// A private copy of `ir` whose expression table differs in exactly one row, so
+/// every rejection case below names the node it rewrites.
+fn withExprRow(
+    allocator: std.mem.Allocator,
+    ir: serialize.RustIr,
+    index: usize,
+    row: exprs.Expr,
+) !serialize.RustIr {
+    var malformed = ir;
+    const rows = try allocator.dupe(exprs.Expr, ir.bodies.exprs);
+    rows[index] = row;
+    malformed.bodies.exprs = rows;
+    return malformed;
+}
+
+/// Rewrite the first occurrence of `from`, refusing to continue when the text
+/// is absent or appears twice. A wire edit that quietly did nothing would leave
+/// the case asserting nothing at all.
+fn replaceOnce(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    from: []const u8,
+    to: []const u8,
+) ![]u8 {
+    const at = std.mem.indexOf(u8, payload, from) orelse return error.MissingWireFragment;
+    if (std.mem.indexOf(u8, payload[at + from.len ..], from) != null) {
+        return error.AmbiguousWireFragment;
+    }
+    const out = try allocator.alloc(u8, payload.len - from.len + to.len);
+    @memcpy(out[0..at], payload[0..at]);
+    @memcpy(out[at..][0..to.len], to);
+    @memcpy(out[at + to.len ..], payload[at + from.len ..]);
+    return out;
+}
+
+/// Decode `payload` and require the DECODER to refuse it. Wire admission is
+/// strict: a core call whose arity or types disagree never becomes a loaded
+/// graph. This is a precedence assertion — the malformed bytes are turned away
+/// at the boundary rather than decoded and only then caught by the validator.
+fn expectDecodedRefusal(payload: []const u8, expected: anyerror) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(expected, serialize.decode(allocator, payload));
+}
+
+/// One fixture carrying all five typed core operations with every operand and
+/// result type the validator reads.
+///
+/// Entity ids: 0 root module, 1 the fixture fn, 2 the generator, 3 the hasher.
+/// `initTestGraph` names items `item_<id>`, and the encoder requires a type
+/// path segment to carry the entity's own name, so the receiver pointees are
+/// spelled exactly that way.
+///
+/// Expression ids, in table order:
+///   0 block (fn body)          1 `from_le_bytes`      2 its `[4]u8` bytes
+///   3 `to_le_bytes`            4 its `u32` value       5 `maybe_uninit_uninit`
+///   6 `fill_bytes_via_next`    7 its generator         8 its `[]u8` dest
+///  12 `fill_bytes_via_next`   13 its `&mut [u8]` dest
+///   9 `hash_write_primitive`  10 its hasher           11 its `u64` value
+///  14 `[MaybeUninit::<u8>::uninit(); 4]` — the repeat that OWNS the length
+///
+/// Type-table rows:
+///   0 `u32`      1 `[4]u8`    2 `u8`      3 `&mut item_2`
+///   4 `[]u8`     5 `()`       6 `u64`     7 `&mut item_3`   8 `&mut [u8]`
+///   9 `MaybeUninit<u8>`       10 `[MaybeUninit<u8>; 4]`
+fn initTypedCoreCallIr(allocator: std.mem.Allocator) !serialize.RustIr {
+    const crate_graph = try initTestGraph(
+        allocator,
+        "core_typed_fixture",
+        &.{ .fn_, .field, .field },
+    );
+    const type_rows = try allocator.alloc(types.Type, 11);
+    type_rows[0] = .{ .prim = .u32 };
+    type_rows[1] = try coreByteImage(allocator, .{ .literal = 4 });
+    type_rows[2] = .{ .prim = .u8 };
+    type_rows[3] = .{ .reference = &.{
+        .mut = true,
+        .pointee = .{ .path = .{ .segments = &.{.{ .name = "item_2", .id = 2 }} } },
+    } };
+    type_rows[4] = .{ .slice = &.{ .const_ = false, .elem = .{ .prim = .u8 } } };
+    type_rows[5] = .{ .prim = .unit };
+    type_rows[6] = .{ .prim = .u64 };
+    type_rows[7] = .{ .reference = &.{
+        .mut = true,
+        .pointee = .{ .path = .{ .segments = &.{.{ .name = "item_3", .id = 3 }} } },
+    } };
+    type_rows[8] = .{ .reference = &.{
+        .mut = true,
+        .pointee = .{ .slice = &.{ .const_ = false, .elem = .{ .prim = .u8 } } },
+    } };
+    type_rows[9] = .{ .external_nominal = .{
+        .path = &.{ "core", "mem", "MaybeUninit" },
+        .args = &.{.{ .prim = .u8 }},
+    } };
+    type_rows[10] = try coreArrayOf(allocator, type_rows[9], .{ .literal = 4 });
+    const expression_table = try allocator.dupe(exprs.Expr, &.{
+        .{
+            .id = 0,
+            .span = core_span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = 1, .labelled = null } },
+        },
+        .{
+            .id = 1,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .core_call = .{
+                .function = .prim_from_le_bytes,
+                .generic_args = &.{.{ .prim = .u32 }},
+                .args = &.{2},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = core_span,
+            .ty = 1,
+            .kind = .{ .literal = .{ .byte_array = .{ .items = "abcd" } } },
+        },
+        .{
+            .id = 3,
+            .span = core_span,
+            .ty = 1,
+            .kind = .{ .core_call = .{
+                .function = .prim_to_le_bytes,
+                .generic_args = &.{.{ .prim = .u32 }},
+                .args = &.{4},
+            } },
+        },
+        .{
+            .id = 4,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "7",
+                .value = 7,
+                .base = .dec,
+                .ty_suffix = "u32",
+            } } },
+        },
+        .{
+            .id = 5,
+            .span = core_span,
+            .ty = 9,
+            .kind = .{ .core_call = .{
+                .function = .maybe_uninit_uninit,
+                .generic_args = &.{.{ .prim = .u8 }},
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 6,
+            .span = core_span,
+            .ty = 5,
+            .kind = .{ .core_call = .{
+                .function = .rng_fill_bytes_via_next,
+                .generic_args = &.{},
+                .args = &.{ 7, 8 },
+            } },
+        },
+        .{
+            .id = 7,
+            .span = core_span,
+            .ty = 3,
+            .kind = .{ .path = .{ .def = 2, .generic_args = &.{} } },
+        },
+        .{
+            .id = 8,
+            .span = core_span,
+            .ty = 4,
+            .kind = .{ .literal = .{ .byte_array = .{ .items = "wxyz" } } },
+        },
+        .{
+            .id = 9,
+            .span = core_span,
+            .ty = 5,
+            .kind = .{ .core_call = .{
+                .function = .hash_write_primitive,
+                .generic_args = &.{.{ .prim = .u64 }},
+                .args = &.{ 10, 11 },
+            } },
+        },
+        .{
+            .id = 10,
+            .span = core_span,
+            .ty = 7,
+            .kind = .{ .path = .{ .def = 3, .generic_args = &.{} } },
+        },
+        .{
+            .id = 11,
+            .span = core_span,
+            .ty = 6,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "5",
+                .value = 5,
+                .base = .dec,
+                .ty_suffix = "u64",
+            } } },
+        },
+        .{
+            .id = 12,
+            .span = core_span,
+            .ty = 5,
+            .kind = .{ .core_call = .{
+                .function = .rng_fill_bytes_via_next,
+                .generic_args = &.{},
+                .args = &.{ 7, 13 },
+            } },
+        },
+        .{
+            .id = 13,
+            .span = core_span,
+            .ty = 8,
+            .kind = .{ .literal = .{ .byte_array = .{ .items = "pqrs" } } },
+        },
+        .{
+            .id = 14,
+            .span = core_span,
+            .ty = 10,
+            .kind = .{ .array = .{ .elements = &.{5}, .repeat = 4 } },
+        },
+    });
+    const body_table = try allocator.alloc(bodies.BodyKind, 4);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } };
+    body_table[2] = .none;
+    body_table[3] = .none;
+    return .{
+        .crate_name = "core_typed_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &.{},
+        .instantiations = &.{},
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = type_rows,
+            .bodies = body_table,
+        },
+    };
+}
+
+test "core calls: five typed operations round-trip with their canonical tags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var ir = try initTypedCoreCallIr(allocator);
+
+    const encoded = try serialize.encode(allocator, &ir);
+    const canonical_tags = [_][]const u8{
+        "\"function\":\"prim_from_le_bytes\"",
+        "\"function\":\"prim_to_le_bytes\"",
+        "\"function\":\"maybe_uninit_uninit\"",
+        "\"function\":\"rng_fill_bytes_via_next\"",
+        "\"function\":\"hash_write_primitive\"",
+    };
+    for (canonical_tags) |tag| {
+        try std.testing.expect(std.mem.indexOf(u8, encoded, tag) != null);
+    }
+
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+
+    const reencoded = try serialize.encode(allocator, &decoded);
+    try std.testing.expectEqualStrings(encoded, reencoded);
+
+    // The decode direction: `[4]u8` and a mutable `u8` dest both survived as
+    // structured types rather than as opaque bytes.
+    const decode_call = try coreCallAt(decoded.bodies.exprs[1]);
+    try std.testing.expectEqual(exprs.CoreFunction.prim_from_le_bytes, decode_call.function);
+    try std.testing.expectEqual(@as(usize, 1), decode_call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 1), decode_call.args.len);
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[1].ty.?)) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.u32, prim),
+        else => return error.ExpectedIntegerResultType,
+    }
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[2].ty.?)) {
+        .array => |array| {
+            try std.testing.expectEqual(@as(u64, 4), switch (array.len) {
+                .literal => |literal| literal,
+                else => return error.ExpectedLiteralByteImageLength,
+            });
+            switch (array.elem) {
+                .prim => |prim| try std.testing.expectEqual(types.Prim.u8, prim),
+                else => return error.ExpectedByteElementType,
+            }
+        },
+        else => return error.ExpectedByteImageType,
+    }
+
+    const encode_call = try coreCallAt(decoded.bodies.exprs[3]);
+    try std.testing.expectEqual(exprs.CoreFunction.prim_to_le_bytes, encode_call.function);
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[4].ty.?)) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.u32, prim),
+        else => return error.ExpectedIntegerValueType,
+    }
+
+    // `MaybeUninit::uninit()` names no value argument, and its own type is the
+    // semantic MaybeUninit<u8> element — neither live u8 nor the repeated array.
+    const uninit_call = try coreCallAt(decoded.bodies.exprs[5]);
+    try std.testing.expectEqual(exprs.CoreFunction.maybe_uninit_uninit, uninit_call.function);
+    try std.testing.expectEqual(@as(usize, 1), uninit_call.generic_args.len);
+    try std.testing.expectEqual(types.Prim.u8, uninit_call.generic_args[0].prim);
+    try std.testing.expectEqual(@as(usize, 0), uninit_call.args.len);
+    switch (try maybeUninitChild(try bodyTypeAt(decoded, decoded.bodies.exprs[5].ty.?))) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.u8, prim),
+        else => return error.ExpectedElementResultType,
+    }
+
+    // `fill_bytes_via_next` names no generic argument: the receiver's own type
+    // is the generator, and a mutable destination reaches it either directly
+    // or behind the reference a `&mut [u8]` binding carries.
+    const rng_call = try coreCallAt(decoded.bodies.exprs[6]);
+    try std.testing.expectEqual(exprs.CoreFunction.rng_fill_bytes_via_next, rng_call.function);
+    try std.testing.expectEqual(@as(usize, 0), rng_call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 2), rng_call.args.len);
+    const borrowed_dest = try coreCallAt(decoded.bodies.exprs[12]);
+    try std.testing.expectEqual(@as(usize, 0), borrowed_dest.generic_args.len);
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[12].ty.?)) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.unit, prim),
+        else => return error.ExpectedUnitResultType,
+    }
+
+    const hash_call = try coreCallAt(decoded.bodies.exprs[9]);
+    try std.testing.expectEqual(exprs.CoreFunction.hash_write_primitive, hash_call.function);
+    try std.testing.expectEqual(@as(usize, 1), hash_call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 2), hash_call.args.len);
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[11].ty.?)) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.u64, prim),
+        else => return error.ExpectedIntegerValueType,
+    }
+}
+
+test "core calls: a wrong generic or value count is refused on both paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir = try initTypedCoreCallIr(allocator);
+    const encoded = try serialize.encode(allocator, &ir);
+
+    // `MaybeUninit::uninit()` takes no value arguments; handing it one would
+    // invent a value the source never passed.
+    const model_arity = try withExprRow(allocator, ir, 5, .{
+        .id = 5,
+        .span = core_span,
+        .ty = 9,
+        .kind = .{ .core_call = .{
+            .function = .maybe_uninit_uninit,
+            .generic_args = &.{.{ .prim = .u8 }},
+            .args = &.{2},
+        } },
+    });
+    try std.testing.expectError(
+        error.InvalidCoreCallArity,
+        serialize.encode(allocator, &model_arity),
+    );
+    try std.testing.expectError(
+        error.InvalidCoreCallArity,
+        root.validateForTranslation(&model_arity),
+    );
+
+    // The same refusal read back off the wire, which proves the decoder turns
+    // away an arity the encoder would never have written rather than quietly
+    // repairing it into a graph.
+    const wire_arity = try replaceOnce(
+        allocator,
+        encoded,
+        "\"function\":\"maybe_uninit_uninit\",\"generic_args\":" ++
+            "[{\"kind\":\"prim\",\"value\":\"u8\"}],\"args\":[]",
+        "\"function\":\"maybe_uninit_uninit\",\"generic_args\":" ++
+            "[{\"kind\":\"prim\",\"value\":\"u8\"}],\"args\":[2]",
+    );
+    try expectDecodedRefusal(wire_arity, error.InvalidCoreCallArity);
+
+    // The owner type argument is required even though no value is constructed.
+    // Neither an omitted argument nor two arguments may be repaired on load.
+    const wrong_uninit_generics = [_]struct {
+        generic_args: []const types.Type,
+        wire: []const u8,
+    }{
+        .{ .generic_args = &.{}, .wire = "[]" },
+        .{
+            .generic_args = &.{ .{ .prim = .u8 }, .{ .prim = .u16 } },
+            .wire = "[{\"kind\":\"prim\",\"value\":\"u8\"},{\"kind\":\"prim\",\"value\":\"u16\"}]",
+        },
+    };
+    for (wrong_uninit_generics) |wrong| {
+        var expression = ir.bodies.exprs[5];
+        expression.kind.core_call.generic_args = wrong.generic_args;
+        const malformed = try withExprRow(allocator, ir, 5, expression);
+        try std.testing.expectError(
+            error.InvalidCoreCallArity,
+            serialize.encode(allocator, &malformed),
+        );
+        try std.testing.expectError(
+            error.InvalidCoreCallArity,
+            root.validateForTranslation(&malformed),
+        );
+        const replacement = try std.fmt.allocPrint(
+            allocator,
+            "\"function\":\"maybe_uninit_uninit\",\"generic_args\":{s},\"args\":[]",
+            .{wrong.wire},
+        );
+        const malformed_wire = try replaceOnce(
+            allocator,
+            encoded,
+            "\"function\":\"maybe_uninit_uninit\",\"generic_args\":" ++
+                "[{\"kind\":\"prim\",\"value\":\"u8\"}],\"args\":[]",
+            replacement,
+        );
+        try expectDecodedRefusal(malformed_wire, error.InvalidCoreCallArity);
+    }
+
+    // `fill_bytes_via_next` names the generator through its receiver, so a
+    // generic argument is one too many even with the right value count.
+    const model_generics = try withExprRow(allocator, ir, 6, .{
+        .id = 6,
+        .span = core_span,
+        .ty = 5,
+        .kind = .{ .core_call = .{
+            .function = .rng_fill_bytes_via_next,
+            .generic_args = &.{.{ .prim = .u64 }},
+            .args = &.{ 7, 8 },
+        } },
+    });
+    try std.testing.expectError(
+        error.InvalidCoreCallArity,
+        serialize.encode(allocator, &model_generics),
+    );
+    try std.testing.expectError(
+        error.InvalidCoreCallArity,
+        root.validateForTranslation(&model_generics),
+    );
+    // The same refusal off the wire: the value count is already right, and the
+    // generic argument the encoder would never write is the whole defect.
+    const wire_generics = try replaceOnce(
+        allocator,
+        encoded,
+        "\"function\":\"rng_fill_bytes_via_next\",\"generic_args\":[],\"args\":[7,8]",
+        "\"function\":\"rng_fill_bytes_via_next\",\"generic_args\":" ++
+            "[{\"kind\":\"prim\",\"value\":\"u64\"}],\"args\":[7,8]",
+    );
+    try expectDecodedRefusal(wire_generics, error.InvalidCoreCallArity);
+}
+
+/// A private copy of `ir` whose body type table differs in exactly one row, so
+/// a case that rejects a TYPE names the row it rewrote.
+fn withTypeRow(
+    allocator: std.mem.Allocator,
+    ir: serialize.RustIr,
+    index: usize,
+    row: types.Type,
+) !serialize.RustIr {
+    var malformed = ir;
+    const rows = try allocator.dupe(types.Type, ir.bodies.types);
+    rows[index] = row;
+    malformed.bodies.types = rows;
+    return malformed;
+}
+
+/// Replace one indexed body type row without also changing its copy in an array.
+fn withWireBodyTypeRow(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+    index: usize,
+    row_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, encoded, .{});
+    defer parsed.deinit();
+    var row = try std.json.parseFromSlice(std.json.Value, allocator, row_json, .{});
+    defer row.deinit();
+    const body_section = parsed.value.object.getPtr("bodies") orelse return error.BadWireFormat;
+    const type_section = body_section.object.getPtr("types") orelse return error.BadWireFormat;
+    if (index >= type_section.array.items.len) return error.BadWireFormat;
+    type_section.array.items[index] = row.value;
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+/// Assert both wire boundaries refuse `ir` for the reason the typed core-call
+/// contract names. The encoder and the translation validator share one rule, so
+/// a model that cannot be written must not be loadable either.
+fn expectCoreTypeRefused(allocator: std.mem.Allocator, ir: serialize.RustIr) !void {
+    try std.testing.expectError(error.InvalidCoreCallType, serialize.encode(allocator, &ir));
+    try std.testing.expectError(error.InvalidCoreCallType, root.validateForTranslation(&ir));
+}
+
+/// An array type node, the shape a byte image and a repeat's element both take.
+fn coreArrayOf(allocator: std.mem.Allocator, elem: types.Type, len: types.ArrayLen) !types.Type {
+    const array = try allocator.create(types.Array);
+    array.* = .{ .elem = elem, .len = len };
+    return .{ .array = array };
+}
+
+/// The pointer-width spelling of the little-endian pair, plus the symbolic form
+/// a fixed-width integer is also allowed to use.
+///
+/// Entities: 0 root module, 1 the fixture fn, 2 the `usize` binding.
+/// Expression ids, in table order:
+///   0 block  1 `mem_size_of::<usize>`  2 `to_le_bytes::<usize>`  3 the value
+///   4 `from_le_bytes::<usize>`  5 its bytes  6 `mem_size_of::<u32>`
+///   7 `to_le_bytes::<u32>`     8 the `u32` value
+///   9 `mem_size_of::<u32>` typed `usize` — the right SHAPE, the wrong integer
+///
+/// A `mem_size_of` call answers `usize` for whatever integer it measures, so
+/// rows 6 and 9 are the same call; row 2 types the `u32` value instead.
+///
+/// Type rows: 0 `usize`  1 `[u8; mem_size_of::<usize>()]`  2 `u32`  3 `[u8; 8]`
+///             4 `[u8; mem_size_of::<u32>()]`
+fn initTargetWidthCoreCallIr(allocator: std.mem.Allocator) !serialize.RustIr {
+    const crate_graph = try initTestGraph(allocator, "core_width_fixture", &.{ .fn_, .field });
+    const type_rows = try allocator.alloc(types.Type, 5);
+    type_rows[0] = .{ .prim = .usize };
+    type_rows[1] = try coreByteImage(allocator, .{ .expression = 1 });
+    // The `u32` value `to_le_bytes::<u32>` encodes, and the only row a value
+    // expression is typed by.
+    type_rows[2] = .{ .prim = .u32 };
+    // Eight bytes is the width of `usize` on the compilation target, whatever
+    // this translator host's own pointer size happens to be.
+    type_rows[3] = try coreByteImage(allocator, .{ .literal = 8 });
+    type_rows[4] = try coreByteImage(allocator, .{ .expression = 6 });
+    const expression_table = try allocator.dupe(exprs.Expr, &.{
+        .{
+            .id = 0,
+            .span = core_span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = 1, .labelled = null } },
+        },
+        .{
+            .id = 1,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .core_call = .{
+                .function = .mem_size_of,
+                .generic_args = &.{.{ .prim = .usize }},
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 2,
+            .span = core_span,
+            .ty = 1,
+            .kind = .{ .core_call = .{
+                .function = .prim_to_le_bytes,
+                .generic_args = &.{.{ .prim = .usize }},
+                .args = &.{3},
+            } },
+        },
+        .{
+            .id = 3,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .path = .{ .def = 2, .generic_args = &.{} } },
+        },
+        .{
+            .id = 4,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .core_call = .{
+                .function = .prim_from_le_bytes,
+                .generic_args = &.{.{ .prim = .usize }},
+                .args = &.{5},
+            } },
+        },
+        .{
+            .id = 5,
+            .span = core_span,
+            .ty = 3,
+            .kind = .{ .literal = .{ .byte_array = .{ .items = "abcdefgh" } } },
+        },
+        .{
+            .id = 6,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .core_call = .{
+                .function = .mem_size_of,
+                .generic_args = &.{.{ .prim = .u32 }},
+                .args = &.{},
+            } },
+        },
+        .{
+            .id = 7,
+            .span = core_span,
+            .ty = 4,
+            .kind = .{ .core_call = .{
+                .function = .prim_to_le_bytes,
+                .generic_args = &.{.{ .prim = .u32 }},
+                .args = &.{8},
+            } },
+        },
+        .{
+            .id = 8,
+            .span = core_span,
+            .ty = 2,
+            .kind = .{ .literal = .{ .int = .{
+                .text = "1",
+                .value = 1,
+                .base = .dec,
+                .ty_suffix = "u32",
+            } } },
+        },
+        .{
+            .id = 9,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .core_call = .{
+                .function = .mem_size_of,
+                .generic_args = &.{.{ .prim = .u32 }},
+                .args = &.{},
+            } },
+        },
+    });
+    const body_table = try allocator.alloc(bodies.BodyKind, 3);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } };
+    body_table[2] = .none;
+    return .{
+        .crate_name = "core_width_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &.{},
+        .instantiations = &.{},
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = type_rows,
+            .bodies = body_table,
+        },
+    };
+}
+
+test "core calls: a byte image may name the target's own width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir = try initTargetWidthCoreCallIr(allocator);
+
+    const encoded = try serialize.encode(allocator, &ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+    try std.testing.expectEqualStrings(encoded, try serialize.encode(allocator, &decoded));
+
+    // The encode direction: `usize` names its width through the target's own
+    // `mem_size_of`, never through a number the host happened to have.
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[2].ty.?)) {
+        .array => |array| switch (array.len) {
+            .expression => |width| try std.testing.expectEqual(@as(u32, 1), width),
+            else => return error.ExpectedSymbolicByteImageLength,
+        },
+        else => return error.ExpectedByteImageType,
+    }
+    const width_call = try coreCallAt(decoded.bodies.exprs[1]);
+    try std.testing.expectEqual(exprs.CoreFunction.mem_size_of, width_call.function);
+    try std.testing.expectEqual(@as(usize, 0), width_call.args.len);
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[1].ty.?)) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.usize, prim),
+        else => return error.ExpectedSizeResultType,
+    }
+
+    // A fixed-width integer may state its width the same symbolic way.
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[7].ty.?)) {
+        .array => |array| switch (array.len) {
+            .expression => |width| try std.testing.expectEqual(@as(u32, 6), width),
+            else => return error.ExpectedSymbolicByteImageLength,
+        },
+        else => return error.ExpectedByteImageType,
+    }
+}
+
+/// The width fixture carrying the one declaration a `.generic` array length
+/// needs: `const N: usize`. `generic_params` carries TYPE parameters only, so
+/// the const parameter belongs to the full `generics` list, and the block tail
+/// moves to the `to_le_bytes` call so the owner walk reads the byte-image row
+/// in the fn's own scope rather than through the crate-wide fallback.
+fn withWidthConstGeneric(allocator: std.mem.Allocator, ir: serialize.RustIr) !serialize.RustIr {
+    const body_rows = try allocator.dupe(bodies.BodyKind, ir.bodies.bodies);
+    var fn_body = body_rows[1].fn_;
+    fn_body.generics = .{
+        .params = &.{.{ .const_ = .{ .name = "N", .ty = .{ .prim = .usize } } }},
+        .where_clauses = &.{},
+    };
+    body_rows[1] = .{ .fn_ = fn_body };
+    var declared = ir;
+    declared.bodies.bodies = body_rows;
+    return withExprRow(allocator, declared, 0, .{
+        .id = 0,
+        .span = core_span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 2, .labelled = null } },
+    });
+}
+
+test "core calls: a byte image width that names something else is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir = try initTargetWidthCoreCallIr(allocator);
+
+    // A symbolic width with the right SHAPE that measures a DIFFERENT integer
+    // sizes the wrong image.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 1, try coreByteImage(allocator, .{ .expression = 9 })),
+    );
+    // A symbolic width that is not a `mem_size_of` at all answers nothing about
+    // this integer.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 1, try coreByteImage(allocator, .{ .expression = 3 })),
+    );
+    // A symbolic width typed something other than `usize` is not a byte count:
+    // the right `mem_size_of::<usize>` shape and arity, answering `u32`. The
+    // byte-image row already names expression 1, so only the result type moves.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 1, .{
+        .id = 1,
+        .span = core_span,
+        .ty = 2,
+        .kind = .{ .core_call = .{
+            .function = .mem_size_of,
+            .generic_args = &.{.{ .prim = .usize }},
+            .args = &.{},
+        } },
+    }));
+    // A width that measures `usize` while the call encodes `u32` is the right
+    // measurement of the wrong integer.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 4, try coreByteImage(allocator, .{ .expression = 1 })),
+    );
+    // A literal width that contradicts a fixed-width integer is a different
+    // array, not the same integer's bytes.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 4, try coreByteImage(allocator, .{ .literal = 8 })),
+    );
+    // A byte image holds bytes.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(
+            allocator,
+            ir,
+            1,
+            try coreArrayOf(allocator, .{ .prim = .u32 }, .{ .literal = 8 }),
+        ),
+    );
+    // A generic parameter is a compile-time length, not this integer's width.
+    // The declaration below binds `N`, so a `.generic` row is well-formed
+    // metadata rather than an incomplete one — which the control proves before
+    // the row itself is rewritten, leaving the width rule as the only refusal.
+    const declared = try withWidthConstGeneric(allocator, ir);
+    const declared_encoded = try serialize.encode(allocator, &declared);
+    var declared_decoded = try serialize.decode(allocator, declared_encoded);
+    defer declared_decoded.graph.deinit();
+    try root.validateForTranslation(&declared_decoded);
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, declared, 1, try coreByteImage(allocator, .{ .generic = 0 })),
+    );
+}
+
+test "core calls: an operand, result, or receiver the tag does not admit is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir = try initTypedCoreCallIr(allocator);
+
+    // A decode that produces something other than the integer it names.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 1, .{
+        .id = 1,
+        .span = core_span,
+        .ty = 6,
+        .kind = .{ .core_call = .{
+            .function = .prim_from_le_bytes,
+            .generic_args = &.{.{ .prim = .u32 }},
+            .args = &.{2},
+        } },
+    }));
+    // A decode whose bytes are not a byte image.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 2, .{
+        .id = 2,
+        .span = core_span,
+        .ty = 0,
+        .kind = .{ .literal = .{ .byte_array = .{ .items = "abcd" } } },
+    }));
+    // An encode whose value is not the integer it names.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 4, .{
+        .id = 4,
+        .span = core_span,
+        .ty = 6,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "7",
+            .value = 7,
+            .base = .dec,
+            .ty_suffix = "u32",
+        } } },
+    }));
+    // An encode whose result is not a byte image.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 3, .{
+        .id = 3,
+        .span = core_span,
+        .ty = 2,
+        .kind = .{ .core_call = .{
+            .function = .prim_to_le_bytes,
+            .generic_args = &.{.{ .prim = .u32 }},
+            .args = &.{4},
+        } },
+    }));
+    // An uninit call whose own type is not the canonical wrapper it names.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 5, .{
+        .id = 5,
+        .span = core_span,
+        .ty = 0,
+        .kind = .{ .core_call = .{
+            .function = .maybe_uninit_uninit,
+            .generic_args = &.{.{ .prim = .u8 }},
+            .args = &.{},
+        } },
+    }));
+    // An unattributed call has no result type to check the contract against.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 5, .{
+        .id = 5,
+        .span = core_span,
+        .ty = null,
+        .kind = .{ .core_call = .{
+            .function = .maybe_uninit_uninit,
+            .generic_args = &.{.{ .prim = .u8 }},
+            .args = &.{},
+        } },
+    }));
+    // A LE pair over something with no byte image at all.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 3, .{
+        .id = 3,
+        .span = core_span,
+        .ty = 1,
+        .kind = .{ .core_call = .{
+            .function = .prim_to_le_bytes,
+            .generic_args = &.{.{ .prim = .f64 }},
+            .args = &.{4},
+        } },
+    }));
+
+    // `fill_bytes_via_next` takes the receiver by the borrow `fill_bytes` makes.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 3, .{ .reference = &.{
+            .mut = false,
+            .pointee = .{ .path = .{ .segments = &.{.{ .name = "item_2", .id = 2 }} } },
+        } }),
+    );
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 3, .{ .prim = .u8 }),
+    );
+    // A destination the call cannot fill.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 4, .{ .slice = &.{
+            .const_ = true,
+            .elem = .{ .prim = .u8 },
+        } }),
+    );
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 4, .{ .slice = &.{
+            .const_ = false,
+            .elem = .{ .prim = .u32 },
+        } }),
+    );
+    // A default body that hands something back.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 6, .{
+        .id = 6,
+        .span = core_span,
+        .ty = 0,
+        .kind = .{ .core_call = .{
+            .function = .rng_fill_bytes_via_next,
+            .generic_args = &.{},
+            .args = &.{ 7, 8 },
+        } },
+    }));
+
+    // The `Hasher` writers share the receiver and unit rules.
+    try expectCoreTypeRefused(
+        allocator,
+        try withTypeRow(allocator, ir, 7, .{ .reference = &.{
+            .mut = false,
+            .pointee = .{ .path = .{ .segments = &.{.{ .name = "item_3", .id = 3 }} } },
+        } }),
+    );
+    // A value that is not the primitive the writer names.
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 11, .{
+        .id = 11,
+        .span = core_span,
+        .ty = 0,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "5",
+            .value = 5,
+            .base = .dec,
+            .ty_suffix = "u32",
+        } } },
+    }));
+    try expectCoreTypeRefused(allocator, try withExprRow(allocator, ir, 9, .{
+        .id = 9,
+        .span = core_span,
+        .ty = 0,
+        .kind = .{ .core_call = .{
+            .function = .hash_write_primitive,
+            .generic_args = &.{.{ .prim = .u64 }},
+            .args = &.{ 10, 11 },
+        } },
+    }));
+
+    // The same refusal read back off the wire.
+    const encoded = try serialize.encode(allocator, &ir);
+    const wire_generic = try replaceOnce(
+        allocator,
+        encoded,
+        "\"function\":\"prim_to_le_bytes\",\"generic_args\":" ++
+            "[{\"kind\":\"prim\",\"value\":\"u32\"}]",
+        "\"function\":\"prim_to_le_bytes\",\"generic_args\":" ++
+            "[{\"kind\":\"prim\",\"value\":\"f64\"}]",
+    );
+    try expectDecodedRefusal(wire_generic, error.InvalidCoreCallType);
+}
+
+test "core calls: an uninit result that is not the canonical wrapper is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir = try initTypedCoreCallIr(allocator);
+    const encoded = try serialize.encode(allocator, &ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+    try std.testing.expectEqualStrings(encoded, try serialize.encode(allocator, &decoded));
+
+    // Supported roots and primitive children keep these cases focused on the
+    // core-call contract, not unsupported roots or undeclared generic paths.
+    const wrong_results = [_]struct {
+        ty: types.Type,
+        wire: []const u8,
+    }{
+        // The old erased result is no longer a semantic result type.
+        .{
+            .ty = .{ .prim = .u8 },
+            .wire = "{\"kind\":\"prim\",\"value\":\"u8\"}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "std", "mem", "MaybeUninit" },
+                .args = &.{.{ .prim = .u8 }},
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"std\",\"mem\",\"MaybeUninit\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"}]}}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "core", "cell", "MaybeUninit" },
+                .args = &.{.{ .prim = .u8 }},
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"core\",\"cell\",\"MaybeUninit\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"}]}}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "core", "mem", "ManuallyDrop" },
+                .args = &.{.{ .prim = .u8 }},
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"core\",\"mem\",\"ManuallyDrop\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"}]}}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "core", "MaybeUninit" },
+                .args = &.{.{ .prim = .u8 }},
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"core\",\"MaybeUninit\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"}]}}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "core", "mem", "MaybeUninit", "Assoc" },
+                .args = &.{.{ .prim = .u8 }},
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"core\",\"mem\",\"MaybeUninit\",\"Assoc\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"}]}}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "core", "mem", "MaybeUninit" },
+                .args = &.{.{ .prim = .u32 }},
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"core\",\"mem\",\"MaybeUninit\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u32\"}]}}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "core", "mem", "MaybeUninit" },
+                .args = &.{},
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"core\",\"mem\",\"MaybeUninit\"],\"args\":[]}}",
+        },
+        .{
+            .ty = .{ .external_nominal = .{
+                .path = &.{ "core", "mem", "MaybeUninit" },
+                .args = &.{ .{ .prim = .u8 }, .{ .prim = .u8 } },
+            } },
+            .wire = "{\"kind\":\"external_nominal\",\"value\":{\"path\":[\"core\",\"mem\",\"MaybeUninit\"],\"args\":[{\"kind\":\"prim\",\"value\":\"u8\"},{\"kind\":\"prim\",\"value\":\"u8\"}]}}",
+        },
+    };
+    for (wrong_results) |wrong| {
+        try expectCoreTypeRefused(allocator, try withTypeRow(allocator, ir, 9, wrong.ty));
+        try expectDecodedRefusal(
+            try withWireBodyTypeRow(allocator, encoded, 9, wrong.wire),
+            error.InvalidCoreCallType,
+        );
+    }
+}
+
+test "core calls: a repeat of an uninit call keeps the element and the length apart" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir = try initTypedCoreCallIr(allocator);
+
+    const encoded = try serialize.encode(allocator, &ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+    try std.testing.expectEqualStrings(encoded, try serialize.encode(allocator, &decoded));
+
+    const repeat = switch (decoded.bodies.exprs[14].kind) {
+        .array => |value| value,
+        else => return error.ExpectedArrayExpression,
+    };
+    // Rust evaluates `MaybeUninit::<u8>::uninit()` ONCE and repeats the value.
+    // One element node plus a repeat count is how the wire says so; an array
+    // whose own type were the element's would re-run the evaluation.
+    try std.testing.expectEqual(@as(usize, 1), repeat.elements.len);
+    try std.testing.expectEqual(@as(exprs.NodeId, 5), repeat.elements[0]);
+    try std.testing.expectEqual(@as(?u64, 4), repeat.repeat);
+
+    // Only the array owns the count; its element is the semantic wrapper.
+    switch (try bodyTypeAt(decoded, decoded.bodies.exprs[14].ty.?)) {
+        .array => |array| {
+            switch (array.len) {
+                .literal => |literal| try std.testing.expectEqual(@as(u64, 4), literal),
+                else => return error.ExpectedLiteralArrayLength,
+            }
+            switch (try maybeUninitChild(array.elem)) {
+                .prim => |prim| try std.testing.expectEqual(types.Prim.u8, prim),
+                else => return error.ExpectedElementResultType,
+            }
+        },
+        else => return error.ExpectedArrayType,
+    }
+    const uninit = try coreCallAt(decoded.bodies.exprs[5]);
+    try std.testing.expectEqual(exprs.CoreFunction.maybe_uninit_uninit, uninit.function);
+    try std.testing.expectEqual(@as(usize, 1), uninit.generic_args.len);
+    try std.testing.expectEqual(types.Prim.u8, uninit.generic_args[0].prim);
+    try std.testing.expectEqual(@as(usize, 0), uninit.args.len);
+    switch (try maybeUninitChild(try bodyTypeAt(decoded, decoded.bodies.exprs[5].ty.?))) {
+        .prim => |prim| try std.testing.expectEqual(types.Prim.u8, prim),
+        else => return error.ExpectedElementResultType,
+    }
+}
+
+test "core calls: an uninit result over a declared generic keeps one child" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var ir = try initTypedCoreCallIr(allocator);
+    const declared: types.Type = .{ .path = .{ .segments = &.{.{ .name = "T", .id = null }} } };
+    const generic_arguments = try allocator.dupe(types.Type, &.{declared});
+    const wrapper: types.Type = .{ .external_nominal = .{
+        .path = &.{ "core", "mem", "MaybeUninit" },
+        .args = generic_arguments,
+    } };
+    const type_rows = try allocator.dupe(types.Type, ir.bodies.types);
+    type_rows[9] = wrapper;
+    type_rows[10] = try coreArrayOf(allocator, wrapper, .{ .literal = 4 });
+    ir.bodies.types = type_rows;
+
+    // Reach the call through the repeated array in this function's own scope.
+    const expression_rows = try allocator.dupe(exprs.Expr, ir.bodies.exprs);
+    expression_rows[0].kind.block.tail = 14;
+    expression_rows[5].kind.core_call.generic_args = generic_arguments;
+    ir.bodies.exprs = expression_rows;
+    const body_rows = try allocator.dupe(bodies.BodyKind, ir.bodies.bodies);
+    body_rows[1].fn_.generic_params = &.{"T"};
+    ir.bodies.bodies = body_rows;
+
+    const encoded = try serialize.encode(allocator, &ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+    try std.testing.expectEqualStrings(encoded, try serialize.encode(allocator, &decoded));
+    try std.testing.expectEqual(@as(usize, 1), decoded.bodies.bodies[1].fn_.generic_params.len);
+    try std.testing.expectEqualStrings("T", decoded.bodies.bodies[1].fn_.generic_params[0]);
+
+    const call = try coreCallAt(decoded.bodies.exprs[5]);
+    try std.testing.expectEqual(exprs.CoreFunction.maybe_uninit_uninit, call.function);
+    try std.testing.expectEqual(@as(usize, 1), call.generic_args.len);
+    try std.testing.expectEqual(@as(usize, 0), call.args.len);
+    const repeat = switch (decoded.bodies.exprs[14].kind) {
+        .array => |value| value,
+        else => return error.ExpectedArrayExpression,
+    };
+    try std.testing.expectEqual(@as(usize, 1), repeat.elements.len);
+    try std.testing.expectEqual(@as(exprs.NodeId, 5), repeat.elements[0]);
+    try std.testing.expectEqual(@as(?u64, 4), repeat.repeat);
+    const array = switch (try bodyTypeAt(decoded, decoded.bodies.exprs[14].ty.?)) {
+        .array => |value| value,
+        else => return error.ExpectedArrayType,
+    };
+    switch (array.len) {
+        .literal => |length| try std.testing.expectEqual(@as(u64, 4), length),
+        else => return error.ExpectedLiteralArrayLength,
+    }
+    const declared_children = [_]types.Type{
+        call.generic_args[0],
+        try maybeUninitChild(try bodyTypeAt(decoded, decoded.bodies.exprs[5].ty.?)),
+        try maybeUninitChild(array.elem),
+    };
+    for (declared_children) |child| {
+        switch (child) {
+            .path => |path| {
+                try std.testing.expectEqual(@as(usize, 1), path.segments.len);
+                try std.testing.expectEqualStrings("T", path.segments[0].name);
+                try std.testing.expect(path.segments[0].id == null);
+            },
+            else => return error.ExpectedDeclaredGenericChildType,
+        }
+    }
+}
+
+/// One call whose function VALUE carries `generic_args` verbatim, so a generic
+/// count or element the rules refuse can be spelled exactly. Both boundaries
+/// decide the generic contract from this single node.
+fn initCoreFunctionValueIr(
+    allocator: std.mem.Allocator,
+    function: exprs.CoreFunction,
+    generic_args: []const types.Type,
+) !serialize.RustIr {
+    const crate_graph = try initTestGraph(allocator, "core_function_fixture", &.{.fn_});
+    const expression_table = try allocator.dupe(exprs.Expr, &.{
+        .{
+            .id = 0,
+            .span = core_span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = 1, .labelled = null } },
+        },
+        .{
+            .id = 1,
+            .span = core_span,
+            .ty = null,
+            .kind = .{ .core_function = .{
+                .function = function,
+                .generic_args = generic_args,
+            } },
+        },
+    });
+    const body_table = try allocator.alloc(bodies.BodyKind, 2);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } };
+    return .{
+        .crate_name = "core_function_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &.{},
+        .instantiations = &.{},
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = body_table,
+        },
+    };
+}
+
+/// The `num_traits` bounds and constants: one type argument, no value arguments,
+/// and a result of that same type. `generic_params` lets a case name a declared
+/// type parameter instead of an integer primitive.
+fn initNumericCoreCallIr(
+    allocator: std.mem.Allocator,
+    function: exprs.CoreFunction,
+    generic_arg: types.Type,
+    result_ty: types.Type,
+    generic_params: []const []const u8,
+) !serialize.RustIr {
+    const crate_graph = try initTestGraph(allocator, "core_numeric_fixture", &.{.fn_});
+    const type_rows = try allocator.alloc(types.Type, 1);
+    type_rows[0] = result_ty;
+    // The expression table is arena-owned and read long after this helper
+    // returns, so the argument slice has to outlive this frame too.
+    const generic_arguments = try allocator.dupe(types.Type, &.{generic_arg});
+    const expression_table = try allocator.dupe(exprs.Expr, &.{
+        .{
+            .id = 0,
+            .span = core_span,
+            .ty = null,
+            .kind = .{ .block = .{ .statements = &.{}, .tail = 1, .labelled = null } },
+        },
+        .{
+            .id = 1,
+            .span = core_span,
+            .ty = 0,
+            .kind = .{ .core_call = .{
+                .function = function,
+                .generic_args = generic_arguments,
+                .args = &.{},
+            } },
+        },
+    });
+    const body_table = try allocator.alloc(bodies.BodyKind, 2);
+    body_table[0] = .none;
+    body_table[1] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .generic_params = generic_params,
+        .body = 0,
+    } };
+    return .{
+        .crate_name = "core_numeric_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .types = &.{},
+        .instantiations = &.{},
+        .bodies = .{
+            .exprs = expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = type_rows,
+            .bodies = body_table,
+        },
+    };
+}
+
+/// The bound and constant tags, in the order the enum declares them.
+const numeric_core_functions = [_]exprs.CoreFunction{
+    .numeric_min_value,
+    .numeric_max_value,
+    .numeric_zero,
+    .numeric_one,
+};
+
+/// The tags whose single type argument must be an integer primitive.
+const integer_core_writers = [_]exprs.CoreFunction{
+    .prim_from_le_bytes,
+    .prim_to_le_bytes,
+    .hash_write_primitive,
+};
+
+test "core calls: the numeric bound tags round-trip over an integer" {
+    for (numeric_core_functions) |function| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const ir = try initNumericCoreCallIr(
+            allocator,
+            function,
+            .{ .prim = .i64 },
+            .{ .prim = .i64 },
+            &.{},
+        );
+
+        const encoded = try serialize.encode(allocator, &ir);
+        const tag = try std.fmt.allocPrint(
+            allocator,
+            "\"function\":\"{s}\"",
+            .{@tagName(function)},
+        );
+        try std.testing.expect(std.mem.indexOf(u8, encoded, tag) != null);
+
+        var decoded = try serialize.decode(allocator, encoded);
+        defer decoded.graph.deinit();
+        try root.validateForTranslation(&decoded);
+        try std.testing.expectEqualStrings(encoded, try serialize.encode(allocator, &decoded));
+
+        const call = try coreCallAt(decoded.bodies.exprs[1]);
+        try std.testing.expectEqual(function, call.function);
+        try std.testing.expectEqual(@as(usize, 1), call.generic_args.len);
+        // A bound or a constant names no value argument: `T::MIN_VALUE` and
+        // `T::zero()` are path functions, not calls taking arguments.
+        try std.testing.expectEqual(@as(usize, 0), call.args.len);
+        switch (try bodyTypeAt(decoded, decoded.bodies.exprs[1].ty.?)) {
+            .prim => |prim| try std.testing.expectEqual(types.Prim.i64, prim),
+            else => return error.ExpectedNumericResultType,
+        }
+    }
+}
+
+test "core calls: a numeric bound accepts a declared generic and refuses a mismatch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // A declared type parameter is a concrete numeric type at this call site,
+    // and the contextual type validator is what resolves it — never an
+    // unattributed fallback.
+    const declared: types.Type = .{ .path = .{ .segments = &.{.{ .name = "I", .id = null }} } };
+    const declared_ir = try initNumericCoreCallIr(
+        allocator,
+        .numeric_zero,
+        declared,
+        declared,
+        &.{"I"},
+    );
+    const declared_encoded = try serialize.encode(allocator, &declared_ir);
+    var declared_decoded = try serialize.decode(allocator, declared_encoded);
+    defer declared_decoded.graph.deinit();
+    try root.validateForTranslation(&declared_decoded);
+    try std.testing.expectEqualStrings(
+        declared_encoded,
+        try serialize.encode(allocator, &declared_decoded),
+    );
+
+    // A result that is not the type the tag names.
+    const mismatched = try initNumericCoreCallIr(
+        allocator,
+        .numeric_max_value,
+        .{ .prim = .u64 },
+        .{ .prim = .u32 },
+        &.{},
+    );
+    try expectCoreTypeRefused(allocator, mismatched);
+
+    // A type with no numeric reading at all: a float never has a Rust integer
+    // bound, so the tag cannot stand in for one.
+    for ([_]types.Prim{ .f32, .f64, .bool, .char, .unit }) |primitive| {
+        const floating = try initNumericCoreCallIr(
+            allocator,
+            .numeric_one,
+            .{ .prim = primitive },
+            .{ .prim = primitive },
+            &.{},
+        );
+        try expectCoreTypeRefused(allocator, floating);
+        const value = try initCoreFunctionValueIr(
+            allocator,
+            .numeric_min_value,
+            &.{.{ .prim = primitive }},
+        );
+        try std.testing.expectError(
+            error.InvalidCoreFunctionType,
+            serialize.encode(allocator, &value),
+        );
+        try std.testing.expectError(
+            error.InvalidCoreFunctionType,
+            root.validateForTranslation(&value),
+        );
+    }
+
+    // The same refusal read back off the wire.
+    const encoded = try serialize.encode(allocator, &declared_ir);
+    const wire_numeric = try replaceOnce(
+        allocator,
+        encoded,
+        "\"function\":\"numeric_zero\",\"generic_args\":[" ++
+            "{\"kind\":\"path\",\"value\":{\"segments\":[" ++
+            "{\"name\":\"I\",\"id\":null}]}}]",
+        "\"function\":\"numeric_zero\",\"generic_args\":[" ++
+            "{\"kind\":\"prim\",\"value\":\"f64\"}]",
+    );
+    try expectDecodedRefusal(wire_numeric, error.InvalidCoreCallType);
+}
+
+test "core function values: the LE and hash writers name one integer" {
+    for (integer_core_writers) |function| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const ir = try initCoreFunctionValueIr(allocator, function, &.{.{ .prim = .i32 }});
+
+        const encoded = try serialize.encode(allocator, &ir);
+        var decoded = try serialize.decode(allocator, encoded);
+        defer decoded.graph.deinit();
+        try root.validateForTranslation(&decoded);
+        try std.testing.expectEqualStrings(encoded, try serialize.encode(allocator, &decoded));
+        switch (decoded.bodies.exprs[1].kind) {
+            .core_function => |value| try std.testing.expectEqual(function, value.function),
+            else => return error.ExpectedCoreFunctionExpression,
+        }
+    }
+}
+
+test "core function values: a non-integer generic has no byte image or written value" {
+    const rejected = [_]types.Prim{ .f32, .f64, .bool, .char, .unit, .never };
+    for (integer_core_writers) |function| {
+        for (rejected) |primitive| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            const ir = try initCoreFunctionValueIr(allocator, function, &.{.{ .prim = primitive }});
+            try std.testing.expectError(
+                error.InvalidCoreFunctionType,
+                serialize.encode(allocator, &ir),
+            );
+            try std.testing.expectError(
+                error.InvalidCoreFunctionType,
+                root.validateForTranslation(&ir),
+            );
+        }
+    }
+}
+
+test "core function values: a generic count the tag does not declare is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const wrong_counts = [_]struct {
+        function: exprs.CoreFunction,
+        generic_args: []const types.Type,
+    }{
+        // One integer, no more and no fewer.
+        .{ .function = .prim_from_le_bytes, .generic_args = &.{} },
+        .{ .function = .prim_to_le_bytes, .generic_args = &.{} },
+        .{
+            .function = .prim_from_le_bytes,
+            .generic_args = &.{ .{ .prim = .u32 }, .{ .prim = .u8 } },
+        },
+        .{ .function = .hash_write_primitive, .generic_args = &.{} },
+        // The generator is the receiver's own type, so there is nothing for a
+        // generic argument to name.
+        .{ .function = .rng_fill_bytes_via_next, .generic_args = &.{.{ .prim = .u64 }} },
+        .{ .function = .maybe_uninit_uninit, .generic_args = &.{} },
+        .{ .function = .numeric_min_value, .generic_args = &.{} },
+        .{ .function = .numeric_max_value, .generic_args = &.{} },
+        .{ .function = .numeric_zero, .generic_args = &.{} },
+        .{ .function = .numeric_one, .generic_args = &.{} },
+        .{
+            .function = .numeric_zero,
+            .generic_args = &.{ .{ .prim = .u32 }, .{ .prim = .u8 } },
+        },
+    };
+    for (wrong_counts) |wrong| {
+        const ir = try initCoreFunctionValueIr(allocator, wrong.function, wrong.generic_args);
+        try std.testing.expectError(
+            error.InvalidCoreFunctionArity,
+            serialize.encode(allocator, &ir),
+        );
+        try std.testing.expectError(
+            error.InvalidCoreFunctionArity,
+            root.validateForTranslation(&ir),
+        );
+    }
+}
+
+test "core calls: an unattributed `_` generic is incomplete metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ir = try initTypedCoreCallIr(allocator);
+
+    // A single-segment `_` is the type table's placeholder for a Rust `_`:
+    // inference rewrites it in place once the constraints name a concrete type.
+    // It is not an unsupported external root, and the row exists while its
+    // element does not.
+    const placeholder: types.Type = .{ .external_nominal = .{ .path = &.{"_"} } };
+    const call = try withExprRow(allocator, ir, 3, .{
+        .id = 3,
+        .span = core_span,
+        .ty = 1,
+        .kind = .{ .core_call = .{
+            .function = .prim_to_le_bytes,
+            .generic_args = &.{placeholder},
+            .args = &.{4},
+        } },
+    });
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        serialize.encode(allocator, &call),
+    );
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        root.validateForTranslation(&call),
+    );
+
+    // The placeholder is caught while the generic argument is attributed, which
+    // is why it never reads as a type the writer could not name.
+    const value = try initCoreFunctionValueIr(
+        allocator,
+        .hash_write_primitive,
+        &.{placeholder},
+    );
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        serialize.encode(allocator, &value),
+    );
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        root.validateForTranslation(&value),
+    );
 }
 fn expectCanonicalDependencyMissingField(field: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -961,6 +2519,13 @@ test "serialize: canonical dependency metadata encodes all states and order" {
     const enabled_features = deps[2].object.get("features").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), enabled_features.len);
     try std.testing.expectEqualStrings("enabled_feature", enabled_features[0].string);
+
+    // The frontend's answer about this build's resolved feature set is written
+    // as a plain boolean on every dependency: `nullable` is the one shape that
+    // may be called certainly empty, the other two may not.
+    try std.testing.expect(deps[0].object.get("resolved_features_known_empty").?.bool);
+    try std.testing.expect(!deps[1].object.get("resolved_features_known_empty").?.bool);
+    try std.testing.expect(!deps[2].object.get("resolved_features_known_empty").?.bool);
 }
 
 test "serialize: canonical dependency metadata decodes owned and roundtrips" {
@@ -978,6 +2543,52 @@ test "serialize: canonical dependency metadata decodes owned and roundtrips" {
     var roundtripped = try serialize.decode(allocator, encoded);
     defer roundtripped.graph.deinit();
     try expectDependencyMetadata(roundtripped.graph.crates.items[0].deps);
+}
+
+test "serialize: a dependency's resolved-empty fact round-trips and an absent key is false" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // This payload predates the key, and a wire that cannot answer the
+    // question must not be read as answering it. Absence is "not known to be
+    // empty", which is the value the field's own default gives — never the
+    // stronger claim a reader might otherwise invent for a missing key.
+    {
+        const absent = try allocator.dupe(u8, canonical_dependency_payload);
+        var decoded = try serialize.decode(allocator, absent);
+        defer decoded.graph.deinit();
+        for (decoded.graph.crates.items[0].deps) |dependency| {
+            try std.testing.expect(!dependency.resolved_features_known_empty);
+        }
+    }
+
+    // With the key present the answer is the frontend's, and it survives both
+    // directions of the wire rather than being re-guessed on the way through.
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        canonical_dependency_payload,
+        .{},
+    );
+    defer parsed.deinit();
+    const crates = parsed.value.object.getPtr("crates") orelse return error.BadWireFormat;
+    const deps = crates.array.items[0].object.getPtr("deps") orelse return error.BadWireFormat;
+    try deps.array.items[0].object.put(allocator, "resolved_features_known_empty", .{
+        .bool = true,
+    });
+    const payload = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+
+    var decoded = try serialize.decode(allocator, payload);
+    defer decoded.graph.deinit();
+    try std.testing.expect(decoded.graph.crates.items[0].deps[0].resolved_features_known_empty);
+    try std.testing.expect(!decoded.graph.crates.items[0].deps[1].resolved_features_known_empty);
+
+    const encoded = try serialize.encode(allocator, &decoded);
+    var roundtripped = try serialize.decode(allocator, encoded);
+    defer roundtripped.graph.deinit();
+    try std.testing.expect(roundtripped.graph.crates.items[0].deps[0].resolved_features_known_empty);
+    try std.testing.expect(!roundtripped.graph.crates.items[0].deps[1].resolved_features_known_empty);
 }
 
 test "serialize: canonical dependency metadata requires exact fields and types" {
@@ -1437,7 +3048,7 @@ test "serialize: explicit Vec literal preserves wire payload and roundtrips" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualSlices(exprs.NodeId, &element_ids, decoded_vec.elements);
-    try std.testing.expectEqual(@as(?usize, null), decoded_vec.repeat);
+    try std.testing.expectEqual(@as(?exprs.VecRepeatCount, null), decoded_vec.repeat);
 }
 
 test "serialize: repeat Vec literal preserves wire payload and roundtrips" {
@@ -1460,7 +3071,7 @@ test "serialize: repeat Vec literal preserves wire payload and roundtrips" {
             .ty = null,
             .kind = .{ .vec_lit = .{
                 .elements = &element_ids,
-                .repeat = 13,
+                .repeat = .{ .literal = 13 },
             } },
         },
     };
@@ -1494,7 +3105,453 @@ test "serialize: repeat Vec literal preserves wire payload and roundtrips" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualSlices(exprs.NodeId, &element_ids, decoded_vec.elements);
-    try std.testing.expectEqual(@as(?usize, 13), decoded_vec.repeat);
+    try std.testing.expectEqual(
+        @as(?exprs.VecRepeatCount, .{ .literal = 13 }),
+        decoded_vec.repeat,
+    );
+}
+
+/// A `vec![e; n]` whose count the target evaluates: the repeated value, the
+/// node that produces the count, and the literal that joins them.
+///
+/// `count_type` is what the count node is typed as — null leaves it
+/// unattributed, which is its own refusal — and `count_id` is the node it
+/// names, so a fixture can point the count at a row that is not there.
+fn initVecRepeatCountIr(
+    allocator: std.mem.Allocator,
+    count_type: ?types.Type,
+    count_id: exprs.NodeId,
+) !serialize.RustIr {
+    const span: spine.Span = .{
+        .start_line = 3,
+        .start_col = 5,
+        .end_line = 3,
+        .end_col = 14,
+    };
+    const type_rows = if (count_type) |ty|
+        try allocator.dupe(types.Type, &.{ty})
+    else
+        try allocator.dupe(types.Type, &.{});
+    const count_type_id: ?exprs.TypeId = if (count_type == null) null else 0;
+    const expression_rows = try allocator.dupe(exprs.Expr, &.{
+        .{ .id = 0, .span = span, .ty = null, .kind = .{ .unit = {} } },
+        .{ .id = 1, .span = span, .ty = count_type_id, .kind = .{ .unit = {} } },
+        .{
+            .id = 2,
+            .span = span,
+            .ty = null,
+            .kind = .{ .vec_lit = .{
+                .elements = try allocator.dupe(exprs.NodeId, &.{0}),
+                .repeat = .{ .expression = count_id },
+            } },
+        },
+    });
+    const body_kinds = [_]bodies.BodyKind{.none};
+    return serialize.RustIr{
+        .crate_name = "vec_dynamic",
+        .edition = "2021",
+        .graph = try initTestGraph(allocator, "vec_dynamic", &.{}),
+        .types = type_rows,
+        .bodies = .{
+            .exprs = expression_rows,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = type_rows,
+            .bodies = &body_kinds,
+        },
+    };
+}
+
+test "serialize: a Vec literal count the target evaluates preserves its wire payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fixture_ir = try initVecRepeatCountIr(alloc, .{ .prim = .usize }, 1);
+    defer fixture_ir.graph.deinit();
+
+    const encoded = try serialize.encode(alloc, &fixture_ir);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"kind\":\"vec_lit\",\"value\":{\"elements\":[0]," ++
+            "\"repeat\":{\"tag\":\"expression\",\"value\":1}}",
+    ) != null);
+
+    var decoded = try serialize.decode(alloc, encoded);
+    defer decoded.graph.deinit();
+    const decoded_vec = switch (decoded.bodies.exprs[2].kind) {
+        .vec_lit => |vec| vec,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), decoded_vec.elements.len);
+    try std.testing.expectEqual(@as(exprs.NodeId, 0), decoded_vec.elements[0]);
+    try std.testing.expectEqual(
+        @as(?exprs.VecRepeatCount, .{ .expression = 1 }),
+        decoded_vec.repeat,
+    );
+    // The count is still a `usize` on the far side of the wire, which is what
+    // makes it a count rather than a number the reader has to take on trust.
+    try root.validateForTranslation(&decoded);
+}
+
+// `vec![e; n]` counts in `usize` by the language. `u32` is a number the node
+// really can evaluate to, and it is still not a count.
+test "validate: a Vec literal count typed as something other than usize is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initVecRepeatCountIr(allocator, .{ .prim = .u32 }, 1);
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(error.UnsupportedType, root.validateForTranslation(&fixture_ir));
+}
+
+// No type is invented for a count nothing typed: inference owes that node one,
+// and a count read without one would be a number the IR never established.
+test "validate: a Vec literal count no declaration typed is incomplete metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initVecRepeatCountIr(allocator, null, 1);
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.IncompleteGenericMetadata,
+        root.validateForTranslation(&fixture_ir),
+    );
+}
+
+test "validate: a Vec literal count naming no expression is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initVecRepeatCountIr(allocator, .{ .prim = .usize }, 99);
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(error.InvalidExprRef, root.validateForTranslation(&fixture_ir));
+}
+
+test "serialize: a Vec literal count object the wire cannot read exactly is rejected" {
+    const allocator = std.testing.allocator;
+    // The count is read before the element list, so every one of these is
+    // refused on the count alone and hands back nothing of the literal.
+    const rejected = [_][]const u8{
+        // A third key: a count this decoder cannot read exactly is never one it
+        // is free to guess at.
+        "{\"tag\":\"expression\",\"value\":1,\"note\":\"extra\"}",
+        // A tag other than the one form the wire has, and a tag that is not a
+        // string at all.
+        "{\"tag\":\"literal\",\"value\":1}",
+        "{\"tag\":1,\"value\":1}",
+        // No node id beside the tag.
+        "{\"tag\":\"expression\"}",
+        // A node id that is not an integer node id.
+        "{\"tag\":\"expression\",\"value\":\"1\"}",
+        "{\"tag\":\"expression\",\"value\":true}",
+        "{\"tag\":\"expression\",\"value\":1.5}",
+        "{\"tag\":\"expression\",\"value\":18446744073709551616}",
+        "{\"tag\":\"expression\",\"value\":-1}",
+    };
+    for (rejected) |count| {
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+                "\"sidecar\":null,\"toolchain\":null,{s}" ++
+                ",\"instantiations\":[],\"types\":[],\"bodies\":{{\"exprs\":[{{\"id\":0," ++
+                "\"span\":{{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":1}}," ++
+                "\"ty\":null,\"kind\":\"vec_lit\",\"value\":{{\"elements\":[],\"repeat\":{s}}}}}]," ++
+                "\"stmts\":[],\"pats\":[],\"types\":[],\"bodies\":[{{\"owner\":0," ++
+                "\"body\":{{\"kind\":\"none\"}}}}]}}}}",
+            .{ valid_crates_json, count },
+        );
+        defer allocator.free(payload);
+        try std.testing.expectError(error.BadWireFormat, serialize.decode(allocator, payload));
+    }
+}
+
+test "serialize: a Vec literal with no repeat key is a missing field" {
+    const payload =
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+        "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
+        ",\"instantiations\":[],\"types\":[],\"bodies\":{\"exprs\":[{\"id\":0," ++
+        "\"span\":{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":1}," ++
+        "\"ty\":null,\"kind\":\"vec_lit\",\"value\":{\"elements\":[]}}]," ++
+        "\"stmts\":[],\"pats\":[],\"types\":[],\"bodies\":[{\"owner\":0," ++
+        "\"body\":{\"kind\":\"none\"}}]}}";
+    try std.testing.expectError(
+        error.MissingField,
+        serialize.decode(std.testing.allocator, payload),
+    );
+}
+
+fn checkVecRepeatCountAllocationFailures(allocator: std.mem.Allocator) !void {
+    // The fixture is built over the INJECTED allocator, so the validation
+    // scratch and every table of the round trip are fault-injected too
+    // rather than served from a pool the test already paid for.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var fixture_ir = try initVecRepeatCountIr(arena.allocator(), .{ .prim = .usize }, 1);
+    defer fixture_ir.graph.deinit();
+
+    try root.validateForTranslation(&fixture_ir);
+    const encoded = try serialize.encode(allocator, &fixture_ir);
+    defer allocator.free(encoded);
+    // `decode` has NO whole-value deinitializer. Its contract is a
+    // caller-owned arena, and everything it owns — the crate name and
+    // edition, every interned type, every element and parameter list, every
+    // body row — comes from that one allocator. Releasing `decoded.graph`
+    // alone frees the crate and strands all of it. So the ARENA is what is
+    // given back, and it is registered BEFORE the decode: a decode that fails
+    // part way still releases what it had already taken.
+    var decoded_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decoded_arena.deinit();
+    var decoded = try serialize.decode(decoded_arena.allocator(), encoded);
+    try root.validateForTranslation(&decoded);
+}
+
+test "serialize: a Vec literal expression count round-trips under allocation faults" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkVecRepeatCountAllocationFailures,
+        .{},
+    );
+}
+
+// Counts are target metadata. Their wire form must remain an exact JSON
+// number, including values above i64, on32-bit and64-bit translator hosts.
+test "serialize: array repeat counts stay exact and numeric through u64::MAX" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const span: spine.Span = .{
+        .start_line = 2,
+        .start_col = 1,
+        .end_line = 2,
+        .end_col = 6,
+    };
+    const counts = [_]u64{
+        4294967296, // u32::MAX + 1, the count a 32-bit host used to refuse
+        9007199254740993, // 2^53 + 1, the first count an f64 would round
+        9223372036854775808, // 2^63, the first count an i64 cannot hold
+        18446744073709551615, // u64::MAX
+    };
+    for (counts) |count| {
+        const element_ids = [_]exprs.NodeId{0};
+        const expr_arr = [_]exprs.Expr{
+            .{ .id = 0, .span = span, .ty = null, .kind = .{ .unit = {} } },
+            .{
+                .id = 1,
+                .span = span,
+                .ty = null,
+                .kind = .{ .array = .{
+                    .elements = &element_ids,
+                    .repeat = count,
+                } },
+            },
+        };
+        const body_kinds = [_]bodies.BodyKind{.none};
+        const ir_types = [_]types.Type{.{ .array = &.{
+            .elem = .{ .prim = .unit },
+            .len = .{ .literal = count },
+        } }};
+        const sample_ir: serialize.RustIr = .{
+            .crate_name = "array_repeat",
+            .edition = "2021",
+            .graph = try initTestGraph(alloc, "array_repeat", &.{}),
+            .types = &ir_types,
+            .bodies = .{
+                .exprs = &expr_arr,
+                .stmts = &.{},
+                .pats = &.{},
+                .types = &ir_types,
+                .bodies = &body_kinds,
+            },
+        };
+
+        const encoded = try serialize.encode(alloc, &sample_ir);
+        // Unquoted, no exponent: a quoted string or a float would both change
+        // the wire format, and a float would round the count.
+        var needle: [48]u8 = undefined;
+        const needle_text = try std.fmt.bufPrint(&needle, "\"repeat\":{d}", .{count});
+        try std.testing.expect(std.mem.indexOf(u8, encoded, needle_text) != null);
+
+        var decoded = try serialize.decode(alloc, encoded);
+        defer decoded.graph.deinit();
+        const decoded_array = switch (decoded.bodies.exprs[1].kind) {
+            .array => |array| array,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(@as(?u64, count), decoded_array.repeat);
+        try std.testing.expectEqual(count, decoded.types[0].array.len.literal);
+    }
+}
+
+fn checkCanonicalEncodeAllocationFailures(
+    allocator: std.mem.Allocator,
+    ir: serialize.RustIr,
+) !void {
+    const encoded = try serialize.encode(allocator, &ir);
+    // Only the wire bytes belong to `allocator`; freeing them here is the
+    // proof that the caller's free matches the caller's own allocation.
+    allocator.free(encoded);
+}
+
+// An encode owns nothing but its output bytes. Everything else it builds — the
+// JSON tree, the crate member masks, the printed count and literal texts, and
+// the validation scratch — belongs to one arena over the caller's allocator,
+// so a fault at any point of the walk must be refused with nothing retained.
+test "serialize: canonical encode owns only its output bytes under allocation faults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 4,
+    };
+    // The widest count the wire format carries, printed twice: as an array
+    // expression's repeat and as an array type's length.
+    const count: u64 = std.math.maxInt(u64);
+    const field = items.Field{
+        .name = "value",
+        .ty = .{ .prim = .i32 },
+        .visibility = .public,
+        .span = span,
+    };
+    const param = items.Param{ .name = "input", .ty = .{ .prim = .i32 }, .span = span };
+    const method = bodies.StructMethod{
+        .name = "make",
+        .visibility = .public,
+        .params = &.{param},
+        .ret = .{ .prim = .i32 },
+        .generic_params = &.{"U"},
+        .body = 0,
+        .receiver = .ref_,
+        .is_allocating = true,
+    };
+    const trait_method = bodies.TraitMethodSig{
+        .name = "convert",
+        .params = &.{param},
+        .ret = .{ .prim = .i32 },
+        .receiver = .mut_ref,
+    };
+    const path_segments = [_]types.PathSegment{.{ .name = "item_5", .id = 5 }};
+    const alias_target: types.Type = .{ .path = .{ .segments = &path_segments } };
+    const body_kinds = [_]bodies.BodyKind{
+        .none,
+        .{ .fn_ = .{
+            .params = &.{param},
+            .ret = .{ .prim = .i32 },
+            .generic_params = &.{"T"},
+            .body = 0,
+            .is_allocating = true,
+        } },
+        .{ .struct_ = .{
+            .generic_params = &.{"T"},
+            .trait_bounds = &.{"T: Copy"},
+            .layout = .tuple,
+            .fields = &.{field},
+            .methods = &.{method},
+            .has_dynamic_resources = true,
+        } },
+        .{ .enum_ = .{
+            .kind = .data,
+            .variants = &.{
+                .{ .name = "Value", .fields = .{ .named = &.{field} }, .discriminant = 7 },
+            },
+            .repr_int = .u32,
+            .non_exhaustive = true,
+        } },
+        .{ .trait_ = .{
+            .name = "Convert",
+            .supertraits = &.{"Display"},
+            .methods = &.{trait_method},
+        } },
+        .{ .type_alias = .{ .target = alias_target } },
+    };
+    const ir_types = [_]types.Type{
+        .{ .prim = .i32 },
+        .{ .array = &.{ .elem = .{ .prim = .unit }, .len = .{ .literal = count } } },
+    };
+    const ir: serialize.RustIr = .{
+        .crate_name = "encode_fault",
+        .edition = "2021",
+        .graph = try initTestGraph(
+            alloc,
+            "encode_fault",
+            &.{ .fn_, .struct_, .enum_, .trait_, .type_alias },
+        ),
+        .types = &ir_types,
+        .bodies = .{
+            .exprs = &.{
+                .{ .id = 0, .span = span, .ty = 0, .kind = .{ .block = .{
+                    .statements = &.{},
+                    .tail = 1,
+                    .labelled = "fault_block",
+                } } },
+                .{ .id = 1, .span = span, .ty = 0, .kind = .{ .array = .{
+                    .elements = &.{2},
+                    .repeat = count,
+                } } },
+                .{ .id = 2, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+            },
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &ir_types,
+            .bodies = &body_kinds,
+        },
+    };
+
+    // The returned bytes are the caller's and outlive the temporary arena:
+    // both counts are still exact, unquoted numbers.
+    const encoded = try serialize.encode(std.testing.allocator, &ir);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(
+        std.mem.indexOf(u8, encoded, "\"repeat\":18446744073709551615") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            encoded,
+            "\"len\":{\"kind\":\"literal\",\"value\":18446744073709551615}",
+        ) != null,
+    );
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkCanonicalEncodeAllocationFailures,
+        .{ir},
+    );
+}
+
+// `decodeExprKind` reads the count before it reads the element id list, so a
+// count that names no describable array is refused before any of that list is
+// allocated. It is refused, not clamped and not rounded down.
+test "serialize: a repeat count wider than u64 is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const over_u64 =
+        "{\"format_version\":6,\"crate_name\":\"bad\",\"edition\":\"2021\"," ++
+        "\"sidecar\":null,\"toolchain\":null," ++ valid_crates_json ++
+        ",\"instantiations\":[],\"types\":[],\"bodies\":{\"exprs\":[{\"id\":0," ++
+        "\"span\":{\"start_line\":1,\"start_col\":1,\"end_line\":1,\"end_col\":1}," ++
+        "\"ty\":null,\"kind\":\"array\",\"value\":{\"elements\":[0,1]," ++
+        "\"repeat\":18446744073709551616}}]," ++
+        "\"stmts\":[],\"pats\":[],\"types\":[],\"bodies\":[{\"owner\":0,\"body\":{\"kind\":\"none\"}}]}}";
+    try std.testing.expectError(
+        error.BadWireFormat,
+        serialize.decode(allocator, over_u64),
+    );
 }
 
 test "serialize: explicit unsupported diagnostics preserve tagged metadata" {
@@ -2385,7 +4442,7 @@ test "serialize: rich bodies preserve all supported metadata" {
     const struct_body = decoded.bodies.bodies[2].struct_;
     try std.testing.expectEqualStrings("T", struct_body.generic_params[0]);
     try std.testing.expectEqualStrings("T: Copy", struct_body.trait_bounds[0]);
-    try std.testing.expectEqual(items.struct_kind.tuple, struct_body.layout);
+    try std.testing.expectEqual(items.StructKind.tuple, struct_body.layout);
     try std.testing.expectEqualStrings("value", struct_body.fields[0].name);
     try std.testing.expectEqual(spine.Visibility.public, struct_body.fields[0].visibility);
     try std.testing.expectEqualStrings("make", struct_body.methods[0].name);
@@ -2398,8 +4455,8 @@ test "serialize: rich bodies preserve all supported metadata" {
     try std.testing.expect(struct_body.has_dynamic_resources);
     const enum_body = decoded.bodies.bodies[3].enum_;
     try std.testing.expectEqual(@as(usize, 1), enum_body.variants.len);
-    try std.testing.expectEqual(@as(?items.int_repr, .u32), enum_body.repr_int);
-    try std.testing.expectEqual(items.enum_kind.data, enum_body.kind);
+    try std.testing.expectEqual(@as(?items.IntRepr, .u32), enum_body.repr_int);
+    try std.testing.expectEqual(items.EnumKind.data, enum_body.kind);
     try std.testing.expectEqualStrings("Value", enum_body.variants[0].name);
     try std.testing.expectEqual(@as(?i128, 7), enum_body.variants[0].discriminant);
     switch (enum_body.variants[0].fields) {
@@ -2419,6 +4476,84 @@ test "serialize: rich bodies preserve all supported metadata" {
         .path => |path| {
             try std.testing.expectEqualStrings("item_5", path.segments[0].name);
             try std.testing.expectEqual(@as(?spine.EntityId, 5), path.segments[0].id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "serialize: field and variant documentation roundtrip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 4,
+    };
+
+    const fields = [_]items.Field{
+        .{
+            .name = "documented",
+            .ty = .{ .prim = .i32 },
+            .visibility = .public,
+            .span = span,
+            .documentation = "Counts bytes.\nSecond line.",
+        },
+        .{
+            .name = "plain",
+            .ty = .{ .prim = .u8 },
+            .visibility = .private,
+            .span = span,
+        },
+    };
+    const variants = [_]items.Variant{
+        .{
+            .name = "Value",
+            .fields = .{ .named = &fields },
+            .discriminant = 1,
+            .documentation = "Carries a payload.",
+        },
+        .{ .name = "Empty", .fields = .none, .discriminant = 0 },
+    };
+    const body_kinds = [_]bodies.BodyKind{
+        .none,
+        .{ .struct_ = .{ .fields = &fields } },
+        .{ .enum_ = .{ .kind = .data, .variants = &variants } },
+    };
+    const root_types = [_]types.Type{.{ .prim = .i32 }};
+    const ir = serialize.RustIr{
+        .crate_name = "documented",
+        .edition = "2021",
+        .graph = try initTestGraph(allocator, "documented", &.{ .struct_, .enum_ }),
+        .types = &root_types,
+        .bodies = .{
+            .exprs = &.{},
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &root_types,
+            .bodies = &body_kinds,
+        },
+    };
+
+    const encoded = try serialize.encode(allocator, &ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+
+    // A record that carried documentation keeps it; one that carried none
+    // decodes to the empty default without allocating.
+    const struct_fields = decoded.bodies.bodies[1].struct_.fields;
+    try std.testing.expectEqual(@as(usize, 2), struct_fields.len);
+    try std.testing.expectEqualStrings("Counts bytes.\nSecond line.", struct_fields[0].documentation);
+    try std.testing.expectEqualStrings("", struct_fields[1].documentation);
+
+    const enum_variants = decoded.bodies.bodies[2].enum_.variants;
+    try std.testing.expectEqual(@as(usize, 2), enum_variants.len);
+    try std.testing.expectEqualStrings("Carries a payload.", enum_variants[0].documentation);
+    try std.testing.expectEqualStrings("", enum_variants[1].documentation);
+    switch (enum_variants[0].fields) {
+        .named => |named| {
+            try std.testing.expectEqualStrings("Counts bytes.\nSecond line.", named[0].documentation);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2545,15 +4680,20 @@ fn initImplOwnedItemIr(
     // Only the struct is a module item. The impl and its two associated items
     // hang off the struct, so the module list must not claim them.
     crate_graph.modules.items[0].items = try allocator.dupe(spine.EntityId, &.{1});
-    crate_graph.symbol_table.entities.items[1].name = "DropGuard";
-    crate_graph.symbol_table.entities.items[2].name = "Deref for DropGuard";
+    // Every name and slice the returned IR keeps is allocator-owned: the graph
+    // frees its entity names on `deinit`, and a `&.{...}` literal holding a
+    // runtime value would be a stack temporary that dies with this frame.
+    crate_graph.symbol_table.entities.items[1].name = try allocator.dupe(u8, "DropGuard");
+    crate_graph.symbol_table.entities.items[2].name = try allocator.dupe(u8, "Deref for DropGuard");
     crate_graph.symbol_table.entities.items[2].parent = 1;
-    crate_graph.symbol_table.entities.items[3].name = "from";
+    crate_graph.symbol_table.entities.items[3].name = try allocator.dupe(u8, "from");
     crate_graph.symbol_table.entities.items[3].parent = 2;
-    crate_graph.symbol_table.entities.items[4].name = "Target";
+    crate_graph.symbol_table.entities.items[4].name = try allocator.dupe(u8, "Target");
     crate_graph.symbol_table.entities.items[4].parent = 2;
 
-    const self_type: types.Type = .{ .path = .{ .segments = &.{.{ .name = "Self", .id = null }} } };
+    const self_segments = try allocator.alloc(types.PathSegment, 1);
+    self_segments[0] = .{ .name = "Self", .id = null };
+    const self_type: types.Type = .{ .path = .{ .segments = self_segments } };
     const param_rows = try allocator.dupe(items.Param, &.{.{
         .name = "into",
         .ty = method_param_ty,
@@ -2572,20 +4712,24 @@ fn initImplOwnedItemIr(
         .ty = null,
         .kind = .{ .block = .{ .statements = &.{}, .tail = 0, .labelled = null } },
     }});
+    const impl_self_segments = try allocator.alloc(types.PathSegment, 1);
+    impl_self_segments[0] = .{ .name = "DropGuard", .id = 1 };
+    const trait_segments = try allocator.dupe(types.PathSegment, &.{
+        .{ .name = "core", .id = null },
+        .{ .name = "ops", .id = null },
+        .{ .name = "Deref", .id = null },
+    });
+    const generic_params = try allocator.dupe(types.GenericParam, &.{
+        .{ .type_ = .{ .name = "I", .bounds = &.{} } },
+        .{ .type_ = .{ .name = "T", .bounds = &.{} } },
+    });
     const body_rows = try allocator.dupe(bodies.BodyKind, &.{
         .none,
         .{ .struct_ = .{ .layout = .unit, .methods = method_rows } },
         .{ .impl_ = .{
-            .self_ty = .{ .path = .{ .segments = &.{.{ .name = "DropGuard", .id = 1 }} } },
-            .trait_path = .{ .segments = &.{
-                .{ .name = "core", .id = null },
-                .{ .name = "ops", .id = null },
-                .{ .name = "Deref", .id = null },
-            } },
-            .generics = .{ .params = &.{
-                .{ .type_ = .{ .name = "I", .bounds = &.{} } },
-                .{ .type_ = .{ .name = "T", .bounds = &.{} } },
-            }, .where_clauses = &.{} },
+            .self_ty = .{ .path = .{ .segments = impl_self_segments } },
+            .trait_path = .{ .segments = trait_segments },
+            .generics = .{ .params = generic_params, .where_clauses = &.{} },
             .assoc_items = try allocator.dupe(spine.EntityId, &.{ 3, 4 }),
         } },
         .{ .fn_ = .{ .params = &.{}, .ret = self_type, .body = 0 } },
@@ -2679,6 +4823,325 @@ test "serialize: an associated type naming an undeclared type is rejected" {
     try std.testing.expectError(
         error.UnresolvedTypePath,
         serialize.encode(allocator, &fixture_ir),
+    );
+}
+
+/// A function generic over `I` whose one parameter is `projection`.
+///
+/// `Sealed` (entity 2) declares the associated type `Buffer`. `Marker`
+/// (entity 3) is a plain struct and `BufferForU8` (entity 4) is the alias an
+/// `impl` leaves behind once it has carried the projection out for one
+/// concrete type, so each slot a canonical projection can be wrong in has a
+/// real declaration to point at. Nothing here is feature metadata carried for
+/// a test: the rule reads the trait's own `assoc_types`, the same list a
+/// `Self::Sealed::Buffer` is checked against.
+fn initGenericProjectionIr(
+    allocator: std.mem.Allocator,
+    projection: types.Type,
+) !serialize.RustIr {
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 8,
+    };
+    var crate_graph = try initTestGraph(
+        allocator,
+        "projection_fixture",
+        &.{ .fn_, .trait_, .struct_, .type_alias },
+    );
+    // Every name the returned IR keeps is allocator-owned: `deinit` frees the
+    // entity names, and a literal holding a stack value would outlive it.
+    crate_graph.symbol_table.entities.items[1].name = try allocator.dupe(u8, "project");
+    crate_graph.symbol_table.entities.items[2].name = try allocator.dupe(u8, "Sealed");
+    crate_graph.symbol_table.entities.items[3].name = try allocator.dupe(u8, "Marker");
+    crate_graph.symbol_table.entities.items[4].name = try allocator.dupe(u8, "BufferForU8");
+
+    const param_rows = try allocator.dupe(items.Param, &.{.{
+        .name = "buf",
+        .ty = projection,
+        .span = span,
+    }});
+    const assoc_rows = try allocator.dupe(items.AssocType, &.{.{
+        .name = try allocator.dupe(u8, "Buffer"),
+        .generics = null,
+        .bounds = &.{},
+        .default = null,
+    }});
+    const expression_rows = try allocator.dupe(exprs.Expr, &.{.{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = 0, .labelled = null } },
+    }});
+    const body_rows = try allocator.dupe(bodies.BodyKind, &.{
+        .none,
+        .{ .fn_ = .{
+            .params = param_rows,
+            .ret = .{ .prim = .u8 },
+            .generic_params = &.{"I"},
+            .body = 0,
+        } },
+        .{ .trait_ = .{
+            .name = try allocator.dupe(u8, "Sealed"),
+            .assoc_types = assoc_rows,
+        } },
+        .{ .struct_ = .{ .layout = .unit } },
+        .{ .type_alias = .{ .target = .{ .prim = .u8 } } },
+    });
+    return serialize.RustIr{
+        .crate_name = "projection_fixture",
+        .edition = "2021",
+        .graph = crate_graph,
+        .bodies = .{
+            .exprs = expression_rows,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &.{},
+            .bodies = body_rows,
+        },
+    };
+}
+
+/// `<I as Sealed>::Buffer` with the `as` clause and the `private::` module
+/// prefix already gone: the receiver, the trait it resolves to, and the member
+/// that trait declares.
+const sealed_projection: types.Path = .{
+    .segments = &[_]types.PathSegment{
+        .{ .name = "I", .id = null },
+        .{ .name = "Sealed", .id = 2 },
+        .{ .name = "Buffer", .id = null },
+    },
+};
+
+test "serialize: a generic projection naming a member its trait declares round-trips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fixture_ir = try initGenericProjectionIr(allocator, .{ .path = sealed_projection });
+    defer fixture_ir.graph.deinit();
+
+    try root.validateForTranslation(&fixture_ir);
+    const encoded = try serialize.encode(allocator, &fixture_ir);
+    var decoded = try serialize.decode(allocator, encoded);
+    defer decoded.graph.deinit();
+    try root.validateForTranslation(&decoded);
+
+    // The three slots survive the wire exactly: a receiver no declaration
+    // resolves, the trait it does, and a terminal that is still the trait's
+    // member name rather than one impl's answer to it.
+    const decoded_param = decoded.bodies.bodies[1].fn_.params[0];
+    const decoded_path = switch (decoded_param.ty) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 3), decoded_path.segments.len);
+    try std.testing.expectEqualStrings("I", decoded_path.segments[0].name);
+    try std.testing.expectEqual(@as(?spine.EntityId, null), decoded_path.segments[0].id);
+    try std.testing.expectEqualStrings("Sealed", decoded_path.segments[1].name);
+    try std.testing.expectEqual(@as(?spine.EntityId, 2), decoded_path.segments[1].id);
+    try std.testing.expectEqualStrings("Buffer", decoded_path.segments[2].name);
+    try std.testing.expectEqual(@as(?spine.EntityId, null), decoded_path.segments[2].id);
+    try std.testing.expectEqual(@as(usize, 1), decoded.bodies.bodies[2].trait_.assoc_types.len);
+}
+
+// An `impl`'s `type Buffer` is the projection already carried out for one
+// concrete type. Reading it back as the trait's member is what would let that
+// one layout stand in for the parameter the signature is still written on.
+test "serialize: a projection terminal resolved against one impl is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const resolved_terminal: types.Path = .{
+        .segments = &[_]types.PathSegment{
+            .{ .name = "I", .id = null },
+            .{ .name = "Sealed", .id = 2 },
+            .{ .name = "Buffer", .id = 4 },
+        },
+    };
+    var fixture_ir = try initGenericProjectionIr(allocator, .{ .path = resolved_terminal });
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.InvalidTypePath,
+        root.validateForTranslation(&fixture_ir),
+    );
+}
+
+// A struct can sit where the trait slot spells a name, but it declares no
+// associated type, so the projection it appears in does not exist.
+test "serialize: a projection whose middle segment is not a trait is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const non_trait_owner: types.Path = .{
+        .segments = &[_]types.PathSegment{
+            .{ .name = "I", .id = null },
+            .{ .name = "Marker", .id = 3 },
+            .{ .name = "Buffer", .id = null },
+        },
+    };
+    var fixture_ir = try initGenericProjectionIr(allocator, .{ .path = non_trait_owner });
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.InvalidTypePath,
+        root.validateForTranslation(&fixture_ir),
+    );
+}
+
+// The trait is right and its name matches, so the member list is the only
+// thing left to decide.
+test "serialize: a projection naming a member the trait does not declare is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const missing_member: types.Path = .{
+        .segments = &[_]types.PathSegment{
+            .{ .name = "I", .id = null },
+            .{ .name = "Sealed", .id = 2 },
+            .{ .name = "Missing", .id = null },
+        },
+    };
+    var fixture_ir = try initGenericProjectionIr(allocator, .{ .path = missing_member });
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.UnresolvedTypePath,
+        root.validateForTranslation(&fixture_ir),
+    );
+}
+
+// An id alone is not enough: the segment has to name the declaration it
+// resolves to, or it is spelling one the id does not reach.
+test "serialize: a projection naming another declaration in its trait slot is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const misnamed_trait: types.Path = .{
+        .segments = &[_]types.PathSegment{
+            .{ .name = "I", .id = null },
+            .{ .name = "Marker", .id = 2 },
+            .{ .name = "Buffer", .id = null },
+        },
+    };
+    var fixture_ir = try initGenericProjectionIr(allocator, .{ .path = misnamed_trait });
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.InvalidTypePath,
+        root.validateForTranslation(&fixture_ir),
+    );
+}
+
+// Only a RESOLVED middle segment makes this shape a projection. Spelling a
+// module prefix after a parameter produces nothing, so it is left exactly as
+// the segment loop already decided.
+test "serialize: a module path spelled after a parameter is not a projection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const unresolved_middle: types.Path = .{
+        .segments = &[_]types.PathSegment{
+            .{ .name = "I", .id = null },
+            .{ .name = "enc", .id = null },
+            .{ .name = "Iter", .id = null },
+        },
+    };
+    var fixture_ir = try initGenericProjectionIr(allocator, .{ .path = unresolved_middle });
+    defer fixture_ir.graph.deinit();
+
+    try root.validateForTranslation(&fixture_ir);
+}
+
+// The rule is three slots wide, so a bare parameter and an unqualified
+// associated step keep whatever they decided before it existed.
+test "serialize: a bare parameter and an unqualified associated step keep their shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const bare_parameter: types.Path = .{
+        .segments = &[_]types.PathSegment{.{ .name = "I", .id = null }},
+    };
+    var bare_ir = try initGenericProjectionIr(allocator, .{ .path = bare_parameter });
+    defer bare_ir.graph.deinit();
+    try root.validateForTranslation(&bare_ir);
+
+    const unqualified_step: types.Path = .{
+        .segments = &[_]types.PathSegment{
+            .{ .name = "I", .id = null },
+            .{ .name = "Buffer", .id = null },
+        },
+    };
+    var step_ir = try initGenericProjectionIr(allocator, .{ .path = unqualified_step });
+    defer step_ir.graph.deinit();
+    try root.validateForTranslation(&step_ir);
+}
+
+// Reading the head as a parameter is what makes the other two slots a
+// projection. A head no declaration binds is still a name nothing resolves.
+test "serialize: a projection on a head no declaration binds is still unresolved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const unknown_head: types.Path = .{
+        .segments = &[_]types.PathSegment{
+            .{ .name = "Absent", .id = null },
+            .{ .name = "Sealed", .id = 2 },
+            .{ .name = "Buffer", .id = null },
+        },
+    };
+    var fixture_ir = try initGenericProjectionIr(allocator, .{ .path = unknown_head });
+    defer fixture_ir.graph.deinit();
+
+    try std.testing.expectError(
+        error.UnresolvedTypePath,
+        root.validateForTranslation(&fixture_ir),
+    );
+}
+
+fn checkGenericProjectionAllocationFailures(allocator: std.mem.Allocator) !void {
+    // The fixture is built over the INJECTED allocator, so the validation
+    // scratch and every table of the round trip are fault-injected too
+    // rather than served from a pool the test already paid for.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var fixture_ir = try initGenericProjectionIr(
+        arena.allocator(),
+        .{ .path = sealed_projection },
+    );
+    defer fixture_ir.graph.deinit();
+
+    try root.validateForTranslation(&fixture_ir);
+    const encoded = try serialize.encode(allocator, &fixture_ir);
+    defer allocator.free(encoded);
+    // `decode` has NO whole-value deinitializer. Its contract is a
+    // caller-owned arena, and everything it owns — the crate name and
+    // edition, every interned type, every element and parameter list, every
+    // body row — comes from that one allocator. Releasing `decoded.graph`
+    // alone frees the crate and strands all of it. So the ARENA is what is
+    // given back, and it is registered BEFORE the decode: a decode that fails
+    // part way still releases what it had already taken.
+    var decoded_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decoded_arena.deinit();
+    var decoded = try serialize.decode(decoded_arena.allocator(), encoded);
+    try root.validateForTranslation(&decoded);
+}
+
+test "serialize: the canonical generic projection round-trips under allocation faults" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkGenericProjectionAllocationFailures,
+        .{},
     );
 }
 

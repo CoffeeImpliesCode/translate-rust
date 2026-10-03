@@ -20,6 +20,18 @@ pub const ModuleKind = enum { root, @"inline", file, directory };
 /// the crate root is reachable from `Crate.root`. `items` is a flat list of
 /// child entity IDs (modules, structs, fns, uses, ...); `parent` is the
 /// inverse edge so `super::` paths can climb.
+///
+/// `items` and `parent` are two records of ONE fact, and `validateTopology`
+/// holds them to it in both directions: an entity whose `parent` is a module is
+/// in that module's `items`, and an entity in a module's `items` has that
+/// module as its `parent`. There is therefore no second way to be listed. A
+/// METHOD — the `fn_` of an `impl`, a trait, or an inherent block — belongs to
+/// that enclosing declaration and not to the module around it, so its parent
+/// names the impl or trait and no module's `items` mentions it: it is listed by
+/// the impl's own `assoc_items`, and a graph that also listed it under the
+/// module would give one declaration two parents, which the second direction
+/// refuses. A free function has no such owner and is a module item, so the
+/// parent it does have is the module that declares it.
 pub const Module = struct {
     id: spine.EntityId,
     kind: ModuleKind,
@@ -46,6 +58,19 @@ pub const CrateDep = struct {
     optional: bool = false,
     default_features: ?bool = null,
     features: []const []const u8 = &.{},
+    /// Whether this build's RESOLVED feature set for this dependency is
+    /// certainly empty.
+    ///
+    /// The declared `features` above are what the dependency table asked for,
+    /// and they say nothing about a forward edge in the consuming crate's own
+    /// feature table — `std = ["num-traits/std"]` switches a dependency
+    /// feature on without the dependency ever naming it. Only the frontend can
+    /// read that edge, so only the frontend may answer this. Default false
+    /// means UNKNOWN: every hand-built fixture and every existing constructor
+    /// reads unknown until the frontend opts in, and an answer of false must
+    /// never be read as "this package is in its default, featureless
+    /// configuration".
+    resolved_features_known_empty: bool = false,
 };
 
 /// A crate in the graph (a workspace / dependency set). v1 fills exactly one.
@@ -186,9 +211,15 @@ pub const CrateGraph = struct {
         }
         self.uses.deinit(a);
 
-        // Free per-entity strings, then the symbol table's backing array.
+        // Free per-entity strings, then the symbol table's backing array. An
+        // entity name is a slice the CALLER supplied, so ownership is recorded
+        // on the entity rather than assumed from the type: a site that passed a
+        // string literal or any slice it does not own sets `name_owned = false`
+        // and this must not free it. Freeing a literal is not a leak — Zig
+        // dedupes identical literals, so one such free corrupts the single byte
+        // sequence the whole test binary shares for that spelling.
         for (self.symbol_table.entities.items) |*e| {
-            a.free(e.name);
+            if (e.name_owned) a.free(e.name);
             if (e.renamed_to) |rn| a.free(rn);
             switch (e.visibility) {
                 .in_path => |p| a.free(p),
@@ -258,14 +289,25 @@ pub const CrateGraph = struct {
         return result;
     }
 
-    /// Look up a Module by its owning entity, or by a dense row id when the
-    /// symbol table is not populated (as in small graph-only fixtures).
+    /// Look up the Module a declaration owns.
+    ///
+    /// An EntityId names ONE declaration, so this answers about that
+    /// declaration and nothing else: when the symbol table holds the id, the id
+    /// has already named its row, and a row that is not a module has no module
+    /// row to answer with. Falling through to `moduleById` in that case would
+    /// let one id name two declarations — the entity it indexes AND whatever
+    /// module happens to sit at that dense row position — which is how a
+    /// function's id comes to resolve to a module and a receiver to be read off
+    /// the wrong declaration.
+    ///
+    /// The dense-row fallback is therefore only for an id the symbol table does
+    /// NOT hold, which is the small graph-only fixture that has module rows and
+    /// no entity table.
     pub fn module(self: *const CrateGraph, id: spine.EntityId) ?Module {
         if (self.symbol_table.get(id)) |entity| {
-            if (entity.kind == .module) {
-                const module_row = self.moduleForEntity(id) orelse return null;
-                return module_row.*;
-            }
+            if (entity.kind != .module) return null;
+            const module_row = self.moduleForEntity(id) orelse return null;
+            return module_row.*;
         }
         const module_row = self.moduleById(id) orelse return null;
         return module_row.*;
@@ -323,9 +365,41 @@ pub const CrateGraph = struct {
         for (self.symbol_table.entities.items, 0..) |entity, index| {
             if (@as(usize, entity.id) != index) return error.InvalidEntityId;
         }
+        // A module row's PARENT edge is checked before the row is resolved to an
+        // entity, because the row is identified by (parent, name): a parent that
+        // names no module makes the pair match nothing, and reporting that as a
+        // missing module entity would blame the row for a fault in its parent
+        // edge. `InvalidParent` names the edge that is actually malformed.
+        for (self.modules.items) |module_row| {
+            if (module_row.parent) |parent_id| {
+                if (@as(usize, parent_id) >= self.symbol_table.entities.items.len) {
+                    return error.InvalidParent;
+                }
+                if (self.symbol_table.entities.items[parent_id].kind != .module) {
+                    return error.InvalidParent;
+                }
+                if (self.moduleForEntity(parent_id) == null) return error.InvalidParent;
+            }
+        }
+
+        // Each module ROW must be the row of a DISTINCT module ENTITY. Two rows
+        // answering for one entity is the same identity fault as two entities
+        // answering for one row, in the other direction: `moduleEntityId` finds
+        // each row's entity by (parent, name), so two rows carrying the same
+        // pair both resolve to the same entity and every later read of "the
+        // module row for this module" has two candidates. Refusing here means
+        // the ambiguity is caught once, at the row that introduces it, instead
+        // of surfacing later as whichever row a linear scan happened to reach
+        // first.
         for (self.modules.items, 0..) |module_row, index| {
             if (@as(usize, module_row.id) != index) return error.InvalidModuleId;
-            if (self.moduleEntityId(&module_row) == null) return error.InvalidModuleEntity;
+            const entity_id = self.moduleEntityId(&module_row) orelse
+                return error.InvalidModuleEntity;
+            for (self.modules.items[0..index]) |prior| {
+                const prior_entity_id = self.moduleEntityId(&prior) orelse
+                    return error.InvalidModuleEntity;
+                if (prior_entity_id == entity_id) return error.InvalidModuleEntity;
+            }
         }
 
         for (self.crates.items, 0..) |crate, crate_index| {
@@ -357,17 +431,12 @@ pub const CrateGraph = struct {
         }
 
         for (self.modules.items) |module_row| {
+            // The parent edge was checked above; resolving the row's own entity
+            // is what remains, and the crate-root case needs that id to ask
+            // whether this row IS a crate's root.
             const module_entity_id = self.moduleEntityId(&module_row) orelse
                 return error.InvalidModuleEntity;
-            if (module_row.parent) |parent_id| {
-                if (@as(usize, parent_id) >= self.symbol_table.entities.items.len) {
-                    return error.InvalidParent;
-                }
-                if (self.symbol_table.entities.items[parent_id].kind != .module) {
-                    return error.InvalidParent;
-                }
-                if (self.moduleForEntity(parent_id) == null) return error.InvalidParent;
-            } else if (!module_row.is_extern) {
+            if (module_row.parent == null and !module_row.is_extern) {
                 var is_crate_root = false;
                 for (self.crates.items) |crate| {
                     if (crate.root == module_entity_id) {
@@ -507,6 +576,23 @@ pub const CrateGraph = struct {
             if (u.id == id) return u;
         }
         return null;
+    }
+
+    /// The declaration a `use` binds, or null when it binds none.
+    ///
+    /// `UseDecl.target` carries `0` for a glob and for an unresolved
+    /// `core`/`std` path, and `0` is also the crate-root module's EntityId. So
+    /// the raw field has one value standing for two facts, and a reader that
+    /// takes it as an id resolves a `use std::io::Read` to the crate root. This
+    /// reads the KIND first and answers null whenever no declaration is named,
+    /// so the one EntityId a use can carry is always a declaration's.
+    pub fn useTarget(self: *const CrateGraph, id: spine.EntityId) ?spine.EntityId {
+        const use_decl = self.useById(id) orelse return null;
+        return switch (use_decl.kind) {
+            .plain => |target| target,
+            .alias => |target| target,
+            .glob, .external => null,
+        };
     }
 
     /// Lazy query, not stored state (crate-graph.md §2.2): the set of item ids
@@ -713,4 +799,486 @@ test "exportedSurface rejects malformed item endpoints" {
         error.UnknownModuleItem,
         g.exportedSurface(allocator, root_id),
     );
+}
+
+test "deinit frees every owned entity name exactly once" {
+    const allocator = std.testing.allocator;
+    var g = CrateGraph.init(allocator);
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+
+    // Many distinct names rather than one, so a missed free or a double free
+    // is reported instead of hiding behind an allocation the graph reuses.
+    // `std.testing.allocator` fails the test on either.
+    var index: usize = 0;
+    while (index < 64) : (index += 1) {
+        _ = try g.symbol_table.add(.{
+            .id = 0,
+            .kind = .fn_,
+            .name = try std.fmt.allocPrint(allocator, "entity_{d}", .{index}),
+            .span = span,
+            .visibility = .public,
+            .parent = null,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
+    }
+    g.deinit();
+}
+
+test "deinit leaves an entity name the graph does not own alone" {
+    const allocator = std.testing.allocator;
+    // A string literal is what a fixture writes when it means to write a name,
+    // and this spelling is not private to this test: `cst.zig` compares entity
+    // names against it and the ts_ext receiver handling does too. Zig dedupes
+    // identical literals, so freeing this one name damages the single shared
+    // byte sequence for `self` across the whole test binary rather than a
+    // private copy.
+    const literal: []const u8 = "self";
+    var g = CrateGraph.init(allocator);
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    const id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = literal,
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+        .name_owned = false,
+    });
+    try std.testing.expectEqualStrings("self", g.symbol_table.get(id).?.name);
+
+    g.deinit();
+
+    // The point of the flag: `deinit` ran to completion over this graph and
+    // left the borrowed name alone. Before the flag existed this call freed the
+    // literal, which under `std.testing.allocator` is an invalid free and
+    // aborts — so this test is the one that fails when the ownership is not
+    // recorded.
+    try std.testing.expectEqualStrings("self", literal);
+}
+
+/// Build a well-formed single-crate graph and the ids a test needs to perturb.
+///
+/// The shape is the smallest one that exercises DECLARATION parenting: a crate
+/// root module, a struct declared in it, an `impl` block whose parent is that
+/// struct, and a method whose parent is the `impl` — plus a free function whose
+/// parent is the module. The method is the case this module exists to pin: it
+/// is NOT a module item, and a fixture that parents it on the module instead of
+/// on the impl is the bug that made receiver identity read off the wrong
+/// declaration.
+const IdentityFixture = struct {
+    graph: CrateGraph,
+    root_module: spine.EntityId,
+    free_fn: spine.EntityId,
+    point_struct: spine.EntityId,
+    impl_block: spine.EntityId,
+    method: spine.EntityId,
+};
+
+fn buildIdentityFixture(allocator: std.mem.Allocator) !IdentityFixture {
+    const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
+    var g = CrateGraph.init(allocator);
+    errdefer g.deinit();
+
+    const root_module = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const free_fn = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "free_fn"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_module,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const point_struct = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try allocator.dupe(u8, "Point"),
+        .span = span,
+        .visibility = .public,
+        .parent = root_module,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    // The impl block is parented on the TYPE it implements for, not on the
+    // module that declares it — `finalizePendingImpls` rewrites this edge once
+    // the target resolves.
+    const impl_block = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try allocator.dupe(u8, "Point"),
+        .span = span,
+        .visibility = .public,
+        .parent = point_struct,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    // The method's parent is the impl. This is the whole point.
+    const method = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try allocator.dupe(u8, "x"),
+        .span = span,
+        .visibility = .public,
+        .parent = impl_block,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    // The root module lists exactly what it DECLARES: the free function and
+    // the struct. The impl is reached through the struct and the method
+    // through the impl, so neither belongs here.
+    const root_items = try allocator.dupe(spine.EntityId, &.{ free_fn, point_struct });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = try allocator.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = root_items,
+        .attributes = &.{},
+    });
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "identity"),
+        .edition = 2021,
+        .kind = .lib,
+        .root = root_module,
+        .deps = &.{},
+        .is_translated = true,
+    });
+
+    return .{
+        .graph = g,
+        .root_module = root_module,
+        .free_fn = free_fn,
+        .point_struct = point_struct,
+        .impl_block = impl_block,
+        .method = method,
+    };
+}
+
+test "an EntityId names one declaration across every graph edge" {
+    const allocator = std.testing.allocator;
+    var f = try buildIdentityFixture(allocator);
+    defer f.graph.deinit();
+    const g = &f.graph;
+
+    // The graph as built is sound; the properties below are read off a graph
+    // that validates, so a failure means an identity fault and not a broken
+    // fixture.
+    try g.validateTopology();
+
+    // Every id reads back its OWN row. Each declaration here carries a distinct
+    // name or a distinct kind, so an id that resolved to a second declaration
+    // would answer one of these with the other's value.
+    try std.testing.expectEqual(@as(spine.EntityId, 0), f.root_module);
+    try std.testing.expectEqualStrings("", g.symbol_table.get(f.root_module).?.name);
+    try std.testing.expectEqualStrings("free_fn", g.symbol_table.get(f.free_fn).?.name);
+    try std.testing.expectEqualStrings("Point", g.symbol_table.get(f.point_struct).?.name);
+    try std.testing.expectEqualStrings("Point", g.symbol_table.get(f.impl_block).?.name);
+    try std.testing.expectEqualStrings("x", g.symbol_table.get(f.method).?.name);
+
+    // Two declarations share the spelling "Point" — the struct and the impl
+    // block — and their ids still tell them apart, which is the case a
+    // name-keyed table would get wrong.
+    try std.testing.expect(f.point_struct != f.impl_block);
+    try std.testing.expectEqual(
+        spine.EntityKind.struct_,
+        g.symbol_table.get(f.point_struct).?.kind,
+    );
+    try std.testing.expectEqual(
+        spine.EntityKind.impl_,
+        g.symbol_table.get(f.impl_block).?.kind,
+    );
+
+    // Each module row resolves to exactly one entity, and the two module edges
+    // — `parent` and `items` — agree about which declarations the module owns.
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, f.root_module),
+        g.moduleEntityId(&g.modules.items[0]),
+    );
+    try std.testing.expect(g.moduleForEntity(f.root_module) != null);
+    try std.testing.expect(g.moduleHasItem(f.root_module, f.free_fn));
+    try std.testing.expect(g.moduleHasItem(f.root_module, f.point_struct));
+
+    // `module` answers about a module id and only about a module id. A
+    // declaration that is not a module has no module row, and one EntityId must
+    // not name both the declaration and whatever module row shares its index.
+    try std.testing.expectEqual(ModuleKind.root, g.module(f.root_module).?.kind);
+    for ([_]spine.EntityId{ f.free_fn, f.point_struct, f.impl_block, f.method }) |non_module| {
+        try std.testing.expect(g.module(non_module) == null);
+        try std.testing.expect(g.moduleForEntity(non_module) == null);
+    }
+}
+
+/// Replace the root module's `items`, freeing the slice it replaced.
+///
+/// The graph owns its `items` slice and `deinit` frees whichever one is
+/// current, so a test that swaps it has to free the outgoing one itself. Both
+/// are heap slices here — never a literal — so the free is always of something
+/// this allocator handed out.
+fn setRootItems(g: *CrateGraph, items: []spine.EntityId) void {
+    const allocator = g.allocator;
+    allocator.free(g.modules.items[0].items);
+    g.modules.items[0].items = items;
+}
+
+test "a method's parent is its declaration and never a module" {
+    const allocator = std.testing.allocator;
+    var f = try buildIdentityFixture(allocator);
+    defer f.graph.deinit();
+    const g = &f.graph;
+
+    // As declared: the method hangs off the impl, and the impl hangs off the
+    // type it is for. `super::` and receiver resolution climb exactly that
+    // chain.
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, f.impl_block),
+        g.symbol_table.get(f.method).?.parent,
+    );
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, f.point_struct),
+        g.symbol_table.get(f.impl_block).?.parent,
+    );
+    try std.testing.expect(g.moduleHasItem(f.root_module, f.method) == false);
+    try g.validateTopology();
+
+    // The module's `items` must name the method's OWN parent or nothing. This
+    // is the first direction of the one-fact rule, and it is what catches the
+    // fixture bug: a method listed by the module while parented on the impl
+    // gives one declaration two parents, and the graph refuses rather than
+    // letting a later read pick one.
+    setRootItems(g, try allocator.dupe(spine.EntityId, &.{
+        f.free_fn,
+        f.point_struct,
+        f.method,
+    }));
+    try std.testing.expectError(error.InvalidModuleItemParent, g.validateTopology());
+
+    // The second direction: reparent the method onto the module and leave it out
+    // of `items`. Now the module does not list it, and the entity loop refuses
+    // that too — so there is no way to leave a method owned by a module that
+    // does not admit to it.
+    setRootItems(g, try allocator.dupe(spine.EntityId, &.{ f.free_fn, f.point_struct }));
+    g.symbol_table.entities.items[f.method].parent = f.root_module;
+    try std.testing.expectError(error.MissingModuleItem, g.validateTopology());
+
+    // And the pair that IS legal: the module lists it AND the method's parent
+    // is the module. That is not a method at all — it is a free function, and
+    // the graph accepts it as one. The distinction is WHICH parent is named, so
+    // a method mis-parented onto the module is indistinguishable from a free
+    // function unless the impl also lists it; `assoc_items` is what says so.
+    // Pinning the legal case is what keeps this from reading as "the validator
+    // refuses every method-ish parent", which would be wrong.
+    setRootItems(g, try allocator.dupe(spine.EntityId, &.{
+        f.free_fn,
+        f.point_struct,
+        f.method,
+    }));
+    try g.validateTopology();
+}
+
+test "an impl block is parented on the type it implements for" {
+    const allocator = std.testing.allocator;
+    var f = try buildIdentityFixture(allocator);
+    defer f.graph.deinit();
+    const g = &f.graph;
+
+    // `impl Point { .. }` sits inside the struct `Point`, not beside it. That
+    // is the edge receiver resolution walks to answer "what type is this
+    // method for", so an impl parented on the MODULE — which is also a live id
+    // and also passes a naive containment check — would silently change the
+    // answer while leaving the graph well-formed.
+    const impl_entity = g.symbol_table.get(f.impl_block).?;
+    try std.testing.expectEqual(spine.EntityKind.impl_, impl_entity.kind);
+    try std.testing.expectEqual(@as(?spine.EntityId, f.point_struct), impl_entity.parent);
+    try std.testing.expect(impl_entity.parent != f.root_module);
+    const impl_target = g.symbol_table.get(impl_entity.parent.?) orelse unreachable;
+    try std.testing.expectEqual(spine.EntityKind.struct_, impl_target.kind);
+    try std.testing.expectEqual(f.point_struct, impl_target.id);
+
+    // Both declarations are still reachable from the crate root through the
+    // chain, so the stricter parenting costs nothing.
+    try std.testing.expect(g.entityBelongsToRoot(f.impl_block, f.root_module));
+    try std.testing.expect(g.entityBelongsToRoot(f.method, f.root_module));
+    try g.validateTopology();
+}
+
+test "moduleEntityId rejects two modules sharing a parent and a name" {
+    const allocator = std.testing.allocator;
+    var f = try buildIdentityFixture(allocator);
+    defer f.graph.deinit();
+    const g = &f.graph;
+
+    // A second module ENTITY with the same (parent, name) as the root: both are
+    // kind `.module`, both hang off nothing, both are spelled "". There is no
+    // field left to tell them apart, so `moduleEntityId` must answer null rather
+    // than hand back the first — a caller reading the first would resolve every
+    // `super::` edge in the crate through whichever entity the scan reached
+    // first, which for a duplicate is arbitrary.
+    const shadow = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try allocator.dupe(u8, ""),
+        .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expect(shadow != f.root_module);
+    try std.testing.expect(g.moduleEntityId(&g.modules.items[0]) == null);
+
+    // The two lookups detect the ambiguity on different sides, and both are
+    // right: `moduleEntityId` asks "which ENTITY owns this row" and finds two
+    // candidates, so it refuses. `moduleForEntity` asks the reverse question —
+    // "which ROW does this entity's (parent, name) name" — and there is still
+    // exactly one such row, so it answers. A reader that wants to be sure the
+    // pair identifies a module must go through `moduleEntityId`, which is what
+    // `validateTopology` does for every row; this asserts the division so the
+    // asymmetry reads as design rather than as a hole.
+    // Both entities resolve to the SAME row — that is the whole fault. The row
+    // side is unambiguous while the entity side is not, so nothing that only
+    // walks parent edges can tell the two declarations apart.
+    const root_row = g.moduleForEntity(f.root_module).?;
+    const shadow_row = g.moduleForEntity(shadow).?;
+    try std.testing.expectEqual(@as(usize, 0), root_row.id);
+    try std.testing.expectEqual(@as(usize, 0), shadow_row.id);
+    try std.testing.expectEqual(root_row.id, shadow_row.id);
+    // The shadow has no module row of its own, so the graph is refused rather
+    // than quietly using the root's row for a second declaration.
+    try std.testing.expectError(error.InvalidModuleEntity, g.validateTopology());
+
+    // Give the shadow a row that duplicates the root's (parent, name) and the
+    // ambiguity is now two-sided: two entities for one row. Still refused, and
+    // for the same reason — the pair no longer identifies a module.
+    const shadow_items = try allocator.dupe(spine.EntityId, &.{});
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = try allocator.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = false,
+        .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+        .items = shadow_items,
+        .attributes = &.{},
+    });
+    try std.testing.expect(g.moduleEntityId(&g.modules.items[0]) == null);
+    try std.testing.expect(g.moduleEntityId(&g.modules.items[1]) == null);
+    try std.testing.expectError(error.InvalidModuleEntity, g.validateTopology());
+}
+
+test "two module rows may not answer for one module entity" {
+    const allocator = std.testing.allocator;
+    var f = try buildIdentityFixture(allocator);
+    defer f.graph.deinit();
+    const g = &f.graph;
+
+    // One module entity, two rows naming it. `moduleEntityId` finds a single
+    // entity for each row, so nothing about the PAIR is ambiguous — which is
+    // exactly why this has to be refused explicitly: every later read of "the
+    // module row for the root" has two candidates, and a linear scan resolves
+    // that by row order, so `module(root)` would answer with whichever row
+    // happens to sit first and `moduleHasItem` would consult the other's items.
+    const duplicate_items = try allocator.dupe(spine.EntityId, &.{});
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = try allocator.dupe(u8, ""),
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+        .items = duplicate_items,
+        .attributes = &.{},
+    });
+
+    // Both rows name the root entity, and `moduleEntityId` reports that for
+    // each — so the refusal cannot come from an ambiguous name match.
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, f.root_module),
+        g.moduleEntityId(&g.modules.items[0]),
+    );
+    try std.testing.expectEqual(
+        @as(?spine.EntityId, f.root_module),
+        g.moduleEntityId(&g.modules.items[1]),
+    );
+    try std.testing.expectError(error.InvalidModuleEntity, g.validateTopology());
+}
+
+test "validateTopology refuses a graph whose entity ids were reused" {
+    const allocator = std.testing.allocator;
+    var f = try buildIdentityFixture(allocator);
+    defer f.graph.deinit();
+    const g = &f.graph;
+    try g.validateTopology();
+
+    // Point a row's stored id at another row's index. `SymbolTable.add` cannot
+    // produce this — it overwrites `.id` with the row's own index — but the
+    // field is public and a deserializer or a fixture can, so the topology
+    // check is the backstop that keeps one id from naming two rows.
+    g.symbol_table.entities.items[f.method].id = f.free_fn;
+    try std.testing.expectError(error.InvalidEntityId, g.validateTopology());
+
+    // Restored, the same graph validates again: the refusal is about the
+    // reused id, not about the graph's shape.
+    g.symbol_table.entities.items[f.method].id = f.method;
+    try g.validateTopology();
+}
+
+test "a deferred binder placeholder is not a graph declaration" {
+    const allocator = std.testing.allocator;
+    var f = try buildIdentityFixture(allocator);
+    defer f.graph.deinit();
+    const g = &f.graph;
+
+    const placeholder = spine.deferredPlaceholder(0).?;
+    // No row answers for it, in either id space.
+    try std.testing.expect(g.symbol_table.get(placeholder) == null);
+    try std.testing.expect(g.moduleById(placeholder) == null);
+    try std.testing.expect(g.module(placeholder) == null);
+    try std.testing.expect(g.moduleForEntity(placeholder) == null);
+    try std.testing.expect(g.entityBelongsToRoot(placeholder, f.root_module) == false);
+
+    // A placeholder used as a `parent` names no declaration, so the graph is
+    // refused instead of the edge being read as the last entity or as no edge
+    // at all. Both of those would let a method resolve to a receiver its owner
+    // never had.
+    g.symbol_table.entities.items[f.method].parent = placeholder;
+    try std.testing.expectError(error.InvalidParent, g.validateTopology());
+
+    // Same for a module row's parent edge, and for a `resolved` edge: a
+    // placeholder is never the answer to "which declaration".
+    g.symbol_table.entities.items[f.method].parent = f.impl_block;
+    g.modules.items[0].parent = placeholder;
+    try std.testing.expectError(error.InvalidParent, g.validateTopology());
+    g.modules.items[0].parent = null;
+    g.symbol_table.entities.items[f.free_fn].resolved = placeholder;
+    try std.testing.expectError(error.InvalidResolvedEntity, g.validateTopology());
 }

@@ -8,10 +8,12 @@ const translate_rust = @import("translate_rust");
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| {
         std.log.err("translate-rust failed: {s}", .{@errorName(err)});
-        if (err == error.UnsupportedExpression) {
-            if (translate_rust.ir.validation.takeUnsupportedReason()) |reason| {
-                std.log.err("unsupported construct: {s}", .{reason});
-            }
+        // Every refusal the validator raises records why, at all three levels
+        // (expression, pattern, type), so the reason is asked for
+        // unconditionally: gating the read on one error NAME left the other two
+        // printing a bare error and nothing an operator could act on.
+        if (translate_rust.ir.validation.takeUnsupportedReason()) |reason| {
+            std.log.err("unsupported construct: {s}", .{reason});
         }
         return err;
     };

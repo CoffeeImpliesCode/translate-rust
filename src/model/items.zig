@@ -42,7 +42,7 @@ pub const ItemKind = union(enum) {
 pub const Struct = struct {
     name: []const u8,
     generics: ?types.Generics,
-    layout: struct_kind,
+    layout: StructKind,
     fields: []const Field,
 };
 
@@ -53,16 +53,16 @@ pub const Field = struct {
     span: spine.Span,
 };
 
-pub const struct_kind = enum { named, tuple, unit };
+pub const StructKind = enum { named, tuple, unit };
 
 // §1.2 — Enum ---------------------------------------------------------------
 
 pub const Enum = struct {
     name: []const u8,
     generics: ?types.Generics,
-    kind: enum_kind,
+    kind: EnumKind,
     variants: []const Variant,
-    repr_int: ?int_repr,
+    repr_int: ?IntRepr,
     non_exhaustive: bool,
 };
 
@@ -78,20 +78,20 @@ pub const VariantFields = union(enum) {
     named: []const Field,
 };
 
-pub const enum_kind = enum { c_like, data, mixed };
+pub const EnumKind = enum { c_like, data, mixed };
 
-pub const int_repr = enum { i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, isize, usize };
+pub const IntRepr = enum { i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, isize, usize };
 
 // §1.3 — Union --------------------------------------------------------------
 
 pub const Union = struct {
     name: []const u8,
     generics: ?types.Generics,
-    repr: union_repr,
+    repr: UnionRepr,
     fields: []const Field,
 };
 
-pub const union_repr = enum { extern_, @"packed", untagged };
+pub const UnionRepr = enum { extern_, @"packed", untagged };
 
 // §1.4 — Function -----------------------------------------------------------
 

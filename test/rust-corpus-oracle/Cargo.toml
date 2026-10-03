@@ -1,0 +1,31 @@
+[package]
+name = "rust-corpus-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Native Rust oracle over the seven promoted corpus crates; asserts upstream-published values and emits a deterministic JSON receipt."
+
+# Path dependencies on the pristine fixture roots. The relative layout mirrors
+# `test/` (crates next to this crate), so the manifest works unchanged from the
+# repository and from a staged copy on local scratch.
+[dependencies]
+adler = { path = "../crates/adler" }
+atoi = { path = "../crates/atoi" }
+itoa = { path = "../crates/itoa" }
+seahash = { path = "../crates/seahash" }
+siphasher = { path = "../crates/siphasher" }
+wyhash = { path = "../crates/wyhash" }
+# `WyRng` implements `rand_core::{RngCore, SeedableRng}`; naming those methods
+# needs the trait itself in scope, and wyhash 0.4.0 depends on rand_core 0.5.
+rand_core = "0.5"
+
+# Upstream xxhash-rust 0.8.15 declares no `default` feature, so the empty
+# default configuration is the valid one: cfg evaluation drops every module and
+# the crate reduces to an empty root. The 32-bit algorithm lives behind the
+# explicit `xxh32` feature, which this oracle turns on in a second run.
+xxhash-rust = { path = "../crates/xxhash-rust", default-features = false }
+
+[features]
+# Empty by design: the default configuration is asserted as its own case set.
+default = []
+xxh32 = ["xxhash-rust/xxh32"]

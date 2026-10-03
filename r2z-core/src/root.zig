@@ -28,6 +28,7 @@ pub const convert = @import("convert.zig");
 pub const option = @import("option.zig");
 pub const ops = @import("ops.zig");
 pub const collections = @import("collections.zig");
+pub const random = @import("random.zig");
 
 test {
     _ = @import("collections.zig");
@@ -40,6 +41,7 @@ test {
     _ = @import("convert.zig");
     _ = @import("option.zig");
     _ = @import("ops.zig");
+    _ = @import("random.zig");
 }
 
 // ── Rust `core::hash` → Zig `std.hash` (generic, no single-algorithm alias) ─
@@ -50,6 +52,98 @@ test {
 // algorithm (e.g. `Fnv1a_64` for the fnv crate) into r2z-core.
 pub const hash = std.hash;
 
+/// Rust `Hash` source shape for a compile-time type descriptor.
+/// The shape preserves distinctions that a Zig runtime type can erase, such as `str` versus `[u8]`
+/// and `usize` versus `u64`.
+/// All child types and tuple fields are descriptors with `Type` and `Layout`, not runtime types.
+/// This metadata has no runtime storage, allocator, or release operation.
+pub const RustHashLayout = union(enum) {
+    /// The exact Rust source primitive this scalar is written as.
+    ///
+    /// The tag is required because the runtime type erases it. `usize` and
+    /// `u64` are the same Zig type `u64` on a 64-bit target, yet Rust reaches
+    /// `Hasher::write_usize` and `Hasher::write_u64` through different `Hash`
+    /// implementations, so two descriptors whose `Type` is identical and whose
+    /// `Layout` differs are two different hash inputs and NOT a mistake.
+    /// `isize` and `i64` erase the same way on a 64-bit target.
+    /// Read this off the Rust SOURCE type; never infer it from `Type` or from
+    /// runtime reflection of it, because that loses exactly the distinction
+    /// this tag exists to keep. `char` is the `u32` Rust spells as `char` and
+    /// hashes through `write_u32`; `unit` is `()`. It names no Rust alias
+    /// that does not exist and adds no export: the members are reachable
+    /// through this field, e.g.
+    /// `@FieldType(RustHashLayout, "scalar").usize`.
+    scalar: enum {
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        usize,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        isize,
+        bool,
+        char,
+        unit,
+    },
+    str: void,
+    /// The slice element descriptor.
+    slice: type,
+    /// The array element descriptor. The runtime type supplies the array length.
+    array: type,
+    /// The field descriptors in Rust tuple order.
+    tuple: []const type,
+    /// The referenced type descriptor.
+    reference: type,
+    /// The pointed-to type descriptor. Hash uses the pointer, not the pointed-to value.
+    raw_pointer: type,
+    /// A named Rust type whose source `Hash` implementation supplies its behavior.
+    nominal: void,
+};
+
+/// Pair a Zig runtime type with its Rust `Hash` source shape.
+/// Use this descriptor as the type argument of a translated `T: Hash` function.
+/// Supply descriptors for all child types in `layout`. This function does not infer or traverse them.
+/// The result holds only compile-time metadata and owns no runtime value or borrowed storage.
+pub fn RustHashType(comptime RuntimeType: type, comptime layout: RustHashLayout) type {
+    return struct {
+        /// The Zig type used for runtime values.
+        pub const Type = RuntimeType;
+        /// The Rust source shape used to select `Hash` behavior.
+        pub const Layout = layout;
+    };
+}
+
+/// Return whether a Rust `Hash` borrow uses a slice view instead of a single-item pointer.
+/// Only a root `str` or `slice` is unsized. Use this result to select a compile-time borrow branch.
+pub inline fn rustHashRefIsFat(comptime Descriptor: type) bool {
+    return switch (Descriptor.Layout) {
+        .str, .slice => true,
+        else => false,
+    };
+}
+
+/// Return the Zig borrow type for a Rust `Hash` descriptor.
+/// Only a root `str` or `slice` is unsized and uses a slice view.
+/// All other roots use a single-item pointer, including a reference to `str` or a slice.
+/// `mutable` controls access to the borrowed value. The caller must keep that value alive.
+/// This function creates no borrow, copies no value, and checks no lifetime or alias rule.
+pub fn RustHashRef(comptime Descriptor: type, comptime mutable: bool) type {
+    if (@TypeOf(Descriptor.Type) != type)
+        @compileError("RustHashRef requires Descriptor.Type: type");
+    if (@TypeOf(Descriptor.Layout) != RustHashLayout)
+        @compileError("RustHashRef requires Descriptor.Layout: RustHashLayout");
+    return switch (Descriptor.Layout) {
+        .str => if (mutable) []u8 else []const u8,
+        .slice => |Element| if (mutable) []Element.Type else []const Element.Type,
+        .scalar, .array, .tuple, .reference, .raw_pointer, .nominal => if (mutable) *Descriptor.Type else *const Descriptor.Type,
+    };
+}
+
 // ── Rust `core::hash::Hasher` trait → Zig interface + FNV-1a runtime ─────
 //
 // Rust's `core::hash` exposes a `Hasher` trait. r2z-core provides a small,
@@ -57,40 +151,80 @@ pub const hash = std.hash;
 // runtime (`FnvHasher`) that translated hashing code can call directly when
 // the original Rust crate relied on a fixed algorithm. This pair is part of
 // the r2z-core contract: a `Hasher` that can `write` bytes and `finish` u64.
+// Both are stateful: a digest is the accumulated state of every `write`, and
+// `finish` reports it without resetting.
 
-/// Generic Hasher trait-interface wrapper (type-erased, allocation-free).
+/// Type-erased handle to a concrete hasher, the fat pointer Rust's
+/// `&mut dyn Hasher` lowers to. It allocates nothing and holds no state of its
+/// own; the running digest lives in the concrete hasher behind `ptr`.
+///
+/// The concrete hasher must stay alive and reachable for as long as a handle
+/// names it, and nothing checks that. Copying a handle copies the pointer, so
+/// a copy is a second alias of one hasher and not a second owner: `write`
+/// through either copy advances the same running digest. Each dispatch runs on
+/// the calling thread, synchronously, inside the call that reached it, and the
+/// concrete hasher may reenter the handle that called it.
 pub const Hasher = struct {
+    /// Erased pointer to the concrete hasher, cast back with its concrete type
+    /// on every call.
     ptr: *anyopaque,
+    /// The dispatch table adapting that concrete type.
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Feeds `bytes` into the concrete hasher's running state. It must
+        /// consume the slice before returning and retain nothing.
         write: *const fn (ctx: *anyopaque, bytes: []const u8) void,
+        /// Reports the running digest. It must not reset or otherwise change
+        /// the concrete hasher, so `finish` is repeatable and writing may
+        /// continue afterwards.
         finish: *const fn (ctx: *const anyopaque) u64,
     };
 
+    /// Feed `bytes` into the concrete hasher's running digest. `bytes` is
+    /// borrowed for the call and is not retained.
     pub inline fn write(self: Hasher, bytes: []const u8) void {
         self.vtable.write(self.ptr, bytes);
     }
 
+    /// Report the running digest. This changes nothing and may be called any
+    /// number of times; the digest continues from where the last `write` left
+    /// it.
     pub inline fn finish(self: Hasher) u64 {
         return self.vtable.finish(self.ptr);
     }
 };
 
 /// 64-bit FNV-1a hasher: `write([]const u8)` feeds bytes, `finish() u64`
-/// returns the digest. Zero-allocation, stateless.
+/// returns the digest.
+///
+/// The value is stateful, not a digest itself: `state` accumulates every byte
+/// `write` has seen, `finish` reports that state and does not reset it, and a
+/// fresh `init` is the only way back to the offset basis. Two hashers fed the
+/// same bytes therefore agree, and one hasher fed a prefix and then the rest
+/// agrees with one fed the whole run at once. Nothing here allocates, and no
+/// allocator is stored or needed.
 pub const FnvHasher = struct {
+    /// The running digest, seeded at `FNV_OFFSET_BASIS` by `init` and by the
+    /// zero value. A hasher that has consumed nothing reports this.
     state: u64 = FNV_OFFSET_BASIS,
 
+    /// The FNV-1a 64-bit prime each byte is folded in with.
     pub const FNV_PRIME: u64 = 0x100000001b3;
+    /// The digest a hasher reports before any byte is written.
     pub const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 
+    /// A hasher at the offset basis, with nothing written yet.
     pub fn init() FnvHasher {
         return .{ .state = FNV_OFFSET_BASIS };
     }
 
+    /// Rust's `Hasher::default`, spelled as the fresh-constructor alias
+    /// `BuildHasherDefault.build_hasher` calls.
     pub const default = init;
 
+    /// Fold `bytes` into the running digest. An empty slice leaves it
+    /// unchanged. The bytes are borrowed for the call and never retained.
     pub fn write(self: *FnvHasher, bytes: []const u8) void {
         for (bytes) |byte| {
             self.state ^= byte;
@@ -98,11 +232,17 @@ pub const FnvHasher = struct {
         }
     }
 
+    /// Report the running digest. This changes nothing, so it is repeatable and
+    /// writing may continue afterwards.
     pub fn finish(self: *const FnvHasher) u64 {
         return self.state;
     }
 
     /// Adapt this concrete hasher to the erased `Hasher` interface.
+    ///
+    /// The handle borrows `self`: the digest keeps advancing in this value, a
+    /// handle to a hasher that has gone out of scope still dispatches, and the
+    /// handle itself needs no release.
     pub fn hasher(self: *FnvHasher) Hasher {
         return .{
             .ptr = self,
@@ -126,18 +266,27 @@ pub const FnvHasher = struct {
 
 /// Rust `BuildHasherDefault<H>`: a zero-sized builder that constructs a
 /// fresh `H` through its default constructor for every request.
+///
+/// The builder holds nothing and allocates nothing; every `build_hasher`
+/// returns an independent hasher, so two calls never share a digest.
 pub fn BuildHasherDefault(comptime H: type) type {
     return struct {
         const Self = @This();
 
+        /// A builder with no state. Every value is interchangeable.
         pub fn new() Self {
             return .{};
         }
 
+        /// Rust's `BuildHasher::default`, spelled as the alias this builder is
+        /// constructed through. Every value is interchangeable.
         pub fn default() Self {
             return .{};
         }
 
+        /// A fresh `H` at its own default state, which is what Rust's per-lookup
+        /// construction produces. Runs on the calling thread and returns an
+        /// independent value the caller owns.
         pub fn build_hasher(self: Self) H {
             _ = self;
             return H.default();
@@ -236,14 +385,26 @@ pub inline fn pow(comptime T: type, base: T, exponent: u32) T {
 // ── Rust `core::slice` → Zig slice primitives ────────────────────────────
 
 /// Iterator yielding non-overlapping chunks of a slice (Rust `chunks(n)`).
+///
+/// The iterator borrows `slice` and owns only its position, so a chunk it
+/// yields aliases that slice and is invalidated when the caller writes the
+/// slice. `size` must be nonzero; a zero size traps rather than iterating
+/// forever.
 pub fn Chunks(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The borrowed source. Every chunk yielded aliases it.
         slice: []const T,
+        /// Chunk length. Never zero for an iterator `chunks` built.
         size: usize,
+        /// Elements already yielded.
         index: usize = 0,
 
+        /// The next chunk, or `null` once the source is exhausted.
+        ///
+        /// The final chunk is short when the source does not divide evenly. The
+        /// returned slice aliases `slice` and is invalidated by a write to it.
         pub fn next(self: *Self) ?[]const T {
             if (self.index >= self.slice.len) return null;
             const chunk_len = @min(self.slice.len - self.index, self.size);
@@ -255,6 +416,10 @@ pub fn Chunks(comptime T: type) type {
 }
 
 /// Create a non-overlapping chunk iterator over `slice`.
+///
+/// `slice` is borrowed and must stay alive and unmodified for as long as the
+/// iterator is used; every chunk the iterator yields aliases it. `size` must be
+/// nonzero, which this asserts in every optimize mode.
 pub fn chunks(comptime T: type, slice: []const T, size: usize) Chunks(T) {
     std.debug.assert(size > 0);
     return .{ .slice = slice, .size = size };
@@ -263,15 +428,28 @@ pub fn chunks(comptime T: type, slice: []const T, size: usize) Chunks(T) {
 /// Iterator yielding only complete, non-overlapping chunks of a slice
 /// (Rust `chunks_exact(n)`). The final partial chunk is retained separately
 /// and remains available through `remainder()` regardless of iterator progress.
+///
+/// The iterator borrows `slice` and owns only its position, so every chunk it
+/// yields aliases that slice. `size` must be nonzero, which `chunksExact`
+/// asserts.
 pub fn ChunksExact(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The borrowed source, trimmed to whole chunks. Every chunk yielded
+        /// aliases it.
         slice: []const T,
+        /// Chunk length. Never zero for an iterator `chunksExact` built.
         size: usize,
+        /// The borrowed partial tail, held from construction.
         remainder_slice: []const T,
+        /// Elements already yielded.
         index: usize = 0,
 
+        /// The next whole chunk, or `null` once only the partial tail is left.
+        ///
+        /// The returned slice aliases `slice` and is invalidated by a write to
+        /// it. The tail is never yielded here; read it with `remainder`.
         pub fn next(self: *Self) ?[]const T {
             if (self.slice.len - self.index < self.size) return null;
             const result = self.slice[self.index .. self.index + self.size];
@@ -280,6 +458,10 @@ pub fn ChunksExact(comptime T: type) type {
         }
 
         /// Return the unconsumed partial tail from iterator creation.
+        ///
+        /// This is the same slice on every call and the same length
+        /// throughout, whether or not the iterator has advanced. It aliases
+        /// `slice` and is invalidated by a write to it.
         pub fn remainder(self: *const Self) []const T {
             return self.remainder_slice;
         }
@@ -287,6 +469,10 @@ pub fn ChunksExact(comptime T: type) type {
 }
 
 /// Create an exact-size chunk iterator over `slice`.
+///
+/// `slice` is borrowed and must stay alive and unmodified for as long as the
+/// iterator or its `remainder` is used. `size` must be nonzero, which this
+/// asserts in every optimize mode.
 pub fn chunksExact(slice: anytype, size: usize) ChunksExact(std.meta.Elem(@TypeOf(slice))) {
     std.debug.assert(size > 0);
     const full_len = slice.len - slice.len % size;
@@ -300,6 +486,9 @@ pub fn chunksExact(slice: anytype, size: usize) ChunksExact(std.meta.Elem(@TypeO
 /// Split `slice` at `mid` (Rust `slice.split_at(mid)`).
 /// Zig's bounds-checked slicing preserves Rust's panic-on-invalid-index
 /// contract when `mid > slice.len`.
+///
+/// Both results alias `slice`, so the two halves are never independent
+/// storage and a write through either is visible through the other.
 pub fn splitAt(slice: anytype, mid: usize) struct {
     []const std.meta.Elem(@TypeOf(slice)),
     []const std.meta.Elem(@TypeOf(slice)),
@@ -307,6 +496,12 @@ pub fn splitAt(slice: anytype, mid: usize) struct {
     return .{ slice[0..mid], slice[mid..] };
 }
 
+/// Rust `slice.split_first()`: the first element and the rest.
+///
+/// `null` for an empty slice, which is the only way a caller learns the slice
+/// had no first element. The pointer and the rest alias `slice`, so a write
+/// through the pointer is visible through the rest and both are invalidated by
+/// a write to `slice` itself.
 pub fn splitFirst(slice: anytype) ?struct {
     *const std.meta.Elem(@TypeOf(slice)),
     []const std.meta.Elem(@TypeOf(slice)),
@@ -315,6 +510,13 @@ pub fn splitFirst(slice: anytype) ?struct {
     return .{ &slice[0], slice[1..] };
 }
 
+/// Whether `value` lies between `start` and `end`, which is Rust's
+/// `Range::contains` with the bound chosen at compile time.
+///
+/// `inclusive` is `true` for `..=end` and `false` for `..end`; the `start`
+/// bound is always included. An inverted range — `start > end` — contains
+/// nothing, because no value satisfies both bounds. Compares without
+/// allocating and borrows nothing.
 pub fn rangeContains(start: anytype, end: @TypeOf(start), value: anytype, comptime inclusive: bool) bool {
     return start <= value and if (inclusive) value <= end else value < end;
 }
@@ -325,14 +527,24 @@ pub inline fn chunksExactRemainder(iterator: anytype) @TypeOf(iterator.remainder
 }
 
 /// Iterator yielding overlapping sliding windows of a slice (Rust `windows(n)`).
+///
+/// The iterator borrows `slice` and owns only its position, so a window it
+/// yields aliases that slice. `size` must be nonzero; a zero size traps.
 pub fn Windows(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The borrowed source. Every window yielded aliases it.
         slice: []const T,
+        /// Window length. Never zero for an iterator `windows` built.
         size: usize,
+        /// Elements already yielded.
         index: usize = 0,
 
+        /// The next window, or `null` once no full window is left.
+        ///
+        /// A source shorter than `size` yields nothing at all. The returned
+        /// slice aliases `slice` and is invalidated by a write to it.
         pub fn next(self: *Self) ?[]const T {
             if (self.size > self.slice.len or self.index > self.slice.len - self.size) {
                 return null;
@@ -345,6 +557,10 @@ pub fn Windows(comptime T: type) type {
 }
 
 /// Create an overlapping sliding window iterator over `slice`.
+///
+/// `slice` is borrowed and must stay alive and unmodified for as long as the
+/// iterator is used. `size` must be nonzero, which this asserts in every
+/// optimize mode.
 pub fn windows(comptime T: type, slice: []const T, size: usize) Windows(T) {
     std.debug.assert(size > 0);
     return .{ .slice = slice, .size = size };
@@ -382,14 +598,29 @@ fn Elem(comptime Base: type) type {
 }
 
 /// Iterator yielding borrowed elements of a slice (Rust `slice.iter()`).
+///
+/// The iterator borrows `slice` and owns only its two cursors, so every
+/// element it yields is a pointer into that slice: it is invalidated when the
+/// caller writes the slice and outlives neither. `clone` copies the cursors,
+/// which gives an independent position over the same storage, not independent
+/// storage; elements already yielded by one cursor are still reachable through
+/// the other.
 pub fn SliceIter(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The borrowed source. Every element yielded aliases it.
         slice: []const T,
+        /// Elements already taken from the front.
         front_index: usize = 0,
+        /// One past the last element still reachable, from the back.
         back_index: usize,
 
+        /// The next element from the front, or `null` once the two cursors
+        /// meet.
+        ///
+        /// The pointer aliases `slice`; the caller may read it for as long as
+        /// the slice is unmodified.
         pub fn next(self: *Self) ?*const T {
             if (self.front_index >= self.back_index) return null;
             const result = &self.slice[self.front_index];
@@ -397,29 +628,48 @@ pub fn SliceIter(comptime T: type) type {
             return result;
         }
 
+        /// The next element from the back, or `null` once the two cursors meet.
+        ///
+        /// The pointer aliases `slice`, as `next` does.
         pub fn next_back(self: *Self) ?*const T {
             if (self.front_index >= self.back_index) return null;
             self.back_index -= 1;
             return &self.slice[self.back_index];
         }
 
+        /// An independent cursor at the same position, over the same storage.
+        ///
+        /// Copying is safe because nothing is owned: advancing either copy
+        /// leaves the other where it was, and both yield pointers into the
+        /// same `slice`.
         pub fn clone(self: *const Self) Self {
             return self.*;
         }
 
+        /// The elements still reachable, from `front_index` to `back_index`.
+        ///
+        /// The slice aliases `slice` and shrinks as the iterator advances, so
+        /// the same value is not a fixed view.
         pub fn as_slice(self: *const Self) []const T {
             return self.slice[self.front_index..self.back_index];
         }
 
+        /// How many elements are still reachable.
         pub fn len(self: *const Self) usize {
             return self.back_index - self.front_index;
         }
 
+        /// `(len, len)`: a slice iterator knows its exact remaining count.
         pub fn size_hint(self: *const Self) SizeHint {
             const count = self.len();
             return .{ count, count };
         }
 
+        /// The `index`-th element from the front, or `null` when fewer are
+        /// left.
+        ///
+        /// Elements before it are consumed, so an out-of-range `index`
+        /// exhausts the iterator rather than leaving it where it was.
         pub fn nth(self: *Self, index: usize) ?*const T {
             if (index >= self.len()) {
                 self.front_index = self.back_index;
@@ -432,19 +682,36 @@ pub fn SliceIter(comptime T: type) type {
 }
 
 /// Create a borrowed slice iterator (mutable `[]T` coerces implicitly).
+///
+/// `slice` is borrowed and must stay alive and unmodified for as long as the
+/// iterator is used; every element the iterator yields is a pointer into it.
 pub fn sliceIter(comptime T: type, slice: []const T) SliceIter(T) {
     return .{ .slice = slice, .back_index = slice.len };
 }
 
 /// Iterator yielding disjoint mutable pointers into a caller-owned slice.
+///
+/// The iterator borrows `slice` and owns only its two cursors. Every element it
+/// yields is a `*T` into that slice, so two live pointers are always disjoint
+/// and both are invalidated by a write that moves the slice's storage. Holding
+/// a pointer past the last call that produced it is the caller's own
+/// obligation; nothing here checks it.
 pub fn SliceIterMut(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The borrowed source. Every element yielded points into it.
         slice: []T,
+        /// Elements already taken from the front.
         front_index: usize = 0,
+        /// One past the last element still reachable, from the back.
         back_index: usize,
 
+        /// The next element from the front, or `null` once the two cursors
+        /// meet.
+        ///
+        /// The pointer aliases `slice` and is disjoint from every other pointer
+        /// this iterator has produced and not yet yielded again.
         pub fn next(self: *Self) ?*T {
             if (self.front_index >= self.back_index) return null;
             const result = &self.slice[self.front_index];
@@ -452,25 +719,39 @@ pub fn SliceIterMut(comptime T: type) type {
             return result;
         }
 
+        /// The next element from the back, or `null` once the two cursors meet.
+        ///
+        /// The pointer aliases `slice`, on the same terms as `next`.
         pub fn next_back(self: *Self) ?*T {
             if (self.front_index >= self.back_index) return null;
             self.back_index -= 1;
             return &self.slice[self.back_index];
         }
 
+        /// The elements still reachable, from `front_index` to `back_index`.
+        ///
+        /// The slice aliases `slice` and shrinks as the iterator advances. A
+        /// write through a pointer this iterator produced is visible here.
         pub fn as_slice(self: *const Self) []const T {
             return self.slice[self.front_index..self.back_index];
         }
 
+        /// How many elements are still reachable.
         pub fn len(self: *const Self) usize {
             return self.back_index - self.front_index;
         }
 
+        /// `(len, len)`: a slice iterator knows its exact remaining count.
         pub fn size_hint(self: *const Self) SizeHint {
             const count = self.len();
             return .{ count, count };
         }
 
+        /// The `index`-th element from the front, or `null` when fewer are
+        /// left.
+        ///
+        /// Elements before it are consumed, so an out-of-range `index`
+        /// exhausts the iterator rather than leaving it where it was.
         pub fn nth(self: *Self, index: usize) ?*T {
             if (index >= self.len()) {
                 self.front_index = self.back_index;
@@ -483,21 +764,37 @@ pub fn SliceIterMut(comptime T: type) type {
 }
 
 /// Create an iterator yielding disjoint mutable pointers into `slice`.
+///
+/// `slice` is borrowed and must stay alive for as long as the iterator or any
+/// pointer it produced is used.
 pub fn sliceIterMut(comptime T: type, slice: []T) SliceIterMut(T) {
     return .{ .slice = slice, .back_index = slice.len };
 }
 
 /// Half-open range iterator over `usize` (Rust `start..end`).
+///
+/// `Range` holds two counters and nothing else: it owns no storage, borrows
+/// nothing, and allocates nothing. The empty range is any state with
+/// `start >= end`, which `next` and `next_back` report as `null` rather than
+/// as a failure. `clone` copies the counters, so a clone is an independent
+/// position over the same range and neither affects the other.
 pub const Range = struct {
     const Self = @This();
 
+    /// The next value `next` will yield.
     start: usize,
+    /// One past the last value `next_back` will yield.
     end: usize,
 
+    /// A range over `[start, end)`. An inverted pair, `start > end`, is the
+    /// empty range rather than an error.
     pub fn init(start: usize, end: usize) Self {
         return .{ .start = start, .end = end };
     }
 
+    /// The next value from the front, or `null` once `start` reaches `end`.
+    ///
+    /// Yields `start` itself, so the first value of `range(n, m)` is `n`.
     pub fn next(self: *Self) ?usize {
         if (self.start >= self.end) return null;
         const result = self.start;
@@ -505,26 +802,39 @@ pub const Range = struct {
         return result;
     }
 
+    /// The next value from the back, or `null` once the cursors meet.
+    ///
+    /// Yields the largest value still in range, so it never returns the same
+    /// value twice for one range.
     pub fn next_back(self: *Self) ?usize {
         if (self.start >= self.end) return null;
         self.end -= 1;
         return self.end;
     }
 
+    /// An independent cursor at the same position.
+    ///
+    /// Copying is safe because the range owns nothing.
     pub fn clone(self: *const Self) Self {
         return self.*;
     }
 
+    /// How many values are left, which is zero for an empty or inverted range.
     pub fn len(self: *const Self) usize {
         if (self.start >= self.end) return 0;
         return self.end - self.start;
     }
 
+    /// `(len, len)`: a range knows its exact remaining count.
     pub fn size_hint(self: *const Self) SizeHint {
         const count = self.len();
         return .{ count, count };
     }
 
+    /// The `index`-th value from the front, or `null` when fewer are left.
+    ///
+    /// Values before it are consumed, so an out-of-range `index` exhausts the
+    /// range rather than leaving it where it was.
     pub fn nth(self: *Self, index: usize) ?usize {
         if (index >= self.len()) {
             self.start = self.end;
@@ -536,17 +846,29 @@ pub const Range = struct {
 };
 
 /// Create a half-open `usize` range.
+///
+/// An inverted pair, `start > end`, is the empty range rather than an error.
+///
 pub fn range(start: usize, end: usize) Range {
     return Range.init(start, end);
 }
 
 /// Adapter applying `F` to every element (Rust `iter.map(F)`).
+///
+/// The adapter owns the source and adds no state of its own. `F` runs once per
+/// element, on the calling thread, inside `next`, and its result is returned
+/// unchanged; it may reenter the source it was handed.
+///
 pub fn Map(comptime Base: type, comptime F: anytype, comptime Out: type) type {
     return struct {
         const Self = @This();
 
         base: Base,
 
+        /// The next mapped element, or `null` once the source is exhausted.
+        ///
+        /// `F` is not called for an exhausted source, so a source of `n`
+        /// elements calls it exactly `n` times.
         pub fn next(self: *Self) ?Out {
             const el = self.base.next() orelse return null;
             return F(el);
@@ -555,12 +877,22 @@ pub fn Map(comptime Base: type, comptime F: anytype, comptime Out: type) type {
 }
 
 /// Adapter keeping only elements where `F` returns true (Rust `iter.filter(F)`).
+///
+/// `F` runs once per source element, on the calling thread, inside `next`, and
+/// may reenter the source it was handed. An exhausted source runs it no
+/// further times.
+///
 pub fn Filter(comptime Base: type, comptime F: anytype) type {
     return struct {
         const Self = @This();
 
         base: Base,
 
+        /// The next element `F` accepted, or `null` once the source is
+        /// exhausted.
+        ///
+        /// Elements `F` rejects are consumed and never yielded, so a `next`
+        /// call can consume any number of source elements.
         pub fn next(self: *Self) ?Elem(Base) {
             while (self.base.next()) |el| {
                 if (F(el)) return el;
@@ -571,6 +903,11 @@ pub fn Filter(comptime Base: type, comptime F: anytype) type {
 }
 
 /// Adapter ending after at most `n` elements (Rust `iter.take(n)`).
+///
+/// The count is consumed whether or not the source still has elements, so a
+/// `take(n)` over a shorter source reports `null` at the source's end rather
+/// than leaving its budget behind.
+///
 pub fn Take(comptime Base: type) type {
     return struct {
         const Self = @This();
@@ -578,6 +915,10 @@ pub fn Take(comptime Base: type) type {
         base: Base,
         remaining: usize,
 
+        /// The next element, or `null` once the budget is spent or the source
+        /// is exhausted.
+        ///
+        /// A `take(0)` yields nothing and does not touch the source.
         pub fn next(self: *Self) ?Elem(Base) {
             if (self.remaining == 0) return null;
             self.remaining -= 1;
@@ -591,6 +932,10 @@ pub fn Take(comptime Base: type) type {
 }
 
 /// Adapter yielding every `step`th source element (Rust `iter.step_by(step)`).
+///
+/// The first source element is always yielded. `step` must be nonzero, which
+/// `stepBy` asserts in every optimize mode.
+///
 pub fn StepBy(comptime Base: type) type {
     return struct {
         const Self = @This();
@@ -598,6 +943,11 @@ pub fn StepBy(comptime Base: type) type {
         base: Base,
         step: usize,
 
+        /// The next element of the stepped sequence, or `null` once the source
+        /// is exhausted.
+        ///
+        /// The `step - 1` elements after the yielded one are consumed and never
+        /// yielded, so one call can consume up to `step` source elements.
         pub fn next(self: *Self) ?Elem(Base) {
             std.debug.assert(self.step > 0);
             const result = self.base.next() orelse return null;
@@ -621,6 +971,11 @@ pub fn StepBy(comptime Base: type) type {
             return self.base.next_back();
         }
 
+        /// The `index`-th element of the stepped sequence, or `null` when
+        /// fewer are left.
+        ///
+        /// Sequence elements before it are consumed, so an out-of-range `index`
+        /// exhausts the adapter rather than leaving it where it was.
         pub fn nth(self: *Self, index: usize) ?Elem(Base) {
             var skipped: usize = 0;
             while (skipped < index) : (skipped += 1) {
@@ -629,14 +984,20 @@ pub fn StepBy(comptime Base: type) type {
             return self.next();
         }
 
+        /// An independent adapter at the same position, over the same source.
+        ///
+        /// Copying is safe because the adapter owns only its source and step.
         pub fn clone(self: *const Self) Self {
             return self.*;
         }
 
+        /// The lower bound of `size_hint`.
         pub fn len(self: *const Self) usize {
             return self.size_hint()[0];
         }
 
+        /// `(lower, upper)` for the stepped sequence, where `upper` is `null`
+        /// when the source has no upper bound.
         pub fn size_hint(self: *const Self) SizeHint {
             std.debug.assert(self.step > 0);
             const hint = self.base.size_hint();
@@ -651,12 +1012,21 @@ pub fn StepBy(comptime Base: type) type {
 }
 
 /// Create a nonzero-stride adapter.
+///
+/// `step` must be nonzero, which this asserts in every optimize mode. The
+/// adapter takes `iter` by value and borrows whatever `iter` itself borrows.
+///
 pub fn stepBy(iter: anytype, step: usize) StepBy(@TypeOf(iter)) {
     std.debug.assert(step > 0);
     return .{ .base = iter, .step = step };
 }
 
 /// Adapter discarding the first `n` source elements (Rust `iter.skip(n)`).
+///
+/// The count is consumed lazily: elements are dropped on the first `next` or
+/// `next_back` that needs them, so an exhausted source discards only what is
+/// left to skip.
+///
 pub fn Skip(comptime Base: type) type {
     return struct {
         const Self = @This();
@@ -664,6 +1034,10 @@ pub fn Skip(comptime Base: type) type {
         base: Base,
         remaining: usize,
 
+        /// The next element after the skipped ones, or `null` once the source
+        /// is exhausted.
+        ///
+        /// The first call consumes up to `n` source elements to get there.
         pub fn next(self: *Self) ?Elem(Base) {
             while (self.remaining != 0) {
                 if (self.base.next() == null) {
@@ -675,6 +1049,11 @@ pub fn Skip(comptime Base: type) type {
             return self.base.next();
         }
 
+        /// The next element from the back after the skipped ones, or `null`
+        /// once the source is exhausted.
+        ///
+        /// This skips from the back, so a skip count larger than the source
+        /// exhausts it from the back rather than the front.
         pub fn next_back(self: *Self) ?Elem(Base) {
             while (self.remaining != 0) {
                 if (self.base.next() == null) {
@@ -686,6 +1065,11 @@ pub fn Skip(comptime Base: type) type {
             return self.base.next_back();
         }
 
+        /// The `index`-th element after the skipped ones, or `null` when fewer
+        /// are left.
+        ///
+        /// Elements before it are consumed, so an out-of-range `index`
+        /// exhausts the adapter rather than leaving it where it was.
         pub fn nth(self: *Self, index: usize) ?Elem(Base) {
             var skipped: usize = 0;
             while (skipped < index) : (skipped += 1) {
@@ -694,14 +1078,20 @@ pub fn Skip(comptime Base: type) type {
             return self.next();
         }
 
+        /// An independent adapter at the same position, over the same source.
+        ///
+        /// Copying is safe because the adapter owns only its source and count.
         pub fn clone(self: *const Self) Self {
             return self.*;
         }
 
+        /// The lower bound of `size_hint`.
         pub fn len(self: *const Self) usize {
             return self.size_hint()[0];
         }
 
+        /// `(lower, upper)` after the skip, where `upper` is `null` when the
+        /// source has no upper bound.
         pub fn size_hint(self: *const Self) SizeHint {
             const hint = self.base.size_hint();
             const lower_skip = @min(hint[0], self.remaining);
@@ -716,11 +1106,20 @@ pub fn Skip(comptime Base: type) type {
 }
 
 /// Create a skip adapter.
+///
+/// The adapter takes `iter` by value and borrows whatever `iter` itself
+/// borrows. A `count` larger than the source exhausts it.
+///
 pub fn skip(iter: anytype, count: usize) Skip(@TypeOf(iter)) {
     return .{ .base = iter, .remaining = count };
 }
 
 /// Adapter pairing items from two sources until either is exhausted.
+///
+/// `next` polls left first, so a source left advances even on the call that
+/// reports exhaustion because the right source ran out; the surplus element is
+/// consumed and lost. Both sources are owned by value.
+///
 pub fn Zip(comptime Left: type, comptime Right: type) type {
     return struct {
         const Self = @This();
@@ -729,6 +1128,10 @@ pub fn Zip(comptime Left: type, comptime Right: type) type {
         left: Left,
         right: Right,
 
+        /// The next pair, or `null` once either source is exhausted.
+        ///
+        /// An element already taken from the left source is dropped when the
+        /// right source is the one that ends.
         pub fn next(self: *Self) ?Item {
             const left = self.left.next() orelse return null;
             const right = self.right.next() orelse return null;
@@ -755,6 +1158,10 @@ pub fn Zip(comptime Left: type, comptime Right: type) type {
             return .{ left orelse return null, right orelse return null };
         }
 
+        /// The `index`-th pair, or `null` when fewer are left.
+        ///
+        /// Pairs before it are consumed, so an out-of-range `index` exhausts
+        /// the adapter rather than leaving it where it was.
         pub fn nth(self: *Self, index: usize) ?Item {
             var skipped: usize = 0;
             while (skipped < index) : (skipped += 1) {
@@ -763,14 +1170,22 @@ pub fn Zip(comptime Left: type, comptime Right: type) type {
             return self.next();
         }
 
+        /// An independent adapter at the same position, over the same two
+        /// sources.
+        ///
+        /// Copying is safe because the adapter owns only its two sources.
         pub fn clone(self: *const Self) Self {
             return self.*;
         }
 
+        /// How many pairs are left, which is the shorter source's remaining
+        /// count.
         pub fn len(self: *const Self) usize {
             return @min(self.left.len(), self.right.len());
         }
 
+        /// `(lower, upper)` for the pairs, where `upper` is `null` when either
+        /// source has no upper bound.
         pub fn size_hint(self: *const Self) SizeHint {
             const left_hint = self.left.size_hint();
             const right_hint = self.right.size_hint();
@@ -785,11 +1200,20 @@ pub fn Zip(comptime Left: type, comptime Right: type) type {
 }
 
 /// Create a zip adapter.
+///
+/// Both sources are taken by value; an iterator that borrows caller storage
+/// keeps that borrow, so the borrow must outlive the zip.
+///
 pub fn zip(left: anytype, right: anytype) Zip(@TypeOf(left), @TypeOf(right)) {
     return .{ .left = left, .right = right };
 }
 
 /// Adapter adding a zero-based index (Rust `iter.enumerate()`).
+///
+/// The index counts from the front only and never resets, so `next_back`
+/// reports the source's remaining count added to the current index. The
+/// source is owned by value.
+///
 pub fn Enumerate(comptime Base: type) type {
     return struct {
         const Self = @This();
@@ -798,6 +1222,11 @@ pub fn Enumerate(comptime Base: type) type {
         base: Base,
         index: usize = 0,
 
+        /// The next `(index, element)` pair, or `null` once the source is
+        /// exhausted.
+        ///
+        /// The element is the source's own value or a pointer into it, on the
+        /// source's own terms.
         pub fn next(self: *Self) ?Item {
             const element = self.base.next() orelse return null;
             const result = Item{ self.index, element };
@@ -805,6 +1234,11 @@ pub fn Enumerate(comptime Base: type) type {
             return result;
         }
 
+        /// The next `(index, element)` pair from the back, or `null` once the
+        /// source is exhausted.
+        ///
+        /// The index is derived from the source's remaining count, so it
+        /// describes the element's position from the front.
         pub fn next_back(self: *Self) ?Item {
             const remaining = self.base.len();
             if (remaining == 0) return null;
@@ -812,6 +1246,10 @@ pub fn Enumerate(comptime Base: type) type {
             return .{ self.index + remaining - 1, element };
         }
 
+        /// The `index`-th pair, or `null` when fewer are left.
+        ///
+        /// Pairs before it are consumed, so an out-of-range `index` exhausts
+        /// the adapter rather than leaving it where it was.
         pub fn nth(self: *Self, index: usize) ?Item {
             var skipped: usize = 0;
             while (skipped < index) : (skipped += 1) {
@@ -820,14 +1258,20 @@ pub fn Enumerate(comptime Base: type) type {
             return self.next();
         }
 
+        /// An independent adapter at the same position, over the same source.
+        ///
+        /// Copying is safe because the adapter owns only its source and index.
         pub fn clone(self: *const Self) Self {
             return self.*;
         }
 
+        /// How many elements the source still has; the adapter drops none.
         pub fn len(self: *const Self) usize {
             return self.base.len();
         }
 
+        /// The source's own `(lower, upper)`: enumeration neither adds nor
+        /// removes elements.
         pub fn size_hint(self: *const Self) SizeHint {
             return self.base.size_hint();
         }
@@ -835,25 +1279,43 @@ pub fn Enumerate(comptime Base: type) type {
 }
 
 /// Create an enumerate adapter.
+///
+/// The adapter takes `iter` by value and borrows whatever `iter` itself
+/// borrows.
+///
 pub fn enumerate(iter: anytype) Enumerate(@TypeOf(iter)) {
     return .{ .base = iter };
 }
 
 /// Adapter reversing a double-ended source (Rust `iter.rev()`).
+///
+/// `Base` must expose `next_back`; a source that does not is a compile error.
+/// Reversing does not copy or rewind the source, so an already-advanced source
+/// reverses only what is left.
+///
 pub fn Rev(comptime Base: type) type {
     return struct {
         const Self = @This();
 
         base: Base,
 
+        /// The next element from the source's back, or `null` once it is
+        /// exhausted.
         pub fn next(self: *Self) ?Elem(Base) {
             return self.base.next_back();
         }
 
+        /// The next element from the source's front, or `null` once it is
+        /// exhausted.
         pub fn next_back(self: *Self) ?Elem(Base) {
             return self.base.next();
         }
 
+        /// The `index`-th element in reverse order, or `null` when fewer are
+        /// left.
+        ///
+        /// Elements before it are consumed, so an out-of-range `index`
+        /// exhausts the adapter rather than leaving it where it was.
         pub fn nth(self: *Self, index: usize) ?Elem(Base) {
             var skipped: usize = 0;
             while (skipped < index) : (skipped += 1) {
@@ -862,14 +1324,19 @@ pub fn Rev(comptime Base: type) type {
             return self.next();
         }
 
+        /// An independent adapter at the same position, over the same source.
+        ///
+        /// Copying is safe because the adapter owns only its source.
         pub fn clone(self: *const Self) Self {
             return self.*;
         }
 
+        /// How many elements are left, which is the source's own count.
         pub fn len(self: *const Self) usize {
             return self.base.len();
         }
 
+        /// The source's own `(lower, upper)`: reversing changes neither.
         pub fn size_hint(self: *const Self) SizeHint {
             return self.base.size_hint();
         }
@@ -877,11 +1344,21 @@ pub fn Rev(comptime Base: type) type {
 }
 
 /// Create a reverse adapter.
+///
+/// The adapter takes `iter` by value and borrows whatever `iter` itself
+/// borrows.
+///
 pub fn rev(iter: anytype) Rev(@TypeOf(iter)) {
     return .{ .base = iter };
 }
 
 /// Consume `iter` until `F` returns true (Rust `iter.any(F)`).
+///
+/// Returns at the first element `F` accepts, so the elements after it are never
+/// seen. `F` runs on the calling thread, inside this call, once per element
+/// examined, and may reenter the iterator it was handed. `iter` is consumed:
+/// it is taken by value and advanced in place.
+///
 pub fn any(iter: anytype, comptime F: anytype) bool {
     var iterator = iter;
     while (iterator.next()) |element| {
@@ -891,21 +1368,40 @@ pub fn any(iter: anytype, comptime F: anytype) bool {
 }
 
 /// Wrap `iter` so each element becomes `F(el)`.
+///
+/// The adapter takes `iter` by value and borrows whatever `iter` itself
+/// borrows. `F` runs once per element, on the calling thread, inside `next`.
+///
 pub fn map(iter: anytype, comptime F: anytype, comptime Out: type) Map(@TypeOf(iter), F, Out) {
     return .{ .base = iter };
 }
 
 /// Wrap `iter`, keeping only the elements for which `F(el)` is true.
+///
+/// The adapter takes `iter` by value and borrows whatever `iter` itself
+/// borrows. `F` runs once per source element, on the calling thread, inside
+/// `next`, so one `next` call can consume any number of source elements.
+///
 pub fn filter(iter: anytype, comptime F: anytype) Filter(@TypeOf(iter), F) {
     return .{ .base = iter };
 }
 
 /// Wrap `iter`, ending after at most `n` elements.
+///
+/// The adapter takes `iter` by value and borrows whatever `iter` itself
+/// borrows. A `take(0)` yields nothing and does not touch the source.
+///
 pub fn take(iter: anytype, n: usize) Take(@TypeOf(iter)) {
     return .{ .base = iter, .remaining = n };
 }
 
 /// Consume `iter`, accumulating `F(acc, el)` starting from `init`.
+///
+/// Returns the final accumulator. `F` runs once per element, on the calling
+/// thread, inside this call, and may reenter the iterator it was handed.
+/// `iter` is consumed: it is taken by value and advanced in place, so an
+/// element beyond the last one examined is never seen.
+///
 pub fn fold(iter: anytype, comptime Acc: type, init: Acc, comptime F: anytype) Acc {
     var acc = init;
     var it = iter;
@@ -917,33 +1413,65 @@ pub fn fold(iter: anytype, comptime Acc: type, init: Acc, comptime F: anytype) A
 
 /// Type-erased iterator box: a `next` function pointer over an `*anyopaque`
 /// context, giving one uniform iterator type.
+///
+/// The box owns nothing: `context` is borrowed and must stay alive and valid
+/// for as long as the box or any adapter built from it is used, and nothing
+/// checks that. Copying a box copies the pointer, so a copy is a second alias
+/// of one cursor and both advance the same source. The box adds no buffering
+/// and no allocation, so a `next` call is one indirect call.
 pub fn Iterator(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The cursor callback. It runs on the calling thread, synchronously,
+        /// inside the `next` call that reached it, receives `context`
+        /// unchanged, and returns the next element or `null` once the source
+        /// is exhausted. It must not free or replace `context`, and it may
+        /// reenter the box that called it.
         next_fn: *const fn (context: *anyopaque) ?T,
+        /// The borrowed cursor this box dispatches to.
         context: *anyopaque,
 
+        /// A box over `context`, calling `next_fn` for each element.
+        ///
+        /// `context` is borrowed, not captured by value, so a cursor that is
+        /// itself a local must outlive the box.
         pub fn init(next_fn: *const fn (context: *anyopaque) ?T, context: *anyopaque) Self {
             return .{ .next_fn = next_fn, .context = context };
         }
 
+        /// The next element, or `null` once the source is exhausted.
+        ///
+        /// Dispatches through `next_fn`, so the cursor advances where it
+        /// stands and any adapter built on this box shares that one cursor.
+        ///
         pub inline fn next(self: *Self) ?T {
             return self.next_fn(self.context);
         }
 
+        /// A mapped adapter over this box. `F` runs once per element, on the
+        /// calling thread, inside `next`.
         pub fn map(self: Self, comptime F: anytype, comptime Out: type) Map(Self, F, Out) {
             return .{ .base = self };
         }
 
+        /// A filtered adapter over this box. `F` runs once per element, on the
+        /// calling thread, inside `next`.
         pub fn filter(self: Self, comptime F: anytype) Filter(Self, F) {
             return .{ .base = self };
         }
 
+        /// A bounded adapter over this box. A `take(0)` yields nothing and
+        /// does not dispatch at all.
         pub fn take(self: Self, n: usize) Take(Self) {
             return .{ .base = self, .remaining = n };
         }
 
+        /// Consume the box, accumulating `F(acc, el)` starting from `acc0`.
+        ///
+        /// `F` runs once per element, on the calling thread, inside this call.
+        /// The box advances the one borrowed cursor, so a second box over the
+        /// same context continues where this one stopped.
         pub fn fold(self: Self, comptime Acc: type, acc0: Acc, comptime F: anytype) Acc {
             var acc = acc0;
             var it = self;

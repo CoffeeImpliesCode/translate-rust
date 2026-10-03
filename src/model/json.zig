@@ -123,17 +123,72 @@ fn reqOptStr(o: ObjectMap, key: []const u8) !?[]const u8 {
         else => error.BadWireFormat,
     };
 }
-fn decodeRepeat(o: ObjectMap, key: []const u8) !?usize {
-    return switch (try req(o, key)) {
-        .integer => |i| {
-            if (i < 0 or i > @as(i128, std.math.maxInt(usize))) {
-                return error.BadWireFormat;
-            }
-            return @intCast(i);
+/// Read a full-width `u64` count off the wire.
+///
+/// `std.json.Value.integer` is `i64`, so a count at or above 2^63 arrives as
+/// `number_string` carrying the raw digits. Both tags are the same unquoted
+/// JSON number on the wire; a token no `u64` holds, and a negative one, are
+/// `BadWireFormat` rather than a clamp or a truncation.
+fn decodeU64Count(v: Json) !u64 {
+    return switch (v) {
+        .integer => |i| blk: {
+            if (i < 0) return error.BadWireFormat;
+            break :blk @as(u64, @intCast(i));
         },
-        .null => null,
+        .number_string => |digits| std.fmt.parseInt(u64, digits, 10) catch
+            error.BadWireFormat,
         else => error.BadWireFormat,
     };
+}
+
+/// A stored `vec![e; N]` count: null, a number, or an expression node.
+///
+/// Null and a bare integer keep the exact meaning — and the exact bytes —
+/// they have always had, so a stored `vec![e; 13]` still reads as the count
+/// 13 it always did. The object form is the one addition, for a count the
+/// translator does not know until the target evaluates it.
+///
+/// That object is read strictly: exactly the keys `tag` and `value`, `tag`
+/// the string `expression`, `value` an integer node id. A third key, another
+/// tag, or a `value` that is not a node id is `BadWireFormat` — a count this
+/// decoder cannot read exactly is never one it is free to guess at. The node
+/// id is read through `decodeCountNodeId`, whose range check turns a negative
+/// or too-wide `value` into that same `BadWireFormat` rather than a trap.
+///
+/// `decodeExprKind` reads the count before it decodes the element id list, so
+/// a count no `u64` holds is rejected without having allocated any of the
+/// element data it would have described. The decoded count owns nothing, so
+/// that rollback stays whole.
+fn decodeVecRepeatCount(o: ObjectMap, key: []const u8) !?exprs.VecRepeatCount {
+    const v = try req(o, key);
+    switch (v) {
+        .null => return null,
+        .object => |count| {
+            if (count.count() != 2) return error.BadWireFormat;
+            const count_tag = try reqStr(count, "tag");
+            if (!std.mem.eql(u8, count_tag, "expression")) return error.BadWireFormat;
+            return .{ .expression = try decodeCountNodeId(count, "value") };
+        },
+        else => return .{ .literal = try decodeU64Count(v) },
+    }
+}
+
+/// The expression node a stored `vec![e; N]` count names, read with its range
+/// checked.
+///
+/// The layer-wide `reqU32` is a bare `@intCast`, so it traps on an integer a
+/// `u32` cannot hold; the canonical semantic-IR codec checks the range first
+/// (`checkedU32` in src/ir/serialize.zig) and reports `BadWireFormat` instead.
+/// Only this field takes the checked reader, so every other legacy id read
+/// keeps the behaviour it has always had. `std.json.Value.integer` is `i64`,
+/// so comparing in `i64` is exact — no count id is ever truncated or wrapped.
+fn decodeCountNodeId(o: ObjectMap, key: []const u8) !u32 {
+    const i = switch (try req(o, key)) {
+        .integer => |x| x,
+        else => return error.BadWireFormat,
+    };
+    if (i < 0 or i > @as(i64, std.math.maxInt(u32))) return error.BadWireFormat;
+    return @intCast(i);
 }
 
 fn freeDecodedStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
@@ -218,6 +273,63 @@ fn freeDecodedPathSegments(
     allocator.free(segments);
 }
 
+fn freeDecodedPath(allocator: std.mem.Allocator, path: types.Path) void {
+    freeDecodedPathSegments(allocator, path.segments);
+}
+
+/// An external nominal owns its Rust path segments and its generic arguments.
+/// Neither is a graph entity, so both are released here and nowhere else.
+fn freeDecodedExternalNominal(
+    allocator: std.mem.Allocator,
+    external: types.ExternalNominal,
+) void {
+    freeDecodedStringList(allocator, external.path);
+    freeDecodedTypeSlice(allocator, external.args);
+}
+
+fn freeDecodedAssociatedTypeBinding(
+    allocator: std.mem.Allocator,
+    binding: types.AssociatedTypeBinding,
+) void {
+    allocator.free(binding.name);
+    freeDecodedType(allocator, binding.ty);
+}
+
+fn freeDecodedAssociatedTypeBindingSlice(
+    allocator: std.mem.Allocator,
+    bindings: []const types.AssociatedTypeBinding,
+) void {
+    for (bindings) |binding| freeDecodedAssociatedTypeBinding(allocator, binding);
+    if (bindings.len > 0) allocator.free(bindings);
+}
+
+fn freeDecodedAssociatedTypeBindingList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(types.AssociatedTypeBinding),
+) void {
+    for (list.items) |binding| freeDecodedAssociatedTypeBinding(allocator, binding);
+    list.deinit(allocator);
+}
+
+fn freeDecodedBound(allocator: std.mem.Allocator, bound: types.Bound) void {
+    freeDecodedPath(allocator, bound.path);
+    freeDecodedTypeSlice(allocator, bound.args);
+    freeDecodedAssociatedTypeBindingSlice(allocator, bound.associated_types);
+}
+
+fn freeDecodedBoundSlice(allocator: std.mem.Allocator, bounds: []const types.Bound) void {
+    for (bounds) |bound| freeDecodedBound(allocator, bound);
+    if (bounds.len > 0) allocator.free(bounds);
+}
+
+fn freeDecodedBoundList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(types.Bound),
+) void {
+    for (list.items) |bound| freeDecodedBound(allocator, bound);
+    list.deinit(allocator);
+}
+
 fn freeDecodedType(allocator: std.mem.Allocator, ty: types.Type) void {
     switch (ty) {
         .path => |path| freeDecodedPathSegments(allocator, path.segments),
@@ -260,6 +372,15 @@ fn freeDecodedType(allocator: std.mem.Allocator, ty: types.Type) void {
             allocator.destroy(@constCast(boxed));
         },
         .unsupported => |unsupported| allocator.free(unsupported.message),
+        .external_nominal => |external| freeDecodedExternalNominal(allocator, external),
+        .@"opaque" => |opaque_ty| {
+            freeDecodedBoundSlice(allocator, opaque_ty.bounds);
+            if (opaque_ty.concrete) |concrete| {
+                freeDecodedType(allocator, concrete.*);
+                allocator.destroy(@constCast(concrete));
+            }
+        },
+        .dyn_trait => |bounds| freeDecodedBoundSlice(allocator, bounds),
         else => {},
     }
 }
@@ -310,7 +431,7 @@ fn freeDecodedLiteral(allocator: std.mem.Allocator, literal: exprs.Literal) void
     }
 }
 fn freeDecodedBlockExpr(allocator: std.mem.Allocator, block: exprs.BlockExpr) void {
-    allocator.free(block.statements);
+    if (block.statements.len > 0) allocator.free(block.statements);
     if (block.labelled) |labelled| allocator.free(labelled);
 }
 fn freeDecodedElseBranch(allocator: std.mem.Allocator, branch: exprs.ElseBranch) void {
@@ -322,6 +443,7 @@ fn freeDecodedElseBranch(allocator: std.mem.Allocator, branch: exprs.ElseBranch)
 fn freeDecodedIterKind(allocator: std.mem.Allocator, iter_kind: exprs.IterKind) void {
     switch (iter_kind) {
         .multi => |ids| allocator.free(ids),
+        .adapter => |chain| freeDecodedIteratorChain(allocator, chain),
         else => {},
     }
 }
@@ -331,30 +453,53 @@ fn freeDecodedUnsupported(allocator: std.mem.Allocator, unsupported: exprs.Unsup
 }
 
 fn freeDecodedClosure(allocator: std.mem.Allocator, closure: exprs.ClosureExpr) void {
-    for (closure.captures) |capture| allocator.free(capture.name);
-    allocator.free(closure.captures);
-    allocator.free(closure.params);
+    freeDecodedCaptures(allocator, closure.captures);
+    if (closure.params.len > 0) allocator.free(closure.params);
     freeDecodedBlockExpr(allocator, closure.body);
+}
+
+fn freeDecodedCaptures(allocator: std.mem.Allocator, captures: []const exprs.Capture) void {
+    for (captures) |capture| allocator.free(capture.name);
+    // A zero-length slice is not an allocation the allocator handed out, so it
+    // is not one it takes back — the same guard `freeDecodedStringList` uses.
+    if (captures.len > 0) allocator.free(captures);
+}
+
+fn freeDecodedCaptureList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(exprs.Capture),
+) void {
+    for (list.items) |capture| allocator.free(capture.name);
+    list.deinit(allocator);
+}
+
+fn freeDecodedIteratorAdapter(
+    allocator: std.mem.Allocator,
+    adapter: exprs.IteratorAdapter,
+) void {
+    switch (adapter) {
+        .map => |map| freeDecodedClosure(allocator, map.closure),
+        .filter => |filter| freeDecodedClosure(allocator, filter.closure),
+        .flat_map => |closure| freeDecodedClosure(allocator, closure),
+        .other => |unsupported| freeDecodedUnsupported(allocator, unsupported),
+        else => {},
+    }
 }
 
 fn freeDecodedIteratorChain(
     allocator: std.mem.Allocator,
     chain: exprs.IteratorChainExpr,
 ) void {
-    for (chain.adapters) |adapter| {
-        switch (adapter) {
-            .map => |map| freeDecodedClosure(allocator, map.closure),
-            .filter => |filter| freeDecodedClosure(allocator, filter.closure),
-            .other => |unsupported| freeDecodedUnsupported(allocator, unsupported),
-            else => {},
-        }
-    }
-    allocator.free(chain.adapters);
+    for (chain.adapters) |adapter| freeDecodedIteratorAdapter(allocator, adapter);
+    if (chain.adapters.len > 0) allocator.free(chain.adapters);
 }
 
 fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void {
     switch (kind) {
         .literal => |literal| freeDecodedLiteral(allocator, literal),
+        .array => |array| allocator.free(array.elements),
+        .range => {},
+        .panic_ => |panic_expr| allocator.free(panic_expr.message),
         .vec_lit => |vec_lit| allocator.free(vec_lit.elements),
         .path => |path| freeDecodedTypeSlice(allocator, path.generic_args),
         .block => |block| freeDecodedBlockExpr(allocator, block),
@@ -384,12 +529,31 @@ fn freeDecodedExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) void 
         },
         .call => |call| allocator.free(call.args),
         .method_call => |method_call| allocator.free(method_call.args),
+        .core_call => |core_call| {
+            freeDecodedTypeSlice(allocator, core_call.generic_args);
+            allocator.free(core_call.args);
+        },
+        .core_function => |core_function| freeDecodedTypeSlice(
+            allocator,
+            core_function.generic_args,
+        ),
         .struct_lit => |struct_lit| freeDecodedFieldInits(allocator, struct_lit.fields),
         .enum_variant => |enum_variant| {
             allocator.free(enum_variant.variant);
             allocator.free(enum_variant.tuple_fields);
             freeDecodedFieldInits(allocator, enum_variant.named_fields);
         },
+        .external_variant => |external| {
+            freeDecodedExternalNominal(allocator, external.owner);
+            allocator.free(external.variant);
+            allocator.free(external.tuple_fields);
+            freeDecodedFieldInits(allocator, external.named_fields);
+        },
+        .format_write => |format_write| {
+            allocator.free(format_write.template);
+            allocator.free(format_write.args);
+        },
+        .cast => |cast| freeDecodedType(allocator, cast.source_type),
         .field => |field| allocator.free(field.field),
         .closure => |closure| freeDecodedClosure(allocator, closure),
         .iterator_chain => |chain| freeDecodedIteratorChain(allocator, chain),
@@ -416,6 +580,11 @@ fn freeDecodedPatternKind(allocator: std.mem.Allocator, kind: exprs.PatternKind)
         .literal => |literal| freeDecodedLiteral(allocator, literal),
         .path => |path| {
             if (path.variant) |variant| allocator.free(variant);
+        },
+        .external_variant => |external| {
+            freeDecodedExternalNominal(allocator, external.owner);
+            allocator.free(external.variant);
+            freeDecodedFieldPats(allocator, external.fields);
         },
         .tuple => |tuple| allocator.free(tuple.elements),
         .slice => |slice| allocator.free(slice.elements),
@@ -569,7 +738,7 @@ fn freeDecodedFieldInitList(
 
 fn freeDecodedFieldInits(allocator: std.mem.Allocator, fields: []const exprs.FieldInit) void {
     for (fields) |field| allocator.free(field.field);
-    allocator.free(fields);
+    if (fields.len > 0) allocator.free(fields);
 }
 
 fn freeDecodedFieldPatList(
@@ -578,6 +747,11 @@ fn freeDecodedFieldPatList(
 ) void {
     for (list.items) |field| allocator.free(field.field);
     list.deinit(allocator);
+}
+
+fn freeDecodedFieldPats(allocator: std.mem.Allocator, fields: []const exprs.FieldPat) void {
+    for (fields) |field| allocator.free(field.field);
+    if (fields.len > 0) allocator.free(fields);
 }
 fn freeDecodedMatchArmList(
     allocator: std.mem.Allocator,
@@ -610,7 +784,7 @@ fn freeDecodedField(allocator: std.mem.Allocator, field: items.Field) void {
 }
 fn freeDecodedFields(allocator: std.mem.Allocator, fields: []const items.Field) void {
     for (fields) |field| freeDecodedField(allocator, field);
-    allocator.free(fields);
+    if (fields.len > 0) allocator.free(fields);
 }
 fn freeDecodedCrateDeps(allocator: std.mem.Allocator, deps: []const graph.CrateDep) void {
     for (deps) |dependency| {
@@ -641,7 +815,7 @@ fn freeDecodedUseDecl(allocator: std.mem.Allocator, use_decl: graph.UseDecl) voi
 
 fn freeDecodedParams(allocator: std.mem.Allocator, params: []const items.Param) void {
     for (params) |param| freeDecodedParam(allocator, param);
-    allocator.free(params);
+    if (params.len > 0) allocator.free(params);
 }
 
 fn freeDecodedFieldList(
@@ -899,6 +1073,11 @@ fn reqFloat(o: ObjectMap, key: []const u8) !f64 {
     return switch (v) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
+        .number_string => |s| blk: {
+            const value = std.fmt.parseFloat(f64, s) catch return error.BadWireFormat;
+            if (!std.math.isFinite(value)) return error.BadWireFormat;
+            break :blk value;
+        },
         else => error.BadWireFormat,
     };
 }
@@ -1049,7 +1228,105 @@ fn decodePathSegments(allocator: std.mem.Allocator, v: Json) ![]const types.Path
     return list.toOwnedSlice(allocator);
 }
 
-fn decodeTypeList(allocator: std.mem.Allocator, v: Json) anyerror![]const types.Type {
+fn decodePath(allocator: std.mem.Allocator, v: Json) !types.Path {
+    const o = try getObj(v);
+    return .{ .segments = try decodePathSegments(allocator, try req(o, "segments")) };
+}
+
+fn decodeAssociatedTypeBinding(
+    allocator: std.mem.Allocator,
+    v: Json,
+) !types.AssociatedTypeBinding {
+    const o = try getObj(v);
+    const name = try allocator.dupe(u8, try reqStr(o, "name"));
+    errdefer allocator.free(name);
+    const ty = try decodeType(allocator, try req(o, "ty"));
+    errdefer freeDecodedType(allocator, ty);
+    return .{ .name = name, .ty = ty };
+}
+
+fn decodeAssociatedTypeBindings(
+    allocator: std.mem.Allocator,
+    v: Json,
+) ![]const types.AssociatedTypeBinding {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(types.AssociatedTypeBinding) = .empty;
+    errdefer freeDecodedAssociatedTypeBindingList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeAssociatedTypeBinding(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedAssociatedTypeBinding(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn decodeBound(allocator: std.mem.Allocator, v: Json) !types.Bound {
+    const o = try getObj(v);
+    const path = try decodePath(allocator, try req(o, "path"));
+    errdefer freeDecodedPath(allocator, path);
+    const args = try decodeTypeList(allocator, try req(o, "args"));
+    errdefer freeDecodedTypeSlice(allocator, args);
+    const associated_types = try decodeAssociatedTypeBindings(
+        allocator,
+        try req(o, "associated_types"),
+    );
+    errdefer freeDecodedAssociatedTypeBindingSlice(allocator, associated_types);
+    const optional = try reqBool(o, "optional");
+    return .{
+        .path = path,
+        .args = args,
+        .associated_types = associated_types,
+        .optional = optional,
+    };
+}
+
+fn decodeBounds(allocator: std.mem.Allocator, v: Json) ![]const types.Bound {
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var list: std.ArrayListUnmanaged(types.Bound) = .empty;
+    errdefer freeDecodedBoundList(allocator, &list);
+    for (arr.items) |item| {
+        const value = try decodeBound(allocator, item);
+        list.append(allocator, value) catch |err| {
+            freeDecodedBound(allocator, value);
+            return err;
+        };
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// A nominal type supplied by `alloc`/`core`/`std`. Its path is provenance
+/// only and must not be empty: a nameless external type names nothing the
+/// emitter could ever resolve, so it is rejected rather than defaulted.
+fn decodeExternalNominal(allocator: std.mem.Allocator, v: Json) !types.ExternalNominal {
+    const o = try getObj(v);
+    const path = try decodeStringList(allocator, try req(o, "path"));
+    errdefer freeDecodedStringList(allocator, path);
+    if (path.len == 0) return error.BadWireFormat;
+    for (path) |segment| {
+        if (segment.len == 0) return error.BadWireFormat;
+    }
+    const args = try decodeTypeList(allocator, try req(o, "args"));
+    errdefer freeDecodedTypeSlice(allocator, args);
+    return .{ .path = path, .args = args };
+}
+
+/// The errors the `Type` decoder group can actually return. The decode side is
+/// mutually recursive through `Bound.associated_types`, so an inferred error
+/// set cannot be resolved; naming it here breaks the cycle the same way
+/// `src/ir/serialize.zig` does for the same dialect. It is not `anyerror`:
+/// every error below is produced by `getObj`/`req`/`reqStr`/`reqBool` or by an
+/// allocation, and naming them keeps the constraint meaningful.
+const TypeDecodeError = std.mem.Allocator.Error || error{ BadWireFormat, MissingField };
+
+fn decodeTypeList(allocator: std.mem.Allocator, v: Json) TypeDecodeError![]const types.Type {
     const arr = switch (v) {
         .array => |a| a,
         else => return error.BadWireFormat,
@@ -1092,7 +1369,7 @@ fn decodeUnsupportedReason(s: []const u8) !spine.UnsupportedReason {
     return error.BadWireFormat;
 }
 
-fn decodeType(allocator: std.mem.Allocator, v: Json) !types.Type {
+fn decodeType(allocator: std.mem.Allocator, v: Json) TypeDecodeError!types.Type {
     const o = try getObj(v);
     const tag = try reqStr(o, "kind");
     const val = try req(o, "value");
@@ -1101,6 +1378,29 @@ fn decodeType(allocator: std.mem.Allocator, v: Json) !types.Type {
         const segments = try decodePathSegments(allocator, try req(p, "segments"));
         errdefer freeDecodedPathSegments(allocator, segments);
         return .{ .path = .{ .segments = segments } };
+    }
+    if (std.mem.eql(u8, tag, "external_nominal")) {
+        return .{ .external_nominal = try decodeExternalNominal(allocator, val) };
+    }
+    if (std.mem.eql(u8, tag, "opaque")) {
+        const p = try getObj(val);
+        const bounds = try decodeBounds(allocator, try req(p, "bounds"));
+        errdefer freeDecodedBoundSlice(allocator, bounds);
+        const concrete: ?*const types.Type = switch (try req(p, "concrete")) {
+            .null => null,
+            else => blk: {
+                const value = try decodeType(allocator, try req(p, "concrete"));
+                errdefer freeDecodedType(allocator, value);
+                const ptr = try allocator.create(types.Type);
+                ptr.* = value;
+                break :blk ptr;
+            },
+        };
+        return .{ .@"opaque" = .{ .bounds = bounds, .concrete = concrete } };
+    }
+    if (std.mem.eql(u8, tag, "dyn_trait")) {
+        const p = try getObj(val);
+        return .{ .dyn_trait = try decodeBounds(allocator, try req(p, "bounds")) };
     }
     if (std.mem.eql(u8, tag, "prim")) {
         return .{ .prim = try decodePrim(try reqStrArray(val)) };
@@ -1242,6 +1542,63 @@ fn decodeBindMode(s: []const u8) !exprs.BindMode {
     return error.BadWireFormat;
 }
 
+fn decodeClosureTrait(s: []const u8) !exprs.ClosureTrait {
+    if (std.mem.eql(u8, s, "fn")) return .@"fn";
+    if (std.mem.eql(u8, s, "fn_mut")) return .fn_mut;
+    if (std.mem.eql(u8, s, "fn_once")) return .fn_once;
+    return error.BadWireFormat;
+}
+
+fn decodeCaptureMode(s: []const u8) !exprs.CaptureMode {
+    if (std.mem.eql(u8, s, "by_value")) return .by_value;
+    if (std.mem.eql(u8, s, "by_ref")) return .by_ref;
+    if (std.mem.eql(u8, s, "by_mut_ref")) return .by_mut_ref;
+    return error.BadWireFormat;
+}
+
+fn decodeUnsupportedVersion(
+    s: []const u8,
+) !@FieldType(exprs.Unsupported, "suggested_version") {
+    if (std.mem.eql(u8, s, "v1")) return .v1;
+    if (std.mem.eql(u8, s, "v2")) return .v2;
+    if (std.mem.eql(u8, s, "v3")) return .v3;
+    return error.BadWireFormat;
+}
+
+fn decodeCoreFunction(s: []const u8) !exprs.CoreFunction {
+    inline for (std.meta.fields(exprs.CoreFunction)) |field| {
+        if (std.mem.eql(u8, s, field.name)) return @enumFromInt(field.value);
+    }
+    return error.BadWireFormat;
+}
+
+/// The conversion syntax, written `as` rather than the tag name `as_` because
+/// the trailing underscore is a Zig identifier guard this wire spelling drops.
+fn decodeConversion(s: []const u8) !@FieldType(exprs.CastExpr, "kind") {
+    if (std.mem.eql(u8, s, "as")) return .as_;
+    if (std.mem.eql(u8, s, "primitive_from")) return .primitive_from;
+    return error.BadWireFormat;
+}
+
+/// A chain's terminal operation. It is required on the wire: the default
+/// `.iterator` is a deferred-fixture convenience, so a chain written without
+/// it would silently read back as a bare iterator and lose its `for` verdict.
+fn decodeIteratorTerminal(s: []const u8) !exprs.IteratorTerminal {
+    if (std.mem.eql(u8, s, "iterator")) return .iterator;
+    if (std.mem.eql(u8, s, "collect_vec")) return .collect_vec;
+    if (std.mem.eql(u8, s, "sum")) return .sum;
+    return error.BadWireFormat;
+}
+
+/// A stored `[e; N]` count: the number of elements the generated program
+/// states, read at full `u64` width. Read before the element list so a count
+/// no `u64` holds is rejected without allocating the data it would describe.
+fn decodeRepeat(o: ObjectMap, key: []const u8) !?u64 {
+    const v = try req(o, key);
+    if (v == .null) return null;
+    return try decodeU64Count(v);
+}
+
 fn decodeBinaryOp(s: []const u8) !exprs.BinaryOp {
     if (std.mem.eql(u8, s, "add")) return .add;
     if (std.mem.eql(u8, s, "sub")) return .sub;
@@ -1270,7 +1627,14 @@ fn decodeAssignOp(s: []const u8) !exprs.AssignOp {
     if (std.mem.eql(u8, s, "sub")) return .sub;
     if (std.mem.eql(u8, s, "mul")) return .mul;
     if (std.mem.eql(u8, s, "div")) return .div;
-    if (std.mem.eql(u8, s, "rem")) return .rem;
+    // The compound bitwise and shift assignments. The encoder writes every
+    // `AssignOp` arm through `@tagName`, so a decoder that stopped at `rem`
+    // refused the five arms a `<<=` or `&=` produces.
+    if (std.mem.eql(u8, s, "bit_and")) return .bit_and;
+    if (std.mem.eql(u8, s, "bit_or")) return .bit_or;
+    if (std.mem.eql(u8, s, "bit_xor")) return .bit_xor;
+    if (std.mem.eql(u8, s, "shl")) return .shl;
+    if (std.mem.eql(u8, s, "shr")) return .shr;
     return error.BadWireFormat;
 }
 
@@ -1313,6 +1677,99 @@ fn decodeElseBranch(allocator: std.mem.Allocator, v: Json) !exprs.ElseBranch {
     return error.BadWireFormat;
 }
 
+/// A closure value: its captures, its parameter patterns, its declared return
+/// type, its body block, and which of the three call traits it closes as. All
+/// five travel; none is defaulted on the way in.
+fn decodeClosure(allocator: std.mem.Allocator, v: Json) !exprs.ClosureExpr {
+    const o = try getObj(v);
+    const captures_array = switch (try req(o, "captures")) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var captures: std.ArrayListUnmanaged(exprs.Capture) = .empty;
+    errdefer freeDecodedCaptureList(allocator, &captures);
+    for (captures_array.items) |capture_value| {
+        const capture = try getObj(capture_value);
+        const name = try allocator.dupe(u8, try reqStr(capture, "name"));
+        errdefer allocator.free(name);
+        try captures.append(allocator, .{
+            .name = name,
+            .mode = try decodeCaptureMode(try reqStr(capture, "mode")),
+            .ty = try reqU32(capture, "ty"),
+        });
+    }
+    const capture_slice = try captures.toOwnedSlice(allocator);
+    errdefer freeDecodedCaptures(allocator, capture_slice);
+    const params = try decodeIdList(allocator, try req(o, "params"));
+    errdefer if (params.len > 0) allocator.free(params);
+    const return_ty = try reqOptionalId(o, "return_ty");
+    const body = try decodeBlockExpr(allocator, try req(o, "body"));
+    errdefer freeDecodedBlockExpr(allocator, body);
+    return .{
+        .captures = capture_slice,
+        .params = params,
+        .return_ty = return_ty,
+        .body = body,
+        .trait = try decodeClosureTrait(try reqStr(o, "trait")),
+    };
+}
+
+fn decodeIteratorAdapter(allocator: std.mem.Allocator, v: Json) !exprs.IteratorAdapter {
+    const o = try getObj(v);
+    const tag = try reqStr(o, "kind");
+    if (std.mem.eql(u8, tag, "map")) {
+        return .{ .map = .{ .closure = try decodeClosure(allocator, try req(o, "closure")) } };
+    }
+    if (std.mem.eql(u8, tag, "filter")) {
+        return .{ .filter = .{ .closure = try decodeClosure(allocator, try req(o, "closure")) } };
+    }
+    if (std.mem.eql(u8, tag, "flat_map")) {
+        return .{ .flat_map = try decodeClosure(allocator, try req(o, "closure")) };
+    }
+    if (std.mem.eql(u8, tag, "enumerate")) return .{ .enumerate = {} };
+    if (std.mem.eql(u8, tag, "zip")) return .{ .zip = .{ .other = try reqU32(o, "other") } };
+    if (std.mem.eql(u8, tag, "range_rev")) return .{ .range_rev = {} };
+    if (std.mem.eql(u8, tag, "other")) {
+        const reason = try allocator.dupe(u8, try reqStr(o, "reason"));
+        errdefer allocator.free(reason);
+        return .{ .other = .{
+            .reason = reason,
+            .suggested_version = try decodeUnsupportedVersion(try reqStr(o, "suggested_version")),
+        } };
+    }
+    return error.BadWireFormat;
+}
+
+fn decodeIteratorChain(allocator: std.mem.Allocator, v: Json) !exprs.IteratorChainExpr {
+    const o = try getObj(v);
+    const adapters_array = switch (try req(o, "adapters")) {
+        .array => |a| a,
+        else => return error.BadWireFormat,
+    };
+    var adapters: std.ArrayListUnmanaged(exprs.IteratorAdapter) = .empty;
+    errdefer {
+        for (adapters.items) |adapter| freeDecodedIteratorAdapter(allocator, adapter);
+        adapters.deinit(allocator);
+    }
+    for (adapters_array.items) |adapter_value| {
+        const adapter = try decodeIteratorAdapter(allocator, adapter_value);
+        adapters.append(allocator, adapter) catch |err| {
+            freeDecodedIteratorAdapter(allocator, adapter);
+            return err;
+        };
+    }
+    const adapter_slice = try adapters.toOwnedSlice(allocator);
+    errdefer {
+        for (adapter_slice) |adapter| freeDecodedIteratorAdapter(allocator, adapter);
+        if (adapter_slice.len > 0) allocator.free(adapter_slice);
+    }
+    return .{
+        .source = try reqU32(o, "source"),
+        .adapters = adapter_slice,
+        .terminal = try decodeIteratorTerminal(try reqStr(o, "terminal")),
+    };
+}
+
 fn decodeIterKind(allocator: std.mem.Allocator, v: Json) !exprs.IterKind {
     const o = try getObj(v);
     const tag = try reqStr(o, "kind");
@@ -1320,6 +1777,9 @@ fn decodeIterKind(allocator: std.mem.Allocator, v: Json) !exprs.IterKind {
     if (std.mem.eql(u8, tag, "slice")) return .{ .slice = {} };
     if (std.mem.eql(u8, tag, "enumerate")) return .{ .enumerate = {} };
     if (std.mem.eql(u8, tag, "multi")) return .{ .multi = try decodeIdList(allocator, try req(o, "value")) };
+    if (std.mem.eql(u8, tag, "adapter")) {
+        return .{ .adapter = try decodeIteratorChain(allocator, try req(o, "value")) };
+    }
     return error.BadWireFormat;
 }
 
@@ -1327,11 +1787,35 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     if (std.mem.eql(u8, tag, "literal")) return .{ .literal = try decodeLiteral(allocator, val) };
     if (std.mem.eql(u8, tag, "vec_lit")) {
         const p = try getObj(val);
-        const repeat = try decodeRepeat(p, "repeat");
+        const repeat = try decodeVecRepeatCount(p, "repeat");
         return .{ .vec_lit = .{
             .elements = try decodeIdList(allocator, try req(p, "elements")),
             .repeat = repeat,
         } };
+    }
+    if (std.mem.eql(u8, tag, "array")) {
+        const p = try getObj(val);
+        // The count is read before the element list, so a count no `u64`
+        // holds is rejected before the elements it would have sized.
+        const repeat = try decodeRepeat(p, "repeat");
+        return .{ .array = .{
+            .elements = try decodeIdList(allocator, try req(p, "elements")),
+            .repeat = repeat,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "range")) {
+        const p = try getObj(val);
+        return .{ .range = .{
+            .start = try reqU32(p, "start"),
+            .end = try reqOptionalId(p, "end"),
+            .inclusive = try reqBool(p, "inclusive"),
+        } };
+    }
+    if (std.mem.eql(u8, tag, "panic_")) {
+        const p = try getObj(val);
+        const message = try allocator.dupe(u8, try reqStr(p, "message"));
+        errdefer allocator.free(message);
+        return .{ .panic_ = .{ .message = message } };
     }
     if (std.mem.eql(u8, tag, "path")) {
         const p = try getObj(val);
@@ -1460,6 +1944,27 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             .args = try decodeIdList(allocator, try req(q, "args")),
         } };
     }
+    if (std.mem.eql(u8, tag, "core_call")) {
+        const q = try getObj(val);
+        const generic_args = try decodeTypeList(allocator, try req(q, "generic_args"));
+        errdefer freeDecodedTypeSlice(allocator, generic_args);
+        const args = try decodeIdList(allocator, try req(q, "args"));
+        errdefer allocator.free(args);
+        return .{ .core_call = .{
+            .function = try decodeCoreFunction(try reqStr(q, "function")),
+            .generic_args = generic_args,
+            .args = args,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "core_function")) {
+        const q = try getObj(val);
+        const generic_args = try decodeTypeList(allocator, try req(q, "generic_args"));
+        errdefer freeDecodedTypeSlice(allocator, generic_args);
+        return .{ .core_function = .{
+            .function = try decodeCoreFunction(try reqStr(q, "function")),
+            .generic_args = generic_args,
+        } };
+    }
     if (std.mem.eql(u8, tag, "method_call")) {
         const q = try getObj(val);
         return .{ .method_call = .{
@@ -1533,6 +2038,53 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
             .named_fields = named_fields,
         } };
     }
+    if (std.mem.eql(u8, tag, "external_variant")) {
+        const q = try getObj(val);
+        const owner = try decodeExternalNominal(allocator, try req(q, "owner"));
+        errdefer freeDecodedExternalNominal(allocator, owner);
+        const variant = try allocator.dupe(u8, try reqStr(q, "variant"));
+        errdefer allocator.free(variant);
+        const tuple_fields = try decodeIdList(allocator, try req(q, "tuple_fields"));
+        errdefer allocator.free(tuple_fields);
+        const named_arr = switch (try req(q, "named_fields")) {
+            .array => |a| a,
+            else => return error.BadWireFormat,
+        };
+        var named: std.ArrayListUnmanaged(exprs.FieldInit) = .empty;
+        errdefer freeDecodedFieldInitList(allocator, &named);
+        for (named_arr.items) |fv| {
+            const fo = try getObj(fv);
+            const field = try allocator.dupe(u8, try reqStr(fo, "field"));
+            errdefer allocator.free(field);
+            const value = try reqU32(fo, "value");
+            const shorthand = try reqBool(fo, "shorthand");
+            try named.append(allocator, .{
+                .field = field,
+                .value = value,
+                .shorthand = shorthand,
+            });
+        }
+        const named_fields = try named.toOwnedSlice(allocator);
+        errdefer freeDecodedFieldInits(allocator, named_fields);
+        return .{ .external_variant = .{
+            .owner = owner,
+            .variant = variant,
+            .tuple_fields = tuple_fields,
+            .named_fields = named_fields,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "format_write")) {
+        const q = try getObj(val);
+        const template = try allocator.dupe(u8, try reqStr(q, "template"));
+        errdefer allocator.free(template);
+        const args = try decodeIdList(allocator, try req(q, "args"));
+        errdefer allocator.free(args);
+        return .{ .format_write = .{
+            .writer = try reqU32(q, "writer"),
+            .template = template,
+            .args = args,
+        } };
+    }
     if (std.mem.eql(u8, tag, "field")) {
         const q = try getObj(val);
         const base = try reqU32(q, "base");
@@ -1550,6 +2102,19 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
         return .{ .index = .{
             .base = try reqU32(q, "base"),
             .index = try reqU32(q, "index"),
+        } };
+    }
+    if (std.mem.eql(u8, tag, "cast")) {
+        const q = try getObj(val);
+        const kind = try decodeConversion(try reqStr(q, "conversion"));
+        const operand = try reqU32(q, "operand");
+        const source_type = try decodeType(allocator, try req(q, "source_type"));
+        errdefer freeDecodedType(allocator, source_type);
+        return .{ .cast = .{
+            .kind = kind,
+            .operand = operand,
+            .source_type = source_type,
+            .target = try reqU32(q, "target"),
         } };
     }
     if (std.mem.eql(u8, tag, "binary")) {
@@ -1602,6 +2167,21 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
         const q = try getObj(val);
         return .{ .return_ = .{ .value = try reqOptionalId(q, "value") } };
     }
+    if (std.mem.eql(u8, tag, "closure")) {
+        return .{ .closure = try decodeClosure(allocator, val) };
+    }
+    if (std.mem.eql(u8, tag, "iterator_chain")) {
+        return .{ .iterator_chain = try decodeIteratorChain(allocator, val) };
+    }
+    if (std.mem.eql(u8, tag, "unsupported")) {
+        const q = try getObj(val);
+        const reason = try allocator.dupe(u8, try reqStr(q, "reason"));
+        errdefer allocator.free(reason);
+        return .{ .unsupported = .{
+            .reason = reason,
+            .suggested_version = try decodeUnsupportedVersion(try reqStr(q, "suggested_version")),
+        } };
+    }
     return error.BadWireFormat;
 }
 
@@ -1631,6 +2211,9 @@ fn decodePatternKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !
             .mutable = mutable,
         } };
     }
+    if (std.mem.eql(u8, tag, "literal")) {
+        return .{ .literal = try decodeLiteral(allocator, val) };
+    }
     if (std.mem.eql(u8, tag, "path")) {
         const p = try getObj(val);
         const def: spine.EntityId = @intCast(try reqU32(p, "def"));
@@ -1642,6 +2225,40 @@ fn decodePatternKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !
         return .{ .path = .{
             .def = def,
             .variant = variant,
+        } };
+    }
+    if (std.mem.eql(u8, tag, "external_variant")) {
+        const p = try getObj(val);
+        const owner = try decodeExternalNominal(allocator, try req(p, "owner"));
+        errdefer freeDecodedExternalNominal(allocator, owner);
+        const variant = try allocator.dupe(u8, try reqStr(p, "variant"));
+        errdefer allocator.free(variant);
+        const fields_arr = switch (try req(p, "fields")) {
+            .array => |a| a,
+            else => return error.BadWireFormat,
+        };
+        var fields: std.ArrayListUnmanaged(exprs.FieldPat) = .empty;
+        errdefer freeDecodedFieldPatList(allocator, &fields);
+        for (fields_arr.items) |fv| {
+            const fo = try getObj(fv);
+            const field = try allocator.dupe(u8, try reqStr(fo, "field"));
+            errdefer allocator.free(field);
+            const pat = try reqOptionalId(fo, "pat");
+            const shorthand = try reqBool(fo, "shorthand");
+            try fields.append(allocator, .{
+                .field = field,
+                .pat = pat,
+                .shorthand = shorthand,
+            });
+        }
+        const field_slice = try fields.toOwnedSlice(allocator);
+        errdefer freeDecodedFieldPats(allocator, field_slice);
+        const rest = try reqBool(p, "rest");
+        return .{ .external_variant = .{
+            .owner = owner,
+            .variant = variant,
+            .fields = field_slice,
+            .rest = rest,
         } };
     }
     if (std.mem.eql(u8, tag, "tuple")) {
@@ -1877,12 +2494,12 @@ fn decodeVariants(allocator: std.mem.Allocator, v: Json) ![]const items.Variant 
     return list.toOwnedSlice(allocator);
 }
 
-fn decodeEnumKind(value: []const u8) !items.enum_kind {
-    return std.meta.stringToEnum(items.enum_kind, value) orelse error.BadWireFormat;
+fn decodeEnumKind(value: []const u8) !items.EnumKind {
+    return std.meta.stringToEnum(items.EnumKind, value) orelse error.BadWireFormat;
 }
 
-fn decodeIntRepr(value: []const u8) !items.int_repr {
-    return std.meta.stringToEnum(items.int_repr, value) orelse error.BadWireFormat;
+fn decodeIntRepr(value: []const u8) !items.IntRepr {
+    return std.meta.stringToEnum(items.IntRepr, value) orelse error.BadWireFormat;
 }
 
 fn decodeOptionalReceiver(o: ObjectMap, key: []const u8) !?items.Receiver {
@@ -1994,7 +2611,7 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
     if (std.mem.eql(u8, kind_str, "struct_")) {
         const so = try getObj(try req(o, "value"));
         const layout_name = try reqStr(so, "layout");
-        const layout: items.struct_kind = if (std.mem.eql(u8, layout_name, "named"))
+        const layout: items.StructKind = if (std.mem.eql(u8, layout_name, "named"))
             .named
         else if (std.mem.eql(u8, layout_name, "tuple"))
             .tuple
@@ -2239,8 +2856,10 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
 /// Graph data accepts v1 through v3; body data is ignored — use `parseFull`
 /// to recover it.
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !graph.CrateGraph {
-    var parsed = std.json.parseFromSlice(Json, allocator, bytes, .{}) catch
-        return error.InvalidJson;
+    var parsed = std.json.parseFromSlice(Json, allocator, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
     defer parsed.deinit();
     const root_map = getObj(parsed.value) catch return error.BadWireFormat;
     const ver: u32 = @intCast(try reqU32(root_map, "format_version"));
@@ -2251,8 +2870,10 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !graph.CrateGraph 
 /// Lossless decode into the full model (graph + bodies). Translation wire
 /// requires v3 because v1/v2 have no complete body/dependency contract.
 pub fn parseFull(allocator: std.mem.Allocator, bytes: []const u8) !FullModel {
-    var parsed = std.json.parseFromSlice(Json, allocator, bytes, .{}) catch
-        return error.InvalidJson;
+    var parsed = std.json.parseFromSlice(Json, allocator, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
     defer parsed.deinit();
     const root_map = getObj(parsed.value) catch return error.BadWireFormat;
     const ver: u32 = @intCast(try reqU32(root_map, "format_version"));
@@ -2279,12 +2900,50 @@ fn freeValue(allocator: std.mem.Allocator, v: *Json) void {
             for (ar.items) |*item| freeValue(allocator, item);
             ar.deinit();
         },
+        // Only the encoder puts a `number_string` in a tree `freeValue` walks:
+        // a wide count is printed into one. A token parsed out of JSON lives
+        // in the parser's own arena and never reaches here.
+        .number_string => |digits| allocator.free(digits),
         else => {},
     }
 }
 
 fn mkInt(x: anytype) Json {
     return .{ .integer = @intCast(x) };
+}
+
+/// Write a full-width `u64` count as an unquoted decimal number, never through
+/// `f64` and never through an `i64` that cannot hold it. `std.json` writes a
+/// `number_string` verbatim, so the wire form stays the same JSON number. The
+/// digits are owned by `allocator`, which `encodeRoot` backs with the per-call
+/// arena: they are copied into the wire bytes before that arena is released.
+fn mkCount(allocator: std.mem.Allocator, n: u64) !Json {
+    if (std.math.cast(i64, n)) |i| return .{ .integer = i };
+    return .{ .number_string = try std.fmt.allocPrint(allocator, "{d}", .{n}) };
+}
+
+/// Write a `vec![e; N]` count. Null and a literal number are written exactly
+/// as a stored count has always been written, so an expression-free literal
+/// round-trips to the bytes an older producer emitted; only an expression
+/// count grows the object form.
+///
+/// The object carries exactly `tag` and `value`, spelled the way the canonical
+/// semantic-IR wire spells them, so this reader and that writer describe one
+/// count rather than two dialects of it.
+fn encodeVecRepeatCount(
+    allocator: std.mem.Allocator,
+    repeat: ?exprs.VecRepeatCount,
+) !Json {
+    const count = repeat orelse return .{ .null = {} };
+    switch (count) {
+        .literal => |n| return try mkCount(allocator, n),
+        .expression => |expression| {
+            var count_object = ObjectMap.empty;
+            try count_object.put(allocator, "tag", .{ .string = "expression" });
+            try count_object.put(allocator, "value", mkInt(expression));
+            return .{ .object = count_object };
+        },
+    }
 }
 
 fn encodeOptStr(s: ?[]const u8) Json {
@@ -2519,7 +3178,7 @@ fn encodeIdList(allocator: std.mem.Allocator, ids: []const exprs.NodeId) !Json {
     return .{ .array = arr };
 }
 
-fn encodeTypeList(allocator: std.mem.Allocator, tys: []const types.Type) anyerror!Json {
+fn encodeTypeList(allocator: std.mem.Allocator, tys: []const types.Type) std.mem.Allocator.Error!Json {
     var arr = Array.init(allocator);
     for (tys) |t| try arr.append(try encodeType(allocator, t));
     return .{ .array = arr };
@@ -2606,7 +3265,74 @@ fn encodeLiteralObj(allocator: std.mem.Allocator, lit: exprs.Literal) !Json {
     return .{ .object = o };
 }
 
-fn encodeType(allocator: std.mem.Allocator, ty: types.Type) !Json {
+fn encodePath(allocator: std.mem.Allocator, path: types.Path) !Json {
+    var o = ObjectMap.empty;
+    var segments = Array.init(allocator);
+    for (path.segments) |segment| {
+        var so = ObjectMap.empty;
+        try so.put(allocator, "name", .{ .string = segment.name });
+        try so.put(
+            allocator,
+            "id",
+            if (segment.id) |id| mkInt(id) else .{ .null = {} },
+        );
+        try segments.append(.{ .object = so });
+    }
+    try o.put(allocator, "segments", .{ .array = segments });
+    return .{ .object = o };
+}
+
+fn encodeAssociatedTypeBinding(
+    allocator: std.mem.Allocator,
+    binding: types.AssociatedTypeBinding,
+) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "name", .{ .string = binding.name });
+    try o.put(allocator, "ty", try encodeType(allocator, binding.ty));
+    return .{ .object = o };
+}
+
+fn encodeAssociatedTypeBindings(
+    allocator: std.mem.Allocator,
+    bindings: []const types.AssociatedTypeBinding,
+) !Json {
+    var arr = Array.init(allocator);
+    for (bindings) |binding| {
+        try arr.append(try encodeAssociatedTypeBinding(allocator, binding));
+    }
+    return .{ .array = arr };
+}
+
+fn encodeBound(allocator: std.mem.Allocator, bound: types.Bound) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "path", try encodePath(allocator, bound.path));
+    try o.put(allocator, "args", try encodeTypeList(allocator, bound.args));
+    try o.put(
+        allocator,
+        "associated_types",
+        try encodeAssociatedTypeBindings(allocator, bound.associated_types),
+    );
+    try o.put(allocator, "optional", .{ .bool = bound.optional });
+    return .{ .object = o };
+}
+
+fn encodeBounds(allocator: std.mem.Allocator, bounds: []const types.Bound) !Json {
+    var arr = Array.init(allocator);
+    for (bounds) |bound| try arr.append(try encodeBound(allocator, bound));
+    return .{ .array = arr };
+}
+
+fn encodeExternalNominal(
+    allocator: std.mem.Allocator,
+    external: types.ExternalNominal,
+) !Json {
+    var o = ObjectMap.empty;
+    try o.put(allocator, "path", try encodeStringList(allocator, external.path));
+    try o.put(allocator, "args", try encodeTypeList(allocator, external.args));
+    return .{ .object = o };
+}
+
+fn encodeType(allocator: std.mem.Allocator, ty: types.Type) std.mem.Allocator.Error!Json {
     var o = ObjectMap.empty;
     switch (ty) {
         .path => |p| {
@@ -2621,6 +3347,10 @@ fn encodeType(allocator: std.mem.Allocator, ty: types.Type) !Json {
             var vo = ObjectMap.empty;
             try vo.put(allocator, "segments", .{ .array = segs });
             try o.put(allocator, "value", .{ .object = vo });
+        },
+        .external_nominal => |e| {
+            try o.put(allocator, "kind", .{ .string = "external_nominal" });
+            try o.put(allocator, "value", try encodeExternalNominal(allocator, e));
         },
         .prim => |p| {
             try o.put(allocator, "kind", .{ .string = "prim" });
@@ -2701,6 +3431,26 @@ fn encodeType(allocator: std.mem.Allocator, ty: types.Type) !Json {
             try o.put(allocator, "kind", .{ .string = "boxed" });
             try o.put(allocator, "value", try encodeType(allocator, b.*));
         },
+        .@"opaque" => |o_ty| {
+            try o.put(allocator, "kind", .{ .string = "opaque" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "bounds", try encodeBounds(allocator, o_ty.bounds));
+            try vo.put(
+                allocator,
+                "concrete",
+                if (o_ty.concrete) |concrete|
+                    try encodeType(allocator, concrete.*)
+                else
+                    .{ .null = {} },
+            );
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .dyn_trait => |bounds| {
+            try o.put(allocator, "kind", .{ .string = "dyn_trait" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "bounds", try encodeBounds(allocator, bounds));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
         .unsupported => |u| {
             try o.put(allocator, "kind", .{ .string = "unsupported" });
             var vo = ObjectMap.empty;
@@ -2737,6 +3487,84 @@ fn encodeElseBranch(allocator: std.mem.Allocator, eb: exprs.ElseBranch) !Json {
     return .{ .object = o };
 }
 
+/// Encode a closure with every field it declares: the captures (each with its
+/// own mode and type-table id), the parameter pattern ids, the return type id,
+/// the body block with its own label, and the call trait. A label on the body
+/// is part of the closure, so it travels with it rather than being folded into
+/// the enclosing expression.
+fn encodeClosure(allocator: std.mem.Allocator, closure: exprs.ClosureExpr) !Json {
+    var o = ObjectMap.empty;
+    var captures = Array.init(allocator);
+    for (closure.captures) |capture| {
+        var capture_object = ObjectMap.empty;
+        try capture_object.put(allocator, "name", .{ .string = capture.name });
+        try capture_object.put(allocator, "mode", .{ .string = @tagName(capture.mode) });
+        try capture_object.put(allocator, "ty", mkInt(capture.ty));
+        try captures.append(.{ .object = capture_object });
+    }
+    try o.put(allocator, "captures", .{ .array = captures });
+    try o.put(allocator, "params", try encodeIdList(allocator, closure.params));
+    try o.put(allocator, "return_ty", encodeOptId(closure.return_ty));
+    try o.put(allocator, "body", try encodeBlockExpr(allocator, closure.body));
+    try o.put(allocator, "trait", .{ .string = @tagName(closure.trait) });
+    return .{ .object = o };
+}
+
+fn encodeIteratorAdapter(
+    allocator: std.mem.Allocator,
+    adapter: exprs.IteratorAdapter,
+) !Json {
+    var o = ObjectMap.empty;
+    switch (adapter) {
+        .map => |map| {
+            try o.put(allocator, "kind", .{ .string = "map" });
+            try o.put(allocator, "closure", try encodeClosure(allocator, map.closure));
+        },
+        .filter => |filter| {
+            try o.put(allocator, "kind", .{ .string = "filter" });
+            try o.put(allocator, "closure", try encodeClosure(allocator, filter.closure));
+        },
+        .flat_map => |closure| {
+            try o.put(allocator, "kind", .{ .string = "flat_map" });
+            try o.put(allocator, "closure", try encodeClosure(allocator, closure));
+        },
+        .enumerate => try o.put(allocator, "kind", .{ .string = "enumerate" }),
+        .zip => |zip| {
+            try o.put(allocator, "kind", .{ .string = "zip" });
+            try o.put(allocator, "other", mkInt(zip.other));
+        },
+        .range_rev => try o.put(allocator, "kind", .{ .string = "range_rev" }),
+        .other => |unsupported| {
+            try o.put(allocator, "kind", .{ .string = "other" });
+            try o.put(allocator, "reason", .{ .string = unsupported.reason });
+            try o.put(
+                allocator,
+                "suggested_version",
+                .{ .string = @tagName(unsupported.suggested_version) },
+            );
+        },
+    }
+    return .{ .object = o };
+}
+
+fn encodeIteratorChain(
+    allocator: std.mem.Allocator,
+    chain: exprs.IteratorChainExpr,
+) !Json {
+    var o = ObjectMap.empty;
+    var adapters = Array.init(allocator);
+    for (chain.adapters) |adapter| {
+        try adapters.append(try encodeIteratorAdapter(allocator, adapter));
+    }
+    try o.put(allocator, "source", mkInt(chain.source));
+    try o.put(allocator, "adapters", .{ .array = adapters });
+    // Always written, never defaulted away: a chain that ends in `collect_vec`
+    // or `sum` is a different program from one left as an iterator value, so
+    // the field is part of what the wire has to say.
+    try o.put(allocator, "terminal", .{ .string = @tagName(chain.terminal) });
+    return .{ .object = o };
+}
+
 fn encodeIterKind(allocator: std.mem.Allocator, ik: exprs.IterKind) !Json {
     var o = ObjectMap.empty;
     switch (ik) {
@@ -2747,7 +3575,10 @@ fn encodeIterKind(allocator: std.mem.Allocator, ik: exprs.IterKind) !Json {
             try o.put(allocator, "kind", .{ .string = "multi" });
             try o.put(allocator, "value", try encodeIdList(allocator, ids));
         },
-        .adapter => return error.UnsupportedWireVariant,
+        .adapter => |chain| {
+            try o.put(allocator, "kind", .{ .string = "adapter" });
+            try o.put(allocator, "value", try encodeIteratorChain(allocator, chain));
+        },
     }
     return .{ .object = o };
 }
@@ -2759,11 +3590,36 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try o.put(allocator, "kind", .{ .string = "literal" });
             try o.put(allocator, "value", try encodeLiteralObj(allocator, v));
         },
+        .array => |v| {
+            try o.put(allocator, "kind", .{ .string = "array" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "elements", try encodeIdList(allocator, v.elements));
+            try vo.put(
+                allocator,
+                "repeat",
+                if (v.repeat) |r| try mkCount(allocator, r) else .{ .null = {} },
+            );
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .range => |v| {
+            try o.put(allocator, "kind", .{ .string = "range" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "start", mkInt(v.start));
+            try vo.put(allocator, "end", encodeOptId(v.end));
+            try vo.put(allocator, "inclusive", .{ .bool = v.inclusive });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .panic_ => |v| {
+            try o.put(allocator, "kind", .{ .string = "panic_" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "message", .{ .string = v.message });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
         .vec_lit => |v| {
             try o.put(allocator, "kind", .{ .string = "vec_lit" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "elements", try encodeIdList(allocator, v.elements));
-            try vo.put(allocator, "repeat", if (v.repeat) |r| mkInt(r) else .{ .null = {} });
+            try vo.put(allocator, "repeat", try encodeVecRepeatCount(allocator, v.repeat));
             try o.put(allocator, "value", .{ .object = vo });
         },
         .path => |p| {
@@ -2872,6 +3728,21 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try vo.put(allocator, "args", try encodeIdList(allocator, v.args));
             try o.put(allocator, "value", .{ .object = vo });
         },
+        .core_call => |v| {
+            try o.put(allocator, "kind", .{ .string = "core_call" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "function", .{ .string = @tagName(v.function) });
+            try vo.put(allocator, "generic_args", try encodeTypeList(allocator, v.generic_args));
+            try vo.put(allocator, "args", try encodeIdList(allocator, v.args));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .core_function => |v| {
+            try o.put(allocator, "kind", .{ .string = "core_function" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "function", .{ .string = @tagName(v.function) });
+            try vo.put(allocator, "generic_args", try encodeTypeList(allocator, v.generic_args));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
         .method_call => |v| {
             try o.put(allocator, "kind", .{ .string = "method_call" });
             var vo = ObjectMap.empty;
@@ -2914,6 +3785,31 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try vo.put(allocator, "named_fields", .{ .array = named });
             try o.put(allocator, "value", .{ .object = vo });
         },
+        .external_variant => |v| {
+            try o.put(allocator, "kind", .{ .string = "external_variant" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "owner", try encodeExternalNominal(allocator, v.owner));
+            try vo.put(allocator, "variant", .{ .string = v.variant });
+            try vo.put(allocator, "tuple_fields", try encodeIdList(allocator, v.tuple_fields));
+            var named = Array.init(allocator);
+            for (v.named_fields) |f| {
+                var fo = ObjectMap.empty;
+                try fo.put(allocator, "field", .{ .string = f.field });
+                try fo.put(allocator, "value", mkInt(f.value));
+                try fo.put(allocator, "shorthand", .{ .bool = f.shorthand });
+                try named.append(.{ .object = fo });
+            }
+            try vo.put(allocator, "named_fields", .{ .array = named });
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .format_write => |v| {
+            try o.put(allocator, "kind", .{ .string = "format_write" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "writer", mkInt(v.writer));
+            try vo.put(allocator, "template", .{ .string = v.template });
+            try vo.put(allocator, "args", try encodeIdList(allocator, v.args));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
         .field => |v| {
             try o.put(allocator, "kind", .{ .string = "field" });
             var vo = ObjectMap.empty;
@@ -2927,6 +3823,18 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             var vo = ObjectMap.empty;
             try vo.put(allocator, "base", mkInt(v.base));
             try vo.put(allocator, "index", mkInt(v.index));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .cast => |v| {
+            try o.put(allocator, "kind", .{ .string = "cast" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "operand", mkInt(v.operand));
+            try vo.put(allocator, "source_type", try encodeType(allocator, v.source_type));
+            try vo.put(allocator, "target", mkInt(v.target));
+            try vo.put(allocator, "conversion", .{ .string = switch (v.kind) {
+                .as_ => "as",
+                .primitive_from => "primitive_from",
+            } });
             try o.put(allocator, "value", .{ .object = vo });
         },
         .binary => |v| {
@@ -2974,7 +3882,25 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try vo.put(allocator, "value", encodeOptId(v.value));
             try o.put(allocator, "value", .{ .object = vo });
         },
-        .closure, .iterator_chain, .unsupported => return error.UnsupportedWireVariant,
+        .unsupported => |u| {
+            try o.put(allocator, "kind", .{ .string = "unsupported" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "reason", .{ .string = u.reason });
+            try vo.put(
+                allocator,
+                "suggested_version",
+                .{ .string = @tagName(u.suggested_version) },
+            );
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .closure => |closure| {
+            try o.put(allocator, "kind", .{ .string = "closure" });
+            try o.put(allocator, "value", try encodeClosure(allocator, closure));
+        },
+        .iterator_chain => |chain| {
+            try o.put(allocator, "kind", .{ .string = "iterator_chain" });
+            try o.put(allocator, "value", try encodeIteratorChain(allocator, chain));
+        },
     }
     return .{ .object = o };
 }
@@ -3034,6 +3960,23 @@ fn encodePatternKind(allocator: std.mem.Allocator, kind: exprs.PatternKind) !Jso
             var vo = ObjectMap.empty;
             try vo.put(allocator, "def", mkInt(p.def));
             try vo.put(allocator, "variant", encodeOptStr(p.variant));
+            try o.put(allocator, "value", .{ .object = vo });
+        },
+        .external_variant => |t| {
+            try o.put(allocator, "kind", .{ .string = "external_variant" });
+            var vo = ObjectMap.empty;
+            try vo.put(allocator, "owner", try encodeExternalNominal(allocator, t.owner));
+            try vo.put(allocator, "variant", .{ .string = t.variant });
+            var fields = Array.init(allocator);
+            for (t.fields) |f| {
+                var fo = ObjectMap.empty;
+                try fo.put(allocator, "field", .{ .string = f.field });
+                try fo.put(allocator, "pat", encodeOptId(f.pat));
+                try fo.put(allocator, "shorthand", .{ .bool = f.shorthand });
+                try fields.append(.{ .object = fo });
+            }
+            try vo.put(allocator, "fields", .{ .array = fields });
+            try vo.put(allocator, "rest", .{ .bool = t.rest });
             try o.put(allocator, "value", .{ .object = vo });
         },
         .tuple => |t| {
@@ -3341,40 +4284,47 @@ fn encodeRoot(
     bodies: ?*const Bodies,
     fmt_version: u32,
 ) ![]u8 {
-    var root_map = ObjectMap.empty;
-    try root_map.put(allocator, "format_version", mkInt(fmt_version));
-    try root_map.put(allocator, "sidecar", encodeOptStr(g.sidecar));
-    try root_map.put(allocator, "toolchain", encodeOptStr(g.toolchain));
+    // Everything this function builds — the JSON tree, the crate member masks,
+    // and the printed count and literal texts — lives in one arena over
+    // `allocator` and is released on both the success and the failure path.
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const scratch_allocator = scratch.allocator();
 
-    var crates_arr = Array.init(allocator);
+    var root_map = ObjectMap.empty;
+    try root_map.put(scratch_allocator, "format_version", mkInt(fmt_version));
+    try root_map.put(scratch_allocator, "sidecar", encodeOptStr(g.sidecar));
+    try root_map.put(scratch_allocator, "toolchain", encodeOptStr(g.toolchain));
+
+    var crates_arr = Array.init(scratch_allocator);
     for (g.crates.items) |c| {
-        const member = try crateMembers(allocator, g, c.root);
-        defer allocator.free(member);
-        try crates_arr.append(try encodeCrate(allocator, g, c, member));
+        const member = try crateMembers(scratch_allocator, g, c.root);
+        try crates_arr.append(try encodeCrate(scratch_allocator, g, c, member));
     }
-    try root_map.put(allocator, "crates", .{ .array = crates_arr });
+    try root_map.put(scratch_allocator, "crates", .{ .array = crates_arr });
 
     if (bodies) |b| {
-        try root_map.put(allocator, "bodies", try encodeBodies(allocator, b));
+        try root_map.put(scratch_allocator, "bodies", try encodeBodies(scratch_allocator, b));
     }
 
-    var root_val: Json = .{ .object = root_map };
-    defer freeValue(allocator, &root_val);
+    // The only allocation that outlives this call: the wire bytes, copied out
+    // of the arena tree before `defer` releases it.
+    const root_val: Json = .{ .object = root_map };
     // Zig 0.16: std.json.stringify was replaced by Stringify.valueAlloc, which
     // owns and returns a []u8 buffer to be freed with the passed allocator.
     return std.json.Stringify.valueAlloc(allocator, root_val, .{});
 }
 
-/// Write the graph back to the wire JSON as a v1 document (no bodies). The
-/// returned `[]u8` is owned by the caller and must be freed with the passed
-/// allocator. Inverses `parse` (graph data only; bodies are omitted).
+/// Encode the graph as v1 JSON, without bodies. Inverses `parse`.
+/// The caller frees the result with `allocator`; temporary encoding allocations
+/// are released on success and failure.
 pub fn encode(allocator: std.mem.Allocator, g: *const graph.CrateGraph) ![]u8 {
     return encodeRoot(allocator, g, null, 1);
 }
 
-/// Write the full model back to the wire JSON as a v3 document (graph + bodies).
-/// The returned `[]u8` is owned by the caller and must be freed with the passed
-/// allocator. Inverses `parseFull`.
+/// Encode the full model as v3 JSON. Inverses `parseFull`.
+/// The caller frees the result with `allocator`; temporary encoding allocations
+/// are released on success and failure.
 pub fn encodeFull(allocator: std.mem.Allocator, model: FullModel) ![]u8 {
     return encodeRoot(allocator, &model.graph, &model.bodies, wire_format_version);
 }
@@ -3625,6 +4575,101 @@ test "encode preserves nonempty use payloads" {
     try std.testing.expectEqual(@as(u32, 7), try reqU32(use_object, "target"));
 }
 
+fn checkGraphEncodeAllocationFailures(
+    allocator: std.mem.Allocator,
+    g: *const graph.CrateGraph,
+) !void {
+    const encoded = try encode(allocator, g);
+    // Only the wire bytes belong to `allocator`; freeing them here is the
+    // proof that the caller's free matches the caller's own allocation.
+    allocator.free(encoded);
+}
+
+fn checkFullEncodeAllocationFailures(
+    allocator: std.mem.Allocator,
+    model: FullModel,
+) !void {
+    const encoded = try encodeFull(allocator, model);
+    allocator.free(encoded);
+}
+
+// The graph-only writer owns nothing but its output bytes: the JSON tree, the
+// crate member masks, and the printed texts belong to one arena over the
+// caller's allocator, so a fault at any point of the walk must be refused
+// with nothing retained.
+test "encode releases its temporary tree at every allocation fault" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const g = try parseMini(arena.allocator());
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkGraphEncodeAllocationFailures,
+        .{&g},
+    );
+}
+
+// The same contract for the full-model writer, on a body table that reaches
+// a nested block and the widest count the wire format carries.
+test "encodeFull releases its temporary tree at every allocation fault" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 4,
+    };
+    const param: items.Param = .{ .name = "input", .ty = .{ .prim = .i32 }, .span = span };
+    const expression_table = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .block = .{
+            .statements = &.{},
+            .tail = 1,
+            .labelled = null,
+        } } },
+        .{ .id = 1, .span = span, .ty = 0, .kind = .{ .vec_lit = .{
+            .elements = &.{2},
+            .repeat = .{ .literal = std.math.maxInt(u64) },
+        } } },
+        .{ .id = 2, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+    };
+    const body_kinds = [_]BodyKind{
+        .none,
+        .{ .fn_ = .{
+            .params = &.{param},
+            .ret = .{ .prim = .i32 },
+            .body = 0,
+        } },
+    };
+    const type_table = [_]types.Type{.{ .prim = .i32 }};
+    const model: FullModel = .{
+        .graph = try parseMini(allocator),
+        .bodies = .{
+            .exprs = &expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &type_table,
+            .bodies = &body_kinds,
+        },
+    };
+
+    // The printed count is arena data, but the wire bytes carry it as an exact
+    // unquoted number that outlives the tree.
+    const encoded = try encodeFull(std.testing.allocator, model);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(
+        std.mem.indexOf(u8, encoded, "\"repeat\":18446744073709551615") != null,
+    );
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkFullEncodeAllocationFailures,
+        .{model},
+    );
+}
+
 test "dependency codec preserves default-feature tri-state and ordered features" {
     const allocator = std.testing.allocator;
     const expected = [_]graph.CrateDep{
@@ -3785,6 +4830,21 @@ test "8. invalid JSON is rejected" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidJson, parse(allocator, "this is not json {"));
 }
+
+test "legacy JSON parsers preserve allocation errors" {
+    const bytes =
+        \\{"format_version":3,"crates":[],
+        \\ "bodies":{"exprs":[],"stmts":[],"pats":[],"types":[],"bodies":[]}}
+    ;
+    inline for (.{ parse, parseFull }) |decode_json| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, decode_json(failing.allocator(), bytes));
+        try std.testing.expectError(
+            error.InvalidJson,
+            decode_json(std.testing.allocator, "this is not json {"),
+        );
+    }
+}
 test "decoder releases partially owned values on allocation failure" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3940,4 +5000,2494 @@ test "parseFull rejects legacy hex enum without body value" {
         error.MissingField,
         parseFull(arena.allocator(), bytes),
     );
+}
+
+// A `vec![e; N]` count names target elements, not host storage, so it
+// describes the translated 64-bit program on any host. `std.json` parses a
+// JSON number into an `i64` and keeps anything wider as decimal digits, so
+// both spellings of the same bare number have to reach `u64` — through the
+// literal arm, which is what a count the translator already holds means.
+test "vec_lit repeat counts read the full u64 range off the wire" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        token: []const u8,
+        count: ?exprs.VecRepeatCount,
+    }{
+        .{ .token = "0", .count = .{ .literal = 0 } },
+        .{ .token = "4294967296", .count = .{ .literal = 4294967296 } },
+        .{ .token = "9007199254740993", .count = .{ .literal = 9007199254740993 } },
+        .{ .token = "9223372036854775808", .count = .{ .literal = 9223372036854775808 } },
+        .{ .token = "18446744073709551615", .count = .{ .literal = std.math.maxInt(u64) } },
+        .{ .token = "null", .count = null },
+    };
+    for (cases) |case| {
+        var payload: [64]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&payload, "{{\"repeat\":{s}}}", .{case.token});
+        var parsed = try std.json.parseFromSlice(Json, allocator, bytes, .{});
+        defer parsed.deinit();
+        const object = try getObj(parsed.value);
+        try std.testing.expectEqual(case.count, try decodeVecRepeatCount(object, "repeat"));
+    }
+}
+
+// A count no `u64` describes, and one that is not a count at all, are both
+// `BadWireFormat`. Neither is clamped, rounded, or read as a float.
+test "vec_lit repeat counts that no u64 describes are rejected" {
+    const allocator = std.testing.allocator;
+    const rejected = [_][]const u8{
+        "-1",
+        "18446744073709551616",
+        "1e3",
+        "1.5",
+        "\"3\"",
+    };
+    for (rejected) |token| {
+        var payload: [64]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&payload, "{{\"repeat\":{s}}}", .{token});
+        var parsed = try std.json.parseFromSlice(Json, allocator, bytes, .{});
+        defer parsed.deinit();
+        const object = try getObj(parsed.value);
+        try std.testing.expectError(
+            error.BadWireFormat,
+            decodeVecRepeatCount(object, "repeat"),
+        );
+    }
+}
+
+// `vec![e; n]` with a count the target evaluates: the count is an ordinary
+// expression node, so it travels as one, tagged with exactly the two keys the
+// canonical semantic-IR wire gives it. This reader has to agree with that
+// writer byte for byte or `--dump model` reports a wire error on an IR that
+// the semantic pipeline emits every day.
+test "vec_lit repeat counts read the canonical dynamic-count object" {
+    const allocator = std.testing.allocator;
+    const bytes =
+        \\{"repeat":{"tag":"expression","value":7}}
+    ;
+    var parsed = try std.json.parseFromSlice(Json, allocator, bytes, .{});
+    defer parsed.deinit();
+    const object = try getObj(parsed.value);
+    try std.testing.expectEqual(
+        @as(?exprs.VecRepeatCount, .{ .expression = 7 }),
+        try decodeVecRepeatCount(object, "repeat"),
+    );
+
+    // The key is `tag`, not `kind`: the sibling array-length object spells it
+    // the other way, and reading one as the other would invent a count.
+    var kinded = try std.json.parseFromSlice(
+        Json,
+        allocator,
+        \\{"repeat":{"kind":"expression","value":7}}
+    ,
+        .{},
+    );
+    defer kinded.deinit();
+    try std.testing.expectError(
+        error.MissingField,
+        decodeVecRepeatCount(try getObj(kinded.value), "repeat"),
+    );
+}
+
+// An object this decoder cannot read exactly is never one it guesses at: a
+// missing key, a third key, another tag, or a `value` that is not a node id
+// is `BadWireFormat`.
+test "vec_lit repeat counts with a malformed dynamic-count object are rejected" {
+    const allocator = std.testing.allocator;
+    const rejected = [_][]const u8{
+        \\{"repeat":{"tag":"expression"}}
+        ,
+        \\{"repeat":{"value":7}}
+        ,
+        \\{"repeat":{"tag":"expression","value":7,"extra":true}}
+        ,
+        \\{"repeat":{"tag":"literal","value":7}}
+        ,
+        \\{"repeat":{"tag":"expression","value":"7"}}
+        ,
+        \\{"repeat":{"tag":"expression","value":1.5}}
+        ,
+        \\{"repeat":{"tag":"expression","value":null}}
+        ,
+        \\{"repeat":{"tag":7,"value":7}}
+        ,
+        \\{"repeat":[]}
+        ,
+        \\{"repeat":{"tag":"expression","value":-1}}
+        ,
+        \\{"repeat":{"tag":"expression","value":4294967296}}
+        ,
+    };
+    for (rejected) |token| {
+        var parsed = try std.json.parseFromSlice(Json, allocator, token, .{});
+        defer parsed.deinit();
+        const object = try getObj(parsed.value);
+        try std.testing.expectError(
+            error.BadWireFormat,
+            decodeVecRepeatCount(object, "repeat"),
+        );
+    }
+}
+
+// End to end through the writer this CLI reads: a body table holding one
+// literal-count, one null-count, and one dynamic-count vector encodes to the
+// exact canonical bytes, and `parseFull` reads every one of them back as the
+// union the encoder was handed. The literal and null goldens are unchanged by
+// the dynamic form — that is the whole point of growing the count rather
+// than re-spelling it.
+test "full model round-trips every vec_lit repeat spelling through the wire" {
+    const allocator = std.testing.allocator;
+    var graph_arena = std.heap.ArenaAllocator.init(allocator);
+    defer graph_arena.deinit();
+
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 4,
+    };
+    const param: items.Param = .{ .name = "input", .ty = .{ .prim = .i32 }, .span = span };
+    const expression_table = [_]exprs.Expr{
+        .{ .id = 0, .span = span, .ty = 0, .kind = .{ .block = .{
+            .statements = &.{},
+            .tail = 1,
+            .labelled = null,
+        } } },
+        // `vec![1, 2]` — the explicit-list form, no count at all.
+        .{ .id = 1, .span = span, .ty = 0, .kind = .{ .vec_lit = .{
+            .elements = &.{ 4, 5 },
+            .repeat = null,
+        } } },
+        // `vec![e; 13]` — a count the translator already holds.
+        .{ .id = 2, .span = span, .ty = 0, .kind = .{ .vec_lit = .{
+            .elements = &.{5},
+            .repeat = .{ .literal = 13 },
+        } } },
+        // `vec![e; n]` — a count the target evaluates.
+        .{ .id = 3, .span = span, .ty = 0, .kind = .{ .vec_lit = .{
+            .elements = &.{5},
+            .repeat = .{ .expression = 6 },
+        } } },
+        .{ .id = 4, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 5, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+        .{ .id = 6, .span = span, .ty = 0, .kind = .{ .unit = {} } },
+    };
+    const body_kinds = [_]BodyKind{
+        .none,
+        .{ .fn_ = .{
+            .params = &.{param},
+            .ret = .{ .prim = .i32 },
+            .body = 0,
+        } },
+    };
+    const type_table = [_]types.Type{.{ .prim = .i32 }};
+    const model: FullModel = .{
+        .graph = try parseMini(graph_arena.allocator()),
+        .bodies = .{
+            .exprs = &expression_table,
+            .stmts = &.{},
+            .pats = &.{},
+            .types = &type_table,
+            .bodies = &body_kinds,
+        },
+    };
+
+    const encoded = try encodeFull(allocator, model);
+    defer allocator.free(encoded);
+    try std.testing.expect(
+        std.mem.indexOf(u8, encoded, "\"repeat\":null") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, encoded, "\"repeat\":13") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            encoded,
+            "\"repeat\":{\"tag\":\"expression\",\"value\":6}",
+        ) != null,
+    );
+
+    var read_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer read_arena.deinit();
+    const decoded = try parseFull(read_arena.allocator(), encoded);
+    // Every vector keeps the element nodes it was built from; only the count
+    // encoding is what this test is about.
+    const read_elements = [_][]const exprs.NodeId{
+        &.{ 4, 5 },
+        &.{5},
+        &.{5},
+    };
+    const read_repeats = [_]?exprs.VecRepeatCount{
+        null,
+        .{ .literal = 13 },
+        .{ .expression = 6 },
+    };
+    for (read_repeats, read_elements, 1..) |expected_repeat, expected_elements, index| {
+        const vector = switch (decoded.bodies.exprs[index].kind) {
+            .vec_lit => |vec| vec,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqualSlices(
+            exprs.NodeId,
+            expected_elements,
+            vector.elements,
+        );
+        try std.testing.expectEqual(expected_repeat, vector.repeat);
+    }
+}
+
+// ── Shape-coverage audit ───────────────────────────────────────────────────
+// Every arm the model declares has to survive encode → parseFull. The
+// fixtures below build one body table holding one node per arm and read every
+// field back, so an arm the codec drops is a decode refusal rather than a
+// silent default.
+
+const audit_span: spine.Span = .{
+    .start_line = 2,
+    .start_col = 3,
+    .end_line = 4,
+    .end_col = 5,
+};
+
+/// The empty slice a fixture row uses where the model says "no elements".
+///
+/// A static empty slice, not `allocator.alloc(T, 0)`: the allocator hands back
+/// a zero-length slice it will not accept back, and the free helpers above
+/// release a list without first asking whether one was allocated. Every one of
+/// them now guards on length, so a static empty slice is the value they expect
+/// to be handed and the value they decline to free.
+fn emptySlice(comptime T: type, allocator: std.mem.Allocator) []const T {
+    _ = allocator;
+    return &.{};
+}
+
+/// Build a one-crate graph with every optional string set to a non-default
+/// value, so a decode that substitutes a default for absent data is caught.
+fn auditGraph(allocator: std.mem.Allocator) !graph.CrateGraph {
+    var g = graph.CrateGraph.init(allocator);
+    errdefer g.deinit();
+    g.sidecar = try allocator.dupe(u8, "sidecar-probe");
+    g.toolchain = try allocator.dupe(u8, "toolchain-probe");
+
+    const entity_attributes = try allocator.alloc(spine.Attribute, 1);
+    entity_attributes[0] = .{
+        .name = try allocator.dupe(u8, "doc"),
+        .meta = try allocator.dupe(u8, "a probed entity"),
+        .known = true,
+    };
+    const root = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try allocator.dupe(u8, "Probe"),
+        .span = audit_span,
+        // The one visibility arm that carries a payload of its own.
+        .visibility = .{ .in_path = try allocator.dupe(u8, "crate::probe") },
+        .parent = null,
+        .resolved = null,
+        .renamed_to = try allocator.dupe(u8, "Probe_"),
+        .attributes = entity_attributes,
+    });
+    const module_attributes = try allocator.alloc(spine.Attribute, 1);
+    module_attributes[0] = .{
+        .name = try allocator.dupe(u8, "path"),
+        .meta = try allocator.dupe(u8, "src/probe.rs"),
+        .known = false,
+    };
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .directory,
+        .name = try allocator.dupe(u8, "probe"),
+        .parent = null,
+        .source_path = try allocator.dupe(u8, "src/probe.rs"),
+        .is_crate = true,
+        .is_extern = true,
+        .span = audit_span,
+        .items = try allocator.dupe(spine.EntityId, &.{root}),
+        .attributes = module_attributes,
+    });
+    const dependency_features = try allocator.dupe([]const u8, &.{ "derive", "std" });
+    const dependencies = try allocator.alloc(graph.CrateDep, 1);
+    dependencies[0] = .{
+        .extern_name = try allocator.dupe(u8, "probe_dep"),
+        .local_alias = try allocator.dupe(u8, "probe_alias"),
+        .id = 77,
+        .default_features = false,
+        .features = dependency_features,
+    };
+    try g.addUse(.{
+        .id = root,
+        // The one UseKind arm with no payload.
+        .kind = .glob,
+        .local_name = try allocator.dupe(u8, "probe_use"),
+        .is_pub_export = true,
+        .target = root,
+        .span = audit_span,
+    });
+    try g.addCrate(.{
+        .name = try allocator.dupe(u8, "probe_crate"),
+        .edition = 2024,
+        .kind = .bin,
+        .root = root,
+        .deps = dependencies,
+        .is_translated = false,
+    });
+    return g;
+}
+
+/// One type row per `types.Type` arm, with every optional and nested field
+/// carrying a value that a defaulted decode would not reproduce.
+fn auditTypeTable(allocator: std.mem.Allocator) ![]const types.Type {
+    var table: std.ArrayListUnmanaged(types.Type) = .empty;
+    errdefer {
+        for (table.items) |ty| freeDecodedType(allocator, ty);
+        table.deinit(allocator);
+    }
+
+    const segments = try allocator.alloc(types.PathSegment, 2);
+    segments[0] = .{ .name = try allocator.dupe(u8, "core"), .id = 3 };
+    segments[1] = .{ .name = try allocator.dupe(u8, "primitive"), .id = null };
+    try table.append(allocator, .{ .path = .{ .segments = segments } });
+
+    // Every primitive, so a decoder that hard-codes one cannot pass.
+    inline for (std.meta.fields(types.Prim)) |field| {
+        try table.append(allocator, .{ .prim = @enumFromInt(field.value) });
+    }
+
+    const reference = try allocator.create(types.Ref);
+    reference.* = .{ .mut = true, .pointee = .{ .prim = .u8 } };
+    try table.append(allocator, .{ .reference = reference });
+
+    const raw_ptr = try allocator.create(types.RawPtr);
+    raw_ptr.* = .{ .mut = false, .pointee = .{ .prim = .i64 } };
+    try table.append(allocator, .{ .raw_ptr = raw_ptr });
+
+    const slice = try allocator.create(types.Slice);
+    slice.* = .{ .const_ = false, .elem = .{ .prim = .u16 } };
+    try table.append(allocator, .{ .slice = slice });
+
+    // Both ArrayLen arms: a literal length and a generic-parameter index.
+    const array_literal = try allocator.create(types.Array);
+    array_literal.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = 4 } };
+    try table.append(allocator, .{ .array = array_literal });
+    const array_generic = try allocator.create(types.Array);
+    array_generic.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .generic = 2 } };
+    try table.append(allocator, .{ .array = array_generic });
+
+    const tuple_params = try allocator.dupe(types.Type, &.{
+        .{ .prim = .bool },
+        .{ .prim = .char },
+    });
+    try table.append(allocator, .{ .tuple = tuple_params });
+
+    const fn_params = try allocator.dupe(types.Type, &.{.{ .prim = .f32 }});
+    const fn_ptr = try allocator.create(types.FnPtr);
+    fn_ptr.* = .{ .params = fn_params, .ret = .{ .prim = .f64 } };
+    try table.append(allocator, .{ .fn_ptr = fn_ptr });
+
+    const generic_params = try allocator.dupe(types.Type, &.{.{ .prim = .usize }});
+    try table.append(allocator, .{ .generic_inst = .{
+        .decl = 91,
+        .args = .{ .params = generic_params },
+    } });
+
+    const option = try allocator.create(types.Type);
+    option.* = .{ .prim = .u128 };
+    try table.append(allocator, .{ .option = option });
+
+    const result = try allocator.create(types.Result);
+    result.* = .{
+        .ok = .{ .prim = .i32 },
+        .err = .{ .prim = .u32 },
+        .is_error_unionable = false,
+    };
+    try table.append(allocator, .{ .result = result });
+
+    const boxed = try allocator.create(types.Type);
+    boxed.* = .{ .prim = .isize };
+    try table.append(allocator, .{ .boxed = boxed });
+
+    // The three arms the model gained for types inference cannot yet resolve.
+    // Each is set to a payload a defaulted decode would not produce.
+    try table.append(allocator, .{ .external_nominal = .{
+        .path = try allocator.dupe([]const u8, &.{ "alloc", "borrow", "Cow" }),
+        .args = try allocator.dupe(types.Type, &.{.{ .prim = .u8 }}),
+    } });
+    // A trait bound, built once per row that needs it: each row owns its own
+    // segments, args and bindings, because a rollback would otherwise release
+    // the same three slices once per row that references them.
+    const make_bound = struct {
+        fn build(a: std.mem.Allocator, optional: bool) !types.Bound {
+            const bound_segments = try a.alloc(types.PathSegment, 2);
+            bound_segments[0] = .{ .name = try a.dupe(u8, "Iterator"), .id = 4 };
+            bound_segments[1] = .{ .name = try a.dupe(u8, "Item"), .id = null };
+            return .{
+                .path = .{ .segments = bound_segments },
+                .args = try a.dupe(types.Type, &.{.{ .prim = .u32 }}),
+                .associated_types = try a.dupe(types.AssociatedTypeBinding, &.{.{
+                    .name = try a.dupe(u8, "Item"),
+                    .ty = .{ .prim = .u32 },
+                }}),
+                .optional = optional,
+            };
+        }
+    }.build;
+
+    const opaque_concrete = try allocator.create(types.Type);
+    opaque_concrete.* = .{ .prim = .u32 };
+    try table.append(allocator, .{ .@"opaque" = .{
+        .bounds = try allocator.dupe(types.Bound, &.{try make_bound(allocator, true)}),
+        .concrete = opaque_concrete,
+    } });
+    // An opaque whose concrete half is still absent, so the optional reads
+    // back as null rather than being filled in.
+    try table.append(allocator, .{ .@"opaque" = .{
+        .bounds = try allocator.dupe(types.Bound, &.{try make_bound(allocator, false)}),
+        .concrete = null,
+    } });
+    try table.append(allocator, .{ .dyn_trait = try allocator.dupe(
+        types.Bound,
+        &.{try make_bound(allocator, true)},
+    ) });
+
+    try table.append(allocator, .{ .unsupported = .{
+        .reason = .rc_arc_refcell,
+        .message = try allocator.dupe(u8, "Rc is not modelled"),
+        .span = audit_span,
+    } });
+
+    return table.toOwnedSlice(allocator);
+}
+
+/// One pattern row per `PatternKind` arm.
+fn auditPatternTable(allocator: std.mem.Allocator) ![]const exprs.Pattern {
+    var table: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    errdefer {
+        for (table.items) |pattern| freeDecodedPattern(allocator, pattern);
+        table.deinit(allocator);
+    }
+
+    try table.append(allocator, .{
+        .id = 0,
+        .span = audit_span,
+        .ty = 0,
+        .kind = .{ .wildcard = {} },
+    });
+    try table.append(allocator, .{
+        .id = 1,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .binding = .{
+            .name = try allocator.dupe(u8, "bound"),
+            .mode = .{ .mut_ref = {} },
+            .mutable = true,
+        } },
+    });
+    // Two more bindings, one per `BindMode` the fixture above does not reach,
+    // so every mode's wire spelling is read back.
+    inline for (.{ exprs.BindMode.value, exprs.BindMode.shared_ref }, 0..) |mode, index| {
+        try table.append(allocator, .{
+            .id = @intCast(100 + index),
+            .span = audit_span,
+            .ty = null,
+            .kind = .{ .binding = .{
+                .name = try allocator.dupe(u8, "mode_bound"),
+                .mode = mode,
+                .mutable = false,
+            } },
+        });
+    }
+    // A literal pattern: the arm `encodePatternKind` writes and the decoder
+    // used to reject on the way back in.
+    try table.append(allocator, .{
+        .id = 2,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{
+            .text = try allocator.dupe(u8, "0xFF"),
+            .value = 0xFF,
+            .base = .hex,
+            .ty_suffix = try allocator.dupe(u8, "u8"),
+        } } },
+    });
+    try table.append(allocator, .{
+        .id = 3,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .path = .{
+            .def = 12,
+            .variant = try allocator.dupe(u8, "Probe"),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = 4,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .tuple = .{
+            .elements = try allocator.dupe(exprs.NodeId, &.{ 1, 2 }),
+            .rest = true,
+        } },
+    });
+    try table.append(allocator, .{
+        .id = 5,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .slice = .{
+            .elements = try allocator.dupe(exprs.NodeId, &.{1}),
+            .rest = 3,
+        } },
+    });
+    const field_pats = try allocator.alloc(exprs.FieldPat, 2);
+    field_pats[0] = .{
+        .field = try allocator.dupe(u8, "x"),
+        .pat = 1,
+        .shorthand = false,
+    };
+    field_pats[1] = .{
+        .field = try allocator.dupe(u8, "y"),
+        .pat = null,
+        .shorthand = true,
+    };
+    try table.append(allocator, .{
+        .id = 6,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .struct_pat = .{ .def = 12, .fields = field_pats, .rest = true } },
+    });
+    try table.append(allocator, .{
+        .id = 7,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .reference = .{ .mode = .{ .shared_ref = {} }, .inner = 1 } },
+    });
+    try table.append(allocator, .{
+        .id = 8,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .@"or" = .{ .alternatives = try allocator.dupe(exprs.NodeId, &.{ 1, 3 }) } },
+    });
+    // An open-ended range: both bounds null, so a decoder that swapped `lo`
+    // and `hi` still has to reproduce nulls in the right slots.
+    try table.append(allocator, .{
+        .id = 9,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .range = .{ .lo = null, .hi = 2, .inclusive = true } },
+    });
+    // A variant owned by an enum from outside this crate: the owner path has
+    // no entity id at all, and both a bound and a shorthand field are set so
+    // neither the optional pattern nor the optional rest reads back defaulted.
+    const external_field_pats = try allocator.alloc(exprs.FieldPat, 2);
+    external_field_pats[0] = .{
+        .field = try allocator.dupe(u8, "0"),
+        .pat = 4,
+        .shorthand = false,
+    };
+    external_field_pats[1] = .{
+        .field = try allocator.dupe(u8, "rest"),
+        .pat = null,
+        .shorthand = true,
+    };
+    try table.append(allocator, .{
+        .id = 10,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .external_variant = .{
+            .owner = .{
+                .path = try allocator.dupe([]const u8, &.{ "core", "option", "Option" }),
+                .args = try allocator.dupe(types.Type, &.{.{ .prim = .u8 }}),
+            },
+            .variant = try allocator.dupe(u8, "Some"),
+            .fields = external_field_pats,
+            .rest = true,
+        } },
+    });
+
+    return table.toOwnedSlice(allocator);
+}
+
+/// One expression row per `ExprKind` arm. Cross-references point at rows in
+/// this same table; the codec does not resolve them, so the audit reads the
+/// ids back rather than the nodes.
+fn auditExprTable(allocator: std.mem.Allocator) ![]const exprs.Expr {
+    var table: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    errdefer {
+        for (table.items) |expression| freeDecodedExpr(allocator, expression);
+        table.deinit(allocator);
+    }
+
+    // Every `Literal` arm, since `Literal` is a union of its own and a codec
+    // that forgot one of them would drop the value silently.
+    const literal_arms = [_]exprs.Literal{
+        .{ .int = .{
+            .text = try allocator.dupe(u8, "1"),
+            .value = 1,
+            .base = .dec,
+            .ty_suffix = try allocator.dupe(u8, "u8"),
+        } },
+        .{ .float = .{
+            .text = try allocator.dupe(u8, "1.5"),
+            .value = 1.5,
+        } },
+        .{ .character = .{
+            .text = try allocator.dupe(u8, "'a'"),
+            .value = 'a',
+        } },
+        .{ .string = .{ .bytes = try allocator.dupe(u8, "probe") } },
+        .{ .byte_array = .{ .items = try allocator.dupe(u8, &.{ 1, 2, 255 }) } },
+        .{ .boolean = true },
+    };
+    for (literal_arms) |literal| {
+        try table.append(allocator, .{
+            .id = @intCast(table.items.len),
+            .span = audit_span,
+            .ty = null,
+            .kind = .{ .literal = literal },
+        });
+    }
+
+    const expr_count = table.items.len;
+    try table.append(allocator, .{
+        .id = @intCast(expr_count),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{
+            .vec_lit = .{
+                .elements = try allocator.dupe(exprs.NodeId, &.{0}),
+                // The dynamic count: an expression node, not a held number.
+                .repeat = .{ .expression = 1 },
+            },
+        },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 1),
+        .span = audit_span,
+        .ty = 0,
+        .kind = .{ .path = .{
+            .def = 5,
+            .generic_args = try allocator.dupe(types.Type, &.{.{ .prim = .u32 }}),
+        } },
+    });
+    // A labelled block that carries its own value: the label travels with the
+    // block and the tail is a real node id, not unit.
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 2),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = try allocator.dupe(exprs.NodeId, &.{0}),
+            .tail = 1,
+            .labelled = try allocator.dupe(u8, "outer"),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 3),
+        .span = audit_span,
+        .ty = null,
+        .kind = .unit,
+    });
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 4),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{
+            .if_else = .{
+                .cond = 0,
+                .then_ = .{
+                    .statements = emptySlice(exprs.NodeId, allocator),
+                    .tail = null,
+                    .labelled = try allocator.dupe(u8, "then"),
+                },
+                // The `else` arm that owns a block, so its label is read back too.
+                .@"else" = .{ .block = .{
+                    .statements = try allocator.dupe(exprs.NodeId, &.{1}),
+                    .tail = 0,
+                    .labelled = try allocator.dupe(u8, "otherwise"),
+                } },
+            },
+        },
+    });
+    // An `if` with no `else` at all, so the `.none` branch of `ElseBranch` is
+    // exercised rather than inferred from the other two.
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 40),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{
+            .if_else = .{
+                .cond = 0,
+                .then_ = .{
+                    .statements = emptySlice(exprs.NodeId, allocator),
+                    .tail = 1,
+                    .labelled = null,
+                },
+                .@"else" = .none,
+            },
+        },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 5),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{
+            .if_let = .{
+                .pattern = 0,
+                .scrutinee = 1,
+                .then_ = .{
+                    .statements = emptySlice(exprs.NodeId, allocator),
+                    .tail = 2,
+                    .labelled = null,
+                },
+                // The `else` arm that names another if node.
+                .@"else" = .{ .chain = 2 },
+            },
+        },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 6),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .match = .{
+            .scrutinee = 0,
+            .arms = try allocator.dupe(exprs.MatchArm, &.{
+                .{ .patterns = try allocator.dupe(exprs.NodeId, &.{ 0, 1 }), .guard = 2, .body = 3 },
+                .{ .patterns = try allocator.dupe(exprs.NodeId, &.{2}), .guard = null, .body = 0 },
+            }),
+            .option_scrutinee = true,
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 7),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .loop_ = .{ .body = .{
+            .statements = try allocator.dupe(exprs.NodeId, &.{0}),
+            .tail = null,
+            .labelled = try allocator.dupe(u8, "spin"),
+        } } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(expr_count + 8),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{
+            .while_ = .{
+                .cond = 0,
+                .body = .{
+                    .statements = emptySlice(exprs.NodeId, allocator),
+                    .tail = 1,
+                    .labelled = null,
+                },
+                // The optional pattern capture, which must not read back as null.
+                .capture = 2,
+            },
+        },
+    });
+    // Every IterKind arm, so a `for` over a chain survives the wire too.
+    const multi = try allocator.dupe(exprs.NodeId, &.{ 0, 1 });
+    const iter_kinds = [_]exprs.IterKind{
+        .{ .range = {} },
+        .{ .slice = {} },
+        .{ .enumerate = {} },
+        .{ .multi = multi },
+        .{
+            .adapter = .{
+                .source = 0,
+                .adapters = try auditIteratorAdapters(allocator),
+                // The third terminal: `collect_vec` rides the standalone chain
+                // above, so each spelling is written and read back once.
+                .terminal = .sum,
+            },
+        },
+    };
+    for (iter_kinds, 0..) |iter_kind, index| {
+        try table.append(allocator, .{
+            .id = @intCast(expr_count + 9 + index),
+            .span = audit_span,
+            .ty = null,
+            .kind = .{ .for_ = .{
+                .pattern = 0,
+                .iterable = 1,
+                .body = .{
+                    .statements = emptySlice(exprs.NodeId, allocator),
+                    .tail = 2,
+                    .labelled = null,
+                },
+                .iter_kind = iter_kind,
+            } },
+        });
+    }
+    const labelled_break = table.items.len;
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break),
+        .span = audit_span,
+        .ty = null,
+        // Both optional fields set: a break with a label AND a value.
+        .kind = .{ .break_ = .{
+            .label = try allocator.dupe(u8, "outer"),
+            .value = 0,
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 1),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .break_ = .{ .label = null, .value = null } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 2),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .continue_ = .{ .label = try allocator.dupe(u8, "outer") } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 3),
+        .span = audit_span,
+        .ty = null,
+        // Every CallKind arm in turn; all three carry a def id.
+        .kind = .{ .call = .{
+            .call_kind = .{ .constructor = 9 },
+            .args = try allocator.dupe(exprs.NodeId, &.{ 0, 1, 2 }),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 4),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .call = .{
+            .call_kind = .{ .free = 1 },
+            .args = emptySlice(exprs.NodeId, allocator),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 5),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .call = .{
+            .call_kind = .{ .associated = 2 },
+            .args = try allocator.dupe(exprs.NodeId, &.{0}),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 6),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{
+            .method_call = .{
+                .receiver = 0,
+                // The receiver mode that is not the default `value`.
+                .receiver_mode = .mutable,
+                .method = 3,
+                .args = try allocator.dupe(exprs.NodeId, &.{1}),
+            },
+        },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 7),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{
+            .struct_lit = .{
+                .def = 4,
+                .fields = try allocator.dupe(exprs.FieldInit, &.{
+                    // Shorthand and non-shorthand in one list, so the flag is read.
+                    .{ .field = try allocator.dupe(u8, "x"), .value = 0, .shorthand = true },
+                    .{ .field = try allocator.dupe(u8, "y"), .value = 1, .shorthand = false },
+                }),
+                // The deferred `..base` edge, which must not read back as null.
+                .base = 2,
+            },
+        },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 8),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .enum_variant = .{
+            .def = 5,
+            .variant = try allocator.dupe(u8, "Probe"),
+            .tuple_fields = try allocator.dupe(exprs.NodeId, &.{0}),
+            .named_fields = try allocator.dupe(exprs.FieldInit, &.{
+                .{ .field = try allocator.dupe(u8, "z"), .value = 2, .shorthand = false },
+            }),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 9),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .field = .{ .base = 0, .field = try allocator.dupe(u8, "x"), .resolved = 6 } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 10),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .index = .{ .base = 0, .index = 1 } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 11),
+        .span = audit_span,
+        .ty = null,
+        // The operator and overflow pairs that are not the defaults.
+        .kind = .{ .binary = .{
+            .op = .boolean_or,
+            .overflow = .saturating,
+            .lhs = 0,
+            .rhs = 1,
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 12),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .unary = .{ .op = .{ .ref = .shared }, .operand = 0 } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 13),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .unary = .{ .op = .deref, .operand = 0 } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 14),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .assign = .{
+            .target = 0,
+            .op = .shl,
+            .value = 1,
+            .overflow = .wrapping,
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 15),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .try_ = .{ .inner = 0 } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 16),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .return_ = .{ .value = 0 } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 17),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .return_ = .{ .value = null } },
+    });
+    // A closure: every field it declares, including a capture whose name the
+    // decoder has to own and a body block with its own label.
+    // One capture per `CaptureMode`, so each mode's wire spelling is read back
+    // rather than the one the fixture happened to pick.
+    const closure_captures = try allocator.alloc(exprs.Capture, 3);
+    inline for (.{
+        exprs.CaptureMode.by_value,
+        exprs.CaptureMode.by_ref,
+        exprs.CaptureMode.by_mut_ref,
+    }, 0..) |mode, index| {
+        closure_captures[index] = .{
+            .name = try allocator.dupe(u8, "acc"),
+            .mode = mode,
+            .ty = 3,
+        };
+    }
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 18),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .closure = .{
+            .captures = closure_captures,
+            .params = try allocator.dupe(exprs.NodeId, &.{ 0, 1 }),
+            .return_ty = 4,
+            .body = .{
+                .statements = try allocator.dupe(exprs.NodeId, &.{2}),
+                .tail = 3,
+                .labelled = try allocator.dupe(u8, "mapped"),
+            },
+            .trait = .fn_mut,
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 19),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .closure = .{
+            .captures = emptySlice(exprs.Capture, allocator),
+            .params = emptySlice(exprs.NodeId, allocator),
+            .return_ty = null,
+            .body = .{
+                .statements = emptySlice(exprs.NodeId, allocator),
+                .tail = null,
+                .labelled = null,
+            },
+            .trait = .@"fn",
+        } },
+    });
+    // A standalone iterator chain: every adapter arm, including the `other`
+    // refusal, whose owned reason string has to survive. The terminal is the
+    // one a defaulted decode would not produce, so a chain written without the
+    // field on the wire fails here instead of passing as a bare iterator.
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 20),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .iterator_chain = .{
+            .source = 0,
+            .adapters = try auditIteratorAdapters(allocator),
+            .terminal = .collect_vec,
+        } },
+    });
+    // The explicit refusal: both of its fields, with the version that is not
+    // the one `ts_ext` defaults to.
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 21),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .unsupported = .{
+            .reason = try allocator.dupe(u8, "proc macro"),
+            .suggested_version = .v2,
+        } },
+    });
+
+    // The arms the model gained after the codec was written. Each is set to a
+    // payload a defaulted decode would not produce, so a decoder that drops
+    // the payload fails here instead of passing on a defaulted row.
+    // `[a, b, c]` with a held repeat count, plus the list form whose count is
+    // the element count and therefore absent.
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 22),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .array = .{
+            .elements = try allocator.dupe(exprs.NodeId, &.{ 0, 1 }),
+            .repeat = 4,
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 23),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .array = .{
+            .elements = try allocator.dupe(exprs.NodeId, &.{0}),
+            .repeat = null,
+        } },
+    });
+    // A bounded inclusive range, then an open-ended one, so the absent end is
+    // read back as null instead of a fabricated node id.
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 24),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .range = .{ .start = 0, .end = 1, .inclusive = true } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 25),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .range = .{ .start = 2, .end = null, .inclusive = false } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 26),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .panic_ = .{ .message = try allocator.dupe(u8, "index out of range") } },
+    });
+    // A core call and a core function item: the same core function name read
+    // twice through two different arms, each carrying its type arguments.
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 27),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .core_call = .{
+            .function = .mem_size_of_val,
+            .generic_args = try allocator.dupe(types.Type, &.{.{ .prim = .u32 }}),
+            .args = try allocator.dupe(exprs.NodeId, &.{0}),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 28),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .core_function = .{
+            .function = .mem_size_of_val,
+            .generic_args = try allocator.dupe(types.Type, &.{.{ .prim = .u32 }}),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 29),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .external_variant = .{
+            .owner = .{
+                .path = try allocator.dupe([]const u8, &.{ "core", "option", "Option" }),
+                .args = try allocator.dupe(types.Type, &.{.{ .prim = .u8 }}),
+            },
+            .variant = try allocator.dupe(u8, "Some"),
+            .tuple_fields = try allocator.dupe(exprs.NodeId, &.{0}),
+            .named_fields = try allocator.dupe(exprs.FieldInit, &.{
+                .{ .field = try allocator.dupe(u8, "z"), .value = 2, .shorthand = false },
+            }),
+        } },
+    });
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 30),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .format_write = .{
+            .writer = 0,
+            .template = try allocator.dupe(u8, "{} {}\n"),
+            .args = try allocator.dupe(exprs.NodeId, &.{ 1, 2 }),
+        } },
+    });
+    // The conversion that is not the default `as`: `primitive_from` writes a
+    // different wire spelling and has to read back as the same conversion.
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 31),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .cast = .{
+            .kind = .primitive_from,
+            .operand = 0,
+            .source_type = .{ .prim = .u64 },
+            .target = 1,
+        } },
+    });
+    // `value as u8` over a slice source: the composite source type has to
+    // survive the wire, so it is allocator-owned like every other fixture row.
+    const cast_source = try allocator.create(types.Slice);
+    cast_source.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    try table.append(allocator, .{
+        .id = @intCast(labelled_break + 32),
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .cast = .{
+            .kind = .as_,
+            .operand = 1,
+            .source_type = .{ .slice = cast_source },
+            .target = 2,
+        } },
+    });
+
+    return table.toOwnedSlice(allocator);
+}
+
+/// The seven `IteratorAdapter` arms, with the payload of each one that has
+/// one set to something a defaulted decode would not produce.
+fn auditIteratorAdapters(allocator: std.mem.Allocator) ![]const exprs.IteratorAdapter {
+    // Every slice here is allocator-owned for the same reason the node fixture
+    // rows are: one teardown releases each row, so a static slice beside a
+    // heap one would be freed twice over.
+    const map_closure: exprs.ClosureExpr = .{
+        .captures = emptySlice(exprs.Capture, allocator),
+        .params = emptySlice(exprs.NodeId, allocator),
+        .return_ty = null,
+        .body = .{
+            .statements = emptySlice(exprs.NodeId, allocator),
+            .tail = 0,
+            .labelled = null,
+        },
+        .trait = .@"fn",
+    };
+    const filter_params = try allocator.dupe(exprs.NodeId, &.{1});
+    const filter_closure: exprs.ClosureExpr = .{
+        .captures = emptySlice(exprs.Capture, allocator),
+        .params = filter_params,
+        .return_ty = 1,
+        .body = .{
+            .statements = emptySlice(exprs.NodeId, allocator),
+            .tail = 0,
+            .labelled = null,
+        },
+        .trait = .fn_once,
+    };
+    // `flat_map` carries the closure directly, so it needs its own closure
+    // value rather than the wrapped one `map` uses.
+    const flat_map_params = try allocator.dupe(exprs.NodeId, &.{2});
+    const flat_map_closure: exprs.ClosureExpr = .{
+        .captures = emptySlice(exprs.Capture, allocator),
+        .params = flat_map_params,
+        .return_ty = 2,
+        .body = .{
+            .statements = emptySlice(exprs.NodeId, allocator),
+            .tail = 1,
+            .labelled = null,
+        },
+        .trait = .@"fn",
+    };
+    const adapters = try allocator.alloc(exprs.IteratorAdapter, 7);
+    adapters[0] = .{ .map = .{ .closure = map_closure } };
+    adapters[1] = .{ .filter = .{ .closure = filter_closure } };
+    adapters[2] = .{ .flat_map = flat_map_closure };
+    adapters[3] = .{ .enumerate = {} };
+    adapters[4] = .{ .zip = .{ .other = 7 } };
+    adapters[5] = .{ .range_rev = {} };
+    adapters[6] = .{ .other = .{
+        .reason = try allocator.dupe(u8, "needs v3"),
+        .suggested_version = .v3,
+    } };
+    return adapters;
+}
+
+/// One statement row per `StatementKind` arm.
+fn auditStatementTable(allocator: std.mem.Allocator) ![]const exprs.Statement {
+    var table: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    errdefer {
+        for (table.items) |statement| freeDecodedStatement(allocator, statement);
+        table.deinit(allocator);
+    }
+    try table.append(allocator, .{
+        .id = 0,
+        .span = audit_span,
+        .ty = null,
+        // Both optional fields set: an initialiser and an explicit type.
+        .kind = .{ .let = .{ .pattern = 0, .init = 1, .ty = 2 } },
+    });
+    try table.append(allocator, .{
+        .id = 1,
+        .span = audit_span,
+        .ty = null,
+        // The uninitialised and untyped `let`, so the nulls read back null.
+        .kind = .{ .let = .{ .pattern = 1, .init = null, .ty = null } },
+    });
+    try table.append(allocator, .{
+        .id = 2,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .let_else = .{
+            .pattern = 2,
+            .init = 3,
+            .else_block = .{
+                .statements = try allocator.dupe(exprs.NodeId, &.{0}),
+                .tail = 1,
+                .labelled = try allocator.dupe(u8, "diverging"),
+            },
+        } },
+    });
+    try table.append(allocator, .{
+        .id = 3,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .expr = 4 },
+    });
+    try table.append(allocator, .{
+        .id = 4,
+        .span = audit_span,
+        .ty = null,
+        .kind = .{ .item = 5 },
+    });
+    return table.toOwnedSlice(allocator);
+}
+
+/// One body row per `BodyKind` arm, with the optional and defaulted fields of
+/// each set away from their defaults.
+fn auditBodyTable(allocator: std.mem.Allocator) ![]const BodyKind {
+    var table: std.ArrayListUnmanaged(BodyKind) = .empty;
+    errdefer {
+        for (table.items) |body| freeDecodedBodyKind(allocator, body);
+        table.deinit(allocator);
+    }
+
+    try table.append(allocator, .none);
+    // A `Result` payload, so a const body whose type is a pointer-carrying arm
+    // is checked for a flattened (and so wrong) decode.
+    const const_result = try allocator.create(types.Result);
+    const_result.* = .{
+        .ok = .{ .prim = .u8 },
+        .err = .{ .prim = .u16 },
+        .is_error_unionable = true,
+    };
+    try table.append(allocator, .{ .const_ = .{
+        .ty = .{ .result = const_result },
+        .init = 0,
+    } });
+
+    const parameter_type = try allocator.create(types.Type);
+    parameter_type.* = .{ .prim = .usize };
+    const parameters = try allocator.alloc(items.Param, 1);
+    parameters[0] = .{
+        .name = try allocator.dupe(u8, "input"),
+        // A nested type, so a decoder that flattens the pointer fails.
+        .ty = .{ .option = parameter_type },
+        .span = audit_span,
+    };
+    try table.append(allocator, .{
+        .fn_ = .{
+            .params = parameters,
+            .ret = .{ .prim = .bool },
+            // Non-empty generic params, and the flag that defaults to false.
+            .generic_params = try allocator.dupe([]const u8, &.{"T"}),
+            .body = 1,
+            .is_allocating = true,
+        },
+    });
+
+    // A struct whose fields carry their own visibility and span, and whose
+    // methods carry a receiver mode and the same allocation flag.
+    // The field-slot binding type: the type a binding of this field is declared
+    // with. It has to reach the wire, or a field binding reads back with a
+    // type the declaration never said.
+    const slot_type = try allocator.create(types.Type);
+    slot_type.* = .{ .prim = .u32 };
+    const struct_fields = try allocator.alloc(items.Field, 1);
+    struct_fields[0] = .{
+        .name = try allocator.dupe(u8, "slot"),
+        .ty = .{ .boxed = slot_type },
+        .visibility = .{ .in_path = try allocator.dupe(u8, "crate::field") },
+        .span = audit_span,
+    };
+    const struct_methods = try allocator.alloc(StructMethod, 1);
+    struct_methods[0] = .{
+        .name = try allocator.dupe(u8, "method"),
+        .visibility = .private,
+        .params = emptySlice(items.Param, allocator),
+        .ret = .{ .prim = .i8 },
+        .generic_params = emptySlice([]const u8, allocator),
+        .body = 2,
+        .receiver = .mut_ref,
+        .is_allocating = true,
+    };
+    try table.append(allocator, .{
+        .struct_ = .{
+            .generic_params = try allocator.dupe([]const u8, &.{"T"}),
+            .trait_bounds = try allocator.dupe([]const u8, &.{"Clone"}),
+            // The layout arm that is not `named`.
+            .layout = .tuple,
+            .fields = struct_fields,
+            .methods = struct_methods,
+            .has_dynamic_resources = true,
+        },
+    });
+
+    const variant_tuple_types = try allocator.dupe(types.Type, &.{.{ .prim = .f32 }});
+    const enum_variants = try allocator.alloc(items.Variant, 3);
+    enum_variants[0] = .{
+        .name = try allocator.dupe(u8, "Unit"),
+        .fields = .none,
+        .discriminant = null,
+    };
+    enum_variants[1] = .{
+        .name = try allocator.dupe(u8, "Tup"),
+        .fields = .{ .tuple = variant_tuple_types },
+        .discriminant = 3,
+    };
+    const variant_named_fields = try allocator.alloc(items.Field, 1);
+    variant_named_fields[0] = .{
+        .name = try allocator.dupe(u8, "named"),
+        .ty = .{ .prim = .char },
+        .visibility = .crate_restricted,
+        .span = audit_span,
+    };
+    enum_variants[2] = .{
+        .name = try allocator.dupe(u8, "Named"),
+        .fields = .{ .named = variant_named_fields },
+        .discriminant = -4,
+    };
+    try table.append(allocator, .{
+        .enum_ = .{
+            // The kind that is not the `c_like` default.
+            .kind = .mixed,
+            .variants = enum_variants,
+            .repr_int = .i128,
+            .non_exhaustive = true,
+        },
+    });
+
+    const trait_methods = try allocator.alloc(TraitMethodSig, 1);
+    trait_methods[0] = .{
+        .name = try allocator.dupe(u8, "required"),
+        .params = emptySlice(items.Param, allocator),
+        .ret = .{ .prim = .u64 },
+        // The receiver mode that is not the `ref_` default.
+        .receiver = .owned,
+    };
+    try table.append(allocator, .{ .trait_ = .{
+        .name = try allocator.dupe(u8, "Probe"),
+        .supertraits = try allocator.dupe([]const u8, &.{"Base"}),
+        .methods = trait_methods,
+    } });
+
+    try table.append(allocator, .{ .type_alias = .{ .target = .{
+        .generic_inst = .{
+            .decl = 42,
+            .args = .{ .params = try allocator.dupe(types.Type, &.{.{ .prim = .i16 }}) },
+        },
+    } } });
+
+    return table.toOwnedSlice(allocator);
+}
+
+/// Mark which arms of `tag_type` appear in `rows`, alongside the arm names so an
+/// uncovered arm can be reported by name rather than by index.
+fn Arms(comptime tag_type: type) type {
+    return struct {
+        const fields = std.meta.fields(tag_type);
+        seen: [fields.len]bool = @splat(false),
+
+        /// Mark an arm by its tag. `tag_type` is a tagged union or a plain
+        /// enum — both answer `@intFromEnum` on their active tag — so the two
+        /// kinds of node tag and of plain discriminator share this helper.
+        fn mark(self: *@This(), tag: anytype) void {
+            self.seen[@intFromEnum(tag)] = true;
+        }
+
+        /// Report, by name, every arm the fixture did not exercise.
+        fn expectComplete(self: *const @This(), comptime label: []const u8) !void {
+            inline for (fields, 0..) |field, tag| {
+                if (!self.seen[tag]) {
+                    std.debug.print(
+                        "arm `{s}` of {s} is not exercised by the round-trip audit\n",
+                        .{ field.name, label },
+                    );
+                    return error.ArmNotCovered;
+                }
+            }
+        }
+    };
+}
+
+/// The coverage gate for every union the wire carries. An arm added to the
+/// model after this fixture was written leaves one arm unexercised here and
+/// the test fails naming that arm — rather than the new shape crossing the
+/// wire with nothing on either side of it proving it survives.
+fn expectEveryArmCovered(
+    expressions: []const exprs.Expr,
+    statements: []const exprs.Statement,
+    patterns: []const exprs.Pattern,
+    type_table: []const types.Type,
+    bodies: []const BodyKind,
+) !void {
+    var expr_arms = Arms(exprs.ExprKind){};
+    var statement_arms = Arms(exprs.StatementKind){};
+    var pattern_arms = Arms(exprs.PatternKind){};
+    var type_arms = Arms(types.Type){};
+    var body_arms = Arms(BodyKind){};
+    var literal_arms = Arms(exprs.Literal){};
+    var iter_kind_arms = Arms(exprs.IterKind){};
+    var adapter_arms = Arms(exprs.IteratorAdapter){};
+    var else_arms = Arms(exprs.ElseBranch){};
+    var trait_arms = Arms(exprs.ClosureTrait){};
+    var capture_mode_arms = Arms(exprs.CaptureMode){};
+    var bind_mode_arms = Arms(exprs.BindMode){};
+
+    for (expressions) |row| {
+        expr_arms.mark(std.meta.activeTag(row.kind));
+        switch (row.kind) {
+            .literal => |literal| literal_arms.mark(std.meta.activeTag(literal)),
+            .if_else => |branch| else_arms.mark(std.meta.activeTag(branch.@"else")),
+            .if_let => |branch| else_arms.mark(std.meta.activeTag(branch.@"else")),
+            .for_ => |for_expr| {
+                iter_kind_arms.mark(std.meta.activeTag(for_expr.iter_kind));
+                switch (for_expr.iter_kind) {
+                    .adapter => |chain| markAdapters(chain, &adapter_arms, &trait_arms),
+                    else => {},
+                }
+            },
+            .iterator_chain => |chain| markAdapters(chain, &adapter_arms, &trait_arms),
+            .closure => |closure| {
+                trait_arms.mark(closure.trait);
+                for (closure.captures) |capture| capture_mode_arms.mark(capture.mode);
+            },
+            else => {},
+        }
+    }
+    for (statements) |row| statement_arms.mark(std.meta.activeTag(row.kind));
+    for (patterns) |row| {
+        pattern_arms.mark(std.meta.activeTag(row.kind));
+        switch (row.kind) {
+            .literal => |literal| literal_arms.mark(std.meta.activeTag(literal)),
+            .binding => |binding| bind_mode_arms.mark(std.meta.activeTag(binding.mode)),
+            .reference => |reference| bind_mode_arms.mark(std.meta.activeTag(reference.mode)),
+            else => {},
+        }
+    }
+    for (type_table) |ty| type_arms.mark(std.meta.activeTag(ty));
+    for (bodies) |body| body_arms.mark(std.meta.activeTag(body));
+
+    try expr_arms.expectComplete("exprs.ExprKind");
+    try statement_arms.expectComplete("exprs.StatementKind");
+    try pattern_arms.expectComplete("exprs.PatternKind");
+    try type_arms.expectComplete("types.Type");
+    try body_arms.expectComplete("BodyKind");
+    try literal_arms.expectComplete("exprs.Literal");
+    try iter_kind_arms.expectComplete("exprs.IterKind");
+    try adapter_arms.expectComplete("exprs.IteratorAdapter");
+    try else_arms.expectComplete("exprs.ElseBranch");
+    try trait_arms.expectComplete("exprs.ClosureTrait");
+    try capture_mode_arms.expectComplete("exprs.CaptureMode");
+    try bind_mode_arms.expectComplete("exprs.BindMode");
+}
+
+/// Mark every adapter arm a chain reaches, and the closure traits its `map`,
+/// `filter` and `flat_map` adapters close as.
+fn markAdapters(
+    chain: exprs.IteratorChainExpr,
+    adapter_arms: *Arms(exprs.IteratorAdapter),
+    trait_arms: *Arms(exprs.ClosureTrait),
+) void {
+    for (chain.adapters) |adapter| {
+        adapter_arms.mark(std.meta.activeTag(adapter));
+        switch (adapter) {
+            .map => |map| trait_arms.mark(map.closure.trait),
+            .filter => |filter| trait_arms.mark(filter.closure.trait),
+            .flat_map => |closure| trait_arms.mark(closure.trait),
+            else => {},
+        }
+    }
+}
+
+/// Assert that every decoded row matches the one that was encoded, field by
+/// field. A row the codec cannot describe is a decode error before this runs;
+/// a field it cannot read is a mismatch here.
+fn expectDecodedExprsMatch(
+    encoded: []const exprs.Expr,
+    decoded: []const exprs.Expr,
+) !void {
+    try std.testing.expectEqual(encoded.len, decoded.len);
+    for (encoded, decoded) |before, after| {
+        try std.testing.expectEqual(before.id, after.id);
+        try std.testing.expectEqual(before.span, after.span);
+        try std.testing.expectEqual(before.ty, after.ty);
+        try expectDecodedExprKindMatches(before.kind, after.kind);
+    }
+}
+
+fn expectDecodedBlockMatches(
+    before: exprs.BlockExpr,
+    after: exprs.BlockExpr,
+) !void {
+    try std.testing.expectEqualSlices(exprs.NodeId, before.statements, after.statements);
+    try std.testing.expectEqual(before.tail, after.tail);
+    if (before.labelled) |label| {
+        try std.testing.expectEqualStrings(label, after.labelled orelse return error.LostLabel);
+    } else {
+        try std.testing.expect(after.labelled == null);
+    }
+}
+
+fn expectDecodedLiteralMatches(before: exprs.Literal, after: exprs.Literal) !void {
+    if (std.meta.activeTag(before) != std.meta.activeTag(after)) {
+        return error.LiteralArmMismatch;
+    }
+    switch (before) {
+        .int => |literal| {
+            try std.testing.expectEqualStrings(literal.text, after.int.text);
+            try std.testing.expectEqual(literal.value, after.int.value);
+            try std.testing.expectEqual(literal.base, after.int.base);
+            if (literal.ty_suffix) |suffix| {
+                try std.testing.expectEqualStrings(
+                    suffix,
+                    after.int.ty_suffix orelse return error.LostLiteralSuffix,
+                );
+            } else {
+                try std.testing.expect(after.int.ty_suffix == null);
+            }
+        },
+        .float => |literal| {
+            try std.testing.expectEqualStrings(literal.text, after.float.text);
+            try std.testing.expectEqual(literal.value, after.float.value);
+        },
+        .character => |literal| {
+            try std.testing.expectEqualStrings(literal.text, after.character.text);
+            try std.testing.expectEqual(literal.value, after.character.value);
+        },
+        .string => |literal| try std.testing.expectEqualStrings(literal.bytes, after.string.bytes),
+        .byte_array => |literal| {
+            try std.testing.expectEqualSlices(u8, literal.items, after.byte_array.items);
+        },
+        .boolean => |value| try std.testing.expectEqual(value, after.boolean),
+    }
+}
+
+fn expectDecodedClosureMatches(
+    before: exprs.ClosureExpr,
+    after: exprs.ClosureExpr,
+) !void {
+    try std.testing.expectEqual(before.captures.len, after.captures.len);
+    for (before.captures, after.captures) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqual(expected.mode, actual.mode);
+        try std.testing.expectEqual(expected.ty, actual.ty);
+    }
+    try std.testing.expectEqualSlices(exprs.NodeId, before.params, after.params);
+    try std.testing.expectEqual(before.return_ty, after.return_ty);
+    try expectDecodedBlockMatches(before.body, after.body);
+    try std.testing.expectEqual(before.trait, after.trait);
+}
+
+fn expectDecodedAdapterMatches(
+    before: exprs.IteratorAdapter,
+    after: exprs.IteratorAdapter,
+) !void {
+    if (std.meta.activeTag(before) != std.meta.activeTag(after)) {
+        return error.AdapterArmMismatch;
+    }
+    switch (before) {
+        .map => |adapter| try expectDecodedClosureMatches(adapter.closure, after.map.closure),
+        .filter => |adapter| try expectDecodedClosureMatches(adapter.closure, after.filter.closure),
+        .flat_map => |adapter| try expectDecodedClosureMatches(adapter, after.flat_map),
+        .enumerate => {},
+        .zip => |adapter| try std.testing.expectEqual(adapter.other, after.zip.other),
+        .range_rev => {},
+        .other => |adapter| {
+            try std.testing.expectEqualStrings(adapter.reason, after.other.reason);
+            try std.testing.expectEqual(
+                adapter.suggested_version,
+                after.other.suggested_version,
+            );
+        },
+    }
+}
+
+fn expectDecodedChainMatches(
+    before: exprs.IteratorChainExpr,
+    after: exprs.IteratorChainExpr,
+) !void {
+    try std.testing.expectEqual(before.source, after.source);
+    try std.testing.expectEqual(before.terminal, after.terminal);
+    try std.testing.expectEqual(before.adapters.len, after.adapters.len);
+    for (before.adapters, after.adapters) |expected, actual| {
+        try expectDecodedAdapterMatches(expected, actual);
+    }
+}
+
+fn expectDecodedElseMatches(
+    before: exprs.ElseBranch,
+    after: exprs.ElseBranch,
+) !void {
+    if (std.meta.activeTag(before) != std.meta.activeTag(after)) {
+        return error.ElseArmMismatch;
+    }
+    switch (before) {
+        .none => {},
+        .chain => |id| try std.testing.expectEqual(id, after.chain),
+        .block => |block| try expectDecodedBlockMatches(block, after.block),
+    }
+}
+
+fn expectDecodedFieldInitMatches(
+    before: []const exprs.FieldInit,
+    after: []const exprs.FieldInit,
+) !void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.field, actual.field);
+        try std.testing.expectEqual(expected.value, actual.value);
+        try std.testing.expectEqual(expected.shorthand, actual.shorthand);
+    }
+}
+
+fn expectDecodedExprKindMatches(
+    before: exprs.ExprKind,
+    after: exprs.ExprKind,
+) !void {
+    if (std.meta.activeTag(before) != std.meta.activeTag(after)) {
+        return error.ExprKindArmMismatch;
+    }
+    switch (before) {
+        .literal => |literal| try expectDecodedLiteralMatches(literal, after.literal),
+        .vec_lit => |vector| {
+            try std.testing.expectEqualSlices(exprs.NodeId, vector.elements, after.vec_lit.elements);
+            try std.testing.expectEqual(vector.repeat, after.vec_lit.repeat);
+        },
+        .array => |array| {
+            try std.testing.expectEqualSlices(exprs.NodeId, array.elements, after.array.elements);
+            try std.testing.expectEqual(array.repeat, after.array.repeat);
+        },
+        .range => |range_expr| {
+            try std.testing.expectEqual(range_expr.start, after.range.start);
+            try std.testing.expectEqual(range_expr.end, after.range.end);
+            try std.testing.expectEqual(range_expr.inclusive, after.range.inclusive);
+        },
+        .panic_ => |panic_expr| try std.testing.expectEqualStrings(
+            panic_expr.message,
+            after.panic_.message,
+        ),
+        .path => |path| {
+            try std.testing.expectEqual(path.def, after.path.def);
+            try std.testing.expectEqual(
+                path.generic_args.len,
+                after.path.generic_args.len,
+            );
+        },
+        .block => |block| try expectDecodedBlockMatches(block, after.block),
+        .unit => {},
+        .if_else => |branch| {
+            try std.testing.expectEqual(branch.cond, after.if_else.cond);
+            try expectDecodedBlockMatches(branch.then_, after.if_else.then_);
+            try expectDecodedElseMatches(branch.@"else", after.if_else.@"else");
+        },
+        .if_let => |branch| {
+            try std.testing.expectEqual(branch.pattern, after.if_let.pattern);
+            try std.testing.expectEqual(branch.scrutinee, after.if_let.scrutinee);
+            try expectDecodedBlockMatches(branch.then_, after.if_let.then_);
+            try expectDecodedElseMatches(branch.@"else", after.if_let.@"else");
+        },
+        .match => |match_expr| {
+            try std.testing.expectEqual(match_expr.scrutinee, after.match.scrutinee);
+            try std.testing.expectEqual(match_expr.option_scrutinee, after.match.option_scrutinee);
+            try std.testing.expectEqual(match_expr.arms.len, after.match.arms.len);
+            for (match_expr.arms, after.match.arms) |expected, actual| {
+                try std.testing.expectEqualSlices(exprs.NodeId, expected.patterns, actual.patterns);
+                try std.testing.expectEqual(expected.guard, actual.guard);
+                try std.testing.expectEqual(expected.body, actual.body);
+            }
+        },
+        .loop_ => |loop_expr| try expectDecodedBlockMatches(
+            loop_expr.body,
+            after.loop_.body,
+        ),
+        .while_ => |while_expr| {
+            try std.testing.expectEqual(while_expr.cond, after.while_.cond);
+            try std.testing.expectEqual(while_expr.capture, after.while_.capture);
+            try expectDecodedBlockMatches(while_expr.body, after.while_.body);
+        },
+        .for_ => |for_expr| {
+            try std.testing.expectEqual(for_expr.pattern, after.for_.pattern);
+            try std.testing.expectEqual(for_expr.iterable, after.for_.iterable);
+            try expectDecodedBlockMatches(for_expr.body, after.for_.body);
+            switch (for_expr.iter_kind) {
+                .range => try std.testing.expect(after.for_.iter_kind == .range),
+                .slice => try std.testing.expect(after.for_.iter_kind == .slice),
+                .enumerate => try std.testing.expect(after.for_.iter_kind == .enumerate),
+                .multi => |ids| try std.testing.expectEqualSlices(
+                    exprs.NodeId,
+                    ids,
+                    after.for_.iter_kind.multi,
+                ),
+                .adapter => |chain| try expectDecodedChainMatches(
+                    chain,
+                    after.for_.iter_kind.adapter,
+                ),
+            }
+        },
+        .break_ => |break_expr| {
+            try std.testing.expectEqual(break_expr.value, after.break_.value);
+            if (break_expr.label) |label| {
+                try std.testing.expectEqualStrings(
+                    label,
+                    after.break_.label orelse return error.LostBreakLabel,
+                );
+            } else {
+                try std.testing.expect(after.break_.label == null);
+            }
+        },
+        .continue_ => |continuation| {
+            if (continuation.label) |label| {
+                try std.testing.expectEqualStrings(
+                    label,
+                    after.continue_.label orelse return error.LostContinueLabel,
+                );
+            } else {
+                try std.testing.expect(after.continue_.label == null);
+            }
+        },
+        .call => |call| {
+            try std.testing.expectEqualSlices(exprs.NodeId, call.args, after.call.args);
+            if (std.meta.activeTag(call.call_kind) !=
+                std.meta.activeTag(after.call.call_kind))
+            {
+                return error.CallKindArmMismatch;
+            }
+            switch (call.call_kind) {
+                .free => |def| try std.testing.expectEqual(def, after.call.call_kind.free),
+                .associated => |def| try std.testing.expectEqual(
+                    def,
+                    after.call.call_kind.associated,
+                ),
+                .constructor => |def| try std.testing.expectEqual(
+                    def,
+                    after.call.call_kind.constructor,
+                ),
+            }
+        },
+        .core_call => |core_call| {
+            try std.testing.expectEqual(core_call.function, after.core_call.function);
+            try expectTypeListsEqual(core_call.generic_args, after.core_call.generic_args);
+            try std.testing.expectEqualSlices(
+                exprs.NodeId,
+                core_call.args,
+                after.core_call.args,
+            );
+        },
+        .core_function => |core_function| {
+            try std.testing.expectEqual(core_function.function, after.core_function.function);
+            try expectTypeListsEqual(
+                core_function.generic_args,
+                after.core_function.generic_args,
+            );
+        },
+        .method_call => |method_call| {
+            try std.testing.expectEqual(method_call.receiver, after.method_call.receiver);
+            try std.testing.expectEqual(
+                method_call.receiver_mode,
+                after.method_call.receiver_mode,
+            );
+            try std.testing.expectEqual(method_call.method, after.method_call.method);
+            try std.testing.expectEqualSlices(
+                exprs.NodeId,
+                method_call.args,
+                after.method_call.args,
+            );
+        },
+        .struct_lit => |struct_lit| {
+            try std.testing.expectEqual(struct_lit.def, after.struct_lit.def);
+            try std.testing.expectEqual(struct_lit.base, after.struct_lit.base);
+            try expectDecodedFieldInitMatches(
+                struct_lit.fields,
+                after.struct_lit.fields,
+            );
+        },
+        .enum_variant => |variant| {
+            try std.testing.expectEqual(variant.def, after.enum_variant.def);
+            try std.testing.expectEqualStrings(
+                variant.variant,
+                after.enum_variant.variant,
+            );
+            try std.testing.expectEqualSlices(
+                exprs.NodeId,
+                variant.tuple_fields,
+                after.enum_variant.tuple_fields,
+            );
+            try expectDecodedFieldInitMatches(
+                variant.named_fields,
+                after.enum_variant.named_fields,
+            );
+        },
+        .external_variant => |external| {
+            try expectExternalNominalEquals(external.owner, after.external_variant.owner);
+            try std.testing.expectEqualStrings(
+                external.variant,
+                after.external_variant.variant,
+            );
+            try std.testing.expectEqualSlices(
+                exprs.NodeId,
+                external.tuple_fields,
+                after.external_variant.tuple_fields,
+            );
+            try expectDecodedFieldInitMatches(
+                external.named_fields,
+                after.external_variant.named_fields,
+            );
+        },
+        .format_write => |format_write| {
+            try std.testing.expectEqual(format_write.writer, after.format_write.writer);
+            try std.testing.expectEqualStrings(
+                format_write.template,
+                after.format_write.template,
+            );
+            try std.testing.expectEqualSlices(
+                exprs.NodeId,
+                format_write.args,
+                after.format_write.args,
+            );
+        },
+        .field => |field| {
+            try std.testing.expectEqual(field.base, after.field.base);
+            try std.testing.expectEqualStrings(field.field, after.field.field);
+            try std.testing.expectEqual(field.resolved, after.field.resolved);
+        },
+        .index => |index_expr| {
+            try std.testing.expectEqual(index_expr.base, after.index.base);
+            try std.testing.expectEqual(index_expr.index, after.index.index);
+        },
+        .cast => |cast| {
+            try std.testing.expectEqual(cast.kind, after.cast.kind);
+            try std.testing.expectEqual(cast.operand, after.cast.operand);
+            try expectTypesEqual(cast.source_type, after.cast.source_type);
+            try std.testing.expectEqual(cast.target, after.cast.target);
+        },
+        .binary => |binary| {
+            try std.testing.expectEqual(binary.op, after.binary.op);
+            try std.testing.expectEqual(binary.overflow, after.binary.overflow);
+            try std.testing.expectEqual(binary.lhs, after.binary.lhs);
+            try std.testing.expectEqual(binary.rhs, after.binary.rhs);
+        },
+        .unary => |unary| {
+            try std.testing.expectEqual(unary.operand, after.unary.operand);
+            switch (unary.op) {
+                .ref => |mode| try std.testing.expectEqual(
+                    mode,
+                    after.unary.op.ref,
+                ),
+                else => try std.testing.expectEqual(unary.op, after.unary.op),
+            }
+        },
+        .assign => |assign| {
+            try std.testing.expectEqual(assign.target, after.assign.target);
+            try std.testing.expectEqual(assign.op, after.assign.op);
+            try std.testing.expectEqual(assign.value, after.assign.value);
+            try std.testing.expectEqual(assign.overflow, after.assign.overflow);
+        },
+        .try_ => |try_expr| try std.testing.expectEqual(
+            try_expr.inner,
+            after.try_.inner,
+        ),
+        .return_ => |return_expr| try std.testing.expectEqual(
+            return_expr.value,
+            after.return_.value,
+        ),
+        .closure => |closure| try expectDecodedClosureMatches(
+            closure,
+            after.closure,
+        ),
+        .iterator_chain => |chain| try expectDecodedChainMatches(
+            chain,
+            after.iterator_chain,
+        ),
+        .unsupported => |unsupported| {
+            try std.testing.expectEqualStrings(
+                unsupported.reason,
+                after.unsupported.reason,
+            );
+            try std.testing.expectEqual(
+                unsupported.suggested_version,
+                after.unsupported.suggested_version,
+            );
+        },
+    }
+}
+
+/// The errors this structural-comparison group can return. These helpers are
+/// mutually recursive over `types.Type`, so an inferred error set cannot be
+/// resolved; naming it breaks the cycle the same way the codec above does.
+/// It is exactly what `std.testing` assertions produce, not `anyerror`.
+const TypeCompareError = error{ TestExpectedEqual, TestUnexpectedResult };
+
+/// An external nominal's Rust path is provenance, so it is compared segment
+/// by segment rather than by last name alone.
+fn expectExternalNominalEquals(
+    before: types.ExternalNominal,
+    after: types.ExternalNominal,
+) TypeCompareError!void {
+    try std.testing.expectEqual(before.path.len, after.path.len);
+    for (before.path, after.path) |segment, decoded_segment| {
+        try std.testing.expectEqualStrings(segment, decoded_segment);
+    }
+    try expectTypeListsEqual(before.args, after.args);
+}
+
+fn expectBoundsEqual(
+    before: []const types.Bound,
+    after: []const types.Bound,
+) TypeCompareError!void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |bound, decoded_bound| {
+        try std.testing.expectEqual(bound.optional, decoded_bound.optional);
+        try std.testing.expectEqual(
+            bound.path.segments.len,
+            decoded_bound.path.segments.len,
+        );
+        for (bound.path.segments, decoded_bound.path.segments) |segment, decoded_segment| {
+            try std.testing.expectEqualStrings(segment.name, decoded_segment.name);
+            try std.testing.expectEqual(segment.id, decoded_segment.id);
+        }
+        try expectTypeListsEqual(bound.args, decoded_bound.args);
+        try std.testing.expectEqual(
+            bound.associated_types.len,
+            decoded_bound.associated_types.len,
+        );
+        for (bound.associated_types, decoded_bound.associated_types) |
+            binding,
+            decoded_binding,
+        | {
+            try std.testing.expectEqualStrings(binding.name, decoded_binding.name);
+            try expectTypesEqual(binding.ty, decoded_binding.ty);
+        }
+    }
+}
+
+/// Compare two `types.Type` values structurally. A decoded type owns fresh
+/// slices at different addresses from the encoded one, so pointer equality is
+/// the wrong question at every depth a type nests.
+fn expectTypesEqual(before: types.Type, after: types.Type) TypeCompareError!void {
+    try std.testing.expectEqual(std.meta.activeTag(before), std.meta.activeTag(after));
+    switch (before) {
+        .path => |path| {
+            try std.testing.expectEqual(path.segments.len, after.path.segments.len);
+            for (path.segments, after.path.segments) |segment, decoded_segment| {
+                try std.testing.expectEqualStrings(segment.name, decoded_segment.name);
+                try std.testing.expectEqual(segment.id, decoded_segment.id);
+            }
+        },
+        .external_nominal => |external| try expectExternalNominalEquals(
+            external,
+            after.external_nominal,
+        ),
+        .prim => |prim| try std.testing.expectEqual(prim, after.prim),
+        .reference => |reference| {
+            try std.testing.expectEqual(reference.mut, after.reference.mut);
+            try expectTypesEqual(reference.pointee, after.reference.pointee);
+        },
+        .raw_ptr => |raw_ptr| {
+            try std.testing.expectEqual(raw_ptr.mut, after.raw_ptr.mut);
+            try expectTypesEqual(raw_ptr.pointee, after.raw_ptr.pointee);
+        },
+        .slice => |slice| {
+            try std.testing.expectEqual(slice.const_, after.slice.const_);
+            try expectTypesEqual(slice.elem, after.slice.elem);
+        },
+        .array => |array| {
+            try expectTypesEqual(array.elem, after.array.elem);
+            try std.testing.expectEqual(array.len, after.array.len);
+        },
+        .tuple => |tuple| {
+            try std.testing.expectEqual(tuple.len, after.tuple.len);
+            for (tuple, after.tuple) |element, decoded_element| {
+                try expectTypesEqual(element, decoded_element);
+            }
+        },
+        .fn_ptr => |fn_ptr| {
+            try std.testing.expectEqual(fn_ptr.params.len, after.fn_ptr.params.len);
+            for (fn_ptr.params, after.fn_ptr.params) |param, decoded_param| {
+                try expectTypesEqual(param, decoded_param);
+            }
+            try expectTypesEqual(fn_ptr.ret, after.fn_ptr.ret);
+        },
+        .generic_inst => |generic_inst| {
+            try std.testing.expectEqual(generic_inst.decl, after.generic_inst.decl);
+            try std.testing.expectEqual(
+                generic_inst.args.params.len,
+                after.generic_inst.args.params.len,
+            );
+            for (generic_inst.args.params, after.generic_inst.args.params) |
+                arg,
+                decoded_arg,
+            | {
+                try expectTypesEqual(arg, decoded_arg);
+            }
+        },
+        .option => |option| try expectTypesEqual(option.*, after.option.*),
+        .result => |result| {
+            try expectTypesEqual(result.ok, after.result.ok);
+            try expectTypesEqual(result.err, after.result.err);
+            try std.testing.expectEqual(
+                result.is_error_unionable,
+                after.result.is_error_unionable,
+            );
+        },
+        .boxed => |boxed| try expectTypesEqual(boxed.*, after.boxed.*),
+        .@"opaque" => |opaque_ty| {
+            try expectBoundsEqual(opaque_ty.bounds, after.@"opaque".bounds);
+            if (opaque_ty.concrete) |concrete| {
+                try expectTypesEqual(concrete.*, after.@"opaque".concrete.?.*);
+            } else {
+                try std.testing.expect(after.@"opaque".concrete == null);
+            }
+        },
+        .dyn_trait => |bounds| try expectBoundsEqual(bounds, after.dyn_trait),
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(
+                unsupported.reason,
+                after.unsupported.reason,
+            );
+            try std.testing.expectEqualStrings(
+                unsupported.message,
+                after.unsupported.message,
+            );
+            try std.testing.expectEqual(unsupported.span, after.unsupported.span);
+        },
+    }
+}
+
+fn expectTypeListsEqual(
+    before: []const types.Type,
+    after: []const types.Type,
+) TypeCompareError!void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |element, decoded_element| {
+        try expectTypesEqual(element, decoded_element);
+    }
+}
+
+fn expectDecodedTypesMatch(
+    before: []const types.Type,
+    after: []const types.Type,
+) !void {
+    try expectTypeListsEqual(before, after);
+}
+
+fn expectDecodedPatternsMatch(
+    before: []const exprs.Pattern,
+    after: []const exprs.Pattern,
+) !void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        try std.testing.expectEqual(expected.id, actual.id);
+        try std.testing.expectEqual(expected.span, actual.span);
+        try std.testing.expectEqual(expected.ty, actual.ty);
+        if (std.meta.activeTag(expected.kind) != std.meta.activeTag(actual.kind)) {
+            return error.PatternArmMismatch;
+        }
+        const decoded_kind = actual.kind;
+        switch (expected.kind) {
+            .wildcard => {},
+            .binding => |binding| {
+                try std.testing.expectEqualStrings(binding.name, decoded_kind.binding.name);
+                try std.testing.expectEqual(binding.mode, decoded_kind.binding.mode);
+                try std.testing.expectEqual(binding.mutable, decoded_kind.binding.mutable);
+            },
+            .literal => |literal| try expectDecodedLiteralMatches(literal, decoded_kind.literal),
+            .path => |path| {
+                try std.testing.expectEqual(path.def, decoded_kind.path.def);
+                if (path.variant) |variant| {
+                    try std.testing.expectEqualStrings(
+                        variant,
+                        decoded_kind.path.variant orelse return error.LostPathVariant,
+                    );
+                } else {
+                    try std.testing.expect(decoded_kind.path.variant == null);
+                }
+            },
+            .external_variant => |external| {
+                try expectExternalNominalEquals(
+                    external.owner,
+                    decoded_kind.external_variant.owner,
+                );
+                try std.testing.expectEqualStrings(
+                    external.variant,
+                    decoded_kind.external_variant.variant,
+                );
+                try std.testing.expectEqual(
+                    external.rest,
+                    decoded_kind.external_variant.rest,
+                );
+                try std.testing.expectEqual(
+                    external.fields.len,
+                    decoded_kind.external_variant.fields.len,
+                );
+                for (external.fields, decoded_kind.external_variant.fields) |
+                    field,
+                    decoded_field,
+                | {
+                    try std.testing.expectEqualStrings(field.field, decoded_field.field);
+                    try std.testing.expectEqual(field.pat, decoded_field.pat);
+                    try std.testing.expectEqual(field.shorthand, decoded_field.shorthand);
+                }
+            },
+            .tuple => |tuple| {
+                try std.testing.expectEqualSlices(
+                    exprs.NodeId,
+                    tuple.elements,
+                    decoded_kind.tuple.elements,
+                );
+                try std.testing.expectEqual(tuple.rest, decoded_kind.tuple.rest);
+            },
+            .slice => |slice| {
+                try std.testing.expectEqualSlices(
+                    exprs.NodeId,
+                    slice.elements,
+                    decoded_kind.slice.elements,
+                );
+                try std.testing.expectEqual(slice.rest, decoded_kind.slice.rest);
+            },
+            .struct_pat => |struct_pat| {
+                try std.testing.expectEqual(struct_pat.def, decoded_kind.struct_pat.def);
+                try std.testing.expectEqual(struct_pat.rest, decoded_kind.struct_pat.rest);
+                try std.testing.expectEqual(
+                    struct_pat.fields.len,
+                    decoded_kind.struct_pat.fields.len,
+                );
+                for (struct_pat.fields, decoded_kind.struct_pat.fields) |field, decoded_field| {
+                    try std.testing.expectEqualStrings(field.field, decoded_field.field);
+                    try std.testing.expectEqual(field.pat, decoded_field.pat);
+                    try std.testing.expectEqual(field.shorthand, decoded_field.shorthand);
+                }
+            },
+            .reference => |reference| {
+                try std.testing.expectEqual(reference.mode, decoded_kind.reference.mode);
+                try std.testing.expectEqual(reference.inner, decoded_kind.reference.inner);
+            },
+            .@"or" => |or_pat| try std.testing.expectEqualSlices(
+                exprs.NodeId,
+                or_pat.alternatives,
+                decoded_kind.@"or".alternatives,
+            ),
+            .range => |range_pat| {
+                try std.testing.expectEqual(range_pat.lo, decoded_kind.range.lo);
+                try std.testing.expectEqual(range_pat.hi, decoded_kind.range.hi);
+                try std.testing.expectEqual(
+                    range_pat.inclusive,
+                    decoded_kind.range.inclusive,
+                );
+            },
+        }
+    }
+}
+
+fn expectDecodedStatementsMatch(
+    before: []const exprs.Statement,
+    after: []const exprs.Statement,
+) !void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        try std.testing.expectEqual(expected.id, actual.id);
+        try std.testing.expectEqual(expected.span, actual.span);
+        try std.testing.expectEqual(expected.ty, actual.ty);
+        if (std.meta.activeTag(expected.kind) != std.meta.activeTag(actual.kind)) {
+            return error.StatementArmMismatch;
+        }
+        const decoded_kind = actual.kind;
+        switch (expected.kind) {
+            .let => |let_stmt| {
+                try std.testing.expectEqual(let_stmt.pattern, decoded_kind.let.pattern);
+                try std.testing.expectEqual(let_stmt.init, decoded_kind.let.init);
+                try std.testing.expectEqual(let_stmt.ty, decoded_kind.let.ty);
+            },
+            .let_else => |let_else| {
+                try std.testing.expectEqual(let_else.pattern, decoded_kind.let_else.pattern);
+                try std.testing.expectEqual(let_else.init, decoded_kind.let_else.init);
+                try expectDecodedBlockMatches(
+                    let_else.else_block,
+                    decoded_kind.let_else.else_block,
+                );
+            },
+            .expr => |id| try std.testing.expectEqual(id, decoded_kind.expr),
+            .item => |id| try std.testing.expectEqual(id, decoded_kind.item),
+        }
+    }
+}
+
+fn expectDecodedFieldsMatch(
+    before: []const items.Field,
+    after: []const items.Field,
+) !void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqual(expected.span, actual.span);
+        // The field-slot binding type: the declared type of the field a
+        // binding of that name takes. Losing it would decode a binding whose
+        // slot the wire never described.
+        try expectTypesEqual(expected.ty, actual.ty);
+        switch (expected.visibility) {
+            .in_path => |path| switch (actual.visibility) {
+                .in_path => |decoded_path| try std.testing.expectEqualStrings(
+                    path,
+                    decoded_path,
+                ),
+                else => return error.LostFieldVisibility,
+            },
+            else => try std.testing.expectEqual(expected.visibility, actual.visibility),
+        }
+    }
+}
+
+fn expectDecodedParamsMatch(
+    before: []const items.Param,
+    after: []const items.Param,
+) !void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqual(expected.span, actual.span);
+        try expectTypesEqual(expected.ty, actual.ty);
+    }
+}
+
+fn expectDecodedVariantsMatch(
+    before: []const items.Variant,
+    after: []const items.Variant,
+) !void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqual(expected.discriminant, actual.discriminant);
+        if (std.meta.activeTag(expected.fields) != std.meta.activeTag(actual.fields)) {
+            return error.VariantFieldsArmMismatch;
+        }
+        switch (expected.fields) {
+            .none => {},
+            .tuple => |tuple| try std.testing.expectEqual(tuple.len, actual.fields.tuple.len),
+            .named => |named| try expectDecodedFieldsMatch(named, actual.fields.named),
+        }
+    }
+}
+
+fn expectDecodedBodiesMatch(
+    before: []const BodyKind,
+    after: []const BodyKind,
+) !void {
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, after) |expected, actual| {
+        if (std.meta.activeTag(expected) != std.meta.activeTag(actual)) {
+            return error.BodyArmMismatch;
+        }
+        switch (expected) {
+            .none => {},
+            .const_ => |const_body| {
+                try expectTypesEqual(const_body.ty, actual.const_.ty);
+                try std.testing.expectEqual(const_body.init, actual.const_.init);
+            },
+            .fn_ => |fn_body| {
+                try expectDecodedParamsMatch(fn_body.params, actual.fn_.params);
+                try expectTypesEqual(fn_body.ret, actual.fn_.ret);
+                try std.testing.expectEqualStrings(
+                    fn_body.generic_params[0],
+                    actual.fn_.generic_params[0],
+                );
+                try std.testing.expectEqual(fn_body.body, actual.fn_.body);
+                try std.testing.expectEqual(fn_body.is_allocating, actual.fn_.is_allocating);
+            },
+            .struct_ => |struct_body| {
+                try std.testing.expectEqualStrings(
+                    struct_body.generic_params[0],
+                    actual.struct_.generic_params[0],
+                );
+                try std.testing.expectEqualStrings(
+                    struct_body.trait_bounds[0],
+                    actual.struct_.trait_bounds[0],
+                );
+                try std.testing.expectEqual(struct_body.layout, actual.struct_.layout);
+                try expectDecodedFieldsMatch(struct_body.fields, actual.struct_.fields);
+                try std.testing.expectEqual(
+                    struct_body.methods.len,
+                    actual.struct_.methods.len,
+                );
+                for (struct_body.methods, actual.struct_.methods) |method, decoded_method| {
+                    try std.testing.expectEqualStrings(method.name, decoded_method.name);
+                    try std.testing.expectEqual(method.visibility, decoded_method.visibility);
+                    try expectTypesEqual(method.ret, decoded_method.ret);
+                    try std.testing.expectEqual(method.body, decoded_method.body);
+                    try std.testing.expectEqual(method.receiver, decoded_method.receiver);
+                    try std.testing.expectEqual(
+                        method.is_allocating,
+                        decoded_method.is_allocating,
+                    );
+                }
+                try std.testing.expectEqual(
+                    struct_body.has_dynamic_resources,
+                    actual.struct_.has_dynamic_resources,
+                );
+            },
+            .enum_ => |enum_body| {
+                try std.testing.expectEqual(enum_body.kind, actual.enum_.kind);
+                try expectDecodedVariantsMatch(enum_body.variants, actual.enum_.variants);
+                try std.testing.expectEqual(enum_body.repr_int, actual.enum_.repr_int);
+                try std.testing.expectEqual(
+                    enum_body.non_exhaustive,
+                    actual.enum_.non_exhaustive,
+                );
+            },
+            .trait_ => |trait_body| {
+                try std.testing.expectEqualStrings(trait_body.name, actual.trait_.name);
+                try std.testing.expectEqualStrings(
+                    trait_body.supertraits[0],
+                    actual.trait_.supertraits[0],
+                );
+                try std.testing.expectEqual(
+                    trait_body.methods.len,
+                    actual.trait_.methods.len,
+                );
+                for (trait_body.methods, actual.trait_.methods) |method, decoded_method| {
+                    try std.testing.expectEqualStrings(method.name, decoded_method.name);
+                    try expectTypesEqual(method.ret, decoded_method.ret);
+                    try std.testing.expectEqual(method.receiver, decoded_method.receiver);
+                }
+            },
+            .type_alias => |alias| try expectTypesEqual(
+                alias.target,
+                actual.type_alias.target,
+            ),
+        }
+    }
+}
+
+// One row per arm of every union the wire carries, with each optional and
+// each defaulted field set away from its default, encoded and read back
+// through `parseFull`. Every arm the model declares is exercised here; an arm
+// the codec cannot describe refuses the decode and names itself in the error.
+test "every model shape the corpus can produce survives encode and parseFull" {
+    // The fixture is built over one arena rather than the testing allocator.
+    // Every row it builds is a set of owned strings and slices released
+    // individually, and the point of this test is the codec's own ownership
+    // rules — not the fixture's. An arena makes the fixture's teardown a single
+    // call, so a failure here names the codec rather than a fixture free.
+    var fixture_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer fixture_arena.deinit();
+    const allocator = fixture_arena.allocator();
+
+    const expressions = try auditExprTable(allocator);
+    const statements = try auditStatementTable(allocator);
+    const patterns = try auditPatternTable(allocator);
+    const type_table = try auditTypeTable(allocator);
+    const bodies = try auditBodyTable(allocator);
+    const probe_graph = try auditGraph(allocator);
+    const encoded = try encodeFull(std.testing.allocator, .{
+        .graph = probe_graph,
+        .bodies = .{
+            .exprs = expressions,
+            .stmts = statements,
+            .pats = patterns,
+            .types = type_table,
+            .bodies = bodies,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+    var read_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer read_arena.deinit();
+    const decoded = try parseFull(read_arena.allocator(), encoded);
+
+    // The coverage gate. Every arm of every union the wire carries is counted
+    // below and compared with what the codec declares it can read, so an arm
+    // added to the model after this test was written shows up as a count
+    // mismatch instead of a shape nothing ever exercises.
+    try expectEveryArmCovered(expressions, statements, patterns, type_table, bodies);
+
+    try expectDecodedExprsMatch(expressions, decoded.bodies.exprs);
+    try expectDecodedStatementsMatch(statements, decoded.bodies.stmts);
+    try expectDecodedPatternsMatch(patterns, decoded.bodies.pats);
+    try expectDecodedTypesMatch(type_table, decoded.bodies.types);
+    try expectDecodedBodiesMatch(bodies, decoded.bodies.bodies);
+
+    // The graph half of the same round trip. Every field asserted here is set
+    // to a non-default value in `auditGraph`, so a decoder that substitutes a
+    // default for absent or dropped data fails instead of passing quietly.
+    try std.testing.expectEqualStrings(
+        "sidecar-probe",
+        decoded.graph.sidecar orelse return error.LostSidecar,
+    );
+    try std.testing.expectEqualStrings(
+        "toolchain-probe",
+        decoded.graph.toolchain orelse return error.LostToolchain,
+    );
+    const crate = decoded.graph.findCrate("probe_crate") orelse
+        return error.LostCrate;
+    try std.testing.expectEqual(@as(u16, 2024), crate.edition);
+    try std.testing.expectEqual(graph.CrateKind.bin, crate.kind);
+    try std.testing.expect(!crate.is_translated);
+    try std.testing.expectEqual(@as(usize, 1), crate.deps.len);
+    try std.testing.expectEqualStrings("probe_dep", crate.deps[0].extern_name);
+    try std.testing.expectEqualStrings("probe_alias", crate.deps[0].local_alias);
+    try std.testing.expectEqual(@as(u32, 77), crate.deps[0].id);
+    try std.testing.expectEqual(@as(?bool, false), crate.deps[0].default_features);
+    try std.testing.expectEqual(@as(usize, 2), crate.deps[0].features.len);
+    try std.testing.expectEqualStrings("derive", crate.deps[0].features[0]);
+    try std.testing.expectEqualStrings("std", crate.deps[0].features[1]);
+
+    const module = decoded.graph.module(crate.root) orelse return error.LostModule;
+    try std.testing.expectEqual(graph.ModuleKind.directory, module.kind);
+    try std.testing.expectEqualStrings("probe", module.name);
+    try std.testing.expectEqualStrings("src/probe.rs", module.source_path.?);
+    try std.testing.expect(module.is_crate);
+    try std.testing.expect(module.is_extern);
+    try std.testing.expectEqual(audit_span, module.span);
+    try std.testing.expectEqual(@as(usize, 1), module.attributes.len);
+    try std.testing.expectEqualStrings("path", module.attributes[0].name);
+    try std.testing.expectEqualStrings("src/probe.rs", module.attributes[0].meta);
+    try std.testing.expect(!module.attributes[0].known);
+
+    const entity = decoded.graph.symbol_table.get(crate.root) orelse
+        return error.LostEntity;
+    try std.testing.expectEqualStrings("Probe_", entity.renamed_to.?);
+    switch (entity.visibility) {
+        .in_path => |path| try std.testing.expectEqualStrings("crate::probe", path),
+        else => return error.LostVisibilityPath,
+    }
+    try std.testing.expectEqual(@as(usize, 1), entity.attributes.len);
+    try std.testing.expect(entity.attributes[0].known);
+
+    const use_decl = decoded.graph.useById(crate.root) orelse return error.LostUseDecl;
+    try std.testing.expect(use_decl.kind == .glob);
+    try std.testing.expect(use_decl.is_pub_export);
 }

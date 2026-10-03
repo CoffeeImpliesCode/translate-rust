@@ -95,7 +95,6 @@ fn freePendingGenericPath(alloc: std.mem.Allocator, path: []const types.PathSegm
     alloc.free(path);
 }
 
-const unresolved_generic_decl_id = std.math.maxInt(spine.EntityId);
 pub const FunctionOrigin = struct {
     lexical_module: spine.EntityId,
     source: []const u8,
@@ -192,7 +191,15 @@ fn isPub(e: *const Ctx, item: ts.Node) bool {
     return visOf(e, item) == .public;
 }
 
-fn parseAttributeText(e: *const Ctx, attr_text: []const u8) !spine.Attribute {
+/// The name and raw value of `#[name(value)]` / `#[name = value]` attribute
+/// text, with the `#[` / `#![` bracket pair removed. `value` keeps its literal
+/// syntax so the caller can decode only the form it understands.
+const AttributeText = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+fn splitAttributeText(attr_text: []const u8) AttributeText {
     var inner = std.mem.trim(u8, attr_text, " \t\r\n");
     if (std.mem.startsWith(u8, inner, "#![") and std.mem.endsWith(u8, inner, "]")) {
         inner = inner[3 .. inner.len - 1];
@@ -202,26 +209,66 @@ fn parseAttributeText(e: *const Ctx, attr_text: []const u8) !spine.Attribute {
     inner = std.mem.trim(u8, inner, " \t\r\n");
 
     const name_end = std.mem.indexOfAny(u8, inner, "(= \t\r\n") orelse inner.len;
-    const name = inner[0..name_end];
     const rest = std.mem.trim(u8, inner[name_end..], " \t\r\n");
-    var meta: []const u8 = "";
     if (rest.len >= 2 and rest[0] == '(' and rest[rest.len - 1] == ')') {
-        meta = std.mem.trim(u8, rest[1 .. rest.len - 1], " \t\r\n");
-    } else if (rest.len > 0 and rest[0] == '=') {
-        meta = std.mem.trim(u8, rest[1..], " \t\r\n");
-        if (meta.len >= 2 and meta[0] == '"' and meta[meta.len - 1] == '"') {
-            meta = meta[1 .. meta.len - 1];
-        }
+        return .{
+            .name = inner[0..name_end],
+            .value = std.mem.trim(u8, rest[1 .. rest.len - 1], " \t\r\n"),
+        };
+    }
+    if (rest.len > 0 and rest[0] == '=') {
+        return .{
+            .name = inner[0..name_end],
+            .value = std.mem.trim(u8, rest[1..], " \t\r\n"),
+        };
+    }
+    return .{ .name = inner[0..name_end], .value = "" };
+}
+
+/// Decode the authored text of a `#[doc = "..."]` value with the shared Rust
+/// literal decoders, so escapes and raw strings reach the model as text. Any
+/// other value — a `concat!` call or another expression — cannot be evaluated
+/// here and yields empty text: unevaluated expression tokens must never reach
+/// the emitter as prose.
+fn decodeDocValue(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    const prefix_len: usize = if (std.mem.startsWith(u8, value, "cr"))
+        2
+    else if (std.mem.startsWith(u8, value, "r"))
+        1
+    else
+        0;
+    if (prefix_len > 0) {
+        return (try decodeRawBytes(allocator, value, prefix_len)) orelse "";
+    }
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') {
+        return "";
+    }
+    // A literal this decoder rejects carries no text; the source is assumed to
+    // compile, so refusing the whole crate over one unreadable doc comment
+    // would trade real metadata for nothing.
+    return ts_ext.decodeEscapedBytes(allocator, value[1 .. value.len - 1], true) catch "";
+}
+
+fn parseAttributeText(e: *const Ctx, attr_text: []const u8) !spine.Attribute {
+    const split = splitAttributeText(attr_text);
+    var owned_meta: ?[]const u8 = null;
+    defer if (owned_meta) |meta| e.alloc.free(meta);
+    var meta: []const u8 = split.value;
+    if (std.mem.eql(u8, split.name, "doc")) {
+        meta = try decodeDocValue(e.alloc, split.value);
+        owned_meta = meta;
+    } else if (meta.len >= 2 and meta[0] == '"' and meta[meta.len - 1] == '"') {
+        meta = meta[1 .. meta.len - 1];
     }
 
-    const name_copy = try e.alloc.dupe(u8, name);
+    const name_copy = try e.alloc.dupe(u8, split.name);
     errdefer e.alloc.free(name_copy);
     const meta_copy = try e.alloc.dupe(u8, meta);
     errdefer e.alloc.free(meta_copy);
     return .{
         .name = name_copy,
         .meta = meta_copy,
-        .known = std.mem.eql(u8, name, "cfg") or std.mem.eql(u8, name, "test"),
+        .known = std.mem.eql(u8, split.name, "cfg") or std.mem.eql(u8, split.name, "test"),
     };
 }
 
@@ -229,50 +276,160 @@ fn parseAttribute(e: *const Ctx, node: ts.Node) !spine.Attribute {
     return parseAttributeText(e, text(e, node));
 }
 
-/// Preserve outer attributes whether the grammar attaches them to the item or
-/// exposes them as preceding siblings.
-fn attributesOf(e: *const Ctx, item: ts.Node) ![]const spine.Attribute {
-    var preceding_count: usize = 0;
-    var prev = item.prevNamedSibling();
-    while (prev) |node| {
-        if (std.mem.eql(u8, node.kind(), "attribute_item")) {
-            preceding_count += 1;
-        } else if (!isComment(node)) {
-            break;
+/// Which declaration a Rust doc comment documents: `outer` attaches to the
+/// item that follows it (`///`, `/** */`), `inner` documents the enclosing
+/// module (`//!`, `/*! */`).
+const DocCommentKind = enum { outer, inner };
+
+/// Recognize a documentation comment by its marker. `////` and `/***` are
+/// ordinary comments in Rust, and an empty `/**/` carries no content, so
+/// none of them is documentation.
+fn docCommentKind(raw: []const u8) ?DocCommentKind {
+    if (raw.len >= 3 and std.mem.startsWith(u8, raw, "//")) {
+        if (raw[2] == '!') return .inner;
+        if (raw[2] != '/') return null;
+        if (raw.len >= 4 and raw[3] == '/') return null;
+        return .outer;
+    }
+    if (raw.len >= 4 and std.mem.startsWith(u8, raw, "/*")) {
+        if (raw[2] == '!') return .inner;
+        if (raw[2] != '*' or raw[3] == '*' or raw.len == 4) return null;
+        return .outer;
+    }
+    return null;
+}
+
+/// The comment node text with its marker — and, for the block forms, the
+/// closing `*/` — removed.
+fn docCommentBody(raw: []const u8) []const u8 {
+    if (raw.len < 4) return "";
+    if (raw[1] == '*') {
+        if (raw.len < 5 or !std.mem.endsWith(u8, raw, "*/")) return "";
+        return raw[3 .. raw.len - 2];
+    }
+    return raw[3..];
+}
+
+/// Normalize authored doc text: strip the marker convention, drop the block
+/// comment's leading `*` column when every non-blank line uses it, and drop
+/// the blank lines at the top and bottom. The result is the prose the author
+/// wrote and nothing else — no purpose, ownership, or threading claim is
+/// invented for it.
+fn normalizeDocComment(e: *const Ctx, raw: []const u8) ![]const u8 {
+    const body = docCommentBody(raw);
+    const is_block = raw[1] == '*';
+
+    // A block comment is conventionally written with ` * ` on every line.
+    // Removing that column is only safe when no content line starts with a
+    // different character, so a markdown list item keeps its own bullet.
+    var strip_star_column = is_block;
+    if (is_block) {
+        var probe = std.mem.splitScalar(u8, body, '\n');
+        while (probe.next()) |line| {
+            const trimmed = std.mem.trimStart(u8, line, " \t");
+            if (trimmed.len == 0) continue;
+            if (trimmed[0] != '*') {
+                strip_star_column = false;
+                break;
+            }
         }
-        prev = node.prevNamedSibling();
     }
 
-    var child_count: usize = 0;
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(e.alloc);
+    var scan = std.mem.splitScalar(u8, body, '\n');
+    while (scan.next()) |raw_line| {
+        var line = std.mem.trimEnd(u8, raw_line, " \t\r");
+        if (strip_star_column) {
+            line = std.mem.trimStart(u8, line, " \t");
+            if (line.len > 0 and line[0] == '*') {
+                line = line[1..];
+                if (line.len > 0 and line[0] == ' ') line = line[1..];
+            }
+        } else if (lines.items.len == 0) {
+            // Only the first line carries the separator space that follows the
+            // marker. Later lines keep their own indentation, so an indented
+            // block written inside the documentation survives.
+            line = std.mem.trimStart(u8, line, " \t");
+        }
+        try lines.append(e.alloc, line);
+    }
+
+    var start: usize = 0;
+    var end: usize = lines.items.len;
+    while (start < end and lines.items[start].len == 0) start += 1;
+    while (end > start and lines.items[end - 1].len == 0) end -= 1;
+    if (start == end) return "";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(e.alloc);
+    for (lines.items[start..end], 0..) |line, index| {
+        if (index > 0) try out.append(e.alloc, '\n');
+        try out.appendSlice(e.alloc, line);
+    }
+    return out.toOwnedSlice(e.alloc);
+}
+
+fn freeAttributeValues(e: *const Ctx, attributes: []const spine.Attribute) void {
+    for (attributes) |attribute| {
+        e.alloc.free(attribute.name);
+        e.alloc.free(attribute.meta);
+    }
+}
+
+/// One doc comment becomes one standard `doc` attribute. `known` stays false
+/// so a comment and the equivalent `#[doc = "..."]` attribute are recorded
+/// identically.
+fn docCommentAttribute(e: *const Ctx, raw: []const u8) !spine.Attribute {
+    const meta = try normalizeDocComment(e, raw);
+    errdefer e.alloc.free(meta);
+    return .{
+        .name = try e.alloc.dupe(u8, "doc"),
+        .meta = meta,
+        .known = false,
+    };
+}
+
+/// Locate the first preceding attribute or comment in source order.
+/// An inner doc comment belongs to the module and ends an item's metadata.
+fn firstMetadataSibling(e: *const Ctx, item: ts.Node) ts.Node {
+    var first = item;
+    while (first.prevNamedSibling()) |node| {
+        if (!std.mem.eql(u8, node.kind(), "attribute_item") and !isComment(node)) break;
+        if (isComment(node) and docCommentKind(text(e, node)) == .inner) break;
+        first = node;
+    }
+    return first;
+}
+
+/// Preserve authored metadata in source order, whether the grammar attaches
+/// it to the item or exposes it as preceding siblings.
+fn attributesOf(e: *const Ctx, item: ts.Node) ![]const spine.Attribute {
+    var attributes: std.ArrayListUnmanaged(spine.Attribute) = .empty;
+    errdefer freeAttributeValues(e, attributes.items);
+
+    var sibling: ?ts.Node = firstMetadataSibling(e, item);
+    while (sibling) |node| {
+        if (node.startByte() == item.startByte()) break;
+        if (isComment(node)) {
+            const raw = text(e, node);
+            if (docCommentKind(raw) == .outer) {
+                try attributes.append(e.alloc, try docCommentAttribute(e, raw));
+            }
+        } else {
+            try attributes.append(e.alloc, try parseAttribute(e, node));
+        }
+        sibling = node.nextNamedSibling();
+    }
+
     var i: u32 = 0;
     while (item.namedChild(i)) |child| : (i += 1) {
-        if (std.mem.eql(u8, child.kind(), "attribute_item")) child_count += 1;
-    }
-
-    const count = preceding_count + child_count;
-    if (count == 0) return &.{};
-    const attributes = try e.alloc.alloc(spine.Attribute, count);
-
-    var preceding_index = preceding_count;
-    prev = item.prevNamedSibling();
-    while (prev) |node| {
-        if (std.mem.eql(u8, node.kind(), "attribute_item")) {
-            preceding_index -= 1;
-            attributes[preceding_index] = try parseAttribute(e, node);
-        } else if (!isComment(node)) {
-            break;
-        }
-        prev = node.prevNamedSibling();
-    }
-
-    var attribute_index = preceding_count;
-    i = 0;
-    while (item.namedChild(i)) |child| : (i += 1) {
         if (!std.mem.eql(u8, child.kind(), "attribute_item")) continue;
-        attributes[attribute_index] = try parseAttribute(e, child);
-        attribute_index += 1;
+        try attributes.append(e.alloc, try parseAttribute(e, child));
     }
-    return attributes;
+
+    if (attributes.items.len == 0) return &.{};
+    return attributes.toOwnedSlice(e.alloc);
 }
 
 /// Append an inner attribute to the owning module. Inner attributes are
@@ -403,6 +560,11 @@ const TypeMapError = std.mem.Allocator.Error || error{
 };
 /// Map an array length without manufacturing a value for an unresolved name.
 /// The declaration environment is evaluated independently of source order.
+///
+/// The length is metadata about the translated program's type, stored as
+/// `u64`; nothing here allocates or indexes by it. With no configured target
+/// pointer width the bound is therefore `u64::MAX`, so a 64-bit target's
+/// `[u8; 4294967296]` maps the same way on a 32-bit translator host.
 fn mapArrayLen(e: *Ctx, node: ts.Node) TypeMapError!types.ArrayLen {
     const value = constIntegerValue(e, node) orelse return error.InvalidType;
     if (value < 0) return error.InvalidType;
@@ -412,7 +574,7 @@ fn mapArrayLen(e: *Ctx, node: ts.Node) TypeMapError!types.ArrayLen {
         32 => @as(i128, std.math.maxInt(u32)),
         64 => @as(i128, std.math.maxInt(u64)),
         else => return error.InvalidType,
-    } else @as(i128, std.math.maxInt(usize));
+    } else @as(i128, std.math.maxInt(u64));
     if (value > max_len) return error.InvalidType;
     return .{ .literal = @intCast(value) };
 }
@@ -740,6 +902,16 @@ fn externalUsePath(e: *const Ctx, name: []const u8) !?[]const []const u8 {
     return path;
 }
 
+/// Whether `io` in this module names the standard `std::io`. The alias path is
+/// borrowed from the graph, so nothing here owns memory.
+fn aliasNamesStdIo(e: *const Ctx) bool {
+    const owner_id = e.declaration_owner orelse return false;
+    const alias = externalUseAlias(e.g, owner_id, "io") orelse return false;
+    return alias.len == 2 and
+        std.mem.eql(u8, alias[0], "std") and
+        std.mem.eql(u8, alias[1], "io");
+}
+
 /// The external path named by an id-free bound path. The segment names are
 /// borrowed: an alias prefix comes from the graph, the rest from the source
 /// text, and both outlive every binder.
@@ -753,6 +925,10 @@ fn externalPathFromSegments(
     }
     return segments;
 }
+/// Takes ownership of `path_segments`: the caller hands over its owned slice
+/// and frees it never again, whether this function stores it or the
+/// `source_owned` defer reclaims it on an early exit. Borrowed memory may not
+/// enter — freeing it would bill the arena for lengths it never returned.
 fn makePendingGeneric(
     e: *Ctx,
     args: []const types.Type,
@@ -761,9 +937,14 @@ fn makePendingGeneric(
     var source_owned = true;
     defer if (source_owned) freePathSegments(e, path_segments);
     const pending = e.pending_generics orelse return error.UnresolvedNominalType;
-    if (pending.items.len >= @as(usize, unresolved_generic_decl_id)) {
+    // The placeholder band is owned by `spine.deferredPlaceholder`, which
+    // refuses past `deferred_placeholder_reserve` ordinals. Minting the id
+    // here would re-derive `maxInt - ordinal` with no floor, so past 4096
+    // pending applications it would hand out ids `SymbolTable.add` is still
+    // free to mint — the collision `spine` refuses to permit. The null
+    // answer below names that boundary instead of minting past it.
+    const placeholder = spine.deferredPlaceholder(pending.items.len) orelse
         return error.UnresolvedNominalType;
-    }
     const owner_id = e.declaration_owner orelse return error.UnresolvedNominalType;
     const owned_path = try e.alloc.alloc(types.PathSegment, path_segments.len);
     var copied: usize = 0;
@@ -778,8 +959,6 @@ fn makePendingGeneric(
         };
         copied += 1;
     }
-    const placeholder: spine.EntityId = unresolved_generic_decl_id -
-        @as(spine.EntityId, @intCast(pending.items.len));
     try pending.append(e.alloc, .{
         .placeholder = placeholder,
         .owner_id = owner_id,
@@ -855,6 +1034,19 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         args = args_arr;
     }
 
+    // `std::io::Result<T>` is the standard alias
+    // `pub type Result<T> = core::result::Result<T, io::Error>`, so a declared
+    // signature written through it carries the same error arm the body-level
+    // reader gives it. A crate's own one-armed `Result` is not this type.
+    if (args.len == 1 and ts_ext.isStdIoResultPath(segs.items, aliasNamesStdIo(e))) {
+        const r = try e.alloc.create(types.Result);
+        r.* = .{
+            .ok = args[0],
+            .err = try ts_ext.stdIoErrorNominal(e.alloc),
+            .is_error_unionable = true,
+        };
+        return .{ .result = r };
+    }
     if (std.mem.eql(u8, nm, "Option") and args.len == 1) {
         const inner = try e.alloc.create(types.Type);
         inner.* = args[0];
@@ -921,30 +1113,13 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         }
     }
 
-    const prelude_visible = blk: {
-        const owner_id = e.declaration_owner orelse break :blk true;
-        const module_id = owningModule(e.g, owner_id) orelse break :blk true;
-        break :blk resolveModuleItem(e.g, module_id, nm) == null;
-    };
-    if (!had_scoped_segments and prelude_visible and
-        (std.mem.eql(u8, nm, "String") or std.mem.eql(u8, nm, "Vec")))
-    {
-        const prelude_path = ts_ext.preludeExternalPath(nm).?;
-        const external_path = try e.alloc.alloc([]const u8, prelude_path.len);
-        var copied: usize = 0;
-        errdefer {
-            for (external_path[0..copied]) |segment| e.alloc.free(segment);
-            e.alloc.free(external_path);
-        }
-        for (prelude_path, 0..) |segment, index| {
-            external_path[index] = try e.alloc.dupe(u8, segment);
-            copied += 1;
-        }
-        return .{ .external_nominal = .{
-            .path = external_path,
-            .args = args,
-        } };
-    }
+    // A bare head is decided by `bindDeclarationTypes`, once the whole graph
+    // exists, and not here. This module is still being walked: a `Hasher<S>`
+    // written above the crate's own `struct Hasher<S: Sip>` cannot see that
+    // definition yet, and answering from the prelude table instead would bind
+    // a local type to `core::hash::Hasher`. `makePendingGeneric` is the wait,
+    // and the binder it defers to reads local definitions first and the
+    // prelude only after — which is the whole of Rust's rule for these names.
     if (args.len > 0) {
         if (segs.items.len == 0 or
             !std.mem.eql(u8, segs.items[segs.items.len - 1].name, nm))
@@ -960,20 +1135,13 @@ fn mapNamedType(e: *Ctx, node: ts.Node) TypeMapError!types.Type {
         defer if (path_owned) freePathSegments(e, path_segments);
         const owner_id = e.declaration_owner orelse return error.UnresolvedNominalType;
         var path: types.Path = .{ .segments = path_segments };
-        const bound = bindPathWithPrelude(e.g, e.bodies_list.items, owner_id, &.{}, &path) catch |err| switch (err) {
+        // `bindPath` alone, never the prelude fallback: a head this module
+        // declares further down the file is not "unresolved", it is later.
+        // The pending application is resolved against the complete graph by
+        // `bindDeclarationTypes`, where `bindPathWithPrelude` keeps exactly
+        // this order — local definition, then the standard name.
+        const bound = bindPath(e.g, e.bodies_list.items, owner_id, &.{}, &path) catch |err| switch (err) {
             error.UnresolvedNominalType => {
-                if (!had_scoped_segments) {
-                    if (ts_ext.preludeExternalPath(nm)) |prelude_path| {
-                        const ext_path = try e.alloc.alloc([]const u8, prelude_path.len);
-                        for (prelude_path, 0..) |seg, i| {
-                            ext_path[i] = try e.alloc.dupe(u8, seg);
-                        }
-                        return .{ .external_nominal = .{
-                            .path = ext_path,
-                            .args = args,
-                        } };
-                    }
-                }
                 path_owned = false;
                 return makePendingGeneric(e, args, path_segments);
             },
@@ -1399,7 +1567,7 @@ fn implSelfType(
             }
             break :blk self_ty;
         },
-        .generic_inst => |generic_inst| if (generic_inst.decl == unresolved_generic_decl_id)
+        .generic_inst => |generic_inst| if (spine.isDeferredPlaceholder(generic_inst.decl))
             null
         else
             self_ty,
@@ -1732,6 +1900,27 @@ fn pendingGeneric(
     return null;
 }
 
+/// Bind every type argument of an application whose head was deferred.
+///
+/// The head waits because the declaration it names may sit further down the
+/// file; its arguments wait in the same node for the same reason, and they are
+/// read by the same graph once it is complete. Reading them apart from the head
+/// is what left a name that appears INSIDE the argument list unbound: the head
+/// resolved, the row became an external nominal, and the name it carried had no
+/// entity behind it.
+fn bindGenericArguments(
+    g: *const graph.CrateGraph,
+    bodies_list: []const bodies.BodyKind,
+    owner_id: spine.EntityId,
+    extra_generic_params: []const []const u8,
+    pending: []const PendingGenericApplication,
+    params: []const types.Type,
+) DeclarationTypeError!void {
+    for (@constCast(params)) |*param| {
+        try bindType(g, bodies_list, owner_id, extra_generic_params, pending, param);
+    }
+}
+
 fn bindType(
     g: *const graph.CrateGraph,
     bodies_list: []const bodies.BodyKind,
@@ -1857,6 +2046,24 @@ fn bindType(
         },
         .generic_inst => |*generic| {
             if (pendingGeneric(pending, generic.decl)) |application| {
+                // Everything under this head was mapped in this declaration and
+                // bound in none of them: the head went to the wait list with its
+                // arguments attached, and the walk that wakes it up resolved the
+                // head alone. An argument left as an id-free path is a name
+                // nothing binds, and an external nominal carrying one is the row
+                // `UnresolvedTypePath` refuses. So the arguments are read here,
+                // from the same complete graph, in the same walk that resolves
+                // the head — at every depth, under the owner this declaration
+                // binds with, so a local declaration written as an argument and
+                // a type parameter of this very signature both answer.
+                try bindGenericArguments(
+                    g,
+                    bodies_list,
+                    owner_id,
+                    extra_generic_params,
+                    pending,
+                    generic.args.params,
+                );
                 var path: types.Path = .{ .segments = application.path };
                 const bound = try bindPathWithPrelude(
                     g,
@@ -1876,13 +2083,22 @@ fn bindType(
                 if (path.segments.len == 0) return error.UnresolvedNominalType;
                 generic.decl = path.segments[path.segments.len - 1].id orelse
                     return error.UnresolvedNominalType;
+                const resolved = g.symbol_table.get(generic.decl) orelse
+                    return error.UnresolvedNominalType;
+                if (!isNominalEntityKind(resolved.kind)) return error.InvalidNominalType;
+                return;
             }
             const entity = g.symbol_table.get(generic.decl) orelse
                 return error.UnresolvedNominalType;
             if (!isNominalEntityKind(entity.kind)) return error.InvalidNominalType;
-            for (@constCast(generic.args.params)) |*param| {
-                try bindType(g, bodies_list, owner_id, extra_generic_params, pending, param);
-            }
+            try bindGenericArguments(
+                g,
+                bodies_list,
+                owner_id,
+                extra_generic_params,
+                pending,
+                generic.args.params,
+            );
         },
         .option => |inner| {
             const mutable_inner = @constCast(inner);
@@ -2111,6 +2327,19 @@ pub fn bindDeclarationTypes(
                 );
             },
             .struct_ => |*structure| {
+                // Bound here, against the complete graph: a bare bound head may
+                // name a `use` alias walked later in the file, so the walk
+                // leaves it unresolved and the prelude stays a fallback.
+                if (structure.generics) |*generics| {
+                    try bindGenerics(
+                        g,
+                        body_slice,
+                        @intCast(owner_id),
+                        &.{},
+                        pending,
+                        generics,
+                    );
+                }
                 try bindFields(
                     g,
                     body_slice,
@@ -2220,6 +2449,19 @@ pub fn bindDeclarationTypes(
                     );
                 }
                 for (@constCast(trait_body.assoc_types)) |*assoc| {
+                    // Bound with the other declaration generics above: an
+                    // associated type's own parameters deserve the same
+                    // alias-before-prelude ordering its bounds do.
+                    if (assoc.generics) |*generics| {
+                        try bindGenerics(
+                            g,
+                            body_slice,
+                            @intCast(owner_id),
+                            &.{},
+                            pending,
+                            generics,
+                        );
+                    }
                     if (assoc.default) |*default| {
                         try bindType(
                             g,
@@ -2390,18 +2632,15 @@ fn parseTraitBound(e: *Ctx, node: ts.Node) !?types.Bound {
     }
 
     const mapped_trait = try mapType(e, trait_node);
-    var bound_path: types.Path = boundPathFromType(e, mapped_trait) orelse blk: {
-        const segs = try mapScopedSegments(e, trait_node);
-        break :blk .{ .segments = segs };
-    };
-    if (bound_path.segments.len == 1) {
-        if (ts_ext.preludePathSegments(e.alloc, bound_path.segments[0].name) catch null) |prelude_segs| {
-            bound_path.segments = prelude_segs;
-        }
-    }
-
+    // Leave a single segment bare: the module's `use` declarations may be
+    // walked later in the file, and the declaration binder reads the graph's
+    // alias before the prelude table. Answering the prelude here would freeze
+    // the wrong name before the alias exists to compete with it.
     return .{
-        .path = bound_path,
+        .path = boundPathFromType(e, mapped_trait) orelse blk: {
+            const segs = try mapScopedSegments(e, trait_node);
+            break :blk .{ .segments = segs };
+        },
         .args = try args_list.toOwnedSlice(e.alloc),
         .associated_types = try assoc_list.toOwnedSlice(e.alloc),
         .optional = optional,
@@ -2582,6 +2821,60 @@ fn collectGenerics(e: *Ctx, item: ts.Node) !?types.Generics {
 
 // ── item lowering ────────────────────────────────────────────────────────────
 
+fn appendDocPart(
+    out: *std.ArrayListUnmanaged(u8),
+    e: *const Ctx,
+    authored: *bool,
+    part: []const u8,
+) !void {
+    if (part.len == 0) return;
+    if (authored.*) try out.append(e.alloc, '\n');
+    try out.appendSlice(e.alloc, part);
+    authored.* = true;
+}
+
+/// Preserve docs on fields and enum variants, which have no entity row.
+/// Ordinary comments are not prose; comments and doc attributes keep source order.
+fn documentationOf(e: *const Ctx, item: ts.Node) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(e.alloc);
+    var authored = false;
+
+    var sibling: ?ts.Node = firstMetadataSibling(e, item);
+    while (sibling) |node| {
+        if (node.startByte() == item.startByte()) break;
+        if (isComment(node)) {
+            const raw = text(e, node);
+            if (docCommentKind(raw) == .outer) {
+                const normalized = try normalizeDocComment(e, raw);
+                defer e.alloc.free(normalized);
+                try appendDocPart(&out, e, &authored, normalized);
+            }
+        } else {
+            const split = splitAttributeText(text(e, node));
+            if (std.mem.eql(u8, split.name, "doc")) {
+                const decoded = try decodeDocValue(e.alloc, split.value);
+                defer e.alloc.free(decoded);
+                try appendDocPart(&out, e, &authored, decoded);
+            }
+        }
+        sibling = node.nextNamedSibling();
+    }
+
+    var i: u32 = 0;
+    while (item.namedChild(i)) |child| : (i += 1) {
+        if (!std.mem.eql(u8, child.kind(), "attribute_item")) continue;
+        const split = splitAttributeText(text(e, child));
+        if (!std.mem.eql(u8, split.name, "doc")) continue;
+        const decoded = try decodeDocValue(e.alloc, split.value);
+        defer e.alloc.free(decoded);
+        try appendDocPart(&out, e, &authored, decoded);
+    }
+
+    if (!authored) return "";
+    return out.toOwnedSlice(e.alloc);
+}
+
 /// Resolve the field list type for a field_declaration / ordered_field_list.
 fn mapFields(e: *Ctx, node: ts.Node) ![]const items.Field {
     var fields: std.ArrayListUnmanaged(items.Field) = .empty;
@@ -2590,6 +2883,7 @@ fn mapFields(e: *Ctx, node: ts.Node) ![]const items.Field {
         var visibility: spine.Visibility = .private;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
+            if (isComment(c) or std.mem.eql(u8, c.kind(), "attribute_item")) continue;
             if (std.mem.eql(u8, c.kind(), "visibility_modifier")) {
                 visibility = .public;
                 continue;
@@ -2605,6 +2899,7 @@ fn mapFields(e: *Ctx, node: ts.Node) ![]const items.Field {
                 .ty = field_type,
                 .visibility = visibility,
                 .span = span_of,
+                .documentation = try documentationOf(e, c),
             });
             visibility = .private;
         }
@@ -2640,11 +2935,14 @@ fn mapFields(e: *Ctx, node: ts.Node) ![]const items.Field {
         const field_ty = fty orelse return error.MalformedField;
         const name_copy = try e.alloc.dupe(u8, field_name);
         errdefer e.alloc.free(name_copy);
+        const documentation = try documentationOf(e, c);
+        errdefer e.alloc.free(documentation);
         try fields.append(e.alloc, .{
             .name = name_copy,
             .ty = field_ty,
             .visibility = if (isPub(e, c)) .public else .private,
             .span = span_of,
+            .documentation = documentation,
         });
     }
     const mapped_fields: []const items.Field = try fields.toOwnedSlice(e.alloc);
@@ -2699,28 +2997,10 @@ fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     var name: []const u8 = "";
     var fields_node: ?ts.Node = null;
     var tuple = false;
-    var generic_params: std.ArrayListUnmanaged([]const u8) = .empty;
     var i: u32 = 0;
     while (item.namedChild(i)) |c| : (i += 1) {
         const k = c.kind();
         if (std.mem.eql(u8, k, "type_identifier")) name = text(e, c);
-        if (std.mem.eql(u8, k, "type_parameters")) {
-            var j: u32 = 0;
-            while (c.namedChild(j)) |tp| : (j += 1) {
-                const tp_k = tp.kind();
-                if (std.mem.eql(u8, tp_k, "type_identifier")) {
-                    try generic_params.append(e.alloc, try e.alloc.dupe(u8, text(e, tp)));
-                } else if (std.mem.eql(u8, tp_k, "type_parameter") or std.mem.eql(u8, tp_k, "const_parameter")) {
-                    var m: u32 = 0;
-                    while (tp.namedChild(m)) |tpc| : (m += 1) {
-                        if (std.mem.eql(u8, tpc.kind(), "type_identifier")) {
-                            try generic_params.append(e.alloc, try e.alloc.dupe(u8, text(e, tpc)));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
         if (std.mem.eql(u8, k, "field_declaration_list")) fields_node = c;
         if (std.mem.eql(u8, k, "ordered_field_declaration_list")) {
             fields_node = c;
@@ -2731,10 +3011,15 @@ fn structItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     const eid = try nominalEntity(e, .struct_, name, parent, item);
     e.declaration_owner = eid;
     const fields = if (fields_node) |fn_| try mapFields(e, fn_) else &.{};
-    const layout: items.struct_kind = if (fields.len == 0) .unit else if (tuple) .tuple else .named;
-    const generic_params_slice: []const []const u8 = try generic_params.toOwnedSlice(e.alloc);
+    // The source form decides the layout, not the field count: an ordered
+    // field list is a tuple struct even when it holds nothing
+    // (`struct Tuple();`), and a named list is a named struct even when it is
+    // empty (`struct Empty {}`). Only a declaration spelling no field list at
+    // all (`struct Unit;`) is a unit struct.
+    const layout: items.StructKind = if (tuple) .tuple else if (fields_node == null) .unit else .named;
     e.bodies_list.items[eid] = .{ .struct_ = .{
-        .generic_params = generic_params_slice,
+        .generic_params = try collectTypeParameterNames(e, item),
+        .generics = try collectGenerics(e, item),
         .layout = layout,
         .fields = fields,
         .methods = &.{},
@@ -2759,14 +3044,14 @@ fn enumItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
     );
     e.declaration_owner = eid;
     var variants: std.ArrayListUnmanaged(items.Variant) = .empty;
-    var kind: items.enum_kind = .c_like;
+    var kind: items.EnumKind = .c_like;
     if (variants_node) |vn| {
         var j: u32 = 0;
         while (vn.namedChild(j)) |v| : (j += 1) {
             if (!std.mem.eql(u8, v.kind(), "enum_variant")) continue;
             var vname: []const u8 = "";
             var ffields: items.VariantFields = .none;
-            var vkind: items.enum_kind = .c_like;
+            var vkind: items.EnumKind = .c_like;
             var k: u32 = 0;
             while (v.namedChild(k)) |c| : (k += 1) {
                 const kk = c.kind();
@@ -2789,10 +3074,13 @@ fn enumItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
             }
             if (vname.len == 0) return error.MalformedVariant;
             if (kind == .c_like) kind = vkind;
+            const variant_documentation = try documentationOf(e, v);
+            errdefer e.alloc.free(variant_documentation);
             try variants.append(e.alloc, .{
                 .name = try e.alloc.dupe(u8, vname),
                 .fields = ffields,
                 .discriminant = null,
+                .documentation = variant_documentation,
             });
         }
     }
@@ -3228,6 +3516,7 @@ fn typeAliasItem(e: *Ctx, item: ts.Node, parent: ?spine.EntityId) !void {
             std.mem.eql(u8, k, "type_identifier") or
             std.mem.eql(u8, k, "scoped_type_identifier") or
             std.mem.eql(u8, k, "reference_type") or
+            std.mem.eql(u8, k, "pointer_type") or
             std.mem.eql(u8, k, "array_type") or
             std.mem.eql(u8, k, "slice_type") or
             std.mem.eql(u8, k, "tuple_type") or
@@ -3457,7 +3746,7 @@ fn lowerConstArray(
         const parsed_len = parseConstIntText(text(e, len_node)) orelse
             return error.InvalidConstArray;
         if (parsed_len.value < 0) return error.InvalidConstArray;
-        const len = std.math.cast(usize, parsed_len.value) orelse
+        const len = std.math.cast(u64, parsed_len.value) orelse
             return error.InvalidConstArray;
         var elems: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
         defer elems.deinit(e.alloc);
@@ -4337,14 +4626,17 @@ fn lowerConstInit(
         if (std.mem.eql(u8, kind, "byte_literal") or std.mem.startsWith(u8, t, "b")) {
             return error.InvalidLiteral;
         }
-        if (t.len < 3 or t[0] != '\'' or t[t.len - 1] != '\'') {
-            return error.InvalidLiteral;
-        }
+        // The source spelling is not the value: `'\n'` is a newline with no
+        // backslash, and `'é'` is two UTF-8 bytes whose lead byte is 0xc3.
+        // Reading the raw first byte gave every escape the value 92 and `'é'`
+        // the value 195, so the emitted Zig constant compared unequal to the
+        // Rust one. One decoder, shared with function bodies and patterns.
+        const value = ts_ext.decodeRustCharCodepoint(t) orelse return error.InvalidLiteral;
         const text_copy = try e.alloc.dupe(u8, t);
         errdefer e.alloc.free(text_copy);
         const id = try appendExpr(e, .{ .literal = .{ .character = .{
             .text = text_copy,
-            .value = t[1],
+            .value = value,
         } } });
         if (expected) |ty| try setConstExprType(e, id, ty);
         return id;
@@ -4868,13 +5160,9 @@ fn implItem(
             if (impl_trait_path == null) {
                 impl_trait_path = .{ .segments = try mapScopedSegments(e, trait_node) };
             }
-            if (impl_trait_path) |*tp| {
-                if (tp.segments.len == 1) {
-                    if (ts_ext.preludePathSegments(e.alloc, tp.segments[0].name) catch null) |prelude_segs| {
-                        tp.segments = prelude_segs;
-                    }
-                }
-            }
+            // A single segment stays bare for the same reason it does in
+            // `parseTraitBound`: the declaration binder answers a module-level
+            // `use` alias before the prelude table sees the name.
         }
     }
     // Publish the impl receiver before lowering associated constants. Their
@@ -5960,7 +6248,21 @@ fn mapItemsInner(e: *Ctx, node: ts.Node, mod_id: spine.EntityId) ![]const spine.
         const item_kind = item.kind();
         if (isComment(item)) {
             // Comments are lexical extras, not Rust items; they carry no
-            // semantic entity in the graph.
+            // semantic entity in the graph. An inner doc comment is the one
+            // exception: it documents the module it is written in, so it
+            // becomes a standard `doc` module attribute. A nested or file
+            // module therefore collects its own inner docs without taking
+            // the outer docs written above its `mod` declaration.
+            const raw = text(e, item);
+            if (docCommentKind(raw)) |doc_kind| {
+                if (doc_kind == .inner) {
+                    try appendModuleAttribute(
+                        e,
+                        mod_id,
+                        try docCommentAttribute(e, raw),
+                    );
+                }
+            }
             continue;
         }
         if (std.mem.eql(u8, item_kind, "attribute_item")) {
@@ -7809,6 +8111,18 @@ fn hasEntity(g: *const graph.CrateGraph, kind: spine.EntityKind, name: []const u
     }
     return false;
 }
+/// The id of the one entity with this kind and name, or null when the graph
+/// does not hold exactly one. A binder test that cannot name its subject
+/// exactly says so instead of asserting against whichever row it found first.
+fn entityIdNamed(g: *const graph.CrateGraph, kind: spine.EntityKind, name: []const u8) ?spine.EntityId {
+    var found: ?spine.EntityId = null;
+    for (g.symbol_table.entities.items) |entity| {
+        if (entity.kind != kind or !std.mem.eql(u8, entity.name, name)) continue;
+        if (found != null) return null;
+        found = entity.id;
+    }
+    return found;
+}
 
 fn expectSegmentNames(path: types.Path, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, path.segments.len);
@@ -8217,6 +8531,103 @@ test "cst binds a union parameter named in a field type" {
     }, &.{"T"});
 }
 
+test "cst records a struct's parameter and where-clause bounds on the body" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub struct Wrapper<T: Copy> where T: Debug {
+        \\    pub inner: T,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const struct_id = entityIdNamed(&crate_graph, .struct_, "Wrapper") orelse
+        return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[struct_id]) {
+        .struct_ => |struct_body| struct_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), body.generic_params.len);
+    try std.testing.expectEqualStrings("T", body.generic_params[0]);
+
+    // The two bounds are written in two different places in the source — one
+    // on the parameter, one in the `where` clause — and the reader asks the
+    // row about `T` without knowing which place wrote the answer. Recording
+    // only the parameter bound is what made a `where`-only bound unreadable.
+    const generics = body.generics orelse return error.TestUnexpectedResult;
+    const type_param = typeParamNamed(generics, "T") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), type_param.bounds.len);
+    try expectSegmentNames(type_param.bounds[0].path, &.{ "core", "marker", "Copy" });
+    try std.testing.expectEqual(@as(usize, 1), generics.where_clauses.len);
+    const clause = generics.where_clauses[0];
+    try expectSegmentNames(clause.self_ty, &.{"T"});
+    try std.testing.expectEqual(@as(usize, 1), clause.bounds.len);
+    try expectSegmentNames(clause.bounds[0].path, &.{ "core", "fmt", "Debug" });
+}
+
+test "cst records a struct's layout from its source form, not its field count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        // Two of the three declare no field at all, so their field counts
+        // agree; only the node each one spells distinguishes them. `Pair()`
+        // has to answer a tuple constructor `Pair()`, not `Pair {}`.
+        .src =
+        \\pub struct Unit;
+        \\pub struct Empty {}
+        \\pub struct Pair();
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const expected = [_]struct { name: []const u8, layout: items.StructKind }{
+        .{ .name = "Unit", .layout = .unit },
+        .{ .name = "Empty", .layout = .named },
+        .{ .name = "Pair", .layout = .tuple },
+    };
+    for (expected) |want| {
+        const struct_id = entityIdNamed(&crate_graph, .struct_, want.name) orelse
+            return error.TestUnexpectedResult;
+        const body = switch (bodies_list.items[struct_id]) {
+            .struct_ => |struct_body| struct_body,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(want.layout, body.layout);
+        try std.testing.expectEqual(@as(usize, 0), body.fields.len);
+    }
+}
+
 test "cst binds a glob re-exported external name in a type position" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -8332,4 +8743,495 @@ test "cst rejects a glob name two glob sources both publish" {
         .exprs_list = &exprs_list,
     };
     try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
+}
+
+test "cst reads block documentation and leaves ordinary comments unattached" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\/*! Module block documentation. */
+        \\/**
+        \\ * Type documentation.
+        \\ */
+        \\//// Four slashes are an ordinary comment, not documentation.
+        \\pub struct Documented {
+        \\    /// Field documentation.
+        \\    value: u8,
+        \\    other: u16,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const module = crate_graph.modules.items[0];
+    try std.testing.expectEqual(@as(usize, 1), module.attributes.len);
+    try std.testing.expectEqualStrings("doc", module.attributes[0].name);
+    try std.testing.expectEqualStrings("Module block documentation.", module.attributes[0].meta);
+
+    const entity = for (crate_graph.symbol_table.entities.items) |candidate| {
+        if (candidate.kind == .struct_ and std.mem.eql(u8, candidate.name, "Documented")) {
+            break candidate;
+        }
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), entity.attributes.len);
+    try std.testing.expectEqualStrings("doc", entity.attributes[0].name);
+    try std.testing.expectEqualStrings("Type documentation.", entity.attributes[0].meta);
+
+    const body = switch (bodies_list.items[entity.id]) {
+        .struct_ => |struct_body| struct_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), body.fields.len);
+    try std.testing.expectEqualStrings("Field documentation.", body.fields[0].documentation);
+    try std.testing.expectEqualStrings("", body.fields[1].documentation);
+}
+
+test "cst decodes doc attributes and never invents text for an expression" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\/// Outer prose.
+        \\#[doc = r"Raw string prose."]
+        \\#[doc = concat!("a", "b")]
+        \\pub fn documented() -> u8 { 0 }
+        \\// Implementation commentary, not documentation.
+        \\pub fn plain() -> u8 { 1 }
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    var found_documented = false;
+    for (crate_graph.symbol_table.entities.items) |entity| {
+        if (std.mem.eql(u8, entity.name, "documented")) {
+            found_documented = true;
+            try std.testing.expectEqual(@as(usize, 3), entity.attributes.len);
+            // The doc comment leads, then the written attributes in source
+            // order; the macro call keeps its metadata but contributes no
+            // prose, because this translator cannot evaluate it.
+            for (entity.attributes) |attribute| {
+                try std.testing.expectEqualStrings("doc", attribute.name);
+            }
+            try std.testing.expectEqualStrings("Outer prose.", entity.attributes[0].meta);
+            try std.testing.expectEqualStrings("Raw string prose.", entity.attributes[1].meta);
+            try std.testing.expectEqualStrings("", entity.attributes[2].meta);
+        } else if (std.mem.eql(u8, entity.name, "plain")) {
+            try std.testing.expectEqual(@as(usize, 0), entity.attributes.len);
+        }
+    }
+    try std.testing.expect(found_documented);
+}
+
+test "cst records documentation on enum variants" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub enum Choice {
+        \\    /// First tag.
+        \\    First,
+        \\    #[doc = "Second tag."]
+        \\    Second,
+        \\    Third,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    const enum_id = for (crate_graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .enum_ and std.mem.eql(u8, entity.name, "Choice")) break entity.id;
+    } else return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[enum_id]) {
+        .enum_ => |enum_body| enum_body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 3), body.variants.len);
+    try std.testing.expectEqualStrings("First tag.", body.variants[0].documentation);
+    try std.testing.expectEqualStrings("Second tag.", body.variants[1].documentation);
+    try std.testing.expectEqualStrings("", body.variants[2].documentation);
+}
+
+test "cst refuses a deferred bare head that nothing declares" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub struct Wrapper<T> {
+        \\    pub inner: Missing<T>,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    // `Missing<T>` is a bare head with arguments, so mapping defers it to
+    // `bindDeclarationTypes`. No module item declares it and the prelude has
+    // no such name, so the wait must end in the typed refusal — a deferral is
+    // bounded, and no placeholder is ever allowed to survive it.
+    try std.testing.expectError(error.UnresolvedNominalType, extractFile(&ctx));
+    try std.testing.expect(ctx.pending_generics == null);
+}
+
+test "cst binds a deferred bare head to the declaration below it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub struct Wrapper<T> {
+        \\    pub inner: Later<T>,
+        \\}
+        \\pub struct Later<S> {
+        \\    pub seed: S,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // `Later` is declared below its use, in the same module, so mapping defers
+    // the head and the declaration pass binds it to that declaration — and
+    // the wait list is drained, so the placeholder cannot outlive the call.
+    try std.testing.expect(ctx.pending_generics == null);
+    const wrapper_id = entityIdNamed(&crate_graph, .struct_, "Wrapper") orelse
+        return error.TestUnexpectedResult;
+    const later_id = entityIdNamed(&crate_graph, .struct_, "Later") orelse
+        return error.TestUnexpectedResult;
+    const wrapper = switch (bodies_list.items[wrapper_id]) {
+        .struct_ => |body| body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), wrapper.fields.len);
+    const application = switch (wrapper.fields[0].ty) {
+        .generic_inst => |generic| generic,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(later_id, application.decl);
+    try std.testing.expectEqual(@as(usize, 1), application.args.params.len);
+    try expectSegmentNames(switch (application.args.params[0]) {
+        .path => |path| path,
+        else => return error.TestUnexpectedResult,
+    }, &.{"T"});
+}
+
+test "cst prefers a same-module declaration to the prelude for a deferred bare head" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub struct Wrapper<T> {
+        \\    pub inner: Hasher<T>,
+        \\}
+        \\pub struct Hasher<S> {
+        \\    pub seed: S,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // `Hasher` is a prelude name (`core::hash::Hasher`), and the field is
+    // written above the crate's own `struct Hasher<S>`, so mapping defers
+    // the head. The deferred binder reads local definitions first and the
+    // prelude only after — the field must name the crate's own struct, never
+    // the standard trait.
+    try std.testing.expect(ctx.pending_generics == null);
+    const wrapper_id = entityIdNamed(&crate_graph, .struct_, "Wrapper") orelse
+        return error.TestUnexpectedResult;
+    const hasher_id = entityIdNamed(&crate_graph, .struct_, "Hasher") orelse
+        return error.TestUnexpectedResult;
+    const wrapper = switch (bodies_list.items[wrapper_id]) {
+        .struct_ => |body| body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), wrapper.fields.len);
+    const application = switch (wrapper.fields[0].ty) {
+        .generic_inst => |generic| generic,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(hasher_id, application.decl);
+    const hasher = crate_graph.symbol_table.get(application.decl) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(spine.EntityKind.struct_, hasher.kind);
+    try std.testing.expectEqual(@as(usize, 1), application.args.params.len);
+}
+
+test "cst prefers a module-level use alias to the prelude" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub fn bounded<H: Hash>() {}
+        \\use core::fmt::Debug as Hash;
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // The prelude answers `Hash` as `core::hash::Hash`, but the module's own
+    // `use` alias answers it as `core::fmt::Debug` — and the alias lives in
+    // the graph, so the binder reads it before the prelude table. The `use`
+    // sits below the function on purpose: at walk time the alias does not
+    // exist yet, so the head goes through the deferred binder rather than
+    // the walk-time shortcut.
+    const fn_id = entityIdNamed(&crate_graph, .fn_, "bounded") orelse
+        return error.TestUnexpectedResult;
+    const body = switch (bodies_list.items[fn_id]) {
+        .fn_ => |fn_body| fn_body,
+        else => return error.TestUnexpectedResult,
+    };
+    const generics = body.generics orelse return error.TestUnexpectedResult;
+    const type_param = typeParamNamed(generics, "H") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), type_param.bounds.len);
+    try expectSegmentNames(type_param.bounds[0].path, &.{ "core", "fmt", "Debug" });
+}
+
+test "cst keeps the same-module declaration beside an anonymous prelude import" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\use core::hash::Hasher as _;
+        \\pub struct Wrapper<T> {
+        \\    pub inner: Hasher<T>,
+        \\}
+        \\pub struct Hasher<S> {
+        \\    pub seed: S,
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    try extractFile(&ctx);
+
+    // `use core::hash::Hasher as _` is an anonymous import: it binds no name
+    // (its `local_name` is `_`, never `Hasher`). A same-scope `struct` and a
+    // named alias for it would be a duplicate definition, so this is the form
+    // in which a module-level alias and a local declaration legally meet —
+    // and the local declaration keeps the name.
+    try std.testing.expect(ctx.pending_generics == null);
+    const use_id = entityIdNamed(&crate_graph, .use_, "core::hash::Hasher as _") orelse
+        return error.TestUnexpectedResult;
+    const use_decl = crate_graph.useById(use_id) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_", use_decl.local_name);
+    const wrapper_id = entityIdNamed(&crate_graph, .struct_, "Wrapper") orelse
+        return error.TestUnexpectedResult;
+    const hasher_id = entityIdNamed(&crate_graph, .struct_, "Hasher") orelse
+        return error.TestUnexpectedResult;
+    const wrapper = switch (bodies_list.items[wrapper_id]) {
+        .struct_ => |body| body,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), wrapper.fields.len);
+    const application = switch (wrapper.fields[0].ty) {
+        .generic_inst => |generic| generic,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(hasher_id, application.decl);
+    const hasher = crate_graph.symbol_table.get(application.decl) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(spine.EntityKind.struct_, hasher.kind);
+}
+
+test "cst refuses an array length taken from a const generic parameter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src =
+        \\pub struct Buf<const N: usize> {
+        \\    pub data: [u8; N],
+        \\}
+        ,
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    // `mapArrayLen` folds literals and module-level `const` items, never a
+    // const generic parameter — `constDeclarationByName` looks the name up
+    // among const *declarations*, so `N` folds to nothing. The IR home for
+    // the use (`ArrayLen.generic`) exists, but a struct row carries no
+    // const-parameter list for the index to name, and the only reader lowers
+    // `.generic` to a `[]const T` slice — a different ABI from `[u8; N]`.
+    // Filling the field would trade this loud refusal for a silently
+    // different program, so the row is refused here instead.
+    try std.testing.expectError(error.InvalidType, extractFile(&ctx));
+}
+
+test "cst never mints a placeholder id below the reserved band" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var crate_graph = try testGraphWithRootModule(allocator);
+    defer crate_graph.deinit();
+
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    try bodies_list.append(allocator, .none);
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    var ctx: Ctx = .{
+        .alloc = allocator,
+        .g = &crate_graph,
+        .src = "pub struct Probe { pub field: u8 }",
+        .types_list = &types_list,
+        .bodies_list = &bodies_list,
+        .exprs_list = &exprs_list,
+    };
+    var local_generics: std.ArrayListUnmanaged(PendingGenericApplication) = .empty;
+    defer {
+        for (local_generics.items) |application| freePendingGenericPath(allocator, application.path);
+        local_generics.deinit(allocator);
+    }
+    ctx.pending_generics = &local_generics;
+    ctx.declaration_owner = 0;
+
+    // One placeholder per ordinal, straight through the band: every id must
+    // answer `isDeferredPlaceholder`, and the last of them must be exactly
+    // the floor — never one id below it, where `SymbolTable.add` is still
+    // free to mint.
+    var ordinal: usize = 0;
+    // The fixture hands the function owned memory, as the walk does with its
+    // `toOwnedSlice`: `makePendingGeneric` frees what it takes, and freeing a
+    // stack slice or a comptime literal is what underflowed the arena.
+    while (ordinal < spine.deferred_placeholder_reserve) : (ordinal += 1) {
+        const one = try allocator.alloc(types.PathSegment, 1);
+        one[0] = .{ .name = try allocator.dupe(u8, "Later"), .id = null };
+        const mapped = try makePendingGeneric(&ctx, &.{}, one);
+        const application = switch (mapped) {
+            .generic_inst => |generic| generic,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(spine.isDeferredPlaceholder(application.decl));
+    }
+    const floor_entry = local_generics.items[local_generics.items.len - 1];
+    try std.testing.expectEqual(spine.deferred_placeholder_floor, floor_entry.placeholder);
+
+    // The band is spent. The next application must refuse with the name of
+    // the boundary, not mint `floor - 1` and collide with a future row. This
+    // call errors through the same ownership handoff, so it too passes arena
+    // memory.
+    const overflow = try allocator.alloc(types.PathSegment, 1);
+    overflow[0] = .{ .name = try allocator.dupe(u8, "Later"), .id = null };
+    try std.testing.expectError(
+        error.UnresolvedNominalType,
+        makePendingGeneric(&ctx, &.{}, overflow),
+    );
+    try std.testing.expectEqual(spine.deferred_placeholder_reserve, local_generics.items.len);
 }

@@ -49,7 +49,9 @@ pub const Expr = struct {
 pub const ExprKind = union(enum) {
     // — literals & atoms (§1.1) —
     literal: Literal,
+    array: ArrayExpr,
     vec_lit: VecLit,
+    range: RangeExpr,
     path: PathExpr,
     block: BlockExpr,
     unit: void,
@@ -66,15 +68,22 @@ pub const ExprKind = union(enum) {
 
     // — calls & construction (§1.3) —
     call: Call,
+    core_call: CoreCall,
+    core_function: CoreFunctionValue,
     method_call: MethodCall,
     struct_lit: StructLit,
     enum_variant: EnumVariant,
+    external_variant: ExternalVariant,
+    format_write: FormatWriteExpr,
 
     // — access (§1.4) —
     field: FieldExpr,
     index: IndexExpr,
 
-    // — operators (§1.5) —
+    // — scalar conversions (§1.5) —
+    cast: CastExpr,
+
+    // — operators (§1.6) —
     binary: BinaryExpr,
     unary: UnaryExpr,
     assign: AssignExpr,
@@ -84,6 +93,9 @@ pub const ExprKind = union(enum) {
     // — deferred seams (§4, not emitted in v1) —
     closure: ClosureExpr,
     iterator_chain: IteratorChainExpr,
+
+    // — explicit divergence —
+    panic_: PanicExpr,
 
     // — explicit refusal —
     unsupported: Unsupported,
@@ -132,13 +144,62 @@ pub const ByteArrayLit = struct {
     items: []const u8,
 };
 
+/// A fixed-length array literal: `[a, b, c]` or the repeating form `[e; N]`.
+/// `elements` holds the element expr NodeIds (all of them for the explicit
+/// list form; exactly one element for the repeating form). When `repeat` is
+/// non-null the total length is `repeat` (Rust `[e; N]`); otherwise the total
+/// length is `elements.len`. Lossless: element exprs are full `Expr` nodes and
+/// the emitter derives Zig `[_]T{ ... }` / `[_]T{ e } ** N` from them.
+///
+/// The count is a plain number because a fixed-length array's length is part
+/// of its type and therefore known before any code runs. `VecLit` has no such
+/// guarantee, which is why its count is a `VecRepeatCount`.
+pub const ArrayExpr = struct {
+    elements: []const NodeId,
+    /// Target-side repeat count; independent of the translator's pointer width.
+    repeat: ?u64,
+};
+
+/// A `vec![e; N]` repeat count: either a number the translator already holds,
+/// or the `Expr` node that produces it.
+///
+/// `Vec` is a runtime container, so `vec![e; N]` states how many elements a
+/// value holds without the count being part of any type: `vec![0u8; n]`
+/// repeats as many times as `n` evaluates to, and `n` is an ordinary
+/// expression with its own effects, types, lifetimes, and captures.
+pub const VecRepeatCount = union(enum) {
+    /// A count the translator holds outright; wide so a count a 64-bit target
+    /// can state survives any host.
+    literal: u64,
+    /// A count the target evaluates, as an expression node. That node is a
+    /// real child of the literal: it is reached by walking the vector, and its
+    /// resolved type and generic arguments are its own.
+    expression: NodeId,
+};
+
 /// A parsed Rust `vec!` literal, distinct from a fixed-length array literal.
 /// When `repeat` is null, `elements` may contain any number of nodes, including
-/// zero. When `repeat` is non-null, `elements` must contain exactly one node.
+/// zero. When `repeat` is set, `elements` must contain exactly one node.
 /// This records macro semantics without claiming runtime `Vec` support.
 pub const VecLit = struct {
     elements: []const NodeId,
-    repeat: ?usize,
+    /// Target-side repeat count; independent of the translator's pointer width.
+    repeat: ?VecRepeatCount,
+};
+
+/// A range expression (`start..end`, `start..=end`, or `start..`).
+/// The absent end is valid for open-ended indexing/slicing only; iteration
+/// requires a bounded range.
+pub const RangeExpr = struct {
+    start: NodeId,
+    end: ?NodeId,
+    inclusive: bool = false,
+};
+
+/// A source-level panic or unreachable expression. Diverging expressions
+/// must carry the never type in their shared expression header.
+pub const PanicExpr = struct {
+    message: []const u8,
 };
 
 /// A resolved reference, not a name. Collapses Rust's `x`, `Foo::Bar` (unit
@@ -255,6 +316,91 @@ pub const Call = struct {
     args: []const NodeId,
 };
 
+/// A call to a supported Rust core or standard-library primitive.
+pub const CoreFunction = enum {
+    mem_size_of,
+    mem_transmute,
+    mem_size_of_val,
+    ptr_copy_nonoverlapping,
+    /// Rust integer `T::from_le_bytes(bytes)`: one type argument `T`, one
+    /// value argument `[size_of::<T>()]u8`, and result `T`. The width belongs
+    /// to the compilation target, including for `usize` and `isize`.
+    /// Unlike `mem_transmute`, this decodes little-endian on every target.
+    prim_from_le_bytes,
+    /// Rust integer `value.to_le_bytes()`: one type argument `T`, one value
+    /// argument `T`, and result `[size_of::<T>()]u8`. Pointer-sized widths
+    /// remain target-dependent. Unlike `mem_transmute`, this encodes
+    /// little-endian on every target.
+    prim_to_le_bytes,
+    /// Rust `MaybeUninit::<T>::uninit()`. One type argument `T`, no value
+    /// arguments, and result `core::mem::MaybeUninit<T>`, not a live `T`.
+    /// Backend layout remains transparent `T`. The array a source writes
+    /// (`[MaybeUninit::<u8>::uninit(); N]`) is the separate `.array` node above
+    /// this one, carrying `repeat = N`. Rust evaluates the element once and
+    /// repeats the value; making the call array-typed would conflate the
+    /// element with the enclosing array and its independent length.
+    ///
+    /// The value is genuinely UNINITIALISED, which is why it cannot be a
+    /// zero-filled array literal: the source promised the bytes hold nothing
+    /// until it writes them, and initialising them is a different program.
+    maybe_uninit_uninit,
+    /// Rust `rand_core::impls::fill_bytes_via_next(rng, dest)`, the default body
+    /// of `RngCore::fill_bytes`. `args` is `[rng, dest]`: the receiver first
+    /// because that is the borrow `fill_bytes` takes, then the slice to fill.
+    /// Zero type arguments, two value arguments, and result `unit`. The
+    /// receiver is mutable and `dest` is a mutable byte slice. Its identity
+    /// is the `rand_core::impls` path, not an unrelated same-named function.
+    rng_fill_bytes_via_next,
+    /// Rust `core::hash::Hasher::write_uN` and the rest of the family's default
+    /// bodies. `generic_args[0]` is the primitive being written and `args` is
+    /// `[hasher, value]`. The default body writes the value's OWN bytes, which
+    /// is native-endian. One integer type argument, two value arguments
+    /// (mutable hasher and that integer), and result `unit`. A source impl's
+    /// override must dispatch to its own method instead of this default.
+    hash_write_primitive,
+    ptr_write_bytes,
+    ptr_read_unaligned,
+    slice_from_raw_parts,
+    slice_from_raw_parts_mut,
+    str_from_utf8,
+    str_from_utf8_unchecked,
+    string_from_utf8,
+    string_from_utf8_lossy,
+    string_from_utf8_unchecked,
+    cmp_min,
+    cmp_max,
+    default_value,
+    convert_from,
+    /// Canonical `num_traits::Bounded::min_value`: one type argument `I`,
+    /// zero value arguments, result `I`. Source trait implementations take
+    /// precedence over the target-integer minimum fallback.
+    numeric_min_value,
+    /// Canonical `num_traits::Bounded::max_value`, with the same shape and
+    /// source-override precedence as `numeric_min_value`.
+    numeric_max_value,
+    /// Canonical `num_traits::Zero::zero`: one type argument `I`, zero value
+    /// arguments, result `I`. This is not `Default::default`; source trait
+    /// implementations take precedence over the typed integer-zero fallback.
+    numeric_zero,
+    /// Canonical `num_traits::One::one`, with the same shape and source-
+    /// override precedence as `numeric_zero`, and integer-one fallback.
+    numeric_one,
+};
+
+/// A core-library function item. It carries type arguments but no value
+/// arguments; applying it remains a distinct `core_call` expression.
+pub const CoreFunctionValue = struct {
+    function: CoreFunction,
+    generic_args: []const types.Type = &.{},
+};
+
+/// An actual core-library call. This never denotes a function value.
+pub const CoreCall = struct {
+    function: CoreFunction,
+    generic_args: []const types.Type = &.{},
+    args: []const NodeId = &.{},
+};
+
 pub const CallKind = union(enum) {
     free: DefId, // f(a)
     associated: DefId, // Foo::f(a) → Foo.f(a)
@@ -268,6 +414,12 @@ pub const MethodCall = struct {
     receiver_mode: ReceiverMode,
     method: DefId,
     /// Argument expression indices (expr table).
+    args: []const NodeId,
+};
+
+pub const FormatWriteExpr = struct {
+    writer: NodeId,
+    template: []const u8,
     args: []const NodeId,
 };
 
@@ -301,6 +453,14 @@ pub const EnumVariant = struct {
     named_fields: []const FieldInit,
 };
 
+/// A variant owned by an external nominal enum with no local graph entity.
+pub const ExternalVariant = struct {
+    owner: types.ExternalNominal,
+    variant: []const u8,
+    tuple_fields: []const NodeId = &.{},
+    named_fields: []const FieldInit = &.{},
+};
+
 // §1.4 Access ───────────────────────────────────────────────────────────────
 
 pub const FieldExpr = struct {
@@ -317,7 +477,28 @@ pub const IndexExpr = struct {
     index: NodeId,
 };
 
-// §1.5 Operators ────────────────────────────────────────────────────────────
+// §1.5 Scalar conversions ───────────────────────────────────────────────────
+
+pub const ConversionKind = enum {
+    as_,
+    primitive_from,
+};
+
+/// A validated primitive scalar conversion (`value as Target`).
+pub const CastExpr = struct {
+    /// Conversion syntax and semantics.
+    kind: ConversionKind = .as_,
+    /// Source expression index (expr table).
+    operand: NodeId,
+    /// Validated source type. This is explicit because transient composite
+    /// types (for example a loop capture reference) are not guaranteed to be
+    /// interned in `Bodies.types`.
+    source_type: types.Type,
+    /// Primitive target type index (type table).
+    target: TypeId,
+};
+
+// §1.6 Operators ────────────────────────────────────────────────────────────
 
 /// Per-site overflow mode: sidecar-decided so emit is deterministic and never
 /// "relies on defaults".
@@ -436,15 +617,28 @@ pub const CaptureMode = enum {
 
 /// The emitter lowers each adapter to an explicit loop; sealed union so
 /// `analyse` rejects unknown adapters loudly but v3 only adds arms.
+pub const IteratorTerminal = enum {
+    /// Leave the adapter chain as an iterator value.
+    iterator,
+    /// Materialize the chain into an owned `Vec`.
+    collect_vec,
+    /// Fold the chain with integer addition.
+    sum,
+};
+
 pub const IteratorChainExpr = struct {
     /// Base iterable expression index (expr table).
     source: NodeId,
     adapters: []const IteratorAdapter,
+    /// Terminal operation. The default preserves deferred iterator fixtures.
+    terminal: IteratorTerminal = .iterator,
 };
 
 pub const IteratorAdapter = union(enum) {
     map: MapAdapter,
     filter: FilterAdapter,
+    /// Apply a closure and flatten each returned iterator.
+    flat_map: ClosureExpr,
     enumerate: void, // → for (xs, 0..)
     zip: ZipAdapter,
     range_rev: void, // .rev() on a range
@@ -486,6 +680,7 @@ pub const PatternKind = union(enum) {
     binding: Binding,
     literal: Literal, // `1`, `'a'`
     path: PathPat, // unit enum variant / const pattern
+    external_variant: ExternalVariantPattern,
     tuple: TuplePat, // (a, b, ..)
     slice: SlicePat, // [a, b, ..rest, c]
     struct_pat: StructPat, // Point { x, y, .. }
@@ -532,6 +727,14 @@ pub const StructPat = struct {
     fields: []const FieldPat, // name : pat  |  shorthand name
     rest: bool, // `..`
     // #[non_exhaustive] handled at the arm/switch level.
+};
+
+/// A pattern for a variant whose enum owner has no local graph entity.
+pub const ExternalVariantPattern = struct {
+    owner: types.ExternalNominal,
+    variant: []const u8,
+    fields: []const FieldPat = &.{},
+    rest: bool = false,
 };
 
 pub const FieldPat = struct {
@@ -625,6 +828,11 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const block_with_stmt: BlockExpr = .{ .statements = &.{ 10, 20 }, .tail = 42, .labelled = "blk" };
     _ = block_with_stmt;
 
+    // §1.1 — Array, Range, Panic
+    const array_expr: ArrayExpr = .{ .elements = &.{ 1, 2 }, .repeat = null };
+    const range_expr: RangeExpr = .{ .start = 3, .end = 4, .inclusive = true };
+    const panic_expr: PanicExpr = .{ .message = "unreachable" };
+
     // §1.2 — IfExpr / ElseBranch (all three variants)
     const else_blk: BlockExpr = .{ .statements = &.{}, .tail = null, .labelled = null };
     const if_full: IfExpr = .{ .cond = 5, .then_ = block_expr, .@"else" = .{ .block = else_blk } };
@@ -681,6 +889,46 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     _ = for_enum;
     _ = break_no_val;
 
+    // §1.3 — CoreFunction / CoreCall / CoreFunctionValue
+    const core_functions = [_]CoreFunction{
+        .mem_size_of,
+        .mem_transmute,
+        .mem_size_of_val,
+        .ptr_copy_nonoverlapping,
+        .ptr_write_bytes,
+        .ptr_read_unaligned,
+        .slice_from_raw_parts,
+        .slice_from_raw_parts_mut,
+        .str_from_utf8,
+        .str_from_utf8_unchecked,
+        .string_from_utf8,
+        .string_from_utf8_lossy,
+        .string_from_utf8_unchecked,
+        .cmp_min,
+        .cmp_max,
+        .default_value,
+        .convert_from,
+        .prim_from_le_bytes,
+        .prim_to_le_bytes,
+        .maybe_uninit_uninit,
+        .rng_fill_bytes_via_next,
+        .hash_write_primitive,
+        .numeric_min_value,
+        .numeric_max_value,
+        .numeric_zero,
+        .numeric_one,
+    };
+    const core_call: CoreCall = .{
+        .function = .mem_size_of,
+        .generic_args = &.{.{ .prim = .u8 }},
+        .args = &.{},
+    };
+    const core_function: CoreFunctionValue = .{
+        .function = .mem_transmute,
+        .generic_args = &.{ .{ .prim = .u8 }, .{ .prim = .u64 } },
+    };
+    _ = core_functions;
+
     // §1.3 — Call / CallKind (all three)
     const call_free: Call = .{ .call_kind = .{ .free = 30 }, .args = &.{ 1, 2 } };
     const call_assoc: Call = .{ .call_kind = .{ .associated = 31 }, .args = &.{} };
@@ -708,9 +956,36 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     };
     _ = struct_with_base;
 
+    // §1.3 — ExternalVariant, FormatWriteExpr
+    const external_variant: ExternalVariant = .{
+        .owner = .{
+            .path = &.{ "alloc", "borrow", "Cow" },
+            .args = &.{.{ .prim = .u8 }},
+        },
+        .variant = "Owned",
+        .tuple_fields = &.{45},
+        .named_fields = &.{fi_a},
+    };
+    const format_write: FormatWriteExpr = .{ .writer = 48, .template = "{}\n", .args = &.{49} };
+
     // §1.4 — FieldExpr, IndexExpr
     const field_expr: FieldExpr = .{ .base = 46, .field = "x", .resolved = 47 };
     const index_expr: IndexExpr = .{ .base = 48, .index = 49 };
+
+    // §1.5 — CastExpr (both ConversionKinds)
+    const cast_expr: CastExpr = .{
+        .kind = .as_,
+        .operand = 46,
+        .source_type = .{ .prim = .u64 },
+        .target = 2,
+    };
+    const cast_from: CastExpr = .{
+        .kind = .primitive_from,
+        .operand = 46,
+        .source_type = .{ .prim = .u64 },
+        .target = 2,
+    };
+    _ = cast_from;
 
     // §1.5 — Overflow (all three)
     const ov_checked: Overflow = .checked;
@@ -835,6 +1110,14 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     const e_try: Expr = .{ .id = 22, .span = span, .ty = null, .kind = .{ .try_ = try_expr } };
     const e_ret: Expr = .{ .id = 23, .span = span, .ty = null, .kind = .{ .return_ = ret_val } };
     const e_unsup: Expr = .{ .id = 25, .span = span, .ty = null, .kind = .{ .unsupported = unsup } };
+    const e_array: Expr = .{ .id = 26, .span = span, .ty = null, .kind = .{ .array = array_expr } };
+    const e_range: Expr = .{ .id = 27, .span = span, .ty = null, .kind = .{ .range = range_expr } };
+    const e_core_call: Expr = .{ .id = 28, .span = span, .ty = null, .kind = .{ .core_call = core_call } };
+    const e_core_fn: Expr = .{ .id = 29, .span = span, .ty = null, .kind = .{ .core_function = core_function } };
+    const e_ext_variant: Expr = .{ .id = 30, .span = span, .ty = null, .kind = .{ .external_variant = external_variant } };
+    const e_fmt_write: Expr = .{ .id = 31, .span = span, .ty = null, .kind = .{ .format_write = format_write } };
+    const e_cast: Expr = .{ .id = 32, .span = span, .ty = null, .kind = .{ .cast = cast_expr } };
+    const e_panic: Expr = .{ .id = 33, .span = span, .ty = null, .kind = .{ .panic_ = panic_expr } };
     _ = e_lit;
     _ = e_path;
     _ = e_block;
@@ -859,6 +1142,14 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     _ = e_try;
     _ = e_ret;
     _ = e_unsup;
+    _ = e_array;
+    _ = e_range;
+    _ = e_core_call;
+    _ = e_core_fn;
+    _ = e_ext_variant;
+    _ = e_fmt_write;
+    _ = e_cast;
+    _ = e_panic;
     // closure / iterator_chain exercised in deferred test.
 }
 
@@ -892,6 +1183,17 @@ test "exprs — every PatternKind / StatementKind variant compiles" {
         .span = span,
         .ty = null,
         .kind = .{ .path = .{ .def = 11, .variant = null } },
+    };
+    const pat_external_variant: Pattern = .{
+        .id = 15,
+        .span = span,
+        .ty = null,
+        .kind = .{ .external_variant = .{
+            .owner = .{ .path = &.{ "core", "option", "Option" } },
+            .variant = "Some",
+            .fields = &.{.{ .field = "0", .pat = 4, .shorthand = false }},
+            .rest = false,
+        } },
     };
     const pat_tuple: Pattern = .{
         .id = 6,
@@ -958,6 +1260,7 @@ test "exprs — every PatternKind / StatementKind variant compiles" {
     _ = pat_lit;
     _ = pat_path;
     _ = pat_path_unit;
+    _ = pat_external_variant;
     _ = pat_tuple;
     _ = pat_tuple_rest;
     _ = pat_slice;
@@ -1050,9 +1353,10 @@ test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter
     // Unsupported (consumed by IteratorAdapter.other below)
     const unsup: Unsupported = .{ .reason = "scan", .suggested_version = .v3 };
 
-    // IteratorAdapter — all 6 variants
+    // IteratorAdapter — all 7 variants
     const ia_map: IteratorAdapter = .{ .map = map_ad };
     const ia_filter: IteratorAdapter = .{ .filter = filter_ad };
+    const ia_flat_map: IteratorAdapter = .{ .flat_map = closure };
     const ia_enum: IteratorAdapter = .{ .enumerate = {} };
     const ia_zip: IteratorAdapter = .{ .zip = zip_ad };
     const ia_rev: IteratorAdapter = .{ .range_rev = {} };
@@ -1064,7 +1368,18 @@ test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter
     _ = ia_other;
 
     // IteratorChainExpr (consumed by IterKind.adapter below)
-    const chain: IteratorChainExpr = .{ .source = 11, .adapters = &.{ia_map} };
+    const chain: IteratorChainExpr = .{
+        .source = 11,
+        .adapters = &.{ ia_map, ia_flat_map },
+        .terminal = .collect_vec,
+    };
+
+    const terminal_iterator: IteratorTerminal = .iterator;
+    const terminal_collect_vec: IteratorTerminal = .collect_vec;
+    const terminal_sum: IteratorTerminal = .sum;
+    _ = terminal_iterator;
+    _ = terminal_collect_vec;
+    _ = terminal_sum;
 
     // IterKind.adapter variant (the deferred escape)
     const ik_adapter: IterKind = .{ .adapter = chain };

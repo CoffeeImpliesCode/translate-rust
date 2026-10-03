@@ -40,7 +40,7 @@ fn materializeInferredConstructorTypes(
     allocator: std.mem.Allocator,
     type_list: *std.ArrayListUnmanaged(types.Type),
     expr_list: []exprs.Expr,
-    inferred: std.AutoHashMapUnmanaged(exprs.NodeId, types.Instantiation),
+    inferred: infer.InstantiationMap,
 ) !void {
     var it = inferred.iterator();
     while (it.next()) |entry| {
@@ -138,6 +138,8 @@ fn materializeOpaqueFunctionReturns(
 /// 7. Method & trait resolution (`resolve_methods.resolveMethods`).
 /// 8. Monomorphization (`monomorphize.collectInstantiations`).
 /// Returns the completed `ir.RustIr`.
+/// Use a caller-owned arena for all analysis allocations. Keep it alive while
+/// using the returned IR, and release it after the last use.
 pub fn analyzeCrate(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -150,6 +152,7 @@ pub fn analyzeCrate(
 /// `cfg.features` means "no selection was made", so the manifest's `default`
 /// feature closure applies; a non-empty list is the caller's explicit
 /// selection and replaces the manifest default.
+/// Uses the caller-owned arena lifetime described by `analyzeCrate`.
 pub fn analyzeCrateWithOptions(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -161,13 +164,26 @@ pub fn analyzeCrateWithOptions(
     const src = try ingest.readFileAlloc(allocator, io, manifest.root_path);
 
     var resolved = options;
-    if (resolved.cfg.features.len == 0) {
+    // A caller's list replaces the manifest default and arrives exactly as
+    // written, so it may name a feature whose own members are what enable a
+    // dependency; nothing may be concluded from what it leaves out.
+    const caller_selected = resolved.cfg.features.len != 0;
+    if (!caller_selected) {
         resolved.cfg.features = try ingest.defaultFeatureClosure(allocator, manifest.features);
     }
-    return analyzeSourceWithGraph(allocator, io, crate_dir, manifest, src, resolved);
+    const dependency_closure: DependencyClosure = .{
+        .features = manifest.features,
+        .active = resolved.cfg.features,
+        // `ingest.defaultFeatureClosure` returns a transitively expanded
+        // closure, so an implicit feature missing from it is definitely off.
+        .complete = !caller_selected,
+    };
+    return analyzeSourceWithGraph(allocator, io, crate_dir, manifest, src, resolved, dependency_closure);
 }
 
 /// Analyze a crate when source is already loaded in memory.
+/// Use a caller-owned arena for all analysis allocations. Keep it alive while
+/// using the returned IR, and release it after the last use.
 pub fn analyzeSource(
     allocator: std.mem.Allocator,
     crate_name: []const u8,
@@ -178,6 +194,7 @@ pub fn analyzeSource(
 }
 
 /// Analyze source with explicit frontend options.
+/// Uses the caller-owned arena lifetime described by `analyzeSource`.
 pub fn analyzeSourceWithOptions(
     allocator: std.mem.Allocator,
     crate_name: []const u8,
@@ -192,7 +209,14 @@ pub fn analyzeSourceWithOptions(
         .root_path = "src/lib.rs",
         .is_bin = false,
     };
-    return analyzeSourceWithGraph(allocator, null, ".", manifest, source, options);
+    // Source loaded from memory has no manifest and so no feature table: there
+    // is nothing a selection could fail to expand, and nothing that could
+    // enable an optional dependency behind a feature.
+    const dependency_closure: DependencyClosure = .{
+        .active = options.cfg.features,
+        .complete = true,
+    };
+    return analyzeSourceWithGraph(allocator, null, ".", manifest, source, options, dependency_closure);
 }
 
 fn manifestEdition(edition: []const u8) !u16 {
@@ -269,7 +293,8 @@ const CollectionEffectScanner = struct {
         return switch (self.exprs[node_id].kind) {
             .literal, .path, .unit, .continue_, .panic_ => false,
             .array => |array| self.nodeListAllocates(array.elements),
-            .vec_lit => |vec| self.nodeListAllocates(vec.elements),
+            .vec_lit => |vec| self.nodeListAllocates(vec.elements) or
+                self.repeatCountAllocates(vec.repeat),
             .range => |range| self.exprAllocates(range.start) or
                 (if (range.end) |end| self.exprAllocates(end) else false),
             .block => |block| self.blockAllocates(block),
@@ -321,6 +346,18 @@ const CollectionEffectScanner = struct {
             if (self.exprAllocates(node_id)) return true;
         }
         return false;
+    }
+
+    /// The count of a `vec![e; n]` is an ordinary expression, evaluated after
+    /// the element and free to allocate in its own right, so it is scanned
+    /// like any other child. A literal count is a number the translator
+    /// already holds, and a missing count is the element-list form.
+    fn repeatCountAllocates(self: *const CollectionEffectScanner, repeat: ?exprs.VecRepeatCount) bool {
+        const count = repeat orelse return false;
+        return switch (count) {
+            .literal => false,
+            .expression => |node| self.exprAllocates(node),
+        };
     }
 
     fn blockAllocates(self: *const CollectionEffectScanner, block: exprs.BlockExpr) bool {
@@ -458,7 +495,8 @@ const ResolvedCallEffectScanner = struct {
         return switch (self.exprs[node_id].kind) {
             .literal, .path, .unit, .continue_, .panic_ => false,
             .array => |array| self.nodeListCallsAllocating(array.elements),
-            .vec_lit => |vec| self.nodeListCallsAllocating(vec.elements),
+            .vec_lit => |vec| self.nodeListCallsAllocating(vec.elements) or
+                self.repeatCountCallsAllocating(vec.repeat),
             .range => |range| self.exprCallsAllocating(range.start) or
                 (if (range.end) |end| self.exprCallsAllocating(end) else false),
             .block => |block| self.blockCallsAllocating(block),
@@ -534,6 +572,18 @@ const ResolvedCallEffectScanner = struct {
             if (self.exprCallsAllocating(node_id)) return true;
         }
         return false;
+    }
+
+    /// The count of a `vec![e; n]` is an ordinary expression, evaluated after
+    /// the element and free to reach an allocator in its own right, so it is
+    /// scanned like any other child. A literal count is a number the
+    /// translator already holds, and a missing count is the element-list form.
+    fn repeatCountCallsAllocating(self: *const ResolvedCallEffectScanner, repeat: ?exprs.VecRepeatCount) bool {
+        const count = repeat orelse return false;
+        return switch (count) {
+            .literal => false,
+            .expression => |node| self.exprCallsAllocating(node),
+        };
     }
 
     fn blockCallsAllocating(self: *const ResolvedCallEffectScanner, block: exprs.BlockExpr) bool {
@@ -738,12 +788,167 @@ fn propagateResolvedCallEffects(
     }
 }
 
+/// The feature names that decide which optional dependencies this build has.
+///
+/// `features` is the manifest's own feature table and `active` is what this
+/// translation enabled. `complete` records whether `active` is already
+/// transitively expanded: only then may an implicit feature missing from it be
+/// read as "this build does not have that dependency".
+const DependencyClosure = struct {
+    features: []const ingest.Feature = &.{},
+    active: []const []const u8 = &.{},
+    complete: bool = false,
+};
+
+/// Cargo's explicit spelling for enabling an optional dependency: the feature
+/// name is `dep:<name>` with the dependency's own name, dashes and all.
+const dependency_feature_prefix = "dep:";
+
+/// Whether `feature` is the implicit feature Cargo creates for `dependency`.
+/// The name is the dependency's, with `-` written `_`, so `foo-bar` is enabled
+/// by a feature called `foo_bar`.
+fn isImplicitDependencyFeature(feature: []const u8, dependency: []const u8) bool {
+    if (std.mem.eql(u8, feature, dependency)) return true;
+    if (feature.len != dependency.len) return false;
+    for (feature, dependency) |left, right| {
+        if ((if (left == '_') '-' else left) != right) return false;
+    }
+    return true;
+}
+
+fn activeNamesDependency(active: []const []const u8, dependency: []const u8) bool {
+    for (active) |entry| {
+        if (!std.mem.startsWith(u8, entry, dependency_feature_prefix)) continue;
+        if (std.mem.eql(u8, entry[dependency_feature_prefix.len..], dependency)) return true;
+    }
+    return false;
+}
+
+/// Whether any ACTIVE feature lists `dep:<dependency>` among its own members.
+/// The members are the manifest's raw strings, which is what keeps the `dep:`
+/// prefix visible here; an inactive feature's `dep:` reference enables nothing,
+/// so only features this build enabled are consulted.
+fn activeFeatureMemberNamesDependency(
+    closure: DependencyClosure,
+    dependency: []const u8,
+) bool {
+    for (closure.active) |active_name| {
+        for (closure.features) |feature| {
+            if (!std.mem.eql(u8, feature.name, active_name)) continue;
+            for (feature.members) |member| {
+                if (!std.mem.startsWith(u8, member, dependency_feature_prefix)) continue;
+                if (std.mem.eql(u8, member[dependency_feature_prefix.len..], dependency)) {
+                    return true;
+                }
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+/// Whether the active feature closure gives this build `dependency`.
+///
+/// A dependency that is not optional is always a dependency: no feature turns
+/// one off. An optional one is built only when the closure enables it — through
+/// the implicit feature Cargo creates for its name, through a `dep:<name>`
+/// named outright, or through an active feature that lists it — and an optional
+/// dependency the closure never mentions is one this build does not have.
+/// Recording it anyway is what made adler's `compiler_builtins` and `core`
+/// dependencies of a build that enables neither, and the backend then refused
+/// the crate for two crates its source never names.
+///
+/// Nothing is concluded from a selection that may be under-expanded: a caller
+/// list replaces the manifest default and arrives exactly as written, so a
+/// dependency it leaves out may still be reachable through a feature the list
+/// names but does not expand. Such a dependency stays a dependency.
+fn dependencyEnabled(dependency: ingest.Dependency, closure: DependencyClosure) bool {
+    if (!dependency.optional) return true;
+    if (!closure.complete) return true;
+    for (closure.active) |active_name| {
+        if (isImplicitDependencyFeature(active_name, dependency.name)) return true;
+    }
+    if (activeNamesDependency(closure.active, dependency.name)) return true;
+    return activeFeatureMemberNamesDependency(closure, dependency.name);
+}
+
+/// Whether any ACTIVE feature of the consuming crate forwards one of its own
+/// features to `dependency`.
+///
+/// Cargo spells that edge `dep:<name>` or `<name>/<feature>`, optionally weak
+/// as `<name>?/<feature>`. All three can switch a dependency feature on, and
+/// the weak form still can: it declines only when the dependency is absent
+/// from the graph, which is a fact about the resolution and not a promise that
+/// no feature is enabled. A dependency whose name merely prefixes this member
+/// — `foo` against `foo-bar/alloc` — is not a forward to `foo`.
+fn activeFeatureForwardsDependency(
+    closure: DependencyClosure,
+    dependency: []const u8,
+) bool {
+    for (closure.active) |active_name| {
+        for (closure.features) |feature| {
+            if (!std.mem.eql(u8, feature.name, active_name)) continue;
+            for (feature.members) |member| {
+                if (std.mem.startsWith(u8, member, dependency_feature_prefix)) {
+                    if (std.mem.eql(u8, member[dependency_feature_prefix.len..], dependency)) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (!std.mem.startsWith(u8, member, dependency)) continue;
+                const tail = member[dependency.len..];
+                if (tail.len != 0 and
+                    (tail[0] == '/' or (tail[0] == '?' and tail.len > 1 and tail[1] == '/')))
+                {
+                    return true;
+                }
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+/// Whether this build's RESOLVED feature set for `dependency` is certainly
+/// empty.
+///
+/// The dependency's own declaration is necessary but not sufficient. It says
+/// what the dependency table asked for and nothing about the forward edge that
+/// lives in this crate's feature table, which is why
+/// `num-traits = { default-features = false }` under a
+/// `std = ["num-traits/std"]` feature is NOT an empty set: `default-features =
+/// false` already removed the defaults, and the forward puts `std` on. wyhash
+/// is the other shape: `rand_core = { version = "0.5" }` with no
+/// `default-features` key and no `[features]` table at all, so nothing was
+/// removed and nothing forwards.
+///
+/// Nothing is read from the dependency's own manifest, and nothing from the
+/// runtime binding: both are facts about other crates. And an under-expanded
+/// selection answers nothing at all, which is why `complete` gates the whole
+/// question rather than only its last step.
+fn resolvedFeaturesKnownEmpty(
+    dependency: ingest.Dependency,
+    closure: DependencyClosure,
+) bool {
+    if (!closure.complete) return false;
+    if (dependency.features.len != 0) return false;
+    if (dependency.default_features == false) return false;
+    return !activeFeatureForwardsDependency(closure, dependency.name);
+}
+
 fn manifestDependency(
     allocator: std.mem.Allocator,
     dependency: ingest.Dependency,
     index: usize,
+    closure: DependencyClosure,
 ) !graph.CrateDep {
-    var result: graph.CrateDep = undefined;
+    // Initialised so the record's OWN defaults apply. `undefined` suppresses
+    // them, which would leave any field this function forgets to assign
+    // reading garbage — and the backend reads `resolved_features_known_empty`
+    // to decide whether a package may be omitted, so a field left unassigned
+    // here is a wrong answer rather than a crash. Every field is still assigned
+    // explicitly below; this only makes a future one safe by default.
+    var result: graph.CrateDep = .{ .extern_name = &.{}, .local_alias = &.{}, .id = 0 };
     result.extern_name = try allocator.dupe(u8, dependency.package orelse dependency.name);
     errdefer allocator.free(result.extern_name);
     result.local_alias = try allocator.dupe(u8, dependency.name);
@@ -770,15 +975,27 @@ fn manifestDependency(
         }
     }
     result.features = owned_features;
+    // Read from this crate's own feature table and nothing else, so the answer
+    // is about this build and not about the dependency's crate.
+    result.resolved_features_known_empty = resolvedFeaturesKnownEmpty(dependency, closure);
     return result;
 }
 
 fn manifestDependencies(
     allocator: std.mem.Allocator,
     dependencies: []const ingest.Dependency,
+    closure: DependencyClosure,
 ) ![]const graph.CrateDep {
-    if (dependencies.len == 0) return &.{};
-    const result = try allocator.alloc(graph.CrateDep, dependencies.len);
+    // Count first and allocate exactly that many: a dependency the closure does
+    // not enable is skipped before `manifestDependency` duplicates a single
+    // string of its own, so nothing it would have owned is allocated here and
+    // there is nothing of its to unwind.
+    var enabled_count: usize = 0;
+    for (dependencies) |dependency| {
+        if (dependencyEnabled(dependency, closure)) enabled_count += 1;
+    }
+    if (enabled_count == 0) return &.{};
+    const result = try allocator.alloc(graph.CrateDep, enabled_count);
     var initialized: usize = 0;
     errdefer {
         for (result[0..initialized]) |entry| {
@@ -792,9 +1009,16 @@ fn manifestDependencies(
         }
         allocator.free(result);
     }
-    for (dependencies, 0..) |dependency, index| {
-        result[index] = try manifestDependency(allocator, dependency, index);
+    var index: usize = 0;
+    for (dependencies) |dependency| {
+        if (!dependencyEnabled(dependency, closure)) continue;
+        // Ids stay dense and one-based over the dependencies this build
+        // actually has. `CrateGraph.validateTopology` requires
+        // `dependency.id == position + 1`, so a skipped dependency must leave
+        // no gap behind it.
+        result[index] = try manifestDependency(allocator, dependency, index, closure);
         initialized += 1;
+        index += 1;
     }
     return result;
 }
@@ -806,6 +1030,7 @@ fn analyzeSourceWithGraph(
     manifest: ingest.Manifest,
     src: []const u8,
     options: AnalysisOptions,
+    dependency_closure: DependencyClosure,
 ) !ir.RustIr {
     const edition = try manifestEdition(manifest.edition);
     // 1. Construct root module and symbol table in CrateGraph
@@ -835,7 +1060,7 @@ fn analyzeSourceWithGraph(
         .items = &.{},
         .attributes = &.{},
     });
-    const crate_deps = try manifestDependencies(allocator, manifest.dependencies);
+    const crate_deps = try manifestDependencies(allocator, manifest.dependencies, dependency_closure);
     try g.addCrate(.{
         .name = try allocator.dupe(u8, manifest.name),
         .edition = edition,
@@ -997,17 +1222,19 @@ fn analyzeSourceWithGraph(
     defer instantiation_table.deinit(allocator);
     var generated = try infer.genWithGraph(allocator, &b_temp, &g);
     defer generated.deinit(allocator);
+    generated.defer_pending_casts = true;
     try infer.materializeDerivedTypes(allocator, &types_list, pats_list.items, &generated);
     b_temp.types = types_list.items;
     var solved = try infer.solveWithGen(allocator, &b_temp, &generated);
+    defer solved.deinit(allocator);
     solved.apply(exprs_list.items);
+    try infer.materializeSolvedSourceTypes(allocator, &b_temp, &types_list, &generated, &solved, &g);
     try materializeOpaqueFunctionReturns(
         allocator,
         &types_list,
         exprs_list.items,
         bodies_list.items,
     );
-    defer solved.deinit(allocator);
     try materializeInferredConstructorTypes(
         allocator,
         &types_list,
@@ -1016,6 +1243,24 @@ fn analyzeSourceWithGraph(
     );
     b_temp.types = types_list.items;
     _ = try resolve_methods.resolveMethods(&g, &b_temp);
+    // Resolution may replace either table when it appends typed operands.
+    // Both tables use this allocator; adopt them without copying their prefix.
+    if (b_temp.exprs.ptr != exprs_list.items.ptr) {
+        exprs_list.deinit(allocator);
+        exprs_list = .fromOwnedSlice(@constCast(b_temp.exprs));
+    } else {
+        exprs_list.items.len = b_temp.exprs.len;
+    }
+    if (b_temp.types.ptr != types_list.items.ptr) {
+        types_list.deinit(allocator);
+        types_list = .fromOwnedSlice(@constCast(b_temp.types));
+    } else {
+        types_list.items.len = b_temp.types.len;
+    }
+    if (generated.source_completion_pending) {
+        try infer.materializeSolvedSourceTypes(allocator, &b_temp, &types_list, &generated, &solved, &g);
+    }
+    try infer.completePendingCasts(&b_temp);
     propagateResolvedCallEffects(&bodies_list, &b_temp, &g);
     instantiation_table = try monomorphize.collectInstantiations(allocator, &g, &b_temp);
     // Inference records are keyed by source expression. Copy their
@@ -1078,7 +1323,7 @@ test "analyzeSource on simple Rust function" {
     const allocator = arena_state.allocator();
 
     const src =
-        \\//! Root documentation is CST trivia.
+        \\//! Crate documentation.
         \\#![no_std]
         \\pub fn add(a: i32, b: i32) -> i32 {
         \\    a + b
@@ -1089,9 +1334,10 @@ test "analyzeSource on simple Rust function" {
 
     try std.testing.expectEqualStrings("mini", rust_ir.crate_name);
     try std.testing.expectEqualStrings("2021", rust_ir.edition);
-    try std.testing.expectEqual(@as(usize, 1), rust_ir.graph.modules.items[0].attributes.len);
-    try std.testing.expectEqualStrings("no_std", rust_ir.graph.modules.items[0].attributes[0].name);
-    try std.testing.expect(rust_ir.graph.symbol_table.entities.items.len > 0);
+    const no_std = for (rust_ir.graph.modules.items[0].attributes) |attribute| {
+        if (std.mem.eql(u8, attribute.name, "no_std")) break attribute;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", no_std.meta);
 }
 
 test "analyzeSourceWithOptions includes cfg test module and function body" {
@@ -1304,6 +1550,50 @@ test "a declared Option return type reaches the returned variant expressions" {
     try std.testing.expect(option_typed);
 }
 
+test "a declared std::io::Result carries std::io::Error as its error arm" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // `std::io::Result<T>` is the alias `Result<T, io::Error>`. Read as an
+    // untranslated external nominal it names no type the backend could lower,
+    // and the runtime's `r2z.io.Result` is written in exactly this two-arm
+    // shape, so the declaration has to arrive as one.
+    const source =
+        \\use std::io;
+        \\
+        \\pub fn read_all(bytes: &[u8]) -> io::Result<&[u8]> {
+        \\    bytes
+        \\}
+    ;
+
+    const rust_ir = try analyzeSourceWithOptions(allocator, "io_result", "2021", source, .{});
+    try ir.validateForTranslation(&rust_ir);
+
+    var declared: ?types.Type = null;
+    for (rust_ir.graph.symbol_table.entities.items, 0..) |entity, index| {
+        if (entity.kind != .fn_) continue;
+        if (!std.mem.eql(u8, entity.name, "read_all")) continue;
+        declared = switch (rust_ir.bodies.bodies[index]) {
+            .fn_ => |fn_body| fn_body.ret,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    const result = switch (declared orelse return error.TestUnexpectedResult) {
+        .result => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(result.is_error_unionable);
+    const err = switch (result.err) {
+        .external_nominal => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 3), err.path.len);
+    try std.testing.expectEqualStrings("std", err.path[0]);
+    try std.testing.expectEqualStrings("io", err.path[1]);
+    try std.testing.expectEqualStrings("Error", err.path[2]);
+}
+
 test "a user-defined Iterator impl keeps next on its struct" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1332,6 +1622,44 @@ test "a user-defined Iterator impl keeps next on its struct" {
 
     const rust_ir = try analyzeSourceWithOptions(allocator, "user_iter", "2021", source, .{});
     try ir.validateForTranslation(&rust_ir);
+}
+
+test "Rust documentation survives source analysis and canonical serialization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const source =
+        \\//! Counts bytes without retaining the input.
+        \\/// Returns the fixed count.
+        \\#[doc = "The result is seven."]
+        \\pub fn count() -> u8 { 7 }
+        \\// This is implementation commentary, not documentation.
+        \\pub fn plain() -> u8 { 0 }
+    ;
+    const rust_ir = try analyzeSource(allocator, "documented", "2021", source);
+    const encoded = try ir.serialize.encode(allocator, &rust_ir);
+    const decoded = try ir.serialize.decode(allocator, encoded);
+
+    const module_attributes = decoded.graph.modules.items[0].attributes;
+    try std.testing.expectEqual(@as(usize, 1), module_attributes.len);
+    try std.testing.expectEqualStrings("doc", module_attributes[0].name);
+    try std.testing.expectEqualStrings(
+        "Counts bytes without retaining the input.",
+        module_attributes[0].meta,
+    );
+    var found_count = false;
+    for (decoded.graph.symbol_table.entities.items) |entity| {
+        if (std.mem.eql(u8, entity.name, "count")) {
+            found_count = true;
+            try std.testing.expectEqual(@as(usize, 2), entity.attributes.len);
+            try std.testing.expectEqualStrings("doc", entity.attributes[0].name);
+            try std.testing.expectEqualStrings("Returns the fixed count.", entity.attributes[0].meta);
+            try std.testing.expectEqualStrings("The result is seven.", entity.attributes[1].meta);
+        } else if (std.mem.eql(u8, entity.name, "plain")) {
+            try std.testing.expectEqual(@as(usize, 0), entity.attributes.len);
+        }
+    }
+    try std.testing.expect(found_count);
 }
 
 test "analyzeSourceWithOptions selects configured feature-gated entity" {
@@ -1943,7 +2271,7 @@ test "analyzeSource: const array + primitive initializers parsed into const body
             try std.testing.expect(cb.ty.array.elem.prim == .u16);
             const ex = body_tables.exprs[cb.init];
             try std.testing.expect(ex.kind == .array);
-            try std.testing.expectEqual(@as(?usize, null), ex.kind.array.repeat);
+            try std.testing.expectEqual(@as(?u64, null), ex.kind.array.repeat);
             try std.testing.expectEqual(@as(usize, 4), ex.kind.array.elements.len);
             // First element 0x00 → 0; third element 0x40 → 64.
             const first = body_tables.exprs[ex.kind.array.elements[0]];
@@ -1957,7 +2285,7 @@ test "analyzeSource: const array + primitive initializers parsed into const body
             const ex = body_tables.exprs[cb.init];
             try std.testing.expect(ex.kind == .array);
             try std.testing.expect(ex.kind == .array);
-            try std.testing.expectEqual(@as(?usize, 256), ex.kind.array.repeat);
+            try std.testing.expectEqual(@as(?u64, 256), ex.kind.array.repeat);
             try std.testing.expectEqual(@as(usize, 1), ex.kind.array.elements.len);
             saw_zeroes = true;
         } else if (std.mem.eql(u8, ent.name, "FLAG")) {
@@ -1978,6 +2306,205 @@ test "analyzeSource: const array + primitive initializers parsed into const body
     try std.testing.expect(saw_zeroes);
     try std.testing.expect(saw_flag);
     try std.testing.expect(saw_count);
+}
+
+test "analyzeSource decodes char constants to their scalar value, not their first byte" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // The token text is not the value. `'\n'` carries no backslash and `'é'`
+    // is two UTF-8 bytes whose lead byte is 0xc3, so a const initializer that
+    // reads the first byte of the token emits 92 for every escape and 195 for
+    // `'é'` — a wrong number that still compiles.
+    const src =
+        \\pub const PLAIN: char = 'a';
+        \\pub const NEWLINE: char = '\n';
+        \\pub const TAB: char = '\t';
+        \\pub const CARRIAGE_RETURN: char = '\r';
+        \\pub const NUL: char = '\0';
+        \\pub const SINGLE_QUOTE: char = '\'';
+        \\pub const DOUBLE_QUOTE: char = '"';
+        \\pub const BACKSLASH: char = '\\';
+        \\pub const HEX_ASCII: char = '\x41';
+        \\pub const RAW_LATIN: char = 'é';
+        \\pub const ESCAPED_BMP: char = '\u{E9}';
+        \\pub const ASTRAL: char = '\u{1F600}';
+        \\
+        \\pub struct Marker {
+        \\    pub id: u32,
+        \\}
+        \\
+        \\impl Marker {
+        \\    pub const ASSOCIATED_TAB: char = '\t';
+        \\}
+    ;
+
+    const rust_ir = try analyzeSource(allocator, "char_consts", "2021", src);
+    try ir.validateForTranslation(&rust_ir);
+
+    const expected = [_]struct { name: []const u8, value: u32 }{
+        .{ .name = "PLAIN", .value = 'a' },
+        .{ .name = "NEWLINE", .value = 0x0a },
+        .{ .name = "TAB", .value = 0x09 },
+        .{ .name = "CARRIAGE_RETURN", .value = 0x0d },
+        .{ .name = "NUL", .value = 0x00 },
+        .{ .name = "SINGLE_QUOTE", .value = '\'' },
+        .{ .name = "DOUBLE_QUOTE", .value = '"' },
+        .{ .name = "BACKSLASH", .value = '\\' },
+        .{ .name = "HEX_ASCII", .value = 0x41 },
+        .{ .name = "RAW_LATIN", .value = 0x00e9 },
+        .{ .name = "ESCAPED_BMP", .value = 0x00e9 },
+        .{ .name = "ASTRAL", .value = 0x1f600 },
+        .{ .name = "ASSOCIATED_TAB", .value = 0x09 },
+    };
+    for (expected) |want| {
+        var entity_id: ?spine.EntityId = null;
+        for (rust_ir.graph.symbol_table.entities.items) |entity| {
+            if (entity.kind != .const_) continue;
+            if (!std.mem.eql(u8, entity.name, want.name)) continue;
+            entity_id = entity.id;
+            break;
+        }
+        const id = entity_id orelse return error.MissingCharConstant;
+        const constant = switch (rust_ir.bodies.bodies[id]) {
+            .const_ => |value| value,
+            else => return error.UnexpectedConstantBody,
+        };
+        // The declared type drives the emitter, which writes a u21 scalar;
+        // the value is the Unicode scalar the Rust compiler computes.
+        try std.testing.expectEqual(types.Type{ .prim = .char }, constant.ty);
+        const expression = rust_ir.bodies.exprs[constant.init];
+        try std.testing.expect(expression.kind == .literal);
+        try std.testing.expect(expression.kind.literal == .character);
+        try std.testing.expectEqual(want.value, expression.kind.literal.character.value);
+    }
+}
+
+test "analyzeSource preserves Unicode character and string values across contexts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const src =
+        \\pub const ASTRAL: char = '\u{1_f_642___}';
+        \\pub const MAXIMUM: char = '\u{10_ffff_}';
+        \\
+        \\pub fn body_char() -> char { '\u{1_f_642___}' }
+        \\pub fn accented() -> char { 'é' }
+        \\pub fn astral() -> char { '🙂' }
+        \\pub fn body_text() -> &'static str { "\u{1_f_642___}\u{10_ffff_}" }
+        \\
+        \\pub fn classify(value: char) -> u8 {
+        \\    match value {
+        \\        '\u{1_f_642___}' => 1,
+        \\        '\u{10_ffff_}' => 2,
+        \\        _ => 0,
+        \\    }
+        \\}
+    ;
+    const rust_ir = try analyzeSource(allocator, "underscored_escapes", "2021", src);
+    try ir.validateForTranslation(&rust_ir);
+
+    const char_consts = [_]struct { name: []const u8, value: u32 }{
+        .{ .name = "ASTRAL", .value = 0x1f642 },
+        .{ .name = "MAXIMUM", .value = 0x10ffff },
+    };
+    for (char_consts) |want| {
+        var entity_id: ?spine.EntityId = null;
+        for (rust_ir.graph.symbol_table.entities.items) |entity| {
+            if (entity.kind != .const_) continue;
+            if (!std.mem.eql(u8, entity.name, want.name)) continue;
+            entity_id = entity.id;
+            break;
+        }
+        const id = entity_id orelse return error.MissingUnderscoredCharConstant;
+        const constant = switch (rust_ir.bodies.bodies[id]) {
+            .const_ => |value| value,
+            else => return error.UnexpectedConstantBody,
+        };
+        try std.testing.expectEqual(types.Type{ .prim = .char }, constant.ty);
+        const expression = rust_ir.bodies.exprs[constant.init];
+        try std.testing.expect(expression.kind == .literal);
+        try std.testing.expect(expression.kind.literal == .character);
+        try std.testing.expectEqual(want.value, expression.kind.literal.character.value);
+    }
+
+    const helpers = struct {
+        fn bodyTail(rust_ir_: *const ir.RustIr, name: []const u8) ?exprs.NodeId {
+            for (rust_ir_.graph.symbol_table.entities.items) |entity| {
+                if (entity.kind != .fn_ or !std.mem.eql(u8, entity.name, name)) continue;
+                const fn_body = switch (rust_ir_.bodies.bodies[entity.id]) {
+                    .fn_ => |body| body,
+                    else => return null,
+                };
+                const block = switch (rust_ir_.bodies.exprs[fn_body.body].kind) {
+                    .block => |value| value,
+                    else => return null,
+                };
+                return block.tail;
+            }
+            return null;
+        }
+    };
+
+    const body_chars = [_]struct { name: []const u8, value: u32 }{
+        .{ .name = "body_char", .value = 0x1f642 },
+        .{ .name = "accented", .value = 0xe9 },
+        .{ .name = "astral", .value = 0x1f642 },
+    };
+    for (body_chars) |want| {
+        const char_tail = helpers.bodyTail(&rust_ir, want.name) orelse
+            return error.MissingBodyChar;
+        const char_literal = switch (rust_ir.bodies.exprs[char_tail].kind) {
+            .literal => |literal| literal,
+            else => return error.ExpectedBodyCharLiteral,
+        };
+        try std.testing.expect(char_literal == .character);
+        try std.testing.expectEqual(want.value, char_literal.character.value);
+    }
+
+    const text_tail = helpers.bodyTail(&rust_ir, "body_text") orelse
+        return error.MissingBodyText;
+    const text_literal = switch (rust_ir.bodies.exprs[text_tail].kind) {
+        .literal => |literal| literal,
+        else => return error.ExpectedBodyTextLiteral,
+    };
+    try std.testing.expect(text_literal == .string);
+    try std.testing.expectEqualStrings("\xF0\x9F\x99\x82\xF4\x8F\xBF\xBF", text_literal.string.bytes);
+
+    const classify_tail = helpers.bodyTail(&rust_ir, "classify") orelse
+        return error.MissingClassifyTail;
+    const classify_match = switch (rust_ir.bodies.exprs[classify_tail].kind) {
+        .match => |match| match,
+        else => return error.ExpectedClassifyMatch,
+    };
+    try std.testing.expectEqual(@as(usize, 3), classify_match.arms.len);
+    const expected_arms = [_]struct { value: u32, result: i128 }{
+        .{ .value = 0x1f642, .result = 1 },
+        .{ .value = 0x10ffff, .result = 2 },
+    };
+    for (classify_match.arms[0..expected_arms.len], expected_arms) |arm, want| {
+        try std.testing.expectEqual(@as(usize, 1), arm.patterns.len);
+        const pattern = rust_ir.bodies.pats[arm.patterns[0]];
+        try std.testing.expect(pattern.kind == .literal);
+        try std.testing.expect(pattern.kind.literal == .character);
+        try std.testing.expectEqual(want.value, pattern.kind.literal.character.value);
+        const arm_literal = switch (rust_ir.bodies.exprs[arm.body].kind) {
+            .literal => |literal| literal,
+            else => return error.ExpectedArmIntegerLiteral,
+        };
+        try std.testing.expect(arm_literal == .int);
+        try std.testing.expectEqual(want.result, arm_literal.int.value);
+    }
+    const fallback = classify_match.arms[expected_arms.len];
+    try std.testing.expectEqual(@as(usize, 1), fallback.patterns.len);
+    try std.testing.expect(rust_ir.bodies.pats[fallback.patterns[0]].kind == .wildcard);
+    const fallback_literal = switch (rust_ir.bodies.exprs[fallback.body].kind) {
+        .literal => |literal| literal,
+        else => return error.ExpectedArmIntegerLiteral,
+    };
+    try std.testing.expect(fallback_literal == .int);
+    try std.testing.expectEqual(@as(i128, 0), fallback_literal.int.value);
 }
 
 test "analyzeSource resolves generic alias inherent method chain" {
@@ -2150,7 +2677,8 @@ test "analyzeSource propagates generic alias constructor type through a local re
                 else
                     false,
                 .array => |array| hasArgs(ir_, array.elements),
-                .vec_lit => |vec_lit| hasArgs(ir_, vec_lit.elements),
+                .vec_lit => |vec_lit| hasArgs(ir_, vec_lit.elements) or
+                    hasVecRepeatCount(ir_, vec_lit.repeat),
                 else => false,
             };
         }
@@ -2167,6 +2695,16 @@ test "analyzeSource propagates generic alias constructor type through a local re
                 if (hasNode(ir_, field.value)) return true;
             }
             return false;
+        }
+
+        /// A `vec![e; n]` count is an ordinary expression, so a failure
+        /// reachable only through it is still reachable through the literal.
+        fn hasVecRepeatCount(ir_: *const ir.RustIr, repeat: ?exprs.VecRepeatCount) bool {
+            const count = repeat orelse return false;
+            return switch (count) {
+                .literal => false,
+                .expression => |node| hasNode(ir_, node),
+            };
         }
 
         fn hasNamedFields(ir_: *const ir.RustIr, fields: []const exprs.FieldInit) bool {
@@ -2887,7 +3425,7 @@ test "analyzeSource fills test body with literal built-in macros" {
         .vec_lit => |vec_lit| vec_lit,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqual(@as(?usize, null), values_vec.repeat);
+    try std.testing.expect(values_vec.repeat == null);
     try std.testing.expectEqual(@as(usize, 3), values_vec.elements.len);
     for (values_vec.elements, 1..) |element_id, expected| {
         const element = rust_ir.bodies.exprs[element_id];
@@ -2906,7 +3444,10 @@ test "analyzeSource fills test body with literal built-in macros" {
         .vec_lit => |vec_lit| vec_lit,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqual(@as(?usize, 4), repeated_vec.repeat);
+    try std.testing.expectEqual(
+        @as(u64, 4),
+        (repeated_vec.repeat orelse return error.TestUnexpectedResult).literal,
+    );
     try std.testing.expectEqual(@as(usize, 1), repeated_vec.elements.len);
     const repeated_element = rust_ir.bodies.exprs[repeated_vec.elements[0]];
     try std.testing.expect(repeated_element.kind == .literal);
@@ -3365,4 +3906,207 @@ test "analyzeCrate enables the manifest default feature closure" {
     // A caller-supplied selection replaces the manifest default, so the same
     // item drops back out when `gated` is not among the requested features.
     try std.testing.expect(find(&overridden, "gated") == null);
+}
+
+test "analyzeCrate: an optional dependency behind an inactive feature is not a dependency" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // adler's own manifest (test/crates/adler/Cargo.toml:50-64) declares two
+    // optional dependencies — `compiler_builtins`, and `core` under the package
+    // `rustc-std-workspace-core` — and its default closure is `std` alone, so a
+    // plain build has neither. Recording them anyway is what made the backend
+    // refuse the crate for two crates its source never names: `src/lib.rs`
+    // reaches `crate::`, `std::` and nothing else.
+    const defaulted = try analyzeCrate(allocator, std.testing.io, "test/crates/adler");
+    try std.testing.expectEqual(@as(usize, 1), defaulted.graph.crates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), defaulted.graph.crates.items[0].deps.len);
+
+    const manifest = try ingest.loadCrateManifest(allocator, std.testing.io, "test/crates/adler");
+    // Two, not three: `criterion` is a dev-dependency and never reaches
+    // `graph.Crate.deps`.
+    try std.testing.expectEqual(@as(usize, 2), manifest.dependencies.len);
+
+    // `rustc-dep-of-std = ["core", "compiler_builtins"]` names both implicit
+    // features and expands to nothing further, so its transitive closure is
+    // exactly these two names. Handed over as a completed closure, both
+    // optional dependencies are dependencies again, numbered densely from one
+    // because `CrateGraph.validateTopology` requires id == position + 1.
+    const rustc_dep_of_std = try manifestDependencies(allocator, manifest.dependencies, .{
+        .features = manifest.features,
+        .active = &.{ "core", "compiler_builtins" },
+        .complete = true,
+    });
+    try std.testing.expectEqual(@as(usize, 2), rustc_dep_of_std.len);
+    try std.testing.expectEqualStrings("compiler_builtins", rustc_dep_of_std[0].local_alias);
+    try std.testing.expectEqualStrings("compiler_builtins", rustc_dep_of_std[0].extern_name);
+    try std.testing.expectEqual(@as(u32, 1), rustc_dep_of_std[0].id);
+    try std.testing.expectEqualStrings("core", rustc_dep_of_std[1].local_alias);
+    try std.testing.expectEqualStrings("rustc-std-workspace-core", rustc_dep_of_std[1].extern_name);
+    try std.testing.expectEqual(@as(u32, 2), rustc_dep_of_std[1].id);
+
+    // A caller's feature list replaces the manifest default and reaches this
+    // function exactly as written, so it may name a feature whose own members
+    // are what enable a dependency. An incomplete selection therefore keeps
+    // every optional dependency rather than concluding from what it leaves out.
+    const unexpanded_selection = try manifestDependencies(allocator, manifest.dependencies, .{
+        .features = manifest.features,
+        .active = &.{"std"},
+        .complete = false,
+    });
+    try std.testing.expectEqual(@as(usize, 2), unexpanded_selection.len);
+}
+
+test "a dependency's resolved feature set is called empty only when no forward reaches it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // atoi's own manifest (test/crates/atoi/Cargo.toml:30-38) declares
+    // `num-traits = { version = "0.2.14", default-features = false }` with no
+    // `features` key at all, and its `std = ["num-traits/std"]` forwards one.
+    // The declared list is empty, so only the forward edge stands between this
+    // dependency and a certainly-empty resolved set — and it is there.
+    const atoi = try ingest.loadCrateManifest(allocator, std.testing.io, "test/crates/atoi");
+    const atoi_deps = try manifestDependencies(allocator, atoi.dependencies, .{
+        .features = atoi.features,
+        .active = try ingest.defaultFeatureClosure(allocator, atoi.features),
+        .complete = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), atoi_deps.len);
+    try std.testing.expectEqualStrings("num-traits", atoi_deps[0].local_alias);
+    try std.testing.expectEqual(@as(?bool, false), atoi_deps[0].default_features);
+    try std.testing.expectEqual(@as(usize, 0), atoi_deps[0].features.len);
+    try std.testing.expect(!atoi_deps[0].resolved_features_known_empty);
+
+    // wyhash's own manifest declares `rand_core = { version = "0.5" }` and has
+    // no `[features]` table at all, so nothing forwards and nothing was turned
+    // off: this build's resolved set for it is certainly empty. This is the
+    // record the backend's omission rule asks about, so the flag landing here
+    // is what lets that rule answer instead of refusing.
+    const wyhash = try ingest.loadCrateManifest(allocator, std.testing.io, "test/crates/wyhash");
+    const wyhash_deps = try manifestDependencies(allocator, wyhash.dependencies, .{
+        .features = wyhash.features,
+        .active = try ingest.defaultFeatureClosure(allocator, wyhash.features),
+        .complete = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), wyhash_deps.len);
+    try std.testing.expectEqualStrings("rand_core", wyhash_deps[0].local_alias);
+    try std.testing.expectEqual(@as(?bool, null), wyhash_deps[0].default_features);
+    try std.testing.expect(wyhash_deps[0].resolved_features_known_empty);
+
+    // The forward alone is enough to withhold the answer. Both dependencies
+    // here leave the defaults on and declare no features, and the only
+    // difference between them is that one feature reaches one of them — so
+    // without this case atoi's `false` would be equally explained by its
+    // `default-features = false`, and the forward would never be shown to run.
+    const mixed = try ingest.parseManifestContent(allocator,
+        \\[package]
+        \\name = "mixed"
+        \\version = "1.0"
+        \\
+        \\[dependencies.forwarded_dep]
+        \\version = "1"
+        \\[dependencies.plain_dep]
+        \\version = "1"
+        \\
+        \\[features]
+        \\default = ["std"]
+        \\std = ["forwarded_dep/std"]
+    );
+    const mixed_active = try ingest.defaultFeatureClosure(allocator, mixed.features);
+    const mixed_deps = try manifestDependencies(allocator, mixed.dependencies, .{
+        .features = mixed.features,
+        .active = mixed_active,
+        .complete = true,
+    });
+    try std.testing.expectEqual(@as(usize, 2), mixed_deps.len);
+    try std.testing.expectEqualStrings("forwarded_dep", mixed_deps[0].local_alias);
+    try std.testing.expect(!mixed_deps[0].resolved_features_known_empty);
+    try std.testing.expectEqualStrings("plain_dep", mixed_deps[1].local_alias);
+    try std.testing.expect(mixed_deps[1].resolved_features_known_empty);
+
+    // An under-expanded selection answers nothing at all, so it answers this
+    // nothing either — even for the dependency nothing forwards.
+    const unanswered = try manifestDependencies(allocator, mixed.dependencies, .{
+        .features = mixed.features,
+        .active = mixed_active,
+        .complete = false,
+    });
+    try std.testing.expectEqual(@as(usize, 2), unanswered.len);
+    try std.testing.expect(!unanswered[0].resolved_features_known_empty);
+    try std.testing.expect(!unanswered[1].resolved_features_known_empty);
+}
+
+test "keys solves the tuple it returns from nested field reads" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    // `(self.0.k0, self.0.k1)` names no element type where the literal is
+    // lowered — a field read carries none of its own — so both slots open as
+    // the inference placeholder and the solver owes the row their `u64`.
+    // Nothing else about the pair is unusual, which is what makes it the
+    // ordinary `keys()` a caller writes.
+    const source =
+        \\pub struct State {
+        \\    k0: u64,
+        \\    k1: u64,
+        \\}
+        \\
+        \\pub struct Tagged(State);
+        \\
+        \\impl Tagged {
+        \\    pub fn keys(&self) -> (u64, u64) {
+        \\        (self.0.k0, self.0.k1)
+        \\    }
+        \\}
+    ;
+
+    const rust_ir = try analyzeSourceWithOptions(allocator, "tuple_row", "2021", source, .{});
+
+    const keys = for (rust_ir.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "keys")) break entity;
+    } else return error.MissingKeys;
+    const body = switch (rust_ir.bodies.bodies[keys.id]) {
+        .fn_ => |function| function,
+        else => return error.MissingKeysBody,
+    };
+    const literal_id = switch (rust_ir.bodies.exprs[body.body].kind) {
+        .block => |block| block.tail orelse return error.MissingKeysTail,
+        else => return error.MissingKeysBlock,
+    };
+    const literal_type_id = rust_ir.bodies.exprs[literal_id].ty orelse
+        return error.UntypedTupleLiteral;
+    const slots = switch (rust_ir.bodies.types[literal_type_id]) {
+        .tuple => |tuple| tuple,
+        else => return error.ReturnedPairIsNotATuple,
+    };
+    try std.testing.expectEqual(@as(usize, 2), slots.len);
+    for (slots) |slot| {
+        const slot_prim = switch (slot) {
+            .prim => |value| value,
+            else => return error.TupleSlotIsNotU64,
+        };
+        try std.testing.expectEqual(types.Prim.u64, slot_prim);
+    }
+
+    // Each element is a read the source named, so it carries the same `u64`
+    // the row now records for its slot. An unsolved read leaves a placeholder
+    // here and the slot above unsolved with it.
+    const elements = switch (rust_ir.bodies.exprs[literal_id].kind) {
+        .array => |array| array.elements,
+        else => return error.ReturnedPairIsNotAnArray,
+    };
+    try std.testing.expectEqual(@as(usize, 2), elements.len);
+    for (elements) |element| {
+        const read_type_id = rust_ir.bodies.exprs[element].ty orelse
+            return error.UntypedFieldRead;
+        const read_prim = switch (rust_ir.bodies.types[read_type_id]) {
+            .prim => |value| value,
+            else => return error.FieldReadIsNotU64,
+        };
+        try std.testing.expectEqual(types.Prim.u64, read_prim);
+    }
 }

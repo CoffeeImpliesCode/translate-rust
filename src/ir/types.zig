@@ -178,6 +178,9 @@ fn listMentionsSelf(
 /// over for the same reason.
 pub const SelfRewriteError = error{ OutOfMemory, InvalidTypeTraversal };
 
+/// Replace `Self` leaves, or return null when no rewrite is needed.
+/// The result can share storage with both inputs. Keep that storage and the
+/// caller-owned arena behind `alloc` alive until the last use of the result.
 pub fn replaceSelfLeaves(
     alloc: std.mem.Allocator,
     self_type: Type,
@@ -358,6 +361,14 @@ pub const Array = struct {
     len: ArrayLen,
 };
 
+/// §4.2 — The count side of `[T; N]`, and the only place a const generic
+/// parameter's USE survives: `generic` is the INDEX the parameter declared at,
+/// never the value it carries. The index is checked against the declaring
+/// declaration's `Generics.params` — `validate` accepts an index that is in
+/// range for that list OR for the type-parameter list, so the two index spaces
+/// are not one — and no frontend producer writes `.generic` today:
+/// `cst.mapArrayLen` reads a literal count and refuses anything else. See
+/// `GenericArgs` for the half that has no representation at all.
 pub const ArrayLen = union(enum) {
     literal: u64,
     generic: u32,
@@ -377,6 +388,25 @@ pub const GenericInst = struct {
     args: GenericArgs,
 };
 
+/// §4.2 — The arguments of a generic application: one `Type` per TYPE argument,
+/// in source order.
+///
+/// A const generic ARGUMENT is a value, and this list has no slot for one.
+/// `Foo<3>` cannot be spelled, and neither can any other instantiation of a
+/// declaration whose parameters are const or lifetime parameters. That is the
+/// one shape `Type` cannot express, and the two halves that do have homes do
+/// not close it: `ConstParam` carries the `const N: usize` the declaration
+/// introduces, and `ArrayLen.generic` carries the index `[u8; N]` uses — but
+/// nothing anywhere carries WHICH value an instantiation supplies. So the
+/// declaration survives and every use of it does not.
+///
+/// The refusal that names this gap is `validate`'s
+/// `error.IncompleteGenericMetadata`: an instantiation's arity is checked
+/// against `genericCountForEntity`, which counts `generic_params` — the type
+/// parameters alone — so a `generic_inst` naming a const-generic declaration
+/// measures zero arguments and is refused before the missing value is even
+/// visible. Adding a value slot here is a separate design decision and is
+/// deliberately not made; this declaration is where that decision would land.
 pub const GenericArgs = struct {
     params: []const Type,
 };
@@ -415,6 +445,9 @@ pub const TypeParam = struct {
     bounds: []const Bound,
 };
 
+/// §3 — `const N: usize`, DECLARED. Only the declaration is representable: no
+/// `GenericArgs` slot carries the value an instantiation supplies, so the
+/// parameter reaches the IR as a name and nothing more.
 pub const ConstParam = struct {
     name: []const u8,
     ty: Type,
@@ -442,6 +475,544 @@ pub const Opaque = struct {
 
     concrete: ?*const Type = null,
 };
+/// Return the argument slot named by a single-segment generic parameter.
+pub fn isTypeParam(t: Type, param_names: []const []const u8) ?usize {
+    switch (t) {
+        .path => |p| {
+            if (p.segments.len == 1) {
+                const seg_name = p.segments[0].name;
+                for (param_names, 0..) |pn, idx| {
+                    if (std.mem.eql(u8, seg_name, pn)) return idx;
+                }
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// Substitute generic parameters while borrowing source and argument storage.
+/// Release the result with `freeSubstitutedType` using the same inputs; only
+/// newly allocated containers belong to the caller, not substituted arguments.
+/// Keep the source and argument storage alive through the result's last use
+/// and release. `error.OutOfMemory` releases all partial allocations and leaves
+/// both inputs unchanged.
+pub fn substType(
+    alloc: std.mem.Allocator,
+    t: Type,
+    param_names: []const []const u8,
+    args: []const Type,
+) std.mem.Allocator.Error!Type {
+    if (param_names.len == 0 or args.len == 0) return t;
+
+    if (isTypeParam(t, param_names)) |idx| {
+        if (idx < args.len) return args[idx];
+    }
+
+    switch (t) {
+        .prim => return t,
+        .path => |p| {
+            if (p.segments.len == 1) {
+                if (isTypeParam(t, param_names)) |idx| {
+                    if (idx < args.len) return args[idx];
+                }
+            }
+            return t;
+        },
+        .reference => |r| {
+            const sub_pointee = try substType(alloc, r.pointee, param_names, args);
+            errdefer freeSubstitutedType(alloc, r.pointee, sub_pointee, param_names, args);
+            if (deepEqual(sub_pointee, r.pointee)) {
+                freeSubstitutedType(alloc, r.pointee, sub_pointee, param_names, args);
+                return t;
+            }
+            const ref_ptr = try alloc.create(Ref);
+            ref_ptr.* = .{ .mut = r.mut, .pointee = sub_pointee };
+            return .{ .reference = ref_ptr };
+        },
+        .raw_ptr => |rp| {
+            const sub_pointee = try substType(alloc, rp.pointee, param_names, args);
+            errdefer freeSubstitutedType(alloc, rp.pointee, sub_pointee, param_names, args);
+            if (deepEqual(sub_pointee, rp.pointee)) {
+                freeSubstitutedType(alloc, rp.pointee, sub_pointee, param_names, args);
+                return t;
+            }
+            const raw_ptr = try alloc.create(RawPtr);
+            raw_ptr.* = .{ .mut = rp.mut, .pointee = sub_pointee };
+            return .{ .raw_ptr = raw_ptr };
+        },
+        .slice => |s| {
+            const sub_elem = try substType(alloc, s.elem, param_names, args);
+            errdefer freeSubstitutedType(alloc, s.elem, sub_elem, param_names, args);
+            if (deepEqual(sub_elem, s.elem)) {
+                freeSubstitutedType(alloc, s.elem, sub_elem, param_names, args);
+                return t;
+            }
+            const slice_ptr = try alloc.create(Slice);
+            slice_ptr.* = .{ .const_ = s.const_, .elem = sub_elem };
+            return .{ .slice = slice_ptr };
+        },
+        .array => |arr| {
+            const sub_elem = try substType(alloc, arr.elem, param_names, args);
+            errdefer freeSubstitutedType(alloc, arr.elem, sub_elem, param_names, args);
+            if (deepEqual(sub_elem, arr.elem)) {
+                freeSubstitutedType(alloc, arr.elem, sub_elem, param_names, args);
+                return t;
+            }
+            const array_ptr = try alloc.create(Array);
+            array_ptr.* = .{ .len = arr.len, .elem = sub_elem };
+            return .{ .array = array_ptr };
+        },
+        .tuple => |tup| {
+            const sub_elems = try substTypeSlice(alloc, tup, param_names, args);
+            if (deepEqual(.{ .tuple = sub_elems }, t)) {
+                freeSubstitutedTypeSlice(alloc, tup, sub_elems, param_names, args);
+                return t;
+            }
+            return .{ .tuple = sub_elems };
+        },
+        .option => |opt| {
+            const sub_inner = try substType(alloc, opt.*, param_names, args);
+            errdefer freeSubstitutedType(alloc, opt.*, sub_inner, param_names, args);
+            if (deepEqual(sub_inner, opt.*)) {
+                freeSubstitutedType(alloc, opt.*, sub_inner, param_names, args);
+                return t;
+            }
+            const opt_ptr = try alloc.create(Type);
+            opt_ptr.* = sub_inner;
+            return .{ .option = opt_ptr };
+        },
+        .result => |res| {
+            const sub_ok = try substType(alloc, res.ok, param_names, args);
+            errdefer freeSubstitutedType(alloc, res.ok, sub_ok, param_names, args);
+            const sub_err = try substType(alloc, res.err, param_names, args);
+            errdefer freeSubstitutedType(alloc, res.err, sub_err, param_names, args);
+            if (deepEqual(sub_ok, res.ok) and deepEqual(sub_err, res.err)) {
+                freeSubstitutedType(alloc, res.ok, sub_ok, param_names, args);
+                freeSubstitutedType(alloc, res.err, sub_err, param_names, args);
+                return t;
+            }
+            const res_ptr = try alloc.create(Result);
+            res_ptr.* = .{ .ok = sub_ok, .err = sub_err, .is_error_unionable = res.is_error_unionable };
+            return .{ .result = res_ptr };
+        },
+        .boxed => |bx| {
+            const sub_inner = try substType(alloc, bx.*, param_names, args);
+            errdefer freeSubstitutedType(alloc, bx.*, sub_inner, param_names, args);
+            if (deepEqual(sub_inner, bx.*)) {
+                freeSubstitutedType(alloc, bx.*, sub_inner, param_names, args);
+                return t;
+            }
+            const bx_ptr = try alloc.create(Type);
+            bx_ptr.* = sub_inner;
+            return .{ .boxed = bx_ptr };
+        },
+        .@"opaque" => |opaque_type| {
+            const sub_bounds = try substBoundSlice(alloc, opaque_type.bounds, param_names, args);
+            errdefer {
+                freeSubstitutedBounds(alloc, opaque_type.bounds, sub_bounds, param_names, args);
+                if (sub_bounds.len > 0) alloc.free(sub_bounds);
+            }
+            const sub_concrete = if (opaque_type.concrete) |concrete| blk: {
+                const concrete_ptr = try alloc.create(Type);
+                errdefer alloc.destroy(concrete_ptr);
+                concrete_ptr.* = try substType(alloc, concrete.*, param_names, args);
+                break :blk @as(?*const Type, concrete_ptr);
+            } else null;
+            const opaque_copy = Opaque{
+                .bounds = sub_bounds,
+                .concrete = sub_concrete,
+            };
+            return .{ .@"opaque" = opaque_copy };
+        },
+        .dyn_trait => |bounds| return .{ .dyn_trait = try substBoundSlice(alloc, bounds, param_names, args) },
+        .external_nominal => |external| {
+            const sub_args = try substTypeSlice(alloc, external.args, param_names, args);
+            const substituted: Type = .{ .external_nominal = .{
+                .path = external.path,
+                .args = sub_args,
+            } };
+            if (deepEqual(substituted, t)) {
+                freeSubstitutedTypeSlice(alloc, external.args, sub_args, param_names, args);
+                return t;
+            }
+            return substituted;
+        },
+        .generic_inst => |gi| {
+            const sub_args = try substTypeSlice(alloc, gi.args.params, param_names, args);
+            const substituted: Type = .{ .generic_inst = .{
+                .decl = gi.decl,
+                .args = .{ .params = sub_args },
+            } };
+            if (deepEqual(substituted, t)) {
+                freeSubstitutedTypeSlice(alloc, gi.args.params, sub_args, param_names, args);
+                return t;
+            }
+            return substituted;
+        },
+        .fn_ptr => |fp| {
+            const sub_params = try substTypeSlice(alloc, fp.params, param_names, args);
+            errdefer freeSubstitutedTypeSlice(alloc, fp.params, sub_params, param_names, args);
+            const sub_ret = try substType(alloc, fp.ret, param_names, args);
+            errdefer freeSubstitutedType(alloc, fp.ret, sub_ret, param_names, args);
+            if (deepEqual(.{ .tuple = sub_params }, .{ .tuple = fp.params }) and
+                deepEqual(sub_ret, fp.ret))
+            {
+                freeSubstitutedTypeSlice(alloc, fp.params, sub_params, param_names, args);
+                freeSubstitutedType(alloc, fp.ret, sub_ret, param_names, args);
+                return t;
+            }
+            const fn_ptr = try alloc.create(FnPtr);
+            fn_ptr.* = .{ .params = sub_params, .ret = sub_ret };
+            return .{ .fn_ptr = fn_ptr };
+        },
+        .unsupported => return t,
+    }
+}
+
+fn substTypeSlice(
+    alloc: std.mem.Allocator,
+    source: []const Type,
+    param_names: []const []const u8,
+    args: []const Type,
+) std.mem.Allocator.Error![]const Type {
+    if (source.len == 0) return &.{};
+    const substituted = try alloc.alloc(Type, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (source[0..initialized], substituted[0..initialized]) |original, replacement| {
+            freeSubstitutedType(alloc, original, replacement, param_names, args);
+        }
+        alloc.free(substituted);
+    }
+    for (source, 0..) |original, index| {
+        substituted[index] = try substType(alloc, original, param_names, args);
+        initialized += 1;
+    }
+    return substituted;
+}
+
+fn substBoundSlice(
+    alloc: std.mem.Allocator,
+    source: []const Bound,
+    param_names: []const []const u8,
+    args: []const Type,
+) std.mem.Allocator.Error![]const Bound {
+    if (source.len == 0) return &.{};
+    const substituted = try alloc.alloc(Bound, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeSubstitutedBounds(alloc, source[0..initialized], substituted[0..initialized], param_names, args);
+        alloc.free(substituted);
+    }
+    for (source, 0..) |original, index| {
+        const bound_args = try substTypeSlice(alloc, original.args, param_names, args);
+        errdefer {
+            for (original.args, bound_args) |original_arg, substituted_arg| {
+                freeSubstitutedType(alloc, original_arg, substituted_arg, param_names, args);
+            }
+            if (bound_args.len > 0) alloc.free(bound_args);
+        }
+        const associated_types = try alloc.alloc(AssociatedTypeBinding, original.associated_types.len);
+        var associated_initialized: usize = 0;
+        errdefer {
+            for (
+                original.associated_types[0..associated_initialized],
+                associated_types[0..associated_initialized],
+            ) |original_binding, replacement_binding| {
+                freeSubstitutedType(
+                    alloc,
+                    original_binding.ty,
+                    replacement_binding.ty,
+                    param_names,
+                    args,
+                );
+            }
+            if (associated_types.len > 0) alloc.free(associated_types);
+        }
+        for (original.associated_types, 0..) |binding, binding_index| {
+            associated_types[binding_index] = .{
+                .name = binding.name,
+                .ty = try substType(alloc, binding.ty, param_names, args),
+            };
+            associated_initialized += 1;
+        }
+        substituted[index] = .{
+            .path = original.path,
+            .args = bound_args,
+            .associated_types = if (associated_types.len > 0) associated_types else &.{},
+            .optional = original.optional,
+        };
+        initialized += 1;
+    }
+    return substituted;
+}
+
+fn freeSubstitutedTypeSlice(
+    alloc: std.mem.Allocator,
+    original: []const Type,
+    substituted: []const Type,
+    param_names: []const []const u8,
+    args: []const Type,
+) void {
+    for (original, substituted) |original_type, substituted_type| {
+        freeSubstitutedType(alloc, original_type, substituted_type, param_names, args);
+    }
+    if (substituted.len > 0) alloc.free(substituted);
+}
+
+fn freeSubstitutedBounds(
+    alloc: std.mem.Allocator,
+    original: []const Bound,
+    substituted: []const Bound,
+    param_names: []const []const u8,
+    args: []const Type,
+) void {
+    if (original.len != substituted.len) return;
+    for (original, substituted) |original_bound, substituted_bound| {
+        if (original_bound.args.len == substituted_bound.args.len) {
+            for (original_bound.args, substituted_bound.args) |original_arg, substituted_arg| {
+                freeSubstitutedType(alloc, original_arg, substituted_arg, param_names, args);
+            }
+        }
+        if (substituted_bound.args.len > 0) alloc.free(substituted_bound.args);
+        if (original_bound.associated_types.len == substituted_bound.associated_types.len) {
+            for (original_bound.associated_types, substituted_bound.associated_types) |
+                original_binding,
+                substituted_binding,
+            | {
+                freeSubstitutedType(
+                    alloc,
+                    original_binding.ty,
+                    substituted_binding.ty,
+                    param_names,
+                    args,
+                );
+            }
+        }
+        if (substituted_bound.associated_types.len > 0) alloc.free(substituted_bound.associated_types);
+    }
+}
+
+/// Release only nodes allocated by `substType`; source and argument types stay borrowed.
+/// Pass the allocator and inputs used for that substitution. Call once per
+/// successful result after its last use; copies share the same allocated nodes.
+pub fn freeSubstitutedType(
+    alloc: std.mem.Allocator,
+    original: Type,
+    substituted: Type,
+    param_names: []const []const u8,
+    args: []const Type,
+) void {
+    if (param_names.len == 0 or args.len == 0) return;
+    if (isTypeParam(original, param_names) != null) return;
+
+    switch (original) {
+        .reference => |ref| {
+            const sub_ref = switch (substituted) {
+                .reference => |value| value,
+                else => return,
+            };
+            if (sub_ref == ref) return;
+            freeSubstitutedType(alloc, ref.pointee, sub_ref.pointee, param_names, args);
+            alloc.destroy(sub_ref);
+        },
+        .raw_ptr => |raw_ptr| {
+            const sub_raw_ptr = switch (substituted) {
+                .raw_ptr => |value| value,
+                else => return,
+            };
+            if (sub_raw_ptr == raw_ptr) return;
+            freeSubstitutedType(alloc, raw_ptr.pointee, sub_raw_ptr.pointee, param_names, args);
+            alloc.destroy(sub_raw_ptr);
+        },
+        .slice => |slice| {
+            const sub_slice = switch (substituted) {
+                .slice => |value| value,
+                else => return,
+            };
+            if (sub_slice == slice) return;
+            freeSubstitutedType(alloc, slice.elem, sub_slice.elem, param_names, args);
+            alloc.destroy(sub_slice);
+        },
+        .array => |array| {
+            const sub_array = switch (substituted) {
+                .array => |value| value,
+                else => return,
+            };
+            if (sub_array == array) return;
+            freeSubstitutedType(alloc, array.elem, sub_array.elem, param_names, args);
+            alloc.destroy(sub_array);
+        },
+        .tuple => |tuple| {
+            const sub_tuple = switch (substituted) {
+                .tuple => |value| value,
+                else => return,
+            };
+            if (sub_tuple.ptr == tuple.ptr) return;
+            freeSubstitutedTypeSlice(alloc, tuple, sub_tuple, param_names, args);
+        },
+        .option => |option| {
+            const sub_option = switch (substituted) {
+                .option => |value| value,
+                else => return,
+            };
+            if (sub_option == option) return;
+            freeSubstitutedType(alloc, option.*, sub_option.*, param_names, args);
+            alloc.destroy(sub_option);
+        },
+        .result => |result| {
+            const sub_result = switch (substituted) {
+                .result => |value| value,
+                else => return,
+            };
+            if (sub_result == result) return;
+            freeSubstitutedType(alloc, result.ok, sub_result.ok, param_names, args);
+            freeSubstitutedType(alloc, result.err, sub_result.err, param_names, args);
+            alloc.destroy(sub_result);
+        },
+        .boxed => |boxed| {
+            const sub_boxed = switch (substituted) {
+                .boxed => |value| value,
+                else => return,
+            };
+            if (sub_boxed == boxed) return;
+            freeSubstitutedType(alloc, boxed.*, sub_boxed.*, param_names, args);
+            alloc.destroy(sub_boxed);
+        },
+        .@"opaque" => |opaque_type| {
+            const sub_opaque = switch (substituted) {
+                .@"opaque" => |value| value,
+                else => return,
+            };
+            if (sub_opaque.bounds.ptr != opaque_type.bounds.ptr) {
+                freeSubstitutedBounds(alloc, opaque_type.bounds, sub_opaque.bounds, param_names, args);
+                if (sub_opaque.bounds.len > 0) alloc.free(sub_opaque.bounds);
+            }
+            if (sub_opaque.concrete) |sub_concrete| {
+                if (opaque_type.concrete) |original_concrete| {
+                    if (sub_concrete == original_concrete) return;
+                    freeSubstitutedType(
+                        alloc,
+                        original_concrete.*,
+                        sub_concrete.*,
+                        param_names,
+                        args,
+                    );
+                }
+                alloc.destroy(sub_concrete);
+            }
+        },
+        .dyn_trait => |bounds| {
+            const sub_bounds = switch (substituted) {
+                .dyn_trait => |value| value,
+                else => return,
+            };
+            if (sub_bounds.ptr == bounds.ptr) return;
+            freeSubstitutedBounds(alloc, bounds, sub_bounds, param_names, args);
+            if (sub_bounds.len > 0) alloc.free(sub_bounds);
+        },
+        .fn_ptr => |fn_ptr| {
+            const sub_fn_ptr = switch (substituted) {
+                .fn_ptr => |value| value,
+                else => return,
+            };
+            if (sub_fn_ptr == fn_ptr) return;
+            freeSubstitutedTypeSlice(alloc, fn_ptr.params, sub_fn_ptr.params, param_names, args);
+            freeSubstitutedType(alloc, fn_ptr.ret, sub_fn_ptr.ret, param_names, args);
+            alloc.destroy(sub_fn_ptr);
+        },
+        .generic_inst => |generic_inst| {
+            const sub_generic_inst = switch (substituted) {
+                .generic_inst => |value| value,
+                else => return,
+            };
+            if (sub_generic_inst.args.params.ptr == generic_inst.args.params.ptr) return;
+            freeSubstitutedTypeSlice(
+                alloc,
+                generic_inst.args.params,
+                sub_generic_inst.args.params,
+                param_names,
+                args,
+            );
+        },
+        .external_nominal => |external| {
+            const sub_external = switch (substituted) {
+                .external_nominal => |value| value,
+                else => return,
+            };
+            if (sub_external.args.ptr == external.args.ptr) return;
+            freeSubstitutedTypeSlice(alloc, external.args, sub_external.args, param_names, args);
+        },
+        .prim, .path, .unsupported => {},
+    }
+}
+
+/// Return whether a source type contains one of the named generic parameters.
+pub fn typeContainsParam(t: Type, param_names: []const []const u8) bool {
+    switch (t) {
+        .prim, .unsupported => return false,
+        .path => |p| {
+            if (p.segments.len == 1) {
+                return isTypeParam(t, param_names) != null;
+            }
+            return false;
+        },
+        .external_nominal => |external| {
+            for (external.args) |arg| {
+                if (typeContainsParam(arg, param_names)) return true;
+            }
+            return false;
+        },
+        .reference => |r| return typeContainsParam(r.pointee, param_names),
+        .raw_ptr => |rp| return typeContainsParam(rp.pointee, param_names),
+        .slice => |s| return typeContainsParam(s.elem, param_names),
+        .array => |arr| return typeContainsParam(arr.elem, param_names),
+        .tuple => |tup| {
+            for (tup) |elem| {
+                if (typeContainsParam(elem, param_names)) return true;
+            }
+            return false;
+        },
+        .fn_ptr => |fp| {
+            for (fp.params) |elem| {
+                if (typeContainsParam(elem, param_names)) return true;
+            }
+            return typeContainsParam(fp.ret, param_names);
+        },
+        .generic_inst => |gi| {
+            for (gi.args.params) |elem| {
+                if (typeContainsParam(elem, param_names)) return true;
+            }
+            return false;
+        },
+        .option => |opt| return typeContainsParam(opt.*, param_names),
+        .result => |res| {
+            return typeContainsParam(res.ok, param_names) or typeContainsParam(res.err, param_names);
+        },
+        .boxed => |bx| return typeContainsParam(bx.*, param_names),
+        .@"opaque" => |opaque_type| {
+            if (opaque_type.concrete) |concrete| {
+                if (typeContainsParam(concrete.*, param_names)) return true;
+            }
+            return boundsContainParam(opaque_type.bounds, param_names);
+        },
+        .dyn_trait => |bounds| return boundsContainParam(bounds, param_names),
+    }
+}
+
+fn boundsContainParam(bounds: []const Bound, param_names: []const []const u8) bool {
+    for (bounds) |bound| {
+        for (bound.args) |arg| {
+            if (typeContainsParam(arg, param_names)) return true;
+        }
+        for (bound.associated_types) |binding| {
+            if (typeContainsParam(binding.ty, param_names)) return true;
+        }
+    }
+    return false;
+}
+
 /// Compare two types by value, including all nested metadata.
 ///
 /// The recursion bound keeps malformed cyclic type graphs from hanging callers.
@@ -625,7 +1196,7 @@ test "types: replacing a Self leaf is all or nothing under allocation failure" {
         .decl = 7,
         .args = .{ .params = pair_args },
     } };
-    const inner = Type{ .result = blk: {
+    const inner: Type = .{ .result = blk: {
         const result = try arena.create(Result);
         result.* = .{
             .ok = self_leaf,
@@ -634,7 +1205,7 @@ test "types: replacing a Self leaf is all or nothing under allocation failure" {
         };
         break :blk result;
     } };
-    const declared = Type{ .tuple = blk: {
+    const declared: Type = .{ .tuple = blk: {
         const elements = try arena.alloc(Type, 2);
         elements[0] = self_leaf;
         elements[1] = inner;
@@ -694,4 +1265,567 @@ test "types: truncated Self substitution refuses the entire mixed type" {
         error.InvalidTypeTraversal,
         replaceSelfLeaves(alloc, .{ .prim = .u8 }, .{ .tuple = &elements }),
     );
+}
+
+fn testPrimPath(alloc: std.mem.Allocator, name: []const u8) !Type {
+    const seg = try alloc.dupe(PathSegment, &.{.{ .name = name, .id = null }});
+    return .{ .path = .{ .segments = seg } };
+}
+
+test "substType substitutes generic type parameters structurally" {
+    const a = std.testing.allocator;
+
+    const t_inner = try testPrimPath(a, "T");
+    defer a.free(t_inner.path.segments);
+    const param_names = try a.alloc([]const u8, 1);
+    defer a.free(param_names);
+    param_names[0] = "T";
+    const args = try a.alloc(Type, 1);
+    defer a.free(args);
+    args[0] = .{ .prim = .u32 };
+
+    // &T -> &u32.
+    const ref_heap = try a.create(Ref);
+    defer a.destroy(ref_heap);
+    const ref_t: Type = .{ .reference = ref_heap };
+    init_heap: {
+        ref_heap.* = .{ .mut = false, .pointee = t_inner };
+        const subst = try substType(a, ref_t, param_names, args);
+        try std.testing.expect(subst == .reference);
+        try std.testing.expectEqual(Type{ .prim = .u32 }, subst.reference.pointee);
+        // Free the substituted Allocation's pointee (a prim — nothing to free)
+        // and the substituted reference node itself.
+        a.destroy(subst.reference);
+        break :init_heap;
+    }
+}
+
+fn checkBoundSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const parameter: Type = .{ .path = .{
+        .segments = &.{.{ .name = "T", .id = null }},
+    } };
+    const declared: Type = .{ .dyn_trait = &.{.{
+        .path = .{ .segments = &.{.{ .name = "Trait", .id = null }} },
+        .args = &.{parameter},
+        .associated_types = &.{.{ .name = "Item", .ty = .{ .prim = .bool } }},
+        .optional = false,
+    }} };
+    const param_names = &.{"T"};
+    const args = &.{Type{ .prim = .u32 }};
+    const substituted = try substType(alloc, declared, param_names, args);
+    defer freeSubstitutedType(alloc, declared, substituted, param_names, args);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.dyn_trait[0].args[0]);
+    try std.testing.expectEqual(Type{ .prim = .bool }, substituted.dyn_trait[0].associated_types[0].ty);
+}
+
+test "substType releases partial generic bounds on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBoundSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkNestedSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const parameter: Type = .{ .path = .{
+        .segments = &.{.{ .name = "T", .id = null }},
+    } };
+    const inner: Ref = .{ .mut = false, .pointee = parameter };
+    const outer: Ref = .{ .mut = false, .pointee = .{ .reference = &inner } };
+    const declared: Type = .{ .reference = &outer };
+    const param_names = &.{"T"};
+    const args = &.{Type{ .prim = .u32 }};
+    const substituted = try substType(alloc, declared, param_names, args);
+    defer freeSubstitutedType(alloc, declared, substituted, param_names, args);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.reference.pointee.reference.pointee);
+}
+
+test "substType releases nested reference substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkNestedSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+/// The generic-parameter slot every fixture below rewrites, and the borrowed
+/// argument it rewrites it to. Both stay out of the fault-injected allocator
+/// so an allocation sweep only ever exercises the containers `substType`
+/// itself allocates.
+const substitution_parameter: Type = .{
+    .path = .{ .segments = &.{.{ .name = "T", .id = null }} },
+};
+const substitution_param_names: []const []const u8 = &.{"T"};
+const substitution_args: []const Type = &.{Type{ .prim = .u32 }};
+
+fn checkRawPtrSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const inner: Ref = .{ .mut = true, .pointee = substitution_parameter };
+    const outer: RawPtr = .{ .mut = false, .pointee = .{ .reference = &inner } };
+    const declared: Type = .{ .raw_ptr = &outer };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .raw_ptr);
+    try std.testing.expectEqual(@as(bool, false), substituted.raw_ptr.mut);
+    try std.testing.expect(substituted.raw_ptr.pointee == .reference);
+    try std.testing.expectEqual(@as(bool, true), substituted.raw_ptr.pointee.reference.mut);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.raw_ptr.pointee.reference.pointee);
+    // The borrowed source node is never released alongside the substituted copy.
+    try std.testing.expectEqual(substitution_parameter, inner.pointee);
+}
+
+test "substType releases nested raw pointer substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkRawPtrSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkSliceSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const inner: Slice = .{ .const_ = false, .elem = substitution_parameter };
+    const outer: Slice = .{ .const_ = true, .elem = .{ .slice = &inner } };
+    const declared: Type = .{ .slice = &outer };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .slice);
+    try std.testing.expectEqual(@as(bool, true), substituted.slice.const_);
+    try std.testing.expect(substituted.slice.elem == .slice);
+    try std.testing.expectEqual(@as(bool, false), substituted.slice.elem.slice.const_);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.slice.elem.slice.elem);
+    try std.testing.expectEqual(substitution_parameter, inner.elem);
+}
+
+test "substType releases nested slice substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkSliceSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkArraySubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const declared_len: ArrayLen = .{ .literal = 4 };
+    const inner: Ref = .{ .mut = false, .pointee = substitution_parameter };
+    const outer: Array = .{ .elem = .{ .reference = &inner }, .len = declared_len };
+    const declared: Type = .{ .array = &outer };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .array);
+    try std.testing.expectEqual(declared_len, substituted.array.len);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.array.elem.reference.pointee);
+    try std.testing.expectEqual(substitution_parameter, inner.pointee);
+}
+
+test "substType releases nested array substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkArraySubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkTupleSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const first: Ref = .{ .mut = true, .pointee = substitution_parameter };
+    const second: RawPtr = .{ .mut = true, .pointee = substitution_parameter };
+    const declared: Type = .{ .tuple = &.{
+        .{ .reference = &first },
+        .{ .raw_ptr = &second },
+        .{ .prim = .bool },
+    } };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .tuple);
+    try std.testing.expectEqual(@as(usize, 3), substituted.tuple.len);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.tuple[0].reference.pointee);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.tuple[1].raw_ptr.pointee);
+    try std.testing.expectEqual(Type{ .prim = .bool }, substituted.tuple[2]);
+    // Both borrowed sources survive the rollback of the partially built slice.
+    try std.testing.expectEqual(substitution_parameter, first.pointee);
+    try std.testing.expectEqual(substitution_parameter, second.pointee);
+}
+
+test "substType releases partial tuple substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkTupleSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkOptionSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const inner: RawPtr = .{ .mut = true, .pointee = substitution_parameter };
+    const payload: Type = .{ .raw_ptr = &inner };
+    const declared: Type = .{ .option = &payload };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .option);
+    try std.testing.expect(substituted.option.* == .raw_ptr);
+    try std.testing.expectEqual(@as(bool, true), substituted.option.*.raw_ptr.mut);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.option.*.raw_ptr.pointee);
+    try std.testing.expectEqual(substitution_parameter, inner.pointee);
+}
+
+test "substType releases nested option substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkOptionSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkResultSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const ok_slice: Slice = .{ .const_ = true, .elem = substitution_parameter };
+    const err_ref: Ref = .{ .mut = false, .pointee = substitution_parameter };
+    const payload: Result = .{
+        .ok = .{ .slice = &ok_slice },
+        .err = .{ .reference = &err_ref },
+        .is_error_unionable = true,
+    };
+    const declared: Type = .{ .result = &payload };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .result);
+    try std.testing.expectEqual(@as(bool, true), substituted.result.is_error_unionable);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.result.ok.slice.elem);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.result.err.reference.pointee);
+    // A failure while building the second arm releases the first arm's node.
+    try std.testing.expectEqual(substitution_parameter, ok_slice.elem);
+    try std.testing.expectEqual(substitution_parameter, err_ref.pointee);
+}
+
+test "substType releases partial result substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkResultSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkBoxedSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const payload: Type = .{ .tuple = &.{ substitution_parameter, .{ .prim = .bool } } };
+    const declared: Type = .{ .boxed = &payload };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .boxed);
+    try std.testing.expect(substituted.boxed.* == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), substituted.boxed.*.tuple.len);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.boxed.*.tuple[0]);
+    try std.testing.expectEqual(Type{ .prim = .bool }, substituted.boxed.*.tuple[1]);
+}
+
+test "substType releases nested boxed substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBoxedSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkOpaqueSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const arg_ref: Ref = .{ .mut = true, .pointee = substitution_parameter };
+    const bound_arg: Type = .{ .tuple = &.{.{ .reference = &arg_ref }} };
+    const concrete_slice: Slice = .{ .const_ = false, .elem = substitution_parameter };
+    const concrete: Type = .{ .slice = &concrete_slice };
+    const declared: Type = .{ .@"opaque" = .{
+        .bounds = &.{.{
+            .path = .{ .segments = &.{.{ .name = "Trait", .id = null }} },
+            .args = &.{bound_arg},
+            .associated_types = &.{.{ .name = "Item", .ty = substitution_parameter }},
+            .optional = false,
+        }},
+        .concrete = &concrete,
+    } };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .@"opaque");
+    try std.testing.expectEqual(@as(usize, 1), substituted.@"opaque".bounds.len);
+    try std.testing.expectEqual(@as(usize, 1), substituted.@"opaque".bounds[0].args.len);
+    try std.testing.expect(substituted.@"opaque".bounds[0].args[0] == .tuple);
+    try std.testing.expectEqual(
+        Type{ .prim = .u32 },
+        substituted.@"opaque".bounds[0].args[0].tuple[0].reference.pointee,
+    );
+    try std.testing.expectEqual(
+        Type{ .prim = .u32 },
+        substituted.@"opaque".bounds[0].associated_types[0].ty,
+    );
+    try std.testing.expect(substituted.@"opaque".concrete != null);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.@"opaque".concrete.?.slice.elem);
+    try std.testing.expectEqual(substitution_parameter, concrete_slice.elem);
+    try std.testing.expectEqual(substitution_parameter, arg_ref.pointee);
+}
+
+test "substType releases opaque bound and concrete substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkOpaqueSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkExternalNominalSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const arg: Ref = .{ .mut = true, .pointee = substitution_parameter };
+    const declared: Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "vec", "Vec" },
+        .args = &.{.{ .reference = &arg }},
+    } };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .external_nominal);
+    try std.testing.expect(substituted.external_nominal.path.ptr == declared.external_nominal.path.ptr);
+    try std.testing.expectEqual(@as(usize, 1), substituted.external_nominal.args.len);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.external_nominal.args[0].reference.pointee);
+    try std.testing.expectEqual(substitution_parameter, arg.pointee);
+}
+
+test "substType releases external nominal argument substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkExternalNominalSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkGenericInstSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const declared_len: ArrayLen = .{ .literal = 3 };
+    const first: Slice = .{ .const_ = true, .elem = substitution_parameter };
+    const second: Array = .{ .elem = substitution_parameter, .len = declared_len };
+    const declared: Type = .{ .generic_inst = .{
+        .decl = 5,
+        .args = .{ .params = &.{
+            .{ .slice = &first },
+            .{ .array = &second },
+        } },
+    } };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .generic_inst);
+    try std.testing.expectEqual(@as(spine.EntityId, 5), substituted.generic_inst.decl);
+    try std.testing.expectEqual(@as(usize, 2), substituted.generic_inst.args.params.len);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.generic_inst.args.params[0].slice.elem);
+    try std.testing.expectEqual(declared_len, substituted.generic_inst.args.params[1].array.len);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.generic_inst.args.params[1].array.elem);
+    try std.testing.expectEqual(substitution_parameter, first.elem);
+    try std.testing.expectEqual(substitution_parameter, second.elem);
+}
+
+test "substType releases generic instantiation argument substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkGenericInstSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+fn checkFnPtrSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const param_slice: Slice = .{ .const_ = false, .elem = substitution_parameter };
+    const ret_payload: Type = .{ .tuple = &.{ .{ .prim = .u8 }, substitution_parameter } };
+    const payload: FnPtr = .{
+        .params = &.{ .{ .slice = &param_slice }, .{ .prim = .bool } },
+        .ret = ret_payload,
+    };
+    const declared: Type = .{ .fn_ptr = &payload };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    defer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .fn_ptr);
+    try std.testing.expectEqual(@as(usize, 2), substituted.fn_ptr.params.len);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.fn_ptr.params[0].slice.elem);
+    try std.testing.expectEqual(Type{ .prim = .bool }, substituted.fn_ptr.params[1]);
+    try std.testing.expect(substituted.fn_ptr.ret == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), substituted.fn_ptr.ret.tuple.len);
+    try std.testing.expectEqual(Type{ .prim = .u8 }, substituted.fn_ptr.ret.tuple[0]);
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.fn_ptr.ret.tuple[1]);
+    try std.testing.expectEqual(substitution_parameter, param_slice.elem);
+}
+
+test "substType releases function pointer parameter substitutions" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkFnPtrSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+/// A substituted parameter becomes the caller's argument by reference. The
+/// substituted container is owned by the caller of `substType`; releasing it
+/// must reach the nodes `substType` allocated and stop at the borrowed
+/// argument's own heap nodes.
+fn checkBorrowedCompositeArgumentSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const borrowed_inner: Ref = .{ .mut = true, .pointee = .{ .prim = .f64 } };
+    const borrowed_elems = [_]Type{
+        .{ .reference = &borrowed_inner },
+        .{ .prim = .bool },
+    };
+    const borrowed: Type = .{ .tuple = &borrowed_elems };
+    const owned_ref: Ref = .{ .mut = false, .pointee = substitution_parameter };
+    const declared: Type = .{ .tuple = &.{
+        substitution_parameter,
+        .{ .reference = &owned_ref },
+    } };
+    const args = &.{borrowed};
+    const substituted = try substType(alloc, declared, substitution_param_names, args);
+    errdefer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, args);
+    try std.testing.expect(substituted == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), substituted.tuple.len);
+    try std.testing.expectEqual(borrowed, substituted.tuple[0]);
+    // The owned reference node wraps the borrowed argument; the argument itself
+    // is substituted in by reference and carries no ownership here.
+    try std.testing.expectEqual(borrowed, substituted.tuple[1].reference.pointee);
+    freeSubstitutedType(alloc, declared, substituted, substitution_param_names, args);
+    // The borrowed argument still owns its reference node after the release.
+    try std.testing.expectEqual(@as(bool, true), borrowed_elems[0].reference.mut);
+    try std.testing.expectEqual(Type{ .prim = .f64 }, borrowed_elems[0].reference.pointee);
+    try std.testing.expectEqual(Type{ .prim = .bool }, borrowed_elems[1]);
+}
+
+test "substType keeps borrowed substitution arguments intact on rollback" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBorrowedCompositeArgumentSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+/// An opaque whose bounds and concrete type hold no generic parameter keeps
+/// every nested source node borrowed. Only the freshly allocated copies may be
+/// released; the nested source graph stays valid for the caller's next use.
+fn checkUnchangedOpaqueSubstitutionAllocationFailures(alloc: std.mem.Allocator) !void {
+    const nested_ref: Ref = .{ .mut = false, .pointee = .{ .prim = .u8 } };
+    const nested_associated: Type = .{ .reference = &nested_ref };
+    const nested_arg: Type = .{ .tuple = &.{nested_associated} };
+    const declared_len: ArrayLen = .{ .literal = 2 };
+    const nested_array: Array = .{ .elem = .{ .prim = .u8 }, .len = declared_len };
+    const nested_concrete: Type = .{ .array = &nested_array };
+    const declared: Type = .{ .@"opaque" = .{
+        .bounds = &.{.{
+            .path = .{ .segments = &.{.{ .name = "Marker", .id = null }} },
+            .args = &.{nested_arg},
+            .associated_types = &.{.{ .name = "Out", .ty = nested_associated }},
+            .optional = true,
+        }},
+        .concrete = &nested_concrete,
+    } };
+    const substituted = try substType(alloc, declared, substitution_param_names, substitution_args);
+    errdefer freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    try std.testing.expect(substituted == .@"opaque");
+    try std.testing.expectEqual(@as(usize, 1), substituted.@"opaque".bounds.len);
+    try std.testing.expectEqual(@as(bool, true), substituted.@"opaque".bounds[0].optional);
+    try std.testing.expect(substituted.@"opaque".bounds[0].args[0].tuple[0] == .reference);
+    try std.testing.expectEqual(
+        Type{ .prim = .u8 },
+        substituted.@"opaque".bounds[0].args[0].tuple[0].reference.pointee,
+    );
+    try std.testing.expectEqual(
+        Type{ .prim = .u8 },
+        substituted.@"opaque".bounds[0].associated_types[0].ty.reference.pointee,
+    );
+    try std.testing.expectEqual(Type{ .prim = .u8 }, substituted.@"opaque".concrete.?.array.elem);
+    freeSubstitutedType(alloc, declared, substituted, substitution_param_names, substitution_args);
+    // The borrowed source graph is untouched by the release of its copy.
+    try std.testing.expectEqual(@as(bool, false), nested_ref.mut);
+    try std.testing.expectEqual(Type{ .prim = .u8 }, nested_ref.pointee);
+    try std.testing.expectEqual(Type{ .prim = .u8 }, nested_array.elem);
+    try std.testing.expectEqual(declared_len, nested_array.len);
+}
+
+test "substType keeps unchanged opaque source nodes intact" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkUnchangedOpaqueSubstitutionAllocationFailures,
+        .{},
+    );
+}
+
+/// `struct Buf<const N: usize, T> { head: [T; N] }` — the declaration half of a
+/// const generic, and the one use that half admits.
+const const_generic_declaration: Generics = .{ .params = &.{
+    .{ .const_ = .{ .name = "N", .ty = .{ .prim = .usize } } },
+    .{ .type_ = .{ .name = "T", .bounds = &.{} } },
+}, .where_clauses = &.{} };
+
+/// Whether a payload IS a value rather than a description of one. Every `Type`
+/// arm's payload goes through this, and none of them may: a value arm would be
+/// the const generic argument slot `GenericArgs` deliberately does not have.
+fn isValuePayload(comptime Payload: type) bool {
+    return switch (@typeInfo(Payload)) {
+        .int, .float, .bool => true,
+        else => false,
+    };
+}
+
+test "a const generic parameter is reached by index, and no Type carries its value" {
+    // The boundary itself: every arm describes a type or points at one, so the
+    // value a const generic argument supplies has nowhere in this union to go.
+    inline for (@typeInfo(Type).@"union".fields) |field| {
+        try std.testing.expect(!isValuePayload(field.type));
+    }
+
+    // The declaration survives it: `N` is a const parameter, `T` a type one.
+    try std.testing.expectEqual(@as(usize, 2), const_generic_declaration.params.len);
+    try std.testing.expectEqualStrings("N", const_generic_declaration.params[0].const_.name);
+    try std.testing.expectEqualStrings("T", const_generic_declaration.params[1].type_.name);
+
+    // The use inside the declaration is the index the parameter declared at, and
+    // that index is part of the type's identity: `[T; N]` is not `[T; M]`.
+    const uses_const: Type = .{ .array = &.{
+        .elem = substitution_parameter,
+        .len = .{ .generic = 0 },
+    } };
+    const uses_type: Type = .{ .array = &.{
+        .elem = substitution_parameter,
+        .len = .{ .generic = 1 },
+    } };
+    try std.testing.expect(!deepEqual(uses_const, uses_type));
+
+    // Substitution fills the type parameter's slot and leaves the const
+    // parameter's index exactly as declared — there is no value to put there.
+    const substituted = try substType(
+        std.testing.allocator,
+        uses_const,
+        substitution_param_names,
+        substitution_args,
+    );
+    defer freeSubstitutedType(
+        std.testing.allocator,
+        uses_const,
+        substituted,
+        substitution_param_names,
+        substitution_args,
+    );
+    try std.testing.expectEqual(Type{ .prim = .u32 }, substituted.array.elem);
+    try std.testing.expectEqual(ArrayLen{ .generic = 0 }, substituted.array.len);
+
+    // A parameter walk answers for the type parameter alone: the length is not
+    // a `Type` child, so a const parameter's name is never one it can find.
+    try std.testing.expect(typeContainsParam(uses_const, substitution_param_names));
+    try std.testing.expect(!typeContainsParam(uses_const, &.{"N"}));
+}
+
+test "a generic argument list holds one slot per type parameter" {
+    const as_u8: Type = .{ .generic_inst = .{
+        .decl = 7,
+        .args = .{ .params = &.{.{ .prim = .u8 }} },
+    } };
+    const as_u32: Type = .{ .generic_inst = .{
+        .decl = 7,
+        .args = .{ .params = &.{.{ .prim = .u32 }} },
+    } };
+    // The slot this list does have is identity: two applications that differ
+    // in it are two types, and an equal one is the same type.
+    try std.testing.expect(!deepEqual(as_u8, as_u32));
+    try std.testing.expect(deepEqual(as_u8, .{ .generic_inst = .{
+        .decl = 7,
+        .args = .{ .params = &.{.{ .prim = .u8 }} },
+    } }));
+
+    // There is exactly one slot per TYPE parameter of the declaration, and the
+    // `const N: usize` it also declares takes none: that is the count
+    // `validate` measures, and the reason it refuses an instantiation of a
+    // const-generic declaration instead of admitting one with a hole in it.
+    var type_parameters: usize = 0;
+    for (const_generic_declaration.params) |parameter| {
+        if (parameter == .type_) type_parameters += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), type_parameters);
+    try std.testing.expectEqual(type_parameters, as_u8.generic_inst.args.params.len);
 }

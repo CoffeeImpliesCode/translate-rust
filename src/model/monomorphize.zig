@@ -32,6 +32,10 @@ pub fn typeEquals(a: types.Type, b: types.Type) bool {
             .path => |bp| pathEquals(ap, bp),
             else => false,
         },
+        .external_nominal => |ap| switch (b) {
+            .external_nominal => |bp| externalNominalEquals(ap, bp),
+            else => false,
+        },
         .prim => |ap| switch (b) {
             .prim => |bp| ap == bp,
             else => false,
@@ -76,6 +80,14 @@ pub fn typeEquals(a: types.Type, b: types.Type) bool {
             .boxed => |bp| typeEquals(ap.*, bp.*),
             else => false,
         },
+        .@"opaque" => |ap| switch (b) {
+            .@"opaque" => |bp| opaqueEquals(ap, bp),
+            else => false,
+        },
+        .dyn_trait => |ap| switch (b) {
+            .dyn_trait => |bp| boundsEqual(ap, bp),
+            else => false,
+        },
         .unsupported => |ap| switch (b) {
             .unsupported => |bp| ap.reason == bp.reason and std.mem.eql(u8, ap.message, bp.message),
             else => false,
@@ -98,6 +110,50 @@ fn lastSegment(p: types.Path) []const u8 {
         if (s.name.len > 0) return s.name;
     }
     return "";
+}
+
+/// An `ExternalNominal` names a type from `alloc`/`core`/`std`, so its path is
+/// compared segment by segment rather than by last name alone: `alloc::Cow`
+/// and `std::borrow::Cow` are the same type only when the whole path agrees.
+fn externalNominalEquals(a: types.ExternalNominal, b: types.ExternalNominal) bool {
+    if (a.path.len != b.path.len) return false;
+    for (a.path, b.path) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs, rhs)) return false;
+    }
+    return typesSliceEqual(a.args, b.args);
+}
+
+/// A `Bound` names the trait a where-clause requires. `optional` is part of
+/// that name (`?Sized` vs `Sized` admit different types), so the flag is
+/// compared alongside the path, the type arguments, and the projections.
+fn boundEquals(a: types.Bound, b: types.Bound) bool {
+    if (a.optional != b.optional) return false;
+    if (!pathEquals(a.path, b.path)) return false;
+    if (!typesSliceEqual(a.args, b.args)) return false;
+    if (a.associated_types.len != b.associated_types.len) return false;
+    for (a.associated_types, b.associated_types) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs.name, rhs.name)) return false;
+        if (!typeEquals(lhs.ty, rhs.ty)) return false;
+    }
+    return true;
+}
+
+fn boundsEqual(a: []const types.Bound, b: []const types.Bound) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (!boundEquals(lhs, rhs)) return false;
+    }
+    return true;
+}
+
+/// An `opaque` is its bounds plus whatever concrete representation inference
+/// has recovered. One concrete against one absent is not the same type: the
+/// emitter keys its layout off the concrete half, so the pair is unequal.
+fn opaqueEquals(a: types.Opaque, b: types.Opaque) bool {
+    if (!boundsEqual(a.bounds, b.bounds)) return false;
+    if ((a.concrete == null) != (b.concrete == null)) return false;
+    if (a.concrete) |lhs| return typeEquals(lhs.*, b.concrete.?.*);
+    return true;
 }
 
 fn arrayLenEquals(a: types.ArrayLen, b: types.ArrayLen) bool {
@@ -161,6 +217,13 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
     }
     switch (ty) {
         .path => |p| try appendMangledPath(alloc, w, p),
+        .external_nominal => |e| {
+            try appendMangledExternalPath(alloc, w, e.path);
+            for (e.args) |a| {
+                try w.append(alloc, '_');
+                try appendMangled(alloc, w, a);
+            }
+        },
         .prim => |p| try w.appendSlice(alloc, @tagName(p)),
         .reference => |r| {
             try appendMangled(alloc, w, r.pointee);
@@ -202,7 +265,7 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
             try appendMangled(alloc, w, f.ret);
         },
         .generic_inst => |g| {
-            try appendMangledPath(alloc, w, segmentPath(g.decl));
+            try w.print(alloc, "g{d}", .{g.decl});
             for (g.args.params) |a| {
                 try w.append(alloc, '_');
                 try appendMangled(alloc, w, a);
@@ -222,16 +285,56 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
             try appendMangled(alloc, w, bx.*);
             try w.appendSlice(alloc, "_box");
         },
-        else => try w.appendSlice(alloc, "unsupported"),
+        .@"opaque" => |o| {
+            try w.appendSlice(alloc, "opaque");
+            try appendMangledBounds(alloc, w, o.bounds);
+            if (o.concrete) |concrete| {
+                try w.append(alloc, '_');
+                try appendMangled(alloc, w, concrete.*);
+            }
+        },
+        .dyn_trait => |bounds| {
+            try w.appendSlice(alloc, "dyn");
+            try appendMangledBounds(alloc, w, bounds);
+        },
+        // `.unsupported` is the only arm left, and it is a Rust type this
+        // build refuses — so the old blanket `else` is now an explicit arm.
+        .unsupported => try w.appendSlice(alloc, "unsupported"),
     }
 }
 
-/// Append decimal digits of a u64 to the writer (no allocation beyond the
-/// stack buffer).
+/// An external nominal path is provenance only, so every segment is mangled:
+/// `alloc::borrow::Cow` and `std::borrow::Cow` must not collide on the last
+/// name alone the way two unresolved `Path`s do.
+fn appendMangledExternalPath(
+    alloc: std.mem.Allocator,
+    w: *std.ArrayListUnmanaged(u8),
+    path: []const []const u8,
+) std.mem.Allocator.Error!void {
+    for (path, 0..) |segment, index| {
+        if (index > 0) try w.append(alloc, '_');
+        try appendMangledName(alloc, w, segment);
+    }
+}
+
+fn appendMangledBounds(
+    alloc: std.mem.Allocator,
+    w: *std.ArrayListUnmanaged(u8),
+    bounds: []const types.Bound,
+) std.mem.Allocator.Error!void {
+    for (bounds) |bound| {
+        try w.append(alloc, 'b');
+        try appendMangledPath(alloc, w, bound.path);
+        for (bound.args) |arg| {
+            try w.append(alloc, '_');
+            try appendMangled(alloc, w, arg);
+        }
+    }
+}
+
+/// Append decimal digits of a u64 to the writer.
 fn appendInt(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), v: u64) std.mem.Allocator.Error!void {
-    var buf: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable;
-    try w.appendSlice(alloc, s);
+    try w.print(alloc, "{d}", .{v});
 }
 
 fn appendMangledPath(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), p: types.Path) std.mem.Allocator.Error!void {
@@ -242,15 +345,6 @@ fn appendMangledName(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), n
     // Sanitize on a scratch capacity reserve so appendAssumeCapacity is safe.
     try w.ensureUnusedCapacity(alloc, name.len);
     for (name) |c| sanitizeChar(c, w);
-}
-
-/// Synthetic one-segment path for a generic_inst whose decl is an EntityId
-/// (no stored name): derive the segment from the id to keep it deterministic.
-fn segmentPath(id: spine.EntityId) types.Path {
-    var buf: [24]u8 = undefined;
-    const name = std.fmt.bufPrint(buf[0..], "g{d}", .{id}) catch buf[0..0];
-    const seg: types.PathSegment = .{ .name = name, .id = id };
-    return .{ .segments = &.{seg} };
 }
 
 /// Deterministic Zig-safe suffix for a generic argument list, prefixed by `_`
@@ -361,6 +455,9 @@ fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, ty: types.T
             }
             for (g.args.params) |a| try collectType(table, alloc, a);
         },
+        // `external_nominal` is a nominal type like `generic_inst`; its args
+        // are ordinary IR types and can name a generic entity themselves.
+        .external_nominal => |e| for (e.args) |a| try collectType(table, alloc, a),
         .reference => |r| try collectType(table, alloc, r.pointee),
         .raw_ptr => |r| try collectType(table, alloc, r.pointee),
         .slice => |s| try collectType(table, alloc, s.elem),
@@ -376,7 +473,26 @@ fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, ty: types.T
             try collectType(table, alloc, r.err);
         },
         .boxed => |bx| try collectType(table, alloc, bx.*),
-        else => {},
+        .@"opaque" => |o| {
+            try collectBoundTypes(table, alloc, o.bounds);
+            if (o.concrete) |concrete| try collectType(table, alloc, concrete.*);
+        },
+        .dyn_trait => |bounds| try collectBoundTypes(table, alloc, bounds),
+        .prim, .path, .unsupported => {},
+    }
+}
+
+/// A `Bound` carries types twice — as its generic arguments and as the types
+/// its associated-type bindings project — and both can name a generic entity,
+/// so both are scanned the way `generic_inst`'s args are.
+fn collectBoundTypes(
+    table: *InstantiationTable,
+    alloc: std.mem.Allocator,
+    bounds: []const types.Bound,
+) std.mem.Allocator.Error!void {
+    for (bounds) |bound| {
+        for (bound.args) |arg| try collectType(table, alloc, arg);
+        for (bound.associated_types) |binding| try collectType(table, alloc, binding.ty);
     }
 }
 
@@ -444,10 +560,42 @@ fn collectExpr(
         },
         .break_ => |br| if (br.value) |bval| try collectExpr(table, alloc, b, v, bval),
         .continue_, .literal, .unit, .unsupported => {},
+        // `panic_` diverges and owns nothing else, so it reaches no node.
+        .panic_ => {},
+        // `[a, b]` and `[e; N]`: a fixed length is a number the translator
+        // holds, so unlike `vec![e; n]` there is no count node to walk.
+        .array => |arr| for (arr.elements) |element| try collectExpr(
+            table,
+            alloc,
+            b,
+            v,
+            element,
+        ),
+        // `start..end`: the absent end of an open-ended range is no node.
+        .range => |r| {
+            try collectExpr(table, alloc, b, v, r.start);
+            if (r.end) |end| try collectExpr(table, alloc, b, v, end);
+        },
         .vec_lit => |vec| {
             for (vec.elements) |element| try collectExpr(table, alloc, b, v, element);
+            // A count the target evaluates is a node like any other: an
+            // instantiation reachable only through `vec![x; n]` is cloned too.
+            if (vec.repeat) |count| switch (count) {
+                .literal => {},
+                .expression => |count_node| try collectExpr(table, alloc, b, v, count_node),
+            };
         },
         .call => |c| for (c.args) |a| try collectExpr(table, alloc, b, v, a),
+        // A core call names no local entity, so there is no `def` to register;
+        // its type arguments still are ordinary IR types.
+        .core_call => |cc| {
+            for (cc.args) |a| try collectExpr(table, alloc, b, v, a);
+            for (cc.generic_args) |g| try collectType(table, alloc, g);
+        },
+        // The function item alone: type arguments only, no value arguments.
+        .core_function => |cf| {
+            for (cf.generic_args) |g| try collectType(table, alloc, g);
+        },
         .method_call => |mc| {
             try collectExpr(table, alloc, b, v, mc.receiver);
             for (mc.args) |a| try collectExpr(table, alloc, b, v, a);
@@ -460,11 +608,23 @@ fn collectExpr(
             for (ev.tuple_fields) |tf| try collectExpr(table, alloc, b, v, tf);
             for (ev.named_fields) |nf| try collectExpr(table, alloc, b, v, nf.value);
         },
+        .external_variant => |ev| {
+            for (ev.tuple_fields) |tf| try collectExpr(table, alloc, b, v, tf);
+            for (ev.named_fields) |nf| try collectExpr(table, alloc, b, v, nf.value);
+        },
+        // `write!(w, "{}", x)`: the writer is evaluated first, then each arg.
+        .format_write => |fw| {
+            try collectExpr(table, alloc, b, v, fw.writer);
+            for (fw.args) |a| try collectExpr(table, alloc, b, v, a);
+        },
         .field => |f| try collectExpr(table, alloc, b, v, f.base),
         .index => |ix| {
             try collectExpr(table, alloc, b, v, ix.base);
             try collectExpr(table, alloc, b, v, ix.index);
         },
+        // `source_type` and `target` are types, not expression nodes; the
+        // source expression itself is the only node the cast reaches.
+        .cast => |c| try collectExpr(table, alloc, b, v, c.operand),
         .binary => |bin| {
             try collectExpr(table, alloc, b, v, bin.lhs);
             try collectExpr(table, alloc, b, v, bin.rhs);
@@ -568,6 +728,15 @@ fn collectPat(
             if (s.rest) |r| try collectPat(table, alloc, b, v, r);
         },
         .struct_pat => |sp| for (sp.fields) |fld| if (fld.pat) |fp| try collectPat(table, alloc, b, v, fp),
+        // An external variant's fields are `FieldPat`s like a struct
+        // pattern's, so a shorthand field (null `pat`) binds nothing to walk.
+        .external_variant => |ev| for (ev.fields) |fld| if (fld.pat) |fp| try collectPat(
+            table,
+            alloc,
+            b,
+            v,
+            fp,
+        ),
         .reference => |r| try collectPat(table, alloc, b, v, r.inner),
         .@"or" => |o| for (o.alternatives) |alt| try collectPat(table, alloc, b, v, alt),
         .range => {},
@@ -595,6 +764,9 @@ fn collectIterator(
     switch (ad) {
         .map => |m| try collectClosure(table, alloc, b, v, m.closure),
         .filter => |f| try collectClosure(table, alloc, b, v, f.closure),
+        // `flat_map` carries the closure directly, like `map`/`filter` carry
+        // theirs wrapped: same body, same parameter patterns to collect.
+        .flat_map => |cl| try collectClosure(table, alloc, b, v, cl),
         .enumerate, .range_rev, .other => {},
         .zip => |z| try collectExpr(table, alloc, b, v, z.other),
     }

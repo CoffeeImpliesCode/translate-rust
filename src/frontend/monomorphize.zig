@@ -7,7 +7,19 @@
 //! name suffix (e.g. `_u32`, `_u8_slice`, `_bool`) for each so the emitter
 //! can produce distinct monomorphized rustons (never duplicate symbols).
 //!
-//! C-free, pure Zig: imports only graph, bodies, types, spine. 0 dynamic
+//! A row is minted only where two separate questions both answer yes: the
+//! argument list is CONCRETE (`isConcreteType`), and the declaration named
+//! instantiates at that arity (`admitsInstantiation`, which counts the
+//! declaration's OWN `generic_params` — the same count
+//! `ir/validate.zig` refuses a finished row against). A method inside
+//! `impl<S> Hasher<S>` binds `S` and declares nothing, so a one-argument
+//! turbofish on it names an instantiation no declaration can have.
+//!
+//! C-free, pure Zig: imports the IR plus `infer.zig` for the one predicate
+//! that decides whether a type names something (`isInferPlaceholderType`).
+//! That edge is acyclic — nothing `infer.zig` reaches imports this module —
+//! and it is here so a placeholder is refused by name rather than by a second
+//! copy of the rule that would drift from the solver's. 0 dynamic
 //! allocations on hot paths (compares & mangles inline; only suffix buffers
 //! allocate).
 
@@ -19,6 +31,7 @@ const types = ir.types;
 const graph = ir.graph;
 const bodies = ir.bodies;
 const exprs = ir.exprs;
+const infer = @import("infer.zig");
 
 // ── §1 Deep structural equality ─────────────────────────────────────────────
 
@@ -243,9 +256,7 @@ fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: t
             try appendMangled(alloc, w, f.ret);
         },
         .generic_inst => |g| {
-            var id_buf: [24]u8 = undefined;
-            const id_str = std.fmt.bufPrint(&id_buf, "g{d}", .{g.decl}) catch "g0";
-            try appendMangledName(alloc, w, id_str);
+            try w.print(alloc, "g{d}", .{g.decl});
             for (g.args.params) |a| {
                 try w.append(alloc, '_');
                 try appendMangled(alloc, w, a);
@@ -298,12 +309,9 @@ fn appendMangledBounds(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8),
     }
 }
 
-/// Append decimal digits of a u64 to the writer (no allocation beyond the
-/// stack buffer).
+/// Append decimal digits of a u64 to the writer.
 fn appendInt(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), v: u64) std.mem.Allocator.Error!void {
-    var buf: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable;
-    try w.appendSlice(alloc, s);
+    try w.print(alloc, "{d}", .{v});
 }
 
 fn appendMangledPath(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), p: types.Path) std.mem.Allocator.Error!void {
@@ -321,15 +329,6 @@ fn appendMangledName(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), n
     // Sanitize on a scratch capacity reserve so appendAssumeCapacity is safe.
     try w.ensureUnusedCapacity(alloc, name.len);
     for (name) |c| sanitizeChar(c, w);
-}
-
-/// Synthetic one-segment path for a generic_inst whose decl is an EntityId
-/// (no stored name): derive the segment from the id to keep it deterministic.
-fn segmentPath(id: spine.EntityId) types.Path {
-    var buf: [24]u8 = undefined;
-    const name = std.fmt.bufPrint(buf[0..], "g{d}", .{id}) catch buf[0..0];
-    const seg: types.PathSegment = .{ .name = name, .id = id };
-    return .{ .segments = &.{seg} };
 }
 
 /// Deterministic Zig-safe suffix for a generic argument list, prefixed by `_`
@@ -397,10 +396,19 @@ pub const InstantiationTable = struct {
     /// Copy every inference record into the owned table before the inference
     /// result is released. The source map is keyed by expression node, while
     /// the public table is deduplicated by declaration and concrete args.
+    ///
+    /// No arity gate runs here, and that is deliberate rather than an omission:
+    /// these records were already gated where they were minted, by the
+    /// `addInstantiation` calls in `frontend/infer.zig` that ask
+    /// `declaredTypeParamCount` of the same body table `admitsInstantiation`
+    /// reads. Re-asking it here would be a second copy of that rule in a file
+    /// with no body table to read it from — `addOrGet` is the table's one
+    /// minting primitive and takes `(generic_id, args)` alone, so the arity a
+    /// row must have is decided by whoever calls it.
     pub fn mergeInferred(
         self: *InstantiationTable,
         alloc: std.mem.Allocator,
-        source: std.AutoHashMapUnmanaged(exprs.NodeId, types.Instantiation),
+        source: infer.InstantiationMap,
     ) !void {
         var it = source.iterator();
         while (it.next()) |entry| {
@@ -446,8 +454,17 @@ const Visited = struct {
 /// nested types but must not become monomorphization records: their `T` path
 /// is valid only in the declaration's generic scope, not as a standalone
 /// instantiation argument.
+///
+/// The inference placeholder is refused for the same reason `T` is, and for
+/// one more: a record carrying `["_"]` mangles a hole into an emitted symbol
+/// name. The `.path` prong below is deliberately stricter than
+/// `infer.isConcreteDerivedType` — a lexical `crate::` prefix is not an
+/// instantiation argument either — but both refuse a placeholder. Were they to
+/// disagree, a hole recorded here and a hole refused there would be two
+/// answers to what this stage considers finished.
 fn isConcreteType(ty: types.Type) bool {
     if (!hasValidTypeTag(ty)) return false;
+    if (infer.isInferPlaceholderType(ty)) return false;
     return switch (ty) {
         .path => |path| blk: {
             if (path.segments.len == 0) break :blk false;
@@ -519,53 +536,99 @@ fn concreteArgs(args: []const types.Type) bool {
     return true;
 }
 
+/// The number of type parameters a declaration binds IN ITS OWN RIGHT, or null
+/// when the slot holds no declaration to count.
+///
+/// This is the count `ir/validate.zig`'s `declaredTypeParamCount` refuses a row
+/// against, read from the same body table: a row names an instantiation of the
+/// DECLARATION its arguments appear in, so a method inside `impl<S> Hasher<S>`
+/// binds `S` and declares nothing, and `(new_with_keys, [Sip24Rounds])` names
+/// an instantiation no declaration can have. `getGenericParamNames` reads the
+/// ENCLOSING declaration and so answers a different question — what a call
+/// substitutes with — which is why an arity gate and a substitution walk are
+/// two functions rather than one.
+///
+/// `null` is the uncertain case, not the empty case: a slot the frontend never
+/// lowered states no arity either way. `frontend/infer.zig` keeps those rows
+/// lossless on purpose ("cannot be checked here … preserved for the later
+/// monomorphization pass"), so `null` PRESERVES the row rather than dropping
+/// it. Only a count that was read and found to disagree refuses.
+fn declaredGenericCount(b: *const bodies.Bodies, decl: spine.EntityId) ?usize {
+    if (@as(usize, decl) >= b.bodies.len) return null;
+    return switch (b.bodies[decl]) {
+        .fn_ => |fn_body| fn_body.generic_params.len,
+        .struct_ => |struct_body| struct_body.generic_params.len,
+        .enum_ => |enum_body| enum_body.generic_params.len,
+        else => null,
+    };
+}
+
+/// Whether a `(decl, args_len)` pair may become a row at all.
+///
+/// The rule is one conjunction: the declaration must bind a non-zero number of
+/// its own type parameters, and exactly as many as the row carries arguments.
+/// Two instantiations that both satisfy it are never merged — the table's key is
+/// the deep argument list, so two argument lists of the same arity stay two
+/// rows even though arity is the only thing this gate looks at.
+fn admitsInstantiation(b: *const bodies.Bodies, decl: spine.EntityId, args_len: usize) bool {
+    const count = declaredGenericCount(b, decl) orelse return true;
+    return count != 0 and count == args_len;
+}
+
 /// Determine whether a Type reachable through the model is itself a generic
 /// instantiation; register it (and recurse into its nested args). Repeated
 /// registration is deduplicated by `addOrGet`, so a simple recursive scan is
 /// safe.
-fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, ty: types.Type) std.mem.Allocator.Error!void {
+///
+/// The declaration is asked its OWN arity before the row is minted, so a type
+/// that names a declaration declaring no type parameters contributes nothing —
+/// the same refusal `frontend/infer.zig` reaches through `addInstantiation`'s
+/// gate, and the one `ir/validate.zig` enforces on the finished row.
+fn collectType(table: *InstantiationTable, alloc: std.mem.Allocator, b: *const bodies.Bodies, ty: types.Type) std.mem.Allocator.Error!void {
     if (!hasValidTypeTag(ty)) return;
     switch (ty) {
         .generic_inst => |g| {
             // Declaration signatures can contain `Wrapper<T>`. It is not a
             // concrete instantiation until every argument has a resolved
             // nominal identity (or is otherwise structurally concrete).
-            if (g.args.params.len > 0 and concreteArgs(g.args.params)) {
+            if (g.args.params.len > 0 and concreteArgs(g.args.params) and
+                admitsInstantiation(b, g.decl, g.args.params.len))
+            {
                 _ = try table.addOrGet(alloc, g.decl, g.args);
             }
-            for (g.args.params) |a| try collectType(table, alloc, a);
+            for (g.args.params) |a| try collectType(table, alloc, b, a);
         },
         .external_nominal => |external| {
-            for (external.args) |arg| try collectType(table, alloc, arg);
+            for (external.args) |arg| try collectType(table, alloc, b, arg);
         },
-        .reference => |r| try collectType(table, alloc, r.pointee),
-        .raw_ptr => |r| try collectType(table, alloc, r.pointee),
-        .slice => |s| try collectType(table, alloc, s.elem),
-        .array => |a| try collectType(table, alloc, a.elem),
-        .tuple => |t| for (t) |e| try collectType(table, alloc, e),
+        .reference => |r| try collectType(table, alloc, b, r.pointee),
+        .raw_ptr => |r| try collectType(table, alloc, b, r.pointee),
+        .slice => |s| try collectType(table, alloc, b, s.elem),
+        .array => |a| try collectType(table, alloc, b, a.elem),
+        .tuple => |t| for (t) |e| try collectType(table, alloc, b, e),
         .fn_ptr => |f| {
-            for (f.params) |p| try collectType(table, alloc, p);
-            try collectType(table, alloc, f.ret);
+            for (f.params) |p| try collectType(table, alloc, b, p);
+            try collectType(table, alloc, b, f.ret);
         },
-        .option => |o| try collectType(table, alloc, o.*),
+        .option => |o| try collectType(table, alloc, b, o.*),
         .result => |r| {
-            try collectType(table, alloc, r.ok);
-            try collectType(table, alloc, r.err);
+            try collectType(table, alloc, b, r.ok);
+            try collectType(table, alloc, b, r.err);
         },
-        .boxed => |bx| try collectType(table, alloc, bx.*),
+        .boxed => |bx| try collectType(table, alloc, b, bx.*),
         .@"opaque" => |opaque_type| {
-            try collectBounds(table, alloc, opaque_type.bounds);
-            if (opaque_type.concrete) |concrete| try collectType(table, alloc, concrete.*);
+            try collectBounds(table, alloc, b, opaque_type.bounds);
+            if (opaque_type.concrete) |concrete| try collectType(table, alloc, b, concrete.*);
         },
-        .dyn_trait => |bounds| try collectBounds(table, alloc, bounds),
+        .dyn_trait => |bounds| try collectBounds(table, alloc, b, bounds),
         else => {},
     }
 }
 
-fn collectBounds(table: *InstantiationTable, alloc: std.mem.Allocator, bounds: []const types.Bound) std.mem.Allocator.Error!void {
+fn collectBounds(table: *InstantiationTable, alloc: std.mem.Allocator, b: *const bodies.Bodies, bounds: []const types.Bound) std.mem.Allocator.Error!void {
     for (bounds) |bound| {
-        for (bound.args) |arg| try collectType(table, alloc, arg);
-        for (bound.associated_types) |binding| try collectType(table, alloc, binding.ty);
+        for (bound.args) |arg| try collectType(table, alloc, b, arg);
+        for (bound.associated_types) |binding| try collectType(table, alloc, b, binding.ty);
     }
 }
 
@@ -584,14 +647,21 @@ fn collectExpr(
     v.exprs[id] = true;
     const e = b.exprs[id];
     if (e.ty) |tyid| {
-        if (tyid < b.types.len) try collectType(table, alloc, b.types[tyid]);
+        if (tyid < b.types.len) try collectType(table, alloc, b, b.types[tyid]);
     }
     switch (e.kind) {
         .path => |p| {
-            if (p.generic_args.len > 0 and concreteArgs(p.generic_args)) {
+            // A turbofish-shaped argument list is not by itself an
+            // instantiation. `ts_ext` gives a struct-literal path a
+            // phantom one-parameter list it read off a field, and a method
+            // inside `impl<S> Hasher<S>` names its receiver through one; only
+            // the declaration's OWN arity decides which of those is a row.
+            if (p.generic_args.len > 0 and concreteArgs(p.generic_args) and
+                admitsInstantiation(b, p.def, p.generic_args.len))
+            {
                 _ = try table.addOrGet(alloc, p.def, .{ .params = p.generic_args });
             }
-            for (p.generic_args) |a| try collectType(table, alloc, a);
+            for (p.generic_args) |a| try collectType(table, alloc, b, a);
         },
         .block => |blk| {
             for (blk.statements) |sid| try collectStmt(table, alloc, b, v, sid);
@@ -635,7 +705,22 @@ fn collectExpr(
         .break_ => |br| if (br.value) |bval| try collectExpr(table, alloc, b, v, bval),
         .continue_, .literal, .unit, .panic_, .unsupported => {},
         .array => |a| for (a.elements) |el| try collectExpr(table, alloc, b, v, el),
-        .vec_lit => |vec| for (vec.elements) |el| try collectExpr(table, alloc, b, v, el),
+        .vec_lit => |vec| {
+            for (vec.elements) |el| try collectExpr(table, alloc, b, v, el);
+            // `Vec` is a runtime container, so `vec![e; n]` states a length the
+            // translator does not already hold. Such a count is an ordinary
+            // expression with its own types, generics, and effects, so it is a
+            // real child: a generic instantiation named only by the count is
+            // otherwise never cloned. A count the translator already holds as a
+            // number names no node, and a `null` repeat is the plain list form
+            // with no count at all. The `Visited` guard above keeps a shared or
+            // cyclic count node from being walked twice, exactly as for any
+            // other child.
+            if (vec.repeat) |count| switch (count) {
+                .literal => {},
+                .expression => |count_node| try collectExpr(table, alloc, b, v, count_node),
+            };
+        },
         .range => |range| {
             try collectExpr(table, alloc, b, v, range.start);
             if (range.end) |end| try collectExpr(table, alloc, b, v, end);
@@ -736,7 +821,7 @@ fn collectStmt(
     v.stmts[id] = true;
     const s = b.stmts[id];
     if (s.ty) |tyid| {
-        if (tyid < b.types.len) try collectType(table, alloc, b.types[tyid]);
+        if (tyid < b.types.len) try collectType(table, alloc, b, b.types[tyid]);
     }
     switch (s.kind) {
         .let => |ls| {
@@ -765,7 +850,7 @@ fn collectPat(
     const p = b.pats[id];
     if (p.kind == .unsupported) return;
     if (p.ty) |tyid| {
-        if (tyid < b.types.len) try collectType(table, alloc, b.types[tyid]);
+        if (tyid < b.types.len) try collectType(table, alloc, b, b.types[tyid]);
     }
     switch (p.kind) {
         .wildcard, .literal => {},
@@ -831,53 +916,54 @@ fn collectClosure(
 fn collectSignatureKind(
     table: *InstantiationTable,
     alloc: std.mem.Allocator,
+    b: *const bodies.Bodies,
     kind: bodies.BodyKind,
 ) std.mem.Allocator.Error!void {
     switch (kind) {
         .none => {},
         .trait_ => |trait_body| {
             for (trait_body.methods) |method| {
-                for (method.params) |param| try collectType(table, alloc, param.ty);
-                try collectType(table, alloc, method.ret);
+                for (method.params) |param| try collectType(table, alloc, b, param.ty);
+                try collectType(table, alloc, b, method.ret);
             }
             for (trait_body.assoc_types) |assoc| {
-                if (assoc.default) |default| try collectType(table, alloc, default);
+                if (assoc.default) |default| try collectType(table, alloc, b, default);
             }
-            for (trait_body.assoc_consts) |assoc| try collectType(table, alloc, assoc.ty);
+            for (trait_body.assoc_consts) |assoc| try collectType(table, alloc, b, assoc.ty);
         },
         .impl_ => |impl_body| {
-            try collectType(table, alloc, impl_body.self_ty);
+            try collectType(table, alloc, b, impl_body.self_ty);
             if (impl_body.generics) |generics| {
                 for (generics.params) |param| {
                     switch (param) {
-                        .const_ => |constant| try collectType(table, alloc, constant.ty),
+                        .const_ => |constant| try collectType(table, alloc, b, constant.ty),
                         else => {},
                     }
                 }
             }
         },
-        .const_ => |constant| try collectType(table, alloc, constant.ty),
+        .const_ => |constant| try collectType(table, alloc, b, constant.ty),
         .fn_ => |function| {
-            for (function.params) |param| try collectType(table, alloc, param.ty);
-            try collectType(table, alloc, function.ret);
+            for (function.params) |param| try collectType(table, alloc, b, param.ty);
+            try collectType(table, alloc, b, function.ret);
         },
         .struct_ => |structure| {
-            for (structure.fields) |field| try collectType(table, alloc, field.ty);
+            for (structure.fields) |field| try collectType(table, alloc, b, field.ty);
             for (structure.methods) |method| {
-                for (method.params) |param| try collectType(table, alloc, param.ty);
-                try collectType(table, alloc, method.ret);
+                for (method.params) |param| try collectType(table, alloc, b, param.ty);
+                try collectType(table, alloc, b, method.ret);
             }
         },
         .enum_ => |enumeration| {
             for (enumeration.variants) |variant| {
                 switch (variant.fields) {
                     .none => {},
-                    .tuple => |fields| for (fields) |field| try collectType(table, alloc, field),
-                    .named => |fields| for (fields) |field| try collectType(table, alloc, field.ty),
+                    .tuple => |fields| for (fields) |field| try collectType(table, alloc, b, field),
+                    .named => |fields| for (fields) |field| try collectType(table, alloc, b, field.ty),
                 }
             }
         },
-        .type_alias => |alias| try collectType(table, alloc, alias.target),
+        .type_alias => |alias| try collectType(table, alloc, b, alias.target),
     }
 }
 
@@ -890,7 +976,7 @@ fn collectBodyKind(
     v: *Visited,
     kind: bodies.BodyKind,
 ) std.mem.Allocator.Error!void {
-    try collectSignatureKind(table, alloc, kind);
+    try collectSignatureKind(table, alloc, b, kind);
     switch (kind) {
         .none, .enum_, .trait_, .impl_, .type_alias => {},
         .struct_ => {},
@@ -909,13 +995,22 @@ fn collectItemTypes(
 ) std.mem.Allocator.Error!void {
     for (g.symbol_table.entities.items) |entity| {
         if (entity.id < b.bodies.len) {
-            try collectSignatureKind(table, alloc, b.bodies[entity.id]);
+            try collectSignatureKind(table, alloc, b, b.bodies[entity.id]);
         }
     }
 }
 
 /// Main entry: build a deduplicated instantiation table from all bodies and
 /// crate-graph item signatures reachable from `g` / `b`.
+///
+/// Two questions are kept apart here. `concreteArgs` asks whether an argument
+/// list is finished — every argument resolved to something the target can name
+/// — and `admitsInstantiation` asks whether the DECLARATION named has an
+/// instantiation of that size to be. Both must hold before a row is minted,
+/// and neither is the other's answer: `Wrapper<T>` in a signature is
+/// unfinished, `SipHasher24` at `[Sip24Rounds]` is finished but names no
+/// instantiation. `mergeInferred` brings in rows the inference pass already
+/// asked both of.
 pub fn collectInstantiations(
     alloc: std.mem.Allocator,
     g: *const graph.CrateGraph,

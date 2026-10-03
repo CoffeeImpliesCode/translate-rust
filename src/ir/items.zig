@@ -7,6 +7,7 @@
 //!
 //! Dependency graph: items → types → spine.
 
+const std = @import("std");
 const spine = @import("spine.zig");
 const types = @import("types.zig");
 
@@ -42,7 +43,7 @@ pub const ItemKind = union(enum) {
 pub const Struct = struct {
     name: []const u8,
     generics: ?types.Generics,
-    layout: struct_kind,
+    layout: StructKind,
     fields: []const Field,
 };
 
@@ -51,18 +52,23 @@ pub const Field = struct {
     ty: types.Type,
     visibility: spine.Visibility,
     span: spine.Span,
+    /// Authored doc text for this field, or `""` when the source carried
+    /// none. A source field has no `spine.Entity` of its own, so the text
+    /// rides on the record instead of on an attribute list. The empty default
+    /// is a static slice; only a decoded field owns its storage.
+    documentation: []const u8 = "",
 };
 
-pub const struct_kind = enum { named, tuple, unit };
+pub const StructKind = enum { named, tuple, unit };
 
 // §1.2 — Enum ---------------------------------------------------------------
 
 pub const Enum = struct {
     name: []const u8,
     generics: ?types.Generics,
-    kind: enum_kind,
+    kind: EnumKind,
     variants: []const Variant,
-    repr_int: ?int_repr,
+    repr_int: ?IntRepr,
     non_exhaustive: bool,
 };
 
@@ -70,6 +76,9 @@ pub const Variant = struct {
     name: []const u8,
     fields: VariantFields,
     discriminant: ?i128,
+    /// Authored doc text for this variant tag, or `""` when the source
+    /// carried none. Owned and defaulted exactly like `Field.documentation`.
+    documentation: []const u8 = "",
 };
 
 pub const VariantFields = union(enum) {
@@ -78,20 +87,20 @@ pub const VariantFields = union(enum) {
     named: []const Field,
 };
 
-pub const enum_kind = enum { c_like, data, mixed };
+pub const EnumKind = enum { c_like, data, mixed };
 
-pub const int_repr = enum { i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, isize, usize };
+pub const IntRepr = enum { i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, isize, usize };
 
 // §1.3 — Union --------------------------------------------------------------
 
 pub const Union = struct {
     name: []const u8,
     generics: ?types.Generics,
-    repr: union_repr,
+    repr: UnionRepr,
     fields: []const Field,
 };
 
-pub const union_repr = enum { extern_, @"packed", untagged };
+pub const UnionRepr = enum { extern_, @"packed", untagged };
 
 // §1.4 — Function -----------------------------------------------------------
 
@@ -195,6 +204,46 @@ pub const TraitMethod = struct {
     sig: Fn,
     default_body: ?BodyRef,
 };
+
+// §1.10 — Agreement with the bodies table -------------------------------------
+//
+// The bodies table (`bodies.BodyKind`, indexed by `spine.EntityId`) redescribes
+// what the item layer declares: its `struct_` row carries the struct's layout
+// and fields, and its `fn_` row carries the function's declared parameters.
+// Those rows already reuse this file's own records (`StructKind`, `Field`,
+// `Param`) rather than a second, drifting copy — see the identity test below.
+// What is still left to the producer is the *values*: an `items.Struct` that
+// says `.tuple` while the body row says `.named`, or an `items.Fn` whose
+// parameter list names a binding the body row omits, would lower the same
+// declaration two incompatible ways.
+//
+// These two predicates are the one place that answers "do the two lists
+// agree" so every reader that needs the question asks it the same way. They
+// compare every declared shape — name, type, and order — and nothing else:
+// spans, visibilities, and documentation locate or decorate the declaration
+// but do not change its shape.
+
+/// Whether two struct field lists declare the same layout: same count, and
+/// the same name and type at every position, by the IR's own type equality.
+pub fn fieldsAgree(a: []const Field, b: []const Field) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name)) return false;
+        if (!types.deepEqual(left.ty, right.ty)) return false;
+    }
+    return true;
+}
+
+/// Whether two parameter lists declare the same signature: same count, and
+/// the same name and type at every position, by the IR's own type equality.
+pub fn paramsAgree(a: []const Param, b: []const Param) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name)) return false;
+        if (!types.deepEqual(left.ty, right.ty)) return false;
+    }
+    return true;
+}
 
 // =============================================================================
 // Tests — instantiate shapes to prove every union arm and struct compiles.
@@ -635,4 +684,130 @@ test "types — Prim covers all 18 primitive variants" {
     _ = p_char;
     _ = p_unit;
     _ = p_never;
+}
+
+// A source-owned Rust declaration is the single input the item row and the
+// body row both project: `Point(f32, f32)` declares a tuple layout with two
+// `f32` fields, and `fn scale(&self, factor: f32)` declares two parameters.
+// The projections carry different decorations — visibilities, spans, doc
+// text, generic records — but the layout and the parameter list must survive
+// identical, which is what this test compares field by field.
+test "items — one source reaches both tables with the same layout and parameters" {
+    // `bodies.zig` is read inside the test only, so the module keeps its
+    // `items → types → spine` shape for every other consumer: nothing in the
+    // item layer names a body row outside this agreement check.
+    const bodies = @import("bodies.zig");
+    const span: spine.Span = .{ .start_line = 4, .start_col = 1, .end_line = 9, .end_col = 1 };
+
+    // The bodies table cannot even spell a second layout enum or parameter
+    // record: its struct row reuses this file's `StructKind`, `Field`, and
+    // `Param` verbatim, so a structural drift between the two declarations
+    // is a compile error rather than a runtime surprise. The receiver is the
+    // same story on the row that can carry one at all: `fn scale(&self, ..)`
+    // is a `StructMethod`, while `FnBody` is a free function's body and has
+    // no `self` for a receiver to name.
+    try std.testing.expect(@FieldType(bodies.StructBody, "layout") == StructKind);
+    try std.testing.expect(@FieldType(bodies.StructBody, "fields") == []const Field);
+    try std.testing.expect(@FieldType(bodies.FnBody, "params") == []const Param);
+    try std.testing.expect(@FieldType(bodies.FnBody, "ret") == types.Type);
+    try std.testing.expect(@FieldType(bodies.StructMethod, "receiver") == ?Receiver);
+
+    // One tuple struct: `struct Point(f32, f32);`
+    const item_fields = [_]Field{
+        .{ .name = "0", .ty = .{ .prim = .f32 }, .visibility = .private, .span = span },
+        .{ .name = "1", .ty = .{ .prim = .f32 }, .visibility = .private, .span = span },
+    };
+    const item_struct: Struct = .{
+        .name = "Point",
+        .generics = null,
+        .layout = .tuple,
+        .fields = &item_fields,
+    };
+    // The body row projects the same declaration: same layout, same field
+    // names in the same order, same types. Its generic params record the
+    // monomorphized names the body table tracks; the decorations (doc text,
+    // per-field spans) may differ without changing the shape.
+    var body_field_two = item_fields[1];
+    body_field_two.documentation = "the y ordinate";
+    const body_fields = [_]Field{ item_fields[0], body_field_two };
+    const body_struct: bodies.StructBody = .{
+        .generic_params = &.{},
+        .trait_bounds = &.{},
+        .layout = .tuple,
+        .fields = &body_fields,
+        .methods = &.{},
+        .has_dynamic_resources = false,
+    };
+    try std.testing.expect(item_struct.layout == body_struct.layout);
+    try std.testing.expectEqual(item_struct.fields.len, body_struct.fields.len);
+    try std.testing.expect(fieldsAgree(item_struct.fields, body_struct.fields));
+
+    // Layout is load-bearing: a body row left on its `.named` default while
+    // the item row says `.tuple` fails the layout check first, before any
+    // field is read. The check is not vacuous — without it a backend that
+    // reads the body row would emit `struct { ... }` for a tuple struct.
+    const defaulted_struct = bodies.StructBody{ .fields = &body_fields };
+    try std.testing.expect(defaulted_struct.layout != item_struct.layout);
+
+    // One method: `fn scale(&self, factor: f32) -> f32`
+    const item_params = [_]Param{
+        .{ .name = "self", .ty = .{ .prim = .f32 }, .span = span },
+        .{ .name = "factor", .ty = .{ .prim = .f32 }, .span = span },
+    };
+    const item_fn: Fn = .{
+        .name = "scale",
+        .generics = null,
+        .params = &item_params,
+        .ret = .{ .prim = .f32 },
+        .is_async = false,
+        .is_unsafe = false,
+        .is_const_fn = false,
+        .receiver = .ref_,
+        .body = null,
+    };
+    const body_fn: bodies.StructMethod = .{
+        .name = "scale",
+        .params = &item_params,
+        .ret = .{ .prim = .f32 },
+        .generic_params = &.{},
+        .generics = null,
+        .body = 0,
+        .receiver = .ref_,
+        .is_allocating = false,
+    };
+    try std.testing.expect(paramsAgree(item_fn.params, body_fn.params));
+    // The receiver survives the projection with the same sensitivity as a
+    // parameter: an item row that says `&self` over a body row that says no
+    // receiver is a signature the call sites and the callee disagree about.
+    try std.testing.expect(body_fn.receiver == item_fn.receiver);
+    var no_receiver = body_fn;
+    no_receiver.receiver = null;
+    try std.testing.expect(no_receiver.receiver != item_fn.receiver);
+
+    // Sensitivity, each direction. A parameter the item row names and the
+    // body row drops — or names differently, or in the opposite order — is
+    // a signature the call sites and the callee disagree about, so every one
+    // of them fails the check.
+    const dropped = [_]Param{item_params[0]};
+    try std.testing.expect(!paramsAgree(item_fn.params, &dropped));
+    var renamed = item_params;
+    renamed[1].name = "amount";
+    try std.testing.expect(!paramsAgree(item_fn.params, &renamed));
+    const reordered = [_]Param{ item_params[1], item_params[0] };
+    try std.testing.expect(!paramsAgree(item_fn.params, &reordered));
+    var widened = item_params;
+    widened[1].ty = .{ .prim = .f64 };
+    try std.testing.expect(!paramsAgree(item_fn.params, &widened));
+
+    // The same discipline for fields: a renamed field, a dropped field, or
+    // a field whose type the body row widens all fail, so a passing check
+    // keeps both tables on the same layout.
+    const short_fields = [_]Field{item_fields[0]};
+    try std.testing.expect(!fieldsAgree(item_struct.fields, &short_fields));
+    var renamed_field = item_fields;
+    renamed_field[0].name = "x";
+    try std.testing.expect(!fieldsAgree(item_struct.fields, &renamed_field));
+    var widened_field = item_fields;
+    widened_field[0].ty = .{ .prim = .f64 };
+    try std.testing.expect(!fieldsAgree(item_struct.fields, &widened_field));
 }

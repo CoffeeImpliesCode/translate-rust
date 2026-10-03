@@ -1,11 +1,20 @@
 //! translate_rust.backend.zig.package — package writer and promotion boundary.
 //! Renders an `ast.Package` to a complete standalone Zig package directory:
-//! build.zig, build.zig.zon, and every `pkg.files[i]` source file. Promotion
-//! stages all output, validates and tests it, then publishes it atomically.
+//! build.zig, build.zig.zon, every `pkg.files[i]` source file, and — for a
+//! package whose sources import the Rust-core runtime — the whole `r2z-core`
+//! package vendored under `r2z-core/`. Promotion stages all output, validates
+//! and tests it, then publishes it atomically.
 
 const std = @import("std");
 const ast = @import("ast.zig");
 const emit = @import("emit.zig");
+const runtime_assets = @import("r2z_core_assets");
+
+/// The compiler running this build, resolved once by build.zig. Promotion
+/// builds and tests the generated package with it, so the gate is reproducible
+/// and never depends on a `zig` that PATH happens to name: the anyzig shim
+/// fails silently outside a checkout that pins a version.
+const zig_executable = @import("toolchain").zig_executable;
 
 // ---------------------------------------------------------------------------
 // Package name helpers
@@ -16,34 +25,75 @@ fn packageIdName(pkg: *const ast.Package) []const u8 {
     return pkg.name;
 }
 
+// ── The vendored runtime ───────────────────────────────────────────────
+
+/// The module a lowered package imports to reach the Rust-core runtime.
+const runtime_module_name = "r2z";
+
+/// The dependency name and vendored directory of that runtime. One string
+/// serves both, because in Zig the dependency's `.path` *is* the directory it
+/// resolves to.
+const runtime_directory = runtime_assets.directory;
+const runtime_dependency_name = runtime_assets.directory;
+
 fn dependencyModuleName(dep_name: []const u8) []const u8 {
-    return if (std.mem.eql(u8, dep_name, "r2z-core")) "r2z" else dep_name;
+    return if (std.mem.eql(u8, dep_name, runtime_dependency_name))
+        runtime_module_name
+    else
+        dep_name;
 }
+
+/// Whether the writer, rather than the caller, supplies the runtime: no
+/// declared dependency already claims the name, and some source file imports
+/// `r2z`.
+///
+/// A caller that declares the dependency itself keeps whatever path it
+/// declared. Resolving that path, or overwriting it, would be the writer
+/// rewriting a decision the caller already made.
+fn needsVendoredRuntime(pkg: *const ast.Package) bool {
+    for (pkg.zon_deps) |dep| {
+        if (std.mem.eql(u8, dep.name, runtime_dependency_name)) return false;
+    }
+    for (pkg.files) |file| {
+        for (file.imports) |import| {
+            if (std.mem.eql(u8, import.module_or_path, runtime_module_name)) return true;
+        }
+    }
+    return false;
+}
+
+/// The package plus what the writer added to it. `vendored_runtime` is the one
+/// fact manifest emission needs and the package itself can no longer answer:
+/// once the dependency is appended, the augmented package declares a runtime
+/// it does not ship.
+///
+/// `appendRuntimeDependency` allocates its dependency slice from the caller's
+/// allocator, so that allocator owns everything reachable from `pkg`.
+const RuntimeWiring = struct {
+    pkg: ast.Package,
+    vendored_runtime: bool,
+};
 
 fn appendRuntimeDependency(
     allocator: std.mem.Allocator,
     pkg: *const ast.Package,
-) !struct { pkg: ast.Package, deps: []const ast.ZonDep } {
-    for (pkg.zon_deps) |dep| {
-        if (std.mem.eql(u8, dep.name, "r2z-core")) {
-            return .{ .pkg = pkg.*, .deps = &.{} };
-        }
+) !RuntimeWiring {
+    if (!needsVendoredRuntime(pkg)) {
+        return .{ .pkg = pkg.*, .vendored_runtime = false };
     }
-    for (pkg.files) |file| {
-        for (file.imports) |import| {
-            if (std.mem.eql(u8, import.module_or_path, "r2z")) break;
-        } else continue;
-        break;
-    } else return .{ .pkg = pkg.*, .deps = &.{} };
     const deps = try allocator.alloc(ast.ZonDep, pkg.zon_deps.len + 1);
     @memcpy(deps[0..pkg.zon_deps.len], pkg.zon_deps);
+    // The runtime ships inside the package, so the path is the one directory
+    // name that is always there. Resolving a checkout at write time made the
+    // manifest name an absolute path *outside* the package, which is why a
+    // copied generated directory could not find it.
     deps[pkg.zon_deps.len] = .{
-        .name = "r2z-core",
-        .path = "@workspace:r2z-core",
+        .name = runtime_dependency_name,
+        .path = runtime_directory,
     };
     var result = pkg.*;
     result.zon_deps = deps;
-    return .{ .pkg = result, .deps = deps };
+    return .{ .pkg = result, .vendored_runtime = true };
 }
 
 /// Sanitize a package name into a valid Zig identifier for build.zig.zon
@@ -159,6 +209,18 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
             \\        .linkage = .static,
             \\    }});
             \\    b.installArtifact(lib);
+            \\    //
+            \\    // The promotion gate drives this package through two invocations
+            \\    // per optimize mode: `check` compiles it and `test` runs it.
+            \\    // Depending on the artifacts' own compile steps is what makes
+            \\    // the first one a build-only gate, so a non-zero exit from the
+            \\    // second is known to be a runtime failure rather than a source
+            \\    // that never compiled. Without this step the two are one
+            \\    // invocation, and a package that only compiles is a package
+            \\    // nobody has run.
+            \\    const check_step = b.step("check", "Compile the package and its tests without running them");
+            \\    check_step.dependOn(&lib.step);
+            \\    check_step.dependOn(&tests.step);
             \\}}
             \\
         ,
@@ -175,8 +237,14 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
         defer allocator.free(dep_id);
         const binding = try std.fmt.allocPrint(allocator, "dep_{s}", .{dep_id});
         defer allocator.free(binding);
+        // Every dependency is a Zig package that may build for a target and
+        // an optimize mode of its own. Without these, a dependency keeps the
+        // defaults its own `standardTargetOptions`/`standardOptimizeOption`
+        // produce: the vendored runtime stayed Debug in a ReleaseFast consumer
+        // and stayed native in a cross-compiled one, so what a consumer
+        // compiled was not what it ran.
         try appendFmt(
-            "    const {s} = b.dependency(\"{s}\", .{{}});\n",
+            "    const {s} = b.dependency(\"{s}\", .{{ .target = target, .optimize = optimize }});\n",
             allocator,
             &bindings,
             .{ binding, dep_id },
@@ -228,6 +296,18 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
         \\        .linkage = .static,
         \\    }});
         \\    b.installArtifact(lib);
+        \\    //
+        \\    // The promotion gate drives this package through two invocations
+        \\    // per optimize mode: `check` compiles it and `test` runs it.
+        \\    // Depending on the artifacts' own compile steps is what makes
+        \\    // the first one a build-only gate, so a non-zero exit from the
+        \\    // second is known to be a runtime failure rather than a source
+        \\    // that never compiled. Without this step the two are one
+        \\    // invocation, and a package that only compiles is a package
+        \\    // nobody has run.
+        \\    const check_step = b.step("check", "Compile the package and its tests without running them");
+        \\    check_step.dependOn(&lib.step);
+        \\    check_step.dependOn(&tests.step);
         \\}}
         \\
     ,
@@ -240,117 +320,16 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
     );
 }
 
-/// Find the workspace `r2z-core` checkout by walking `anchor` and its parents.
+/// Render `wiring.pkg` as a `build.zig.zon`.
 ///
-/// `@src().file` cannot drive this walk. The compiler spells it relative to
-/// the directory it was invoked in, which is this module's root, not the
-/// process working directory or the executable: joining a runtime anchor to
-/// that relative path lands in a different tree, and the three-level climb
-/// that repairs an absolute path then overshoots by one. The anchor is the
-/// only runtime fact available here, so the search looks for `r2z-core`
-/// itself at each level instead.
-fn tryWorkspaceCoreFromAnchor(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    anchor: []const u8,
-) !?[:0]u8 {
-    var cursor = try allocator.dupe(u8, anchor);
-    defer allocator.free(cursor);
-    const cwd = std.Io.Dir.cwd();
-    while (true) {
-        const core_path = std.fs.path.resolvePosix(
-            allocator,
-            &.{ cursor, "r2z-core" },
-        ) catch return error.DependencySourceUnavailable;
-        if (std.Io.Dir.accessAbsolute(io, core_path, .{})) |_| {
-            const result = cwd.realPathFileAlloc(io, core_path, allocator) catch {
-                allocator.free(core_path);
-                return error.DependencySourceUnavailable;
-            };
-            allocator.free(core_path);
-            return result;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => {
-                allocator.free(core_path);
-                return err;
-            },
-        }
-        allocator.free(core_path);
-
-        const parent = std.fs.path.dirname(cursor) orelse break;
-        if (std.mem.eql(u8, parent, cursor)) break;
-        const next = try allocator.dupe(u8, parent);
-        allocator.free(cursor);
-        cursor = next;
-    }
-    return null;
-}
-
-fn workspaceCoreAbsolute(allocator: std.mem.Allocator, io: std.Io) ![:0]u8 {
-    const source_file = @src().file;
-    if (std.fs.path.isAbsolute(source_file)) {
-        const package_dir = std.fs.path.dirname(source_file) orelse
-            return error.DependencySourceUnavailable;
-        const core_path = try std.fs.path.resolvePosix(
-            allocator,
-            &.{ package_dir, "../../..", "r2z-core" },
-        );
-        defer allocator.free(core_path);
-        return std.Io.Dir.realPathFileAbsoluteAlloc(io, core_path, allocator) catch
-            error.DependencySourceUnavailable;
-    }
-
-    const cwd_anchor = std.process.currentPathAlloc(io, allocator) catch
-        return error.DependencySourceUnavailable;
-    defer allocator.free(cwd_anchor);
-    if (try tryWorkspaceCoreFromAnchor(allocator, io, cwd_anchor)) |path| {
-        return path;
-    }
-
-    const exe_anchor = std.process.executableDirPathAlloc(io, allocator) catch
-        return error.DependencySourceUnavailable;
-    defer allocator.free(exe_anchor);
-    if (try tryWorkspaceCoreFromAnchor(allocator, io, exe_anchor)) |path| {
-        return path;
-    }
-    return error.DependencySourceUnavailable;
-}
-
-fn absolutePathAllowMissing(
-    allocator: std.mem.Allocator,
-    cwd_path: []const u8,
-    path: []const u8,
-) ![]const u8 {
-    if (std.fs.path.isAbsolute(path)) {
-        return std.fs.path.resolvePosix(allocator, &.{path});
-    }
-    return std.fs.path.resolvePosix(allocator, &.{ cwd_path, path });
-}
-
-fn resolveDependencyPath(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cwd_path: []const u8,
-    out_dir: []const u8,
-    path: []const u8,
-) ![]const u8 {
-    if (std.mem.eql(u8, path, "@workspace:r2z-core")) {
-        const core_absolute = try workspaceCoreAbsolute(allocator, io);
-        defer allocator.free(core_absolute);
-        const out_absolute = try absolutePathAllowMissing(allocator, cwd_path, out_dir);
-        defer allocator.free(out_absolute);
-        return std.fs.path.relativePosix(allocator, cwd_path, out_absolute, core_absolute);
-    }
-    return allocator.dupe(u8, path);
-}
-
+/// `wiring` rather than the bare package: `.paths` has to list the vendored
+/// runtime, and only `wiring` can still tell a runtime this package *ships*
+/// from one it merely declares a dependency on.
 fn generateBuildZigZon(
     allocator: std.mem.Allocator,
-    io: std.Io,
-    pkg: *const ast.Package,
-    out_dir: []const u8,
+    wiring: RuntimeWiring,
 ) ![]const u8 {
+    const pkg = &wiring.pkg;
     try validatePackageShape(pkg);
     const zon_name = try zonPackageName(allocator, packageIdName(pkg));
     defer allocator.free(zon_name);
@@ -394,10 +373,6 @@ fn generateBuildZigZon(
         );
     }
 
-    const cwd_path = std.process.currentPathAlloc(io, allocator) catch
-        return error.DependencySourceUnavailable;
-    defer allocator.free(cwd_path);
-
     // Manifest with declared dependencies.
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -425,16 +400,13 @@ fn generateBuildZigZon(
         try buf.appendSlice(allocator, dep_id);
         try buf.appendSlice(allocator, " = .{ ");
         if (dep.path) |path| {
-            const resolved_path = try resolveDependencyPath(
-                allocator,
-                io,
-                cwd_path,
-                out_dir,
-                path,
-            );
-            defer allocator.free(resolved_path);
+            // The path a caller declared is the path they meant. The writer
+            // resolves nothing here and rewrites nothing here: the runtime it
+            // supplies is already vendored inside the package under exactly
+            // the name it declares, so a generated package has no dependency
+            // that reaches outside itself.
             try buf.appendSlice(allocator, ".path = \"");
-            try buf.appendSlice(allocator, resolved_path);
+            try buf.appendSlice(allocator, path);
             try buf.appendSlice(allocator, "\"");
         } else {
             try buf.appendSlice(allocator, ".url = \"");
@@ -450,6 +422,14 @@ fn generateBuildZigZon(
     try buf.appendSlice(allocator, "        \"build.zig\",\n");
     try buf.appendSlice(allocator, "        \"build.zig.zon\",\n");
     try buf.appendSlice(allocator, "        \"src\",\n");
+    if (wiring.vendored_runtime) {
+        // Listing a directory that is not shipped would let the package cache
+        // drop it; omitting one that is would make the package it is fetched
+        // as unable to resolve its own runtime dependency.
+        try buf.appendSlice(allocator, "        \"");
+        try buf.appendSlice(allocator, runtime_directory);
+        try buf.appendSlice(allocator, "\",\n");
+    }
     try buf.appendSlice(allocator, "    },\n");
     try buf.appendSlice(allocator, "}\n");
 
@@ -461,7 +441,11 @@ fn generateBuildZigZon(
 // ---------------------------------------------------------------------------
 
 /// Write an `ast.Package` to a staging directory: build.zig, build.zig.zon,
-/// and every `pkg.files[i]` rendered via `emit.emitFile`.
+/// every `pkg.files[i]` rendered via `emit.emitFile`, and the vendored runtime
+/// when the package uses one.
+///
+/// Everything lands before the caller verifies anything, so a staged package
+/// is complete or the promotion fails.
 fn writeToDisk(io: std.Io, pkg: *const ast.Package, staging_dir: []const u8) !void {
     try validatePackageShape(pkg);
 
@@ -472,21 +456,40 @@ fn writeToDisk(io: std.Io, pkg: *const ast.Package, staging_dir: []const u8) !vo
     var dir = std.Io.Dir.cwd();
     try dir.createDirPath(io, staging_dir);
 
-    const with_runtime = try appendRuntimeDependency(allocator, pkg);
-    defer if (with_runtime.deps.len > 0) allocator.free(with_runtime.deps);
+    const wiring = try appendRuntimeDependency(allocator, pkg);
 
     // 1. build.zig
-    const build_zig = try generateBuildZig(allocator, &with_runtime.pkg);
+    const build_zig = try generateBuildZig(allocator, &wiring.pkg);
     try writeFile(allocator, io, staging_dir, "build.zig", build_zig);
 
     // 2. build.zig.zon
-    const build_zig_zon = try generateBuildZigZon(allocator, io, &with_runtime.pkg, staging_dir);
+    const build_zig_zon = try generateBuildZigZon(allocator, wiring);
     try writeFile(allocator, io, staging_dir, "build.zig.zon", build_zig_zon);
 
     // 3. Source files
     for (pkg.files) |file| {
         const content = try emit.emitFile(allocator, &file);
         try writeFile(allocator, io, staging_dir, file.path, content);
+    }
+
+    // 4. The vendored runtime, straight out of the translator's image. Each
+    // asset is one write of bytes that are already in memory: no parse, no
+    // staged copy, no per-file scratch beyond the joined path.
+    if (wiring.vendored_runtime) {
+        try writeVendoredRuntime(allocator, io, staging_dir);
+    }
+}
+
+fn writeVendoredRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    staging_dir: []const u8,
+) !void {
+    if (runtime_assets.license) |license| {
+        try writeFile(allocator, io, staging_dir, license.path, license.contents);
+    }
+    for (runtime_assets.files) |file| {
+        try writeFile(allocator, io, staging_dir, file.path, file.contents);
     }
 }
 
@@ -521,16 +524,39 @@ const promotion_attempt_limit = 16;
 
 pub const PromotionError = error{
     GeneratedPackageBuildFailed,
+    GeneratedPackageRunFailed,
     InvalidOutputDirectory,
     InvalidGeneratedManifest,
     InvalidGeneratedSource,
     StagingPathExhausted,
+    StagingCleanupFailed,
+};
+
+/// Which half of the promotion gate a result came from.
+///
+/// The gate drives the staged package through two invocations per optimize
+/// mode: one that compiles it and one that runs it. `zig build test` alone
+/// cannot tell the two apart — it compiles and runs in one process, so a
+/// source that never compiled and a test that aborted at runtime both arrive
+/// as the same non-zero exit. Those are different defects: the first is in
+/// what the emitter wrote, the second is in what the emitted code does, and
+/// a caller that has to choose between them cannot while both arrive as
+/// `GeneratedPackageBuildFailed`.
+pub const GatePhase = enum {
+    /// The package, its test artifact included, was compiled and not run.
+    compile,
+    /// The package compiled, and the test binary then failed to run clean.
+    run,
 };
 
 pub const BuildTestResult = struct {
     term: std.process.Child.Term,
     stdout: []const u8,
     stderr: []const u8,
+    /// The gate phase this result came from. `compile` is the default so a
+    /// hook that reports only a process outcome is read as the failure it
+    /// always was before the gate had phases.
+    phase: GatePhase = .compile,
 };
 
 pub const FillPromotionNonce = *const fn (
@@ -554,8 +580,10 @@ pub const ResolveFingerprint = *const fn (
     result: *const BuildTestResult,
 ) anyerror!?u64;
 
-/// Sink for the output of a staged build that did not pass. Split out of
-/// `promoteWithHooks` so a test can read the diagnostics a user sees.
+/// Sink for the output of a staged gate run that did not pass. Split out of
+/// `promoteWithHooks` so a test can read the diagnostics a user sees. The
+/// result carries the phase that failed, which is what lets the message say
+/// "build" or "run" instead of one word for both.
 pub const ReportBuildFailure = *const fn (
     context: ?*anyopaque,
     result: *const BuildTestResult,
@@ -568,6 +596,16 @@ pub const PromotionHooks = struct {
     resolve_fingerprint: ResolveFingerprint = resolveFingerprint,
     report_build_failure: ReportBuildFailure = printBuildFailure,
 };
+
+/// The error a gate failure raises. A package that never compiled and a package
+/// that compiled and then aborted are different facts about the translator,
+/// so they are different errors.
+fn gateFailure(phase: GatePhase) anyerror {
+    return switch (phase) {
+        .compile => error.GeneratedPackageBuildFailed,
+        .run => error.GeneratedPackageRunFailed,
+    };
+}
 
 /// Return a unique sibling path for the package staging directory.
 fn stagingPath(
@@ -692,6 +730,18 @@ fn validateStagedPackage(
     for (pkg.files) |file| {
         try validateStagedFile(allocator, io, staging_dir, file.path);
     }
+    // A vendored runtime is as load-bearing as a translated source file: the
+    // package cannot resolve its own dependency without it. The question is
+    // asked of `pkg`, the package the writer was handed, because the staged
+    // manifest now declares the dependency whether or not the writer added it.
+    if (needsVendoredRuntime(pkg)) {
+        if (runtime_assets.license) |license| {
+            try validateStagedFile(allocator, io, staging_dir, license.path);
+        }
+        for (runtime_assets.files) |file| {
+            try validateStagedFile(allocator, io, staging_dir, file.path);
+        }
+    }
 
     const zon_path = try std.fs.path.join(allocator, &.{ staging_dir, "build.zig.zon" });
     defer allocator.free(zon_path);
@@ -718,27 +768,47 @@ const promotion_optimize_flags = [_][]const u8{
     "-Doptimize=ReleaseSafe",
 };
 
+/// The build-system step each gate phase runs. `check` compiles the staged
+/// package and its test artifact; `test` does the same and then runs the
+/// artifact. Both are emitted by `generateBuildZig`.
+const gate_phases = [_]GatePhase{ .compile, .run };
+
+fn gateStepName(phase: GatePhase) []const u8 {
+    return switch (phase) {
+        .compile => "check",
+        .run => "test",
+    };
+}
+
 const RunGateMode = *const fn (
     allocator: std.mem.Allocator,
     context: ?*anyopaque,
+    phase: GatePhase,
     flag: []const u8,
 ) anyerror!BuildTestResult;
 
-/// Compile the staged package once per optimize mode. The first failure is
-/// returned unchanged: a second run would repeat the same manifest
-/// fingerprint hint, and `resolveFingerprint` rejects a hint it sees twice.
+/// Compile and run the staged package once per optimize mode. Every mode gets
+/// both phases, so a package that compiles is also run before it is published.
+/// The first failure is returned unchanged apart from the phase it came from: a
+/// second run would repeat the same manifest fingerprint hint, and
+/// `resolveFingerprint` rejects a hint it sees twice.
 fn runGateOptimizeModes(
     allocator: std.mem.Allocator,
     run_mode: RunGateMode,
     context: ?*anyopaque,
 ) anyerror!BuildTestResult {
     for (promotion_optimize_flags) |flag| {
-        const result = try run_mode(allocator, context, flag);
-        if (result.term == .exited and result.term.exited == 0) {
-            releaseBuildTestResult(allocator, result);
-            continue;
+        for (gate_phases) |phase| {
+            var result = try run_mode(allocator, context, phase, flag);
+            if (result.term == .exited and result.term.exited == 0) {
+                releaseBuildTestResult(allocator, result);
+                continue;
+            }
+            // The phase is a property of which invocation failed, not of what
+            // the runner chooses to report, so the loop stamps it.
+            result.phase = phase;
+            return result;
         }
-        return result;
     }
     return .{ .term = .{ .exited = 0 }, .stdout = "", .stderr = "" };
 }
@@ -751,17 +821,19 @@ const GeneratedGateContext = struct {
 fn runGeneratedGateMode(
     allocator: std.mem.Allocator,
     opaque_context: ?*anyopaque,
+    phase: GatePhase,
     flag: []const u8,
 ) anyerror!BuildTestResult {
     const context: *GeneratedGateContext = @ptrCast(@alignCast(opaque_context.?));
     const result = try std.process.run(allocator, context.io, .{
-        .argv = &.{ "zig", "build", "test", flag },
+        .argv = &.{ zig_executable, "build", gateStepName(phase), flag },
         .cwd = .{ .path = context.staging_dir },
     });
     return .{
         .term = result.term,
         .stdout = result.stdout,
         .stderr = result.stderr,
+        .phase = phase,
     };
 }
 
@@ -867,22 +939,28 @@ fn releaseBuildTestResult(allocator: std.mem.Allocator, result: BuildTestResult)
     allocator.free(result.stderr);
 }
 
-/// Report a staged build that did not pass. The compiler's own output is the
+/// Report a staged gate run that did not pass. The child's own output is the
 /// only diagnostic a promotion failure carries, and it is reported on every
 /// failing pass: the retry pass always did, the first pass dropped it, so a
 /// one-pass compile error surfaced as a bare error with no message at all.
+/// The phase decides the word, because a runtime abort and a source that does
+/// not compile are not the same failure to read about.
 fn printBuildFailure(_: ?*anyopaque, result: *const BuildTestResult) void {
+    const label = switch (result.phase) {
+        .compile => "generated package build failed",
+        .run => "generated package run failed",
+    };
     var reported = false;
     if (hasCapturedOutput(result.stdout)) {
-        std.debug.print("generated package build failed (stdout):\n{s}\n", .{result.stdout});
+        std.debug.print("{s} (stdout):\n{s}\n", .{ label, result.stdout });
         reported = true;
     }
     if (hasCapturedOutput(result.stderr)) {
-        std.debug.print("generated package build failed:\n{s}\n", .{result.stderr});
+        std.debug.print("{s}:\n{s}\n", .{ label, result.stderr });
         reported = true;
     }
     if (!reported) {
-        std.debug.print("generated package build failed: no compiler output captured\n", .{});
+        std.debug.print("{s}: no output captured\n", .{label});
     }
 }
 
@@ -891,13 +969,69 @@ fn hasCapturedOutput(bytes: []const u8) bool {
     return std.mem.trim(u8, bytes, " \t\r\n").len != 0;
 }
 
+/// Whether `candidate` is the staging directory this promotion created beside
+/// `out_dir`, and not a directory the caller owns.
+///
+/// `stagingPath` names that directory `.{basename}.staging.{32 hex digits}`
+/// inside `dirname(out_dir)`, so every directory this promotion creates matches
+/// this shape and nothing else beside `out_dir` does. `deleteTree` is
+/// recursive, so the check is the difference between removing this run's own
+/// scratch space and removing whatever the caller pointed at: `out_dir`
+/// itself, a sibling named by the caller, or a directory some other run owns.
+fn isStagingSiblingOf(out_dir: []const u8, candidate: []const u8) bool {
+    if (std.mem.eql(u8, out_dir, candidate)) return false;
+    const out_parent = std.fs.path.dirname(out_dir) orelse "";
+    const candidate_parent = std.fs.path.dirname(candidate) orelse "";
+    if (!std.mem.eql(u8, out_parent, candidate_parent)) return false;
+    var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const prefix = std.fmt.bufPrint(
+        &prefix_buf,
+        ".{s}.staging.",
+        .{std.fs.path.basename(out_dir)},
+    ) catch return false;
+    const name = std.fs.path.basename(candidate);
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const nonce_hex = name[prefix.len..];
+    if (nonce_hex.len != promotion_nonce_len * 2) return false;
+    for (nonce_hex) |character| {
+        // `stagingPath` writes the nonce with `bytesToHex(..., .lower)`, so an
+        // uppercase digit is in a name this promotion did not create.
+        // `isHex` accepts both cases, and a name that merely looks like this
+        // run's scratch space belongs to some other run or to the caller.
+        if (!std.ascii.isHex(character) or std.ascii.isUpper(character)) return false;
+    }
+    return true;
+}
+
+/// Remove the staging tree of a promotion that failed, and keep the failure.
+///
+/// A failed promotion must not leave a package directory behind, so the tree
+/// goes first. `deleteTree` was allowed to raise, which replaced the real
+/// diagnosis with a filesystem error and left the debris unnamed: the operator
+/// was told the staging directory could not be touched and nothing about the
+/// source that could not be compiled. Now the debris is named on stderr and
+/// the promotion's own error still reaches the caller.
 fn cleanupPromotion(
     io: std.Io,
+    out_dir: []const u8,
     staging_dir: []const u8,
     primary_error: anyerror,
 ) anyerror {
+    // Never hand a recursive delete a path this promotion did not create.
+    if (!isStagingSiblingOf(out_dir, staging_dir)) return primary_error;
     var dir = std.Io.Dir.cwd();
-    try dir.deleteTree(io, staging_dir);
+    // `deleteTree` already treats an absent path as the outcome this function
+    // exists to reach: `deleteTreeOpenInitialSubpath` answers null and the
+    // call returns success. So there is no "not found" arm to write — naming
+    // one would not compile, because `DeleteTreeError` has no such member, and
+    // every real failure below is one an operator has to hear about.
+    dir.deleteTree(io, staging_dir) catch |failure| {
+        std.debug.print(
+            "generated package promotion failed ({s}) and its staging directory {s} could not be removed ({s}); that directory holds an unpublished partial package, so remove it before promoting again\n",
+            .{ @errorName(primary_error), staging_dir, @errorName(failure) },
+        );
+        return error.StagingCleanupFailed;
+    };
     return primary_error;
 }
 
@@ -925,7 +1059,8 @@ pub fn promoteWithHooks(
     const staging_dir = try makeStagingDirectory(allocator, io, out_dir, hooks);
     defer allocator.free(staging_dir);
 
-    writeToDisk(io, pkg, staging_dir) catch |err| return cleanupPromotion(io, staging_dir, err);
+    writeToDisk(io, pkg, staging_dir) catch |err|
+        return cleanupPromotion(io, out_dir, staging_dir, err);
     validateStagedPackage(
         allocator,
         io,
@@ -933,10 +1068,10 @@ pub fn promoteWithHooks(
         staging_dir,
         pkg.fingerprint,
         false,
-    ) catch |err| return cleanupPromotion(io, staging_dir, err);
+    ) catch |err| return cleanupPromotion(io, out_dir, staging_dir, err);
 
     var build_result = hooks.run_build_test(allocator, io, hooks.context, staging_dir) catch |err|
-        return cleanupPromotion(io, staging_dir, err);
+        return cleanupPromotion(io, out_dir, staging_dir, err);
     var fingerprint_patched = false;
     var final_fingerprint = pkg.fingerprint;
     while (true) {
@@ -949,18 +1084,24 @@ pub fn promoteWithHooks(
                 releaseBuildTestResult(allocator, build_result);
                 return cleanupPromotion(
                     io,
+                    out_dir,
                     staging_dir,
-                    error.GeneratedPackageBuildFailed,
+                    gateFailure(build_result.phase),
                 );
             },
         }
-        if (fingerprint_patched) {
+        // A run failure is not a hint that the manifest is wrong. Patching and
+        // re-running would execute the same tests again and then report a
+        // build failure, which is the one thing this split exists to stop: the
+        // package compiled, and what it does at runtime is what failed.
+        if (build_result.phase == .run or fingerprint_patched) {
             hooks.report_build_failure(hooks.context, &build_result);
             releaseBuildTestResult(allocator, build_result);
             return cleanupPromotion(
                 io,
+                out_dir,
                 staging_dir,
-                error.GeneratedPackageBuildFailed,
+                gateFailure(build_result.phase),
             );
         }
 
@@ -973,12 +1114,12 @@ pub fn promoteWithHooks(
         ) catch |err| {
             hooks.report_build_failure(hooks.context, &build_result);
             releaseBuildTestResult(allocator, build_result);
-            return cleanupPromotion(io, staging_dir, err);
+            return cleanupPromotion(io, out_dir, staging_dir, err);
         };
         const resolved_fingerprint = fingerprint orelse {
             hooks.report_build_failure(hooks.context, &build_result);
             releaseBuildTestResult(allocator, build_result);
-            return cleanupPromotion(io, staging_dir, error.GeneratedPackageBuildFailed);
+            return cleanupPromotion(io, out_dir, staging_dir, error.GeneratedPackageBuildFailed);
         };
         releaseBuildTestResult(allocator, build_result);
         patchManifestFingerprint(
@@ -986,11 +1127,11 @@ pub fn promoteWithHooks(
             io,
             staging_dir,
             resolved_fingerprint,
-        ) catch |err| return cleanupPromotion(io, staging_dir, err);
+        ) catch |err| return cleanupPromotion(io, out_dir, staging_dir, err);
         final_fingerprint = resolved_fingerprint;
         fingerprint_patched = true;
         build_result = hooks.run_build_test(allocator, io, hooks.context, staging_dir) catch |err|
-            return cleanupPromotion(io, staging_dir, err);
+            return cleanupPromotion(io, out_dir, staging_dir, err);
     }
     releaseBuildTestResult(allocator, build_result);
     validateStagedPackage(
@@ -1000,10 +1141,10 @@ pub fn promoteWithHooks(
         staging_dir,
         final_fingerprint,
         true,
-    ) catch |err| return cleanupPromotion(io, staging_dir, err);
+    ) catch |err| return cleanupPromotion(io, out_dir, staging_dir, err);
 
     publishStagedPackage(io, staging_dir, out_dir) catch |err|
-        return cleanupPromotion(io, staging_dir, err);
+        return cleanupPromotion(io, out_dir, staging_dir, err);
 }
 
 /// Promote a generated package with the production build and fingerprint
@@ -1088,6 +1229,28 @@ fn buildTestPackage() ast.Package {
     };
 }
 
+/// A package whose root imports the `r2z` module, which is what makes the
+/// writer responsible for shipping the runtime. The declaration is incidental;
+/// it only keeps the fixture on the real code path, since a root that declares
+/// nothing is rejected before it is written.
+fn buildRuntimeTestPackage() ast.Package {
+    const marker_decl: ast.Decl = .{ .const_decl = .{
+        .name = "MARKER",
+        .init = ast.Expr{ .lit = .{ .int = 1 } },
+    } };
+    return .{
+        .name = "demo",
+        .files = &.{.{
+            .path = "src/root.zig",
+            .imports = &.{
+                .{ .local_name = "std", .module_or_path = "std" },
+                .{ .local_name = "r2z", .module_or_path = "r2z" },
+            },
+            .decls = &.{marker_decl},
+        }},
+    };
+}
+
 test "generateBuildZig: runs every translated test through the root module" {
     const allocator = std.testing.allocator;
     var pkg = buildTestPackage();
@@ -1153,67 +1316,6 @@ test "generateBuildZig: runs every translated test through the root module" {
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(u8, build_zig, "test_step.dependOn("),
-    );
-}
-
-test "generateBuildZig: selects the optimize mode explicitly, defaulting to ReleaseSafe" {
-    const allocator = std.testing.allocator;
-    const pkg = buildTestPackage();
-    const build_zig = try generateBuildZig(allocator, &pkg);
-    defer allocator.free(build_zig);
-
-    // `b.standardOptimizeOption(.{})` resolves to Debug unless the consumer
-    // passes -Doptimize, so a promoted package was only ever compiled in the
-    // one mode nobody ships. ReleaseSafe is the mode a consumer runs, and it
-    // keeps `std.debug.assert` guards live under the optimizer.
-    try std.testing.expect(std.mem.indexOf(u8, build_zig, "standardOptimizeOption") == null);
-    try std.testing.expect(
-        std.mem.indexOf(u8, build_zig, "std.builtin.OptimizeMode,") != null,
-    );
-    try std.testing.expect(
-        std.mem.indexOf(u8, build_zig, "\"optimize\",") != null,
-    );
-    try std.testing.expect(
-        std.mem.indexOf(u8, build_zig, ".off, .any => .ReleaseSafe,") != null,
-    );
-
-    // Without this annotation the `orelse` switch yields an untyped
-    // `@EnumLiteral`, and the generated build rejects itself: "value with
-    // comptime-only type depends on runtime control flow".
-    try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            build_zig,
-            "const optimize: std.builtin.OptimizeMode = b.option(",
-        ) != null,
-    );
-}
-
-test "generateBuildZig: the ReleaseSafe default survives the dependency template" {
-    const allocator = std.testing.allocator;
-    var pkg = buildTestPackage();
-    pkg.zon_deps = &.{.{ .name = "r2z-helper", .path = "../helper" }};
-    const build_zig = try generateBuildZig(allocator, &pkg);
-    defer allocator.free(build_zig);
-
-    // The dependency-carrying template is a second copy of the same preamble;
-    // a ReleaseSafe default in one and a Debug default in the other would
-    // leave the gate mode-dependent on which shape a package lowers to.
-    try std.testing.expect(std.mem.indexOf(u8, build_zig, "standardOptimizeOption") == null);
-    try std.testing.expect(
-        std.mem.indexOf(u8, build_zig, ".off, .any => .ReleaseSafe,") != null,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, build_zig, ".off, .any => .ReleaseSafe,"),
-    );
-
-    try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            build_zig,
-            "const optimize: std.builtin.OptimizeMode = b.option(",
-        ) != null,
     );
 }
 
@@ -1313,17 +1415,14 @@ test "writeToDisk: emits path dependency wiring" {
 test "writeToDisk: binds r2z imports to the r2z-core dependency key" {
     const allocator = std.testing.allocator;
     const test_io = std.testing.io;
-    var pkg = buildTestPackage();
-    var imports = [_]ast.Import{
-        .{ .local_name = "std", .module_or_path = "std" },
-        .{ .local_name = "r2z", .module_or_path = "r2z" },
-    };
-    var files = [_]ast.File{pkg.files[0]};
-    files[0].imports = &imports;
-    pkg.files = &files;
-    const with_runtime = try appendRuntimeDependency(allocator, &pkg);
-    defer if (with_runtime.deps.len > 0) allocator.free(with_runtime.deps);
-    try std.testing.expectEqualStrings("r2z-core", with_runtime.pkg.zon_deps[0].name);
+    const pkg = buildRuntimeTestPackage();
+    const wiring = try appendRuntimeDependency(allocator, &pkg);
+    // The only thing `appendRuntimeDependency` allocates; the rest of this test
+    // frees what it takes explicitly.
+    defer allocator.free(wiring.pkg.zon_deps);
+    try std.testing.expect(wiring.vendored_runtime);
+    try std.testing.expectEqualStrings(runtime_dependency_name, wiring.pkg.zon_deps[0].name);
+    try std.testing.expectEqualStrings(runtime_directory, wiring.pkg.zon_deps[0].path.?);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1349,77 +1448,11 @@ test "writeToDisk: binds r2z imports to the r2z-core dependency key" {
     defer allocator.free(zon_path);
     const zon = try readFileContent(allocator, test_io, zon_path);
     defer allocator.free(zon);
-    try std.testing.expect(std.mem.indexOf(u8, zon, ".r2z_core = .{") != null);
-}
-
-test "generateBuildZigZon: excludes runtime dependency from emitted paths" {
-    const allocator = std.testing.allocator;
-    // Manifest generation runs on a package that has already lowered, and a
-    // root that declares nothing is not one. The declaration is incidental to
-    // the manifest text these tests assert on; it only keeps the fixture on the
-    // real code path.
-    const marker_decl: ast.Decl = .{ .const_decl = .{
-        .name = "MARKER",
-        .init = ast.Expr{ .lit = .{ .int = 1 } },
-    } };
-    const pkg: ast.Package = .{
-        .name = "demo",
-        .files = &.{.{
-            .path = "src/root.zig",
-            .imports = &.{.{ .local_name = "r2z", .module_or_path = "r2z" }},
-            .decls = &.{marker_decl},
-        }},
-    };
-    const with_runtime = try appendRuntimeDependency(allocator, &pkg);
-    defer if (with_runtime.deps.len > 0) allocator.free(with_runtime.deps);
-
-    const zon = try generateBuildZigZon(allocator, std.testing.io, &with_runtime.pkg, ".");
-    defer allocator.free(zon);
-
+    // The dependency resolves inside the package it belongs to. A path naming
+    // anything outside it is exactly what made a copied generated directory
+    // report its runtime as missing.
     try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            zon,
-            ".dependencies = .{\n        .r2z_core = .{",
-        ) != null,
-    );
-    try std.testing.expect(std.mem.indexOf(u8, zon, "\"r2z_core\"") == null);
-    try std.testing.expect(
-        std.mem.indexOf(u8, zon,
-            \\.paths = .{
-            \\        "build.zig",
-            \\        "build.zig.zon",
-            \\        "src",
-        ) != null,
-    );
-}
-
-test "generateBuildZigZon: allows a missing absolute output directory" {
-    const allocator = std.testing.allocator;
-    const marker_decl: ast.Decl = .{ .const_decl = .{
-        .name = "MARKER",
-        .init = ast.Expr{ .lit = .{ .int = 1 } },
-    } };
-    const pkg: ast.Package = .{
-        .name = "demo",
-        .files = &.{.{
-            .path = "src/root.zig",
-            .imports = &.{.{ .local_name = "r2z", .module_or_path = "r2z" }},
-            .decls = &.{marker_decl},
-        }},
-    };
-    const with_runtime = try appendRuntimeDependency(allocator, &pkg);
-    defer if (with_runtime.deps.len > 0) allocator.free(with_runtime.deps);
-
-    const zon = try generateBuildZigZon(
-        allocator,
-        std.testing.io,
-        &with_runtime.pkg,
-        "/tmp/translate-rust-missing-output/backend",
-    );
-    defer allocator.free(zon);
-    try std.testing.expect(
-        std.mem.indexOf(u8, zon, ".r2z_core = .{ .path = \"") != null,
+        std.mem.indexOf(u8, zon, ".r2z_core = .{ .path = \"r2z-core\" }") != null,
     );
 }
 
@@ -1442,7 +1475,7 @@ fn zonNameLineFor(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
             .decls = &.{marker_decl},
         }},
     };
-    const zon = try generateBuildZigZon(allocator, std.testing.io, &pkg, ".");
+    const zon = try generateBuildZigZon(allocator, try appendRuntimeDependency(allocator, &pkg));
     defer allocator.free(zon);
     const marker = "    .name = .";
     const start = std.mem.indexOf(u8, zon, marker) orelse
@@ -1551,25 +1584,6 @@ test "writeToDisk: rejects a package without src/root.zig" {
     try expectWriteValidationError(error.MissingRootFile, &pkg);
 }
 
-test "writeToDisk: rejects a package whose root file declares nothing" {
-    // The staged package would still link and its own `zig build test` would
-    // pass on a zero-test binary, so an empty root has to stop here rather
-    // than be published as a translation. Sibling declarations do not help.
-    var pkg = buildTestPackage();
-    var root = pkg.files[0];
-    root.decls = &.{};
-    root.tests = &.{};
-    pkg.files = &.{ root, .{
-        .path = "src/util.zig",
-        .decls = &.{.{ .const_decl = .{
-            .name = "util",
-            .init = ast.Expr{ .lit = .{ .int = 1 } },
-        } }},
-    } };
-
-    try expectWriteValidationError(error.EmptyRootFile, &pkg);
-}
-
 test "writeToDisk: rejects duplicate source files" {
     var pkg = buildTestPackage();
     pkg.files = &.{ pkg.files[0], pkg.files[0] };
@@ -1642,13 +1656,19 @@ test "writeToDisk: rejects dependency names that collide after ZON sanitization"
 const PromotionTestMode = enum {
     compile_failure,
     compile_failure_on_stdout,
+    run_failure,
     fingerprint_then_success,
     fingerprint_then_failure,
+    fingerprint_then_run_failure,
     resolver_failure,
     success_without_fingerprint,
 };
 
 const reported_output_capacity = 256;
+
+/// What a generated package's test binary writes when the emitted code
+/// misbehaves at runtime rather than failing to compile.
+const run_panic_text = "thread 1 panicked at root.zig:1: reached unreachable code";
 
 const PromotionTestContext = struct {
     final_path: []const u8,
@@ -1662,6 +1682,7 @@ const PromotionTestContext = struct {
     reported_stdout_len: usize = 0,
     reported_stderr: [reported_output_capacity]u8 = undefined,
     reported_stderr_len: usize = 0,
+    reported_phase: GatePhase = .compile,
 };
 
 fn fixedPromotionNonce(
@@ -1691,6 +1712,7 @@ fn fakePromotionBuildTest(
     const stderr = switch (context.mode) {
         .compile_failure => "generated source does not compile",
         .compile_failure_on_stdout => "",
+        .run_failure => run_panic_text,
         .fingerprint_then_success, .resolver_failure => if (context.build_calls == 1)
             "fingerprint: 0x81677af28f9d3b4e"
         else
@@ -1699,6 +1721,10 @@ fn fakePromotionBuildTest(
             "fingerprint: 0x81677af28f9d3b4e"
         else
             "optimized build still rejects the generated source",
+        .fingerprint_then_run_failure => if (context.build_calls == 1)
+            "fingerprint: 0x81677af28f9d3b4e"
+        else
+            run_panic_text,
         .success_without_fingerprint => "",
     };
     const stdout_text = switch (context.mode) {
@@ -1709,7 +1735,17 @@ fn fakePromotionBuildTest(
         .compile_failure, .compile_failure_on_stdout, .resolver_failure => 1,
         .fingerprint_then_success => if (context.build_calls == 1) 1 else 0,
         .fingerprint_then_failure => 1,
+        .run_failure, .fingerprint_then_run_failure => 1,
         .success_without_fingerprint => 0,
+    };
+    const phase: GatePhase = switch (context.mode) {
+        // A run failure from the first pass: the package compiled and the
+        // run that followed it aborted.
+        .run_failure => .run,
+        // Two passes: the first is the compile that hands the resolver its
+        // manifest hint, the second is the run that aborts.
+        .fingerprint_then_run_failure => if (context.build_calls == 1) .compile else .run,
+        else => .compile,
     };
     const stdout = try allocator.dupe(u8, stdout_text);
     errdefer allocator.free(stdout);
@@ -1718,6 +1754,7 @@ fn fakePromotionBuildTest(
         .term = .{ .exited = exit_code },
         .stdout = stdout,
         .stderr = stderr_copy,
+        .phase = phase,
     };
 }
 
@@ -1739,8 +1776,11 @@ fn fakePromotionFingerprint(
         std.mem.indexOf(u8, zon, ".fingerprint") == null;
 
     return switch (context.mode) {
-        .compile_failure, .compile_failure_on_stdout => null,
-        .fingerprint_then_success, .fingerprint_then_failure => 0x81677af28f9d3b4e,
+        .compile_failure, .compile_failure_on_stdout, .run_failure => null,
+        .fingerprint_then_success,
+        .fingerprint_then_failure,
+        .fingerprint_then_run_failure,
+        => 0x81677af28f9d3b4e,
         .resolver_failure => error.FingerprintResolverFailed,
         .success_without_fingerprint => null,
     };
@@ -1762,23 +1802,30 @@ fn recordBuildFailure(
     context.report_calls += 1;
     context.reported_stdout_len = copyReportedOutput(&context.reported_stdout, result.stdout);
     context.reported_stderr_len = copyReportedOutput(&context.reported_stderr, result.stderr);
+    context.reported_phase = result.phase;
 }
 
 const GateModeTestContext = struct {
     allocator: std.mem.Allocator,
     flags: std.ArrayListUnmanaged([]const u8) = .empty,
+    phases: std.ArrayListUnmanaged(GatePhase) = .empty,
     fail_flag: ?[]const u8 = null,
+    fail_phase: ?GatePhase = null,
     fail_stderr: []const u8 = "",
 };
 
 fn fakeGateModeBuild(
     allocator: std.mem.Allocator,
     opaque_context: ?*anyopaque,
+    phase: GatePhase,
     flag: []const u8,
 ) anyerror!BuildTestResult {
     const context: *GateModeTestContext = @ptrCast(@alignCast(opaque_context.?));
     try context.flags.append(context.allocator, flag);
-    const fails = if (context.fail_flag) |fail| std.mem.eql(u8, fail, flag) else false;
+    try context.phases.append(context.allocator, phase);
+    const flag_fails = if (context.fail_flag) |fail| std.mem.eql(u8, fail, flag) else false;
+    const phase_fails = if (context.fail_phase) |fail| fail == phase else false;
+    const fails = flag_fails or phase_fails;
     const stdout = try allocator.dupe(u8, "");
     errdefer allocator.free(stdout);
     const stderr = try allocator.dupe(u8, if (fails) context.fail_stderr else "");
@@ -1789,20 +1836,32 @@ fn fakeGateModeBuild(
     };
 }
 
-test "promotion gate compiles the staged package in Debug and ReleaseSafe" {
+test "promotion gate compiles and runs the staged package in Debug and ReleaseSafe" {
     const allocator = std.testing.allocator;
     const test_io = std.testing.io;
     var context: GateModeTestContext = .{ .allocator = allocator };
     defer context.flags.deinit(allocator);
+    defer context.phases.deinit(allocator);
 
     const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
     defer releaseBuildTestResult(allocator, result);
 
     // Debug alone left every ReleaseSafe-only defect (elided
-    // `std.debug.assert` guards, optimizer-exposed UB) unpublished.
-    try std.testing.expectEqual(@as(usize, 2), context.flags.items.len);
-    try std.testing.expectEqualStrings("-Doptimize=Debug", context.flags.items[0]);
-    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", context.flags.items[1]);
+    // `std.debug.assert` guards, optimizer-exposed UB) unpublished, and a
+    // compile-only pass would leave every runtime defect unpublished instead.
+    // Each mode is compiled and then run, in that order: a package that only
+    // compiles must not reach the caller as a promoted package.
+    const expected = [_]struct { flag: []const u8, phase: GatePhase }{
+        .{ .flag = "-Doptimize=Debug", .phase = .compile },
+        .{ .flag = "-Doptimize=Debug", .phase = .run },
+        .{ .flag = "-Doptimize=ReleaseSafe", .phase = .compile },
+        .{ .flag = "-Doptimize=ReleaseSafe", .phase = .run },
+    };
+    try std.testing.expectEqual(expected.len, context.flags.items.len);
+    for (expected, 0..) |want, index| {
+        try std.testing.expectEqualStrings(want.flag, context.flags.items[index]);
+        try std.testing.expectEqual(want.phase, context.phases.items[index]);
+    }
     try std.testing.expectEqual(@as(u8, 0), result.term.exited);
     try std.testing.expectEqual(@as(?u64, null), try resolveFingerprint(
         allocator,
@@ -1822,13 +1881,17 @@ test "promotion gate returns the first failing mode output without running later
         .fail_stderr = "error: use this value: 0xdeadbeefcafebabe",
     };
     defer context.flags.deinit(allocator);
+    defer context.phases.deinit(allocator);
 
     const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
     defer releaseBuildTestResult(allocator, result);
 
     // Running the second mode would repeat the same manifest fingerprint
-    // hint, and `resolveFingerprint` rejects a hint it sees twice.
+    // hint, and `resolveFingerprint` rejects a hint it sees twice. The
+    // fingerprint is read during configuration, so the compile phase is
+    // where it has to be found.
     try std.testing.expectEqual(@as(usize, 1), context.flags.items.len);
+    try std.testing.expectEqual(GatePhase.compile, result.phase);
     try std.testing.expectEqual(@as(u8, 1), result.term.exited);
     try std.testing.expectEqual(
         @as(?u64, 0xdeadbeefcafebabe),
@@ -1845,16 +1908,52 @@ test "promotion gate fails when the package breaks only under ReleaseSafe" {
         .fail_stderr = "error: use of undeclared identifier 'undefined_value'",
     };
     defer context.flags.deinit(allocator);
+    defer context.phases.deinit(allocator);
 
     const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
     defer releaseBuildTestResult(allocator, result);
 
-    // Debug passed; the ReleaseSafe run is the only thing that catches this,
-    // and its output carries no fingerprint hint, so promotion must report a
-    // build failure rather than patch the manifest and re-run.
-    try std.testing.expectEqual(@as(usize, 2), context.flags.items.len);
-    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", context.flags.items[1]);
+    // Debug compiled and ran; the ReleaseSafe compile is the only thing that
+    // catches this, and its output carries no fingerprint hint, so promotion
+    // must report a build failure rather than patch the manifest and re-run.
+    try std.testing.expectEqual(@as(usize, 3), context.flags.items.len);
+    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", context.flags.items[2]);
+    try std.testing.expectEqual(GatePhase.compile, result.phase);
     try std.testing.expectEqual(@as(u8, 1), result.term.exited);
+    try std.testing.expectEqual(@as(?u64, null), try resolveFingerprint(
+        allocator,
+        test_io,
+        null,
+        "unused",
+        &result,
+    ));
+}
+
+test "promotion gate names a failure that comes from running the package" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var context: GateModeTestContext = .{
+        .allocator = allocator,
+        .fail_phase = .run,
+        .fail_stderr = "thread 1 panicked at root.zig:1: reached unreachable code",
+    };
+    defer context.flags.deinit(allocator);
+    defer context.phases.deinit(allocator);
+
+    const result = try runGateOptimizeModes(allocator, fakeGateModeBuild, &context);
+    defer releaseBuildTestResult(allocator, result);
+
+    // The compile phase of the first mode passed, so a non-zero exit from the
+    // run phase that follows it can only be what the emitted code did when it
+    // ran. Calling that a build failure points whoever reads it at the
+    // emitter when the emitter wrote exactly what it meant to.
+    try std.testing.expectEqual(@as(usize, 2), context.flags.items.len);
+    try std.testing.expectEqual(GatePhase.compile, context.phases.items[0]);
+    try std.testing.expectEqual(GatePhase.run, context.phases.items[1]);
+    try std.testing.expectEqual(GatePhase.run, result.phase);
+    try std.testing.expectEqual(@as(u8, 1), result.term.exited);
+    // A panic message is not a manifest fingerprint hint, and treating one as
+    // such is what made a run failure come back labelled as a build failure.
     try std.testing.expectEqual(@as(?u64, null), try resolveFingerprint(
         allocator,
         test_io,
@@ -2195,4 +2294,305 @@ test "promotion reports nothing when the build passes" {
     try std.testing.expectEqual(@as(u32, 1), context.resolver_calls);
     try std.testing.expectEqual(@as(u32, 0), context.report_calls);
     try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+// ── The staging boundary, property by property ─────────────────────────────
+// `cleanupPromotion` answers a failed promotion with a recursive delete of the
+// tree that promotion wrote. Each claim below is therefore about what that
+// delete may reach and what a failure may leave behind, and none of them is
+// answered by naming the one staging path a test can compute for itself.
+
+test "a failed promotion leaves nothing under the output directory to find" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    const pkg = buildTestPackage();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .compile_failure,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+        }),
+    );
+
+    // The other promotion tests name the one staging path their own fixed
+    // nonce produces and check it is gone. What is pinned here is every *other*
+    // name: a staging directory left under a nonce this test never computed, or
+    // a destination that was created and then abandoned, both land in the same
+    // parent, and both are a package a later run into this output directory
+    // could read as a finished one. The parent is empty, so there is nothing to
+    // read.
+    var parent = try std.Io.Dir.cwd().openDir(test_io, tmp_root, .{ .iterate = true });
+    defer parent.close(test_io);
+    var entries = parent.iterate();
+    var remaining: usize = 0;
+    while (try entries.next(test_io)) |entry| {
+        std.debug.print("failed promotion left `{s}` beside the output directory\n", .{entry.name});
+        remaining += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), remaining);
+}
+
+/// `cleanupPromotion` keeps the failure as a value rather than as an error
+/// union, so `std.testing.expectError`, which destructures an error union,
+/// cannot read it directly. This puts the error that function chose to keep
+/// into the shape it expects: nothing is translated and nothing substituted.
+fn cleanupFailure(err: anyerror) anyerror!void {
+    return err;
+}
+
+test "cleanupPromotion removes the run's own staging directory and nothing else" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    const sibling = try std.fs.path.join(allocator, &.{ tmp_root, "other-package" });
+    defer allocator.free(sibling);
+    const zon_path = try std.fs.path.join(allocator, &.{ out_dir, "build.zig.zon" });
+    defer allocator.free(zon_path);
+    const keep_path = try std.fs.path.join(allocator, &.{ sibling, "keep.txt" });
+    defer allocator.free(keep_path);
+
+    // Two directories this promotion did not create: the package an earlier run
+    // published, and a sibling the caller owns.
+    try writeFile(allocator, test_io, out_dir, "build.zig.zon", ".name = .published\n");
+    try writeFile(allocator, test_io, sibling, "keep.txt", "owned by the caller\n");
+
+    // `deleteTree` is recursive. Handed the destination it would destroy the
+    // one package here that is complete; handed the caller's sibling it would
+    // destroy something no promotion of this package ever wrote.
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        cleanupFailure(cleanupPromotion(test_io, out_dir, out_dir, error.GeneratedPackageBuildFailed)),
+    );
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        cleanupFailure(cleanupPromotion(test_io, out_dir, sibling, error.GeneratedPackageBuildFailed)),
+    );
+    const published = try readFileContent(allocator, test_io, zon_path);
+    defer allocator.free(published);
+    try std.testing.expectEqualStrings(".name = .published\n", published);
+    const kept = try readFileContent(allocator, test_io, keep_path);
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("owned by the caller\n", kept);
+
+    // The guard is not "never delete". The directory this promotion did create
+    // is the one thing `cleanupPromotion` exists to remove, so a test that read
+    // only the two refusals would also pass against a function that had given
+    // up on removing anything at all.
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+    try writeFile(allocator, test_io, staging_dir, "src/root.zig", "pub const LIMIT: u32 = 42;\n");
+
+    try std.testing.expectError(
+        error.GeneratedPackageBuildFailed,
+        cleanupFailure(cleanupPromotion(test_io, out_dir, staging_dir, error.GeneratedPackageBuildFailed)),
+    );
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "a package that compiles and then fails its tests is a run failure" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    const pkg = buildTestPackage();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .run_failure,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageRunFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // The package compiled and the run that followed it aborted, so this is a
+    // fact about the emitted code and not about the manifest. Reporting it as a
+    // build failure points whoever reads it at the emitter, which wrote exactly
+    // what it meant to. The resolver is never consulted either: an aborting
+    // test is not a fingerprint hint, so patching the manifest would run the
+    // same tests again and then name the wrong phase for the same failure.
+    try std.testing.expectEqual(@as(u32, 1), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 0), context.resolver_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqual(GatePhase.run, context.reported_phase);
+    try std.testing.expectEqualStrings(
+        run_panic_text,
+        context.reported_stderr[0..context.reported_stderr_len],
+    );
+    try expectDirectoryAbsent(test_io, out_dir);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "a run failure after the manifest was patched is still a run failure" {
+    const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
+    var pkg = buildTestPackage();
+    pkg.fingerprint = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_root);
+    const out_dir = try std.fs.path.join(allocator, &.{ tmp_root, "published" });
+    defer allocator.free(out_dir);
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const staging_dir = try stagingPath(allocator, out_dir, nonce);
+    defer allocator.free(staging_dir);
+
+    var context: PromotionTestContext = .{
+        .final_path = out_dir,
+        .mode = .fingerprint_then_run_failure,
+    };
+    try std.testing.expectError(
+        error.GeneratedPackageRunFailed,
+        promoteWithHooks(allocator, test_io, &pkg, out_dir, .{
+            .context = &context,
+            .fill_nonce = fixedPromotionNonce,
+            .run_build_test = fakePromotionBuildTest,
+            .resolve_fingerprint = fakePromotionFingerprint,
+            .report_build_failure = recordBuildFailure,
+        }),
+    );
+
+    // The first pass failed to configure and handed the resolver a real
+    // fingerprint hint, so the manifest was patched and the package then
+    // compiled. The second pass is the run, and it aborted. A promotion that
+    // had just fixed the manifest is the one place where "it compiled, so the
+    // manifest was wrong" is most tempting and most wrong: the phase is a
+    // property of which invocation failed, and a package whose tests fail is
+    // not promoted even once it compiles.
+    try std.testing.expectEqual(@as(u32, 2), context.build_calls);
+    try std.testing.expectEqual(@as(u32, 1), context.resolver_calls);
+    try std.testing.expect(context.resolver_saw_missing_fingerprint);
+    try std.testing.expectEqual(@as(u32, 1), context.report_calls);
+    try std.testing.expectEqual(GatePhase.run, context.reported_phase);
+    try expectDirectoryAbsent(test_io, out_dir);
+    try expectDirectoryAbsent(test_io, staging_dir);
+}
+
+test "the staging check admits the name promotion creates and no other" {
+    const allocator = std.testing.allocator;
+
+    // The names are taken from `stagingPath` rather than copied out of the
+    // implementation: the check exists to admit exactly what the naming
+    // produces, so if the two ever drift apart a real staging directory would
+    // stop being cleaned up and a test that only spelled the shape out by hand
+    // would still pass.
+    const nested_out = "zig-out/staging-audit/published";
+    var nonce: [promotion_nonce_len]u8 = undefined;
+    @memset(&nonce, 0xa5);
+    const nested_staging = try stagingPath(allocator, nested_out, nonce);
+    defer allocator.free(nested_staging);
+    try std.testing.expect(isStagingSiblingOf(nested_out, nested_staging));
+
+    // A bare output directory has no parent to compare against, which is the
+    // `-o out` spelling a caller actually writes.
+    @memset(&nonce, 0xff);
+    const bare_staging = try stagingPath(allocator, "published", nonce);
+    defer allocator.free(bare_staging);
+    try std.testing.expect(isStagingSiblingOf("published", bare_staging));
+
+    const short_nonce = try std.fmt.allocPrint(
+        allocator,
+        "zig-out/staging-audit/.published.staging.{s}",
+        .{"a" ** 31},
+    );
+    defer allocator.free(short_nonce);
+    const long_nonce = try std.fmt.allocPrint(
+        allocator,
+        "zig-out/staging-audit/.published.staging.{s}",
+        .{"a" ** 33},
+    );
+    defer allocator.free(long_nonce);
+    const non_hex_nonce = try std.fmt.allocPrint(
+        allocator,
+        "zig-out/staging-audit/.published.staging.{s}",
+        .{"g" ** 32},
+    );
+    defer allocator.free(non_hex_nonce);
+    const upper_hex_nonce = try std.fmt.allocPrint(
+        allocator,
+        "zig-out/staging-audit/.published.staging.{s}",
+        .{"A" ** 32},
+    );
+    defer allocator.free(upper_hex_nonce);
+    const elsewhere = try std.fmt.allocPrint(
+        allocator,
+        "zig-out/elsewhere/.published.staging.{s}",
+        .{"a" ** 32},
+    );
+    defer allocator.free(elsewhere);
+    const below_staging = try std.fmt.allocPrint(
+        allocator,
+        "zig-out/staging-audit/.published.staging.{s}/src",
+        .{"a" ** 32},
+    );
+    defer allocator.free(below_staging);
+
+    const rejected = [_][]const u8{
+        // The destination itself, spelled with and without its trailing
+        // separator. A recursive delete of either one is the one mistake here
+        // that costs a caller a package which is complete.
+        nested_out,
+        "zig-out/staging-audit/published/",
+        // Names that merely begin with the output directory's name, or with
+        // the staging prefix, and then continue as something else.
+        "zig-out/staging-audit/published-extra",
+        "zig-out/staging-audit/published2",
+        short_nonce,
+        long_nonce,
+        non_hex_nonce,
+        // A nonce no promotion writes: `stagingPath` hex-encodes in lower
+        // case, so this name belongs to whoever made it.
+        upper_hex_nonce,
+        // The right name in the wrong place — beside another output directory,
+        // or below the staging directory rather than beside it.
+        elsewhere,
+        below_staging,
+    };
+    for (rejected) |candidate| {
+        std.testing.expect(!isStagingSiblingOf(nested_out, candidate)) catch |err| {
+            std.debug.print("the staging check admitted `{s}`\n", .{candidate});
+            return err;
+        };
+    }
+    try std.testing.expect(!isStagingSiblingOf("published", "published"));
 }

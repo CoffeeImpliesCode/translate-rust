@@ -41,6 +41,11 @@ pub const WireCompatibilityError = pipeline.WireCompatibilityError;
 /// Fingerprint probe result and injectable probe type for deterministic tests.
 pub const FingerprintProbeResult = pipeline.FingerprintProbeResult;
 pub const FingerprintProbe = pipeline.FingerprintProbe;
+/// Which input-availability boundary a refusal sits on, and what input it names.
+pub const RefusalKind = pipeline.RefusalKind;
+pub const RefusalExplanation = pipeline.RefusalExplanation;
+pub const explainRefusal = pipeline.explainRefusal;
+pub const refusalTable = pipeline.refusalTable;
 pub const FingerprintError = pipeline.FingerprintError;
 pub const fixFingerprintWithProbe = pipeline.fixFingerprintWithProbe;
 
@@ -50,4 +55,5 @@ pub const readFileAlloc = pipeline.readFileAlloc;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("pipeline.zig");
+    _ = @import("pipeline_test.zig");
 }

@@ -4,8 +4,6 @@ const std = @import("std");
 const translate_rust = @import("translate_rust");
 
 const crate_dir = "test/crates/hex";
-const rust_ir_path = "test/golden/rust_ir/hex.rustir.json";
-const rust_ir_temp_path = "test/golden/rust_ir/hex.rustir.json.tmp";
 const zig_ast_path = "test/golden/zig_ast/hex.zigast.json";
 const zig_ast_temp_path = "test/golden/zig_ast/hex.zigast.json.tmp";
 
@@ -46,24 +44,20 @@ pub fn main(init: std.process.Init) !void {
     defer rust_ir.deinitInstantiations(allocator);
     try translate_rust.ir.validateForTranslation(&rust_ir);
 
-    const rust_ir_json = try translate_rust.ir.serialize.encode(allocator, &rust_ir);
-    try writeCanonicalFile(init.io, rust_ir_path, rust_ir_temp_path, rust_ir_json);
-
     const pkg = try translate_rust.backend.zig.lower.lowerRustIr(allocator, &rust_ir, null);
     const zig_ast_json = try translate_rust.backend.zig.serialize.encode(allocator, &pkg);
     try writeCanonicalFile(init.io, zig_ast_path, zig_ast_temp_path, zig_ast_json);
-    for (pkg.files) |*file| {
-        const source = try translate_rust.backend.zig.emit.emitFile(allocator, file);
-        const source_path = try std.fmt.allocPrint(
-            allocator,
-            "test/golden/zig_src/hex/{s}",
-            .{file.path},
-        );
-        const source_temporary_path = try std.fmt.allocPrint(
-            allocator,
-            "test/golden/zig_src/hex/{s}.tmp",
-            .{file.path},
-        );
-        try writeCanonicalFile(init.io, source_path, source_temporary_path, source);
-    }
+    // Only the `zig_ast` package is written. It is the one golden for this
+    // fixture that an assertion reads: `src/backend/zig/documentation_test.zig`
+    // decodes it into a typed AST and checks every documentation sentence
+    // against the signature it names.
+    //
+    // This generator used to write the RustIR document and every emitted
+    // source file as well. `hex` is a `typed` golden fixture — its RustIR
+    // document is a table of row indices and its emitted text is mostly the
+    // crate's own rustdoc — so nothing compared either. They were dead files
+    // that looked like coverage, and
+    // `test/golden_test.zig`'s "every golden file is read by an assertion" test
+    // now rejects any golden file no assertion opens. Writing them again would
+    // resurrect exactly that, so they are not written.
 }

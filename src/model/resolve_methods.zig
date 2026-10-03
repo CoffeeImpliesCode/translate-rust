@@ -9,14 +9,13 @@
 //!
 //! Ambiguity or unresolvable methods cleanly degrade to `.unsupported` per-node.
 //!
-//! Pure Zig (C-free): imports only graph, spine, types, bodies, items, exprs.
+//! Pure Zig (C-free): imports only graph, spine, types, bodies, exprs.
 
 const std = @import("std");
 const spine = @import("spine.zig");
 const graph = @import("graph.zig");
 const types = @import("types.zig");
 const bodies = @import("bodies.zig");
-const items = @import("items.zig");
 const exprs = @import("exprs.zig");
 
 pub const StdMethod = enum {

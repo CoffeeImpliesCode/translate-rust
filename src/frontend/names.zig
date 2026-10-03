@@ -14,8 +14,9 @@
 //!   - bare / leading `::` -> the use's own module, falling back to the crate
 //!     root for the first segment when it is not found locally
 //! Any unresolved non-external path degrades to `target = 0` with
-//! `.kind = .{ .plain = 0 }`; unresolved rooted `core`/`std`/`alloc` non-glob
-//! use `.kind = .external` and retain their full path.
+//! `.kind = .{ .plain = 0 }`; an unresolved non-glob use rooted at `core`,
+//! `std`, `alloc` or a manifest dependency uses `.kind = .external` and
+//! retains its full path.
 
 const std = @import("std");
 const ir = @import("translate_rust.ir");
@@ -27,22 +28,38 @@ pub const span_of: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 
 /// A per-module scope: bare-name -> EntityId within ONE module. Shadowing is
 /// modeled by the entries map (a later binding overwrites an earlier one);
 /// name lookup never bleeds across modules except through explicit descent.
+///
+/// `locals` holds the same names restricted to items that are NOT `use`
+/// declarations, so the binding a `use` displaced stays reachable. A `use`
+/// that binds a name its own module already declares must SHADOW that
+/// declaration for every reader of the module — that is what `entries` says —
+/// but a use declaration is never its own target, and the thing such a path
+/// names is precisely the declaration the `use` sat on top of. One map cannot
+/// answer both questions, so the two live side by side.
 pub const Scope = struct {
     mod_id: spine.EntityId, // the module entity's EntityId
     entries: std.StringHashMapUnmanaged(spine.EntityId) = .empty,
+    locals: std.StringHashMapUnmanaged(spine.EntityId) = .empty,
 
     pub fn init(mod_id: spine.EntityId) Scope {
-        return .{ .mod_id = mod_id, .entries = .empty };
+        return .{ .mod_id = mod_id, .entries = .empty, .locals = .empty };
     }
 
     pub fn deinit(self: *Scope, alloc: std.mem.Allocator) void {
         self.entries.deinit(alloc);
+        self.locals.deinit(alloc);
         self.* = undefined;
     }
 
     /// Resolve a bare name within this module ONLY.
     pub fn lookup(self: *const Scope, name: []const u8) ?spine.EntityId {
         return self.entries.get(name);
+    }
+
+    /// The declaration `name` names in this module, ignoring any `use` that
+    /// bound the same name. Null when the module holds no such declaration.
+    pub fn lookupLocal(self: *const Scope, name: []const u8) ?spine.EntityId {
+        return self.locals.get(name);
     }
 };
 
@@ -143,6 +160,36 @@ fn scopeAt(scopes: []const ?Scope, entity_id: spine.EntityId) ?Scope {
     return scopes[entity_id];
 }
 
+/// Discard a binding that names the `use` being resolved, and hand back what
+/// the name stood for before that `use` shadowed it.
+///
+/// A `use` registers itself in its own module under BOTH its source path and
+/// the name it binds, so a single-segment `use helper;` is reachable as
+/// "helper" through the very entry being resolved. Taking that would make the
+/// declaration its own target: `u.target` and `entity.resolved` would both
+/// name the `use_` itself, and every later hop that follows a binding would
+/// walk into itself and find nothing. A use declaration is never its own
+/// target.
+///
+/// What a self-hit hides is not always nothing. A `use` that binds a name its
+/// own module already declares — a re-export written as `use self::T;`, or a
+/// path that leads back into the module holding it — SHADOWED a real
+/// declaration to get there, and that declaration is what the path names.
+/// Discarding the self-hit and returning null there is what turned such a use
+/// into a dangling alias, so the shadowed declaration is consulted instead;
+/// only a name nothing else declared still falls through to the bare fallback
+/// inside `resolvePath`.
+fn skipSelf(
+    found: ?spine.EntityId,
+    sc: *const Scope,
+    self_id: spine.EntityId,
+    seg: []const u8,
+) ?spine.EntityId {
+    const binding = found orelse return null;
+    if (binding != self_id) return binding;
+    return sc.lookupLocal(seg);
+}
+
 /// Walk `segs` from the scope of module entity `start`. `bare_fallback` lets
 /// the first segment resolve from the crate root when absent locally (bare
 /// paths). `need_module` requires every intermediate AND the final segment to
@@ -153,6 +200,7 @@ fn resolvePath(
     g: *const graph.CrateGraph,
     root_id: spine.EntityId,
     start: spine.EntityId,
+    self_id: spine.EntityId,
     segs: []const []const u8,
     bare_fallback: bool,
     need_module: bool,
@@ -161,10 +209,10 @@ fn resolvePath(
     var cur = start;
     for (segs, 0..) |seg, i| {
         const sc = scopeAt(scopes, cur) orelse return null;
-        var found = sc.lookup(seg);
+        var found = skipSelf(sc.lookup(seg), &sc, self_id, seg);
         if (found == null and i == 0 and bare_fallback) {
             const rsc = scopeAt(scopes, root_id) orelse return null;
-            found = rsc.lookup(seg);
+            found = skipSelf(rsc.lookup(seg), &rsc, self_id, seg);
             if (found != null) cur = root_id;
         }
         const f = found orelse return null;
@@ -194,11 +242,50 @@ fn clearExternalKind(alloc: std.mem.Allocator, u: *graph.UseDecl) void {
     u.kind = .{ .plain = 0 };
 }
 
-fn isExternalRootedUse(parsed: ParsedUse) bool {
+/// A crate name the manifest spells with dashes is spelled with underscores
+/// at the use site, so the two forms have to compare equal here exactly as
+/// they do in the declaration binder.
+fn normalizedNameEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_char, right_char| {
+        const normalized_left = if (left_char == '-') '_' else left_char;
+        const normalized_right = if (right_char == '-') '_' else right_char;
+        if (normalized_left != normalized_right) return false;
+    }
+    return true;
+}
+
+/// Whether `name` roots a path whose types never exist as graph entities: the
+/// three standard crates, or a dependency this crate's manifest declares.
+///
+/// This has to answer exactly as `cst.zig`'s `isKnownExternalCrate` does. The
+/// CST pass seeds every such `use` with an external candidate so declaration
+/// types can bind while the walk is still running; this pass is what keeps
+/// that candidate. A narrower rule here silently drops a dependency-rooted
+/// `use` back to a plain binding that resolves to nothing, and every later
+/// path through that alias stops naming a type at all.
+fn isExternalRootName(g: *const graph.CrateGraph, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "core") or
+        std.mem.eql(u8, name, "std") or
+        std.mem.eql(u8, name, "alloc"))
+    {
+        return true;
+    }
+    for (g.crates.items) |crate_info| {
+        for (crate_info.deps) |dependency| {
+            if (normalizedNameEqual(dependency.local_alias, name) or
+                normalizedNameEqual(dependency.extern_name, name))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn isExternalRootedUse(g: *const graph.CrateGraph, parsed: ParsedUse) bool {
     if (parsed.base != .bare or parsed.glob or parsed.segments.items.len == 0) return false;
-    const root = parsed.segments.items[0];
-    return std.mem.eql(u8, root, "core") or std.mem.eql(u8, root, "std") or
-        std.mem.eql(u8, root, "alloc");
+    return isExternalRootName(g, parsed.segments.items[0]);
 }
 
 fn duplicateExternalPath(
@@ -251,15 +338,21 @@ pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
             const ent = g.symbol_table.get(item_id) orelse continue;
             if (ent.name.len == 0) continue;
             scope.entries.put(alloc, ent.name, item_id) catch {
-                scope.entries.deinit(alloc);
+                scope.deinit(alloc);
                 scope = Scope.init(@intCast(i));
                 continue;
             };
-            // A `use` also introduces a binding under its local name.
+            // A `use` also introduces a binding under its local name, and it
+            // shadows whatever the module already declared under it. A
+            // declaration is the one binding no `use` may displace, so it is
+            // indexed beside the shadowed name: `skipSelf` reads it back when
+            // the path being resolved is the `use` that did the shadowing.
             if (ent.kind == .use_) {
                 if (use_local.get(item_id)) |ln| {
                     if (ln.len > 0) scope.entries.put(alloc, ln, item_id) catch continue;
                 }
+            } else {
+                scope.locals.put(alloc, ent.name, item_id) catch continue;
             }
         }
         scopes.items[i] = scope;
@@ -299,6 +392,7 @@ pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
             g,
             root_id,
             start_id,
+            u.id,
             parsed.segments.items,
             bare_fallback,
             parsed.glob,
@@ -326,7 +420,7 @@ pub fn resolveGraph(alloc: std.mem.Allocator, g: *graph.CrateGraph) !void {
         } else {
             clearExternalKind(alloc, u);
             u.target = 0;
-            if (isExternalRootedUse(parsed)) {
+            if (isExternalRootedUse(g, parsed)) {
                 const external_path = try duplicateExternalPath(alloc, parsed.segments.items);
                 u.kind = .{ .external = .{
                     .path = external_path,

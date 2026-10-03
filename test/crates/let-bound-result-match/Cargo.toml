@@ -1,0 +1,10 @@
+# Ownership-proof fixture, not a published crate.
+#
+# `src/lib.rs` binds one owning `Result` to a NAME and then matches that name by
+# value. The consumer that pins the release contract is
+# `test/let_bound_result_consumer.zig`.
+[package]
+name = "let-bound-result-match"
+version = "0.1.0"
+edition = "2021"
+publish = false

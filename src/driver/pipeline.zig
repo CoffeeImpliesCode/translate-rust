@@ -9,6 +9,12 @@ const ir = @import("translate_rust.ir");
 const frontend = @import("translate_rust.frontend");
 const backend = @import("translate_rust.backend");
 
+/// The compiler running this build, resolved once by build.zig. The fingerprint
+/// probe builds the staged package, and a bare `zig` would be whatever PATH
+/// names: the anyzig shim resolves on every invocation and fails silently
+/// outside a checkout that pins a version.
+const zig_executable = @import("toolchain").zig_executable;
+
 /// Error reported when the driver rejects a wire version before canonical decode.
 pub const WireCompatibilityError = error{
     UnsupportedWireVersion,
@@ -54,8 +60,10 @@ fn decodeWireJson(
     allocator: std.mem.Allocator,
     json_bytes: []const u8,
 ) !ir.serialize.RustIr {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch
-        return error.InvalidJson;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
     defer parsed.deinit();
 
     const root = switch (parsed.value) {
@@ -172,6 +180,107 @@ pub fn translateWithOptions(
     try promotePackage(arena_alloc, io, &pkg, out_dir);
 }
 
+/// Which boundary of INPUT AVAILABILITY a translation refusal sits on.
+///
+/// These four are not lowering limits. Each one is raised because the run asked
+/// for an input it cannot have: an artifact only a build script can produce, a
+/// macro body only another crate's source can define, a crate root no manifest
+/// entry admits, or a `cfg` predicate no target configuration answers. Naming
+/// them separately from `UnsupportedExpression` and friends is what keeps a
+/// missing input from being read as an unimplemented construct — the two need
+/// opposite responses, and only one of them is fixed by writing more lowering.
+pub const RefusalKind = enum {
+    /// A Cargo build script's generated artifact.
+    build_script_artifact,
+    /// A `macro_rules!` body defined outside this crate.
+    external_macro_source,
+    /// A `use` root no manifest entry admits.
+    undeclared_crate_root,
+    /// A `cfg`/`cfg_attr` predicate no target configuration answers.
+    cfg_predicate,
+};
+
+/// What the run could not obtain, and which boundary stopped it.
+pub const RefusalExplanation = struct {
+    kind: RefusalKind,
+    /// The class of input that was missing, in the words a reader needs. This is
+    /// deliberately a description of the CLASS and not of one crate's instance:
+    /// which file, macro, crate root or predicate is missing is a fact about the
+    /// crate being translated, and that crate's own text is where it is stated.
+    missing: []const u8,
+};
+
+/// Every input-availability refusal, with the class of input each one names.
+///
+/// The table is the whole policy: a refusal absent from it is not an
+/// input-availability boundary, and `explainRefusal` answering null for one is
+/// what keeps a lowering gap from being filed under a missing input.
+const refusal_table = [_]struct { err: anyerror, kind: RefusalKind, missing: []const u8 }{
+    .{
+        .err = error.BuildScriptArtifactUnavailable,
+        .kind = .build_script_artifact,
+        // `include!(concat!(env!("OUT_DIR"), "/tables.rs"))` names a file that
+        // exists only after `build.rs` has been run as a PROGRAM. Translating
+        // Rust to Zig never runs it, so the artifact is not merely missing from
+        // the input set — producing it is a different kind of work than
+        // analysis, and no amount of lowering reaches it.
+        .missing = "a build script's generated artifact under `$OUT_DIR`, which exists only " ++
+            "once `build.rs` has been EXECUTED as a program",
+    },
+    .{
+        .err = error.ExternalMacroSourceUnavailable,
+        .kind = .external_macro_source,
+        // The invocation's `macro_rules!` body lives in the DEFINING crate's
+        // source. A crate this translator did not read cannot supply it, so the
+        // expansion has no text to re-parse — this is the macro's own body
+        // missing, not the invocation being unrecognised.
+        .missing = "the `macro_rules!` body of a macro exported by another crate, whose " ++
+            "defining source is not part of this translation input",
+    },
+    .{
+        .err = error.UnsupportedExternalUse,
+        .kind = .undeclared_crate_root,
+        // The `use` names a root that is neither a module of this crate nor an
+        // entry in the dependency table the manifest built. Dropping the import
+        // instead would stage a package naming a type the translator never
+        // defined, so the run stops and says which root was unadmitted.
+        .missing = "a `use` root that is neither a module of this crate nor a dependency " ++
+            "its manifest declares",
+    },
+    .{
+        .err = error.UnsupportedCfgPredicate,
+        .kind = .cfg_predicate,
+        // `cfg` decides only what to DROP, so an unanswered predicate that is
+        // false for the target may prune safely and one that is true may not.
+        // With no target configuration to answer it, the run cannot tell which
+        // case it is in and must not guess.
+        .missing = "the value of a `cfg`/`cfg_attr` predicate naming a target property " ++
+            "this translation has no configuration for",
+    },
+};
+
+/// The input-availability boundary `err` sits on, or null when it is not one.
+///
+/// A lowering refusal answers null here on purpose: `UnsupportedExpression` and
+/// `UnsupportedPattern` mean a construct this translator does not implement,
+/// which is answered by writing lowering, not by obtaining an input.
+pub fn explainRefusal(err: anyerror) ?RefusalExplanation {
+    inline for (refusal_table) |row| {
+        if (err == row.err) {
+            return .{ .kind = row.kind, .missing = row.missing };
+        }
+    }
+    return null;
+}
+
+/// Every input-availability boundary, for tests that must all stay reachable.
+// `&refusal_table` is a pointer to the ARRAY, which coerces to a slice of the
+// array's ELEMENT type; naming the array itself would ask for a slice of
+// arrays, for which no such coercion exists.
+pub fn refusalTable() []const @TypeOf(refusal_table[0]) {
+    return &refusal_table;
+}
+
 /// Translate canonical v6 wire JSON into a standalone Zig package.
 /// Unsupported wire versions fail before decoding or package creation.
 pub fn translateWireJson(
@@ -237,11 +346,9 @@ fn runFingerprintProbe(
     io: std.Io,
     out_dir: []const u8,
 ) !FingerprintProbeResult {
-    const cmd = try std.fmt.allocPrint(allocator, "cd {s} && zig build 2>&1", .{out_dir});
-    defer allocator.free(cmd);
-
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "sh", "-c", cmd },
+        .argv = &.{ zig_executable, "build" },
+        .cwd = .{ .path = out_dir },
     });
     return .{
         .term = result.term,
@@ -544,6 +651,18 @@ test "wire dispatch sends canonical v6 to canonical decoder" {
 
     try std.testing.expectEqualStrings("fixture", decoded.crate_name);
     try std.testing.expectEqualStrings("2021", decoded.edition);
+}
+
+test "wire dispatch preserves JSON parser allocation errors" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        decodeWireJson(failing.allocator(), "{\"format_version\":6" ++ canonical_wire_payload_suffix),
+    );
+    try std.testing.expectError(
+        error.InvalidJson,
+        decodeWireJson(std.testing.allocator, "this is not json {"),
+    );
 }
 
 test "framed package emission labels each source file" {

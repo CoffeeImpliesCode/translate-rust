@@ -307,6 +307,24 @@ test "expandMacroRules recursively matches nested repetitions" {
     try std.testing.expect(std.mem.indexOf(u8, expanded, "struct d;") != null);
 }
 
+test "expandMacroRules resolves enclosing captures inside nested repetitions" {
+    const alloc = std.testing.allocator;
+    var def = try expand.parseMacroRulesDefinition(alloc,
+        \\macro_rules! tagged {
+        \\    ($($tag:ident ; $($x:ident),*);*) => { [ $( $( $tag + $x , )* )* ] };
+        \\}
+    );
+    defer def.deinit(alloc);
+
+    const expanded = try expand.expandMacroRules(alloc, def, "(outer_a; a,b; outer_b; c)");
+    defer alloc.free(expanded);
+    const first = std.mem.indexOf(u8, expanded, "outer_a + a") orelse return error.MissingFirstCapture;
+    const second = std.mem.indexOf(u8, expanded, "outer_a + b") orelse return error.MissingSecondCapture;
+    const third = std.mem.indexOf(u8, expanded, "outer_b + c") orelse return error.MissingThirdCapture;
+    try std.testing.expect(first < second and second < third);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, expanded, " + "));
+}
+
 test "expandMacroRules rejects repetition depth overflow" {
     const alloc = std.testing.allocator;
     var raw: std.ArrayListUnmanaged(u8) = .empty;
@@ -541,40 +559,6 @@ test "parseVecInvocation ignores a semicolon inside a string literal" {
     try std.testing.expectEqual(@as(usize, 2), elements.len);
     try std.testing.expectEqualStrings("\"left;right\"", elements[0]);
     try std.testing.expectEqualStrings("7", elements[1]);
-}
-
-test "parseVecInvocation ignores a semicolon inside a raw string literal" {
-    const alloc = std.testing.allocator;
-    var invocation: expand.VecInvocation =
-        try expand.parseVecInvocation(alloc, "[r#\"left;right\"#, 7]");
-    defer invocation.deinit(alloc);
-
-    const elements = switch (invocation) {
-        .elements => |items| items,
-        .repeat => {
-            try std.testing.expect(false);
-            return;
-        },
-    };
-
-    try std.testing.expectEqual(@as(usize, 2), elements.len);
-}
-
-test "parseVecInvocation ignores a semicolon inside a block comment" {
-    const alloc = std.testing.allocator;
-    var invocation: expand.VecInvocation =
-        try expand.parseVecInvocation(alloc, "[1 /* ; */, 2]");
-    defer invocation.deinit(alloc);
-
-    const elements = switch (invocation) {
-        .elements => |items| items,
-        .repeat => {
-            try std.testing.expect(false);
-            return;
-        },
-    };
-
-    try std.testing.expectEqual(@as(usize, 2), elements.len);
 }
 
 test "isTestingAssert correctly identifies test assertion macros" {
@@ -1333,7 +1317,7 @@ test "cst skips disabled extern crates and preserves inner attributes" {
     });
 
     const src =
-        \\//! A documentation comment is CST trivia, not an item.
+        \\//! Crate documentation.
         \\#![no_std]
         \\#[cfg(feature = "alloc")]
         \\extern crate alloc as allocator;
@@ -1354,8 +1338,10 @@ test "cst skips disabled extern crates and preserves inner attributes" {
     try cst.extractFile(&ctx);
 
     try std.testing.expectEqual(@as(usize, 1), g.modules.items[0].items.len);
-    try std.testing.expectEqual(@as(usize, 1), g.modules.items[0].attributes.len);
-    try std.testing.expectEqualStrings("no_std", g.modules.items[0].attributes[0].name);
+    const no_std = for (g.modules.items[0].attributes) |attribute| {
+        if (std.mem.eql(u8, attribute.name, "no_std")) break attribute;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", no_std.meta);
 
     var found_extern = false;
     var found_function = false;
@@ -2544,4 +2530,610 @@ test "expression macro captures retain whitespace before delimiters" {
     const output = try expand.expandMacroRules(alloc, definition, "(buf, start + i, u32)");
     defer alloc.free(output);
     try std.testing.expectEqualStrings("(buf[start + i] as u32)", std.mem.trim(u8, output, " \t\r\n"));
+}
+
+// ── built-in macro shape audit ───────────────────────────────────────────────
+//
+// Every built-in macro the corpus uses is classified here and handed to the
+// frontend as a token-tree argument list (or a `vec!` element/repeat pair).
+// These tests pin that expanded SHAPE — the items, their order and their
+// count — because that is what the lowering consumes. Asserting the source
+// text would pin nothing: the same text yields a different shape as soon as
+// one comment, raw string or wildcard changes what the item scan sees.
+
+test "splitMacroArgs keeps comment and raw string bytes inside one argument" {
+    const alloc = std.testing.allocator;
+
+    {
+        // The comma lives in a comment, so it separates nothing: three
+        // arguments here would bind operands that the source never had.
+        const args = try expand.splitMacroArgs(alloc, "(a /*,*/ b, c)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("a /*,*/ b", args[0]);
+        try std.testing.expectEqualStrings("c", args[1]);
+    }
+    {
+        // A delimiter inside a comment opens no nesting level; if it did,
+        // every comma after it would stop being top level.
+        const args = try expand.splitMacroArgs(alloc, "(a /* ( ) ; */ b, c)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("a /* ( ) ; */ b", args[0]);
+        try std.testing.expectEqualStrings("c", args[1]);
+    }
+    {
+        // A line comment runs to the newline, and its comma stays in the
+        // argument it was written in.
+        const args = try expand.splitMacroArgs(alloc, "(a // ,\n b, c)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("a // ,\n b", args[0]);
+        try std.testing.expectEqualStrings("c", args[1]);
+    }
+    {
+        // A raw string ends at its own terminator, not at its first quote.
+        const args = try expand.splitMacroArgs(alloc, "(r#\"a\"b, c\"#, d)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("r#\"a\"b, c\"#", args[0]);
+        try std.testing.expectEqualStrings("d", args[1]);
+    }
+}
+
+test "splitMacroArgs pins the corpus assert family shapes" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect(expand.isTestingAssert(expand.identifyMacro("assert!")));
+    try std.testing.expect(expand.isTestingAssert(expand.identifyMacro("assert_eq!")));
+    try std.testing.expect(expand.isTestingAssert(expand.identifyMacro("assert_ne!")));
+    try std.testing.expect(!expand.isTestingAssert(expand.identifyMacro("format!")));
+
+    {
+        // No message: the condition is the whole argument list.
+        const args = try expand.splitMacroArgs(alloc, "(a > b)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 1), args.len);
+        try std.testing.expectEqualStrings("a > b", args[0]);
+    }
+    {
+        // With a message: condition, format literal, then its arguments.
+        const args = try expand.splitMacroArgs(alloc, "(a > b, \"a must exceed b: {}\", a)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 3), args.len);
+        try std.testing.expectEqualStrings("a > b", args[0]);
+        try std.testing.expectEqualStrings("\"a must exceed b: {}\"", args[1]);
+        try std.testing.expectEqualStrings("a", args[2]);
+    }
+    {
+        const args = try expand.splitMacroArgs(alloc, "(left, right)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("left", args[0]);
+        try std.testing.expectEqualStrings("right", args[1]);
+    }
+    {
+        const args = try expand.splitMacroArgs(
+            alloc,
+            "(left, right, \"{} != {}\", left, right)",
+        );
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 5), args.len);
+        try std.testing.expectEqualStrings("left", args[0]);
+        try std.testing.expectEqualStrings("right", args[1]);
+        try std.testing.expectEqualStrings("\"{} != {}\"", args[2]);
+        try std.testing.expectEqualStrings("left", args[3]);
+        try std.testing.expectEqualStrings("right", args[4]);
+    }
+    {
+        const args = try expand.splitMacroArgs(alloc, "(left, right, \"not equal\")");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 3), args.len);
+        try std.testing.expectEqualStrings("left", args[0]);
+        try std.testing.expectEqualStrings("right", args[1]);
+        try std.testing.expectEqualStrings("\"not equal\"", args[2]);
+    }
+    {
+        // A nested `matches!` is one condition: its own commas and its `_`
+        // wildcard stay inside it.
+        const args = try expand.splitMacroArgs(alloc, "(matches!(e, Some(Variant(_, b))), true)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("matches!(e, Some(Variant(_, b)))", args[0]);
+        try std.testing.expectEqualStrings("true", args[1]);
+    }
+}
+
+test "splitMacroArgs pins the write, writeln and format shapes" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(expand.MacroKind.write, expand.identifyMacro("write!"));
+    try std.testing.expectEqual(expand.MacroKind.writeln, expand.identifyMacro("writeln!"));
+    try std.testing.expectEqual(expand.MacroKind.format, expand.identifyMacro("format!"));
+    try std.testing.expectEqual(expand.MacroKind.format, expand.identifyMacro("std::format!"));
+
+    {
+        // writer, format literal, then one value per placeholder.
+        const args = try expand.splitMacroArgs(alloc, "(out, \"{}\", value)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 3), args.len);
+        try std.testing.expectEqualStrings("out", args[0]);
+        try std.testing.expectEqualStrings("\"{}\"", args[1]);
+        try std.testing.expectEqualStrings("value", args[2]);
+    }
+    {
+        // A comma inside the format literal is part of the literal.
+        const args = try expand.splitMacroArgs(alloc, "(out, \"{0},{1}\", a, b)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 4), args.len);
+        try std.testing.expectEqualStrings("out", args[0]);
+        try std.testing.expectEqualStrings("\"{0},{1}\"", args[1]);
+        try std.testing.expectEqualStrings("a", args[2]);
+        try std.testing.expectEqualStrings("b", args[3]);
+    }
+    {
+        // `writeln!(out)` carries the writer alone; the template is empty.
+        const args = try expand.splitMacroArgs(alloc, "(out)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 1), args.len);
+        try std.testing.expectEqualStrings("out", args[0]);
+    }
+    {
+        // `format!` has no writer: the literal is the first argument.
+        const args = try expand.splitMacroArgs(alloc, "(\"{} and {}\", a, b)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 3), args.len);
+        try std.testing.expectEqualStrings("\"{} and {}\"", args[0]);
+        try std.testing.expectEqualStrings("a", args[1]);
+        try std.testing.expectEqualStrings("b", args[2]);
+    }
+    {
+        // A raw string literal keeps its own commas and quotes, so the writer
+        // stays first and the values stay last.
+        const args = try expand.splitMacroArgs(alloc, "(out, r#\"a, \"b\"\"#, c)");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 3), args.len);
+        try std.testing.expectEqualStrings("out", args[0]);
+        try std.testing.expectEqualStrings("r#\"a, \"b\"\"#", args[1]);
+        try std.testing.expectEqualStrings("c", args[2]);
+    }
+}
+
+test "matches token trees keep both operands and their wildcards" {
+    const alloc = std.testing.allocator;
+
+    // `matches!` is not a built-in kind. It must survive expansion untouched so
+    // that the pattern it carries reaches the pattern lowering whole.
+    try std.testing.expectEqual(expand.MacroKind.custom, expand.identifyMacro("matches!"));
+    try std.testing.expectEqual(expand.MacroKind.custom, expand.identifyMacro("std::matches"));
+    try std.testing.expectEqual(expand.MacroKind.custom, expand.identifyMacro("core::matches!"));
+
+    {
+        const args = try expand.splitMacroArgs(
+            alloc,
+            "(limits, RangeLimits::HalfOpen(_) | RangeLimits::Closed(_))",
+        );
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("limits", args[0]);
+        try std.testing.expectEqualStrings(
+            "RangeLimits::HalfOpen(_) | RangeLimits::Closed(_)",
+            args[1],
+        );
+    }
+    {
+        const args = try expand.splitMacroArgs(alloc, "(&*body, Expr::Block(_) | Expr::Path(_))");
+        defer alloc.free(args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("&*body", args[0]);
+        try std.testing.expectEqualStrings("Expr::Block(_) | Expr::Path(_)", args[1]);
+    }
+}
+
+test "expandSourceMacros preserves every builtin invocation while expanding siblings" {
+    const allocator = std.testing.allocator;
+    var table = expand.MacroTable.init(allocator);
+    defer table.deinit();
+
+    var definition = try expand.parseMacroRulesDefinition(
+        allocator,
+        // `{2}` not `{ 2 }`: expansion is byte-preserving, so template padding
+        // lands in the output and would make the `const N` assertion below
+        // depend on whitespace the fixture chose, not on what it pins.
+        "macro_rules! two { () => {2}; }",
+    );
+    table.register(definition.name, definition) catch |err| {
+        definition.deinit(allocator);
+        return err;
+    };
+
+    const source =
+        \\fn probe(e: u8, x: i64, out: u8, y: i64) -> bool {
+        \\    matches!(e, Variant(_, 2))
+        \\}
+        \\const N: u8 = two!();
+        \\fn shapes(n: usize) {
+        \\    let a = vec![1, 2, 3];
+        \\    let b = vec![0u8; 4];
+        \\    let c = vec![7u8; n];
+        \\    assert!(x > 0, "x must be positive");
+        \\    assert_eq!(x, y);
+        \\    write!(out, "{}", x);
+        \\    format!("{} + {}", x, y);
+        \\}
+    ;
+    const expanded = try expand.expandSourceMacros(allocator, &table, source, .{});
+    defer allocator.free(expanded);
+
+    // The built-ins are not rewritten here — the frontend lowers them from the
+    // same token trees — so every separator and every `_` must still be there.
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "matches!(e, Variant(_, 2))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "vec![1, 2, 3]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "vec![0u8; 4]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "vec![7u8; n]") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, expanded, "assert!(x > 0, \"x must be positive\")") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "assert_eq!(x, y)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "write!(out, \"{}\", x)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "format!(\"{} + {}\", x, y)") != null);
+    // The sibling macro_rules! still expands, so the pass-through above is not
+    // the whole of what this pass does.
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "const N: u8 = 2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "two!") == null);
+}
+
+test "parseVecInvocation keeps every item of a corpus vec" {
+    const alloc = std.testing.allocator;
+
+    {
+        // A wildcard is an item. Dropping it — as a named-child walk drops an
+        // anonymous `_` — is what makes the backend bind the wrong element.
+        const raw = "[Pair(_, 2), 3]";
+        var invocation: expand.VecInvocation = try expand.parseVecInvocation(alloc, raw);
+        defer invocation.deinit(alloc);
+        const elements = switch (invocation) {
+            .elements => |items| items,
+            .repeat => {
+                try std.testing.expect(false);
+                return;
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 2), elements.len);
+        try std.testing.expectEqualStrings("Pair(_, 2)", elements[0]);
+        try std.testing.expectEqualStrings("3", elements[1]);
+        try std.testing.expectEqual(
+            @intFromPtr(raw[1..2].ptr),
+            @intFromPtr(elements[0].ptr),
+        );
+    }
+    {
+        // A semicolon inside a literal or a comment is not the repeat
+        // separator, and a comma inside a comment is not an item boundary.
+        const cases = [_]struct { raw: []const u8, first: []const u8, second: []const u8 }{
+            .{ .raw = "[\"left;right\", 7]", .first = "\"left;right\"", .second = "7" },
+            .{ .raw = "[r#\"left;right\"#, 7]", .first = "r#\"left;right\"#", .second = "7" },
+            .{ .raw = "[1 /* ; */, 7]", .first = "1 /* ; */", .second = "7" },
+            .{ .raw = "[a /* , */, c]", .first = "a /* , */", .second = "c" },
+            .{ .raw = "[a /* ( */, c]", .first = "a /* ( */", .second = "c" },
+        };
+        for (cases) |case| {
+            var invocation: expand.VecInvocation = try expand.parseVecInvocation(alloc, case.raw);
+            defer invocation.deinit(alloc);
+            const elements = switch (invocation) {
+                .elements => |items| items,
+                .repeat => {
+                    try std.testing.expect(false);
+                    return;
+                },
+            };
+            try std.testing.expectEqual(@as(usize, 2), elements.len);
+            try std.testing.expectEqualStrings(case.first, elements[0]);
+            try std.testing.expectEqualStrings(case.second, elements[1]);
+        }
+    }
+    {
+        // `vec![e; N]` is one element and one count, both borrowed from the
+        // token tree, never merged into a single item.
+        const raw = "[0u8; n]";
+        var invocation: expand.VecInvocation = try expand.parseVecInvocation(alloc, raw);
+        defer invocation.deinit(alloc);
+        const repeat = switch (invocation) {
+            .repeat => |parts| parts,
+            .elements => {
+                try std.testing.expect(false);
+                return;
+            },
+        };
+        try std.testing.expectEqualStrings("0u8", repeat.element);
+        try std.testing.expectEqualStrings("n", repeat.count);
+        try std.testing.expectEqual(
+            @intFromPtr(raw[1..2].ptr),
+            @intFromPtr(repeat.element.ptr),
+        );
+    }
+    {
+        // A block element keeps its own semicolons; only the top-level one
+        // separates the element from the count.
+        var invocation: expand.VecInvocation =
+            try expand.parseVecInvocation(alloc, "[{ let n = 2; n }; 3]");
+        defer invocation.deinit(alloc);
+        const repeat = switch (invocation) {
+            .repeat => |parts| parts,
+            .elements => {
+                try std.testing.expect(false);
+                return;
+            },
+        };
+        try std.testing.expectEqualStrings("{ let n = 2; n }", repeat.element);
+        try std.testing.expectEqualStrings("3", repeat.count);
+    }
+    {
+        // An empty vec has no elements and no repeat.
+        var invocation: expand.VecInvocation = try expand.parseVecInvocation(alloc, "[]");
+        defer invocation.deinit(alloc);
+        const elements = switch (invocation) {
+            .elements => |items| items,
+            .repeat => {
+                try std.testing.expect(false);
+                return;
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 0), elements.len);
+    }
+}
+
+test "macro_rules fragment captures ignore separators inside comments" {
+    const alloc = std.testing.allocator;
+    var definition = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! list_all { ($($e:expr),*) => { [$($e),*] }; }",
+    );
+    defer definition.deinit(alloc);
+
+    // The comma inside the comment is not the repetition separator, so the
+    // first capture is the whole `a /*,*/ b` expression. Truncating it at the
+    // comment's comma yields a fragment that does not parse.
+    const output = try expand.expandMacroRules(alloc, definition, "(a /*,*/ b, c)");
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "[a /*,*/ b,\nc]",
+        std.mem.trim(u8, output, " \t\r\n"),
+    );
+}
+
+test "macro_rules fragment captures ignore separators inside raw strings" {
+    const alloc = std.testing.allocator;
+    var definition = try expand.parseMacroRulesDefinition(
+        alloc,
+        "macro_rules! list_all { ($($e:expr),*) => { [$($e),*] }; }",
+    );
+    defer definition.deinit(alloc);
+
+    // The raw string holds a quote, so only its own terminator ends it; the
+    // comma it holds is not the repetition separator.
+    const output = try expand.expandMacroRules(alloc, definition, "(r#\"a\"b, c\"#, d)");
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "[r#\"a\"b, c\"#,\nd]",
+        std.mem.trim(u8, output, " \t\r\n"),
+    );
+}
+
+/// The block of a function whose body is a block, or null when it is not one.
+fn fnBodyBlock(rust_ir: *const ir.RustIr, fn_id: ir.spine.EntityId) ?exprs.BlockExpr {
+    const body_id = switch (rust_ir.bodies.bodies[fn_id]) {
+        .fn_ => |body| body.body,
+        else => return null,
+    };
+    return switch (rust_ir.bodies.exprs[body_id].kind) {
+        .block => |value| value,
+        else => return null,
+    };
+}
+
+/// The one expression statement of a function body, or null when the body is
+/// not exactly one expression statement.
+fn fnBodyStatementExpr(rust_ir: *const ir.RustIr, fn_id: ir.spine.EntityId) ?exprs.NodeId {
+    const block = fnBodyBlock(rust_ir, fn_id) orelse return null;
+    if (block.statements.len != 1 or block.tail != null) return null;
+    const statement = rust_ir.bodies.stmts[block.statements[0]];
+    return switch (statement.kind) {
+        .expr => |id| id,
+        else => null,
+    };
+}
+
+/// The condition node an assertion marker carries.
+fn assertionCondition(marker: exprs.Unsupported) ?exprs.NodeId {
+    const prefix = "assertion:";
+    if (!std.mem.startsWith(u8, marker.reason, prefix)) return null;
+    return std.fmt.parseUnsigned(exprs.NodeId, marker.reason[prefix.len..], 10) catch null;
+}
+
+test "pipeline expands the corpus vec forms into lowerable literal shapes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source =
+        \\pub fn vecs(n: usize) {
+        \\    let listed = vec![1, 2, 3];
+        \\    let counted = vec![0u8; 4];
+        \\    let computed = vec![7u8; n];
+        \\}
+    ;
+
+    const rust_ir = try pipeline.analyzeSource(allocator, "vec_macro_shapes", "2021", source);
+
+    var listed: ?exprs.VecLit = null;
+    var literal_repeat: ?exprs.VecLit = null;
+    var expression_repeat: ?exprs.VecLit = null;
+    for (rust_ir.bodies.exprs) |expr| {
+        const vector = switch (expr.kind) {
+            .vec_lit => |value| value,
+            else => continue,
+        };
+        const repeat = vector.repeat orelse {
+            listed = vector;
+            continue;
+        };
+        switch (repeat) {
+            .literal => literal_repeat = vector,
+            .expression => expression_repeat = vector,
+        }
+    }
+
+    const listed_vec = listed orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), listed_vec.elements.len);
+    for (listed_vec.elements, 0..) |element_id, index| {
+        const element = rust_ir.bodies.exprs[element_id];
+        const literal = switch (element.kind) {
+            .literal => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        const value = switch (literal) {
+            .int => |integer| integer.value,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(@as(i128, @intCast(index + 1)), value);
+    }
+
+    const counted = literal_repeat orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), counted.elements.len);
+    try std.testing.expectEqual(@as(u64, 4), counted.repeat.?.literal);
+
+    const computed = expression_repeat orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), computed.elements.len);
+    const count_expr = rust_ir.bodies.exprs[computed.repeat.?.expression];
+    try std.testing.expect(switch (count_expr.kind) {
+        .path => true,
+        else => false,
+    });
+}
+
+test "pipeline expands the assert family into markers over lowered conditions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source =
+        \\pub fn eq_check(a: i64, b: i64) {
+        \\    assert_eq!(a, b);
+        \\}
+        \\pub fn ne_check(a: i64, b: i64) {
+        \\    assert_ne!(a, b);
+        \\}
+        \\pub fn bare_check(a: i64) {
+        \\    assert!(a > 0);
+        \\}
+        \\pub fn message_check(a: i64, b: i64) {
+        \\    assert!(a > b, "a must exceed b");
+        \\}
+    ;
+
+    const rust_ir = try pipeline.analyzeSource(allocator, "assert_macro_shapes", "2021", source);
+
+    const cases = [_]struct {
+        fn_name: []const u8,
+        op: exprs.BinaryOp,
+        rhs_int: ?i128,
+    }{
+        .{ .fn_name = "eq_check", .op = .eq, .rhs_int = null },
+        .{ .fn_name = "ne_check", .op = .ne, .rhs_int = null },
+        .{ .fn_name = "bare_check", .op = .gt, .rhs_int = 0 },
+        .{ .fn_name = "message_check", .op = .gt, .rhs_int = null },
+    };
+    for (cases) |entry| {
+        const fn_id = findEntityId(&rust_ir.graph, .fn_, entry.fn_name) orelse
+            return error.TestUnexpectedResult;
+        const marker_id = fnBodyStatementExpr(&rust_ir, fn_id) orelse
+            return error.TestUnexpectedResult;
+        const marker = switch (rust_ir.bodies.exprs[marker_id].kind) {
+            .unsupported => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        // The marker names the condition node the backend asserts on, so the
+        // condition is a real expression rather than dropped macro text.
+        const condition_id = assertionCondition(marker) orelse
+            return error.TestUnexpectedResult;
+        if (condition_id >= rust_ir.bodies.exprs.len) return error.TestUnexpectedResult;
+        const condition = rust_ir.bodies.exprs[condition_id];
+        const binary = switch (condition.kind) {
+            .binary => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(entry.op, binary.op);
+        try std.testing.expect(binary.lhs != binary.rhs);
+        if (binary.lhs >= rust_ir.bodies.exprs.len) return error.TestUnexpectedResult;
+        if (binary.rhs >= rust_ir.bodies.exprs.len) return error.TestUnexpectedResult;
+        const lhs = rust_ir.bodies.exprs[binary.lhs];
+        try std.testing.expect(switch (lhs.kind) {
+            .path => true,
+            else => false,
+        });
+        const rhs = rust_ir.bodies.exprs[binary.rhs];
+        if (entry.rhs_int) |expected| {
+            const literal = switch (rhs.kind) {
+                .literal => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            const value = switch (literal) {
+                .int => |integer| integer.value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(expected, value);
+        } else {
+            try std.testing.expect(switch (rhs.kind) {
+                .path => true,
+                else => false,
+            });
+        }
+    }
+}
+
+test "pipeline expands the write family into a writer, a template and its values" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source =
+        \\pub struct Sink {
+        \\    count: u32,
+        \\}
+        \\pub fn emit(sink: &mut Sink, x: i64) {
+        \\    write!(sink, "v={}", x);
+        \\    writeln!(sink, "w={}", x);
+        \\}
+    ;
+
+    const rust_ir = try pipeline.analyzeSource(allocator, "write_macro_shapes", "2021", source);
+
+    var saw_write = false;
+    var saw_writeln = false;
+    for (rust_ir.bodies.exprs) |expr| {
+        const format_write = switch (expr.kind) {
+            .format_write => |value| value,
+            else => continue,
+        };
+        // One writer, one template and one lowered value per placeholder: the
+        // shape the Zig backend formats through.
+        try std.testing.expectEqual(@as(usize, 1), format_write.args.len);
+        if (format_write.writer >= rust_ir.bodies.exprs.len) return error.TestUnexpectedResult;
+        if (format_write.args[0] >= rust_ir.bodies.exprs.len) return error.TestUnexpectedResult;
+        try std.testing.expect(switch (rust_ir.bodies.exprs[format_write.writer].kind) {
+            .path => true,
+            else => false,
+        });
+        try std.testing.expect(switch (rust_ir.bodies.exprs[format_write.args[0]].kind) {
+            .path => true,
+            else => false,
+        });
+        if (std.mem.eql(u8, format_write.template, "v={}")) {
+            saw_write = true;
+        } else if (std.mem.eql(u8, format_write.template, "w={}\n")) {
+            saw_writeln = true;
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(saw_write);
+    try std.testing.expect(saw_writeln);
 }

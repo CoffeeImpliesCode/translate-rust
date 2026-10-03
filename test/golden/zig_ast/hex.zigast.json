@@ -6,6 +6,7 @@
   "files": [
     {
       "path": "src/root.zig",
+      "documentation": "Zig translation of Rust crate `hex`, module `crate root`.\n\nRust source documentation:\nEncoding and decoding hex strings.\nFor most cases, you can simply use the [`decode`], [`encode`] and\n[`encode_upper`] functions. If you need a bit more control, use the traits\n[`ToHex`] and [`FromHex`] instead.\n# Example\n```\n# #[cfg(not(feature = \"alloc\"))]\n# let mut output = [0; 0x18];\n#\n# #[cfg(not(feature = \"alloc\"))]\n# hex::encode_to_slice(b\"Hello world!\", &mut output).unwrap();\n#\n# #[cfg(not(feature = \"alloc\"))]\n# let hex_string = ::core::str::from_utf8(&output).unwrap();\n#\n# #[cfg(feature = \"alloc\")]\nlet hex_string = hex::encode(\"Hello world!\");\nprintln!(\"{}\", hex_string); // Prints \"48656c6c6f20776f726c6421\"\n# assert_eq!(hex_string, \"48656c6c6f20776f726c6421\");\n```\n\nZig consumer contract:\nImport the registered `hex` module through a build dependency; child\nmodules are reached through the crate's exported namespaces.\nRequires Zig 0.16.0. Target and optimization options belong to the consumer.\nRust names are preserved except native protocol hooks and name collisions.\nZig field access and value copying do not enforce Rust privacy or moves.\nPointers, slices and erased interfaces borrow their backing storage.\nRelease returned owned runtime storage with its creating allocator;\nassignment is not a deep clone and does not create a second cleanup owner.\nThis package does not supply a borrow checker or a process-wide allocator.\n\n```zig\nconst library = @import(\"hex\");\n```",
       "imports": [
         {
           "local_name": "std",
@@ -269,7 +270,8 @@
                       ]
                     }
                   },
-                  "generic_params": []
+                  "generic_params": [],
+                  "documentation": "Runs the translated Rust operation `new`."
                 }
               },
               {
@@ -655,23 +657,37 @@
                                                           },
                                                           "source": null,
                                                           "operand": {
-                                                            "kind": "bin_op",
-                                                            "op": "bit_and",
-                                                            "lhs": {
-                                                              "kind": "unary_op",
-                                                              "op": "deref",
-                                                              "operand": {
-                                                                "kind": "ident",
-                                                                "name": "byte"
+                                                            "kind": "builtin",
+                                                            "name": "bitCast",
+                                                            "args": [
+                                                              {
+                                                                "kind": "cast",
+                                                                "target": {
+                                                                  "kind": "prim",
+                                                                  "value": "isize"
+                                                                },
+                                                                "source": null,
+                                                                "operand": {
+                                                                  "kind": "bin_op",
+                                                                  "op": "bit_and",
+                                                                  "lhs": {
+                                                                    "kind": "unary_op",
+                                                                    "op": "deref",
+                                                                    "operand": {
+                                                                      "kind": "ident",
+                                                                      "name": "byte"
+                                                                    }
+                                                                  },
+                                                                  "rhs": {
+                                                                    "kind": "lit",
+                                                                    "value": {
+                                                                      "kind": "int",
+                                                                      "value": "15"
+                                                                    }
+                                                                  }
+                                                                }
                                                               }
-                                                            },
-                                                            "rhs": {
-                                                              "kind": "lit",
-                                                              "value": {
-                                                                "kind": "int",
-                                                                "value": "15"
-                                                              }
-                                                            }
+                                                            ]
                                                           }
                                                         }
                                                       ]
@@ -704,7 +720,8 @@
                       }
                     }
                   },
-                  "generic_params": []
+                  "generic_params": [],
+                  "documentation": "Runs the translated Rust operation `next`."
                 }
               },
               {
@@ -797,7 +814,8 @@
                       ]
                     }
                   },
-                  "generic_params": []
+                  "generic_params": [],
+                  "documentation": "Runs the translated Rust operation `size_hint`."
                 }
               },
               {
@@ -922,11 +940,13 @@
                       "name": "length"
                     }
                   },
-                  "generic_params": []
+                  "generic_params": [],
+                  "documentation": "Runs the translated Rust operation `len`."
                 }
               }
             ],
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Rust `BytesToHexChars` state with Zig value semantics."
           }
         },
         {
@@ -1200,7 +1220,8 @@
                 "name": "__r2z_owner"
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `encode_to_iter`.\n\n`allocator` supplies memory operations and cleanup; use an allocator\ncompatible with any pre-existing storage passed into this call.\n"
           }
         },
         {
@@ -1508,7 +1529,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `val`."
           }
         },
         {
@@ -1590,7 +1612,8 @@
                 }
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Encodes `data` as hex string using lowercase characters.\nLowercase characters are used (e.g. `f9b4ca`). The resulting string's\nlength is always even, each byte in `data` is always encoded using two hex\ndigits. Thus, the resulting string contains exactly twice as many bytes as\nthe input data.\n# Example\n```\nassert_eq!(hex::encode(\"Hello world!\"), \"48656c6c6f20776f726c6421\");\nassert_eq!(hex::encode(vec![1, 2, 3, 15, 16]), \"0102030f10\");\n```\n\n`allocator` supplies memory operations and cleanup; use an allocator\ncompatible with any pre-existing storage passed into this call.\nRelease each returned owned runtime payload once with the allocator used\nto create or grow it; see that runtime type's cleanup contract.\n"
           }
         },
         {
@@ -1672,7 +1695,8 @@
                 }
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Encodes `data` as hex string using uppercase characters.\nApart from the characters' casing, this works exactly like `encode()`.\n# Example\n```\nassert_eq!(hex::encode_upper(\"Hello world!\"), \"48656C6C6F20776F726C6421\");\nassert_eq!(hex::encode_upper(vec![1, 2, 3, 15, 16]), \"0102030F10\");\n```\n\n`allocator` supplies memory operations and cleanup; use an allocator\ncompatible with any pre-existing storage passed into this call.\nRelease each returned owned runtime payload once with the allocator used\nto create or grow it; see that runtime type's cleanup contract.\n"
           }
         },
         {
@@ -1762,7 +1786,8 @@
                 }
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Decodes a hex string into raw bytes.\nBoth, upper and lower case characters are valid in the input string and can\neven be mixed (e.g. `f9b4ca`, `F9B4CA` and `f9B4Ca` are all valid strings).\n# Example\n```\nassert_eq!(\nhex::decode(\"48656c6c6f20776f726c6421\"),\nOk(\"Hello world!\".to_owned().into_bytes())\n);\nassert_eq!(hex::decode(\"123\"), Err(hex::FromHexError::OddLength));\nassert!(hex::decode(\"foo\").is_err());\n```\n\n`allocator` supplies memory operations and cleanup; use an allocator\ncompatible with any pre-existing storage passed into this call.\nRelease each returned owned runtime payload once with the allocator used\nto create or grow it; see that runtime type's cleanup contract.\n"
           }
         },
         {
@@ -2378,7 +2403,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Decode a hex string into a mutable bytes slice.\nBoth, upper and lower case characters are valid in the input string and can\neven be mixed (e.g. `f9b4ca`, `F9B4CA` and `f9B4Ca` are all valid strings).\n# Example\n```\nlet mut bytes = [0u8; 4];\nassert_eq!(hex::decode_to_slice(\"6b697769\", &mut bytes as &mut [u8]), Ok(()));\nassert_eq!(&bytes, b\"kiwi\");\n```"
           }
         },
         {
@@ -2546,7 +2572,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `generate_iter`."
           }
         },
         {
@@ -2724,7 +2751,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `byte2hex`."
           }
         },
         {
@@ -3228,7 +3256,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Encodes some bytes into a mutable slice of bytes.\nThe output buffer, has to be able to hold at least `input.len() * 2` bytes,\notherwise this function will return an error.\n# Example\n```\n# use hex::FromHexError;\n# fn main() -> Result<(), FromHexError> {\nlet mut bytes = [0u8; 4 * 2];\nhex::encode_to_slice(b\"kiwi\", &mut bytes)?;\nassert_eq!(&bytes, b\"6b697769\");\n# Ok(())\n# }\n```"
           }
         },
         {
@@ -3342,7 +3371,8 @@
                 }
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `encode_hex`.\n\n`allocator` supplies memory operations and cleanup; use an allocator\ncompatible with any pre-existing storage passed into this call.\n"
           }
         },
         {
@@ -3456,7 +3486,8 @@
                 }
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `encode_hex_upper`.\n\n`allocator` supplies memory operations and cleanup; use an allocator\ncompatible with any pre-existing storage passed into this call.\n"
           }
         },
         {
@@ -3726,8 +3757,12 @@
                       "is_mut": true
                     },
                     {
-                      "kind": "expr_stmt",
-                      "expr": {
+                      "kind": "assign",
+                      "target": {
+                        "kind": "ident",
+                        "name": "_"
+                      },
+                      "val": {
                         "kind": "block",
                         "block": {
                           "label": "__r2z_collect_exit",
@@ -4232,7 +4267,12 @@
                                                                     "field_name": "unwrap_err"
                                                                   },
                                                                   "generic_args": [],
-                                                                  "args": []
+                                                                  "args": [
+                                                                    {
+                                                                      "kind": "ident",
+                                                                      "name": "allocator"
+                                                                    }
+                                                                  ]
                                                                 },
                                                                 "op": "assign"
                                                               },
@@ -4270,7 +4310,8 @@
                           ],
                           "expr": null
                         }
-                      }
+                      },
+                      "op": "assign"
                     }
                   ],
                   "expr": {
@@ -4396,7 +4437,8 @@
                 }
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`.\n\n`allocator` supplies memory operations and cleanup; use an allocator\ncompatible with any pre-existing storage passed into this call.\nRelease each returned owned runtime payload once with the allocator used\nto create or grow it; see that runtime type's cleanup contract.\n"
           }
         },
         {
@@ -4622,7 +4664,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -4848,7 +4891,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -5074,7 +5118,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -5300,7 +5345,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -5526,7 +5572,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -5752,7 +5799,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -5978,7 +6026,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -6204,7 +6253,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -6430,7 +6480,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -6656,7 +6707,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -6882,7 +6934,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -7108,7 +7161,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -7334,7 +7388,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -7560,7 +7615,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -7786,7 +7842,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -8012,7 +8069,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -8238,7 +8296,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -8464,7 +8523,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -8690,7 +8750,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -8916,7 +8977,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -9142,7 +9204,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -9368,7 +9431,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -9594,7 +9658,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -9820,7 +9885,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -10046,7 +10112,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -10272,7 +10339,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -10498,7 +10566,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -10724,7 +10793,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -10950,7 +11020,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -11176,7 +11247,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -11402,7 +11474,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -11628,7 +11701,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -11854,7 +11928,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -12080,7 +12155,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -12306,7 +12382,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -12532,7 +12609,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -12758,7 +12836,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -12984,7 +13063,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -13210,7 +13290,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -13436,7 +13517,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -13662,7 +13744,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -13888,7 +13971,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -14114,7 +14198,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -14340,7 +14425,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -14566,7 +14652,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -14792,7 +14879,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -15018,7 +15106,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -15244,7 +15333,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -15470,7 +15560,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -15696,7 +15787,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -15922,7 +16014,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -16148,7 +16241,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -16374,7 +16468,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -16600,7 +16695,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -16826,7 +16922,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -17052,7 +17149,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -17278,7 +17376,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -17504,7 +17603,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -17730,7 +17830,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -17956,7 +18057,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -18182,7 +18284,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -18408,7 +18511,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -18634,7 +18738,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -18860,7 +18965,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -19086,7 +19192,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -19312,7 +19419,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -19538,7 +19646,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -19764,7 +19873,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -19990,7 +20100,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -20216,7 +20327,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -20442,7 +20554,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -20668,7 +20781,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -20894,7 +21008,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -21120,7 +21235,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -21346,7 +21462,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -21572,7 +21689,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -21798,7 +21916,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -22024,7 +22143,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -22250,7 +22370,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -22476,7 +22597,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -22702,7 +22824,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -22928,7 +23051,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -23154,7 +23278,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -23380,7 +23505,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -23606,7 +23732,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -23832,7 +23959,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -24058,7 +24186,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -24284,7 +24413,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -24510,7 +24640,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -24736,7 +24867,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -24962,7 +25094,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -25188,7 +25321,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -25414,7 +25548,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -25640,7 +25775,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -25866,7 +26002,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -26092,7 +26229,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -26318,7 +26456,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -26544,7 +26683,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -26770,7 +26910,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -26996,7 +27137,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -27222,7 +27364,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -27448,7 +27591,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -27674,7 +27818,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -27900,7 +28045,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -28126,7 +28272,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -28352,7 +28499,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -28578,7 +28726,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -28804,7 +28953,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -29030,7 +29180,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -29256,7 +29407,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -29482,7 +29634,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -29708,7 +29861,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -29934,7 +30088,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -30160,7 +30315,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -30386,7 +30542,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -30612,7 +30769,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -30838,7 +30996,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -31064,7 +31223,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -31290,7 +31450,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -31516,7 +31677,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -31742,7 +31904,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -31968,7 +32131,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -32194,7 +32358,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -32420,7 +32585,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -32646,7 +32812,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -32872,7 +33039,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -33098,7 +33266,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -33324,7 +33493,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -33550,7 +33720,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -33776,7 +33947,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -34002,7 +34174,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -34228,7 +34401,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -34454,7 +34628,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -34680,7 +34855,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -34906,7 +35082,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -35132,7 +35309,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -35358,7 +35536,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -35584,7 +35763,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -35810,7 +35990,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -36036,7 +36217,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -36262,7 +36444,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -36488,7 +36671,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -36714,7 +36898,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -36940,7 +37125,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -37166,7 +37352,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -37392,7 +37579,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -37618,7 +37806,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -37844,7 +38033,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -38070,7 +38260,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -38296,7 +38487,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -38522,7 +38714,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -38748,7 +38941,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -38974,7 +39168,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -39200,7 +39395,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -39426,7 +39622,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -39652,7 +39849,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -39878,7 +40076,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -40104,7 +40303,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -40330,7 +40530,8 @@
                 ]
               }
             },
-            "generic_params": []
+            "generic_params": [],
+            "documentation": "Runs the translated Rust operation `from_hex`."
           }
         },
         {
@@ -40423,6 +40624,7 @@
     },
     {
       "path": "src/error.zig",
+      "documentation": "Zig translation of Rust crate `hex`, module `error`.\n\nZig consumer contract:\nImport the registered `hex` module through a build dependency; child\nmodules are reached through the crate's exported namespaces.\nRequires Zig 0.16.0. Target and optimization options belong to the consumer.\nRust names are preserved except native protocol hooks and name collisions.\nZig field access and value copying do not enforce Rust privacy or moves.\nPointers, slices and erased interfaces borrow their backing storage.\nRelease returned owned runtime storage with its creating allocator;\nassignment is not a deep clone and does not create a second cleanup owner.\nThis package does not supply a borrow checker or a process-wide allocator.\n\n```zig\nconst library = @import(\"hex\");\n```",
       "imports": [
         {
           "local_name": "std",
@@ -40476,28 +40678,31 @@
                     }
                   ]
                 },
-                "is_pub": true
+                "is_pub": true,
+                "documentation": "An invalid character was found. Valid ones are: `0...9`, `a...f`\nor `A...F`."
               },
               {
                 "name": "OddLength",
                 "ty": {
                   "kind": "void_type"
                 },
-                "is_pub": true
+                "is_pub": true,
+                "documentation": "A hex string's length needs to be even, as two digits correspond to\none byte."
               },
               {
                 "name": "InvalidStringLength",
                 "ty": {
                   "kind": "void_type"
                 },
-                "is_pub": true
+                "is_pub": true,
+                "documentation": "If the hex string is decoded into a fixed sized container, such as an\narray, the hex string's length * 2 has to match the container's\nlength."
               }
             ],
             "decls": [
               {
                 "kind": "fn_decl",
                 "value": {
-                  "name": "fmt",
+                  "name": "format",
                   "is_pub": true,
                   "is_test": false,
                   "params": [
@@ -40690,10 +40895,12 @@
                       ]
                     }
                   },
-                  "generic_params": []
+                  "generic_params": [],
+                  "documentation": "Runs the translated Rust operation `fmt`."
                 }
               }
-            ]
+            ],
+            "documentation": "The error type for decoding a hex string into `Vec<u8>` or `[u8; N]`."
           }
         }
       ],
@@ -40723,6 +40930,7 @@
     },
     {
       "path": "src/error/tests.zig",
+      "documentation": "Zig translation of Rust crate `hex`, module `tests`.\n\nZig consumer contract:\nImport the registered `hex` module through a build dependency; child\nmodules are reached through the crate's exported namespaces.\nRequires Zig 0.16.0. Target and optimization options belong to the consumer.\nRust names are preserved except native protocol hooks and name collisions.\nZig field access and value copying do not enforce Rust privacy or moves.\nPointers, slices and erased interfaces borrow their backing storage.\nRelease returned owned runtime storage with its creating allocator;\nassignment is not a deep clone and does not create a second cleanup owner.\nThis package does not supply a borrow checker or a process-wide allocator.\n\n```zig\nconst library = @import(\"hex\");\n```",
       "imports": [
         {
           "local_name": "std",
@@ -41240,6 +41448,7 @@
     },
     {
       "path": "src/test.zig",
+      "documentation": "Zig translation of Rust crate `hex`, module `test`.\n\nZig consumer contract:\nImport the registered `hex` module through a build dependency; child\nmodules are reached through the crate's exported namespaces.\nRequires Zig 0.16.0. Target and optimization options belong to the consumer.\nRust names are preserved except native protocol hooks and name collisions.\nZig field access and value copying do not enforce Rust privacy or moves.\nPointers, slices and erased interfaces borrow their backing storage.\nRelease returned owned runtime storage with its creating allocator;\nassignment is not a deep clone and does not create a second cleanup owner.\nThis package does not supply a borrow checker or a process-wide allocator.\n\n```zig\nconst library = @import(\"hex\");\n```",
       "imports": [
         {
           "local_name": "std",
@@ -41485,7 +41694,29 @@
                     }
                   }
                 },
-                "is_mut": false
+                "is_mut": true
+              },
+              {
+                "kind": "defer_stmt",
+                "expr": {
+                  "kind": "call",
+                  "callee": {
+                    "kind": "field_access",
+                    "target": {
+                      "kind": "ident",
+                      "name": "result_1"
+                    },
+                    "field_name": "deinit"
+                  },
+                  "generic_args": [],
+                  "args": [
+                    {
+                      "kind": "ident",
+                      "name": "allocator"
+                    }
+                  ]
+                },
+                "is_errdefer": false
               },
               {
                 "kind": "expr_stmt",
@@ -41664,50 +41895,6 @@
                         }
                       }
                     ]
-                  }
-                }
-              },
-              {
-                "kind": "expr_stmt",
-                "expr": {
-                  "kind": "block",
-                  "block": {
-                    "label": null,
-                    "stmts": [
-                      {
-                        "kind": "let_stmt",
-                        "name": "__r2z_release",
-                        "ty": null,
-                        "init": {
-                          "kind": "ident",
-                          "name": "result_1"
-                        },
-                        "is_mut": true
-                      },
-                      {
-                        "kind": "defer_stmt",
-                        "expr": {
-                          "kind": "call",
-                          "callee": {
-                            "kind": "field_access",
-                            "target": {
-                              "kind": "ident",
-                              "name": "__r2z_release"
-                            },
-                            "field_name": "deinit"
-                          },
-                          "generic_args": [],
-                          "args": [
-                            {
-                              "kind": "ident",
-                              "name": "allocator"
-                            }
-                          ]
-                        },
-                        "is_errdefer": false
-                      }
-                    ],
-                    "expr": null
                   }
                 }
               }
@@ -44024,7 +44211,12 @@
                               "field_name": "unwrap_err"
                             },
                             "generic_args": [],
-                            "args": []
+                            "args": [
+                              {
+                                "kind": "ident",
+                                "name": "allocator"
+                              }
+                            ]
                           },
                           {
                             "kind": "struct_init",
@@ -44129,7 +44321,12 @@
                               "field_name": "unwrap_err"
                             },
                             "generic_args": [],
-                            "args": []
+                            "args": [
+                              {
+                                "kind": "ident",
+                                "name": "allocator"
+                              }
+                            ]
                           },
                           {
                             "kind": "struct_init",
@@ -44264,7 +44461,12 @@
                               "field_name": "unwrap_err"
                             },
                             "generic_args": [],
-                            "args": []
+                            "args": [
+                              {
+                                "kind": "ident",
+                                "name": "allocator"
+                              }
+                            ]
                           },
                           {
                             "kind": "struct_init",
@@ -44617,7 +44819,12 @@
                               "field_name": "unwrap_err"
                             },
                             "generic_args": [],
-                            "args": []
+                            "args": [
+                              {
+                                "kind": "ident",
+                                "name": "allocator"
+                              }
+                            ]
                           },
                           {
                             "kind": "struct_init",

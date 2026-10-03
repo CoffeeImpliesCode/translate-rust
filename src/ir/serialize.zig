@@ -11,6 +11,7 @@ const items = @import("items.zig");
 const types = @import("types.zig");
 const exprs = @import("exprs.zig");
 const bodies_mod = @import("bodies.zig");
+const validate = @import("validate.zig");
 
 const Json = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
@@ -61,6 +62,21 @@ fn checkedU64(value: i128) !u64 {
     return @intCast(value);
 }
 
+/// Read a full-width `u64` count off the wire.
+///
+/// `std.json.Value.integer` is `i64`, so a count at or above 2^63 arrives as
+/// `number_string` carrying the raw digits. Both tags are the same unquoted
+/// JSON number on the wire; a token no `u64` holds, and a negative one, are
+/// `BadWireFormat` rather than a clamp or a truncation.
+fn decodeU64Count(v: Json) !u64 {
+    return switch (v) {
+        .integer => |i| try checkedU64(i),
+        .number_string => |digits| std.fmt.parseInt(u64, digits, 10) catch
+            error.BadWireFormat,
+        else => error.BadWireFormat,
+    };
+}
+
 fn reqU32(o: ObjectMap, key: []const u8) !u32 {
     const v = try req(o, key);
     return switch (v) {
@@ -70,11 +86,7 @@ fn reqU32(o: ObjectMap, key: []const u8) !u32 {
 }
 
 fn reqU64(o: ObjectMap, key: []const u8) !u64 {
-    const v = try req(o, key);
-    return switch (v) {
-        .integer => |i| try checkedU64(i),
-        else => error.BadWireFormat,
-    };
+    return decodeU64Count(try req(o, key));
 }
 
 fn reqBool(o: ObjectMap, key: []const u8) !bool {
@@ -89,6 +101,20 @@ fn reqOptBool(o: ObjectMap, key: []const u8) !?bool {
     return switch (try req(o, key)) {
         .bool => |value| value,
         .null => null,
+        else => error.BadWireFormat,
+    };
+}
+
+/// A boolean a wire may leave out, where absence means `false`.
+///
+/// Used only for a field whose own default is `false`, so an older wire that
+/// predates the key decodes to exactly what a writer that never set it would
+/// have produced. A present value of the wrong type is still a malformed
+/// wire, not an absent one.
+fn boolOrFalse(o: ObjectMap, key: []const u8) !bool {
+    const v = o.get(key) orelse return false;
+    return switch (v) {
+        .bool => |b| b,
         else => error.BadWireFormat,
     };
 }
@@ -142,11 +168,31 @@ fn reqStrArray(v: Json) ![]const u8 {
     };
 }
 
+/// Decode a float wire field.
+///
+/// The encoder writes every `f64` through `std.json`, which renders floats in
+/// decimal mode with no precision. That makes the emitted text depend on the
+/// magnitude: `1e-300` and `5e-324` carry a fraction or an exponent and come
+/// back as `float`, while `1e300`, `f64` max, and every other value whose
+/// shortest decimal form needs neither `.` nor `e` come back as a bare
+/// integer token. `std.json` keeps any integer token wider than `i64` as
+/// `number_string`, so that tag is the only one some finite `f64` values can
+/// reach. The token is still the shortest decimal that uniquely identifies
+/// the value, so parsing it back is bit-exact; `-0.0` reaches `float`
+/// directly because `std.json` never treats the literal `-0` as integer-like,
+/// and an integer token that fits `i64` keeps its value through
+/// `@floatFromInt`. A token no `f64` can hold is rejected rather than turned
+/// into an infinity, and string scalars stay invalid.
 fn reqFloat(o: ObjectMap, key: []const u8) !f64 {
     const v = try req(o, key);
     return switch (v) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
+        .number_string => |digits| blk: {
+            const parsed = std.fmt.parseFloat(f64, digits) catch return error.BadWireFormat;
+            if (!std.math.isFinite(parsed)) return error.BadWireFormat;
+            break :blk parsed;
+        },
         else => error.BadWireFormat,
     };
 }
@@ -159,17 +205,52 @@ fn reqOptionalId(o: ObjectMap, key: []const u8) !?exprs.NodeId {
     };
 }
 
-fn decodeRepeat(o: ObjectMap, key: []const u8) !?usize {
-    return switch (try req(o, key)) {
-        .integer => |i| {
-            if (i < 0 or i > @as(i128, std.math.maxInt(usize))) {
-                return error.BadWireFormat;
-            }
-            return @intCast(i);
+/// A stored `[e; N]` count: the number of elements the generated program
+/// states, not a host allocation size. Reading it is `u64`-wide so a count a
+/// 64-bit target can state survives any host.
+///
+/// `decodeExprKind` reads the count before it decodes the element id list, so
+/// a count no `u64` holds is rejected without having allocated any of the
+/// element data it would have described.
+///
+/// This reader is the fixed-length array's alone: `[e; N]` fixes its length
+/// at compile time, so a number is all it can hold. `vec![e; N]` reads its
+/// count through `decodeVecRepeatCount`, which adds the expression form.
+fn decodeRepeat(o: ObjectMap, key: []const u8) !?u64 {
+    const v = try req(o, key);
+    if (v == .null) return null;
+    const count = try decodeU64Count(v);
+    return count;
+}
+
+/// A stored `vec![e; N]` count: null, a number, or an expression node.
+///
+/// Null and a bare integer keep the exact meaning — and the exact bytes —
+/// they have always had, so a stored `vec![e; 13]` still reads as the count
+/// 13 it always did. The object form is the one addition, for a count the
+/// translator does not know until the target evaluates it.
+///
+/// That object is read strictly: exactly the keys `tag` and `value`, `tag`
+/// the string `expression`, `value` an integer node id. A third key, another
+/// tag, or a `value` that is not a node id is `BadWireFormat` — a count this
+/// decoder cannot read exactly is never one it is free to guess at.
+///
+/// The decoded count owns nothing: no allocation follows from reading it, so
+/// the element-list rollback `decodeExprKind` already performs stays whole,
+/// and the count is still read before the element list for the same reason
+/// `decodeRepeat` is.
+fn decodeVecRepeatCount(o: ObjectMap, key: []const u8) !?exprs.VecRepeatCount {
+    const v = try req(o, key);
+    switch (v) {
+        .null => return null,
+        .object => |count| {
+            if (count.count() != 2) return error.BadWireFormat;
+            const count_tag = try reqStr(count, "tag");
+            if (!std.mem.eql(u8, count_tag, "expression")) return error.BadWireFormat;
+            return .{ .expression = try reqU32(count, "value") };
         },
-        .null => null,
-        else => error.BadWireFormat,
-    };
+        else => return .{ .literal = try decodeU64Count(v) },
+    }
 }
 
 fn freeDecodedStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
@@ -525,10 +606,17 @@ fn freeDecodedFieldPatList(
     list.deinit(allocator);
 }
 
+/// Documentation decodes to the static `""` when the record carried none, and
+/// freeing a zero-length slice is not a valid deallocation.
+fn freeDecodedDocumentation(allocator: std.mem.Allocator, text: []const u8) void {
+    if (text.len != 0) allocator.free(text);
+}
+
 fn freeDecodedField(allocator: std.mem.Allocator, field: items.Field) void {
     allocator.free(field.name);
     freeDecodedType(allocator, field.ty);
     freeDecodedVisibility(allocator, field.visibility);
+    freeDecodedDocumentation(allocator, field.documentation);
 }
 
 fn freeDecodedFieldList(
@@ -554,6 +642,7 @@ fn freeDecodedVariantFields(allocator: std.mem.Allocator, fields: items.VariantF
 fn freeDecodedVariant(allocator: std.mem.Allocator, variant: items.Variant) void {
     allocator.free(variant.name);
     freeDecodedVariantFields(allocator, variant.fields);
+    freeDecodedDocumentation(allocator, variant.documentation);
 }
 
 fn freeDecodedVariantList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(items.Variant)) void {
@@ -691,7 +780,7 @@ fn decodeEntityKind(s: []const u8) !spine.EntityKind {
 
 fn decodeModule(allocator: std.mem.Allocator, v: Json) !graph.Module {
     const o = try getObj(v);
-    const id = @as(spine.EntityId, @intCast(try reqU32(o, "id")));
+    const id: spine.EntityId = @intCast(try reqU32(o, "id"));
     const kind = try decodeModuleKind(try reqStr(o, "kind"));
     const name = try allocator.dupe(u8, try reqStr(o, "name"));
     errdefer allocator.free(name);
@@ -723,7 +812,7 @@ fn decodeModule(allocator: std.mem.Allocator, v: Json) !graph.Module {
 
 fn decodeEntity(allocator: std.mem.Allocator, v: Json) !spine.Entity {
     const o = try getObj(v);
-    const id = @as(spine.EntityId, @intCast(try reqU32(o, "id")));
+    const id: spine.EntityId = @intCast(try reqU32(o, "id"));
     const kind = try decodeEntityKind(try reqStr(o, "kind"));
     const name = try allocator.dupe(u8, try reqStr(o, "name"));
     errdefer allocator.free(name);
@@ -742,6 +831,12 @@ fn decodeEntity(allocator: std.mem.Allocator, v: Json) !spine.Entity {
         .id = id,
         .kind = kind,
         .name = name,
+        // The name above was duplicated by THIS decoder, so the graph owns it
+        // whatever the encoder's copy said. Ownership is a fact about the
+        // allocation in this process, not a property of the Rust source, which
+        // is why it is not carried on the wire and why the decoder states it
+        // instead of trusting the field's default.
+        .name_owned = true,
         .span = span,
         .visibility = visibility,
         .parent = parent,
@@ -771,7 +866,7 @@ fn decodeUseDecl(allocator: std.mem.Allocator, v: Json) !graph.UseDecl {
         }
         break :blk .{ .external = .{ .path = external_path } };
     } else return error.BadWireFormat;
-    const id = @as(spine.EntityId, @intCast(try reqU32(o, "id")));
+    const id: spine.EntityId = @intCast(try reqU32(o, "id"));
     const local_name = try allocator.dupe(u8, try reqStr(o, "local_name"));
     errdefer allocator.free(local_name);
     const is_pub_export = try reqBool(o, "is_pub_export");
@@ -809,7 +904,11 @@ fn decodeDeps(allocator: std.mem.Allocator, v: Json) ![]const graph.CrateDep {
         const features = try decodeStringList(allocator, try req(d, "features"));
         errdefer freeDecodedStringList(allocator, features);
         const optional = try reqBool(d, "optional");
-        const id = @as(u32, @intCast(try reqU32(d, "id")));
+        // A wire written before this fact existed cannot answer it, and the
+        // honest reading of a missing answer is "not known to be empty" — the
+        // same value the field's own default gives.
+        const resolved_features_known_empty = try boolOrFalse(d, "resolved_features_known_empty");
+        const id: u32 = @intCast(try reqU32(d, "id"));
         if (index >= @as(usize, std.math.maxInt(u32)) or
             id != @as(u32, @intCast(index + 1)))
         {
@@ -825,6 +924,7 @@ fn decodeDeps(allocator: std.mem.Allocator, v: Json) ![]const graph.CrateDep {
             .optional = optional,
             .default_features = default_features,
             .features = features,
+            .resolved_features_known_empty = resolved_features_known_empty,
         });
         extern_name = null;
         local_alias = null;
@@ -882,7 +982,7 @@ fn decodeCharLit(allocator: std.mem.Allocator, v: Json) !exprs.CharLit {
     const o = try getObj(v);
     const text = try allocator.dupe(u8, try reqStr(o, "text"));
     errdefer allocator.free(text);
-    const value = @as(u32, @intCast(try reqU32(o, "value")));
+    const value: u32 = @intCast(try reqU32(o, "value"));
     return .{
         .text = text,
         .value = value,
@@ -1300,7 +1400,7 @@ fn decodeTypeList(allocator: std.mem.Allocator, v: Json) TypeDecodeError![]const
 
 fn decodeInstantiation(allocator: std.mem.Allocator, v: Json) !types.Instantiation {
     const o = try getObj(v);
-    const generic_id = @as(spine.EntityId, @intCast(try reqU32(o, "generic_id")));
+    const generic_id: spine.EntityId = @intCast(try reqU32(o, "generic_id"));
     const args_obj = try getObj(try req(o, "args"));
     const params = try decodeTypeList(allocator, try req(args_obj, "params"));
     errdefer freeDecodedTypeSlice(allocator, params);
@@ -1629,6 +1729,15 @@ fn decodeCoreFunction(s: []const u8) !exprs.CoreFunction {
     if (std.mem.eql(u8, s, "cmp_max")) return .cmp_max;
     if (std.mem.eql(u8, s, "default_value")) return .default_value;
     if (std.mem.eql(u8, s, "convert_from")) return .convert_from;
+    if (std.mem.eql(u8, s, "prim_from_le_bytes")) return .prim_from_le_bytes;
+    if (std.mem.eql(u8, s, "prim_to_le_bytes")) return .prim_to_le_bytes;
+    if (std.mem.eql(u8, s, "maybe_uninit_uninit")) return .maybe_uninit_uninit;
+    if (std.mem.eql(u8, s, "rng_fill_bytes_via_next")) return .rng_fill_bytes_via_next;
+    if (std.mem.eql(u8, s, "hash_write_primitive")) return .hash_write_primitive;
+    if (std.mem.eql(u8, s, "numeric_min_value")) return .numeric_min_value;
+    if (std.mem.eql(u8, s, "numeric_max_value")) return .numeric_max_value;
+    if (std.mem.eql(u8, s, "numeric_zero")) return .numeric_zero;
+    if (std.mem.eql(u8, s, "numeric_one")) return .numeric_one;
     return error.BadWireFormat;
 }
 
@@ -1817,7 +1926,7 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     }
     if (std.mem.eql(u8, tag, "vec_lit")) {
         const p = try getObj(val);
-        const repeat = try decodeRepeat(p, "repeat");
+        const repeat = try decodeVecRepeatCount(p, "repeat");
         return .{ .vec_lit = .{
             .elements = try decodeIdList(allocator, try req(p, "elements")),
             .repeat = repeat,
@@ -1849,18 +1958,25 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     if (std.mem.eql(u8, tag, "unit")) return .unit;
     if (std.mem.eql(u8, tag, "if_else")) {
         const q = try getObj(val);
+        const cond = try reqU32(q, "cond");
+        const then_ = try decodeBlockExpr(allocator, try req(q, "then"));
+        errdefer freeDecodedBlockExpr(allocator, then_);
         return .{ .if_else = .{
-            .cond = try reqU32(q, "cond"),
-            .then_ = try decodeBlockExpr(allocator, try req(q, "then")),
+            .cond = cond,
+            .then_ = then_,
             .@"else" = try decodeElseBranch(allocator, try req(q, "else")),
         } };
     }
     if (std.mem.eql(u8, tag, "if_let")) {
         const q = try getObj(val);
+        const pattern = try reqU32(q, "pattern");
+        const scrutinee = try reqU32(q, "scrutinee");
+        const then_ = try decodeBlockExpr(allocator, try req(q, "then"));
+        errdefer freeDecodedBlockExpr(allocator, then_);
         return .{ .if_let = .{
-            .pattern = try reqU32(q, "pattern"),
-            .scrutinee = try reqU32(q, "scrutinee"),
-            .then_ = try decodeBlockExpr(allocator, try req(q, "then")),
+            .pattern = pattern,
+            .scrutinee = scrutinee,
+            .then_ = then_,
             .@"else" = try decodeElseBranch(allocator, try req(q, "else")),
         } };
     }
@@ -1902,26 +2018,35 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     }
     if (std.mem.eql(u8, tag, "while_")) {
         const q = try getObj(val);
+        const cond = try reqU32(q, "cond");
+        const body = try decodeBlockExpr(allocator, try req(q, "body"));
+        errdefer freeDecodedBlockExpr(allocator, body);
         return .{ .while_ = .{
-            .cond = try reqU32(q, "cond"),
-            .body = try decodeBlockExpr(allocator, try req(q, "body")),
+            .cond = cond,
+            .body = body,
             .capture = try reqOptionalId(q, "capture"),
         } };
     }
     if (std.mem.eql(u8, tag, "for_")) {
         const q = try getObj(val);
+        const pattern = try reqU32(q, "pattern");
+        const iterable = try reqU32(q, "iterable");
+        const body = try decodeBlockExpr(allocator, try req(q, "body"));
+        errdefer freeDecodedBlockExpr(allocator, body);
         return .{ .for_ = .{
-            .pattern = try reqU32(q, "pattern"),
-            .iterable = try reqU32(q, "iterable"),
-            .body = try decodeBlockExpr(allocator, try req(q, "body")),
+            .pattern = pattern,
+            .iterable = iterable,
+            .body = body,
             .iter_kind = try decodeIterKind(allocator, try req(q, "iter_kind")),
         } };
     }
     if (std.mem.eql(u8, tag, "break_")) {
         const q = try getObj(val);
         const label = try reqOptStr(q, "label");
+        const owned_label: ?[]u8 = if (label) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (owned_label) |owned| allocator.free(owned);
         return .{ .break_ = .{
-            .label = if (label) |s| try allocator.dupe(u8, s) else null,
+            .label = owned_label,
             .value = try reqOptionalId(q, "value"),
         } };
     }
@@ -1978,7 +2103,7 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     }
     if (std.mem.eql(u8, tag, "struct_lit")) {
         const q = try getObj(val);
-        const def = @as(exprs.DefId, @intCast(try reqU32(q, "def")));
+        const def: exprs.DefId = @intCast(try reqU32(q, "def"));
         const fields_arr = switch (try req(q, "fields")) {
             .array => |a| a,
             else => return error.BadWireFormat,
@@ -2009,7 +2134,7 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     }
     if (std.mem.eql(u8, tag, "enum_variant")) {
         const q = try getObj(val);
-        const def = @as(exprs.DefId, @intCast(try reqU32(q, "def")));
+        const def: exprs.DefId = @intCast(try reqU32(q, "def"));
         const variant = try allocator.dupe(u8, try reqStr(q, "variant"));
         errdefer allocator.free(variant);
         const tuple_fields = try decodeIdList(allocator, try req(q, "tuple_fields"));
@@ -2093,7 +2218,7 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
         const base = try reqU32(q, "base");
         const field = try allocator.dupe(u8, try reqStr(q, "field"));
         errdefer allocator.free(field);
-        const resolved = @as(exprs.DefId, @intCast(try reqU32(q, "resolved")));
+        const resolved: exprs.DefId = @intCast(try reqU32(q, "resolved"));
         return .{ .field = .{
             .base = base,
             .field = field,
@@ -2110,10 +2235,13 @@ fn decodeExprKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !exp
     if (std.mem.eql(u8, tag, "cast")) {
         const q = try getObj(val);
         const kind = try decodeConversion(try reqStr(q, "conversion"));
+        const operand = try reqU32(q, "operand");
+        const source_type = try decodeType(allocator, try req(q, "source_type"));
+        errdefer freeDecodedType(allocator, source_type);
         return .{ .cast = .{
             .kind = kind,
-            .operand = try reqU32(q, "operand"),
-            .source_type = try decodeType(allocator, try req(q, "source_type")),
+            .operand = operand,
+            .source_type = source_type,
             .target = try reqU32(q, "target"),
         } };
     }
@@ -2287,7 +2415,7 @@ fn decodePatternKind(allocator: std.mem.Allocator, tag: []const u8, val: Json) !
     }
     if (std.mem.eql(u8, tag, "struct_pat")) {
         const t = try getObj(val);
-        const def = @as(exprs.DefId, @intCast(try reqU32(t, "def")));
+        const def: exprs.DefId = @intCast(try reqU32(t, "def"));
         const fields_arr = switch (try req(t, "fields")) {
             .array => |a| a,
             else => return error.BadWireFormat,
@@ -2406,6 +2534,20 @@ fn decodeStatement(allocator: std.mem.Allocator, v: Json) !exprs.Statement {
     };
 }
 
+/// Optional documentation metadata on a field or variant record. An absent
+/// key, a null, and an empty string all decode to the static `""` default, so
+/// a record without authored docs needs no allocation and nothing to free.
+fn decodeDocumentation(allocator: std.mem.Allocator, o: ObjectMap) ![]const u8 {
+    const raw = o.get("documentation") orelse return "";
+    const value = switch (raw) {
+        .string => |text| text,
+        .null => return "",
+        else => return error.BadWireFormat,
+    };
+    if (value.len == 0) return "";
+    return allocator.dupe(u8, value);
+}
+
 fn decodeField(allocator: std.mem.Allocator, v: Json) !items.Field {
     const o = try getObj(v);
     const name = try allocator.dupe(u8, try reqStr(o, "name"));
@@ -2417,11 +2559,13 @@ fn decodeField(allocator: std.mem.Allocator, v: Json) !items.Field {
         o.get("vis") orelse o.get("visibility") orelse return error.MissingField,
     );
     errdefer freeDecodedVisibility(allocator, visibility);
+    const span = try decodeSpan(try req(o, "span"));
     return .{
         .name = name,
         .ty = ty,
         .visibility = visibility,
-        .span = try decodeSpan(try req(o, "span")),
+        .span = span,
+        .documentation = try decodeDocumentation(allocator, o),
     };
 }
 
@@ -2439,15 +2583,15 @@ fn decodeParam(allocator: std.mem.Allocator, v: Json) !items.Param {
     };
 }
 
-fn decodeEnumKind(value: []const u8) !items.enum_kind {
+fn decodeEnumKind(value: []const u8) !items.EnumKind {
     if (std.mem.eql(u8, value, "c_like")) return .c_like;
     if (std.mem.eql(u8, value, "data")) return .data;
     if (std.mem.eql(u8, value, "mixed")) return .mixed;
     return error.BadWireFormat;
 }
 
-fn decodeIntRepr(value: []const u8) !items.int_repr {
-    return std.meta.stringToEnum(items.int_repr, value) orelse error.BadWireFormat;
+fn decodeIntRepr(value: []const u8) !items.IntRepr {
+    return std.meta.stringToEnum(items.IntRepr, value) orelse error.BadWireFormat;
 }
 
 fn decodeVariant(allocator: std.mem.Allocator, v: Json) !items.Variant {
@@ -2479,8 +2623,14 @@ fn decodeVariant(allocator: std.mem.Allocator, v: Json) !items.Variant {
         .null => null,
         else => return error.BadWireFormat,
     };
-    return .{ .name = name, .fields = fields, .discriminant = discriminant };
+    return .{
+        .name = name,
+        .fields = fields,
+        .discriminant = discriminant,
+        .documentation = try decodeDocumentation(allocator, o),
+    };
 }
+
 fn decodeParams(allocator: std.mem.Allocator, v: Json) ![]const items.Param {
     const arr = switch (v) {
         .array => |a| a,
@@ -2664,7 +2814,7 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
     if (std.mem.eql(u8, kind_str, "struct_")) {
         const so = try getObj(try req(o, "value"));
         const layout_name = try reqStr(so, "layout");
-        const layout: items.struct_kind = if (std.mem.eql(u8, layout_name, "named"))
+        const layout: items.StructKind = if (std.mem.eql(u8, layout_name, "named"))
             .named
         else if (std.mem.eql(u8, layout_name, "tuple"))
             .tuple
@@ -2674,6 +2824,13 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
             return error.BadWireFormat;
         const generic_params = try decodeStringList(allocator, try req(so, "generic_params"));
         errdefer freeDecodedStringList(allocator, generic_params);
+        // Optional and additive: a struct body written before this field
+        // existed carries no `generics` key, and reads back as `null` — the
+        // same value the frontend records for a declaration that spells no
+        // parameters and no `where` clause. No fixture already on disk has to
+        // change.
+        const generics = try decodeOptionalGenerics(allocator, so, "generics");
+        errdefer if (generics) |value| freeDecodedGenerics(allocator, value);
         const trait_bounds = try decodeStringList(allocator, try req(so, "trait_bounds"));
         errdefer freeDecodedStringList(allocator, trait_bounds);
         const fields = try decodeFields(allocator, try req(so, "fields"));
@@ -2683,6 +2840,7 @@ fn decodeBodyKind(allocator: std.mem.Allocator, v: Json) !BodyKind {
         const has_dynamic_resources = try reqBool(so, "has_dynamic_resources");
         return .{ .struct_ = .{
             .generic_params = generic_params,
+            .generics = generics,
             .trait_bounds = trait_bounds,
             .layout = layout,
             .fields = fields,
@@ -2790,6 +2948,7 @@ fn freeDecodedBodyFields(allocator: std.mem.Allocator, fields: []const items.Fie
         allocator.free(field.name);
         freeDecodedType(allocator, field.ty);
         freeDecodedVisibility(allocator, field.visibility);
+        freeDecodedDocumentation(allocator, field.documentation);
     }
     if (fields.len > 0) allocator.free(fields);
 }
@@ -2797,6 +2956,7 @@ fn freeDecodedBodyFields(allocator: std.mem.Allocator, fields: []const items.Fie
 fn freeDecodedBodyVariants(allocator: std.mem.Allocator, variants: []const items.Variant) void {
     for (variants) |variant| {
         allocator.free(variant.name);
+        freeDecodedDocumentation(allocator, variant.documentation);
         switch (variant.fields) {
             .none => {},
             .tuple => |fields| freeDecodedTypeSlice(allocator, fields),
@@ -3084,6 +3244,7 @@ fn freeDecodedBodyKind(allocator: std.mem.Allocator, body: BodyKind) void {
         },
         .struct_ => |struct_body| {
             freeDecodedStringList(allocator, struct_body.generic_params);
+            if (struct_body.generics) |generics| freeDecodedGenerics(allocator, generics);
             freeDecodedStringList(allocator, struct_body.trait_bounds);
             freeDecodedBodyFields(allocator, struct_body.fields);
             freeDecodedStructMethods(allocator, struct_body.methods);
@@ -3171,7 +3332,7 @@ fn validateBodySlot(
 
 fn decodeBodySlot(allocator: std.mem.Allocator, v: Json) !BodySlot {
     const o = try getObj(v);
-    const owner = @as(spine.EntityId, @intCast(try reqU32(o, "owner")));
+    const owner: spine.EntityId = @intCast(try reqU32(o, "owner"));
     const body = try decodeBodyKind(allocator, try req(o, "body"));
     return .{ .owner = owner, .body = body };
 }
@@ -3389,23 +3550,38 @@ fn decodeGraph(allocator: std.mem.Allocator, root_map: ObjectMap) !graph.CrateGr
 // Encode Helpers
 // ---------------------------------------------------------------------------
 
-fn freeValue(allocator: std.mem.Allocator, v: *Json) void {
-    switch (v.*) {
-        .object => |*o| {
-            var it = o.iterator();
-            while (it.next()) |entry| freeValue(allocator, entry.value_ptr);
-            o.deinit(allocator);
-        },
-        .array => |*ar| {
-            for (ar.items) |*item| freeValue(allocator, item);
-            ar.deinit();
-        },
-        else => {},
-    }
-}
-
 fn mkInt(x: anytype) Json {
     return .{ .integer = @intCast(x) };
+}
+
+/// Write a full-width `u64` count as an unquoted decimal number, never through
+/// `f64` and never through an `i64` that cannot hold it. `std.json` writes a
+/// `number_string` verbatim, so the wire form stays the same JSON number. The
+/// digits are owned by `allocator`, which `encode` backs with the per-call
+/// arena: they are copied into the wire bytes before that arena is released.
+fn mkCount(allocator: std.mem.Allocator, n: u64) !Json {
+    if (std.math.cast(i64, n)) |i| return .{ .integer = i };
+    return .{ .number_string = try std.fmt.allocPrint(allocator, "{d}", .{n}) };
+}
+
+/// Write a `vec![e; N]` count. Null and a literal number are written exactly
+/// as a stored count has always been written, so an expression-free literal
+/// round-trips to the bytes an older producer emitted; only an expression
+/// count grows the object form.
+fn encodeVecRepeatCount(
+    allocator: std.mem.Allocator,
+    repeat: ?exprs.VecRepeatCount,
+) !Json {
+    const count = repeat orelse return .{ .null = {} };
+    switch (count) {
+        .literal => |n| return try mkCount(allocator, n),
+        .expression => |expression| {
+            var count_object = ObjectMap.empty;
+            try count_object.put(allocator, "tag", .{ .string = "expression" });
+            try count_object.put(allocator, "value", mkInt(expression));
+            return .{ .object = count_object };
+        },
+    }
 }
 
 fn encodeOptStr(s: ?[]const u8) Json {
@@ -3551,6 +3727,9 @@ fn encodeDep(allocator: std.mem.Allocator, d: graph.CrateDep) !Json {
     try o.put(allocator, "optional", .{ .bool = d.optional });
     try o.put(allocator, "default_features", encodeOptBool(d.default_features));
     try o.put(allocator, "features", try encodeStringList(allocator, d.features));
+    try o.put(allocator, "resolved_features_known_empty", .{
+        .bool = d.resolved_features_known_empty,
+    });
     return .{ .object = o };
 }
 
@@ -4006,7 +4185,7 @@ fn encodeType(allocator: std.mem.Allocator, ty: types.Type) std.mem.Allocator.Er
             switch (a.len) {
                 .literal => |n| {
                     try lo.put(allocator, "kind", .{ .string = "literal" });
-                    try lo.put(allocator, "value", mkInt(n));
+                    try lo.put(allocator, "value", try mkCount(allocator, n));
                 },
                 .generic => |n| {
                     try lo.put(allocator, "kind", .{ .string = "generic" });
@@ -4207,14 +4386,17 @@ fn encodeExprKind(allocator: std.mem.Allocator, kind: exprs.ExprKind) !Json {
             try o.put(allocator, "kind", .{ .string = "array" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "elements", try encodeIdList(allocator, a.elements));
-            try vo.put(allocator, "repeat", if (a.repeat) |r| mkInt(r) else .{ .null = {} });
+            try vo.put(allocator, "repeat", if (a.repeat) |r|
+                try mkCount(allocator, r)
+            else
+                .{ .null = {} });
             try o.put(allocator, "value", .{ .object = vo });
         },
         .vec_lit => |v| {
             try o.put(allocator, "kind", .{ .string = "vec_lit" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "elements", try encodeIdList(allocator, v.elements));
-            try vo.put(allocator, "repeat", if (v.repeat) |r| mkInt(r) else .{ .null = {} });
+            try vo.put(allocator, "repeat", try encodeVecRepeatCount(allocator, v.repeat));
             try o.put(allocator, "value", .{ .object = vo });
         },
         .range => |v| {
@@ -4714,12 +4896,21 @@ fn encodeStringList(allocator: std.mem.Allocator, values: []const []const u8) !J
     return .{ .array = arr };
 }
 
+/// Documentation is additive metadata: an absent key decodes back to the
+/// empty default, so a record with no authored docs encodes exactly as it did
+/// before this field existed and needs no wire-format bump.
+fn encodeDocumentation(allocator: std.mem.Allocator, o: *ObjectMap, text: []const u8) !void {
+    if (text.len == 0) return;
+    try o.put(allocator, "documentation", .{ .string = text });
+}
+
 fn encodeField(allocator: std.mem.Allocator, field: items.Field) !Json {
     var o = ObjectMap.empty;
     try o.put(allocator, "name", .{ .string = field.name });
     try o.put(allocator, "ty", try encodeType(allocator, field.ty));
     try o.put(allocator, "visibility", try encodeVisibility(allocator, field.visibility));
     try o.put(allocator, "span", try encodeSpan(allocator, field.span));
+    try encodeDocumentation(allocator, &o, field.documentation);
     return .{ .object = o };
 }
 
@@ -4747,6 +4938,7 @@ fn encodeVariant(allocator: std.mem.Allocator, variant: items.Variant) !Json {
         .named => |named| try fields.put(allocator, "named", try encodeFields(allocator, named)),
     }
     try o.put(allocator, "fields", .{ .object = fields });
+    try encodeDocumentation(allocator, &o, variant.documentation);
     return .{ .object = o };
 }
 
@@ -4857,6 +5049,14 @@ fn encodeBodyKind(allocator: std.mem.Allocator, bk: BodyKind) !Json {
             try o.put(allocator, "kind", .{ .string = "struct_" });
             var vo = ObjectMap.empty;
             try vo.put(allocator, "generic_params", try encodeStringList(allocator, sb.generic_params));
+            try vo.put(
+                allocator,
+                "generics",
+                if (sb.generics) |generics|
+                    try encodeGenerics(allocator, generics)
+                else
+                    .{ .null = {} },
+            );
             try vo.put(allocator, "trait_bounds", try encodeStringList(allocator, sb.trait_bounds));
             try vo.put(allocator, "layout", .{ .string = @tagName(sb.layout) });
             try vo.put(allocator, "fields", try encodeFields(allocator, sb.fields));
@@ -5081,61 +5281,56 @@ fn nominalOwnerContext(
 ) !NominalContext {
     const entities = environment.entities;
     if (@as(usize, owner) >= entities.len) return error.InvalidEntityReference;
-    var parent_id = entities[owner].parent orelse return .{ .names = &.{} };
-    var depth: usize = 0;
-    while (depth < entities.len) : (depth += 1) {
-        if (@as(usize, parent_id) >= entities.len) return error.InvalidParent;
-        const parent = entities[parent_id];
-        switch (parent.kind) {
-            .impl_ => {
-                if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
-                    return error.InvalidBodyTable;
-                }
-                const impl_body = switch (environment.bodies.bodies[parent_id]) {
-                    .impl_ => |body| body,
-                    else => return error.BodyKindMismatch,
-                };
-                return .{
-                    .names = &.{},
-                    .params = if (impl_body.generics) |generics| generics.params else &.{},
+    const parent_id = entities[owner].parent orelse return .{ .names = &.{} };
+    if (@as(usize, parent_id) >= entities.len) return error.InvalidParent;
+    const parent = entities[parent_id];
+    switch (parent.kind) {
+        .impl_ => {
+            if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
+                return error.InvalidBodyTable;
+            }
+            const impl_body = switch (environment.bodies.bodies[parent_id]) {
+                .impl_ => |body| body,
+                else => return error.BodyKindMismatch,
+            };
+            return .{
+                .names = &.{},
+                .params = if (impl_body.generics) |generics| generics.params else &.{},
+                .implicit_self = true,
+                .self_entity = nominalConcreteSelfEntity(environment, impl_body.self_ty),
+            };
+        },
+        .struct_, .union_ => {
+            if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
+                return error.InvalidBodyTable;
+            }
+            const struct_body = switch (environment.bodies.bodies[parent_id]) {
+                .struct_ => |body| body,
+                else => return error.BodyKindMismatch,
+            };
+            return .{
+                .names = struct_body.generic_params,
+                .implicit_self = true,
+                .self_entity = parent.id,
+            };
+        },
+        .trait_ => {
+            if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
+                return error.InvalidBodyTable;
+            }
+            return switch (environment.bodies.bodies[parent_id]) {
+                .trait_ => |body| .{
+                    .names = body.generic_params,
+                    .params = if (body.generics) |generics| generics.params else &.{},
                     .implicit_self = true,
-                    .self_entity = nominalConcreteSelfEntity(environment, impl_body.self_ty),
-                };
-            },
-            .struct_, .union_ => {
-                if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
-                    return error.InvalidBodyTable;
-                }
-                const struct_body = switch (environment.bodies.bodies[parent_id]) {
-                    .struct_ => |body| body,
-                    else => return error.BodyKindMismatch,
-                };
-                return .{
-                    .names = struct_body.generic_params,
-                    .implicit_self = true,
-                    .self_entity = parent.id,
-                };
-            },
-            .trait_ => {
-                if (@as(usize, parent_id) >= environment.bodies.bodies.len) {
-                    return error.InvalidBodyTable;
-                }
-                return switch (environment.bodies.bodies[parent_id]) {
-                    .trait_ => |body| .{
-                        .names = body.generic_params,
-                        .params = if (body.generics) |generics| generics.params else &.{},
-                        .implicit_self = true,
-                    },
-                    .none => .{ .names = &.{}, .implicit_self = true },
-                    else => error.BodyKindMismatch,
-                };
-            },
-            .fn_, .module, .crate_ => return .{ .names = &.{} },
-            else => return error.InvalidParent,
-        }
-        parent_id = parent.parent orelse return .{ .names = &.{} };
+                },
+                .none => .{ .names = &.{}, .implicit_self = true },
+                else => error.BodyKindMismatch,
+            };
+        },
+        .fn_, .module, .crate_ => return .{ .names = &.{} },
+        else => return error.InvalidParent,
     }
-    return error.InvalidParent;
 }
 
 /// The generic context an owning `impl` lends to a method re-parented onto
@@ -5250,8 +5445,33 @@ fn validateNominalImplicitSelfPath(
     }
     if (path.segments.len == 1) return true;
     if (path.segments.len != 3) return error.InvalidTypePath;
-    const trait_segment = path.segments[1];
-    const assoc_segment = path.segments[2];
+    try validateNominalAssociatedProjection(
+        environment,
+        path.segments[1],
+        path.segments[2],
+    );
+    return true;
+}
+
+/// What a `<receiver>::Trait::Assoc` step has to satisfy whichever receiver it
+/// is written on: the middle segment resolves to the trait it names, and the
+/// terminal stays a NULL id naming an associated type that trait declares.
+///
+/// One predicate for both receivers, so `Self::Sealed::Buffer` and
+/// `I::Sealed::Buffer` cannot disagree about what the pair means.
+///
+/// The null terminal is the load-bearing half. An `impl`'s own
+/// `type Buffer = ...` is this projection already carried out for ONE concrete
+/// `I`, so a resolved terminal would let the first impl's layout stand in for
+/// the generic the signature is still written on. The trait slot must therefore
+/// resolve to the trait itself — a module or a type that merely sits at that
+/// position is not a projection — and it must be the entity the segment names,
+/// or the segment is spelling a declaration it does not reach.
+fn validateNominalAssociatedProjection(
+    environment: NominalEnvironment,
+    trait_segment: types.PathSegment,
+    assoc_segment: types.PathSegment,
+) !void {
     const trait_id = trait_segment.id orelse return error.UnresolvedTypePath;
     if (@as(usize, trait_id) >= environment.entities.len or
         environment.entities[trait_id].kind != .trait_ or
@@ -5268,9 +5488,44 @@ fn validateNominalImplicitSelfPath(
         };
     } else return error.InvalidEntityReference;
     for (trait_body.assoc_types) |assoc_type| {
-        if (std.mem.eql(u8, assoc_type.name, assoc_segment.name)) return true;
+        if (std.mem.eql(u8, assoc_type.name, assoc_segment.name)) return;
     }
     return error.UnresolvedTypePath;
+}
+
+/// The same step written on a generic parameter rather than on `Self`: `<I as
+/// private::Sealed>::Buffer` reaches the IR as `I::Sealed::Buffer`, the module
+/// prefix and the `as` clause already gone.
+///
+/// Exactly three segments, and the middle one is the only one allowed to carry
+/// an id. The head is a lexical parameter no declaration resolves, and the
+/// terminal stays the trait's own member name. Anything else is not this shape
+/// and keeps whatever the segment loop decided: a bare `T`, an unqualified
+/// `T::Assoc`, a `Self` receiver that `validateNominalImplicitSelfPath` already
+/// owns, and every ordinary module path are untouched.
+///
+/// An unresolved middle segment is what keeps the rule narrow. `T::enc::Iter`
+/// spells a module prefix after a parameter, which no declaration produces, so
+/// it is not claimed here and is left as it was.
+fn validateNominalGenericProjectionPath(
+    environment: NominalEnvironment,
+    path: types.Path,
+    context: NominalContext,
+) !bool {
+    if (path.segments.len != 3) return false;
+    const head = path.segments[0];
+    if (head.id != null) return false;
+    // `Self` is the implicit receiver, never a lexical parameter, and
+    // `validateNominalImplicitSelfPath` decides it wherever it is in scope.
+    if (std.mem.eql(u8, head.name, "Self")) return false;
+    if (!nominalNameKnown(context, head.name)) return false;
+    if (path.segments[1].id == null) return false;
+    try validateNominalAssociatedProjection(
+        environment,
+        path.segments[1],
+        path.segments[2],
+    );
+    return true;
 }
 
 fn validateNominalType(
@@ -5316,6 +5571,7 @@ fn validateNominalTypeContextDepth(
         .path => |path| {
             if (path.segments.len == 0) return error.InvalidTypePath;
             if (try validateNominalImplicitSelfPath(environment, path, context)) return;
+            if (try validateNominalGenericProjectionPath(environment, path, context)) return;
             var generic_root = false;
             for (path.segments, 0..) |segment, index| {
                 if (segment.name.len == 0) return error.InvalidTypePath;
@@ -5336,6 +5592,10 @@ fn validateNominalTypeContextDepth(
             }
         },
         .external_nominal => |external| {
+            if (external.path.len == 0) return error.InvalidTypePath;
+            if (external.path.len == 1 and std.mem.eql(u8, external.path[0], "_")) {
+                return error.IncompleteGenericMetadata;
+            }
             if (!isExternalRoot(environment, external.path)) {
                 return error.UnsupportedExternalNominalType;
             }
@@ -5417,21 +5677,6 @@ fn validateNominalTypeContextDepth(
     }
 }
 
-fn validateNominalFields(
-    environment: NominalEnvironment,
-    fields: []const items.Field,
-    generic_names: []const []const u8,
-) !void {
-    for (fields) |field| try validateNominalType(environment, field.ty, generic_names);
-}
-fn validateNominalPath(
-    environment: NominalEnvironment,
-    path: types.Path,
-    generic_names: []const []const u8,
-) !void {
-    return validateNominalPathContext(environment, path, .{ .names = generic_names });
-}
-
 fn validateNominalPathContext(
     environment: NominalEnvironment,
     path: types.Path,
@@ -5439,6 +5684,7 @@ fn validateNominalPathContext(
 ) !void {
     if (path.segments.len == 0) return error.InvalidTypePath;
     if (try validateNominalImplicitSelfPath(environment, path, context)) return;
+    if (try validateNominalGenericProjectionPath(environment, path, context)) return;
     var generic_root = false;
     for (path.segments, 0..) |segment, index| {
         if (segment.name.len == 0) return error.InvalidTypePath;
@@ -5455,14 +5701,6 @@ fn validateNominalPathContext(
             return error.UnresolvedTypePath;
         }
     }
-}
-
-fn validateNominalTraitPath(
-    environment: NominalEnvironment,
-    path: types.Path,
-    generic_names: []const []const u8,
-) !void {
-    return validateNominalTraitPathContext(environment, path, .{ .names = generic_names });
 }
 
 fn validateNominalTraitPathContext(
@@ -5551,14 +5789,6 @@ fn validateNominalBoundContextDepth(
         context,
         depth + 1,
     );
-}
-
-fn validateNominalBounds(
-    environment: NominalEnvironment,
-    bounds: []const types.Bound,
-    generic_names: []const []const u8,
-) !void {
-    return validateNominalBoundsContext(environment, bounds, .{ .names = generic_names });
 }
 
 fn validateNominalBoundsContext(
@@ -5866,6 +6096,21 @@ fn nominalCoreCallArity(function: exprs.CoreFunction) NominalCoreCallArity {
         .cmp_max => .{ .generic_count = 1, .value_count = 2 },
         .default_value => .{ .generic_count = 1, .value_count = 0 },
         .convert_from => .{ .generic_count = 1, .value_count = 1 },
+        // The little-endian byte-image pair and the uninitialised element.
+        // are the same counts `validate.coreCallArity` enforces, kept in step
+        // deliberately: this pass runs against the nominal IR the sidecar
+        // carries and that pass runs against the translated one, and a wire
+        // that decoded an arity the translator then rejects would blame the
+        // wrong stage.
+        .prim_from_le_bytes => .{ .generic_count = 1, .value_count = 1 },
+        .prim_to_le_bytes => .{ .generic_count = 1, .value_count = 1 },
+        .maybe_uninit_uninit => .{ .generic_count = 1, .value_count = 0 },
+        // `fill_bytes_via_next` fills its destination in place, so it names no
+        // generic argument — the receiver's own type is the generator — and
+        // takes the receiver plus the slice.
+        .rng_fill_bytes_via_next => .{ .generic_count = 0, .value_count = 2 },
+        .hash_write_primitive => .{ .generic_count = 1, .value_count = 2 },
+        .numeric_min_value, .numeric_max_value, .numeric_zero, .numeric_one => .{ .generic_count = 1, .value_count = 0 },
     };
 }
 
@@ -5881,6 +6126,7 @@ fn validateNominalCoreFunction(
     for (function.generic_args) |argument| {
         try validateNominalTypeContext(environment, argument, context);
     }
+    try validate.validateCoreFunctionTypes(function);
 }
 
 fn validateNominalCoreCall(
@@ -5989,7 +6235,7 @@ fn validateNominalContextualTypeRef(
     context: NominalContext,
     context_seen: *NominalContextSeen,
 ) !void {
-    const index = @as(usize, id);
+    const index: usize = id;
     if (index >= environment.bodies.types.len) return error.InvalidTypeRef;
     markNominalBodyTypeSeen(context_seen, index);
     try validateNominalTypeContext(environment, environment.bodies.types[index], context);
@@ -6005,7 +6251,7 @@ fn validateNominalContextualRootType(
     context: NominalContext,
     context_seen: *NominalContextSeen,
 ) !void {
-    const index = @as(usize, id);
+    const index: usize = id;
     if (index >= root_types.len) return error.InvalidTypeRef;
     markNominalRootTypeSeen(context_seen, index);
     try validateNominalTypeContext(environment, root_types[index], context);
@@ -6025,6 +6271,41 @@ fn validateNominalContextualClosure(
     }
     if (closure.return_ty) |return_ty| {
         try validateNominalContextualTypeRef(environment, return_ty, context, context_seen);
+    }
+}
+
+/// The count a `vec![e; n]` repeats is `usize` by the language, so the node
+/// that produces it has to say so.
+///
+/// The type is read off the node and resolved in the OWNER's lexical scope
+/// before it is compared, exactly like every other operand type — a count
+/// written on a parameter is only that parameter if the owner binds the name.
+/// No type is invented for an unattributed count: inference owes that node one,
+/// and a count read without one would be a number the IR never established.
+///
+/// The check is on the operand's type, never on a walk of it: the node is
+/// reached once by `validateNominalContextualNode` like any other child, and
+/// this only reads what that node already says about itself.
+fn validateNominalVecRepeatCountType(
+    environment: NominalEnvironment,
+    count: exprs.NodeId,
+    context: NominalContext,
+    context_seen: *NominalContextSeen,
+) !void {
+    if (@as(usize, count) >= environment.bodies.exprs.len) return error.InvalidExprRef;
+    const type_id = environment.bodies.exprs[count].ty orelse
+        return error.IncompleteGenericMetadata;
+    // Reads the type in context first, so a row no table holds is
+    // `InvalidTypeRef` before anything indexes it, and so a parameter is
+    // compared as the type the owner binds rather than as the name written.
+    try validateNominalContextualTypeRef(environment, type_id, context, context_seen);
+    switch (environment.bodies.types[type_id]) {
+        .prim => |primitive| if (primitive != .usize) return error.UnsupportedType,
+        // A parameter the owner binds arrives here as a path, and the
+        // contextual read above has already resolved it against that owner —
+        // the same answer `isNumericCoreType` gives an operand count.
+        .path, .generic_inst => {},
+        else => return error.UnsupportedType,
     }
 }
 
@@ -6051,7 +6332,19 @@ fn validateNominalContextualExpr(
                 try validateNominalTypeContext(environment, argument, context);
             }
         },
-        .core_call => |call| try validateNominalCoreCall(environment, call, context),
+        .vec_lit => |vector| if (vector.repeat) |count| switch (count) {
+            .expression => |count_node| try validateNominalVecRepeatCountType(
+                environment,
+                count_node,
+                context,
+                context_seen,
+            ),
+            .literal => {},
+        },
+        .core_call => |call| {
+            try validateNominalCoreCall(environment, call, context);
+            try validate.validateCoreCallTypes(environment.bodies, expression);
+        },
         .core_function => |function| try validateNominalCoreFunction(environment, function, context),
         .external_variant => |variant| {
             try validateNominalExternalVariant(environment, variant, context);
@@ -6115,7 +6408,7 @@ fn validateNominalContextualNode(
 ) !void {
     switch (node) {
         .expression => |id| {
-            const index = @as(usize, id);
+            const index: usize = id;
             context_seen.expressions[index] = true;
             try validateNominalContextualExpr(
                 environment,
@@ -6126,7 +6419,7 @@ fn validateNominalContextualNode(
             );
         },
         .statement => |id| {
-            const index = @as(usize, id);
+            const index: usize = id;
             const statement = environment.bodies.stmts[index];
             context_seen.statements[index] = true;
             if (statement.ty) |type_id| {
@@ -6147,7 +6440,7 @@ fn validateNominalContextualNode(
             }
         },
         .pattern => |id| {
-            const index = @as(usize, id);
+            const index: usize = id;
             const pattern = environment.bodies.pats[index];
             context_seen.patterns[index] = true;
             if (pattern.ty) |type_id| {
@@ -6558,9 +6851,13 @@ fn validateNominalTables(
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Encode a `RustIr` instance into a JSON string.
-/// The returned slice is allocated with `allocator` and must be freed by caller.
+/// Encode a `RustIr` into JSON. The caller frees the result with `allocator`.
+/// Releases temporary encoding allocations on success and failure.
 pub fn encode(allocator: std.mem.Allocator, ir_data: *const RustIr) ![]const u8 {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const scratch_allocator = scratch.allocator();
+
     try ir_data.graph.validateTopology();
     if (ir_data.crate_name.len == 0) return error.MissingField;
     if (ir_data.edition.len == 0) return error.MissingField;
@@ -6576,7 +6873,7 @@ pub fn encode(allocator: std.mem.Allocator, ir_data: *const RustIr) ![]const u8 
     }
     try validateNominalTables(
         .{
-            .allocator = allocator,
+            .allocator = scratch_allocator,
             .entities = ir_data.graph.symbol_table.entities.items,
             .bodies = &ir_data.bodies,
             .crates = ir_data.graph.crates.items,
@@ -6586,42 +6883,48 @@ pub fn encode(allocator: std.mem.Allocator, ir_data: *const RustIr) ![]const u8 
     );
 
     var root_map = ObjectMap.empty;
-    try root_map.put(allocator, "format_version", mkInt(wire_format_version));
-    try root_map.put(allocator, "crate_name", .{ .string = ir_data.crate_name });
-    try root_map.put(allocator, "edition", .{ .string = ir_data.edition });
-    try root_map.put(allocator, "sidecar", encodeOptStr(ir_data.graph.sidecar));
-    try root_map.put(allocator, "toolchain", encodeOptStr(ir_data.graph.toolchain));
+    try root_map.put(scratch_allocator, "format_version", mkInt(wire_format_version));
+    try root_map.put(scratch_allocator, "crate_name", .{ .string = ir_data.crate_name });
+    try root_map.put(scratch_allocator, "edition", .{ .string = ir_data.edition });
+    try root_map.put(scratch_allocator, "sidecar", encodeOptStr(ir_data.graph.sidecar));
+    try root_map.put(scratch_allocator, "toolchain", encodeOptStr(ir_data.graph.toolchain));
 
-    var crates_arr = Array.init(allocator);
+    var crates_arr = Array.init(scratch_allocator);
     for (ir_data.graph.crates.items) |c| {
-        const member = try crateMembers(allocator, &ir_data.graph, c.root);
-        defer allocator.free(member);
-        try crates_arr.append(try encodeCrate(allocator, &ir_data.graph, c, member));
+        const member = try crateMembers(scratch_allocator, &ir_data.graph, c.root);
+        try crates_arr.append(try encodeCrate(scratch_allocator, &ir_data.graph, c, member));
     }
-    try root_map.put(allocator, "crates", .{ .array = crates_arr });
-    try root_map.put(allocator, "types", try encodeTypeList(allocator, ir_data.types));
+    try root_map.put(scratch_allocator, "crates", .{ .array = crates_arr });
     try root_map.put(
-        allocator,
-        "instantiations",
-        try encodeInstantiations(allocator, ir_data.instantiations),
+        scratch_allocator,
+        "types",
+        try encodeTypeList(scratch_allocator, ir_data.types),
     );
     try root_map.put(
-        allocator,
+        scratch_allocator,
+        "instantiations",
+        try encodeInstantiations(scratch_allocator, ir_data.instantiations),
+    );
+    try root_map.put(
+        scratch_allocator,
         "bodies",
         try encodeBodies(
-            allocator,
+            scratch_allocator,
             &ir_data.bodies,
             ir_data.graph.symbol_table.entities.items,
         ),
     );
 
-    var root_val: Json = .{ .object = root_map };
-    defer freeValue(allocator, &root_val);
+    // The only allocation that outlives this call: the wire bytes, copied out
+    // of the arena tree before `defer` releases it.
+    const root_val: Json = .{ .object = root_map };
     return std.json.Stringify.valueAlloc(allocator, root_val, .{});
 }
 
 /// Decode a canonical v6 JSON string into a `RustIr` instance.
-/// Allocations made during decoding use `allocator`.
+/// Use a caller-owned arena and keep it alive until all uses of the result finish.
+/// `RustIr` has no whole-value deinitializer. Release the arena after use.
+/// Invalid JSON returns `InvalidJson`; allocation failures return `OutOfMemory`.
 pub fn decode(allocator: std.mem.Allocator, json_bytes: []const u8) !RustIr {
     var parsed = std.json.parseFromSlice(Json, allocator, json_bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -6947,4 +7250,476 @@ test "encode rejects an unknown type on a leftover operator operand" {
     const ir_data = try leftoverOperandIr(allocator, "Undeclared");
 
     try std.testing.expectError(error.UnresolvedTypePath, encode(allocator, &ir_data));
+}
+
+/// Push one float literal through the exact seam that fails in production:
+/// `encodeFloatLit` builds the value node, `std.json` renders the `f64` to
+/// wire text, the parser re-tags that text by magnitude, and `decodeFloatLit`
+/// reads it back.
+fn floatLitRoundTripValue(allocator: std.mem.Allocator, value: f64) !f64 {
+    const encoded = try encodeFloatLit(allocator, .{ .text = "0.0", .value = value });
+    const bytes = try std.json.Stringify.valueAlloc(allocator, encoded, .{});
+    var parsed = try std.json.parseFromSlice(Json, allocator, bytes, .{});
+    defer parsed.deinit();
+    return (try decodeFloatLit(allocator, parsed.value)).value;
+}
+
+/// Decode a float literal node from hand-written wire text.
+fn decodeFloatLitFromText(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) !exprs.FloatLit {
+    var parsed = try std.json.parseFromSlice(Json, allocator, bytes, .{});
+    defer parsed.deinit();
+    return decodeFloatLit(allocator, parsed.value);
+}
+
+test "float literals round-trip bit-exactly at both ends of the f64 range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // `1e300` and `f64` max render as bare integer tokens wider than `i64`,
+    // `1e-300` and `5e-324` render with a fraction, and both signed zeros
+    // render as `0` and `-0`. Every value must come back with its own bits,
+    // whichever parser tag its text earns.
+    const values = [_]f64{
+        1e300,
+        1e-300,
+        std.math.floatMax(f64),
+        5e-324,
+        0.0,
+        -0.0,
+    };
+    for (values) |value| {
+        const decoded = try floatLitRoundTripValue(allocator, value);
+        const encoded_bits: u64 = @bitCast(value);
+        const decoded_bits: u64 = @bitCast(decoded);
+        try std.testing.expectEqual(encoded_bits, decoded_bits);
+    }
+}
+
+test "a float literal value no f64 can hold is rejected" {
+    // `1e400` parses to an infinity, which no `f64` literal can stand for.
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeFloatLitFromText(std.testing.allocator,
+            \\{"text":"1e400","value":1e400}
+        ),
+    );
+}
+
+test "a float literal value carried as a string is rejected" {
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeFloatLitFromText(std.testing.allocator,
+            \\{"text":"1.5","value":"1.5"}
+        ),
+    );
+}
+
+test "a float literal node missing its value is a missing field" {
+    try std.testing.expectError(
+        error.MissingField,
+        decodeFloatLitFromText(std.testing.allocator,
+            \\{"text":"1.5"}
+        ),
+    );
+}
+
+test "a malformed float literal value releases the text it already copied" {
+    // `decodeFloatLit` copies `text` before reading `value`, so the bool must
+    // fail with the copy already released rather than leaking it.
+    var parsed = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{"text":"1.5","value":true}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeFloatLit(std.testing.allocator, parsed.value),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `decodeExprKind` decoder rollback
+// ---------------------------------------------------------------------------
+//
+// Each arm below decodes one owned payload — a block, a label, a source type —
+// before it reads a field that can still fail. A wire document rejected on that
+// later read has to hand the owned payload back: the decoder promises the
+// caller ownership of everything it allocates, and an `ArenaAllocator` in the
+// production driver hid the difference. The malformed payloads below all fail
+// *after* the owned field is allocated, for both rejection classes a late
+// scalar can carry (a missing key, a wrong-typed or unknown value), and the
+// valid payload behind each one is decoded, inspected, and released so the
+// sweep over allocation failures walks the same rollback with every other
+// allocation point failed in turn.
+
+fn checkIfElseExprKindRollback(allocator: std.mem.Allocator, value: Json) !void {
+    const decoded = try decodeExprKind(allocator, "if_else", value);
+    defer freeDecodedExprKind(allocator, decoded);
+    try std.testing.expect(decoded == .if_else);
+    try std.testing.expectEqual(@as(exprs.NodeId, 1), decoded.if_else.cond);
+    const then_block = decoded.if_else.then_;
+    try std.testing.expectEqualSlices(exprs.NodeId, &.{ 2, 3 }, then_block.statements);
+    try std.testing.expectEqual(@as(?exprs.NodeId, 4), then_block.tail);
+    try std.testing.expectEqualStrings("then", then_block.labelled.?);
+    try std.testing.expect(decoded.if_else.@"else" == .block);
+    const otherwise = decoded.if_else.@"else".block;
+    try std.testing.expectEqualSlices(exprs.NodeId, &.{5}, otherwise.statements);
+    try std.testing.expectEqual(@as(?exprs.NodeId, null), otherwise.tail);
+    try std.testing.expectEqualStrings("otherwise", otherwise.labelled.?);
+}
+
+test "if_else decoder rollback releases the then block when the else is malformed" {
+    // The then block is decoded — and its statement list and label copy
+    // allocated — before the else branch is read at all.
+    var unknown_branch = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "cond": 1,
+        \\  "then": {"statements":[2,3],"tail":4,"labelled":"then"},
+        \\  "else": {"kind":"mystery"}
+        \\}
+    , .{});
+    defer unknown_branch.deinit();
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeExprKind(std.testing.allocator, "if_else", unknown_branch.value),
+    );
+
+    var untagged_branch = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "cond": 1,
+        \\  "then": {"statements":[2,3],"tail":4,"labelled":"then"},
+        \\  "else": {}
+        \\}
+    , .{});
+    defer untagged_branch.deinit();
+    try std.testing.expectError(
+        error.MissingField,
+        decodeExprKind(std.testing.allocator, "if_else", untagged_branch.value),
+    );
+
+    var valid = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "cond": 1,
+        \\  "then": {"statements":[2,3],"tail":4,"labelled":"then"},
+        \\  "else": {"kind":"block","value":{"statements":[5],"tail":null,"labelled":"otherwise"}}
+        \\}
+    , .{});
+    defer valid.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkIfElseExprKindRollback,
+        .{valid.value},
+    );
+}
+
+fn checkIfLetExprKindRollback(allocator: std.mem.Allocator, value: Json) !void {
+    const decoded = try decodeExprKind(allocator, "if_let", value);
+    defer freeDecodedExprKind(allocator, decoded);
+    try std.testing.expect(decoded == .if_let);
+    try std.testing.expectEqual(@as(exprs.NodeId, 7), decoded.if_let.pattern);
+    try std.testing.expectEqual(@as(exprs.NodeId, 8), decoded.if_let.scrutinee);
+    const then_block = decoded.if_let.then_;
+    try std.testing.expectEqualSlices(exprs.NodeId, &.{9}, then_block.statements);
+    try std.testing.expectEqual(@as(?exprs.NodeId, 10), then_block.tail);
+    try std.testing.expectEqualStrings("bound", then_block.labelled.?);
+    try std.testing.expect(decoded.if_let.@"else" == .chain);
+    try std.testing.expectEqual(@as(exprs.NodeId, 11), decoded.if_let.@"else".chain);
+}
+
+test "if_let decoder rollback releases the then block when the else is malformed" {
+    var unknown_branch = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "pattern": 7,
+        \\  "scrutinee": 8,
+        \\  "then": {"statements":[9],"tail":10,"labelled":"bound"},
+        \\  "else": {"kind":"nonsense"}
+        \\}
+    , .{});
+    defer unknown_branch.deinit();
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeExprKind(std.testing.allocator, "if_let", unknown_branch.value),
+    );
+
+    var missing_branch = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "pattern": 7,
+        \\  "scrutinee": 8,
+        \\  "then": {"statements":[9],"tail":10,"labelled":"bound"}
+        \\}
+    , .{});
+    defer missing_branch.deinit();
+    try std.testing.expectError(
+        error.MissingField,
+        decodeExprKind(std.testing.allocator, "if_let", missing_branch.value),
+    );
+
+    var valid = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "pattern": 7,
+        \\  "scrutinee": 8,
+        \\  "then": {"statements":[9],"tail":10,"labelled":"bound"},
+        \\  "else": {"kind":"chain","value":11}
+        \\}
+    , .{});
+    defer valid.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkIfLetExprKindRollback,
+        .{valid.value},
+    );
+}
+
+fn checkWhileExprKindRollback(allocator: std.mem.Allocator, value: Json) !void {
+    const decoded = try decodeExprKind(allocator, "while_", value);
+    defer freeDecodedExprKind(allocator, decoded);
+    try std.testing.expect(decoded == .while_);
+    try std.testing.expectEqual(@as(exprs.NodeId, 3), decoded.while_.cond);
+    const body = decoded.while_.body;
+    try std.testing.expectEqualSlices(exprs.NodeId, &.{ 4, 5 }, body.statements);
+    try std.testing.expectEqual(@as(?exprs.NodeId, 6), body.tail);
+    try std.testing.expectEqualStrings("spin", body.labelled.?);
+    try std.testing.expectEqual(@as(?exprs.NodeId, 7), decoded.while_.capture);
+}
+
+test "while_ decoder rollback releases the body when the capture is malformed" {
+    // The body is decoded, and its statement list and label copy allocated,
+    // before the optional capture is read.
+    var string_capture = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "cond": 3,
+        \\  "body": {"statements":[4,5],"tail":6,"labelled":"spin"},
+        \\  "capture": "seven"
+        \\}
+    , .{});
+    defer string_capture.deinit();
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeExprKind(std.testing.allocator, "while_", string_capture.value),
+    );
+
+    var absent_capture = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "cond": 3,
+        \\  "body": {"statements":[4,5],"tail":6,"labelled":"spin"}
+        \\}
+    , .{});
+    defer absent_capture.deinit();
+    try std.testing.expectError(
+        error.MissingField,
+        decodeExprKind(std.testing.allocator, "while_", absent_capture.value),
+    );
+
+    var valid = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "cond": 3,
+        \\  "body": {"statements":[4,5],"tail":6,"labelled":"spin"},
+        \\  "capture": 7
+        \\}
+    , .{});
+    defer valid.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkWhileExprKindRollback,
+        .{valid.value},
+    );
+}
+
+fn checkForExprKindRollback(allocator: std.mem.Allocator, value: Json) !void {
+    const decoded = try decodeExprKind(allocator, "for_", value);
+    defer freeDecodedExprKind(allocator, decoded);
+    try std.testing.expect(decoded == .for_);
+    try std.testing.expectEqual(@as(exprs.NodeId, 1), decoded.for_.pattern);
+    try std.testing.expectEqual(@as(exprs.NodeId, 2), decoded.for_.iterable);
+    const body = decoded.for_.body;
+    try std.testing.expectEqualSlices(exprs.NodeId, &.{3}, body.statements);
+    try std.testing.expectEqual(@as(?exprs.NodeId, 4), body.tail);
+    try std.testing.expectEqualStrings("each", body.labelled.?);
+    try std.testing.expect(decoded.for_.iter_kind == .adapter);
+    const chain = decoded.for_.iter_kind.adapter;
+    try std.testing.expectEqual(@as(exprs.NodeId, 2), chain.source);
+    try std.testing.expectEqual(@as(exprs.IteratorTerminal, .collect_vec), chain.terminal);
+    try std.testing.expectEqual(@as(usize, 2), chain.adapters.len);
+    try std.testing.expect(chain.adapters[0] == .map);
+    const closure = chain.adapters[0].map.closure;
+    try std.testing.expectEqual(@as(usize, 1), closure.captures.len);
+    try std.testing.expectEqualStrings("acc", closure.captures[0].name);
+    try std.testing.expect(closure.captures[0].mode == .by_ref);
+    try std.testing.expectEqual(@as(exprs.TypeRef, 5), closure.captures[0].ty);
+    try std.testing.expectEqualSlices(exprs.NodeId, &.{6}, closure.params);
+    try std.testing.expectEqual(@as(?exprs.TypeRef, 7), closure.return_ty);
+    try std.testing.expectEqualStrings("mapped", closure.body.labelled.?);
+    try std.testing.expect(chain.adapters[1] == .other);
+    try std.testing.expectEqualStrings("needs v3", chain.adapters[1].other.reason);
+}
+
+test "for_ decoder rollback releases the body when the iteration kind is malformed" {
+    // The body is owned before the iteration kind is decoded, and the adapter
+    // kind below owns a closure that owns a capture, a parameter list, and a
+    // labelled block of its own.
+    var string_elements = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "pattern": 1,
+        \\  "iterable": 2,
+        \\  "body": {"statements":[3],"tail":4,"labelled":"each"},
+        \\  "iter_kind": {"kind":"multi","value":"not-a-list"}
+        \\}
+    , .{});
+    defer string_elements.deinit();
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeExprKind(std.testing.allocator, "for_", string_elements.value),
+    );
+
+    var absent_kind = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "pattern": 1,
+        \\  "iterable": 2,
+        \\  "body": {"statements":[3],"tail":4,"labelled":"each"}
+        \\}
+    , .{});
+    defer absent_kind.deinit();
+    try std.testing.expectError(
+        error.MissingField,
+        decodeExprKind(std.testing.allocator, "for_", absent_kind.value),
+    );
+
+    var valid = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "pattern": 1,
+        \\  "iterable": 2,
+        \\  "body": {"statements":[3],"tail":4,"labelled":"each"},
+        \\  "iter_kind": {"kind":"adapter","value":{
+        \\    "source": 2,
+        \\    "adapters": [
+        \\      {"kind":"map","closure":{
+        \\        "captures": [{"name":"acc","mode":"by_ref","ty":5}],
+        \\        "params": [6],
+        \\        "return_ty": 7,
+        \\        "body": {"statements":[8],"tail":9,"labelled":"mapped"},
+        \\        "trait": "fn"
+        \\      }},
+        \\      {"kind":"other","reason":"needs v3","suggested_version":"v3"}
+        \\    ],
+        \\    "terminal": "collect_vec"
+        \\  }}
+        \\}
+    , .{});
+    defer valid.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkForExprKindRollback,
+        .{valid.value},
+    );
+}
+
+fn checkBreakExprKindRollback(allocator: std.mem.Allocator, value: Json) !void {
+    const decoded = try decodeExprKind(allocator, "break_", value);
+    defer freeDecodedExprKind(allocator, decoded);
+    try std.testing.expect(decoded == .break_);
+    try std.testing.expectEqualStrings("outer", decoded.break_.label.?);
+    try std.testing.expectEqual(@as(?exprs.NodeId, 12), decoded.break_.value);
+}
+
+test "break_ decoder rollback releases the label when the value is malformed" {
+    // The label is copied before the break value is read.
+    var string_value = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{"label":"outer","value":"twelve"}
+    , .{});
+    defer string_value.deinit();
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeExprKind(std.testing.allocator, "break_", string_value.value),
+    );
+
+    var absent_value = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{"label":"outer"}
+    , .{});
+    defer absent_value.deinit();
+    try std.testing.expectError(
+        error.MissingField,
+        decodeExprKind(std.testing.allocator, "break_", absent_value.value),
+    );
+
+    var valid = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{"label":"outer","value":12}
+    , .{});
+    defer valid.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBreakExprKindRollback,
+        .{valid.value},
+    );
+}
+
+fn checkCastExprKindRollback(allocator: std.mem.Allocator, value: Json) !void {
+    const decoded = try decodeExprKind(allocator, "cast", value);
+    defer freeDecodedExprKind(allocator, decoded);
+    try std.testing.expect(decoded == .cast);
+    try std.testing.expectEqual(@as(exprs.ConversionKind, .as_), decoded.cast.kind);
+    try std.testing.expectEqual(@as(exprs.NodeId, 13), decoded.cast.operand);
+    try std.testing.expect(decoded.cast.source_type == .slice);
+    const slice = decoded.cast.source_type.slice;
+    try std.testing.expect(slice.*.const_);
+    try std.testing.expect(slice.*.elem == .prim);
+    try std.testing.expectEqual(types.Prim.u8, slice.*.elem.prim);
+    try std.testing.expectEqual(@as(exprs.TypeId, 14), decoded.cast.target);
+}
+
+test "cast decoder rollback releases the source type when the target is malformed" {
+    // A composite source type is fully decoded, and its slice node allocated,
+    // before the target type index is read.
+    var string_target = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "conversion": "as",
+        \\  "operand": 13,
+        \\  "source_type": {"kind":"slice","value":{
+        \\    "const_": true,
+        \\    "elem": {"kind":"prim","value":"u8"}
+        \\  }},
+        \\  "target": "fourteen"
+        \\}
+    , .{});
+    defer string_target.deinit();
+    try std.testing.expectError(
+        error.BadWireFormat,
+        decodeExprKind(std.testing.allocator, "cast", string_target.value),
+    );
+
+    var absent_target = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "conversion": "as",
+        \\  "operand": 13,
+        \\  "source_type": {"kind":"slice","value":{
+        \\    "const_": true,
+        \\    "elem": {"kind":"prim","value":"u8"}
+        \\  }}
+        \\}
+    , .{});
+    defer absent_target.deinit();
+    try std.testing.expectError(
+        error.MissingField,
+        decodeExprKind(std.testing.allocator, "cast", absent_target.value),
+    );
+
+    var valid = try std.json.parseFromSlice(Json, std.testing.allocator,
+        \\{
+        \\  "conversion": "as",
+        \\  "operand": 13,
+        \\  "source_type": {"kind":"slice","value":{
+        \\    "const_": true,
+        \\    "elem": {"kind":"prim","value":"u8"}
+        \\  }},
+        \\  "target": 14
+        \\}
+    , .{});
+    defer valid.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkCastExprKindRollback,
+        .{valid.value},
+    );
 }

@@ -1,6 +1,8 @@
 //! infer_test — tests for P2 constraint generation (infer.zig).
 //!
-//! C-free: this file links under `zig build test` without tree-sitter C.
+//! This file is part of the `translate_rust.frontend` test binary, which links
+//! the tree-sitter grammar the frontend needs; the hand-built fixtures below
+//! still do not use it.
 //!
 //! Asserts the 5 contract requirements:
 //! (a) Suffixed literal 0x1u64 is pinned to u64.
@@ -9,6 +11,11 @@
 //! (d) Binary `a + b` produces Edge.eq(a, result) and Edge.eq(b, result).
 //! (e) A body containing an `.unsupported` node completes without error and
 //!     emits its supported pins/edges (unsupported node absent).
+//!
+//! Two shapes of regression live here. Most build the IR by hand, because the
+//! question is what one constraint-generation decision does to a graph the
+//! test owns. The source regressions at the end drive real Rust text through
+//! `pipeline`, so what they assert is what a crate actually produced.
 
 const std = @import("std");
 const infer = @import("infer.zig");
@@ -19,6 +26,7 @@ const types = ir.types;
 const items = ir.items;
 const spine = ir.spine;
 const crate_graph = ir.graph;
+const pipeline = @import("pipeline.zig");
 
 const span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 };
 
@@ -2067,11 +2075,168 @@ test "chained raw pointer cast resolves a wildcard pointee" {
 
     var inferred = try infer.solve(alloc, &b);
     defer inferred.deinit(alloc);
+    // `&value as *const _` is the pointer `value` already had, so the wildcard
+    // resolves to the operand's own pointee — the `u64` the chain walks over
+    // before it narrows to bytes. Reading the destination instead would state
+    // `*const u8` as the source of a `*const u64` value, and the two would
+    // contradict each other the moment anything types the operand.
     const resolved = exprs_store[3].kind.cast.source_type;
     try std.testing.expect(resolved == .raw_ptr);
     try std.testing.expect(!resolved.raw_ptr.mut);
-    try std.testing.expectEqual(types.Type{ .prim = .u8 }, resolved.raw_ptr.pointee);
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, resolved.raw_ptr.pointee);
     try std.testing.expectEqual(@as(?exprs.TypeId, 2), inferred.getType(3));
+}
+
+/// `&mut bytes as *mut [MaybeUninit<u8>; N]` — the operand's reference already
+/// carries a number and the destination spells the same length as the
+/// constant's own expression, the shape `Buffer::format` writes in itoa.
+const ConstLengthCastFixture = struct {
+    types: [5]types.Type,
+    exprs: [5]exprs.Expr,
+    stmts: [1]exprs.Statement,
+    bodies: [4]bodies.BodyKind,
+
+    /// `operand_length` is the number the operand's array carries and
+    /// `declared_length` the number `const N: usize = declared_length;` holds.
+    /// Every table is arena-owned and lives as long as the caller's arena.
+    fn build(
+        alloc: std.mem.Allocator,
+        operand_length: u64,
+        declared_length: i128,
+    ) !ConstLengthCastFixture {
+        const usize_type: types.Type = .{ .prim = .usize };
+        const unit_type: types.Type = .{ .prim = .unit };
+        const maybe_uninit: types.Type = .{ .external_nominal = .{
+            .path = &.{ "core", "mem", "MaybeUninit" },
+            .args = &.{.{ .prim = .u8 }},
+        } };
+        const operand_array = try alloc.create(types.Array);
+        operand_array.* = .{ .elem = maybe_uninit, .len = .{ .literal = operand_length } };
+        // The destination's spelling: the length is the constant's expression.
+        const spelled_array = try alloc.create(types.Array);
+        spelled_array.* = .{ .elem = maybe_uninit, .len = .{ .expression = 0 } };
+        const destination = try alloc.create(types.RawPtr);
+        destination.* = .{ .mut = true, .pointee = .{ .array = spelled_array } };
+        const borrow = try alloc.create(types.Ref);
+        borrow.* = .{ .mut = true, .pointee = .{ .array = operand_array } };
+        const borrow_type: types.Type = .{ .reference = borrow };
+
+        return .{
+            .types = .{
+                usize_type,
+                unit_type,
+                .{ .raw_ptr = destination },
+                .{ .array = operand_array },
+                borrow_type,
+            },
+            .exprs = .{
+                // 0 `N` — the length's own expression node.
+                .{ .id = 0, .span = span, .ty = null, .kind = .{ .path = .{
+                    .def = 1,
+                    .generic_args = &.{},
+                } } },
+                // 1 the initializer the constant declares.
+                .{
+                    .id = 1,
+                    .span = span,
+                    .ty = 0,
+                    .kind = .{ .literal = .{ .int = .{
+                        .text = "40",
+                        .value = declared_length,
+                        .base = .dec,
+                        .ty_suffix = null,
+                    } } },
+                },
+                // 2 `self.bytes`, a field whose own type holds the number.
+                .{ .id = 2, .span = span, .ty = 4, .kind = .{ .path = .{
+                    .def = 2,
+                    .generic_args = &.{},
+                } } },
+                // 3 the cast itself.
+                .{
+                    .id = 3,
+                    .span = span,
+                    .ty = 2,
+                    .kind = .{ .cast = .{
+                        .kind = .as_,
+                        .operand = 2,
+                        .source_type = borrow_type,
+                        .target = 2,
+                    } },
+                },
+                .{ .id = 4, .span = span, .ty = null, .kind = .{ .block = .{
+                    .statements = &.{0},
+                    .tail = null,
+                    .labelled = null,
+                } } },
+            },
+            .stmts = .{.{ .id = 0, .span = span, .ty = null, .kind = .{ .expr = 3 } }},
+            .bodies = .{
+                .none,
+                .{ .const_ = .{ .ty = usize_type, .init = 1 } },
+                .none,
+                .{ .fn_ = .{ .params = &.{}, .ret = unit_type, .body = 4 } },
+            },
+        };
+    }
+};
+
+test "a destination whose array length names a constant carries that constant's value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var fixture = try ConstLengthCastFixture.build(alloc, 40, 40);
+    const b: bodies.Bodies = .{
+        .exprs = &fixture.exprs,
+        .stmts = &fixture.stmts,
+        .pats = &.{},
+        .types = &fixture.types,
+        .bodies = &fixture.bodies,
+    };
+
+    var inferred = try infer.solve(alloc, &b);
+    defer inferred.deinit(alloc);
+    inferred.apply(&fixture.exprs);
+
+    // Both spellings are one type, so the destination the crate publishes names
+    // the one length `const I128_MAX_LEN: usize = 40;` states and the cast is
+    // pinned to that row.
+    const published = fixture.types[2];
+    try std.testing.expect(published == .raw_ptr);
+    try std.testing.expect(published.raw_ptr.mut);
+    try std.testing.expect(published.raw_ptr.pointee == .array);
+    try std.testing.expectEqual(
+        types.ArrayLen{ .literal = 40 },
+        published.raw_ptr.pointee.array.len,
+    );
+    try std.testing.expectEqual(@as(?exprs.TypeId, 2), inferred.getType(3));
+}
+
+test "a destination whose constant declares a different length is still refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Restoring the number the declaration carries is not a licence to agree
+    // with the operand: this constant says 41 while the operand is a
+    // `[MaybeUninit<u8>; 40]`, and no rule makes those the same array.
+    var fixture = try ConstLengthCastFixture.build(alloc, 40, 41);
+    const b: bodies.Bodies = .{
+        .exprs = &fixture.exprs,
+        .stmts = &fixture.stmts,
+        .pats = &.{},
+        .types = &fixture.types,
+        .bodies = &fixture.bodies,
+    };
+
+    if (infer.solve(alloc, &b)) |inferred| {
+        var accepted = inferred;
+        defer accepted.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidCast, err);
+    }
 }
 
 test "a wildcard scalar cast target resolves from the destination annotation" {
@@ -5004,4 +5169,2682 @@ test "a borrowed str and a borrowed byte slice own differently" {
         } },
         (try borrowedToOwnedResultType(alloc, .{ .slice = byte_slice })).?,
     );
+}
+
+// ── Source-declared method dispatch ────────────────────────────────────────
+//
+// A method a crate declares for its OWN type is the answer to every question
+// about that type. The lookups below all run BEFORE the receiver-shaped
+// standard rules, so a crate's `len`, `next` or `write` is its own and not the
+// runtime's, and an `impl Trait for Type` block is as much a declaration as an
+// inherent one — which is the whole reason `WyRng`'s `RngCore` methods answer
+// at all.
+//
+// Entity ids are fixed because the body table is indexed by entity id, and
+// every lookup here is a walk over the graph rather than a pointer chase.
+const source_method_module: exprs.DefId = 0;
+const source_method_struct: exprs.DefId = 1;
+const source_method_impl: exprs.DefId = 2;
+const source_method_method: exprs.DefId = 3;
+const source_method_owner: exprs.DefId = 4;
+/// The `impl Source for <type>` entity, whose name is the only place the trait
+/// and the type are both spelled.
+const source_method_trait_name = "Source";
+
+/// Expr table of the source-method fixture:
+///   0 = the `&mut T` receiver
+///   1 = `receiver.wide()`
+///   2 = `receiver.wide() as u32` — the call under a scalar cast
+///   3 = the declared method's own (empty) body block
+///   4 = the enclosing `fn`'s body block, whose only statement is the cast
+const source_method_receiver_node: exprs.NodeId = 0;
+const source_method_call_node: exprs.NodeId = 1;
+const source_method_cast_node: exprs.NodeId = 2;
+
+/// Types of the source-method fixture: 0 = `&mut <type>`, 1 = the method's own
+/// declared return (interned so the solver records a pin rather than a derived
+/// type `solveWithGraph` never materializes), 2 = the cast destination.
+const source_method_receiver_type: exprs.TypeId = 0;
+const source_method_declared_type: exprs.TypeId = 1;
+const source_method_cast_type: exprs.TypeId = 2;
+
+const SourceMethodFixture = struct {
+    exprs_store: []exprs.Expr,
+    types_store: []types.Type,
+    /// The pattern table `b` views. `materializeDerivedTypes` writes the rows it
+    /// publishes back into it, so it is a store this fixture owns rather than
+    /// the immutable empty literal the frontend's own tables are built from.
+    pats_store: []exprs.Pattern,
+    stmts_store: []exprs.Statement,
+    bodies_store: []bodies.BodyKind,
+    b: bodies.Bodies,
+    graph: crate_graph.CrateGraph,
+
+    fn deinit(self: *SourceMethodFixture, alloc: std.mem.Allocator) void {
+        self.graph.deinit();
+        alloc.free(self.bodies_store);
+        alloc.free(self.stmts_store);
+        alloc.free(self.pats_store);
+        alloc.free(self.types_store);
+        alloc.free(self.exprs_store);
+        self.* = undefined;
+    }
+};
+
+const SourceMethodSpec = struct {
+    /// The method the enclosing call names. Deliberately free of every name a
+    /// standard rule claims, except in the test that says so out loud.
+    method_name: []const u8,
+    type_name: []const u8,
+    /// The `->` the trait impl's method declares.
+    declared_return: types.Type,
+    /// The method's OWN type parameters (`fn choose<U>(..) -> U`).
+    method_generic_params: []const []const u8 = &.{},
+    /// The impl block's type parameters (`impl<T> Source for Cell<T>`).
+    impl_type_params: []const []const u8 = &.{},
+    /// Non-empty makes the receiver `&mut <type><args>`, so the declared return
+    /// is substituted from the receiver's own arguments.
+    receiver_args: []const types.Type = &.{},
+    /// A second trait declaring the same method on the same type. Two answers
+    /// is not an answer, and neither is "whichever came first".
+    competing_return: ?types.Type = null,
+};
+
+/// `receiver.wide() as u32` inside `fn narrow()`, with `wide` declared only by
+/// `impl Source for <type>`. Nothing in this fixture puts `u64` on the call
+/// except that declaration: no inherent block, no turbofish, no annotation,
+/// and no standard rule — so a call that comes out `u64` can only have come
+/// from reading the source.
+fn buildSourceMethodFixture(
+    alloc: std.mem.Allocator,
+    spec: SourceMethodSpec,
+) !SourceMethodFixture {
+    var graph = crate_graph.CrateGraph.init(alloc);
+    errdefer graph.deinit();
+
+    const module_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(source_method_module, module_id);
+    const struct_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try alloc.dupe(u8, spec.type_name),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(source_method_struct, struct_id);
+    // The trait impl is a single named entity: `lookupSourceMethod` reads the
+    // trait and the type out of that one string.
+    const impl_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try std.fmt.allocPrint(
+            alloc,
+            "{s} for {s}",
+            .{ source_method_trait_name, spec.type_name },
+        ),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(source_method_impl, impl_id);
+    const method_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, spec.method_name),
+        .span = span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(source_method_method, method_id);
+    const owner_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "narrow"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(source_method_owner, owner_id);
+
+    var entity_count: exprs.DefId = source_method_owner + 1;
+    var competing_impl_id: exprs.DefId = 0;
+    var competing_method_id: exprs.DefId = 0;
+    if (spec.competing_return != null) {
+        competing_impl_id = try graph.symbol_table.add(.{
+            .id = 0,
+            .kind = .impl_,
+            .name = try std.fmt.allocPrint(
+                alloc,
+                "Alternate for {s}",
+                .{spec.type_name},
+            ),
+            .span = span,
+            .visibility = .public,
+            .parent = module_id,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
+        try std.testing.expectEqual(entity_count, competing_impl_id);
+        competing_method_id = try graph.symbol_table.add(.{
+            .id = 0,
+            .kind = .fn_,
+            .name = try alloc.dupe(u8, spec.method_name),
+            .span = span,
+            .visibility = .public,
+            .parent = competing_impl_id,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
+        try std.testing.expectEqual(entity_count + 1, competing_method_id);
+        entity_count += 2;
+    }
+
+    // Types. `Path`/`GenericArgs` rows are owned: they outlive this call.
+    const type_segments = try alloc.dupe(types.PathSegment, &.{.{
+        .name = try alloc.dupe(u8, spec.type_name),
+        .id = source_method_struct,
+    }});
+    const receiver_args = try alloc.dupe(types.Type, spec.receiver_args);
+    const self_type: types.Type = if (receiver_args.len == 0)
+        .{ .path = .{ .segments = type_segments } }
+    else
+        .{ .generic_inst = .{
+            .decl = source_method_struct,
+            .args = .{ .params = receiver_args },
+        } };
+    // `&mut self` is a borrow, and the borrow is what the receiver expression
+    // carries: `canonicalReceiverName` has to peel it to reach the type.
+    const receiver_reference = try alloc.create(types.Ref);
+    receiver_reference.* = .{ .mut = true, .pointee = self_type };
+
+    const types_store = try alloc.alloc(types.Type, 3);
+    types_store[source_method_receiver_type] = .{ .reference = receiver_reference };
+    types_store[source_method_declared_type] = spec.declared_return;
+    types_store[source_method_cast_type] = .{ .prim = .u32 };
+
+    // Nothing in this fixture binds a pattern — the only statement is an
+    // expression statement around a cast — so the store stays empty. It is
+    // still a store the fixture owns: `solveSourceMethodFixture` hands it to
+    // `materializeDerivedTypes`, which writes back every pattern row it
+    // publishes, and an empty slice literal cannot be written to.
+    const pats_store = try alloc.alloc(exprs.Pattern, 0);
+
+    const trait_path: types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        types.PathSegment,
+        &.{.{ .name = source_method_trait_name, .id = null }},
+    ) } };
+
+    var impl_generics: ?types.Generics = null;
+    if (spec.impl_type_params.len != 0) {
+        const params = try alloc.alloc(types.GenericParam, spec.impl_type_params.len);
+        for (spec.impl_type_params, 0..) |name, index| {
+            params[index] = .{ .type_ = .{ .name = name, .bounds = &.{} } };
+        }
+        impl_generics = .{ .params = params, .where_clauses = &.{} };
+    }
+
+    const exprs_store = try alloc.alloc(exprs.Expr, 5);
+    exprs_store[source_method_receiver_node] = .{
+        .id = source_method_receiver_node,
+        .span = span,
+        .ty = source_method_receiver_type,
+        .kind = .{ .path = .{ .def = source_method_struct, .generic_args = &.{} } },
+    };
+    exprs_store[source_method_call_node] = .{
+        .id = source_method_call_node,
+        .span = span,
+        .ty = null,
+        .kind = .{ .method_call = .{
+            .receiver = source_method_receiver_node,
+            .receiver_mode = .mutable,
+            .method = source_method_method,
+            .generic_args = &.{},
+            .args = &.{},
+        } },
+    };
+    exprs_store[source_method_cast_node] = .{
+        .id = source_method_cast_node,
+        .span = span,
+        .ty = null,
+        .kind = .{
+            .cast = .{
+                .kind = .as_,
+                .operand = source_method_call_node,
+                // What CST lowering writes when it could not type the operand yet.
+                .source_type = .{ .unsupported = .{
+                    .reason = .iterators,
+                    .message = "cast source type pending inference",
+                    .span = span,
+                } },
+                .target = source_method_cast_type,
+            },
+        },
+    };
+    exprs_store[3] = .{
+        .id = 3,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = null, .labelled = null } },
+    };
+    exprs_store[4] = .{
+        .id = 4,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = null,
+            .labelled = null,
+        } },
+    };
+
+    const stmts_store = try alloc.alloc(exprs.Statement, 1);
+    stmts_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = source_method_cast_node },
+    };
+
+    const bodies_store = try alloc.alloc(bodies.BodyKind, entity_count);
+    bodies_store[source_method_module] = .none;
+    bodies_store[source_method_struct] = .{ .struct_ = .{} };
+    bodies_store[source_method_impl] = .{ .impl_ = .{
+        .self_ty = self_type,
+        .trait_path = switch (trait_path) {
+            .path => |value| value,
+            else => unreachable,
+        },
+        .generics = impl_generics,
+        .assoc_items = try alloc.dupe(spine.EntityId, &.{source_method_method}),
+    } };
+    bodies_store[source_method_method] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = spec.declared_return,
+        .generic_params = spec.method_generic_params,
+        .body = 3,
+    } };
+    bodies_store[source_method_owner] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .u32 },
+        .body = 4,
+    } };
+    if (spec.competing_return) |competing| {
+        bodies_store[competing_impl_id] = .{ .impl_ = .{
+            .self_ty = self_type,
+            .assoc_items = try alloc.dupe(spine.EntityId, &.{competing_method_id}),
+        } };
+        bodies_store[competing_method_id] = .{ .fn_ = .{
+            .params = &.{},
+            .ret = competing,
+            .body = 3,
+        } };
+    }
+
+    return .{
+        .exprs_store = exprs_store,
+        .types_store = types_store,
+        .pats_store = pats_store,
+        .stmts_store = stmts_store,
+        .bodies_store = bodies_store,
+        .b = .{
+            .exprs = exprs_store,
+            .stmts = stmts_store,
+            .pats = pats_store,
+            .types = types_store,
+            .bodies = bodies_store,
+        },
+        .graph = graph,
+    };
+}
+
+/// Solve a `buildSourceMethodFixture` the way the pipeline does: generate,
+/// materialize the derived types, then solve. `infer.solveWithGraph` runs the
+/// first and last of those and skips the middle one, so a fixture whose answer
+/// the declaration only names through substitution — `impl<T> Source for
+/// Counter<T> { fn get(&self) -> T }` reaching `Counter<u8>` — has its
+/// substituted row recorded as a derived pin that nothing ever publishes, and
+/// the call it belongs to stays untyped. Materializing here is that fixture's
+/// own precondition, not a widening of the solver: `solveWithGraph` is what
+/// every other fixture uses, and it is left alone.
+///
+/// The pool is a growable list, exactly as the frontend's own context owns it,
+/// and appending keeps every row the fixture already handed out — the cast's
+/// `target` names row 2, so a pool restarted from empty would leave the
+/// destination the substitution's own row had been about to fill. The grown
+/// list is left for the caller's arena to reclaim, because `fixture.b.types`
+/// reads it after this returns.
+fn solveSourceMethodFixture(
+    alloc: std.mem.Allocator,
+    fixture: *SourceMethodFixture,
+) !infer.Inferred {
+    var generated = try infer.genWithGraph(alloc, &fixture.b, &fixture.graph);
+    errdefer generated.deinit(alloc);
+    var type_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    try type_list.appendSlice(alloc, fixture.b.types);
+    // `bodies.Bodies` holds every table as a view, and the pattern table is no
+    // exception, so the mutable store this fixture owns is handed over through
+    // the same `@constCast` the production replay uses at `infer.zig`'s own
+    // `materializeDerivedTypes` call. The cast is what the derived-pattern
+    // channel has always been given; the fixture does not widen it.
+    try infer.materializeDerivedTypes(alloc, &type_list, @constCast(fixture.b.pats), &generated);
+    fixture.b.types = type_list.items;
+    var inferred = try infer.solveWithGen(alloc, &fixture.b, &generated);
+    errdefer inferred.deinit(alloc);
+    // Adopted onto the nodes, not merely reported: a test that reads a cast's
+    // recorded source reads the record this solve produced.
+    inferred.apply(fixture.exprs_store);
+    generated.deinit(alloc);
+    // `type_list` is deliberately not freed: `fixture.b.types` reads its
+    // buffer for the rest of the test, and the caller's arena reclaims it.
+    return inferred;
+}
+
+test "a trait impl method declared u64 types the &mut self call a cast narrows to u32" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `impl Source for Counter { fn wide(&mut self) -> u64 }` reached from
+    // `receiver.wide() as u32`. The method name is one no standard rule
+    // claims, so the answer can only be the declaration's.
+    var fixture = try buildSourceMethodFixture(alloc, .{
+        .method_name = "wide",
+        .type_name = "Counter",
+        .declared_return = .{ .prim = .u64 },
+    });
+    defer fixture.deinit(alloc);
+
+    var inferred = try solveSourceMethodFixture(alloc, &fixture);
+    defer inferred.deinit(alloc);
+
+    // The cast's recorded source stopped being the frontend's "still pending"
+    // placeholder and became the declared `u64`: the cast survived, and it
+    // survived with the operand's real type on it.
+    const cast = switch (fixture.exprs_store[source_method_cast_node].kind) {
+        .cast => |value| value,
+        else => return error.CastWasReplaced,
+    };
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, cast.source_type);
+    try std.testing.expectEqual(source_method_call_node, cast.operand);
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u32 },
+        fixture.b.types[cast.target],
+    );
+
+    const operand_id = inferred.getType(source_method_call_node) orelse
+        return error.SourceMethodCallStayedUntyped;
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, fixture.b.types[operand_id]);
+    const result_id = inferred.getType(source_method_cast_node) orelse
+        return error.NarrowedSourceMethodStayedUntyped;
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, fixture.b.types[result_id]);
+}
+
+test "a source method named len keeps its declared u64 instead of the standard usize" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // A crate is free to declare its own `len`. The receiver-shaped standard
+    // rule for `len` is an early `return`, so a lookup that consulted it first
+    // would leave this call untyped rather than wrongly typed — which is why
+    // this fixture has to answer the question the other way round.
+    var fixture = try buildSourceMethodFixture(alloc, .{
+        .method_name = "len",
+        .type_name = "Counter",
+        .declared_return = .{ .prim = .u64 },
+    });
+    defer fixture.deinit(alloc);
+
+    var inferred = try solveSourceMethodFixture(alloc, &fixture);
+    defer inferred.deinit(alloc);
+
+    const operand_id = inferred.getType(source_method_call_node) orelse
+        return error.SourceLenLostToTheStandardRule;
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, fixture.b.types[operand_id]);
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u64 },
+        fixture.exprs_store[source_method_cast_node].kind.cast.source_type,
+    );
+}
+
+test "two traits declaring the same method leave the call untyped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `impl Source for Counter` and `impl Alternate for Counter`, both with
+    // `fn wide`. Rust would have rejected the call too, so neither declaration
+    // may be picked: ambiguity is a different answer from absence, and this
+    // call must not acquire the receiver's argument as a substitute.
+    var fixture = try buildSourceMethodFixture(alloc, .{
+        .method_name = "wide",
+        .type_name = "Counter",
+        .declared_return = .{ .prim = .u64 },
+        .receiver_args = &.{.{ .prim = .u8 }},
+        .competing_return = .{ .prim = .u32 },
+    });
+    defer fixture.deinit(alloc);
+
+    var inferred = try solveSourceMethodFixture(alloc, &fixture);
+    defer inferred.deinit(alloc);
+
+    try std.testing.expectEqual(
+        @as(?exprs.TypeId, null),
+        inferred.getType(source_method_call_node),
+    );
+}
+
+test "a trait impl method returning the impl's own parameter follows the receiver's argument" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `impl<T> Source for Counter<T> { fn get(&self) -> T }` reached as
+    // `counter.get() as u32` with `counter: &mut Counter<u8>`. The declared
+    // return is a type parameter and the receiver's argument is the only thing
+    // that can name it, so a call that stays untyped here means the receiver's
+    // arguments are not reaching a trait impl's signature.
+    const declared_param: types.Type = .{ .path = .{ .segments = &.{.{
+        .name = "T",
+        .id = null,
+    }} } };
+    var fixture = try buildSourceMethodFixture(alloc, .{
+        .method_name = "get",
+        .type_name = "Counter",
+        .declared_return = declared_param,
+        .impl_type_params = &.{"T"},
+        .receiver_args = &.{.{ .prim = .u8 }},
+    });
+    defer fixture.deinit(alloc);
+
+    var inferred = try solveSourceMethodFixture(alloc, &fixture);
+    defer inferred.deinit(alloc);
+
+    const operand_id = inferred.getType(source_method_call_node) orelse
+        return error.SubstitutedSourceReturnStayedUntyped;
+    try std.testing.expectEqual(types.Type{ .prim = .u8 }, fixture.b.types[operand_id]);
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u8 },
+        fixture.exprs_store[source_method_cast_node].kind.cast.source_type,
+    );
+}
+
+test "a trait impl method whose return is its own type parameter leaves the call untyped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `impl<T> Source for Counter<T> { fn choose<U>(&self) -> U }`. `U` is the
+    // method's own parameter and no turbofish binds it, so the receiver's `u8`
+    // is not an answer for it. Pinning anything here — the receiver's
+    // argument, the bare `U`, or a default — would invent a type the source
+    // never wrote.
+    const declared_param: types.Type = .{ .path = .{ .segments = &.{.{
+        .name = "U",
+        .id = null,
+    }} } };
+    var fixture = try buildSourceMethodFixture(alloc, .{
+        .method_name = "choose",
+        .type_name = "Counter",
+        .declared_return = declared_param,
+        .method_generic_params = &.{"U"},
+        .impl_type_params = &.{"T"},
+        .receiver_args = &.{.{ .prim = .u8 }},
+    });
+    defer fixture.deinit(alloc);
+
+    var inferred = try solveSourceMethodFixture(alloc, &fixture);
+    defer inferred.deinit(alloc);
+
+    try std.testing.expectEqual(
+        @as(?exprs.TypeId, null),
+        inferred.getType(source_method_call_node),
+    );
+}
+
+/// The whole generic-source-return path over ONE injected allocator: build the
+/// fixture, generate, materialize, solve, adopt. The fixture fixes the answer —
+/// `impl<T> Source for Counter<T> { fn wide(&mut self) -> T }` reached on a
+/// `&mut Counter<u64>` IS a `u64` — so a run that neither propagates
+/// `error.OutOfMemory` nor lands on that answer has left a WRONG type behind.
+/// That is the case a generic return makes reachable: the substitution is
+/// assembled out of allocations, and a half-assembled one must never read as an
+/// answer the backend then emits.
+fn checkGenericSourceReturnAllocationFailures(alloc: std.mem.Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const declared_param: types.Type = .{ .path = .{ .segments = &.{.{
+        .name = "T",
+        .id = null,
+    }} } };
+    var fixture = try buildSourceMethodFixture(arena, .{
+        .method_name = "wide",
+        .type_name = "Counter",
+        .declared_return = declared_param,
+        .impl_type_params = &.{"T"},
+        .receiver_args = &.{.{ .prim = .u64 }},
+    });
+    defer fixture.deinit(arena);
+
+    var generated = try infer.genWithGraph(arena, &fixture.b, &fixture.graph);
+    defer generated.deinit(arena);
+
+    // The type pool is a growable list here, exactly as the frontend's own
+    // context owns it: materializing appends the rows the deferred pins need,
+    // and every row keeps the id the fixture already handed out — the cast's
+    // `target` names row 2, so a pool restarted from empty would leave the
+    // destination the substitution's own row had been about to fill.
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(arena);
+    try types_list.appendSlice(arena, fixture.b.types);
+    try infer.materializeDerivedTypes(arena, &types_list, &.{}, &generated);
+    fixture.b.types = types_list.items;
+
+    var inferred = try infer.solveWithGen(arena, &fixture.b, &generated);
+    defer inferred.deinit(arena);
+    inferred.apply(fixture.exprs_store);
+
+    // Adopted onto the nodes, not merely reported: the substituted return and
+    // the source the cast records are the same `u64`, and the cast narrowed to
+    // the `u32` its target row always named.
+    const operand_id = fixture.exprs_store[source_method_call_node].ty orelse
+        return error.GenericSourceReturnStayedUntyped;
+    try std.testing.expectEqual(
+        types.Type{ .prim = .u64 },
+        fixture.b.types[operand_id],
+    );
+    const cast = switch (fixture.exprs_store[source_method_cast_node].kind) {
+        .cast => |value| value,
+        else => return error.GenericSourceReturnCastWasRewritten,
+    };
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, cast.source_type);
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, fixture.b.types[cast.target]);
+    const result_id = fixture.exprs_store[source_method_cast_node].ty orelse
+        return error.NarrowedGenericSourceReturnStayedUntyped;
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, fixture.b.types[result_id]);
+}
+
+test "a generic trait impl return propagates allocation failures instead of a wrong type" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkGenericSourceReturnAllocationFailures,
+        .{},
+    );
+}
+
+// ── Struct destructuring ───────────────────────────────────────────────────
+//
+// `let State { a, b, c, d, written } = self;` binds five captures to five
+// fields of ONE struct. Each capture is a `u64`, not the struct it came from:
+// a capture that is equated with the whole initializer unifies a primitive
+// with its aggregate, and every operator over the chain then reads an operand
+// that is not the one the source wrote.
+
+/// One `field: binding` pair of a struct pattern. They differ exactly when the
+/// source renamed the capture (`let Pair { big: hi } = pair;`).
+const DestructureField = struct {
+    field: []const u8,
+    binding: []const u8,
+};
+
+const DestructureFixture = struct {
+    exprs_store: []exprs.Expr,
+    types_store: []types.Type,
+    bodies_store: []bodies.BodyKind,
+    pats_store: []exprs.Pattern,
+    stmts_store: []exprs.Statement,
+    b: bodies.Bodies,
+    graph: crate_graph.CrateGraph,
+    /// The `self` initializer the pattern destructures.
+    init_node: exprs.NodeId,
+    /// The first of `capture_use_count` path expressions naming the captures.
+    capture_use_node: exprs.NodeId,
+    capture_use_count: usize,
+    /// The block tail: the `^` chain over every capture.
+    tail_node: exprs.NodeId,
+
+    fn deinit(self: *DestructureFixture, alloc: std.mem.Allocator) void {
+        self.graph.deinit();
+        alloc.free(self.pats_store);
+        alloc.free(self.stmts_store);
+        alloc.free(self.bodies_store);
+        alloc.free(self.types_store);
+        alloc.free(self.exprs_store);
+        self.* = undefined;
+    }
+};
+
+/// `fn finalize(self) -> u64 { let Struct { ..fields } = self;
+/// binding_0 ^ binding_1 ^ .. }`, with every declared field a `u64` — which is
+/// the shape `SeaHash`'s `State::finalize` writes.
+fn buildDestructureFixture(
+    alloc: std.mem.Allocator,
+    type_name: []const u8,
+    fields: []const DestructureField,
+) !DestructureFixture {
+    const capture_count = fields.len;
+    std.debug.assert(capture_count >= 2);
+
+    var graph = crate_graph.CrateGraph.init(alloc);
+    errdefer graph.deinit();
+
+    // 0 = the crate module, 1 = the struct, 2 = its inherent impl, 3 = the
+    // method. The captures follow, as `.field` entities parented to the method
+    // so `claimLocal` can find each one by the name it is bound to.
+    const module_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const struct_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try alloc.dupe(u8, type_name),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const impl_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try alloc.dupe(u8, type_name),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const method_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "finalize"),
+        .span = span,
+        .visibility = .public,
+        .parent = impl_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const receiver_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .field,
+        .name = try alloc.dupe(u8, "self"),
+        .span = span,
+        .visibility = .private,
+        .parent = method_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    const capture_ids = try alloc.alloc(exprs.DefId, capture_count);
+    for (fields, 0..) |field, index| {
+        capture_ids[index] = try graph.symbol_table.add(.{
+            .id = 0,
+            .kind = .field,
+            .name = try alloc.dupe(u8, field.binding),
+            .span = span,
+            .visibility = .private,
+            .parent = method_id,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
+    }
+
+    const struct_type_segments = try alloc.dupe(types.PathSegment, &.{.{
+        .name = try alloc.dupe(u8, type_name),
+        .id = struct_id,
+    }});
+    const struct_type: types.Type = .{ .path = .{ .segments = struct_type_segments } };
+    const types_store = try alloc.alloc(types.Type, 2);
+    types_store[0] = struct_type;
+    types_store[1] = .{ .prim = .u64 };
+
+    const declared_fields = try alloc.alloc(items.Field, capture_count);
+    for (fields, 0..) |field, index| {
+        declared_fields[index] = .{
+            .name = try alloc.dupe(u8, field.field),
+            .ty = types_store[1],
+            .visibility = .private,
+            .span = span,
+        };
+    }
+
+    const field_pats = try alloc.alloc(exprs.FieldPat, capture_count);
+    const pats_store = try alloc.alloc(exprs.Pattern, capture_count + 1);
+    for (fields, 0..) |field, index| {
+        // The pattern index of this capture: pats are laid out struct-pattern
+        // first so the field table and the binding table read the same order.
+        const pattern_id: exprs.NodeId = @intCast(index + 1);
+        field_pats[index] = .{
+            .field = try alloc.dupe(u8, field.field),
+            .pat = pattern_id,
+            .shorthand = std.mem.eql(u8, field.field, field.binding),
+        };
+        pats_store[index + 1] = .{
+            .id = pattern_id,
+            .span = span,
+            .ty = null,
+            .kind = .{ .binding = .{
+                .name = try alloc.dupe(u8, field.binding),
+                .mode = .{ .value = {} },
+                .mutable = false,
+            } },
+        };
+    }
+    pats_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .struct_pat = .{
+            .def = struct_id,
+            .fields = field_pats,
+            .rest = false,
+        } },
+    };
+
+    // Expr table: 0 = the `self` initializer, 1..n = the capture uses, the
+    // n-1 `^` nodes after them, then the body block.
+    const expr_count = 2 * capture_count + 1;
+    const exprs_store = try alloc.alloc(exprs.Expr, expr_count);
+    exprs_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = 0,
+        .kind = .{ .path = .{ .def = receiver_id, .generic_args = &.{} } },
+    };
+    for (0..capture_count) |index| {
+        const node: exprs.NodeId = @intCast(index + 1);
+        exprs_store[node] = .{
+            .id = node,
+            .span = span,
+            .ty = null,
+            .kind = .{ .path = .{ .def = capture_ids[index], .generic_args = &.{} } },
+        };
+    }
+    var accumulator: exprs.NodeId = 1;
+    for (1..capture_count) |index| {
+        const node: exprs.NodeId = @intCast(capture_count + index);
+        exprs_store[node] = .{
+            .id = node,
+            .span = span,
+            .ty = null,
+            .kind = .{ .binary = .{
+                .op = .bit_xor,
+                .overflow = .checked,
+                .lhs = accumulator,
+                .rhs = @intCast(index + 1),
+            } },
+        };
+        accumulator = node;
+    }
+    const tail_node: exprs.NodeId = @intCast(expr_count - 2);
+    const block_node: exprs.NodeId = @intCast(expr_count - 1);
+    exprs_store[block_node] = .{
+        .id = block_node,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = tail_node,
+            .labelled = null,
+        } },
+    };
+
+    const stmts_store = try alloc.alloc(exprs.Statement, 1);
+    stmts_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .let = .{ .pattern = 0, .init = 0, .ty = null } },
+    };
+
+    const params = try alloc.alloc(items.Param, 1);
+    params[0] = .{ .name = "self", .ty = struct_type, .span = span };
+    const entity_count = graph.symbol_table.entities.items.len;
+    const bodies_store = try alloc.alloc(bodies.BodyKind, entity_count);
+    for (bodies_store) |*body| body.* = .none;
+    bodies_store[struct_id] = .{ .struct_ = .{ .fields = declared_fields } };
+    bodies_store[impl_id] = .{ .impl_ = .{
+        .self_ty = struct_type,
+        .assoc_items = try alloc.dupe(spine.EntityId, &.{method_id}),
+    } };
+    bodies_store[method_id] = .{ .fn_ = .{
+        .params = params,
+        .ret = types_store[1],
+        .body = block_node,
+    } };
+
+    return .{
+        .exprs_store = exprs_store,
+        .types_store = types_store,
+        .bodies_store = bodies_store,
+        .pats_store = pats_store,
+        .stmts_store = stmts_store,
+        .b = .{
+            .exprs = exprs_store,
+            .stmts = stmts_store,
+            .pats = pats_store,
+            .types = types_store,
+            .bodies = bodies_store,
+        },
+        .graph = graph,
+        .init_node = 0,
+        .capture_use_node = 1,
+        .capture_use_count = capture_count,
+        .tail_node = tail_node,
+    };
+}
+
+/// The five-field shape `SeaHash` writes, kept as its own constant so the test
+/// below reads as the source it is about.
+const seahash_state_fields = [_]DestructureField{
+    .{ .field = "a", .binding = "a" },
+    .{ .field = "b", .binding = "b" },
+    .{ .field = "c", .binding = "c" },
+    .{ .field = "d", .binding = "d" },
+    .{ .field = "written", .binding = "written" },
+};
+
+test "a struct destructuring capture keeps its field's primitive type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `let State { a, b, c, d, written } = self; a ^ b ^ c ^ d ^ written`.
+    // Every capture is a `u64`; the aggregate they came from is `State`. Both
+    // facts are asserted on nodes that would have been unified into one class
+    // by a capture equated with its initializer, which is why the struct's own
+    // node is checked here too.
+    var fixture = try buildDestructureFixture(alloc, "State", &seahash_state_fields);
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    const struct_id = inferred.getType(fixture.init_node) orelse
+        return error.DestructuredInitializerStayedUntyped;
+    try std.testing.expect(fixture.b.types[struct_id] == .path);
+    for (0..fixture.capture_use_count) |index| {
+        const node: exprs.NodeId = @intCast(fixture.capture_use_node + index);
+        const capture_id = inferred.getType(node) orelse
+            return error.DestructuredCaptureStayedUntyped;
+        try std.testing.expectEqual(types.Type{ .prim = .u64 }, fixture.b.types[capture_id]);
+        try std.testing.expect(capture_id != struct_id);
+    }
+    const tail_id = inferred.getType(fixture.tail_node) orelse
+        return error.XorChainStayedUntyped;
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, fixture.b.types[tail_id]);
+    try std.testing.expectEqual(
+        exprs.BinaryOp.bit_xor,
+        fixture.exprs_store[fixture.tail_node].kind.binary.op,
+    );
+}
+
+test "a renamed struct capture binds the field it renames, not the whole struct" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `let Pair { big: hi, small } = pair; hi ^ small`. The field name and the
+    // bound name differ, so a capture resolved by name lookup instead of by the
+    // pattern it sits under would bind the wrong slot — or none.
+    const fields = [_]DestructureField{
+        .{ .field = "big", .binding = "hi" },
+        .{ .field = "small", .binding = "small" },
+    };
+    var fixture = try buildDestructureFixture(alloc, "Pair", &fields);
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    const struct_id = inferred.getType(fixture.init_node) orelse
+        return error.DestructuredInitializerStayedUntyped;
+    for (0..fixture.capture_use_count) |index| {
+        const node: exprs.NodeId = @intCast(fixture.capture_use_node + index);
+        const capture_id = inferred.getType(node) orelse
+            return error.RenamedCaptureStayedUntyped;
+        try std.testing.expectEqual(types.Type{ .prim = .u64 }, fixture.b.types[capture_id]);
+        try std.testing.expect(capture_id != struct_id);
+    }
+}
+
+// ── Casts that wait for dispatch ────────────────────────────────────────────
+//
+// `x as T` over an operand nothing has typed yet is not a wrong cast, it is an
+// unresolved one: the frontend records a placeholder source and leaves the
+// verdict to whoever ends up holding a type for the operand. A standalone
+// solver has no later phase, so it names the refusal on the spot — the
+// `untyped cast operand` test above pins that. The full compiler does have a
+// later phase: it asks the solver to leave the cast alone, adopts the
+// resolver's final tables, and finishes the cast once the operand has a type.
+const pending_cast_operand_node: exprs.NodeId = 0;
+const pending_cast_node: exprs.NodeId = 1;
+const pending_cast_body_node: exprs.NodeId = 2;
+
+const PendingCastFixture = struct {
+    exprs_store: []exprs.Expr,
+    types_store: []types.Type,
+    stmts_store: []exprs.Statement,
+    bodies_store: []bodies.BodyKind,
+    b: bodies.Bodies,
+
+    fn deinit(self: *PendingCastFixture, alloc: std.mem.Allocator) void {
+        alloc.free(self.bodies_store);
+        alloc.free(self.stmts_store);
+        alloc.free(self.types_store);
+        alloc.free(self.exprs_store);
+        self.* = undefined;
+    }
+};
+
+/// `operand as <target>` with the recorded source still the frontend's pending
+/// placeholder. Type row 0 is the destination and row 1 the operand's; the
+/// operand carries row 1 only when `operand_typed` says the solve itself
+/// already holds it, which is the difference between "the resolver will hand
+/// this over" and "this arrived typed".
+fn buildPendingCastFixture(
+    alloc: std.mem.Allocator,
+    kind: exprs.ConversionKind,
+    operand_type: types.Type,
+    operand_typed: bool,
+    target_type: types.Type,
+) !PendingCastFixture {
+    const types_store = try alloc.alloc(types.Type, 2);
+    types_store[0] = target_type;
+    types_store[1] = operand_type;
+
+    const exprs_store = try alloc.alloc(exprs.Expr, 3);
+    exprs_store[pending_cast_operand_node] = .{
+        .id = pending_cast_operand_node,
+        .span = span,
+        .ty = if (operand_typed) @as(?exprs.TypeId, 1) else null,
+        // A `def` naming no entity, so nothing in the graph can type this path
+        // however long the solve runs.
+        .kind = .{ .path = .{ .def = 7, .generic_args = &.{} } },
+    };
+    exprs_store[pending_cast_node] = .{
+        .id = pending_cast_node,
+        .span = span,
+        .ty = null,
+        .kind = .{ .cast = .{
+            .kind = kind,
+            .operand = pending_cast_operand_node,
+            .source_type = .{ .unsupported = .{
+                .reason = .iterators,
+                .message = "cast source type pending inference",
+                .span = span,
+            } },
+            .target = 0,
+        } },
+    };
+    exprs_store[pending_cast_body_node] = .{
+        .id = pending_cast_body_node,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = null,
+            .labelled = null,
+        } },
+    };
+
+    const stmts_store = try alloc.alloc(exprs.Statement, 1);
+    stmts_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = pending_cast_node },
+    };
+
+    const bodies_store = try alloc.alloc(bodies.BodyKind, 1);
+    bodies_store[0] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = pending_cast_body_node,
+    } };
+
+    return .{
+        .exprs_store = exprs_store,
+        .types_store = types_store,
+        .stmts_store = stmts_store,
+        .bodies_store = bodies_store,
+        .b = .{
+            .exprs = exprs_store,
+            .stmts = stmts_store,
+            .pats = &.{},
+            .types = types_store,
+            .bodies = bodies_store,
+        },
+    };
+}
+
+test "the deferred-cast opt-in leaves the cast exactly as the frontend recorded it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // The same shape the standalone refusal test builds, run with the opt-in
+    // on. Every field the frontend wrote has to come back out unchanged: the
+    // conversion syntax, the operand it reads, the destination it named, and
+    // the placeholder source that says "not yet".
+    var fixture = try buildPendingCastFixture(
+        alloc,
+        .as_,
+        .{ .prim = .u64 },
+        false,
+        .{ .prim = .u64 },
+    );
+    defer fixture.deinit(alloc);
+
+    var generated = try infer.gen(alloc, &fixture.b);
+    defer generated.deinit(alloc);
+    generated.defer_pending_casts = true;
+
+    var inferred = try infer.solveWithGen(alloc, &fixture.b, &generated);
+    defer inferred.deinit(alloc);
+
+    const cast = switch (fixture.exprs_store[pending_cast_node].kind) {
+        .cast => |value| value,
+        else => return error.DeferredCastWasRewritten,
+    };
+    try std.testing.expect(cast.kind == .as_);
+    try std.testing.expectEqual(pending_cast_operand_node, cast.operand);
+    try std.testing.expectEqual(@as(exprs.TypeId, 0), cast.target);
+    try std.testing.expect(std.meta.activeTag(cast.source_type) == .unsupported);
+    try std.testing.expectEqual(@as(?exprs.TypeId, null), inferred.getType(pending_cast_node));
+}
+
+test "the deferred-cast finalizer completes a resolved u64 source into a u32 destination" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // The solver left the cast pending because the operand had no type yet.
+    // Adopting the resolver's tables is what gives the operand one, and the
+    // finalizer then has everything it needs: a genuine `u64` source and a
+    // `u32` destination it may check against `isValidCast`.
+    var fixture = try buildPendingCastFixture(
+        alloc,
+        .as_,
+        .{ .prim = .u64 },
+        false,
+        .{ .prim = .u32 },
+    );
+    defer fixture.deinit(alloc);
+
+    var generated = try infer.gen(alloc, &fixture.b);
+    defer generated.deinit(alloc);
+    generated.defer_pending_casts = true;
+    var inferred = try infer.solveWithGen(alloc, &fixture.b, &generated);
+    inferred.deinit(alloc);
+
+    fixture.exprs_store[pending_cast_operand_node].ty = 1;
+    try infer.completePendingCasts(&fixture.b);
+
+    const cast = switch (fixture.exprs_store[pending_cast_node].kind) {
+        .cast => |value| value,
+        else => return error.CompletedCastWasRewritten,
+    };
+    try std.testing.expectEqual(types.Type{ .prim = .u64 }, cast.source_type);
+    try std.testing.expectEqual(@as(exprs.TypeId, 0), cast.target);
+    try std.testing.expectEqual(
+        @as(?exprs.TypeId, 0),
+        fixture.exprs_store[pending_cast_node].ty,
+    );
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, fixture.b.types[cast.target]);
+}
+
+test "the deferred-cast finalizer still names a cast whose operand never resolved" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Waiting did not help this one. The operand is still untyped when the
+    // finalizer runs, so there is no source type to rule on and any verdict
+    // would be a guess — the same named refusal the standalone solver gives,
+    // reached at the other end of the pipeline.
+    var fixture = try buildPendingCastFixture(
+        alloc,
+        .as_,
+        .{ .prim = .u64 },
+        false,
+        .{ .prim = .u32 },
+    );
+    defer fixture.deinit(alloc);
+
+    try infer.completePendingCasts(&fixture.b);
+
+    const marker = switch (fixture.exprs_store[pending_cast_node].kind) {
+        .unsupported => |value| value,
+        else => return error.UnresolvedCastWasGuessed,
+    };
+    try std.testing.expectEqualStrings(untyped_cast_operand_reason, marker.reason);
+    try std.testing.expect(marker.suggested_version == .v1);
+}
+
+test "the deferred-cast finalizer stays strict about a conversion it cannot admit" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // Two conversions valid Rust writes down and this translator does not
+    // admit, so the finalizer cannot become a hole the solver's strictness
+    // used to close. `u64 as u32` through `From` narrows, and a thin pointer
+    // cast off a slice drops the length the slice type carries.
+    var narrowing = try buildPendingCastFixture(
+        alloc,
+        .primitive_from,
+        .{ .prim = .u64 },
+        true,
+        .{ .prim = .u32 },
+    );
+    defer narrowing.deinit(alloc);
+    try std.testing.expectError(error.InvalidCast, infer.completePendingCasts(&narrowing.b));
+
+    const byte_slice = try alloc.create(types.Slice);
+    byte_slice.* = .{ .const_ = true, .elem = .{ .prim = .u8 } };
+    const borrowed_slice = try alloc.create(types.Ref);
+    borrowed_slice.* = .{ .mut = false, .pointee = .{ .slice = byte_slice } };
+    const thin_pointer = try alloc.create(types.RawPtr);
+    thin_pointer.* = .{ .mut = false, .pointee = .{ .prim = .u16 } };
+    var fat_to_thin = try buildPendingCastFixture(
+        alloc,
+        .as_,
+        .{ .reference = borrowed_slice },
+        true,
+        .{ .raw_ptr = thin_pointer },
+    );
+    defer fat_to_thin.deinit(alloc);
+    try std.testing.expectError(error.InvalidCast, infer.completePendingCasts(&fat_to_thin.b));
+}
+
+// ── Source regressions: real Rust through the pipeline ──────────────────────
+//
+// Everything above builds the IR by hand, which is the right way to ask what
+// one decision does. These ask the other question — what a crate actually
+// produces — so they drive Rust text through `pipeline` and then assert over
+// the WHOLE type pool rather than the rows an expression still points at. A
+// partial row the solver never needed is exactly where a hole survives, so a
+// walk that follows only live expressions would stop one row short of it.
+
+/// The one seam: real source in, the frontend's own model out.
+fn analyzeSourceRegression(alloc: std.mem.Allocator, source: []const u8) !ir.RustIr {
+    return pipeline.analyzeSource(alloc, "tuple_materialization", "2021", source);
+}
+
+fn typeAt(model: *const ir.RustIr, type_id: exprs.TypeId) ?types.Type {
+    if (type_id >= model.bodies.types.len) return null;
+    return model.bodies.types[type_id];
+}
+
+fn exprType(model: *const ir.RustIr, node: exprs.NodeId) ?types.Type {
+    if (node >= model.bodies.exprs.len) return null;
+    return typeAt(model, model.bodies.exprs[node].ty orelse return null);
+}
+
+fn entityName(model: *const ir.RustIr, def: exprs.DefId) ?[]const u8 {
+    return (model.graph.symbol_table.get(def) orelse return null).name;
+}
+
+fn callCallee(model: *const ir.RustIr, call: exprs.Call) ?[]const u8 {
+    const def = switch (call.call_kind) {
+        .free => |id| id,
+        .associated => |id| id,
+        .constructor => |id| id,
+    };
+    return entityName(model, def);
+}
+
+/// The elements of a tuple literal's resolved type, or null when this node is
+/// not one. A Rust `(a, b)` lowers to the same `.array` node an array literal
+/// does, so the resolved type is what tells the two apart.
+fn tupleElements(model: *const ir.RustIr, node: exprs.NodeId) ?[]const types.Type {
+    if (node >= model.bodies.exprs.len) return null;
+    if (model.bodies.exprs[node].kind != .array) return null;
+    const type_id = model.bodies.exprs[node].ty orelse return null;
+    return switch (typeAt(model, type_id) orelse return null) {
+        .tuple => |elements| elements,
+        else => null,
+    };
+}
+
+/// The elements of a resolved tuple, whether this node IS the literal or the
+/// binding that names it.
+///
+/// `hash(&s)` borrows through the `let` binding, not through the literal `s`
+/// was built from, so the node a borrow points at is a path whose resolved
+/// type is the tuple. What has to carry the leaves is the BORROW's own record;
+/// which shape of node the borrow happens to name is not part of that question,
+/// so reading it through a path is not a weaker check.
+fn resolvedTupleElements(model: *const ir.RustIr, node: exprs.NodeId) ?[]const types.Type {
+    if (node >= model.bodies.exprs.len) return null;
+    const type_id = model.bodies.exprs[node].ty orelse return null;
+    return switch (typeAt(model, type_id) orelse return null) {
+        .tuple => |elements| elements,
+        else => null,
+    };
+}
+
+fn isPrim(ty: types.Type, prim: types.Prim) bool {
+    return ty == .prim and ty.prim == prim;
+}
+
+/// `&str`: a shared borrow of the `str` primitive, which is what a string
+/// literal is. The qualifier is part of the answer, so it is checked too.
+fn isSharedStrRef(ty: types.Type) bool {
+    const reference = switch (ty) {
+        .reference => |value| value,
+        else => return false,
+    };
+    return !reference.mut and types.isStr(reference.pointee);
+}
+/// A `&[i32]` — the shape a borrowed slice view reaches the type table as.
+fn isBorrowedI32Slice(ty: types.Type) bool {
+    const reference = switch (ty) {
+        .reference => |value| value,
+        else => return false,
+    };
+    const slice = switch (reference.pointee) {
+        .slice => |value| value,
+        else => return false,
+    };
+    return isPrim(slice.elem, .i32);
+}
+
+/// A slice view of `i32` elements, whether the node carries the slice itself
+/// or a borrow of it: a range index and the `&` written in front of it are the
+/// same view seen one layer apart.
+fn isI32SliceView(ty: types.Type) bool {
+    const slice = switch (ty) {
+        .slice => |value| value,
+        .reference => |reference| switch (reference.pointee) {
+            .slice => |value| value,
+            else => return false,
+        },
+        else => return false,
+    };
+    return isPrim(slice.elem, .i32);
+}
+
+test "source tuple strings stay &str leaves through the borrowed Hash argument" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `let s = ("aa", "bb"); hash(&s)`. A string literal is a borrow of `str`,
+    // so a tuple of them is a tuple of borrows, and the borrow of THAT tuple is
+    // what `hash` is asked to hash. A leaf that came back as a bare `str`, or a
+    // tuple argument that lost its leaves, hashes the wrong bytes.
+    const source =
+        \\use core::hash::{Hash, Hasher};
+        \\struct Trace { state: u64 }
+        \\impl Hasher for Trace {
+        \\    fn finish(&self) -> u64 { self.state }
+        \\    fn write(&mut self, bytes: &[u8]) {
+        \\        for &byte in bytes {
+        \\            self.state = (self.state ^ byte as u64).wrapping_mul(1099511628211);
+        \\        }
+        \\    }
+        \\}
+        \\fn hash<T: Hash>(value: &T) -> u64 {
+        \\    let mut state = Trace { state: 14695981039346656037 };
+        \\    value.hash(&mut state);
+        \\    state.finish()
+        \\}
+        \\pub fn tuple_strings() -> bool {
+        \\    let s = ("aa", "bb");
+        \\    let t = ("aabb", "");
+        \\    let u = ("a", "abb");
+        \\    hash(&s) != hash(&t) && hash(&s) != hash(&u)
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    var string_leaves: usize = 0;
+    var str_tuples: usize = 0;
+    var borrowed_str_tuples: usize = 0;
+    for (model.bodies.exprs, 0..) |expression, index| {
+        const node: exprs.NodeId = @intCast(index);
+        switch (expression.kind) {
+            .literal => |literal| switch (literal) {
+                .string => {
+                    const leaf = exprType(&model, node) orelse
+                        return error.UntypedStringLiteral;
+                    if (!isSharedStrRef(leaf)) return error.StringLeafIsNotASharedStrRef;
+                    string_leaves += 1;
+                },
+                else => {},
+            },
+            .array => {
+                const elements = tupleElements(&model, node) orelse continue;
+                if (elements.len != 2) continue;
+                if (!isSharedStrRef(elements[0]) or !isSharedStrRef(elements[1])) continue;
+                str_tuples += 1;
+            },
+            .unary => |unary| {
+                if (unary.op != .ref) continue;
+                const elements = resolvedTupleElements(&model, unary.operand) orelse continue;
+                if (elements.len != 2) continue;
+                if (!isSharedStrRef(elements[0]) or !isSharedStrRef(elements[1])) continue;
+                borrowed_str_tuples += 1;
+                // `hash(&s)` is asked about a REFERENCE to the tuple, so the
+                // borrow node itself has to carry it, leaves and all.
+                const borrow = exprType(&model, node) orelse
+                    return error.UntypedBorrowedTuple;
+                const reference = switch (borrow) {
+                    .reference => |value| value,
+                    else => return error.BorrowedTupleLostItsReference,
+                };
+                const borrowed = switch (reference.pointee) {
+                    .tuple => |value| value,
+                    else => return error.BorrowedTupleIsNotATuple,
+                };
+                if (borrowed.len != 2) return error.BorrowedTupleArityChanged;
+                if (!isSharedStrRef(borrowed[0]) or !isSharedStrRef(borrowed[1])) {
+                    return error.BorrowedTupleLeavesIncomplete;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 6), string_leaves);
+    try std.testing.expectEqual(@as(usize, 3), str_tuples);
+    // One borrow per borrow SITE, not per tuple: the source writes `hash(&s)`
+    // twice alongside `hash(&t)` and `hash(&u)`, so four borrowed tuples reach
+    // the table and all four have to carry their leaves.
+    try std.testing.expectEqual(@as(usize, 4), borrowed_str_tuples);
+}
+
+test "source tuple of borrowed slices defaults its elements to i32 and its indices to usize" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `let u = [1, 0, 0, 0]; (&u[..1], &u[1..3], &u[3..])`. Nothing here names
+    // the element type: `i32` is what an unsuffixed integer defaults to once
+    // Rust's own context has had its say. The range endpoints are a different
+    // question — they are sequence indices, so they carry `usize` — and the
+    // Range node itself is a view, never the scalar an endpoint happens to be.
+    const source =
+        \\use core::hash::{Hash, Hasher};
+        \\struct Trace { state: u64 }
+        \\impl Hasher for Trace {
+        \\    fn finish(&self) -> u64 { self.state }
+        \\    fn write(&mut self, bytes: &[u8]) {
+        \\        for &byte in bytes {
+        \\            self.state = (self.state ^ byte as u64).wrapping_mul(1099511628211);
+        \\        }
+        \\    }
+        \\}
+        \\fn hash<T: Hash>(value: &T) -> u64 {
+        \\    let mut state = Trace { state: 14695981039346656037 };
+        \\    value.hash(&mut state);
+        \\    state.finish()
+        \\}
+        \\pub fn tuple_slices() -> bool {
+        \\    let u = [1, 0, 0, 0];
+        \\    let v = (&u[..1], &u[1..3], &u[3..]);
+        \\    let w = (&u[..], &u[4..4], &u[4..4]);
+        \\    hash(&v) != hash(&w)
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    var array_literals: usize = 0;
+    var range_views: usize = 0;
+    var usize_endpoints: usize = 0;
+    var borrowed_slice_views: usize = 0;
+    var borrowed_slice_tuples: usize = 0;
+    for (model.bodies.exprs, 0..) |expression, index| {
+        const node: exprs.NodeId = @intCast(index);
+        switch (expression.kind) {
+            .array => {
+                // `[1, 0, 0, 0]` and `(a, b)` reach the IR as the same node: an
+                // array of elements with no repeat. What separates them is the
+                // row the literal carries — one homogeneous element and a count
+                // the source fixed, or one type per position. `repeat` is the
+                // count in `[e; N]`, and this crate writes no such literal, so
+                // gating on it would skip the one array it means to check and
+                // read a tuple as an array beside it.
+                const ty = exprType(&model, node) orelse return error.UntypedArrayLiteral;
+                if (tupleElements(&model, node)) |elements| {
+                    if (elements.len != 3) continue;
+                    var all_borrowed = true;
+                    for (elements) |element| {
+                        if (!isBorrowedI32Slice(element)) all_borrowed = false;
+                    }
+                    if (all_borrowed) borrowed_slice_tuples += 1;
+                    continue;
+                }
+                const row = switch (ty) {
+                    .array => |value| value,
+                    else => return error.ArrayLiteralHasNoArrayType,
+                };
+                if (!isPrim(row.elem, .i32)) return error.ArrayElementIsNotI32;
+                if (row.len != .literal or row.len.literal != 4) {
+                    return error.ArrayLiteralIsNotFourLong;
+                }
+                array_literals += 1;
+            },
+            .range => |range| {
+                // The endpoints are sequence indices, so they carry `usize` —
+                // they are not unconstrained integers that happened to default.
+                const start_type = exprType(&model, range.start) orelse
+                    return error.UntypedRangeStart;
+                if (!isPrim(start_type, .usize)) return error.RangeStartIsNotUsize;
+                usize_endpoints += 1;
+                if (range.end) |end| {
+                    const end_type = exprType(&model, end) orelse
+                        return error.UntypedRangeEnd;
+                    if (!isPrim(end_type, .usize)) return error.RangeEndIsNotUsize;
+                    usize_endpoints += 1;
+                }
+                // A Range is a view over a sequence, and a view is never the
+                // scalar its own endpoint happens to be.
+                if (exprType(&model, node)) |ty| {
+                    if (isPrim(ty, .usize)) return error.RangeNodeLabeledAsUsize;
+                }
+                // The view itself is over the array's element type.
+                if (exprType(&model, node)) |ty| {
+                    if (!isI32SliceView(ty)) return error.RangeViewIsNotAnI32Slice;
+                    range_views += 1;
+                }
+            },
+            .unary => |unary| {
+                if (unary.op != .ref) continue;
+                const operand_type = exprType(&model, unary.operand) orelse continue;
+                if (!isI32SliceView(operand_type)) continue;
+                const borrow_type = exprType(&model, node) orelse
+                    return error.UntypedSliceBorrow;
+                if (!isBorrowedI32Slice(borrow_type)) return error.SliceBorrowLostItsType;
+                borrowed_slice_views += 1;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), array_literals);
+    try std.testing.expect(range_views >= 6);
+    try std.testing.expect(usize_endpoints >= 8);
+    try std.testing.expectEqual(@as(usize, 6), borrowed_slice_views);
+    try std.testing.expectEqual(@as(usize, 2), borrowed_slice_tuples);
+}
+
+/// Whether any nested type in `ty` still carries the frontend's `_` hole. The
+/// hole only ever appears as the last segment of an external nominal, so that
+/// is where it is looked for — at every depth, because a hole one wrapper down
+/// is still a hole the consumer cannot emit.
+fn carriesInferenceHole(ty: types.Type) bool {
+    return switch (ty) {
+        .external_nominal => |external| blk: {
+            if (external.path.len == 0) break :blk false;
+            if (std.mem.eql(u8, external.path[external.path.len - 1], "_")) break :blk true;
+            for (external.args) |arg| {
+                if (carriesInferenceHole(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        .reference => |reference| carriesInferenceHole(reference.pointee),
+        .raw_ptr => |pointer| carriesInferenceHole(pointer.pointee),
+        .slice => |slice| carriesInferenceHole(slice.elem),
+        .array => |array| carriesInferenceHole(array.elem),
+        .tuple => |elements| blk: {
+            for (elements) |element| {
+                if (carriesInferenceHole(element)) break :blk true;
+            }
+            break :blk false;
+        },
+        .boxed => |boxed| carriesInferenceHole(boxed.*),
+        .option => |payload| carriesInferenceHole(payload.*),
+        .result => |value| carriesInferenceHole(value.ok) or
+            carriesInferenceHole(value.err),
+        .generic_inst => |instance| blk: {
+            for (instance.args.params) |param| {
+                if (carriesInferenceHole(param)) break :blk true;
+            }
+            break :blk false;
+        },
+        .@"opaque" => |opaque_type| blk: {
+            const concrete = opaque_type.concrete orelse break :blk false;
+            break :blk carriesInferenceHole(concrete.*);
+        },
+        .fn_ptr, .dyn_trait, .path, .prim, .unsupported => false,
+    };
+}
+
+/// Every row of the type pool, not only the ones an expression still names: a
+/// literal-private row the solver repointed away from is precisely the row a
+/// filtered walk would stop looking at.
+fn expectCompleteTypePool(model: *const ir.RustIr) !void {
+    for (model.bodies.types, 0..) |row, index| {
+        if (!carriesInferenceHole(row)) continue;
+        std.debug.print("type row {d} still carries an inference hole\n", .{index});
+        return error.IncompleteTypeRow;
+    }
+}
+
+/// The strict validator and the canonical codec, both over the whole pool.
+/// The decode is the consumer's own view of the same rows, so a hole that
+/// survives either of them is a hole the generated package would carry.
+fn expectCanonicalRoundTrip(alloc: std.mem.Allocator, model: *const ir.RustIr) !void {
+    const encoded = try ir.serialize.encode(alloc, model);
+
+    var decoded_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer decoded_arena.deinit();
+    const decoded_alloc = decoded_arena.allocator();
+
+    var decoded = try ir.serialize.decode(decoded_alloc, encoded);
+    defer decoded.graph.deinit();
+    defer decoded.deinitInstantiations(decoded_alloc);
+
+    try ir.validateForTranslation(&decoded);
+    try expectCompleteTypePool(&decoded);
+}
+
+/// What every source regression below asserts about its own model, before it
+/// says anything specific: it is a crate the rest of the pipeline would
+/// accept, its whole type pool is complete, and that pool survives the wire.
+fn expectValidAndCanonical(alloc: std.mem.Allocator, model: *const ir.RustIr) !void {
+    try ir.validateForTranslation(model);
+    try expectCompleteTypePool(model);
+    try expectCanonicalRoundTrip(alloc, model);
+}
+
+test "atoi's Option map unwrap_or tuple keeps the enum identity and the usize offset" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `.map(|sign| (sign, 1)).unwrap_or((Sign::Plus, 0))`. The `1` and the `0`
+    // are unsuffixed and unknown until the positions around them say what they
+    // are; the offset really is a `usize` and the sign really is the same enum
+    // on both sides. A hand-built tuple with the answer already written into it
+    // would say nothing about how the answer is reached.
+    const source =
+        \\#[derive(Clone, Copy)]
+        \\enum Sign { Plus, Minus }
+        \\impl Sign {
+        \\    fn try_from(byte: u8) -> Option<Self> {
+        \\        match byte {
+        \\            b'+' => Some(Sign::Plus),
+        \\            b'-' => Some(Sign::Minus),
+        \\            _ => None,
+        \\        }
+        \\    }
+        \\}
+        \\pub fn atoi_offset(text: &[u8]) -> usize {
+        \\    let (sign, offset) = text.first()
+        \\        .and_then(|&byte| Sign::try_from(byte))
+        \\        .map(|sign| (sign, 1))
+        \\        .unwrap_or((Sign::Plus, 0));
+        \\    let mut index;
+        \\    index = offset;
+        \\    while index != text.len() { let _ = text[index]; index += 1; }
+        \\    match sign { Sign::Plus => index, Sign::Minus => index }
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    var usize_tuples: usize = 0;
+    var sign_slot: ?types.Type = null;
+    for (model.bodies.exprs, 0..) |_, index| {
+        const elements = tupleElements(&model, @intCast(index)) orelse continue;
+        if (elements.len != 2) continue;
+        if (!isPrim(elements[1], .usize)) continue;
+        usize_tuples += 1;
+        if (isPrim(elements[0], .u8) or isPrim(elements[0], .u32)) {
+            return error.SignSlotCollapsedToAPrimitive;
+        }
+        if (sign_slot) |previous| {
+            if (!types.deepEqual(previous, elements[0])) return error.SignSlotIdentitySplit;
+        } else {
+            sign_slot = elements[0];
+        }
+    }
+    try std.testing.expect(usize_tuples >= 2);
+    try std.testing.expect(sign_slot != null);
+
+    // The tuple pattern the `let` binds carries the same two types, and each
+    // leaf carries its own slot's type rather than the tuple's.
+    var pattern_checked = false;
+    for (model.bodies.pats) |pattern| {
+        const tuple_pattern = switch (pattern.kind) {
+            .tuple => |value| value,
+            else => continue,
+        };
+        if (tuple_pattern.elements.len != 2) continue;
+        const pattern_id = pattern.ty orelse return error.UntypedTuplePattern;
+        const pattern_type = typeAt(&model, pattern_id) orelse
+            return error.UntypedTuplePattern;
+        const slots = switch (pattern_type) {
+            .tuple => |value| value,
+            else => return error.TuplePatternHasNoTupleType,
+        };
+        if (slots.len != 2) return error.TuplePatternArityChanged;
+        if (!isPrim(slots[1], .usize)) return error.TuplePatternOffsetIsNotUsize;
+        if (sign_slot) |expected| {
+            if (!types.deepEqual(expected, slots[0])) return error.TuplePatternSignDiverged;
+        }
+        for (tuple_pattern.elements, 0..) |element, slot| {
+            const leaf_id = model.bodies.pats[element].ty orelse
+                return error.UntypedTuplePatternLeaf;
+            const leaf = typeAt(&model, leaf_id) orelse
+                return error.UntypedTuplePatternLeaf;
+            if (!types.deepEqual(leaf, slots[slot])) {
+                return error.TuplePatternLeafDivergedFromItsSlot;
+            }
+        }
+        pattern_checked = true;
+        break;
+    }
+    try std.testing.expect(pattern_checked);
+}
+
+/// `Option<u8>`, in either of the two spellings this IR writes it.
+///
+/// `preludeVariantType` builds the nominal — `core::option::Option` with the
+/// one argument it was given — because that is the identity a CONSTRUCTOR
+/// carries. A type the SOURCE spells `Option<u8>` is the builtin `.option`
+/// instead (`mapCstNamedType`), and a peer's declared return is spelled by the
+/// source, so the demand a comparison pushes into a `None` slot is that
+/// spelling. Both are `Option<u8>`; neither is a weaker answer than the other,
+/// and reading only one of them made this predicate report a correctly named
+/// option as unnamed. What it still insists on is the substance: the option
+/// `core::option::Option` names, over exactly `payload`.
+fn isOptionOf(ty: types.Type, payload: types.Prim) bool {
+    switch (ty) {
+        .option => |inner| return isPrim(inner.*, payload),
+        .external_nominal => {},
+        else => return false,
+    }
+    const external = ty.external_nominal;
+    if (external.path.len != 3) return false;
+    if (!std.mem.eql(u8, external.path[0], "core")) return false;
+    if (!std.mem.eql(u8, external.path[1], "option")) return false;
+    if (!std.mem.eql(u8, external.path[2], "Option")) return false;
+    if (external.args.len != 1) return false;
+    return isPrim(external.args[0], payload);
+}
+
+test "a comparison names the option a `None` slot stands for" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `(None, 3) == pair()` beside `fn pair() -> (Option<u8>, usize)`. `None`
+    // carries no payload, so nothing inside the literal says what it is:
+    // `preludeVariantType` reads a payload to build the option from and
+    // `knownSourceEnumVariantType` refuses a generic enum, which is exactly
+    // what `Option` is. The private row the literal built was therefore
+    // `(_, _)`, and the Defaults Phase turned the second slot into the `i32`
+    // an unconstrained integer literal becomes. The comparison is the only
+    // thing in the source that names either slot, and reading its peer as
+    // already answered is what left the `_` standing in a row `validate` then
+    // refuses as `IncompleteGenericMetadata`. This is the shape of `atoi`'s own
+    // `assert_eq!((None, 3), u8::from_radix_10_checked(b"256"))`.
+    const source =
+        \\fn pair() -> (Option<u8>, usize) { (Some(1u8), 2) }
+        \\pub fn agrees() -> bool { (None, 3) == pair() }
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    var compared: usize = 0;
+    for (model.bodies.exprs) |expression| {
+        const binary = switch (expression.kind) {
+            .binary => |value| value,
+            else => continue,
+        };
+        if (binary.op != .eq) continue;
+        const elements = tupleElements(&model, binary.lhs) orelse continue;
+        if (elements.len != 2) continue;
+        compared += 1;
+        if (!isPrim(elements[1], .usize)) return error.OffsetSlotIsNotUsize;
+        if (!isOptionOf(elements[0], .u8)) return error.NoneSlotIsNotAnOptionOfU8;
+    }
+    // One comparison in the source, and it is the one that has to be resolved:
+    // a count that reached zero would let the loop pass without ever asking.
+    try std.testing.expectEqual(@as(usize, 1), compared);
+}
+
+test "a source private generic return row survives the return expression being repointed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `fn generic_return<I: Clone>(number: I, text: &[u8]) -> (I, usize)`. The
+    // declared return is a tuple whose first slot is a lexical type parameter.
+    // `I` is neither a hole nor a primitive: it is a name the crate wrote, and
+    // the row the tuple literal built privately has to keep saying so even when
+    // the solver repoints the expression at the declared row.
+    const source =
+        \\pub fn generic_return<I: Clone>(number: I, text: &[u8]) -> (I, usize) {
+        \\    let mut index = 0;
+        \\    while index != text.len() { index += 1; }
+        \\    (number, index)
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    const return_id = for (model.graph.symbol_table.entities.items) |entity| {
+        if (entity.kind == .fn_ and std.mem.eql(u8, entity.name, "generic_return")) break entity.id;
+    } else return error.GenericReturnNotFound;
+    const declared = switch (model.bodies.bodies[return_id]) {
+        .fn_ => |fn_body| fn_body.ret,
+        else => return error.GenericReturnHasNoBody,
+    };
+    const slots = switch (declared) {
+        .tuple => |value| value,
+        else => return error.GenericReturnIsNotATuple,
+    };
+    if (slots.len != 2) return error.GenericReturnArityChanged;
+    if (!isPrim(slots[1], .usize)) return error.GenericReturnSecondSlotIsNotUsize;
+    const parameter = switch (slots[0]) {
+        .path => |value| value,
+        else => return error.GenericReturnFirstSlotIsNotALexicalPath,
+    };
+    if (parameter.segments.len != 1 or !std.mem.eql(u8, parameter.segments[0].name, "I")) {
+        return error.GenericReturnFirstSlotIsNotTheTypeParameter;
+    }
+
+    // The literal's own row is a second row with the same shape, and it is the
+    // one a walk that only follows live expressions would never look at.
+    var literal_tuples: usize = 0;
+    for (model.bodies.exprs, 0..) |_, index| {
+        const elements = tupleElements(&model, @intCast(index)) orelse continue;
+        if (elements.len != 2) continue;
+        literal_tuples += 1;
+        if (!types.deepEqual(elements[0], slots[0])) return error.LiteralRowLostItsParameter;
+        if (!isPrim(elements[1], .usize)) return error.LiteralRowLostItsUsize;
+    }
+    try std.testing.expectEqual(@as(usize, 1), literal_tuples);
+
+    // Every arity-2 row that carries a `usize` in its second slot must still
+    // carry the parameter in its first: no row anywhere was left half-built.
+    var complete_rows: usize = 0;
+    for (model.bodies.types) |row| {
+        const row_slots = switch (row) {
+            .tuple => |value| value,
+            else => continue,
+        };
+        if (row_slots.len != 2) continue;
+        if (!isPrim(row_slots[1], .usize)) continue;
+        complete_rows += 1;
+        if (!types.deepEqual(row_slots[0], slots[0])) {
+            return error.PoolRowLostItsTypeParameter;
+        }
+    }
+    try std.testing.expect(complete_rows >= 1);
+}
+
+test "a nested borrowed tuple takes the contextual u8 rather than a defaulted i32" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `let borrowed = &7; let pair = ((borrowed, true), 0); byte_ref(pair.0.0)`.
+    // Nothing near the `7` says `u8`; the callee's own parameter is what says
+    // so. Seeding the borrow as `&i32` on the way in makes the nested tuple's
+    // first slot wrong for every reader downstream, and the seeding is invisible
+    // afterwards.
+    const source =
+        \\fn byte_ref(value: &u8) -> u8 { *value }
+        \\pub fn nested_borrow() -> u8 {
+        \\    let borrowed = &7;
+        \\    let pair = ((borrowed, true), 0);
+        \\    let result = byte_ref(pair.0.0);
+        \\    let count: usize = pair.1;
+        \\    result + count as u8
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    // Nothing in this crate is a borrow of a defaulted integer.
+    for (model.bodies.exprs) |expression| {
+        const ty = exprType(&model, expression.ty orelse continue) orelse continue;
+        const reference = switch (ty) {
+            .reference => |value| value,
+            else => continue,
+        };
+        if (isPrim(reference.pointee, .i32)) return error.BorrowSeededAsAReferenceToI32;
+    }
+
+    // `&7` and the `7` inside it both came out `&u8` / `u8`.
+    var borrowed_literals: usize = 0;
+    for (model.bodies.exprs, 0..) |expression, index| {
+        const node: exprs.NodeId = @intCast(index);
+        const literal = switch (expression.kind) {
+            .literal => |value| value,
+            else => continue,
+        };
+        const integer = switch (literal) {
+            .int => |value| value,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, integer.text, "7")) continue;
+        const literal_ty = exprType(&model, node) orelse continue;
+        if (!isPrim(literal_ty, .u8)) return error.BorrowedLiteralIsNotU8;
+
+        for (model.bodies.exprs, 0..) |_, outer| {
+            const outer_node: exprs.NodeId = @intCast(outer);
+            const unary = switch (model.bodies.exprs[outer_node].kind) {
+                .unary => |value| value,
+                else => continue,
+            };
+            if (unary.op != .ref or unary.operand != node) continue;
+            borrowed_literals += 1;
+            const borrow = exprType(&model, outer_node) orelse
+                return error.UntypedBorrow;
+            const reference = switch (borrow) {
+                .reference => |value| value,
+                else => return error.BorrowIsNotAReference,
+            };
+            if (reference.mut) return error.BorrowOfALiteralIsMutable;
+            if (!isPrim(reference.pointee, .u8)) return error.BorrowOfALiteralIsNotU8;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), borrowed_literals);
+
+    // `byte_ref(pair.0.0)` is what supplied the type; its argument has to be
+    // the borrow the callee declares, or the chain never got there.
+    var argument_checked = false;
+    for (model.bodies.exprs) |expression| {
+        const call = switch (expression.kind) {
+            .call => |value| value,
+            else => continue,
+        };
+        const name = callCallee(&model, call) orelse continue;
+        if (!std.mem.eql(u8, name, "byte_ref")) continue;
+        if (call.args.len != 1) return error.ByteRefArgumentCountChanged;
+        const argument = exprType(&model, call.args[0]) orelse
+            return error.UntypedByteRefArgument;
+        const reference = switch (argument) {
+            .reference => |value| value,
+            else => return error.ByteRefArgumentIsNotABorrow,
+        };
+        if (!isPrim(reference.pointee, .u8)) return error.ByteRefArgumentIsNotAU8Borrow;
+        argument_checked = true;
+    }
+    try std.testing.expect(argument_checked);
+
+    // `let count: usize = pair.1;` — the annotated slot keeps what it declared.
+    var annotated_slot = false;
+    for (model.bodies.exprs) |expression| {
+        const field = switch (expression.kind) {
+            .field => |value| value,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, field.field, "1")) continue;
+        const base_type = exprType(&model, field.base) orelse continue;
+        const inner = switch (base_type) {
+            .tuple => |value| value,
+            else => continue,
+        };
+        if (inner.len != 2) continue;
+        if (!isPrim(inner[1], .usize)) return error.AnnotatedTupleSlotIsNotUsize;
+        annotated_slot = true;
+    }
+    try std.testing.expect(annotated_slot);
+}
+
+test "a shadowed tuple binding stays a separate row from the one it shadows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `let pair = (7, true);` and, inside a block, `let pair = (9, false);`.
+    // Two bindings, two tuples, two rows — the inner one a `u64` because
+    // `wide` asks for one and the outer a `u8` because `byte` does. A scope
+    // keyed by the NAME rather than by the definition the binding resolved to
+    // would hand both of them the same row.
+    const source =
+        \\fn byte(value: u8) -> u8 { value }
+        \\fn wide(value: u64) -> u64 { value }
+        \\pub fn shadowed_rows() -> u64 {
+        \\    let pair = (7, true);
+        \\    let small = byte(pair.0);
+        \\    let large = { let pair = (9, false); wide(pair.0) };
+        \\    small as u64 + large
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    var narrow_row: ?exprs.TypeId = null;
+    var wide_row: ?exprs.TypeId = null;
+    for (model.bodies.exprs, 0..) |_, index| {
+        const node: exprs.NodeId = @intCast(index);
+        const elements = tupleElements(&model, node) orelse continue;
+        if (elements.len != 2) continue;
+        if (!isPrim(elements[1], .bool)) continue;
+        if (isPrim(elements[0], .u8)) narrow_row = model.bodies.exprs[node].ty;
+        if (isPrim(elements[0], .u64)) wide_row = model.bodies.exprs[node].ty;
+    }
+    const narrow_id = narrow_row orelse return error.ShadowedNarrowRowMissing;
+    const wide_id = wide_row orelse return error.ShadowedWideRowMissing;
+    try std.testing.expect(narrow_id != wide_id);
+
+    const encoded = try ir.serialize.encode(alloc, &model);
+    var decoded_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer decoded_arena.deinit();
+    const decoded_alloc = decoded_arena.allocator();
+    var decoded = try ir.serialize.decode(decoded_alloc, encoded);
+    defer decoded.graph.deinit();
+    defer decoded.deinitInstantiations(decoded_alloc);
+
+    // The two rows stay two rows across the wire, each with its own first slot.
+    var decoded_narrow: usize = 0;
+    var decoded_wide: usize = 0;
+    for (decoded.bodies.types) |row| {
+        const slots = switch (row) {
+            .tuple => |value| value,
+            else => continue,
+        };
+        if (slots.len != 2) continue;
+        if (!isPrim(slots[1], .bool)) continue;
+        if (isPrim(slots[0], .u8)) decoded_narrow += 1;
+        if (isPrim(slots[0], .u64)) decoded_wide += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), decoded_narrow);
+    try std.testing.expectEqual(@as(usize, 1), decoded_wide);
+}
+
+test "a trait method on u64 returning &'static str types its receiver and feeds a cast" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `impl Label for u64 { fn label_text(&self) -> &'static str }` reached as
+    // `value.label_text().len() as isize`. The receiver is a primitive, which is
+    // the one shape a source method lookup cannot read a nominal name out of,
+    // and the trait impl is the only thing in this crate that can type the call
+    // at all — so if the receiver names no type, nothing downstream has a `&str`
+    // to take a length of.
+    const source =
+        \\pub trait Label {
+        \\    fn label_text(&self) -> &'static str;
+        \\}
+        \\impl Label for u64 {
+        \\    fn label_text(&self) -> &'static str { "kib" }
+        \\}
+        \\pub fn label_width() -> isize {
+        \\    let value: u64 = 4096;
+        \\    value.label_text().len() as isize
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    var label_call: ?exprs.NodeId = null;
+    for (model.bodies.exprs, 0..) |expression, index| {
+        const node: exprs.NodeId = @intCast(index);
+        const call = switch (expression.kind) {
+            .method_call => |value| value,
+            else => continue,
+        };
+        const name = entityName(&model, call.method) orelse continue;
+        if (!std.mem.eql(u8, name, "label_text")) continue;
+        const ty = exprType(&model, node) orelse return error.UntypedLabelCall;
+        if (!isSharedStrRef(ty)) return error.LabelCallIsNotASharedStrRef;
+        label_call = node;
+    }
+    const str_node = label_call orelse return error.LabelCallNotFound;
+
+    var len_call: ?exprs.NodeId = null;
+    for (model.bodies.exprs, 0..) |_, index| {
+        const node: exprs.NodeId = @intCast(index);
+        const call = switch (model.bodies.exprs[node].kind) {
+            .method_call => |value| value,
+            else => continue,
+        };
+        if (call.receiver != str_node) continue;
+        const name = entityName(&model, call.method) orelse continue;
+        if (!std.mem.eql(u8, name, "len")) continue;
+        if (!isPrim(exprType(&model, node) orelse return error.UntypedLenCall, .usize)) {
+            return error.LenOfASharedStrIsNotUsize;
+        }
+        len_call = node;
+    }
+    const len_node = len_call orelse return error.LenCallNotFound;
+
+    var cast_checked = false;
+    for (model.bodies.exprs, 0..) |_, index| {
+        const node: exprs.NodeId = @intCast(index);
+        const cast = switch (model.bodies.exprs[node].kind) {
+            .cast => |value| value,
+            else => continue,
+        };
+        if (cast.operand != len_node) continue;
+        if (!isPrim(cast.source_type, .usize)) return error.CastSourceIsNotTheLenUsize;
+        const destination = typeAt(&model, cast.target) orelse return error.UntypedCastTarget;
+        if (!isPrim(destination, .isize)) return error.CastDestinationIsNotIsize;
+        cast_checked = true;
+    }
+    try std.testing.expect(cast_checked);
+}
+
+test "a dynamic vec repeat count is visited and typed before the vector is built" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `vec![7u8; count()]`. The count is an EXPRESSION, not a literal, so it is
+    // a node of its own that has to be walked and typed like any other. A
+    // walker that looked only at the repeat's text, or skipped the node
+    // entirely, would leave the count — and the locals inside it — untyped.
+    const source =
+        \\fn count() -> usize { 3 }
+        \\pub fn repeated() -> usize {
+        \\    let values = vec![7u8; { let extra = 2; count() + extra }];
+        \\    values.len()
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    // The count subtree: the `count()` call, its `usize` return, the block that
+    // holds it and the `extra` local inside that block.
+    var count_call: ?exprs.NodeId = null;
+    var extra_local_usize = false;
+    var vec_u8 = false;
+    for (model.bodies.exprs, 0..) |expression, index| {
+        const node: exprs.NodeId = @intCast(index);
+        switch (expression.kind) {
+            .call => |call| {
+                const name = callCallee(&model, call) orelse continue;
+                if (!std.mem.eql(u8, name, "count")) continue;
+                if (!isPrim(exprType(&model, node) orelse return error.UntypedCountCall, .usize)) {
+                    return error.CountCallIsNotUsize;
+                }
+                count_call = node;
+            },
+            .vec_lit => {
+                // `Vec` is ONE canonical external nominal, and the element the
+                // macro names is its single argument. A `generic_inst` here
+                // would be a different type wearing the same name — and its
+                // `decl` is an ENTITY id, so nothing in the type table is
+                // addressed by it at all.
+                try std.testing.expect(types.deepEqual(
+                    types.Type{ .external_nominal = .{
+                        .path = &.{ "alloc", "vec", "Vec" },
+                        .args = &.{.{ .prim = .u8 }},
+                    } },
+                    exprType(&model, node) orelse return error.UntypedVecLiteral,
+                ));
+                vec_u8 = true;
+            },
+            .path => |path| {
+                const name = entityName(&model, path.def) orelse continue;
+                if (!std.mem.eql(u8, name, "extra")) continue;
+                if (isPrim(exprType(&model, node) orelse continue, .usize)) {
+                    extra_local_usize = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(count_call != null);
+    try std.testing.expect(extra_local_usize);
+    try std.testing.expect(vec_u8);
+
+    // The repeat is an EXPRESSION, and the node it names is the count the
+    // source wrote — the block that holds the call, not the call itself. So
+    // the question is not whether the repeat points AT `count()`, but whether
+    // the count subtree it does name is typed: the block, the `extra` local it
+    // declares and the call all survive as nodes the backend can emit, rather
+    // than as a constant the frontend invented.
+    const count_node = count_call.?;
+    var count_root: ?exprs.NodeId = null;
+    for (model.bodies.exprs) |expression| {
+        const vector = switch (expression.kind) {
+            .vec_lit => |value| value,
+            else => continue,
+        };
+        const repeat = vector.repeat orelse continue;
+        switch (repeat) {
+            .literal => continue,
+            .expression => |root| count_root = root,
+        }
+    }
+    const root = count_root orelse return error.DynamicCountRootMissing;
+    if (!isPrim(exprType(&model, root) orelse return error.UntypedCountRoot, .usize)) {
+        return error.CountRootIsNotUsize;
+    }
+
+    // Reach is a fact about the WALK from the root the vec literal actually
+    // names, not about one node: the count subtree has to be reachable whether
+    // the root is the block, its tail, or the call the block ends in.
+    var walker = try exprs.NodeWalker.init(
+        alloc,
+        model.bodies.exprs,
+        model.bodies.stmts,
+        model.bodies.pats,
+        model.bodies.types,
+    );
+    defer walker.deinit();
+    try walker.reset(root);
+    var reaches_call = false;
+    var reaches_extra = false;
+    while (try walker.next()) |reachable| {
+        const reached = switch (reachable) {
+            .expression => |id| id,
+            else => continue,
+        };
+        if (reached == count_node) reaches_call = true;
+        const path = switch (model.bodies.exprs[reached].kind) {
+            .path => |value| value,
+            else => continue,
+        };
+        const name = entityName(&model, path.def) orelse continue;
+        if (std.mem.eql(u8, name, "extra")) reaches_extra = true;
+    }
+    try std.testing.expect(reaches_call);
+    try std.testing.expect(reaches_extra);
+}
+
+test "a source trait method declared u64 types the &mut self call its cast narrows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `trait Wide { fn wide(&mut self) -> u64 }` implemented for a local
+    // struct, reached as `counter.wide() as u32` on a `&mut Counter`. Nothing
+    // at the use site names a type: no inherent block, no turbofish, no
+    // annotation, and no standard rule claims `wide`. So the call's `u64` can
+    // only have come from the trait impl's declaration, and the cast that
+    // consumed it is where that answer is visible — a call left untyped leaves
+    // the cast carrying the frontend's "source type pending" placeholder.
+    const source =
+        \\pub trait Wide {
+        \\    fn wide(&mut self) -> u64;
+        \\}
+        \\pub struct Counter {
+        \\    value: u64,
+        \\}
+        \\impl Wide for Counter {
+        \\    fn wide(&mut self) -> u64 { self.value }
+        \\}
+        \\pub fn narrow(counter: &mut Counter) -> u32 {
+        \\    counter.wide() as u32
+        \\}
+    ;
+    const model = try analyzeSourceRegression(alloc, source);
+    try expectValidAndCanonical(alloc, &model);
+
+    var wide_call: ?exprs.NodeId = null;
+    for (model.bodies.exprs, 0..) |_, index| {
+        const node: exprs.NodeId = @intCast(index);
+        const call = switch (model.bodies.exprs[node].kind) {
+            .method_call => |value| value,
+            else => continue,
+        };
+        const name = entityName(&model, call.method) orelse continue;
+        if (!std.mem.eql(u8, name, "wide")) continue;
+        if (!isPrim(exprType(&model, node) orelse return error.UntypedWideCall, .u64)) {
+            return error.TraitDeclaredWideCallIsNotU64;
+        }
+        wide_call = node;
+    }
+    const call_node = wide_call orelse return error.WideCallNotFound;
+
+    var cast_checked = false;
+    for (model.bodies.exprs, 0..) |_, index| {
+        const node: exprs.NodeId = @intCast(index);
+        const cast = switch (model.bodies.exprs[node].kind) {
+            .cast => |value| value,
+            else => continue,
+        };
+        if (cast.operand != call_node) continue;
+        // The cast SURVIVED, and it survived carrying the declared `u64` as its
+        // source and the `u32` the source spelled as its destination.
+        if (!isPrim(cast.source_type, .u64)) return error.CastSourceIsNotTheDeclaredU64;
+        const destination = typeAt(&model, cast.target) orelse return error.UntypedCastTarget;
+        if (!isPrim(destination, .u32)) return error.CastDestinationIsNotU32;
+        cast_checked = true;
+    }
+    try std.testing.expect(cast_checked);
+}
+
+// ── Inherited generic parameters ──────────────────────────────────────────────
+//
+// A method that declares no type parameter of its own binds the ones the
+// DECLARATION it is nested in declares, and that is the only question
+// `getGenericParamNames` answers. `impl<S: Sip> Hasher<S> { fn new_with_keys(k0:
+// u64, k1: u64) -> Hasher<S> }` records zero parameters on the function and one
+// on the impl; the call still has to produce `Hasher<Sip24Rounds>`, and a row
+// naming the FUNCTION with one argument is an instantiation no declaration can
+// have — `validateInstantiations` counts the entity's own parameters and finds
+// none.
+
+/// Entity ids are fixed because the body table is indexed by entity id.
+const inherited_module: exprs.DefId = 0;
+const inherited_struct: exprs.DefId = 1;
+const inherited_impl: exprs.DefId = 2;
+const inherited_method: exprs.DefId = 3;
+const inherited_owner: exprs.DefId = 4;
+
+/// Expr table: 0 = the argument that carries the parameter, 1 =
+/// `Cell::<..>::from_radix_10_checked(..)`, 2 = the callee's own empty body,
+/// 3 = the enclosing `fn`'s body block.
+const inherited_arg_node: exprs.NodeId = 0;
+const inherited_call_node: exprs.NodeId = 1;
+const inherited_method_body_node: exprs.NodeId = 2;
+const inherited_owner_body_node: exprs.NodeId = 3;
+
+/// Type rows: 0 = the BARE type parameter, 1 = the argument's own type,
+/// 2 = the substituted result, 3 = the owner's declared return.
+const inherited_param_row: exprs.TypeId = 0;
+const inherited_arg_type: exprs.TypeId = 1;
+const inherited_result_type: exprs.TypeId = 2;
+const inherited_owner_return_type: exprs.TypeId = 3;
+
+const InheritedParamFixture = struct {
+    exprs_store: []exprs.Expr,
+    stmts_store: []exprs.Statement,
+    types_store: []types.Type,
+    bodies_store: []bodies.BodyKind,
+    b: bodies.Bodies,
+    graph: crate_graph.CrateGraph,
+
+    fn deinit(self: *InheritedParamFixture, alloc: std.mem.Allocator) void {
+        self.graph.deinit();
+        alloc.free(self.bodies_store);
+        alloc.free(self.types_store);
+        alloc.free(self.stmts_store);
+        alloc.free(self.exprs_store);
+        self.* = undefined;
+    }
+};
+
+const InheritedParamSpec = struct {
+    /// What `struct Cell<..>` declares. Non-empty also parents the method to
+    /// the STRUCT, which is where Rust puts a method written inside it.
+    struct_type_params: []const []const u8 = &.{},
+    /// What `impl<..> FromRadix10Checked for Cell` declares. Non-empty parents
+    /// the method to the impl instead.
+    impl_type_params: []const []const u8 = &.{},
+    /// The callee's OWN parameters, in the order the call passes them. It
+    /// declares no type parameter of its own whatever these carry.
+    callee_params: []const items.Param,
+    /// The `->` the callee declares.
+    declared_return: types.Type,
+    /// What the one argument is written with; also the concrete every inherited
+    /// parameter is instantiated at.
+    argument_type: types.Type,
+    /// The row the substitution is expected to land on.
+    expected_result: types.Type,
+};
+
+fn buildInheritedParamFixture(
+    alloc: std.mem.Allocator,
+    spec: InheritedParamSpec,
+) !InheritedParamFixture {
+    const parameter_name = if (spec.struct_type_params.len != 0)
+        spec.struct_type_params[0]
+    else if (spec.impl_type_params.len != 0)
+        spec.impl_type_params[0]
+    else
+        return error.NoDeclarationBindsTheParameter;
+    try std.testing.expectEqual(@as(usize, 1), spec.callee_params.len);
+
+    var graph = crate_graph.CrateGraph.init(alloc);
+    errdefer graph.deinit();
+
+    const module_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(inherited_module, module_id);
+    const struct_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try alloc.dupe(u8, "Cell"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(inherited_struct, struct_id);
+    const impl_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .impl_,
+        .name = try alloc.dupe(u8, "FromRadix10Checked for Cell"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(inherited_impl, impl_id);
+    // A method written inside an `impl` belongs to that impl, and a method
+    // written inside a `struct` block belongs to that struct. Which one this
+    // fixture models is exactly what the parameter under test is inherited from.
+    const method_parent: spine.EntityId = if (spec.impl_type_params.len == 0)
+        struct_id
+    else
+        impl_id;
+    const method_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "from_radix_10_checked"),
+        .span = span,
+        .visibility = .public,
+        .parent = method_parent,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(inherited_method, method_id);
+    const owner_id = try graph.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "run"),
+        .span = span,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try std.testing.expectEqual(inherited_owner, owner_id);
+
+    const parameter_path: types.Type = .{ .path = .{ .segments = try alloc.dupe(
+        types.PathSegment,
+        &.{.{ .name = try alloc.dupe(u8, parameter_name), .id = null }},
+    ) } };
+    const parameter_args = try alloc.dupe(types.Type, &.{parameter_path});
+    const impl_self_ty: types.Type = .{ .generic_inst = .{
+        .decl = struct_id,
+        .args = .{ .params = parameter_args },
+    } };
+    const impl_generics: ?types.Generics = blk: {
+        if (spec.impl_type_params.len == 0) break :blk null;
+        const params = try alloc.alloc(types.GenericParam, spec.impl_type_params.len);
+        for (spec.impl_type_params, 0..) |name, index| {
+            params[index] = .{ .type_ = .{
+                .name = try alloc.dupe(u8, name),
+                .bounds = &.{},
+            } };
+        }
+        break :blk .{ .params = params, .where_clauses = &.{} };
+    };
+
+    const types_store = try alloc.alloc(types.Type, 4);
+    // The bare parameter IS interned here, on purpose. A name scan contributes
+    // a one-segment path only when that path has no row of its own, so with
+    // this row present the scan sees nothing at all — which is what makes the
+    // scope walk, and not the signature, the only thing that can bind it.
+    types_store[inherited_param_row] = parameter_path;
+    types_store[inherited_arg_type] = spec.argument_type;
+    types_store[inherited_result_type] = spec.expected_result;
+    types_store[inherited_owner_return_type] = .{ .prim = .unit };
+
+    const exprs_store = try alloc.alloc(exprs.Expr, 4);
+    exprs_store[inherited_arg_node] = .{
+        .id = inherited_arg_node,
+        .span = span,
+        .ty = inherited_arg_type,
+        .kind = .{ .path = .{ .def = module_id, .generic_args = &.{} } },
+    };
+    exprs_store[inherited_call_node] = .{
+        .id = inherited_call_node,
+        .span = span,
+        .ty = null,
+        .kind = .{ .call = .{
+            .call_kind = .{ .associated = method_id },
+            .args = try alloc.dupe(exprs.NodeId, &.{inherited_arg_node}),
+        } },
+    };
+    exprs_store[inherited_method_body_node] = .{
+        .id = inherited_method_body_node,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{ .statements = &.{}, .tail = null, .labelled = null } },
+    };
+    // The call is a STATEMENT, not the enclosing function's tail. A tail call
+    // is additionally handed the owner's own declared return as an expectation,
+    // and what this fixture is about is the substitution the callee's scope
+    // produces, not which of two answers to the same node arrives last.
+    exprs_store[inherited_owner_body_node] = .{
+        .id = inherited_owner_body_node,
+        .span = span,
+        .ty = null,
+        .kind = .{ .block = .{
+            .statements = &.{0},
+            .tail = null,
+            .labelled = null,
+        } },
+    };
+
+    const stmts_store = try alloc.alloc(exprs.Statement, 1);
+    stmts_store[0] = .{
+        .id = 0,
+        .span = span,
+        .ty = null,
+        .kind = .{ .expr = inherited_call_node },
+    };
+
+    const bodies_store = try alloc.alloc(bodies.BodyKind, 5);
+    bodies_store[inherited_module] = .none;
+    bodies_store[inherited_struct] = .{ .struct_ = .{
+        .generic_params = spec.struct_type_params,
+    } };
+    bodies_store[inherited_impl] = .{ .impl_ = .{
+        .self_ty = impl_self_ty,
+        .trait_path = .{ .segments = try alloc.dupe(
+            types.PathSegment,
+            &.{.{ .name = "FromRadix10Checked", .id = null }},
+        ) },
+        .generics = impl_generics,
+        .assoc_items = try alloc.dupe(spine.EntityId, &.{method_id}),
+    } };
+    // The callee declares NOTHING of its own. That is the point: every parameter
+    // it binds belongs to the declaration above it.
+    bodies_store[inherited_method] = .{ .fn_ = .{
+        .params = spec.callee_params,
+        .ret = spec.declared_return,
+        .generic_params = &.{},
+        .body = inherited_method_body_node,
+    } };
+    bodies_store[inherited_owner] = .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = inherited_owner_body_node,
+    } };
+
+    return .{
+        .exprs_store = exprs_store,
+        .stmts_store = stmts_store,
+        .types_store = types_store,
+        .bodies_store = bodies_store,
+        .b = .{
+            .exprs = exprs_store,
+            .stmts = stmts_store,
+            .pats = &.{},
+            .types = types_store,
+            .bodies = bodies_store,
+        },
+        .graph = graph,
+    };
+}
+
+test "a method of a generic struct binds the parameter the struct declares" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `struct Hasher<S> { .. }` with `fn from_radix_10_checked(payload: S) ->
+    // Hasher<S>` written inside it, reached as `Hasher::from_radix_10_checked(x)`
+    // with `x: u8`. The function's own body records no parameter, and the bare
+    // `S` already has a row in the type table, so nothing in the signature can
+    // be read as a parameter name — only the scope walk finds it.
+    const parameter_segments = [_]types.PathSegment{.{ .name = "S", .id = null }};
+    const parameter_path: types.Type = .{ .path = .{ .segments = &parameter_segments } };
+    const parameter_args = [_]types.Type{parameter_path};
+    const concrete_args = [_]types.Type{.{ .prim = .u8 }};
+    const callee_params = [_]items.Param{.{
+        .name = "payload",
+        .ty = parameter_path,
+        .span = span,
+    }};
+    const declared_return: types.Type = .{ .generic_inst = .{
+        .decl = inherited_struct,
+        .args = .{ .params = &parameter_args },
+    } };
+    const expected_result: types.Type = .{ .generic_inst = .{
+        .decl = inherited_struct,
+        .args = .{ .params = &concrete_args },
+    } };
+
+    var fixture = try buildInheritedParamFixture(alloc, .{
+        .struct_type_params = &.{"S"},
+        .callee_params = &callee_params,
+        .declared_return = declared_return,
+        .argument_type = .{ .prim = .u8 },
+        .expected_result = expected_result,
+    });
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    // The struct's parameter binds, and the declared return substitutes to the
+    // `Hasher<u8>` the type table already holds.
+    try std.testing.expectEqual(
+        @as(?exprs.TypeId, inherited_result_type),
+        inferred.getType(inherited_call_node),
+    );
+    // No row names the method: it declares no parameter of its own, so
+    // `(from_radix_10_checked, [u8])` is an instantiation it cannot have.
+    try std.testing.expect(inferred.getInstantiation(inherited_call_node) == null);
+}
+
+test "a method of a generic impl binds the parameter the impl declares" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    // `impl<I: Integer> FromRadix10Checked<I> for I { fn from_radix_10_checked(..)
+    // -> (Option<I>, usize) }` reached with `I = u8`. The impl declares `I`, the
+    // function declares nothing, and the answer the call owes is
+    // `(Option<u8>, usize)` — the tuple atoi's `u8::from_radix_10_checked(..)`
+    // has to complete to.
+    //
+    // The receiver is spelled as a parameter because this is an ASSOCIATED call:
+    // `source: &Cell<I>` is the same statement about `I` that `self` makes when
+    // the call goes through a method call, and it is what lets the signature
+    // bind `I` at all. Nothing in the function's own body records it.
+    const parameter_segments = [_]types.PathSegment{.{ .name = "I", .id = null }};
+    const parameter_path: types.Type = .{ .path = .{ .segments = &parameter_segments } };
+    const parameter_args = [_]types.Type{parameter_path};
+    const declared_cell: types.Type = .{ .generic_inst = .{
+        .decl = inherited_struct,
+        .args = .{ .params = &parameter_args },
+    } };
+    // `.reference` carries a pointer, so the borrow is allocated rather than
+    // taken from a local: the table has to own every node it points at.
+    const declared_receiver = try alloc.create(types.Ref);
+    declared_receiver.* = .{ .mut = false, .pointee = declared_cell };
+    const callee_params = [_]items.Param{.{
+        .name = "source",
+        .ty = .{ .reference = declared_receiver },
+        .span = span,
+    }};
+
+    const declared_option = try alloc.create(types.Type);
+    declared_option.* = parameter_path;
+    const declared_return: types.Type = .{ .tuple = &.{
+        .{ .option = declared_option },
+        .{ .prim = .usize },
+    } };
+
+    const concrete_args = [_]types.Type{.{ .prim = .u8 }};
+    const concrete_cell: types.Type = .{ .generic_inst = .{
+        .decl = inherited_struct,
+        .args = .{ .params = &concrete_args },
+    } };
+    const concrete_receiver = try alloc.create(types.Ref);
+    concrete_receiver.* = .{ .mut = false, .pointee = concrete_cell };
+    const result_option = try alloc.create(types.Type);
+    result_option.* = .{ .prim = .u8 };
+    const expected_result: types.Type = .{ .tuple = &.{
+        .{ .option = result_option },
+        .{ .prim = .usize },
+    } };
+
+    var fixture = try buildInheritedParamFixture(alloc, .{
+        .impl_type_params = &.{"I"},
+        .callee_params = &callee_params,
+        .declared_return = declared_return,
+        .argument_type = .{ .reference = concrete_receiver },
+        .expected_result = expected_result,
+    });
+    defer fixture.deinit(alloc);
+
+    var inferred = try infer.solveWithGraph(alloc, &fixture.b, &fixture.graph);
+    defer inferred.deinit(alloc);
+
+    // The impl's parameter binds, and `(Option<I>, usize)` substitutes to the
+    // `(Option<u8>, usize)` the type table already holds.
+    try std.testing.expectEqual(
+        @as(?exprs.TypeId, inherited_result_type),
+        inferred.getType(inherited_call_node),
+    );
+    // And no row names the method: `I` is the impl's, so the one-argument
+    // record the call could otherwise write describes an instantiation the
+    // function does not have.
+    try std.testing.expect(inferred.getInstantiation(inherited_call_node) == null);
 }

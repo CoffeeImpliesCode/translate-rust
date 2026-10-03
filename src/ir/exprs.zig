@@ -161,17 +161,39 @@ pub const ByteArrayLit = struct {
 /// non-null the total length is `repeat` (Rust `[e; N]`); otherwise the total
 /// length is `elements.len`. Lossless: element exprs are full `Expr` nodes and
 /// the backend derives Zig `[_]T{ ... }` / `[_]T{ e } ** N` from them.
+///
+/// The count is a plain number because a fixed-length array's length is part
+/// of its type and therefore known before any code runs. `VecLit` has no such
+/// guarantee, which is why its count is a `VecRepeatCount`.
 pub const ArrayExpr = struct {
     elements: []const NodeId,
-    repeat: ?usize,
+    /// Target-side repeat count; independent of the translator's pointer width.
+    repeat: ?u64,
 };
+
+/// A `vec![e; N]` repeat count: either a number the translator already holds,
+/// or the `Expr` node that produces it.
+///
+/// `Vec` is a runtime container, so `vec![e; N]` states how many elements a
+/// value holds without the count being part of any type: `vec![0u8; n]`
+/// repeats as many times as `n` evaluates to, and `n` is an ordinary
+/// expression with its own effects, types, lifetimes, and captures.
+pub const VecRepeatCount = union(enum) {
+    /// A count the translator holds outright; wide so a count a 64-bit target
+    /// can state survives any host.
+    literal: u64,
+    /// A count the target evaluates, as an expression node.
+    expression: NodeId,
+};
+
 /// A parsed Rust `vec!` literal, distinct from a fixed-length array literal.
 /// When `repeat` is null, `elements` may contain any number of nodes, including
-/// zero. When `repeat` is non-null, `elements` must contain exactly one node.
+/// zero. When `repeat` is set, `elements` must contain exactly one node.
 /// This records macro semantics without claiming runtime `Vec` support.
 pub const VecLit = struct {
     elements: []const NodeId,
-    repeat: ?usize,
+    /// Target-side repeat count; independent of the translator's pointer width.
+    repeat: ?VecRepeatCount,
 };
 
 /// A range expression (`start..end`, `start..=end`, or `start..`).
@@ -309,6 +331,42 @@ pub const CoreFunction = enum {
     mem_transmute,
     mem_size_of_val,
     ptr_copy_nonoverlapping,
+    /// Rust integer `T::from_le_bytes(bytes)`: one type argument `T`, one
+    /// value argument `[size_of::<T>()]u8`, and result `T`. The width belongs
+    /// to the compilation target, including for `usize` and `isize`.
+    /// Unlike `mem_transmute`, this decodes little-endian on every target.
+    prim_from_le_bytes,
+    /// Rust integer `value.to_le_bytes()`: one type argument `T`, one value
+    /// argument `T`, and result `[size_of::<T>()]u8`. Pointer-sized widths
+    /// remain target-dependent. Unlike `mem_transmute`, this encodes
+    /// little-endian on every target.
+    prim_to_le_bytes,
+    /// Rust `MaybeUninit::<T>::uninit()`. One type argument `T`, no value
+    /// arguments, and result `core::mem::MaybeUninit<T>`, not a live `T`.
+    /// Backend layout remains transparent `T`. The array a source writes
+    /// (`[MaybeUninit::<u8>::uninit(); N]`) is the separate `.array` node above
+    /// this one, carrying `repeat = N`. Rust evaluates the element once and
+    /// repeats the value; making the call array-typed would conflate the
+    /// element with the enclosing array and its independent length.
+    ///
+    /// The value is genuinely UNINITIALISED, which is why it cannot be a
+    /// zero-filled array literal: the source promised the bytes hold nothing
+    /// until it writes them, and initialising them is a different program.
+    maybe_uninit_uninit,
+    /// Rust `rand_core::impls::fill_bytes_via_next(rng, dest)`, the default body
+    /// of `RngCore::fill_bytes`. `args` is `[rng, dest]`: the receiver first
+    /// because that is the borrow `fill_bytes` takes, then the slice to fill.
+    /// Zero type arguments, two value arguments, and result `unit`. The
+    /// receiver is mutable and `dest` is a mutable byte slice. Its identity
+    /// is the `rand_core::impls` path, not an unrelated same-named function.
+    rng_fill_bytes_via_next,
+    /// Rust `core::hash::Hasher::write_uN` and the rest of the family's default
+    /// bodies. `generic_args[0]` is the primitive being written and `args` is
+    /// `[hasher, value]`. The default body writes the value's OWN bytes, which
+    /// is native-endian. One integer type argument, two value arguments
+    /// (mutable hasher and that integer), and result `unit`. A source impl's
+    /// override must dispatch to its own method instead of this default.
+    hash_write_primitive,
     ptr_write_bytes,
     ptr_read_unaligned,
     slice_from_raw_parts,
@@ -322,6 +380,20 @@ pub const CoreFunction = enum {
     cmp_max,
     default_value,
     convert_from,
+    /// Canonical `num_traits::Bounded::min_value`: one type argument `I`,
+    /// zero value arguments, result `I`. Source trait implementations take
+    /// precedence over the target-integer minimum fallback.
+    numeric_min_value,
+    /// Canonical `num_traits::Bounded::max_value`, with the same shape and
+    /// source-override precedence as `numeric_min_value`.
+    numeric_max_value,
+    /// Canonical `num_traits::Zero::zero`: one type argument `I`, zero value
+    /// arguments, result `I`. This is not `Default::default`; source trait
+    /// implementations take precedence over the typed integer-zero fallback.
+    numeric_zero,
+    /// Canonical `num_traits::One::one`, with the same shape and source-
+    /// override precedence as `numeric_zero`, and integer-one fallback.
+    numeric_one,
 };
 
 /// A core-library function item. It carries type arguments but no value
@@ -987,6 +1059,13 @@ pub const NodeWalker = struct {
             },
             .vec_lit => |vector| {
                 for (vector.elements) |element| try self.enqueueExpression(element);
+                // A count the target evaluates is a real child node: whatever
+                // it touches is the literal's own reach, so it is walked and
+                // bound-checked like any other element.
+                if (vector.repeat) |count| switch (count) {
+                    .literal => {},
+                    .expression => |id| try self.enqueueExpression(id),
+                };
             },
             .range => |range| {
                 try self.enqueueExpression(range.start);
@@ -1156,8 +1235,96 @@ pub const NodeWalker = struct {
     }
 };
 // =============================================================================
-// Tests — instantiate every union arm and struct to prove compile.  All values
-// use compile-time static slices; no allocator needed (mirrors items.zig).
+// Walker audit — every child a node can carry is reachable from its parent.
+//
+// The `enqueue*Children` switches exhaust every union tag (a new tag is a
+// compile error, not a missed child), so what the audit must pin is the
+// *fields*: a payload whose node or type edge the walker forgets. Each
+// fixture below carries exactly one such edge, and the walker must surface
+// it. New edges — a new `types.Type` carried by `CoreCall`, say — join this
+// family with their own probe, never by extending an existing arm's reach.
+// =============================================================================
+
+/// A flat-tables builder for walker fixtures. Every row it appends is dense:
+/// the id handed back is that row's index in its own table, exactly as a
+/// deserialised wire body would carry it.
+const WalkFixture = struct {
+    alloc: std.mem.Allocator,
+    exprs: std.ArrayListUnmanaged(Expr) = .empty,
+    stmts: std.ArrayListUnmanaged(Statement) = .empty,
+    pats: std.ArrayListUnmanaged(Pattern) = .empty,
+    types: std.ArrayListUnmanaged(types.Type) = .empty,
+    span: spine.Span = .{ .start_line = 1, .start_col = 1, .end_line = 1, .end_col = 1 },
+
+    fn deinit(self: *WalkFixture) void {
+        self.exprs.deinit(self.alloc);
+        self.stmts.deinit(self.alloc);
+        self.pats.deinit(self.alloc);
+        self.types.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn expr(self: *WalkFixture, kind: ExprKind) !NodeId {
+        const id: NodeId = @intCast(self.exprs.items.len);
+        try self.exprs.append(
+            self.alloc,
+            .{ .id = id, .span = self.span, .ty = null, .kind = kind },
+        );
+        return id;
+    }
+
+    fn stmt(self: *WalkFixture, kind: StatementKind) !NodeId {
+        const id: NodeId = @intCast(self.stmts.items.len);
+        try self.stmts.append(
+            self.alloc,
+            .{ .id = id, .span = self.span, .ty = null, .kind = kind },
+        );
+        return id;
+    }
+
+    fn pat(self: *WalkFixture, kind: PatternKind) !NodeId {
+        const id: NodeId = @intCast(self.pats.items.len);
+        try self.pats.append(
+            self.alloc,
+            .{ .id = id, .span = self.span, .ty = null, .kind = kind },
+        );
+        return id;
+    }
+
+    fn ty(self: *WalkFixture, ty_value: types.Type) !TypeId {
+        const id: TypeId = @intCast(self.types.items.len);
+        try self.types.append(self.alloc, ty_value);
+        return id;
+    }
+
+    fn walker(self: *const WalkFixture) !NodeWalker {
+        return NodeWalker.init(
+            self.alloc,
+            self.exprs.items,
+            self.stmts.items,
+            self.pats.items,
+            self.types.items,
+        );
+    }
+};
+
+/// The `NodeId`s a walk from `root` visits.
+fn reachableExprIds(
+    walk: *NodeWalker,
+    root: NodeId,
+    out: []bool,
+) !void {
+    try walk.reset(root);
+    while (try walk.next()) |node| {
+        if (node == .expression) out[@as(usize, node.expression)] = true;
+    }
+}
+
+// =============================================================================
+// Tests — reachability proofs first, then the compile smoke below. The
+// walker proofs build their fixtures with the testing allocator and release
+// everything they append; the smoke tests keep the original static-slice
+// pattern (mirrors items.zig).
 //
 // Pattern: standalone exercises (enums, payloads) use `_ =` to suppress
 // unused warnings.  Composed values (Expr, Pattern, Statement) are consumed
@@ -1181,6 +1348,10 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
     _ = lit_bool;
 
     const vec_lit: VecLit = .{ .elements = &.{ 1, 2 }, .repeat = null };
+    const vec_lit_repeated: VecLit = .{ .elements = &.{3}, .repeat = .{ .literal = 4 } };
+    const vec_lit_counted: VecLit = .{ .elements = &.{3}, .repeat = .{ .expression = 5 } };
+    _ = vec_lit_repeated;
+    _ = vec_lit_counted;
     const array_expr: ArrayExpr = .{ .elements = &.{ 3, 4 }, .repeat = null };
     const range_expr: RangeExpr = .{ .start = 5, .end = 6, .inclusive = false };
 
@@ -1265,6 +1436,15 @@ test "exprs — every ExprKind / Literal / Operator variant compiles" {
         .cmp_max,
         .default_value,
         .convert_from,
+        .prim_from_le_bytes,
+        .prim_to_le_bytes,
+        .maybe_uninit_uninit,
+        .rng_fill_bytes_via_next,
+        .hash_write_primitive,
+        .numeric_min_value,
+        .numeric_max_value,
+        .numeric_zero,
+        .numeric_one,
     };
     const core_call: CoreCall = .{
         .function = .mem_size_of,
@@ -1735,4 +1915,196 @@ test "exprs — deferred seam (ClosureExpr / IteratorChainExpr / IteratorAdapter
     _ = e_range;
     _ = e_closure;
     _ = e_chain;
+}
+
+// A `CoreCall` is exactly where a missed type edge strands a consumer:
+// `hash_write_primitive` carries the written primitive as a type argument and
+// the hasher and value as value arguments, and serialising its caller without
+// walking the type side would leave the primitive half of the call behind.
+test "walker reaches the Hasher primitive write's type and both values" {
+    var f = WalkFixture{ .alloc = std.testing.allocator };
+    defer f.deinit();
+
+    const hasher = try f.expr(.{ .path = .{ .def = 7, .generic_args = &.{} } });
+    const hasher_type: types.Type = .{ .reference = &.{
+        .mut = true,
+        .pointee = .{ .path = .{ .segments = &.{
+            .{ .name = "SeaHasher", .id = 7 },
+        } } },
+    } };
+    const hasher_type_id = try f.ty(hasher_type);
+    f.exprs.items[@as(usize, hasher)].ty = hasher_type_id;
+
+    // The primitive's own row: a wire walk that stops at the value arguments
+    // never names it, so the primitive rides as an array whose length is an
+    // expression node and nothing else in the fixture points at it. Reaching
+    // the probe below proves the walker descended into `generic_args`
+    // rather than stopping at the call's value edges.
+    const probe = try f.expr(.{ .unit = {} });
+    const primitive_id = try f.ty(.{ .array = &.{
+        .elem = .{ .prim = .u64 },
+        .len = .{ .expression = probe },
+    } });
+
+    const value = try f.expr(.{ .literal = .{ .int = .{
+        .text = "0",
+        .value = 0,
+        .base = .dec,
+        .ty_suffix = "u64",
+    } } });
+    const value_type_id = try f.ty(.{ .prim = .u64 });
+    f.exprs.items[@as(usize, value)].ty = value_type_id;
+
+    const call = try f.expr(.{ .core_call = .{
+        .function = .hash_write_primitive,
+        .generic_args = &.{f.types.items[primitive_id]},
+        .args = &.{ hasher, value },
+    } });
+
+    var walk = try f.walker();
+    defer walk.deinit();
+    const reached = try f.alloc.alloc(bool, f.exprs.items.len);
+    defer f.alloc.free(reached);
+    @memset(reached, false);
+    try reachableExprIds(&walk, call, reached);
+
+    try std.testing.expect(reached[@as(usize, call)]);
+    try std.testing.expect(reached[@as(usize, hasher)]);
+    try std.testing.expect(reached[@as(usize, value)]);
+    // The type argument's length expression: reached only if the walker
+    // descended into the call's `generic_args` type row.
+    try std.testing.expect(reached[@as(usize, probe)]);
+}
+
+// The array's element expression and a `vec_lit`'s count expression consume
+// the probe length through the *type* table: reaching the count node proves
+// `enqueueType` walked the array's length rather than stopping at the element.
+test "walker reaches the type-only repeat and index expressions" {
+    var f = WalkFixture{ .alloc = std.testing.allocator };
+    defer f.deinit();
+
+    const count = try f.expr(.{ .literal = .{ .int = .{
+        .text = "64",
+        .value = 64,
+        .base = .dec,
+        .ty_suffix = "u64",
+    } } });
+    // A length that names an expression node rather than a number; nothing
+    // else in the fixture points at `count`.
+    const repeated: types.Type = .{ .array = &.{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .expression = count },
+    } };
+    const repeated_id = try f.ty(repeated);
+
+    const element = try f.expr(.{ .literal = .{ .int = .{
+        .text = "0",
+        .value = 0,
+        .base = .dec,
+        .ty_suffix = "u8",
+    } } });
+
+    const repeat_lit = try f.expr(.{ .array = .{ .elements = &.{element}, .repeat = 64 } });
+    const indexed = try f.expr(.{ .index = .{ .base = repeat_lit, .index = element } });
+    f.exprs.items[@as(usize, repeat_lit)].ty = repeated_id;
+    f.exprs.items[@as(usize, indexed)].ty = repeated_id;
+
+    var walk = try f.walker();
+    defer walk.deinit();
+    const reached = try f.alloc.alloc(bool, f.exprs.items.len);
+    defer f.alloc.free(reached);
+    @memset(reached, false);
+    try reachableExprIds(&walk, indexed, reached);
+
+    try std.testing.expect(reached[@as(usize, indexed)]);
+    try std.testing.expect(reached[@as(usize, repeat_lit)]);
+    try std.testing.expect(reached[@as(usize, element)]);
+    try std.testing.expect(reached[@as(usize, count)]);
+}
+
+// A Vec's repeat count is an ordinary expression with its own effects and
+// types, while a fixed array's is a plain number. Walking the array must not
+// produce the Vec's count node, and walking the Vec must — the two count
+// shapes stay distinct on the wire exactly here.
+test "walker keeps a Vec repeat expression apart from a fixed array count" {
+    var f = WalkFixture{ .alloc = std.testing.allocator };
+    defer f.deinit();
+
+    const element = try f.expr(.{ .unit = {} });
+    const count = try f.expr(.{ .unit = {} });
+
+    const fixed = try f.expr(.{ .array = .{ .elements = &.{element}, .repeat = 64 } });
+    const dynamic = try f.expr(.{ .vec_lit = .{
+        .elements = &.{element},
+        .repeat = .{ .expression = count },
+    } });
+
+    var walk = try f.walker();
+    defer walk.deinit();
+
+    const reached_fixed = try f.alloc.alloc(bool, f.exprs.items.len);
+    defer f.alloc.free(reached_fixed);
+    @memset(reached_fixed, false);
+    try reachableExprIds(&walk, fixed, reached_fixed);
+    try std.testing.expect(reached_fixed[@as(usize, fixed)]);
+    try std.testing.expect(reached_fixed[@as(usize, element)]);
+    // The Vec's count node is a *target-side evaluation*, never a row of
+    // this array: the fixed array's plain-number count cannot reach it.
+    try std.testing.expect(!reached_fixed[@as(usize, count)]);
+
+    const reached_dynamic = try f.alloc.alloc(bool, f.exprs.items.len);
+    defer f.alloc.free(reached_dynamic);
+    @memset(reached_dynamic, false);
+    try reachableExprIds(&walk, dynamic, reached_dynamic);
+    try std.testing.expect(reached_dynamic[@as(usize, dynamic)]);
+    try std.testing.expect(reached_dynamic[@as(usize, element)]);
+    try std.testing.expect(reached_dynamic[@as(usize, count)]);
+}
+
+// The comparison temporary is read off the operand's `Expr.ty`, which the
+// walker delivers from the row itself even when the operand is nested under
+// projections. Reaching the probe length proves that type row was delivered.
+test "walker reaches a nested comparison operand's declared type" {
+    var f = WalkFixture{ .alloc = std.testing.allocator };
+    defer f.deinit();
+
+    const payload = try f.expr(.{ .literal = .{ .int = .{
+        .text = "0",
+        .value = 0,
+        .base = .dec,
+        .ty_suffix = "u64",
+    } } });
+    // The merge target the frontend wrote the comparison against; nothing
+    // else in the fixture points at it.
+    const probe = try f.expr(.{ .unit = {} });
+    const owned: types.Type = .{ .array = &.{
+        .elem = .{ .prim = .u8 },
+        .len = .{ .expression = probe },
+    } };
+    const owned_id = try f.ty(owned);
+    f.exprs.items[@as(usize, payload)].ty = owned_id;
+
+    const projected = try f.expr(.{ .field = .{ .base = payload, .field = "0", .resolved = 0 } });
+    const other = try f.expr(.{ .literal = .{ .boolean = true } });
+    const compared = try f.expr(.{ .binary = .{
+        .op = .eq,
+        .overflow = .checked,
+        .lhs = projected,
+        .rhs = other,
+    } });
+
+    var walk = try f.walker();
+    defer walk.deinit();
+    const reached = try f.alloc.alloc(bool, f.exprs.items.len);
+    defer f.alloc.free(reached);
+    @memset(reached, false);
+    try reachableExprIds(&walk, compared, reached);
+
+    try std.testing.expect(reached[@as(usize, compared)]);
+    // The tuple projection's own base stays reachable through the field.
+    try std.testing.expect(reached[@as(usize, projected)]);
+    try std.testing.expect(reached[@as(usize, payload)]);
+    // And the comparison's operand type row is delivered through the probe.
+    try std.testing.expect(reached[@as(usize, probe)]);
+    try std.testing.expect(reached[@as(usize, other)]);
 }

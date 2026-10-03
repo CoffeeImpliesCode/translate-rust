@@ -49,6 +49,21 @@ const Local = struct {
     def: spine.EntityId,
     ty: ?types.Type = null,
 };
+
+const BlockImportTarget = union(enum) {
+    entity: spine.EntityId,
+    external: []const []const u8,
+};
+const BlockImport = struct {
+    name: []const u8,
+    target: BlockImportTarget,
+    block_depth: usize,
+};
+const BlockImportBinding = union(enum) {
+    none,
+    bound: BlockImportTarget,
+    ambiguous,
+};
 const Ext = struct {
     ctx: *Ctx,
     /// Enclosing fn entity id (for local parents).
@@ -63,6 +78,9 @@ const Ext = struct {
     /// — while a `let` binding of the enclosing function stays invisible to it.
     /// That is why the item scope is threaded apart from `locals`.
     item_scope: []const Local = &.{},
+    /// Borrowed lexical import scope; the declaring block owns each path array.
+    block_imports: []const BlockImport = &.{},
+    block_depth: usize = 0,
 
     fn deinit(self: *Ext) void {
         self.locals.deinit(self.ctx.alloc);
@@ -361,11 +379,54 @@ fn rootModuleEntity(e: *const Ext) ?spine.EntityId {
     return null;
 }
 
+/// One module-item lookup on the search path currently being walked.
+const UseLookup = struct {
+    module_id: spine.EntityId,
+    name: []const u8,
+};
+
+/// The `(module, name)` lookups the current `use` walk has already made.
+///
+/// A `use` may lead back into a module the walk is already inside — `mod a
+/// { pub use crate::b::Item; } mod b { pub use crate::a::Item; }` names each
+/// other — and resolution descends through those aliases one `resolveImportedEntity`
+/// at a time. Each descent used to start a walk of its own, so nothing saw the
+/// module it was returning to and the recursion ran until the stack died.
+///
+/// Re-entering a lookup that is already on the path IS that cycle, and it ends
+/// this walk the way any path this crate does not hold ends it: with null.
+/// Nothing is lost by stopping there. Resolution is a function of the pair, so
+/// an acyclic walk never reaches a pair it already proved, and every crate
+/// without a `use` cycle answers exactly as it did before.
+const UseLookupPath = struct {
+    entries: std.ArrayListUnmanaged(UseLookup) = .empty,
+
+    fn contains(self: *const UseLookupPath, module_id: spine.EntityId, name: []const u8) bool {
+        for (self.entries.items) |entry| {
+            if (entry.module_id != module_id) continue;
+            if (std.mem.eql(u8, entry.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Push one lookup, or report that this walk is already inside it.
+    fn enter(self: *UseLookupPath, alloc: std.mem.Allocator, module_id: spine.EntityId, name: []const u8) !bool {
+        if (self.contains(module_id, name)) return false;
+        try self.entries.append(alloc, .{ .module_id = module_id, .name = name });
+        return true;
+    }
+
+    fn deinit(self: *UseLookupPath, alloc: std.mem.Allocator) void {
+        self.entries.deinit(alloc);
+        self.* = .{};
+    }
+};
+
 /// Resolve a use binding through its already-resolved target, or by walking
 /// the binding's source path in the lexical module tree. The latter keeps
 /// source-driven extraction correct when a graph was built without the names
 /// pass (or when a use target was left unresolved).
-fn resolveImportedEntity(e: *const Ext, use_id: spine.EntityId) ?spine.EntityId {
+fn resolveImportedEntity(e: *const Ext, use_id: spine.EntityId, path: *UseLookupPath) ?spine.EntityId {
     const entity_count = e.ctx.g.symbol_table.entities.items.len;
     var current = use_id;
     var hop_count: usize = 0;
@@ -384,7 +445,7 @@ fn resolveImportedEntity(e: *const Ext, use_id: spine.EntityId) ?spine.EntityId 
             }
         }
 
-        const target = resolveUseSourcePath(e, current, hop_count + 1) orelse return null;
+        const target = resolveUseSourcePath(e, current, hop_count + 1, path) orelse return null;
         if (target == current) return null;
         current = target;
     }
@@ -406,6 +467,7 @@ fn resolveUseSourcePath(
     e: *const Ext,
     use_id: spine.EntityId,
     depth: usize,
+    path: *UseLookupPath,
 ) ?spine.EntityId {
     if (depth >= e.ctx.g.symbol_table.entities.items.len) return null;
     const use_ent = e.ctx.g.symbol_table.get(use_id) orelse return null;
@@ -432,8 +494,30 @@ fn resolveUseSourcePath(
         count += 1;
     }
     if (count == 0) return null;
+    const module_id = use_ent.parent orelse return null;
+    return resolveUsePathSegments(e, module_id, segments[0..count], depth, path);
+}
 
-    var current = use_ent.parent orelse return null;
+/// The bounded walk every `use` path takes, module-level or block-local.
+///
+/// `segments` is the path's own text already split on `::`; `module_id` is the
+/// module the declaration sits in, which is what makes `crate`, `self` and
+/// `super` mean the same thing for both. Every intermediate segment must name a
+/// module and there is no crate-wide same-name fallback, so a path that names
+/// nothing this crate holds returns null — and its caller decides what to do,
+/// which is what lets a block-local import refuse instead of guessing.
+fn resolveUsePathSegments(
+    e: *const Ext,
+    module_id: spine.EntityId,
+    segments: []const []const u8,
+    depth: usize,
+    path: *UseLookupPath,
+) ?spine.EntityId {
+    if (depth >= e.ctx.g.symbol_table.entities.items.len) return null;
+    const count = segments.len;
+    if (count == 0) return null;
+
+    var current = module_id;
     var index: usize = 0;
     if (std.mem.eql(u8, segments[0], "crate")) {
         current = rootModuleEntity(e) orelse return null;
@@ -449,7 +533,7 @@ fn resolveUseSourcePath(
     if (index >= count) return current;
 
     while (index < count) : (index += 1) {
-        const found = resolveModuleItem(e, current, segments[index]) orelse return null;
+        const found = resolveUsePathSegment(e, current, segments[index], path) orelse return null;
         if (index + 1 == count) {
             if (e.ctx.g.symbol_table.get(found) == null) return null;
             // Return aliases to the bounded outer walk so cycle detection is
@@ -467,7 +551,24 @@ fn resolveUseSourcePath(
 fn resolveModuleItem(e: *const Ext, module_id: spine.EntityId, name: []const u8) ?spine.EntityId {
     var visited: std.ArrayListUnmanaged(spine.EntityId) = .empty;
     defer visited.deinit(e.ctx.alloc);
-    return resolveModuleItemThroughGlobs(e, module_id, name, &visited);
+    var path: UseLookupPath = .{};
+    defer path.deinit(e.ctx.alloc);
+    return resolveModuleItemThroughGlobs(e, module_id, name, &visited, &path);
+}
+
+/// One segment of a `use` path, resolved as a module item lookup of its own.
+/// The glob walk's own visited set is per lookup, exactly as it is for every
+/// other entry into `resolveModuleItemThroughGlobs`; the `use` walk's lookup
+/// path is the one that spans the whole descent.
+fn resolveUsePathSegment(
+    e: *const Ext,
+    module_id: spine.EntityId,
+    name: []const u8,
+    path: *UseLookupPath,
+) ?spine.EntityId {
+    var visited: std.ArrayListUnmanaged(spine.EntityId) = .empty;
+    defer visited.deinit(e.ctx.alloc);
+    return resolveModuleItemThroughGlobs(e, module_id, name, &visited, path);
 }
 
 /// Search a module's direct items first, then its resolved glob targets.
@@ -479,7 +580,11 @@ fn resolveModuleItemThroughGlobs(
     module_id: spine.EntityId,
     name: []const u8,
     visited: *std.ArrayListUnmanaged(spine.EntityId),
+    path: *UseLookupPath,
 ) ?spine.EntityId {
+    const entered = path.enter(e.ctx.alloc, module_id, name) catch return null;
+    if (!entered) return null;
+    defer path.entries.items.len -= 1;
     const entity_count = e.ctx.g.symbol_table.entities.items.len;
     if (module_id >= entity_count) return null;
     if (visited.items.len >= entity_count) return null;
@@ -497,7 +602,7 @@ fn resolveModuleItemThroughGlobs(
             if (ent.kind == .use_) {
                 const use_decl = e.ctx.g.useById(item_id) orelse continue;
                 if (!std.mem.eql(u8, use_decl.local_name, name)) continue;
-                return resolveImportedEntity(e, item_id);
+                return resolveImportedEntity(e, item_id, path);
             }
             if (std.mem.eql(u8, ent.name, name)) return item_id;
         }
@@ -510,7 +615,7 @@ fn resolveModuleItemThroughGlobs(
         if (ent.kind == .use_) {
             const use_decl = e.ctx.g.useById(ent.id) orelse continue;
             if (std.mem.eql(u8, use_decl.local_name, name)) {
-                return resolveImportedEntity(e, ent.id);
+                return resolveImportedEntity(e, ent.id, path);
             }
         } else if (std.mem.eql(u8, ent.name, name)) {
             return ent.id;
@@ -530,7 +635,7 @@ fn resolveModuleItemThroughGlobs(
             };
             const target_ent = e.ctx.g.symbol_table.get(target) orelse continue;
             if (target_ent.kind != .module) continue;
-            if (resolveModuleItemThroughGlobs(e, target, name, visited)) |found| {
+            if (resolveModuleItemThroughGlobs(e, target, name, visited, path)) |found| {
                 return found;
             }
         }
@@ -544,7 +649,7 @@ fn resolveModuleItemThroughGlobs(
         };
         const target_ent = e.ctx.g.symbol_table.get(target) orelse continue;
         if (target_ent.kind != .module) continue;
-        if (resolveModuleItemThroughGlobs(e, target, name, visited)) |found| {
+        if (resolveModuleItemThroughGlobs(e, target, name, visited, path)) |found| {
             return found;
         }
     }
@@ -588,9 +693,9 @@ fn resolveModulePath(
     return current;
 }
 
-/// Resolve a scoped path string to its terminal entity.
-fn resolveScopedPathText(e: *const Ext, raw: []const u8) ?spine.EntityId {
-    var segments: [8][]const u8 = undefined;
+/// Split a `::`-joined path into its segments, or null when it names nothing
+/// or names more of them than `segments` can hold.
+fn splitPathSegments(raw: []const u8, segments: [][]const u8) ?[]const []const u8 {
     var count: usize = 0;
     var it = std.mem.splitSequence(u8, raw, "::");
     while (it.next()) |segment| {
@@ -600,6 +705,40 @@ fn resolveScopedPathText(e: *const Ext, raw: []const u8) ?spine.EntityId {
         count += 1;
     }
     if (count == 0) return null;
+    return segments[0..count];
+}
+
+/// Resolve `segments` relative to `module_id`. `crate`, `self` and `super`
+/// move the start; everything after the qualifiers is a module walk.
+fn resolvePathSegmentsInModule(
+    e: *const Ext,
+    module_id: spine.EntityId,
+    segments: []const []const u8,
+) ?spine.EntityId {
+    if (segments.len == 0) return null;
+    var start = module_id;
+    var offset: usize = 0;
+    if (std.mem.eql(u8, segments[0], "crate")) {
+        start = rootModuleEntity(e) orelse return null;
+        offset = 1;
+    } else if (std.mem.eql(u8, segments[0], "self")) {
+        offset = 1;
+    } else {
+        while (offset < segments.len and std.mem.eql(u8, segments[offset], "super")) {
+            start = parentModuleEntity(e, start) orelse return null;
+            offset += 1;
+        }
+    }
+    if (offset >= segments.len) return null;
+    return resolveModulePath(e, start, segments[offset..]);
+}
+
+/// Resolve a scoped path string to its terminal entity, in the module being
+/// lowered.
+fn resolveScopedPathText(e: *const Ext, raw: []const u8) ?spine.EntityId {
+    var segments: [8][]const u8 = undefined;
+    const parsed = splitPathSegments(raw, &segments) orelse return null;
+    const count = parsed.len;
     if (std.mem.eql(u8, segments[0], "Self")) {
         if (count == 1) return e.self_ty;
         var owner: ?spine.EntityId = e.fn_id;
@@ -616,21 +755,33 @@ fn resolveScopedPathText(e: *const Ext, raw: []const u8) ?spine.EntityId {
     }
 
     const owner = owningModule(e, e.ctx.mod_id) orelse return null;
-    var start = owner;
-    var offset: usize = 0;
-    if (std.mem.eql(u8, segments[0], "crate")) {
-        start = rootModuleEntity(e) orelse return null;
-        offset = 1;
-    } else if (std.mem.eql(u8, segments[0], "self")) {
-        offset = 1;
-    } else {
-        while (offset < count and std.mem.eql(u8, segments[offset], "super")) {
-            start = parentModuleEntity(e, start) orelse return null;
-            offset += 1;
-        }
-    }
-    if (offset >= count) return null;
-    return resolveModulePath(e, start, segments[offset..count]);
+    return resolvePathSegmentsInModule(e, owner, parsed);
+}
+
+/// Resolve a supertrait path as the trait that writes it wrote it.
+///
+/// A supertrait is named in the lexical module of its own declaration, so
+/// `private::Sealed` is a module relative to THAT trait. Reducing the path to
+/// its leaf name and resolving that name in whatever function is asking about
+/// the bound resolves a different declaration — or nothing at all — as soon as
+/// the caller sits in another module, or a shadowing declaration of the leaf
+/// name is in scope there.
+fn resolveSupertraitPath(
+    e: *const Ext,
+    decl_id: spine.EntityId,
+    raw: []const u8,
+) ?spine.EntityId {
+    var path = std.mem.trim(u8, raw, " \t\r\n");
+    if (path.len == 0) return null;
+    // Generic arguments say how a supertrait is used, never which trait it is.
+    if (std.mem.indexOfScalar(u8, path, '<')) |generic_start| path = path[0..generic_start];
+    var segments: [8][]const u8 = undefined;
+    const parsed = splitPathSegments(std.mem.trim(u8, path, " \t\r\n"), &segments) orelse
+        return null;
+    const module_id = owningModule(e, decl_id) orelse
+        owningModule(e, e.ctx.mod_id) orelse
+        return null;
+    return resolvePathSegmentsInModule(e, module_id, parsed);
 }
 
 /// Resolve a CST scoped path to its terminal entity.
@@ -899,6 +1050,7 @@ fn implImplementsTrait(e: *const Ext, impl_id: spine.EntityId, trait_name: []con
 /// a `Type::method` path carries: the callee never spells the type arguments.
 fn nominalHeadName(e: *const Ext, t: types.Type) ?[]const u8 {
     return switch (t) {
+        .prim => |primitive| @tagName(primitive),
         .path => |p| if (p.segments.len > 0) p.segments[p.segments.len - 1].name else null,
         .external_nominal => |x| if (x.path.len > 0) x.path[x.path.len - 1] else null,
         .generic_inst => |instance| blk: {
@@ -948,6 +1100,39 @@ fn implMethodForOwnerType(
         }
     }
     return found;
+}
+
+fn primitiveSourceAssociatedCall(e: *Ext, raw: []const u8, args: []const exprs.NodeId, explicit: []const types.Type) anyerror!?exprs.NodeId {
+    const separator = std.mem.indexOf(u8, raw, "::") orelse return null;
+    const primitive = mapPrim(raw[0..separator]) orelse return null;
+    const method = raw[separator + 2 ..];
+    if (implMethodForOwnerType(e, @tagName(primitive), method)) |direct|
+        return try appendGenericCall(e, .{ .associated = direct }, args, explicit);
+    if (explicit.len != 0) return null;
+    var selected: ?spine.EntityId = null;
+    for (e.ctx.g.symbol_table.entities.items) |implementation| {
+        if (implementation.kind != .impl_ or implementation.id >= e.ctx.bodies_list.items.len) continue;
+        const body = switch (e.ctx.bodies_list.items[implementation.id]) {
+            .impl_ => |value| value,
+            else => continue,
+        };
+        if (body.trait_path == null or body.self_ty != .path or body.self_ty.path.segments.len != 1) continue;
+        const self_name = body.self_ty.path.segments[0].name;
+        // The Rust input is valid: its trait solver has already checked the
+        // inline and where-clause bounds for this primitive instantiation.
+        // Preserve that actual source implementation and its Self argument,
+        // rather than reimplementing a second trait solver here.
+        const generics = body.generics orelse continue;
+        if (generics.params.len != 1 or generics.params[0] != .type_ or
+            !std.mem.eql(u8, generics.params[0].type_.name, self_name)) continue;
+        for (e.ctx.g.symbol_table.entities.items) |child| {
+            if (child.kind != .fn_ or child.parent != implementation.id or !std.mem.eql(u8, child.name, method)) continue;
+            if (selected != null) return null;
+            selected = child.id;
+        }
+    }
+    const selected_method = selected orelse return null;
+    return try appendGenericCall(e, .{ .associated = selected_method }, args, &.{.{ .prim = primitive }});
 }
 
 fn traitMethodForPath(e: *Ext, node: ts.Node) anyerror!?spine.EntityId {
@@ -1191,6 +1376,31 @@ fn ensureStandardPreludeVariant(
     };
 }
 
+/// True when `enum_id` is the canonical `core::<module>::<enum>` this pass
+/// materializes for a prelude variant.
+///
+/// A crate is free to declare its own `Result` and its own `Ok`; `appendPat`
+/// and `lowerCall` resolve ordinary source first, so a declaration with that
+/// spelling keeps its own meaning everywhere it is reached. Only the shape
+/// reached through the prelude root is the one whose generic parameters the
+/// source never writes, so only that one may be stamped with a type derived
+/// from what its arms carry.
+fn isStandardPreludeEnum(
+    e: *const Ext,
+    enum_id: spine.EntityId,
+    module_name: []const u8,
+    enum_name: []const u8,
+) bool {
+    const enum_entity = e.ctx.g.symbol_table.get(enum_id) orelse return false;
+    if (enum_entity.kind != .enum_ or !std.mem.eql(u8, enum_entity.name, enum_name)) return false;
+    const module_entity = e.ctx.g.symbol_table.get(enum_entity.parent orelse return false) orelse
+        return false;
+    if (module_entity.kind != .module or !std.mem.eql(u8, module_entity.name, module_name)) return false;
+    const root_entity = e.ctx.g.symbol_table.get(module_entity.parent orelse return false) orelse
+        return false;
+    return root_entity.kind == .module and std.mem.eql(u8, root_entity.name, "core");
+}
+
 /// The variants a standard-library enum declares, for the external enums this
 /// translator admits in value position.
 ///
@@ -1243,6 +1453,96 @@ fn stdEnumVariantNames(owner_path: []const []const u8) ?[]const []const u8 {
         if (equal) return entry.variants;
     }
     return null;
+}
+
+/// A standard-library unit struct this translator admits in value position,
+/// recorded with the declaration it actually has.
+///
+/// A unit struct is written as a bare name wherever a value is expected —
+/// `_marker: PhantomData` is how siphasher spells `_marker: PhantomData<S>` —
+/// and there is no binding of that name in scope to resolve: the `use` that
+/// introduced it binds a TYPE, not a value. Lowering the name as an unresolved
+/// identifier refuses valid Rust, and lowering it to a bare `.path` to nothing
+/// loses which declaration it stands for. So the declaration is recorded here,
+/// once, from the standard library's own source, and every later reference
+/// finds the same entity — the same role `std_enum_variants` plays for a
+/// variant of an external enum. A struct outside this table keeps the refusal
+/// it already has rather than being minted.
+const StdUnitStruct = struct {
+    /// The declaration's path, spelled the way `core` spells it. A `std`
+    /// spelling of the same path reaches it too; see
+    /// `externalPathMatchesStandard`.
+    path: []const []const u8,
+    /// The declaration's own name, which is also the value the path spells.
+    name: []const u8,
+    /// The declaration's TYPE parameters, in source order. `PhantomData`'s `T`
+    /// is what the surrounding position fixes, so it is declared even though
+    /// the value position never spells it.
+    type_params: []const []const u8 = &.{},
+};
+
+const std_unit_structs = [_]StdUnitStruct{
+    // `pub struct PhantomData<T: ?Sized>;` — verbatim. The `?Sized` bound is
+    // implied on every type parameter rather than spelled, so no bound is
+    // recorded.
+    .{
+        .path = &.{ "core", "marker", "PhantomData" },
+        .name = "PhantomData",
+        .type_params = &.{"T"},
+    },
+};
+
+fn stdUnitStruct(path: []const []const u8) ?StdUnitStruct {
+    for (std_unit_structs) |entry| {
+        if (externalPathMatchesStandard(path, entry.path)) return entry;
+    }
+    return null;
+}
+
+/// The struct entity an external path names, created on first use under the
+/// module that contains it and found again on every later use — the same
+/// find-or-create shape `ensureExternalEnumEntity` and
+/// `ensureStandardPreludeVariant` use.
+fn ensureExternalUnitStructEntity(
+    e: *Ext,
+    module_id: spine.EntityId,
+    decl: StdUnitStruct,
+) anyerror!spine.EntityId {
+    for (e.ctx.g.symbol_table.entities.items) |ent| {
+        if (ent.kind == .struct_ and ent.parent == module_id and
+            std.mem.eql(u8, ent.name, decl.name))
+        {
+            return ent.id;
+        }
+    }
+    const struct_id = try e.ctx.g.symbol_table.add(.{
+        .id = 0,
+        .kind = .struct_,
+        .name = try e.ctx.alloc.dupe(u8, decl.name),
+        .span = span_of,
+        .visibility = .public,
+        .parent = module_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    try e.ctx.bodies_list.append(e.ctx.alloc, .none);
+    const params = try e.ctx.alloc.alloc(types.GenericParam, decl.type_params.len);
+    for (decl.type_params, 0..) |param_name, index| {
+        params[index] = .{ .type_ = .{ .name = param_name, .bounds = &.{} } };
+    }
+    // A unit struct is one that spells no field list at all, which is how
+    // `PhantomData` is written, so the layout is `.unit` and not a named field
+    // list that happens to be empty.
+    e.ctx.bodies_list.items[struct_id] = .{ .struct_ = .{
+        .generic_params = decl.type_params,
+        .generics = .{ .params = params, .where_clauses = &.{} },
+        .layout = .unit,
+        .fields = &.{},
+        .methods = &.{},
+    } };
+    try appendGraphModuleItem(e, module_id, struct_id);
+    return struct_id;
 }
 
 /// The extern module chain an external path's module prefix names, built
@@ -1338,12 +1638,36 @@ fn lowerExternalEnumVariantPath(e: *Ext, node: ts.Node) anyerror!?exprs.NodeId {
         owner.path[owner.path.len - 1],
         names,
     );
-    return try appendExpr(e, .{ .enum_variant = .{
+    const variant = try appendExpr(e, .{ .enum_variant = .{
         .def = enum_id,
         .variant = try e.ctx.alloc.dupe(u8, variant_name),
         .tuple_fields = &.{},
         .named_fields = &.{},
     } });
+    return variant;
+}
+
+/// A path naming a standard-library unit struct in value position:
+/// `PhantomData`, `core::marker::PhantomData`, `std::marker::PhantomData`.
+///
+/// The declaration is admitted only when the path resolves to an external
+/// nominal this translator records in `std_unit_structs`; anything else keeps
+/// the refusal it already has, so no declaration can be invented for a type
+/// outside the crate. Both spellings go through `externalNominalForPath`, so
+/// the one entity is reached whether the source wrote the bare name its own
+/// `use` introduced or the full path itself.
+///
+/// The result is a plain `.path` naming that struct, which is what a
+/// crate-local unit struct in value position lowers to as well: the value of a
+/// unit struct IS its constructor, and the constructor's name is the
+/// declaration's. The type parameter the surrounding position fixes is not
+/// spelled here, exactly as the source does not spell it.
+fn lowerExternalUnitStructPath(e: *Ext, raw_path: []const u8) anyerror!?exprs.NodeId {
+    const external = (try externalNominalForPath(e, raw_path)) orelse return null;
+    const decl = stdUnitStruct(external.path) orelse return null;
+    const module_id = try ensureExternalModuleChain(e, external.path[0 .. external.path.len - 1]);
+    const struct_id = try ensureExternalUnitStructEntity(e, module_id, decl);
+    return try appendExpr(e, .{ .path = .{ .def = struct_id, .generic_args = &.{} } });
 }
 
 /// One parameter of a known standard-library associated function.
@@ -1364,6 +1688,12 @@ const StdAssocParam = struct { name: []const u8, ty_param: []const u8 };
 /// `impl<T> Cursor<T> { pub const fn new(inner: T) -> Cursor<T> }`.
 const StdAssocFn = struct {
     owner: []const []const u8,
+    /// The other standard spellings of that same declaration. `std::vec::Vec`
+    /// and `alloc::vec::Vec` are one item the standard library publishes under
+    /// both roots, and a source may write either. Keeping the aliases beside
+    /// the signature is what lets both spellings reach ONE declaration instead
+    /// of two that could answer differently.
+    owner_aliases: []const []const []const u8 = &.{},
     name: []const u8,
     type_params: []const []const u8,
     params: []const StdAssocParam,
@@ -1371,14 +1701,66 @@ const StdAssocFn = struct {
     ret_args: []const []const u8,
 };
 
-const std_assoc_fns = [_]StdAssocFn{.{
-    .owner = &.{ "std", "io", "Cursor" },
-    .name = "new",
-    .type_params = &.{"T"},
-    .params = &.{.{ .name = "inner", .ty_param = "T" }},
-    .ret_owner = &.{ "std", "io", "Cursor" },
-    .ret_args = &.{"T"},
-}};
+const std_assoc_fns = [_]StdAssocFn{
+    .{
+        .owner = &.{ "std", "io", "Cursor" },
+        .name = "new",
+        .type_params = &.{"T"},
+        .params = &.{.{ .name = "inner", .ty_param = "T" }},
+        .ret_owner = &.{ "std", "io", "Cursor" },
+        .ret_args = &.{"T"},
+    },
+    // `impl<R: Read> BufReader<R> { pub fn new(inner: R) -> BufReader<R> }`,
+    // verbatim. `R` is the reader the buffer wraps, so `BufReader::new(data)`
+    // hands back a `BufReader` over exactly the argument's own type — which is
+    // what makes `fill_buf` and `consume` on the result the same two
+    // `std::io::BufRead` methods `runtime_io_methods` admits on any other
+    // `BufRead`-bounded receiver.
+    .{
+        .owner = &.{ "std", "io", "BufReader" },
+        .name = "new",
+        .type_params = &.{"R"},
+        .params = &.{.{ .name = "inner", .ty_param = "R" }},
+        .ret_owner = &.{ "std", "io", "BufReader" },
+        .ret_args = &.{"R"},
+    },
+    // `impl<T> Vec<T> { pub const fn new() -> Vec<T> }`, verbatim. The element
+    // type is not an argument here — `Vec::new()` takes none — so `T` is the
+    // element the surrounding position fixes, and this declares the call with
+    // that parameter open rather than inventing one.
+    .{
+        .owner = &.{ "alloc", "vec", "Vec" },
+        .owner_aliases = &.{&.{ "std", "vec", "Vec" }},
+        .name = "new",
+        .type_params = &.{"T"},
+        .params = &.{},
+        .ret_owner = &.{ "alloc", "vec", "Vec" },
+        .ret_args = &.{"T"},
+    },
+    // `impl String { pub const fn new() -> String }`, verbatim. A `String`
+    // carries no type parameter, so this one is declared with its whole
+    // signature and the call it builds is typed at extraction.
+    .{
+        .owner = &.{ "alloc", "string", "String" },
+        .owner_aliases = &.{&.{ "std", "string", "String" }},
+        .name = "new",
+        .type_params = &.{},
+        .params = &.{},
+        .ret_owner = &.{ "alloc", "string", "String" },
+        .ret_args = &.{},
+    },
+    // `impl<K, V> HashMap<K, V> { pub fn new() -> HashMap<K, V> }`, verbatim.
+    // The key and the value are the ones the surrounding position fixes, for
+    // the same reason `Vec::new` leaves its element open.
+    .{
+        .owner = &.{ "std", "collections", "HashMap" },
+        .name = "new",
+        .type_params = &.{ "K", "V" },
+        .params = &.{},
+        .ret_owner = &.{ "std", "collections", "HashMap" },
+        .ret_args = &.{ "K", "V" },
+    },
+};
 
 fn externalPathSlicesEqual(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
@@ -1390,11 +1772,20 @@ fn externalPathSlicesEqual(left: []const []const u8, right: []const []const u8) 
 
 /// The known signature for `Owner::assoc`, or null when this function is not
 /// one this translator can declare. Matching is on the RESOLVED owner path, so
-/// a crate's own `Cursor` is never claimed by the standard library's.
+/// a crate's own `Cursor` is never claimed by the standard library's, and a
+/// standard name published under both roots reaches the one declaration it is.
 fn findStdAssocFn(owner_path: []const []const u8, assoc_name: []const u8) ?*const StdAssocFn {
     for (&std_assoc_fns) |*entry| {
         if (!std.mem.eql(u8, entry.name, assoc_name)) continue;
-        if (!externalPathSlicesEqual(entry.owner, owner_path)) continue;
+        if (!externalPathSlicesEqual(entry.owner, owner_path)) {
+            var published_under = false;
+            for (entry.owner_aliases) |alias| {
+                if (!externalPathSlicesEqual(alias, owner_path)) continue;
+                published_under = true;
+                break;
+            }
+            if (!published_under) continue;
+        }
         return entry;
     }
     return null;
@@ -1426,12 +1817,26 @@ fn ensureExternalAssociatedFn(
     const known = findStdAssocFn(owner_path, assoc_name) orelse return null;
 
     const module_id = try ensureExternalModuleChain(e, owner_path[0 .. owner_path.len - 1]);
+    // `(module, name)` is NOT the identity of an associated function: every
+    // type in one standard module shares that module, and `Cursor::new` and
+    // `BufReader::new` share the name. Keying on those two alone hands back
+    // whichever was declared first, so a second owner silently inherits the
+    // first one's signature. The declared result is what distinguishes them —
+    // a constructor returns its owner — so it joins the key.
     for (e.ctx.g.symbol_table.entities.items) |ent| {
-        if (ent.kind == .fn_ and ent.parent == module_id and
-            std.mem.eql(u8, ent.name, assoc_name))
-        {
-            return ent.id;
-        }
+        if (ent.kind != .fn_ or ent.parent == null or ent.parent.? != module_id) continue;
+        if (!std.mem.eql(u8, ent.name, assoc_name)) continue;
+        if (ent.id >= e.ctx.bodies_list.items.len) continue;
+        const existing = switch (e.ctx.bodies_list.items[ent.id]) {
+            .fn_ => |value| value,
+            else => continue,
+        };
+        const existing_ret = switch (existing.ret) {
+            .external_nominal => |value| value,
+            else => continue,
+        };
+        if (!externalPathSlicesEqual(existing_ret.path, known.ret_owner)) continue;
+        return ent.id;
     }
 
     const params = try e.ctx.alloc.alloc(items.Param, known.params.len);
@@ -1493,21 +1898,33 @@ fn ensureExternalAssociatedFn(
 /// An `Owner::assoc(..)` call whose owner is an external nominal AND whose
 /// signature this translator knows. Anything else is left to the existing
 /// refusal rather than declared with a guessed shape.
+///
+/// `generic_args` is the call's own turbofish, and it is the answer to the
+/// element a constructor leaves open: `Vec::<String>::new()` names its element
+/// here, where `Vec::new()` leaves it to the position around it.
 fn lowerExternalAssociatedCall(
     e: *Ext,
     raw_path: []const u8,
     args: []const exprs.NodeId,
+    generic_args: []const types.Type,
 ) anyerror!?exprs.NodeId {
     const separator = std.mem.lastIndexOf(u8, raw_path, "::") orelse return null;
-    const owner_text = std.mem.trim(u8, raw_path[0..separator], " \t\r\n");
+    var owner_text = std.mem.trim(u8, raw_path[0..separator], " \t\r\n");
     const assoc_name = std.mem.trim(u8, raw_path[separator + 2 ..], " \t\r\n");
+    // A turbofish can sit ON the owner — `Vec::<String>::new` — and its
+    // arguments are the CALLEE's, not another module segment. Resolving the
+    // whole spelling would name a module `<String>`, which is not one.
+    if (std.mem.indexOfScalar(u8, owner_text, '<')) |cut| {
+        owner_text = std.mem.trim(u8, owner_text[0..cut], " \t\r\n");
+    }
     if (owner_text.len == 0 or assoc_name.len == 0) return null;
     const owner = (try externalNominalForPath(e, owner_text)) orelse return null;
     const fn_id = (try ensureExternalAssociatedFn(e, owner.path, assoc_name)) orelse return null;
-    return try appendExpr(e, .{ .call = .{
-        .call_kind = .{ .associated = fn_id },
-        .args = args,
-    } });
+    // The declared return is the call's own type wherever the declaration leaves
+    // it decided — `String::new()` states it outright, and a turbofished
+    // `Vec::<String>::new()` states its element the same way — and stays open
+    // where the standard library itself leaves it open.
+    return @as(?exprs.NodeId, try appendGenericCall(e, .{ .associated = fn_id }, args, generic_args));
 }
 
 fn lookupModuleEntity(e: *const Ext, name: []const u8) ?spine.EntityId {
@@ -1516,7 +1933,8 @@ fn lookupModuleEntity(e: *const Ext, name: []const u8) ?spine.EntityId {
 }
 
 /// Resolve an identifier: lexical `let` bindings first, then the enclosing
-/// blocks' items, and only then the current module scope.
+/// blocks' items, then a `use` those blocks declare, and only then the current
+/// module scope.
 fn resolveName(e: *const Ext, name: []const u8) ?spine.EntityId {
     var i = e.locals.items.len;
     while (i > 0) {
@@ -1527,6 +1945,19 @@ fn resolveName(e: *const Ext, name: []const u8) ?spine.EntityId {
     while (j > 0) {
         j -= 1;
         if (std.mem.eql(u8, e.item_scope[j].name, name)) return e.item_scope[j].def;
+    }
+    // A block-local `use` is the innermost binding for its name, so nothing
+    // outside its block may answer for it. A binding to a definition IS that
+    // definition; a binding to an external path has no entity here and is read
+    // through `externalUsePath`, so it yields null rather than falling through
+    // to a module item of the same name.
+    switch (blockImportBinding(e, name)) {
+        .none => {},
+        .ambiguous => return null,
+        .bound => |target| return switch (target) {
+            .entity => |def| def,
+            .external => null,
+        },
     }
     if (lookupModuleEntity(e, name)) |def| return def;
     return null;
@@ -1722,6 +2153,7 @@ fn cstBoundPath(e: *Ext, ty: types.Type) anyerror!types.Path {
 pub fn preludeExternalPath(name: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, name, "String")) return &.{ "alloc", "string", "String" };
     if (std.mem.eql(u8, name, "Vec")) return &.{ "alloc", "vec", "Vec" };
+    if (std.mem.eql(u8, name, "HashMap")) return &.{ "std", "collections", "HashMap" };
     if (std.mem.eql(u8, name, "From")) return &.{ "core", "convert", "From" };
     if (std.mem.eql(u8, name, "Into")) return &.{ "core", "convert", "Into" };
     if (std.mem.eql(u8, name, "TryFrom")) return &.{ "core", "convert", "TryFrom" };
@@ -1788,6 +2220,50 @@ pub fn preludePathSegments(allocator: std.mem.Allocator, name: []const u8) !?[]c
         segments[i] = .{ .name = try allocator.dupe(u8, seg_name), .id = null };
     }
     return segments;
+}
+
+/// Whether a nominal type path spells `std::io::Result`, the standard alias
+/// `pub type Result<T> = core::result::Result<T, io::Error>`.
+///
+/// `alias_is_std_io` reports that a leading `io` segment is the module a
+/// `use std::io;` binds; without it the two-segment spelling is a crate's own
+/// `Result` and keeps its own meaning.
+pub fn isStdIoResultPath(segments: []const types.PathSegment, alias_is_std_io: bool) bool {
+    if (segments.len < 2) return false;
+    if (!std.mem.eql(u8, segments[segments.len - 1].name, "Result")) return false;
+    if (segments.len == 3) {
+        return std.mem.eql(u8, segments[0].name, "std") and
+            std.mem.eql(u8, segments[1].name, "io");
+    }
+    if (segments.len == 2) {
+        return alias_is_std_io and std.mem.eql(u8, segments[0].name, "io");
+    }
+    return false;
+}
+
+/// The `std::io::Error` the alias carries as its error arm. The path is owned
+/// the way every other external nominal in the table owns its own.
+pub fn stdIoErrorNominal(allocator: std.mem.Allocator) !types.Type {
+    const names = [_][]const u8{ "std", "io", "Error" };
+    const path = try allocator.alloc([]const u8, names.len);
+    var copied: usize = 0;
+    errdefer {
+        for (path[0..copied]) |segment| allocator.free(segment);
+        allocator.free(path);
+    }
+    for (names, 0..) |segment, index| {
+        path[index] = try allocator.dupe(u8, segment);
+        copied += 1;
+    }
+    return .{ .external_nominal = .{ .path = path, .args = &.{} } };
+}
+
+/// Whether `io` in this module names the standard `std::io`.
+fn aliasNamesStdIo(e: *const Ext) !bool {
+    const path = (try externalUsePath(e, "io")) orelse return false;
+    return path.len == 2 and
+        std.mem.eql(u8, path[0], "std") and
+        std.mem.eql(u8, path[1], "io");
 }
 
 /// The path a trait-bound node names, with every segment the graph could
@@ -2194,10 +2670,20 @@ fn mapCstType(e: *Ext, node: ts.Node) anyerror!types.Type {
         a.* = .{ .elem = elem, .len = len };
         return .{ .array = a };
     }
-    if (std.mem.eql(u8, kind, "qualified_type")) {
-        return mapCstQualifiedType(e, node);
+    // `<I as private::Sealed>::Buffer` arrives as an outer
+    // `scoped_type_identifier`, so the projection is reached through the
+    // named-type arm below rather than as a bare `qualified_type`. A bracketed
+    // form on its own names nothing — it has no `::Member` to project — so it
+    // keeps the refusal the inner `qualified_type` already got instead of
+    // falling through to the first-child default, which would read the
+    // receiver as if it were the whole type.
+    if (std.mem.eql(u8, kind, "bracketed_type") or std.mem.eql(u8, kind, "qualified_type")) {
+        return error.UnresolvedNominalType;
     }
-    if (std.mem.eql(u8, kind, "generic_type") or
+    if (std.mem.eql(u8, kind, "scoped_type_identifier")) {
+        if (try mapCstQualifiedProjection(e, node)) |projection| return projection;
+    }
+    if (std.mem.eql(u8, kind, "generic_type") or std.mem.eql(u8, kind, "generic_type_with_turbofish") or
         std.mem.eql(u8, kind, "type_identifier") or
         std.mem.eql(u8, kind, "identifier") or
         std.mem.eql(u8, kind, "scoped_type_identifier"))
@@ -2230,37 +2716,93 @@ fn mapCstType(e: *Ext, node: ts.Node) anyerror!types.Type {
     if (node.namedChildCount() > 0) return mapCstType(e, node.namedChild(0).?);
     return unsupportedCstType();
 }
-fn mapCstQualifiedType(e: *Ext, node: ts.Node) anyerror!types.Type {
-    const receiver_node = node.childByFieldName("type") orelse return error.UnresolvedNominalType;
-    const trait_node = node.childByFieldName("trait") orelse return error.UnresolvedNominalType;
-    const assoc_node = node.childByFieldName("path") orelse return error.UnresolvedNominalType;
-    const receiver = try mapCstType(e, receiver_node);
+/// `<Receiver as Trait>::Member` — the qualified associated projection, in the
+/// one shape the rest of the pipeline already reads.
+///
+/// The CST is an OUTER `scoped_type_identifier` whose `path` is a
+/// `bracketed_type` holding the inner `qualified_type`; the member is the
+/// outer `name` field, and the inner node carries `type` (the receiver) and
+/// `alias` (the trait). `qualifiedAssociatedPath` already walks exactly that
+/// shape, so the projection is read through it rather than a second spelling
+/// of the same walk.
+///
+/// The IR form is three path segments — receiver, trait, member — with the
+/// module prefix on the trait and the `as` clause already gone. The middle
+/// segment is the trait ENTITY, not the text that spelled it, so
+/// `private::Sealed` and a `Sealed` in scope reach the same projection through
+/// the one resolver that finds nested modules.
+///
+/// The terminal id stays NULL. An impl's own `type Member = ...` is this
+/// projection already carried out for ONE concrete receiver, so stamping that
+/// id here would let the first impl's array length stand in for the generic
+/// the signature is written on. The null terminal is what the backend's
+/// `lowerAssociatedProjection` pairs with the trait descriptor so the impl
+/// matching the receiver supplies the layout.
+///
+/// Every check here is the conservative half of the pair: the receiver is a
+/// lexical type parameter no declaration resolves, the middle entity is a
+/// trait, and that trait declares this member in its own body. Metadata that
+/// does not support the shape is refused (`null`), which leaves the node to
+/// the ordinary named-path mapper rather than guessing a layout.
+fn mapCstQualifiedProjection(e: *Ext, node: ts.Node) anyerror!?types.Type {
+    const qualified = qualifiedAssociatedPath(e, node) orelse return null;
+    const member = std.mem.trim(u8, qualified.name, " \t\r\n");
+    if (member.len == 0) return null;
+
+    const trait_id = resolvePatternPath(e, qualified.trait) orelse return null;
+    const trait_entity = e.ctx.g.symbol_table.get(trait_id) orelse return null;
+    if (trait_entity.kind != .trait_) return null;
+    if (!traitDeclaresAssociatedType(e, trait_id, member)) return null;
+
+    const receiver = mapCstType(e, qualified.receiver) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
     const receiver_path = switch (receiver) {
         .path => |path| path,
-        else => return error.UnresolvedNominalType,
+        else => return null,
     };
-    if (receiver_path.segments.len != 1) return error.UnresolvedNominalType;
-
-    const trait_def = resolvePatternPath(e, trait_node) orelse return error.UnresolvedNominalType;
-    const trait_raw = std.mem.trim(u8, text(e, trait_node), " \t\r\n");
-    const trait_name = if (std.mem.lastIndexOf(u8, trait_raw, "::")) |sep|
-        trait_raw[sep + 2 ..]
-    else
-        trait_raw;
-    const assoc_name = std.mem.trim(u8, text(e, assoc_node), " \t\r\n");
-    if (trait_name.len == 0 or assoc_name.len == 0) return error.UnresolvedNominalType;
+    // The head of a projection is the lexical type parameter the source wrote
+    // the signature on. A receiver that carries an id has already been
+    // resolved to one nominal, and the descriptor pair the backend builds is
+    // about choosing between impls — not about a receiver already chosen.
+    if (receiver_path.segments.len != 1) return null;
+    const receiver_segment = receiver_path.segments[0];
+    if (receiver_segment.id != null) return null;
+    if (!activeTypeParameter(e, receiver_segment.name)) return null;
 
     const segments = try e.ctx.alloc.alloc(types.PathSegment, 3);
-    segments[0] = receiver_path.segments[0];
-    segments[1] = .{
-        .name = try e.ctx.alloc.dupe(u8, trait_name),
-        .id = trait_def,
-    };
+    errdefer e.ctx.alloc.free(segments);
+    // The receiver keeps the name slice its own path already owns; nothing
+    // here allocates a second copy of it or frees the first.
+    segments[0] = receiver_segment;
+    segments[1] = .{ .name = trait_entity.name, .id = trait_id };
     segments[2] = .{
-        .name = try e.ctx.alloc.dupe(u8, assoc_name),
+        .name = try e.ctx.alloc.dupe(u8, member),
         .id = null,
     };
     return .{ .path = .{ .segments = segments } };
+}
+
+/// True when `trait_id` declares an associated TYPE called `name` in its own
+/// body. This is the same membership `validateAssociatedProjection` in
+/// `ir/validate.zig` requires of the IR path and `traitHasAssociatedMember`
+/// in `backend/zig/lower.zig` requires of the descriptor, so a projection the
+/// extractor emits is one the rest of the pipeline can act on.
+fn traitDeclaresAssociatedType(
+    e: *const Ext,
+    trait_id: spine.EntityId,
+    name: []const u8,
+) bool {
+    if (trait_id >= e.ctx.bodies_list.items.len) return false;
+    const trait_body = switch (e.ctx.bodies_list.items[trait_id]) {
+        .trait_ => |body| body,
+        else => return false,
+    };
+    for (trait_body.assoc_types) |assoc_type| {
+        if (std.mem.eql(u8, assoc_type.name, name)) return true;
+    }
+    return false;
 }
 
 fn cstSlice(e: *const Ext, elem: types.Type, const_: bool) !types.Type {
@@ -2286,7 +2828,7 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
         std.mem.eql(u8, kind, "identifier"))
     {
         name = text(e, node);
-    } else if (std.mem.eql(u8, kind, "scoped_type_identifier")) {
+    } else if (std.mem.eql(u8, kind, "scoped_type_identifier") or std.mem.eql(u8, kind, "scoped_identifier")) {
         const sub = try mapCstScopedSegments(e, node);
         try segs.appendSlice(e.ctx.alloc, sub);
     } else {
@@ -2297,7 +2839,7 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
                 std.mem.eql(u8, k, "identifier"))
             {
                 name = text(e, c);
-            } else if (std.mem.eql(u8, k, "scoped_type_identifier")) {
+            } else if (std.mem.eql(u8, k, "scoped_type_identifier") or std.mem.eql(u8, k, "scoped_identifier")) {
                 const sub = try mapCstScopedSegments(e, c);
                 try segs.appendSlice(e.ctx.alloc, sub);
             } else if (std.mem.eql(u8, k, "type_arguments") or
@@ -2326,6 +2868,20 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
         args = args_arr;
     }
 
+    // `std::io::Result<T>` is the standard alias
+    // `pub type Result<T> = core::result::Result<T, io::Error>`, so it reads as
+    // a one-armed result here and the error arm is the nominal the runtime's
+    // `r2z.io.Result` is written in. A crate's own one-armed `Result` is not
+    // this type, which is what the alias argument below decides.
+    if (args.len == 1 and isStdIoResultPath(segs.items, try aliasNamesStdIo(e))) {
+        const r = try e.ctx.alloc.create(types.Result);
+        r.* = .{
+            .ok = args[0],
+            .err = try stdIoErrorNominal(e.ctx.alloc),
+            .is_error_unionable = true,
+        };
+        return .{ .result = r };
+    }
     if (std.mem.eql(u8, nm, "Option") and args.len == 1) {
         const inner = try e.ctx.alloc.create(types.Type);
         inner.* = args[0];
@@ -2341,7 +2897,7 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
         inner.* = args[0];
         return .{ .boxed = inner };
     }
-    if (segs.items.len == 0 and resolveName(e, nm) == null and
+    if (segs.items.len == 0 and blockImportBinding(e, nm) == .none and resolveName(e, nm) == null and
         (std.mem.eql(u8, nm, "String") or std.mem.eql(u8, nm, "Vec")))
     {
         const prelude_path = if (std.mem.eql(u8, nm, "String")) "alloc::string::String" else "alloc::vec::Vec";
@@ -2380,8 +2936,12 @@ fn mapCstNamedType(e: *Ext, node: ts.Node) anyerror!types.Type {
     }
     if (!had_scoped_segments) {
         if (try externalUsePath(e, nm)) |external_path| {
+            const path = switch (blockImportBinding(e, nm)) {
+                .bound => try externalNominalPath(e, external_path, &.{}),
+                else => external_path,
+            };
             return .{ .external_nominal = .{
-                .path = external_path,
+                .path = path,
                 .args = args,
             } };
         }
@@ -2424,6 +2984,19 @@ fn mapCstScopedSegments(e: *const Ext, node: ts.Node) ![]const types.PathSegment
     return segs.toOwnedSlice(e.ctx.alloc);
 }
 fn externalUsePath(e: *const Ext, name: []const u8) !?[]const []const u8 {
+    // A block-local `use` binds the name in the innermost scope that introduces
+    // it, so once a block has bound it neither an outer block nor a module
+    // import may answer — including a module import of a DIFFERENT path under
+    // the same name, which is what makes a body-scoped alias shadow instead of
+    // merge.
+    switch (blockImportBinding(e, name)) {
+        .bound => |target| return switch (target) {
+            .external => |path| path,
+            .entity => null,
+        },
+        .ambiguous => return null,
+        .none => {},
+    }
     const module_id = owningModule(e, e.fn_id) orelse return null;
     const module = moduleByEntity(e, module_id) orelse return null;
     var found: ?[]const []const u8 = null;
@@ -2440,6 +3013,18 @@ fn externalUsePath(e: *const Ext, name: []const u8) !?[]const []const u8 {
         found = external.path;
     }
     return found;
+}
+
+/// The standard declaration a bare, unclaimed name stands for, or null when
+/// something already claims the name.
+///
+/// A name this crate binds is never a prelude name. siphasher imports
+/// `core::hash::Hasher as _` beside its own `struct Hasher<S>`, and the local
+/// one has to keep answering for `Hasher`; Rust's rule is the same, since an
+/// item in scope outranks the prelude.
+fn preludeBareName(e: *const Ext, name: []const u8) ?[]const []const u8 {
+    if (resolveName(e, name) != null) return null;
+    return preludeExternalPath(name);
 }
 
 fn externalNominalForPath(e: *const Ext, raw_path: []const u8) !?types.ExternalNominal {
@@ -2459,17 +3044,27 @@ fn externalNominalForPath(e: *const Ext, raw_path: []const u8) !?types.ExternalN
     if (part_count == 0) return null;
 
     var prefix: []const []const u8 = &.{};
-    if (part_count > 1 and std.mem.eql(u8, parts[0], "String") and
-        resolveName(e, "String") == null)
-    {
-        prefix = &.{ "alloc", "string", "String" };
-    } else if (part_count == 1) {
-        prefix = (try externalUsePath(e, parts[0])) orelse return null;
-    } else if (!std.mem.eql(u8, parts[0], "core") and
-        !std.mem.eql(u8, parts[0], "std") and
-        !std.mem.eql(u8, parts[0], "alloc"))
-    {
-        prefix = (try externalUsePath(e, parts[0])) orelse return null;
+    // A block-local import is the innermost binding for its name, so it
+    // outranks both the prelude entry below and a module import. Consulting it
+    // first is what makes a body-local `use std::string::String;` mean that
+    // path, rather than the `alloc::string::String` the prelude supplies for a
+    // name no module binds.
+    prefix = blockImportPath(e, parts[0]) orelse prefix;
+    if (prefix.len == 0) {
+        // A name the module itself imports is the import's: an explicit `use`
+        // shadows the prelude, which is Rust's own rule and the reason
+        // `use std::collections::HashMap;` keeps meaning that map.
+        if (part_count == 1) {
+            prefix = (try externalUsePath(e, parts[0])) orelse
+                preludeBareName(e, parts[0]) orelse return null;
+        } else if (preludeBareName(e, parts[0])) |prelude| {
+            prefix = prelude;
+        } else if (!std.mem.eql(u8, parts[0], "core") and
+            !std.mem.eql(u8, parts[0], "std") and
+            !std.mem.eql(u8, parts[0], "alloc"))
+        {
+            prefix = (try externalUsePath(e, parts[0])) orelse return null;
+        }
     }
 
     const source_start: usize = if (prefix.len > 0) 1 else 0;
@@ -2511,7 +3106,14 @@ fn externalAliasNominalType(
 ) !?types.ExternalNominal {
     if (segs.len < 2) return null;
     const module_id = owningModule(e, e.fn_id) orelse return null;
-    if (resolveModuleItem(e, module_id, segs[0].name) != null) return null;
+    // A block-local `use` is the innermost binding for its name, so a module
+    // item of the same name does not outrank it: the guard below exists to
+    // leave a head that still resolves locally alone, and a block import is not
+    // local scope.
+    switch (blockImportBinding(e, segs[0].name)) {
+        .none => if (resolveModuleItem(e, module_id, segs[0].name) != null) return null,
+        .bound, .ambiguous => {},
+    }
     const alias = (try externalUsePath(e, segs[0].name)) orelse return null;
     const tail = try e.ctx.alloc.alloc([]const u8, segs.len - 1);
     defer e.ctx.alloc.free(tail);
@@ -2887,18 +3489,18 @@ const UnwrappedIter = struct {
 /// The method name of a `recv.method(...)` call node, or null.
 fn methodNameOf(e: *Ext, node: ts.Node) ?[]const u8 {
     if (!std.mem.eql(u8, node.kind(), "call_expression")) return null;
-    const callee = node.namedChild(0) orelse return null;
+    const callee = valueChild(node, 0) orelse return null;
     if (!std.mem.eql(u8, callee.kind(), "field_expression")) return null;
-    const method = callee.namedChild(1) orelse return null;
+    const method = valueChild(callee, 1) orelse return null;
     return text(e, method);
 }
 
 /// The receiver (`recv`) of a `recv.method(...)` call node, or null.
 fn receiverOf(node: ts.Node) ?ts.Node {
     if (!std.mem.eql(u8, node.kind(), "call_expression")) return null;
-    const callee = node.namedChild(0) orelse return null;
+    const callee = valueChild(node, 0) orelse return null;
     if (!std.mem.eql(u8, callee.kind(), "field_expression")) return null;
-    return callee.namedChild(0);
+    return valueChild(callee, 0);
 }
 
 /// The `arguments` child of a call node, or null.
@@ -2938,6 +3540,13 @@ fn closurePatternNode(node: ts.Node) ?ts.Node {
     if (std.mem.eql(u8, node.kind(), "parameter") or
         std.mem.eql(u8, node.kind(), "self_parameter"))
     {
+        // `parameter.pattern` is a grammar FIELD, and its wildcard case is
+        // the ANONYMOUS `_` token — `namedChild` never returns it, so the walk
+        // below cannot see `|_: ()|` at all and a TYPED parameter lost its
+        // slot. Reading the field keeps the token; the named walk stays as
+        // the fallback for a revision that carries no field. `self_parameter`
+        // has no `pattern` field, so it still falls through unchanged.
+        if (node.childByFieldName("pattern")) |pattern| return pattern;
         var i: u32 = 0;
         while (node.namedChild(i)) |child| : (i += 1) {
             if (isPatternNode(child)) return child;
@@ -2961,6 +3570,234 @@ fn localType(e: *const Ext, def: spine.EntityId) ?types.Type {
         },
         else => null,
     };
+}
+
+// Only known runtime owners qualify; references and unconstrained T stay borrowed.
+fn ownedCaptureContainerType(ty: types.Type) bool {
+    switch (ty) {
+        .boxed => return true,
+        .external_nominal => |external| {
+            return externalPathSlicesEqual(external.path, &.{ "alloc", "string", "String" }) or
+                externalPathSlicesEqual(external.path, &.{ "std", "string", "String" }) or
+                externalPathSlicesEqual(external.path, &.{ "alloc", "string", "FromUtf8Error" }) or
+                externalPathSlicesEqual(external.path, &.{ "std", "string", "FromUtf8Error" }) or
+                externalPathSlicesEqual(external.path, &.{ "alloc", "vec", "Vec" }) or
+                externalPathSlicesEqual(external.path, &.{ "alloc", "borrow", "Cow" }) or
+                externalPathSlicesEqual(external.path, &.{ "std", "borrow", "Cow" });
+        },
+        else => return false,
+    }
+}
+
+fn patternBindsByValue(e: *const Ext, pattern_id: exprs.NodeId) bool {
+    if (pattern_id >= e.ctx.pats.items.len) return false;
+    return switch (e.ctx.pats.items[pattern_id].kind) {
+        .binding => |binding| binding.mode == .value,
+        .tuple => |tuple| patternsBindByValue(e, tuple.elements),
+        .@"or" => |alternatives| patternsBindByValue(e, alternatives.alternatives),
+        .struct_pat => |structure| fieldsBindByValue(e, structure.fields),
+        .external_variant => |variant| fieldsBindByValue(e, variant.fields),
+        .slice => |slice| patternsBindByValue(e, slice.elements) or
+            (if (slice.rest) |rest| patternBindsByValue(e, rest) else false),
+        else => false,
+    };
+}
+
+fn blockConsumesBinding(e: *const Ext, block: exprs.BlockExpr, def: spine.EntityId) bool {
+    for (block.statements) |stmt_id| {
+        if (stmt_id >= e.ctx.stmts.items.len) continue;
+        switch (e.ctx.stmts.items[stmt_id].kind) {
+            .let => |declaration| {
+                const init = declaration.init orelse continue;
+                if (expressionConsumesBinding(e, init, def, patternBindsByValue(e, declaration.pattern))) return true;
+            },
+            .expr => |expr_id| {
+                if (valueConsumesBinding(e, expr_id, def)) return true;
+            },
+            else => {},
+        }
+    }
+    const tail = block.tail orelse return false;
+    return valueConsumesBinding(e, tail, def);
+}
+
+fn valueConsumesBinding(e: *const Ext, expr_id: exprs.NodeId, def: spine.EntityId) bool {
+    return expressionConsumesBinding(e, expr_id, def, true);
+}
+
+fn expressionConsumesBinding(e: *const Ext, expr_id: exprs.NodeId, def: spine.EntityId, by_value: bool) bool {
+    if (expr_id >= e.ctx.exprs.items.len) return false;
+    switch (e.ctx.exprs.items[expr_id].kind) {
+        .path => |path| return by_value and path.def == def,
+        .block => |block| return blockConsumesBinding(e, block, def),
+        .array => |array| {
+            for (array.elements) |element| {
+                if (valueConsumesBinding(e, element, def)) return true;
+            }
+        },
+        .vec_lit => |literal| {
+            for (literal.elements) |element| {
+                if (valueConsumesBinding(e, element, def)) return true;
+            }
+            // `vec![e; n]` evaluates `n` as an ordinary expression after `e`,
+            // so a binding the count reads is consumed here too — and a count
+            // that moves one out of it is the same move the elements would be.
+            if (literal.repeat) |repeat| switch (repeat) {
+                .expression => |count| {
+                    if (valueConsumesBinding(e, count, def)) return true;
+                },
+                .literal => {},
+            };
+        },
+        .struct_lit => |structure| {
+            for (structure.fields) |field| {
+                if (valueConsumesBinding(e, field.value, def)) return true;
+            }
+        },
+        .enum_variant => |variant| {
+            for (variant.tuple_fields) |field| {
+                if (valueConsumesBinding(e, field, def)) return true;
+            }
+            for (variant.named_fields) |field| {
+                if (valueConsumesBinding(e, field.value, def)) return true;
+            }
+        },
+        .external_variant => |variant| {
+            for (variant.tuple_fields) |field| {
+                if (valueConsumesBinding(e, field, def)) return true;
+            }
+            for (variant.named_fields) |field| {
+                if (valueConsumesBinding(e, field.value, def)) return true;
+            }
+        },
+        .call => |call| {
+            for (call.args) |argument| {
+                if (valueConsumesBinding(e, argument, def)) return true;
+            }
+        },
+        .core_call => |call| {
+            for (call.args) |argument| {
+                if (valueConsumesBinding(e, argument, def)) return true;
+            }
+        },
+        .method_call => |method| {
+            if (expressionConsumesBinding(e, method.receiver, def, methodConsumesOwnedReceiver(e, method))) return true;
+            for (method.args) |argument| {
+                if (valueConsumesBinding(e, argument, def)) return true;
+            }
+        },
+        .cast => |cast| return valueConsumesBinding(e, cast.operand, def),
+        .try_ => |tried| return valueConsumesBinding(e, tried.inner, def),
+        .return_ => |returned| {
+            const value = returned.value orelse return false;
+            return valueConsumesBinding(e, value, def);
+        },
+        .break_ => |brk| {
+            const value = brk.value orelse return false;
+            return valueConsumesBinding(e, value, def);
+        },
+        .assign => |assignment| return valueConsumesBinding(e, assignment.value, def),
+        .if_else => |conditional| {
+            if (expressionConsumesBinding(e, conditional.cond, def, false)) return true;
+            if (blockConsumesBinding(e, conditional.then_, def)) return true;
+            return elseBranchConsumesBinding(e, conditional.@"else", def);
+        },
+        .if_let => |conditional| {
+            if (expressionConsumesBinding(e, conditional.scrutinee, def, patternBindsByValue(e, conditional.pattern))) return true;
+            if (blockConsumesBinding(e, conditional.then_, def)) return true;
+            return elseBranchConsumesBinding(e, conditional.@"else", def);
+        },
+        .loop_ => |loop| return blockConsumesBinding(e, loop.body, def),
+        .while_ => |loop| return expressionConsumesBinding(e, loop.cond, def, false) or
+            blockConsumesBinding(e, loop.body, def),
+        .for_ => |loop| return expressionConsumesBinding(e, loop.iterable, def, false) or
+            blockConsumesBinding(e, loop.body, def),
+        .match => |arms| {
+            for (arms.arms) |arm| {
+                if (expressionConsumesBinding(e, arms.scrutinee, def, patternsBindByValue(e, arm.patterns))) return true;
+                if (arm.guard) |guard| {
+                    if (expressionConsumesBinding(e, guard, def, false)) return true;
+                }
+                if (valueConsumesBinding(e, arm.body, def)) return true;
+            }
+        },
+        .field => |field| return expressionConsumesBinding(e, field.base, def, false),
+        .index => |index| return expressionConsumesBinding(e, index.base, def, false) or
+            expressionConsumesBinding(e, index.index, def, false),
+        .unary => |unary| return expressionConsumesBinding(e, unary.operand, def, false),
+        .binary => |binary| {
+            const takes_left = binary.op == .add and isKnownStringOperand(e, binary.lhs);
+            return expressionConsumesBinding(e, binary.lhs, def, takes_left) or
+                expressionConsumesBinding(e, binary.rhs, def, false);
+        },
+        .iterator_chain => |chain| return expressionConsumesBinding(e, chain.source, def, false),
+        .format_write => |format| {
+            if (expressionConsumesBinding(e, format.writer, def, false)) return true;
+            for (format.args) |argument| {
+                if (expressionConsumesBinding(e, argument, def, false)) return true;
+            }
+        },
+        .literal,
+        .range,
+        .unit,
+        .core_function,
+        .panic_,
+        .unsupported,
+        .closure,
+        .continue_,
+        => {},
+    }
+    return false;
+}
+
+fn elseBranchConsumesBinding(e: *const Ext, branch: exprs.ElseBranch, def: spine.EntityId) bool {
+    return switch (branch) {
+        .none => false,
+        .block => |block| blockConsumesBinding(e, block, def),
+        .chain => |chained| valueConsumesBinding(e, chained, def),
+    };
+}
+fn patternsBindByValue(e: *const Ext, patterns: []const exprs.NodeId) bool {
+    for (patterns) |pattern| {
+        if (patternBindsByValue(e, pattern)) return true;
+    }
+    return false;
+}
+
+fn fieldsBindByValue(e: *const Ext, fields: []const exprs.FieldPat) bool {
+    for (fields) |field| {
+        if (field.pat) |pattern| {
+            if (patternBindsByValue(e, pattern)) return true;
+        } else if (field.shorthand) return true;
+    }
+    return false;
+}
+
+fn isKnownStringOperand(e: *const Ext, id: exprs.NodeId) bool {
+    if (id >= e.ctx.exprs.items.len or e.ctx.exprs.items[id].kind != .path) return false;
+    const ty = localType(e, e.ctx.exprs.items[id].kind.path.def) orelse return false;
+    if (ty != .external_nominal) return false;
+    return externalPathSlicesEqual(ty.external_nominal.path, &.{ "alloc", "string", "String" }) or
+        externalPathSlicesEqual(ty.external_nominal.path, &.{ "std", "string", "String" });
+}
+
+// These consuming receivers match the existing finite standard-library signatures.
+// Extraction has not resolved receiver_mode yet; `String::len` must stay a borrow.
+fn methodConsumesOwnedReceiver(e: *const Ext, method: exprs.MethodCall) bool {
+    if (method.receiver >= e.ctx.exprs.items.len or e.ctx.exprs.items[method.receiver].kind != .path) return false;
+    const ty = localType(e, e.ctx.exprs.items[method.receiver].kind.path.def) orelse return false;
+    if (ty != .external_nominal) return false;
+    const external = ty.external_nominal;
+    if (external.path.len != 3 or
+        (!std.mem.eql(u8, external.path[0], "alloc") and !std.mem.eql(u8, external.path[0], "std"))) return false;
+    const entity = e.ctx.g.symbol_table.get(method.method) orelse return false;
+    if (std.mem.eql(u8, external.path[1], "string") and std.mem.eql(u8, external.path[2], "String"))
+        return std.mem.eql(u8, entity.name, "into_bytes");
+    if (std.mem.eql(u8, external.path[1], "borrow") and std.mem.eql(u8, external.path[2], "Cow"))
+        return std.mem.eql(u8, entity.name, "into_owned");
+    if (std.mem.eql(u8, external.path[1], "vec") and std.mem.eql(u8, external.path[2], "Vec"))
+        return std.mem.eql(u8, entity.name, "into_iter");
+    return false;
 }
 
 fn writesCapturedLocal(e: *const Ext, expression: exprs.Expr, definition: spine.EntityId) bool {
@@ -3003,6 +3840,7 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
     var fallback_body: ?ts.Node = null;
     var i: u32 = 0;
     while (node.namedChild(i)) |child| : (i += 1) {
+        if (isBlockTrivia(child)) continue;
         if (std.mem.eql(u8, child.kind(), "closure_parameters")) {
             parameters_node = child;
         } else {
@@ -3084,6 +3922,7 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
         }
     }
     var closure_trait: exprs.ClosureTrait = .@"fn";
+    var consumed = false;
     for (e.locals.items[0..outer_local_count]) |outer_local| {
         var referenced = false;
         var mutated = false;
@@ -3106,12 +3945,17 @@ fn lowerClosureExpression(e: *Ext, node: ts.Node) anyerror!?exprs.ClosureExpr {
             else => {},
         }
         const capture_type_id = (try appendType(e, capture_type)) orelse return null;
+        const body_takes_it = ownedCaptureContainerType(capture_type) and
+            blockConsumesBinding(e, body_block, outer_local.def);
+        if (body_takes_it) consumed = true;
+        const by_value = capture_mode == .by_value or body_takes_it;
         try captures.append(e.ctx.alloc, .{
             .name = capture_entity.name,
-            .mode = if (mutated and capture_mode != .by_value) .by_mut_ref else capture_mode,
+            .mode = if (mutated and !by_value) .by_mut_ref else if (by_value) .by_value else .by_ref,
             .ty = capture_type_id,
         });
     }
+    if (consumed) closure_trait = .fn_once;
 
     const closure_captures = try captures.toOwnedSlice(e.ctx.alloc);
     errdefer e.ctx.alloc.free(closure_captures);
@@ -3634,6 +4478,33 @@ fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
     const eid = try lowerExpr(e, node);
     return .{ .kind = .{ .slice = {} }, .eid = eid };
 }
+/// The item a `for` over a container binds, or null when the carrier says
+/// nothing about its elements.
+///
+/// A standard container answers from its own type argument, and a BORROW of one
+/// answers with a borrow of that element — which is exactly what
+/// `for entry in &values` binds, and the only thing in the source that says so.
+/// Without it the loop's binding has no type at all, and every use of an element
+/// in the body — projecting it, measuring it, casting it — starts from nothing.
+fn iteratorCarrierItem(e: *const Ext, ty: types.Type) ?types.Type {
+    switch (ty) {
+        .reference => |reference| {
+            const element = iteratorCarrierItem(e, reference.pointee) orelse return null;
+            const borrow = e.ctx.alloc.create(types.Ref) catch return null;
+            borrow.* = .{ .mut = reference.mut, .pointee = element };
+            return .{ .reference = borrow };
+        },
+        .external_nominal => |external| {
+            if (external.path.len != 3 or external.args.len != 1) return null;
+            if (!std.mem.eql(u8, external.path[0], "alloc")) return null;
+            if (!std.mem.eql(u8, external.path[1], "vec")) return null;
+            if (!std.mem.eql(u8, external.path[2], "Vec")) return null;
+            return external.args[0];
+        },
+        else => return null,
+    }
+}
+
 /// Lower a `for_expression` to a wire `for_` expr, returning its expr id.
 fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const outer_local_count = e.locals.items.len;
@@ -3673,15 +4544,38 @@ fn lowerFor(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (pat_node == null) pat_node = idents[0];
     }
 
-    // Lower the pattern first so every loop binding is in local scope before
-    // the body is lowered (`lowerPattern` registers each binding via
-    // `pushLocal`, including tuple and reference patterns).
-    const pn = pat_node orelse return error.MalformedCst;
-    const pat_id = try lowerPattern(e, pn);
-
+    // The iterable is evaluated BEFORE the loop binding exists, so it is
+    // lowered first and every name it reads resolves against the enclosing
+    // scope. Lowering the pattern first installs the capture through
+    // `pushLocal`, and `resolveName` reverse-resolves a name to the most
+    // recent local — so in `for buf in buf.chunks(4)` the ITERABLE RECEIVER
+    // would bind to the capture rather than to the parameter, and the two
+    // would be one entity from here on. That is invisible for a capture whose
+    // name differs from its receiver's and fatal for the one that matches.
+    // `lowerIf` orders its scrutinee the same way, for the same reason.
     const iter = iter_node orelse return error.MalformedCst;
     const it = try unwrapIterable(e, iter);
     const iter_eid = it.eid;
+
+    // Every loop binding is in local scope before the body is lowered
+    // (`lowerPattern` registers each binding via `pushLocal`, including tuple
+    // and reference patterns).
+    const pn = pat_node orelse return error.MalformedCst;
+    const pat_id = try lowerPattern(e, pn);
+    // A binding over a borrow of a standard container carries that carrier's
+    // element, and the borrow the loop writes is the whole of what says so. A
+    // slice or an array iterable is left to inference, which already reads its
+    // element off the same node — only the carriers that answer nothing here are
+    // given a type.
+    if (knownCastOperandType(e, iter_eid)) |iterable_ty| {
+        switch (iterable_ty) {
+            .reference, .external_nominal => if (iteratorCarrierItem(e, iterable_ty)) |item| {
+                setPatternLocalTypes(e, pat_id, item);
+            },
+            else => {},
+        }
+    }
+
     const body = body_node orelse return error.MalformedCst;
     // The label belongs to the loop, and the backend reads a loop's label off
     // the block its body is, so it is recorded there.
@@ -3707,6 +4601,50 @@ fn isBlockTrivia(node: ts.Node) bool {
         std.mem.eql(u8, k, "attribute_item") or
         std.mem.eql(u8, k, "inner_attribute_item") or
         std.mem.eql(u8, k, "empty_statement");
+}
+
+/// The first named child that carries a value, stepping over lexical trivia.
+///
+/// Tree-sitter attaches `extras` — `//` and `/* */` comments among them — to
+/// the node whose span contains them, so a comment written between two
+/// operands, between a receiver and its field, or between two call arguments
+/// is a named child of that node. A positional read has to step over it: the
+/// comment is not an expression, and handing it to `lowerExpr` refuses the
+/// whole translation with the comment's own node kind as the reason.
+fn firstValueChild(node: ts.Node) ?ts.Node {
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (isBlockTrivia(child)) continue;
+        return child;
+    }
+    return null;
+}
+
+/// The `index`-th named child that carries a value. A node with two operands
+/// either side of an unnamed token — a receiver and its field, a base and its
+/// subscript — is read positionally, and one that does not have that many
+/// values is malformed, which stays the caller's answer to give.
+fn valueChild(node: ts.Node, index: u32) ?ts.Node {
+    var seen: u32 = 0;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (isBlockTrivia(child)) continue;
+        if (seen == index) return child;
+        seen += 1;
+    }
+    return null;
+}
+
+/// The last named child that carries a value. An operator token is unnamed, so
+/// for a node with two named children this is the right operand.
+fn lastValueChild(node: ts.Node) ?ts.Node {
+    var found: ?ts.Node = null;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |child| : (i += 1) {
+        if (isBlockTrivia(child)) continue;
+        found = child;
+    }
+    return found;
 }
 
 /// Return whether a CST statement has an explicit trailing semicolon.
@@ -3939,7 +4877,13 @@ fn declareLocalFn(e: *Ext, node: ts.Node) anyerror!LocalFnDecl {
 
     // A signature is written in the enclosing block's scope, but the helper is
     // the owner from here on, which is what makes its own `T` resolve.
-    var signature: Ext = .{ .ctx = e.ctx, .fn_id = entity_id, .item_scope = e.item_scope };
+    var signature: Ext = .{
+        .ctx = e.ctx,
+        .fn_id = entity_id,
+        .item_scope = e.item_scope,
+        .block_imports = e.block_imports,
+        .block_depth = e.block_depth,
+    };
     defer signature.deinit();
     const params = try mapLocalFnParams(&signature, params_node);
     const ret: types.Type = if (localFnReturnTypeNode(node)) |ret_node|
@@ -3959,7 +4903,284 @@ fn declareLocalFn(e: *Ext, node: ts.Node) anyerror!LocalFnDecl {
     return .{ .name = name, .def = entity_id };
 }
 
-/// Lower one declared block-local helper: its parameter bindings and body.
+/// Compile-time imports stay in their declaring block; source bytes are borrowed.
+fn blockImportBinding(e: *const Ext, name: []const u8) BlockImportBinding {
+    var best_depth: ?usize = null;
+    var bound: ?BlockImportTarget = null;
+    var duplicate = false;
+    for (e.block_imports) |entry| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+        if (best_depth == null or entry.block_depth > best_depth.?) {
+            best_depth = entry.block_depth;
+            bound = entry.target;
+            duplicate = false;
+            continue;
+        }
+        if (entry.block_depth == best_depth.?) duplicate = true;
+    }
+    if (duplicate) return .ambiguous;
+    const found = bound orelse return .none;
+    return .{ .bound = found };
+}
+
+fn blockImportPath(e: *const Ext, name: []const u8) ?[]const []const u8 {
+    return switch (blockImportBinding(e, name)) {
+        .bound => |target| switch (target) {
+            .external => |path| path,
+            .entity => null,
+        },
+        .none, .ambiguous => null,
+    };
+}
+
+fn isCanonicalImportRoot(root: []const u8) bool {
+    return std.mem.eql(u8, root, "std") or
+        std.mem.eql(u8, root, "alloc") or
+        std.mem.eql(u8, root, "core");
+}
+
+fn lastPathSegment(raw: []const u8) []const u8 {
+    var source = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, source, "::")) source = source[2..];
+    const separator = std.mem.lastIndexOf(u8, source, "::") orelse return source;
+    return std.mem.trim(u8, source[separator + 2 ..], " \t\r\n");
+}
+
+fn freeImportSegments(alloc: std.mem.Allocator, segments: []const []const u8) void {
+    alloc.free(segments);
+}
+
+fn freeBlockImportTarget(alloc: std.mem.Allocator, target: BlockImportTarget) void {
+    switch (target) {
+        .entity => {},
+        .external => |path| freeImportSegments(alloc, path),
+    }
+}
+
+fn blockImportSegments(
+    e: *Ext,
+    prefix: []const []const u8,
+    raw: []const u8,
+) !?[]const []const u8 {
+    var parts: [16][]const u8 = undefined;
+    var count: usize = 0;
+    var source = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, source, "::")) source = source[2..];
+    if (source.len == 0) return null;
+    var iterator = std.mem.splitSequence(u8, source, "::");
+    while (iterator.next()) |part| {
+        const name = std.mem.trim(u8, part, " \t\r\n");
+        if (name.len == 0 or count == parts.len) return null;
+        parts[count] = name;
+        count += 1;
+    }
+    const owned = try e.ctx.alloc.alloc([]const u8, prefix.len + count);
+    @memcpy(owned[0..prefix.len], prefix);
+    @memcpy(owned[prefix.len..], parts[0..count]);
+    return owned;
+}
+
+fn dupeImportSegments(
+    e: *Ext,
+    segments: []const []const u8,
+) ![]const []const u8 {
+    const owned = try e.ctx.alloc.alloc([]const u8, segments.len);
+    @memcpy(owned, segments);
+    return owned;
+}
+
+fn blockImportEntity(e: *const Ext, path: []const []const u8) ?spine.EntityId {
+    const module_id = owningModule(e, e.fn_id) orelse return null;
+    var lookups: UseLookupPath = .{};
+    defer lookups.deinit(e.ctx.alloc);
+    return resolveUsePathSegments(e, module_id, path, 0, &lookups);
+}
+
+const UseScan = struct {
+    imports: std.ArrayListUnmanaged(BlockImport) = .empty,
+    refused: bool = false,
+
+    fn deinit(self: *UseScan, alloc: std.mem.Allocator) void {
+        for (self.imports.items) |entry| freeBlockImportTarget(alloc, entry.target);
+        self.imports.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn appendBlockImport(
+    e: *Ext,
+    scan: *UseScan,
+    name: []const u8,
+    target: BlockImportTarget,
+    depth: usize,
+) anyerror!void {
+    errdefer freeBlockImportTarget(e.ctx.alloc, target);
+    try scan.imports.append(e.ctx.alloc, .{
+        .name = name,
+        .target = target,
+        .block_depth = depth,
+    });
+}
+
+fn bindBlockImportLeaf(
+    e: *Ext,
+    name: []const u8,
+    prefix: []const []const u8,
+    raw: []const u8,
+    depth: usize,
+    scan: *UseScan,
+) anyerror!void {
+    const segments = (try blockImportSegments(e, prefix, raw)) orelse {
+        scan.refused = true;
+        return;
+    };
+    if (isCanonicalImportRoot(segments[0])) {
+        try appendBlockImport(e, scan, name, .{ .external = segments }, depth);
+        return;
+    }
+    const def = blockImportEntity(e, segments);
+    freeImportSegments(e.ctx.alloc, segments);
+    if (def == null) {
+        scan.refused = true;
+        return;
+    }
+    try appendBlockImport(e, scan, name, .{ .entity = def.? }, depth);
+}
+
+fn bindBlockImportSelf(
+    e: *Ext,
+    prefix: []const []const u8,
+    depth: usize,
+    scan: *UseScan,
+) anyerror!void {
+    if (prefix.len == 0) {
+        scan.refused = true;
+        return;
+    }
+    const leaf = prefix[prefix.len - 1];
+    if (isCanonicalImportRoot(prefix[0])) {
+        const owned = try dupeImportSegments(e, prefix);
+        try appendBlockImport(e, scan, leaf, .{ .external = owned }, depth);
+        return;
+    }
+    const def = blockImportEntity(e, prefix) orelse {
+        scan.refused = true;
+        return;
+    };
+    try appendBlockImport(e, scan, leaf, .{ .entity = def }, depth);
+}
+
+fn collectBlockUseClause(
+    e: *Ext,
+    node: ts.Node,
+    prefix: []const []const u8,
+    depth: usize,
+    scan: *UseScan,
+) anyerror!void {
+    if (scan.refused) return;
+    if (isComment(node)) return;
+    const k = node.kind();
+    if (std.mem.eql(u8, k, "visibility_modifier")) return;
+
+    if (std.mem.eql(u8, k, "scoped_use_list")) {
+        var path_node: ?ts.Node = null;
+        var list_node: ?ts.Node = null;
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            const ck = c.kind();
+            if (std.mem.eql(u8, ck, "use_list")) {
+                list_node = c;
+            } else if (path_node == null) {
+                path_node = c;
+            }
+        }
+        const list = list_node orelse {
+            scan.refused = true;
+            return;
+        };
+        if (path_node) |pn| {
+            const folded = (try blockImportSegments(e, prefix, text(e, pn))) orelse {
+                scan.refused = true;
+                return;
+            };
+            defer freeImportSegments(e.ctx.alloc, folded);
+            try collectBlockUseClause(e, list, folded, depth, scan);
+        } else {
+            try collectBlockUseClause(e, list, prefix, depth, scan);
+        }
+    } else if (std.mem.eql(u8, k, "use_list")) {
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            try collectBlockUseClause(e, c, prefix, depth, scan);
+            if (scan.refused) return;
+        }
+    } else if (std.mem.eql(u8, k, "use_as_clause")) {
+        var path_child: ?ts.Node = null;
+        var alias_child: ?ts.Node = null;
+        var i: u32 = 0;
+        while (node.namedChild(i)) |c| : (i += 1) {
+            if (path_child == null) path_child = c else if (alias_child == null) alias_child = c;
+        }
+        const pc = path_child orelse {
+            scan.refused = true;
+            return;
+        };
+        const ac = alias_child orelse {
+            scan.refused = true;
+            return;
+        };
+        const alias = std.mem.trim(u8, text(e, ac), " \t\r\n");
+        if (alias.len == 0 or std.mem.eql(u8, alias, "self") or
+            std.mem.eql(u8, alias, "crate") or std.mem.eql(u8, alias, "super"))
+        {
+            scan.refused = true;
+            return;
+        }
+        if (std.mem.eql(u8, std.mem.trim(u8, text(e, pc), " \t\r\n"), "self")) {
+            scan.refused = true;
+            return;
+        }
+        try bindBlockImportLeaf(e, alias, prefix, text(e, pc), depth, scan);
+    } else if (std.mem.eql(u8, k, "use_wildcard")) {
+        scan.refused = true;
+    } else if (std.mem.eql(u8, k, "self")) {
+        try bindBlockImportSelf(e, prefix, depth, scan);
+    } else if (std.mem.eql(u8, k, "identifier") or
+        std.mem.eql(u8, k, "scoped_identifier") or
+        std.mem.eql(u8, k, "crate") or
+        std.mem.eql(u8, k, "super"))
+    {
+        const raw = std.mem.trim(u8, text(e, node), " \t\r\n");
+        if (std.mem.eql(u8, raw, "self")) {
+            scan.refused = true;
+            return;
+        }
+        try bindBlockImportLeaf(e, lastPathSegment(raw), prefix, raw, depth, scan);
+    } else {
+        scan.refused = true;
+    }
+}
+
+fn collectBlockUseDeclaration(
+    e: *Ext,
+    node: ts.Node,
+    depth: usize,
+    scan: *UseScan,
+) anyerror!void {
+    var clauses: usize = 0;
+    var i: u32 = 0;
+    while (node.namedChild(i)) |c| : (i += 1) {
+        if (isComment(c)) continue;
+        const k = c.kind();
+        if (std.mem.eql(u8, k, "visibility_modifier")) continue;
+        clauses += 1;
+        try collectBlockUseClause(e, c, &.{}, depth, scan);
+        if (scan.refused) return;
+    }
+    if (clauses == 0) scan.refused = true;
+}
+
+/// Lower one declared block-local helper:
 ///
 /// A helper is a separate Rust item and does not capture the enclosing
 /// function's `let` bindings, so it gets its own `Ext` carrying only the item
@@ -3980,7 +5201,18 @@ fn lowerLocalFnBody(e: *Ext, node: ts.Node, entity_id: spine.EntityId) anyerror!
     }
     const blk_node = block orelse return error.MalformedLocalFunctionBody;
 
-    var nested: Ext = .{ .ctx = e.ctx, .fn_id = entity_id, .item_scope = e.item_scope };
+    // The enclosing block's imports come along, and are BORROWED: the block
+    // that owns them outlives this call, because a helper is lowered in place
+    // while the body that declares it is read. A helper does not capture the
+    // enclosing function's `let` bindings, but a `use` is an ITEM, and an item
+    // is in scope for the whole block that declares it.
+    var nested: Ext = .{
+        .ctx = e.ctx,
+        .fn_id = entity_id,
+        .item_scope = e.item_scope,
+        .block_imports = e.block_imports,
+        .block_depth = e.block_depth,
+    };
     defer nested.deinit();
 
     const params: []const items.Param = switch (e.ctx.bodies_list.items[entity_id]) {
@@ -4037,6 +5269,73 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
     defer stmt_ids.deinit(e.ctx.alloc);
     var tail: ?exprs.NodeId = null;
 
+    // A `use` written in a body is an item too, so it is in scope for the whole
+    // block that writes it: the statements ABOVE it, the helpers beside it, and
+    // nothing outside. The bindings are installed before any of this block is
+    // lowered — before the helper signatures are mapped and before the first
+    // statement runs — the same order `block_items` uses and for the same reason.
+    //
+    // A refused declaration keeps its node so the statement loop can place its
+    // marker where the declaration is, as a statement of THIS block: a marker no
+    // walker reaches is the silent omission this must never be.
+    var refused_use_nodes: std.ArrayListUnmanaged(ts.Node) = .empty;
+    defer refused_use_nodes.deinit(e.ctx.alloc);
+    const outer_imports = e.block_imports;
+    const outer_depth = e.block_depth;
+    const import_depth = outer_depth + 1;
+    // `scope` owns the entries past `outer_imports` and only those: the entries
+    // it inherits are borrowed from the block that declared them. Released on
+    // the normal and the error path alike.
+    var owned_imports: ?[]BlockImport = null;
+    defer if (owned_imports) |scope| {
+        for (scope[outer_imports.len..]) |entry| freeBlockImportTarget(e.ctx.alloc, entry.target);
+        e.ctx.alloc.free(scope);
+    };
+    {
+        var collected: std.ArrayListUnmanaged(BlockImport) = .empty;
+        defer {
+            for (collected.items) |entry| freeBlockImportTarget(e.ctx.alloc, entry.target);
+            collected.deinit(e.ctx.alloc);
+        }
+        var scan_use: u32 = 0;
+        while (node.namedChild(scan_use)) |c| : (scan_use += 1) {
+            if (isBlockTrivia(c)) continue;
+            if (!std.mem.eql(u8, c.kind(), "use_declaration")) continue;
+            // One `defer` per iteration, not an `errdefer` plus an explicit call:
+            // this body can fail again after `scan.deinit` has already run.
+            var scan: UseScan = .{};
+            defer scan.deinit(e.ctx.alloc);
+            try collectBlockUseDeclaration(e, c, import_depth, &scan);
+            if (scan.refused) {
+                try refused_use_nodes.append(e.ctx.alloc, c);
+                continue;
+            }
+            try collected.appendSlice(e.ctx.alloc, scan.imports.items);
+            // Ownership of these entries moves to `collected`; the scan's buffer
+            // no longer holds them, so its `deinit` frees only the buffer.
+            scan.imports.clearRetainingCapacity();
+        }
+        if (collected.items.len > 0) {
+            const scope = try e.ctx.alloc.alloc(
+                BlockImport,
+                outer_imports.len + collected.items.len,
+            );
+            @memcpy(scope[0..outer_imports.len], outer_imports);
+            @memcpy(scope[outer_imports.len..], collected.items);
+            // The entries now live in `scope`, so this list must forget them
+            // before its own `deinit` — which runs at the end of this scope,
+            // while `scope` is still installed and still in use.
+            collected.clearRetainingCapacity();
+            owned_imports = scope;
+            e.block_imports = scope;
+        }
+    }
+    // Registered AFTER the release, so the restore runs FIRST: the field is never
+    // left pointing at released memory, not even between two defers.
+    defer e.block_imports = outer_imports;
+    defer e.block_depth = outer_depth;
+    e.block_depth = import_depth;
+
     // A Rust `fn` item is in scope for the whole block that declares it, so
     // every one of them is declared before the first statement runs. That is
     // what lets a call name an item written further down the block.
@@ -4073,6 +5372,9 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
     }
     defer e.item_scope = outer_item_scope;
     var local_fn_ordinal: usize = 0;
+    // Both lists are in source order and the loop walks children in source
+    // order, so one cursor matches each refused declaration to its position.
+    var refused_uses: usize = 0;
 
     // Find the last value-bearing child so trivia cannot become the block tail.
     var last: ?ts.Node = null;
@@ -4103,6 +5405,24 @@ fn lowerBlock(e: *Ext, node: ts.Node) anyerror!exprs.BlockExpr {
             const sid = try appendStmt(e, .{ .item = declared.def });
             try stmt_ids.append(e.ctx.alloc, sid);
             try lowerLocalFnBody(e, c, declared.def);
+        } else if (std.mem.eql(u8, k, "use_declaration")) {
+            // An admitted `use` binds a name and has no runtime effect, so it
+            // contributes no statement. It is handled here, BEFORE the `is_last`
+            // arms, so it can never become the block tail: a block that ends in
+            // a `use` item is unit, which is what Rust says it is.
+            //
+            // A refused one replays its marker HERE rather than at the scan
+            // above, so the marker is a statement of this block that validation,
+            // the reachability walker and the backend all reach.
+            if (refused_uses < refused_use_nodes.items.len and
+                refused_use_nodes.items[refused_uses].id == c.id)
+            {
+                refused_uses += 1;
+                const sid = try appendStmt(e, .{
+                    .expr = try unsupported(e, "block-local use"),
+                });
+                try stmt_ids.append(e.ctx.alloc, sid);
+            }
         } else if (std.mem.eql(u8, k, "let_declaration")) {
             try lowerLet(e, c);
             try stmt_ids.append(e.ctx.alloc, @intCast(e.ctx.stmts.items.len - 1));
@@ -4220,10 +5540,30 @@ fn controlValue(e: *Ext, node: ts.Node) anyerror!?exprs.NodeId {
 
 // ── expression lowering ─────────────────────────────────────────────────────
 
+/// True when `node` is the discard `_`: the anonymous token in pattern
+/// position, or the identifier `_`, which names no binding in expression
+/// position.
+fn isUnderscoreValue(e: *const Ext, node: ts.Node) bool {
+    if (std.mem.eql(u8, node.kind(), "_")) return true;
+    if (!std.mem.eql(u8, node.kind(), "identifier")) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, text(e, node), " \t\r\n"), "_");
+}
+
 fn lowerAssignmentExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const lhs = node.childByFieldName("left");
     const rhs = node.childByFieldName("right");
     if (lhs == null or rhs == null) return error.MalformedCst;
+
+    // `_ = value;` evaluates and discards: `_` names no place, so there is
+    // no target to write and the right side is the whole of it. The caller
+    // wraps the returned node in an expression statement, which is exactly
+    // the discard Rust performs. Reading it as a use of a binding called `_`
+    // refused valid Rust as an "unresolved identifier" — no such binding is
+    // ever pushed — while dropping the right side would drop effects the
+    // source performs.
+    if (std.mem.eql(u8, node.kind(), "assignment_expression") and isUnderscoreValue(e, lhs.?)) {
+        return lowerExpr(e, rhs.?);
+    }
 
     const op: exprs.AssignOp = if (std.mem.eql(u8, node.kind(), "assignment_expression"))
         .plain
@@ -4236,26 +5576,6 @@ fn lowerAssignmentExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         .value = try lowerExpr(e, rhs.?),
         .overflow = .wrapping,
     } });
-}
-const ScalarPointeeLayout = enum {
-    byte_1,
-    byte_2,
-    byte_4,
-    byte_8,
-    byte_16,
-    pointer,
-};
-
-fn scalarPointeeLayout(primitive: types.Prim) ?ScalarPointeeLayout {
-    return switch (primitive) {
-        .i8, .u8, .bool => .byte_1,
-        .i16, .u16 => .byte_2,
-        .i32, .u32, .f32, .char => .byte_4,
-        .i64, .u64, .f64 => .byte_8,
-        .i128, .u128 => .byte_16,
-        .isize, .usize => .pointer,
-        .unit, .never => null,
-    };
 }
 
 fn isScalarCastType(ty: types.Type) bool {
@@ -4442,6 +5762,30 @@ fn indexedElementType(ty: types.Type) ?types.Type {
     };
 }
 
+/// `entry.0` through a borrow: the element of a tuple, read off the receiver's
+/// own type.
+///
+/// A tuple has no field entities — `0` and `1` are positions, not names — so
+/// there is nothing for `knownFieldType` to look up and the projection goes
+/// unanswered. Nothing else states what such a receiver holds either: the
+/// borrow in front of it says nothing about the element behind it, which is
+/// exactly what a `for` over `&Vec<(A, B)>` binds.
+fn tupleProjectionType(e: *const Ext, field: exprs.FieldExpr) ?types.Type {
+    const base = knownCastOperandType(e, field.base) orelse return null;
+    const behind = switch (base) {
+        .reference => |reference| reference.pointee,
+        .raw_ptr => |raw_ptr| raw_ptr.pointee,
+        else => base,
+    };
+    const tuple = switch (behind) {
+        .tuple => |value| value,
+        else => return null,
+    };
+    const index = std.fmt.parseInt(usize, field.field, 10) catch return null;
+    if (index >= tuple.len) return null;
+    return tuple[index];
+}
+
 fn knownFieldType(e: *const Ext, field_id: spine.EntityId) ?types.Type {
     const field_entity = e.ctx.g.symbol_table.get(field_id) orelse return null;
     const parent = field_entity.parent orelse return null;
@@ -4538,7 +5882,7 @@ fn knownCastOperandType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
     }
     return switch (expression.kind) {
         .path => |path| localType(e, path.def),
-        .field => |field| knownFieldType(e, field.resolved),
+        .field => |field| knownFieldType(e, field.resolved) orelse tupleProjectionType(e, field),
         .cast => |cast| if (cast.target < e.ctx.types.items.len)
             e.ctx.types.items[cast.target]
         else
@@ -4614,6 +5958,190 @@ fn coreCallResultType(call: exprs.CoreCall) ?types.Type {
     return result;
 }
 
+/// The result a call declares through the signature it was resolved against.
+///
+/// An associated call on an external nominal is the shape this needs it for:
+/// `ensureExternalAssociatedFn` declared that signature from the standard
+/// library, so its result is the owner's own identity and the source writes
+/// no type for it anywhere — `Ok(String::from("a"))` names `String` only in
+/// the call's return position. A crate's own function declares its result the
+/// same way, so one rule covers both.
+fn declaredCallResultType(e: *const Ext, call: exprs.Call) ?types.Type {
+    const def = switch (call.call_kind) {
+        .free => |value| value,
+        .associated => |value| value,
+        .constructor => return null,
+    };
+    if (def >= e.ctx.bodies_list.items.len) return null;
+    const ret = switch (e.ctx.bodies_list.items[def]) {
+        .fn_ => |body| body.ret,
+        else => return null,
+    };
+    if (ret == .unsupported) return null;
+    return ret;
+}
+
+/// `vec![a, b]` is `Vec<typeof a>`: every element of one literal carries the
+/// same type by construction, so the first element that names one names the
+/// vector's element. A literal whose elements say nothing says nothing.
+fn vecLitType(e: *const Ext, literal: exprs.VecLit) ?types.Type {
+    for (literal.elements) |element| {
+        const elem = resultArmValueType(e, element) orelse continue;
+        var external = (externalNominalForPath(e, "alloc::vec::Vec") catch return null) orelse
+            return null;
+        const args = e.ctx.alloc.alloc(types.Type, 1) catch return null;
+        args[0] = elem;
+        external.args = args;
+        return .{ .external_nominal = external };
+    }
+    return null;
+}
+
+/// A borrow the arm wrote over its own value: `Ok(&self.bytes)` is
+/// `Result<&[u8], E>`, and that reference is the payload's whole type. Nothing
+/// outside the arm states it — the arm is the only place the borrow appears —
+/// so it is read from the value under it rather than from whatever row the
+/// borrow node happens to carry.
+fn borrowedPayloadType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
+    if (node_id >= e.ctx.exprs.items.len) return null;
+    const unary = switch (e.ctx.exprs.items[node_id].kind) {
+        .unary => |value| value,
+        else => return null,
+    };
+    const mode = switch (unary.op) {
+        .ref => |value| value,
+        else => return null,
+    };
+    const pointee = knownCastOperandType(e, unary.operand) orelse return null;
+    if (pointee == .unsupported) return null;
+    const ref_ptr = e.ctx.alloc.create(types.Ref) catch return null;
+    ref_ptr.* = .{ .mut = (mode == .mutable), .pointee = pointee };
+    return .{ .reference = ref_ptr };
+}
+
+/// The type an `Ok`/`Err` arm's own value carries.
+///
+/// `Ok(v)` is `Result<typeof v, E>`, so the ok slot is whatever `v` is — a
+/// concrete type, a slice, a type parameter, a vector literal — and only the
+/// value itself says which. `knownCastOperandType` already answers for the
+/// shapes it recognises; the two it does not are an associated call on an
+/// external nominal and a `vec!` literal, and neither is a guess — each
+/// carries its own type in a place this pass has already read.
+fn resultArmValueType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
+    if (literalTypeIsOnlyAFallback(e, node_id)) return null;
+    if (borrowedPayloadType(e, node_id)) |ty| return ty;
+    if (knownCastOperandType(e, node_id)) |ty| return ty;
+    if (node_id >= e.ctx.exprs.items.len) return null;
+    return switch (e.ctx.exprs.items[node_id].kind) {
+        .call => |call| declaredCallResultType(e, call),
+        .vec_lit => |literal| vecLitType(e, literal),
+        else => null,
+    };
+}
+
+/// Whether the only type `node_id` has is the fallback an unsuffixed numeric
+/// literal falls back on.
+///
+/// `Ok(1)` does not name a type: Rust reads that integer off the position it
+/// stands in, and `i32` is what it becomes when the position asks for
+/// nothing. Naming the fallback here would fix `T` before any position had a
+/// say, and the position that does have one is a later pass. So the answer is
+/// nothing, and the pair stays unbound for that pass — which is where an
+/// unconstrained `Result` was always going to be decided.
+fn literalTypeIsOnlyAFallback(e: *const Ext, node_id: exprs.NodeId) bool {
+    if (node_id >= e.ctx.exprs.items.len) return false;
+    const literal = switch (e.ctx.exprs.items[node_id].kind) {
+        .literal => |value| value,
+        else => return false,
+    };
+    return switch (literal) {
+        .int => |integer| integer.ty_suffix == null,
+        .float => |float| !std.mem.endsWith(u8, float.text, "f32") and
+            !std.mem.endsWith(u8, float.text, "f64"),
+        else => false,
+    };
+}
+
+/// What one arm of a pair contributes to the `Result` the pair builds.
+const ResultArmPayload = struct {
+    error_arm: bool,
+    ty: types.Type,
+};
+
+/// The payload a canonical `Ok(..)`/`Err(..)` construction carries, or null
+/// when the node is not one of them or its value has not decided yet.
+///
+/// Only the arm that WRITES a slot answers for that slot: `Ok(v)` names
+/// `Result<typeof v, E>`, and `E` is written in no `Ok` arm at all.
+fn standardResultArmPayload(e: *const Ext, node_id: exprs.NodeId) ?ResultArmPayload {
+    if (node_id >= e.ctx.exprs.items.len) return null;
+    const variant = switch (e.ctx.exprs.items[node_id].kind) {
+        .enum_variant => |value| value,
+        else => return null,
+    };
+    const info = standardPreludeVariantName(variant.variant) orelse return null;
+    if (!std.mem.eql(u8, info.enum_name, "Result")) return null;
+    if (!isStandardPreludeEnum(e, variant.def, info.module_name, info.enum_name)) return null;
+    if (variant.tuple_fields.len != 1 or variant.named_fields.len != 0) return null;
+    const payload = resultArmValueType(e, variant.tuple_fields[0]) orelse return null;
+    return .{ .error_arm = std.mem.eql(u8, variant.variant, "Err"), .ty = payload };
+}
+
+/// Bind the `Result` an unannotated `Ok`/`Err` pair builds onto both of the arm
+/// nodes that carry it.
+///
+/// Rust writes the identity of a `Result` in exactly one place: the annotation
+/// on the value. `let r: Result<String, u8> = ..` already arrives typed,
+/// because `mapCstType` read both slots off that annotation and inference
+/// pushes them into the `Ok` it names. Written without one, `Ok(v)` says only
+/// `T = typeof v` and `Err(e)` says only `E = typeof e`: each arm holds half
+/// of an identity neither of them names in full, and the pair is the only
+/// place the other half exists at all. Stating it here is reading the source,
+/// and it is what gives the conditional's own type, a `let` that takes it,
+/// and every match that reads it a resolved pair instead of the stand-in
+/// nothing later pass fills in.
+///
+/// Both nodes get the SAME interned row. Inference reads a conditional's type
+/// by comparing its arms, and the two arms of one `Result` are one value, so
+/// one row is that identity while two equal rows would only agree by
+/// coincidence.
+fn pinStandardResultArms(
+    e: *Ext,
+    then_tail: ?exprs.NodeId,
+    else_tail: ?exprs.NodeId,
+) !void {
+    const then_arm = then_tail orelse return;
+    const else_arm = else_tail orelse return;
+    const then_payload = standardResultArmPayload(e, then_arm) orelse return;
+    const else_payload = standardResultArmPayload(e, else_arm) orelse return;
+    if (then_payload.error_arm == else_payload.error_arm) return;
+    const ok = if (then_payload.error_arm) else_payload.ty else then_payload.ty;
+    const err = if (then_payload.error_arm) then_payload.ty else else_payload.ty;
+    // `appendType` interns, but interning this row needs the pointer to compare
+    // first, so the reuse case reads the table directly rather than allocating
+    // a row it would then throw away.
+    var result_id: exprs.TypeId = 0;
+    var found = false;
+    for (e.ctx.types.items, 0..) |candidate, index| {
+        const existing = switch (candidate) {
+            .result => |value| value,
+            else => continue,
+        };
+        if (!existing.is_error_unionable) continue;
+        if (!infer.typeEqual(existing.ok, ok) or !infer.typeEqual(existing.err, err)) continue;
+        result_id = @intCast(index);
+        found = true;
+        break;
+    }
+    if (!found) {
+        const result = try e.ctx.alloc.create(types.Result);
+        result.* = .{ .ok = ok, .err = err, .is_error_unionable = true };
+        result_id = (try appendType(e, .{ .result = result })) orelse return;
+    }
+    e.ctx.exprs.items[then_arm].ty = result_id;
+    e.ctx.exprs.items[else_arm].ty = result_id;
+}
+
 fn pendingCastSourceType() types.Type {
     return .{ .unsupported = .{
         .reason = .iterators,
@@ -4673,6 +6201,63 @@ fn nativeEndianByteArray(e: *Ext, primitive: types.Prim) ?types.Type {
     const array = e.ctx.alloc.create(types.Array) catch return null;
     array.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = width } };
     return .{ .array = array };
+}
+
+/// `mem::size_of::<T>()`, the target's own answer for an integer's byte width.
+///
+/// This is how a `usize`/`isize` byte image gets a length without the
+/// translator having to know the target. A `.literal` length would be right
+/// for the host that ran the translation and wrong for every target that is not
+/// it, which is the same reason `nativeEndianByteWidth` refuses those two
+/// types; the difference is that this one DEFERS the question instead of
+/// declining it. The length stays an expression all the way through, so the
+/// target decides.
+fn appendMemSizeOf(e: *Ext, primitive: types.Prim) anyerror!exprs.NodeId {
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 1);
+    generic_args[0] = .{ .prim = primitive };
+    const call = try appendExpr(e, .{ .core_call = .{
+        .function = .mem_size_of,
+        .generic_args = generic_args,
+        .args = &.{},
+    } });
+    e.ctx.exprs.items[call].ty = try appendType(e, .{ .prim = .usize });
+    return call;
+}
+
+/// `[u8; @sizeOf(T)]`, the byte image of an integer whose width only the target
+/// knows. The length is the `mem_size_of` call above, not a number.
+fn targetWidthByteArray(e: *Ext, primitive: types.Prim) !types.Type {
+    const width = try appendMemSizeOf(e, primitive);
+    const array = try e.ctx.alloc.create(types.Array);
+    array.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .expression = width } };
+    return .{ .array = array };
+}
+
+/// The byte image of `primitive` however its width is known: a literal array
+/// length for a fixed-width integer, the target's own `mem_size_of` for
+/// `usize`/`isize`. Only a type with neither a fixed width nor a size the
+/// target can answer is refused.
+fn integerByteArray(e: *Ext, primitive: types.Prim) !types.Type {
+    if (nativeEndianByteWidth(primitive)) |width| {
+        const array = try e.ctx.alloc.create(types.Array);
+        array.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = width } };
+        return .{ .array = array };
+    }
+    return switch (primitive) {
+        .usize, .isize => targetWidthByteArray(e, primitive),
+        else => error.UnresolvedNominalType,
+    };
+}
+
+/// Whether an integer's byte width is one this translator can state at all: a
+/// fixed width for the sized integers, or the target's own `mem_size_of` for
+/// `usize`/`isize`. A float, a `char`, or a `bool` has no byte image these
+/// methods produce, so the answer is no.
+fn isIntegerByteWidthKnown(primitive: types.Prim) bool {
+    return switch (primitive) {
+        .i8, .i16, .i32, .i64, .i128, .isize, .u8, .u16, .u32, .u64, .u128, .usize => true,
+        else => false,
+    };
 }
 
 /// `core::mem::transmute` between an integer and the same value's bytes.
@@ -4750,6 +6335,77 @@ fn appendPrimitiveFromNeBytes(
         return unsupported(e, "primitive from_ne_bytes call");
     return appendNativeEndianTransmute(e, bytes, .{ .prim = target_primitive }, args[0]);
 }
+
+/// `receiver.to_le_bytes()`, the explicit little-endian spelling of the same
+/// byte image `to_ne_bytes` produces natively.
+///
+/// It is deliberately NOT `mem_transmute`. `mem_transmute` copies the value's
+/// own bytes, which is the right answer on a little-endian target and the wrong
+/// one on a big-endian one; `to_le_bytes` has to be little-endian on every
+/// target or the hash it feeds is a different hash. So it gets its own core
+/// function, which the backend emits as `std.mem.nativeToLittle` — a `@bitCast`
+/// on LE and a `@byteSwap` on BE, both resolved at comptime.
+fn appendToLeBytes(e: *Ext, receiver: exprs.NodeId) anyerror!?exprs.NodeId {
+    const declared = knownCastOperandType(e, receiver) orelse return null;
+    const primitive = integerReceiverType(declared) orelse return null;
+    // A fixed-width integer gets a literal array length; `usize`/`isize` get
+    // the target's own `mem_size_of`, so the count is never the host's.
+    const byte_array = integerByteArray(e, primitive) catch return null;
+    const operand = if (declared == .reference)
+        try appendExpr(e, .{ .unary = .{ .op = .deref, .operand = receiver } })
+    else
+        receiver;
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 1);
+    generic_args[0] = .{ .prim = primitive };
+    const args = try e.ctx.alloc.alloc(exprs.NodeId, 1);
+    args[0] = operand;
+    const call = try appendExpr(e, .{ .core_call = .{
+        .function = .prim_to_le_bytes,
+        .generic_args = generic_args,
+        .args = args,
+    } });
+    e.ctx.exprs.items[call].ty = try appendType(e, byte_array);
+    return call;
+}
+
+/// `u16::from_le_bytes`, the associated-function spelling of the same decode.
+fn primitiveFromLeBytesTarget(raw: []const u8) ?types.Prim {
+    const suffix = "::from_le_bytes";
+    if (!std.mem.endsWith(u8, raw, suffix)) return null;
+    const primitive = mapPrim(raw[0 .. raw.len - suffix.len]) orelse return null;
+    return switch (primitive) {
+        .i8, .i16, .i32, .i64, .i128, .isize, .u8, .u16, .u32, .u64, .u128, .usize => primitive,
+        else => null,
+    };
+}
+
+fn appendPrimitiveFromLeBytes(
+    e: *Ext,
+    target_primitive: types.Prim,
+    args: []const exprs.NodeId,
+) anyerror!exprs.NodeId {
+    defer e.ctx.alloc.free(args);
+    if (args.len != 1) return unsupported(e, "primitive from_le_bytes call");
+    // The decode takes the bytes as they are and produces the integer, so it
+    // needs no array type of its own — this asks only whether the width is one
+    // anything can state, and deliberately does NOT build the array, which
+    // would leave an unreferenced `mem_size_of` expression in the table.
+    if (!isIntegerByteWidthKnown(target_primitive)) {
+        return unsupported(e, "primitive from_le_bytes call");
+    }
+    const generic_args = try e.ctx.alloc.alloc(types.Type, 1);
+    generic_args[0] = .{ .prim = target_primitive };
+    const owned = try e.ctx.alloc.alloc(exprs.NodeId, 1);
+    owned[0] = args[0];
+    const call = try appendExpr(e, .{ .core_call = .{
+        .function = .prim_from_le_bytes,
+        .generic_args = generic_args,
+        .args = owned,
+    } });
+    e.ctx.exprs.items[call].ty = try appendType(e, .{ .prim = target_primitive });
+    return call;
+}
+
 fn primitiveTryFromTarget(raw: []const u8) ?types.Prim {
     const suffix = "::try_from";
     if (!std.mem.endsWith(u8, raw, suffix)) return null;
@@ -4771,6 +6427,203 @@ fn primitiveTryFromTarget(raw: []const u8) ?types.Prim {
         => primitive,
         else => null,
     };
+}
+
+/// An integer primitive's own `const fn` for its extreme value, as
+/// `u64::max_value()` spells it. `MIN`/`MAX` are the same values under their
+/// modern names, and `BITS` is the width the other two are computed from, so
+/// one table answers all of the spellings a single type can be asked for.
+const PrimitiveAssocConst = struct {
+    name: []const u8,
+    arity: usize,
+    /// The `const fn` body, evaluated here because every one of them is a
+    /// compile-time constant: `max_value`/`MAX` is the type's largest
+    /// representable value, `min_value`/`MIN` its smallest, and `BITS` its
+    /// width. None of them reads an argument, reads memory, or can fail, so a
+    /// /// literal is the whole operation.
+    value: i128,
+    text: []const u8,
+};
+
+/// `u8::MAX` — the largest value a `u8` can hold. The `value` field is what
+/// the emitter re-derives from, and `text` is the same number in hex so the
+/// emitted literal stays as readable as the source's own constant.
+const primitive_assoc_consts = [_]struct { prim: types.Prim, entry: PrimitiveAssocConst }{
+    .{ .prim = .u8, .entry = .{ .name = "max_value", .arity = 0, .value = 0xff, .text = "0xff" } },
+    .{ .prim = .u8, .entry = .{ .name = "MAX", .arity = 0, .value = 0xff, .text = "0xff" } },
+    .{ .prim = .u8, .entry = .{ .name = "min_value", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u8, .entry = .{ .name = "MIN", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u8, .entry = .{ .name = "BITS", .arity = 0, .value = 8, .text = "8" } },
+    .{ .prim = .u16, .entry = .{ .name = "max_value", .arity = 0, .value = 0xffff, .text = "0xffff" } },
+    .{ .prim = .u16, .entry = .{ .name = "MAX", .arity = 0, .value = 0xffff, .text = "0xffff" } },
+    .{ .prim = .u16, .entry = .{ .name = "min_value", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u16, .entry = .{ .name = "MIN", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u16, .entry = .{ .name = "BITS", .arity = 0, .value = 16, .text = "16" } },
+    .{ .prim = .u32, .entry = .{ .name = "max_value", .arity = 0, .value = 0xffff_ffff, .text = "0xffff_ffff" } },
+    .{ .prim = .u32, .entry = .{ .name = "MAX", .arity = 0, .value = 0xffff_ffff, .text = "0xffff_ffff" } },
+    .{ .prim = .u32, .entry = .{ .name = "min_value", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u32, .entry = .{ .name = "MIN", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u32, .entry = .{ .name = "BITS", .arity = 0, .value = 32, .text = "32" } },
+    // `u64::MAX` fits an `i128` value field exactly — 1.8e19 against a ceiling
+    // of 1.7e38 — so it is carried as itself and the emitter re-derives the Zig
+    // spelling from `text` plus `ty_suffix`.
+    .{
+        .prim = .u64,
+        .entry = .{
+            .name = "max_value",
+            .arity = 0,
+            .value = 0xffff_ffff_ffff_ffff,
+            .text = "0xffff_ffff_ffff_ffff",
+        },
+    },
+    .{
+        .prim = .u64,
+        .entry = .{
+            .name = "MAX",
+            .arity = 0,
+            .value = 0xffff_ffff_ffff_ffff,
+            .text = "0xffff_ffff_ffff_ffff",
+        },
+    },
+    // The full u128 maximum is emitted as typed bit-not below, not an i128 literal.
+    .{ .prim = .u64, .entry = .{ .name = "min_value", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u64, .entry = .{ .name = "MIN", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u64, .entry = .{ .name = "BITS", .arity = 0, .value = 64, .text = "64" } },
+    .{ .prim = .i8, .entry = .{ .name = "max_value", .arity = 0, .value = 0x7f, .text = "0x7f" } },
+    .{ .prim = .i8, .entry = .{ .name = "MAX", .arity = 0, .value = 0x7f, .text = "0x7f" } },
+    .{ .prim = .i8, .entry = .{ .name = "min_value", .arity = 0, .value = -0x80, .text = "-0x80" } },
+    .{ .prim = .i8, .entry = .{ .name = "MIN", .arity = 0, .value = -0x80, .text = "-0x80" } },
+    .{ .prim = .i8, .entry = .{ .name = "BITS", .arity = 0, .value = 8, .text = "8" } },
+    .{ .prim = .i16, .entry = .{ .name = "max_value", .arity = 0, .value = 0x7fff, .text = "0x7fff" } },
+    .{ .prim = .i16, .entry = .{ .name = "MAX", .arity = 0, .value = 0x7fff, .text = "0x7fff" } },
+    .{ .prim = .i16, .entry = .{ .name = "min_value", .arity = 0, .value = -0x8000, .text = "-0x8000" } },
+    .{ .prim = .i16, .entry = .{ .name = "MIN", .arity = 0, .value = -0x8000, .text = "-0x8000" } },
+    .{ .prim = .i16, .entry = .{ .name = "BITS", .arity = 0, .value = 16, .text = "16" } },
+    .{ .prim = .i32, .entry = .{ .name = "max_value", .arity = 0, .value = 0x7fff_ffff, .text = "0x7fff_ffff" } },
+    .{ .prim = .i32, .entry = .{ .name = "MAX", .arity = 0, .value = 0x7fff_ffff, .text = "0x7fff_ffff" } },
+    .{ .prim = .i32, .entry = .{ .name = "min_value", .arity = 0, .value = -0x8000_0000, .text = "-0x8000_0000" } },
+    .{ .prim = .i32, .entry = .{ .name = "MIN", .arity = 0, .value = -0x8000_0000, .text = "-0x8000_0000" } },
+    .{ .prim = .i32, .entry = .{ .name = "BITS", .arity = 0, .value = 32, .text = "32" } },
+    .{ .prim = .i64, .entry = .{ .name = "max_value", .arity = 0, .value = 0x7fff_ffff_ffff_ffff, .text = "0x7fff_ffff_ffff_ffff" } },
+    .{ .prim = .i64, .entry = .{ .name = "MAX", .arity = 0, .value = 0x7fff_ffff_ffff_ffff, .text = "0x7fff_ffff_ffff_ffff" } },
+    .{ .prim = .i64, .entry = .{ .name = "min_value", .arity = 0, .value = std.math.minInt(i64), .text = "-0x8000_0000_0000_0000" } },
+    .{ .prim = .i64, .entry = .{ .name = "MIN", .arity = 0, .value = std.math.minInt(i64), .text = "-0x8000_0000_0000_0000" } },
+    .{ .prim = .i64, .entry = .{ .name = "BITS", .arity = 0, .value = 64, .text = "64" } },
+    .{ .prim = .i128, .entry = .{ .name = "max_value", .arity = 0, .value = std.math.maxInt(i128), .text = "0x7fff_ffff_ffff_ffff_ffff_ffff_ffff_ffff" } },
+    .{ .prim = .i128, .entry = .{ .name = "MAX", .arity = 0, .value = std.math.maxInt(i128), .text = "0x7fff_ffff_ffff_ffff_ffff_ffff_ffff_ffff" } },
+    .{ .prim = .i128, .entry = .{ .name = "min_value", .arity = 0, .value = std.math.minInt(i128), .text = "-0x8000_0000_0000_0000_0000_0000_0000_0000" } },
+    .{ .prim = .i128, .entry = .{ .name = "MIN", .arity = 0, .value = std.math.minInt(i128), .text = "-0x8000_0000_0000_0000_0000_0000_0000_0000" } },
+    .{ .prim = .i128, .entry = .{ .name = "BITS", .arity = 0, .value = 128, .text = "128" } },
+    .{ .prim = .u128, .entry = .{ .name = "min_value", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u128, .entry = .{ .name = "MIN", .arity = 0, .value = 0, .text = "0" } },
+    .{ .prim = .u128, .entry = .{ .name = "BITS", .arity = 0, .value = 128, .text = "128" } },
+};
+
+/// `u64::max_value()` / `i8::MIN` / `u32::BITS`, as a literal of the named
+/// primitive, or null when the path is not one of this table's entries.
+fn primitiveAssocConstTarget(raw: []const u8) ?struct { prim: types.Prim, entry: PrimitiveAssocConst } {
+    const separator = std.mem.indexOf(u8, raw, "::") orelse return null;
+    if (std.mem.lastIndexOf(u8, raw, "::").? != separator) return null;
+    const base_name = std.mem.trim(u8, raw[0..separator], " \t\r\n");
+    const const_name = std.mem.trim(u8, raw[separator + 2 ..], " \t\r\n");
+    const primitive = mapPrim(base_name) orelse return null;
+    if ((primitive == .usize or primitive == .isize or primitive == .u128) and
+        (std.mem.eql(u8, const_name, "MAX") or std.mem.eql(u8, const_name, "MIN") or
+            std.mem.eql(u8, const_name, "BITS") or std.mem.eql(u8, const_name, "max_value") or
+            std.mem.eql(u8, const_name, "min_value")))
+    {
+        return .{ .prim = primitive, .entry = .{
+            .name = const_name,
+            .arity = 0,
+            .value = 0,
+            .text = "0",
+        } };
+    }
+    for (primitive_assoc_consts) |candidate| {
+        if (candidate.prim != primitive) continue;
+        if (!std.mem.eql(u8, candidate.entry.name, const_name)) continue;
+        return .{ .prim = candidate.prim, .entry = candidate.entry };
+    }
+    return null;
+}
+
+fn appendPrimitiveAssocConst(
+    e: *Ext,
+    prim: types.Prim,
+    entry: PrimitiveAssocConst,
+    args: []const exprs.NodeId,
+) anyerror!exprs.NodeId {
+    defer e.ctx.alloc.free(args);
+    if (args.len != entry.arity) return unsupported(e, "primitive associated const call");
+    if (prim == .usize or prim == .isize or prim == .u128) {
+        return appendTargetIntegerConstant(e, prim, entry.name);
+    }
+    const suffix = if (std.mem.eql(u8, entry.name, "BITS")) "u32" else @tagName(prim);
+    const literal = try appendExpr(e, .{ .literal = .{ .int = .{
+        .text = try e.ctx.alloc.dupe(u8, entry.text),
+        .value = entry.value,
+        .base = .hex,
+        .ty_suffix = try e.ctx.alloc.dupe(u8, suffix),
+    } } });
+    e.ctx.exprs.items[literal].ty = try appendType(e, .{ .prim = if (std.mem.eql(u8, entry.name, "BITS")) .u32 else prim });
+    return literal;
+}
+
+fn typedIntegerLiteral(e: *Ext, prim: types.Prim, value: i128) anyerror!exprs.NodeId {
+    const id = try appendExpr(e, .{ .literal = .{ .int = .{
+        .text = try std.fmt.allocPrint(e.ctx.alloc, "{d}", .{value}),
+        .value = value,
+        .base = .dec,
+        .ty_suffix = @tagName(prim),
+    } } });
+    e.ctx.exprs.items[id].ty = try appendType(e, .{ .prim = prim });
+    return id;
+}
+
+fn typedIntegerBinary(e: *Ext, prim: types.Prim, op: exprs.BinaryOp, lhs: exprs.NodeId, rhs: exprs.NodeId) anyerror!exprs.NodeId {
+    const id = try appendExpr(e, .{ .binary = .{
+        .op = op,
+        .overflow = .wrapping,
+        .lhs = lhs,
+        .rhs = rhs,
+    } });
+    e.ctx.exprs.items[id].ty = try appendType(e, .{ .prim = prim });
+    return id;
+}
+
+fn typedIntegerNot(e: *Ext, prim: types.Prim, operand: exprs.NodeId) anyerror!exprs.NodeId {
+    const id = try appendExpr(e, .{ .unary = .{ .op = .bit_not, .operand = operand } });
+    e.ctx.exprs.items[id].ty = try appendType(e, .{ .prim = prim });
+    return id;
+}
+
+/// Target pointer widths are computed in the emitted program. In particular
+/// u128::MAX never passes through the IR's signed i128 literal payload.
+fn appendTargetIntegerConstant(e: *Ext, prim: types.Prim, name: []const u8) anyerror!exprs.NodeId {
+    const is_bits = std.mem.eql(u8, name, "BITS");
+    const is_min = std.mem.eql(u8, name, "MIN") or std.mem.eql(u8, name, "min_value");
+    if (prim == .u128 and is_bits) return typedIntegerLiteral(e, .u32, 128);
+    if (prim != .isize and !is_bits) {
+        const zero = try typedIntegerLiteral(e, prim, 0);
+        return if (is_min) zero else typedIntegerNot(e, prim, zero);
+    }
+    const bytes = try appendMemSizeOf(e, prim);
+    const bits = try typedIntegerBinary(e, .usize, .mul, bytes, try typedIntegerLiteral(e, .usize, 8));
+    if (is_bits) {
+        const target = (try appendType(e, .{ .prim = .u32 })) orelse unreachable;
+        const cast = try appendExpr(e, .{ .cast = .{
+            .kind = .as_,
+            .operand = bits,
+            .source_type = .{ .prim = .usize },
+            .target = target,
+        } });
+        e.ctx.exprs.items[cast].ty = target;
+        return cast;
+    }
+    const shift = try typedIntegerBinary(e, .usize, .sub, bits, try typedIntegerLiteral(e, .usize, 1));
+    const minus_one = try typedIntegerNot(e, prim, try typedIntegerLiteral(e, prim, 0));
+    const minimum = try typedIntegerBinary(e, prim, .shl, minus_one, shift);
+    return if (is_min) minimum else typedIntegerNot(e, prim, minimum);
 }
 
 fn appendPrimitiveTryFrom(
@@ -4907,7 +6760,7 @@ fn lowerReferenceExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
 const PrimitiveAssociatedConstant = struct {
     primitive: types.Prim,
-    value: i128,
+    name: []const u8,
 };
 
 fn primitiveAssociatedConstant(raw: []const u8) ?PrimitiveAssociatedConstant {
@@ -4929,36 +6782,20 @@ fn primitiveAssociatedConstant(raw: []const u8) ?PrimitiveAssociatedConstant {
         return null;
     }
     const primitive = mapPrim(segments[count - 2]) orelse return null;
-    const is_max = std.mem.eql(u8, segments[count - 1], "MAX");
-    const is_min = std.mem.eql(u8, segments[count - 1], "MIN");
-    if (!is_max and !is_min) return null;
-    const value: i128 = switch (primitive) {
-        .i8 => if (is_max) std.math.maxInt(i8) else std.math.minInt(i8),
-        .i16 => if (is_max) std.math.maxInt(i16) else std.math.minInt(i16),
-        .i32 => if (is_max) std.math.maxInt(i32) else std.math.minInt(i32),
-        .i64 => if (is_max) std.math.maxInt(i64) else std.math.minInt(i64),
-        .i128 => if (is_max) std.math.maxInt(i128) else std.math.minInt(i128),
-        .u8 => if (is_max) std.math.maxInt(u8) else 0,
-        .u16 => if (is_max) std.math.maxInt(u16) else 0,
-        .u32 => if (is_max) std.math.maxInt(u32) else 0,
-        .u64 => if (is_max) std.math.maxInt(u64) else 0,
-        .usize => if (is_max) std.math.maxInt(usize) else 0,
-        .u128 => if (is_max) return null else 0,
-        else => return null,
-    };
-    return .{ .primitive = primitive, .value = value };
+    const name = segments[count - 1];
+    if (!std.mem.eql(u8, name, "MAX") and !std.mem.eql(u8, name, "MIN") and
+        !std.mem.eql(u8, name, "BITS")) return null;
+    if (!isIntegerByteWidthKnown(primitive)) return null;
+    return .{ .primitive = primitive, .name = name };
 }
 
 fn lowerPrimitiveAssociatedConstant(e: *Ext, constant: PrimitiveAssociatedConstant) anyerror!exprs.NodeId {
-    return appendExpr(e, .{ .literal = .{ .int = .{
-        .text = try std.fmt.allocPrint(e.ctx.alloc, "{d}{s}", .{
-            constant.value,
-            @tagName(constant.primitive),
-        }),
-        .value = constant.value,
-        .base = .dec,
-        .ty_suffix = @tagName(constant.primitive),
-    } } });
+    if (constant.primitive == .usize or constant.primitive == .isize or constant.primitive == .u128)
+        return appendTargetIntegerConstant(e, constant.primitive, constant.name);
+    const raw = try std.fmt.allocPrint(e.ctx.alloc, "{s}::{s}", .{ @tagName(constant.primitive), constant.name });
+    defer e.ctx.alloc.free(raw);
+    const target = primitiveAssocConstTarget(raw) orelse return error.MalformedCst;
+    return appendPrimitiveAssocConst(e, target.prim, target.entry, try e.ctx.alloc.alloc(exprs.NodeId, 0));
 }
 fn lowerPathValue(e: *Ext, def: spine.EntityId) anyerror!exprs.NodeId {
     const entity = e.ctx.g.symbol_table.get(def) orelse return error.MalformedCst;
@@ -4997,6 +6834,15 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
         if (def) |resolved| {
             return lowerPathValue(e, resolved);
+        }
+        // A unit struct is spelled as a bare name in value position, so
+        // `_marker: PhantomData` arrives here with no binding of that name in
+        // scope: the `use` that introduced it binds a TYPE, not a value. Last,
+        // because it is the widest of these — every branch above resolves a
+        // real local entity first, so this only ever sees a name nothing in
+        // this crate claims.
+        if (try lowerExternalUnitStructPath(e, nm)) |unit_struct| {
+            return unit_struct;
         }
         return unsupported(e, "unresolved identifier");
     }
@@ -5093,14 +6939,19 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         if (try lowerExternalEnumVariantPath(e, node)) |external_variant| {
             return external_variant;
         }
+        // A standard-library unit struct, reached by its full path where the
+        // `use` spelling above would have reached the same entity by name.
+        if (try lowerExternalUnitStructPath(e, text(e, node))) |unit_struct| {
+            return unit_struct;
+        }
         return unsupported(e, "unresolved scoped path");
     }
     if (std.mem.eql(u8, kind, "mutable_specifier")) return error.MalformedCst;
 
     // Binary / compound assignments.
     if (std.mem.eql(u8, kind, "binary_expression")) {
-        const lhs = node.namedChild(0);
-        const rhs = node.namedChild(if (node.namedChildCount() > 2) 2 else 1);
+        const lhs = firstValueChild(node);
+        const rhs = lastValueChild(node);
         if (lhs == null or rhs == null) return error.MalformedCst;
         const op_txt = opOf(e, node);
         const bop = mapBinaryOp(op_txt) orelse return unsupported(e, "binary op");
@@ -5142,8 +6993,8 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     // Field / index access.
     if (std.mem.eql(u8, kind, "field_expression")) {
-        const base = node.namedChild(0);
-        const field = node.namedChild(1);
+        const base = valueChild(node, 0);
+        const field = valueChild(node, 1);
         if (base == null) return error.MalformedCst;
         var fname = if (field) |field_node| text(e, field_node) else "";
         if (fname.len == 0) {
@@ -5170,8 +7021,8 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         } });
     }
     if (std.mem.eql(u8, kind, "index_expression")) {
-        const base = node.namedChild(0);
-        const idx = node.namedChild(1);
+        const base = valueChild(node, 0);
+        const idx = valueChild(node, 1);
         if (base == null or idx == null) return error.MalformedCst;
         return appendExpr(e, .{ .index = .{
             .base = try lowerExpr(e, base.?),
@@ -5249,6 +7100,7 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         var val: ?exprs.NodeId = null;
         var i: u32 = 0;
         while (node.namedChild(i)) |c| : (i += 1) {
+            if (isBlockTrivia(c)) continue;
             if (!std.mem.eql(u8, c.kind(), "return")) {
                 val = try lowerExpr(e, c);
                 break;
@@ -5257,10 +7109,7 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return appendExpr(e, .{ .return_ = .{ .value = val } });
     }
     if (std.mem.eql(u8, kind, "unary_expression")) {
-        const operand = if (node.namedChildCount() > 0)
-            node.namedChild(node.namedChildCount() - 1)
-        else
-            null;
+        const operand = lastValueChild(node);
         if (operand == null) return error.MalformedCst;
         const operator = opOf(e, node);
         const operand_id = try lowerExpr(e, operand.?);
@@ -5306,11 +7155,11 @@ fn lowerExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         return tuple_id;
     }
     if (std.mem.eql(u8, kind, "parenthesized_expression")) {
-        if (node.namedChildCount() > 0) return lowerExpr(e, node.namedChild(0).?);
-        return error.MalformedCst;
+        return lowerExpr(e, firstValueChild(node) orelse return error.MalformedCst);
     }
     if (std.mem.eql(u8, kind, "try_expression")) {
-        const inner_node = node.namedChild(0) orelse node.childByFieldName("expression") orelse return error.MalformedCst;
+        const inner_node = firstValueChild(node) orelse
+            node.childByFieldName("expression") orelse return error.MalformedCst;
         const inner_id = try lowerExpr(e, inner_node);
         return appendExpr(e, .{ .try_ = .{ .inner = inner_id } });
     }
@@ -5357,9 +7206,37 @@ fn parseIntLiteral(raw: []const u8) ?ParsedIntLiteral {
     if (body.len > 2 and body[0] == '0' and (body[1] == 'b' or body[1] == 'B')) base = 2;
     if (body.len > 2 and body[0] == '0' and (body[1] == 'o' or body[1] == 'O')) base = 8;
     const untrimmed_digits = if (base == 10) body else body[2..];
-    const digits = std.mem.trimEnd(u8, untrimmed_digits, "_");
-    if (digits.len == 0) return null;
-    const value = std.fmt.parseInt(i128, digits, base) catch return null;
+    // Rust writes `_` between digits, and `std.fmt.parseInt` has no rule for
+    // it at all: every one of them makes the parse fail. `trimEnd` alone —
+    // which is all this did — therefore turned `0x_07_06_05_04_03_02_01_00`
+    // into a refusal named "integer literal out of range" for a value that is
+    // neither out of range nor unreadable. The separator was the whole of the
+    // problem, so it is skipped here instead.
+    //
+    // Skipping EVERY `_` is the rule rustc's own lexer applies, and `syn`
+    // pins it: `syn/tests/test_lit.rs:220` reads `5_____0_____` as `50` and
+    // line 228 reads `0x__7___f_` as `127`. A rule that only tolerated one
+    // separator between digits would be stricter than the language it reads.
+    // The base prefix is consumed above, so `0x_ff` and `0xff` arrive here as
+    // the same digits.
+    const radix: i128 = base;
+    var value: i128 = 0;
+    var saw_digit = false;
+    for (untrimmed_digits) |character| {
+        if (character == '_') continue;
+        const digit: i128 = switch (character) {
+            '0'...'9' => character - '0',
+            'a'...'f' => character - 'a' + 10,
+            'A'...'F' => character - 'A' + 10,
+            else => return null,
+        };
+        if (digit >= radix) return null;
+        if (saw_digit) value = std.math.mul(i128, value, radix) catch return null;
+        value = std.math.add(i128, value, digit) catch return null;
+        saw_digit = true;
+    }
+    // Separators are not digits: a literal made only of them names no value.
+    if (!saw_digit) return null;
     return .{
         .body = body,
         .value = value,
@@ -5377,7 +7254,72 @@ test "Rust integer suffixes preserve separated and hexadecimal values" {
     try std.testing.expectEqualStrings("u8", hexadecimal.ty_suffix.?);
 }
 
-fn parseVecRepeatCount(raw: []const u8) ?usize {
+// Rust's `_` digit separator, which `std.fmt.parseInt` cannot read.
+//
+// `siphasher` writes both of its vector-table keys this way
+// (`src/tests.rs:127-128`, `src/tests128.rs:50-51`, and the `2_4` twins), and
+// every one of them used to come back as an `.unsupported` node whose reason
+// blamed the value's RANGE. The range was never the problem, so the refusal
+// named an obstacle the source did not contain.
+test "Rust digit separators fold into the literal's value" {
+    // `0x_07_06_05_04_03_02_01_00` — a separator straight after the base
+    // prefix and one between every pair of digits.
+    const key0 = parseIntLiteral("0x_07_06_05_04_03_02_01_00") orelse
+        return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 506097522914230528), key0.value);
+    try std.testing.expectEqual(@as(u8, 16), key0.base);
+
+    // `0x_0f_0e_0d_0c_0b_0a_09_08` — the same spelling over a value whose top
+    // nibble is not zero, so a fold that dropped digits would still look
+    // plausible here if it did not compare against the exact number.
+    const key1 = parseIntLiteral("0x_0f_0e_0d_0c_0b_0a_09_08") orelse
+        return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 1084818905618843912), key1.value);
+    try std.testing.expectEqual(@as(u8, 16), key1.base);
+
+    // The decimal spelling with an interior separator, which is the same
+    // defect in the base `std.fmt.parseInt` handled by default.
+    const separated = parseIntLiteral("1_000_000") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 1000000), separated.value);
+    try std.testing.expectEqual(@as(u8, 10), separated.base);
+
+    // A suffix still binds after the separators are folded away.
+    const suffixed = parseIntLiteral("0x_ff_u8") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 255), suffixed.value);
+    try std.testing.expectEqualStrings("u8", suffixed.ty_suffix.?);
+
+    // The spellings `syn`'s own lexer tests pin: it reads a RUN of separators
+    // as one, at either end of the digit string as well as between digits, and
+    // a suffix still binds after them. A fold that stopped at the first
+    // separator, or that rejected a doubled one, would disagree with the
+    // parser this repository already treats as the reference for literal
+    // syntax.
+    const doubled = parseIntLiteral("5_____0_____") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 50), doubled.value);
+    const prefix_run = parseIntLiteral("0x__7___f_") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 127), prefix_run.value);
+    const suffixed_run = parseIntLiteral("0x_7F__u8") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 127), suffixed_run.value);
+    try std.testing.expectEqualStrings("u8", suffixed_run.ty_suffix.?);
+    const binary = parseIntLiteral("0b_1_0__01") orelse return error.LiteralRejected;
+    try std.testing.expectEqual(@as(i128, 9), binary.value);
+    try std.testing.expectEqual(@as(u8, 2), binary.base);
+
+    // What is still refused: a spelling with no digit in it at all, and one
+    // carrying a digit the base cannot express. A separator is not a digit, so
+    // `0x_` and `___` name no value; `0b_2` and `0xffg` do not name one either.
+    for ([_][]const u8{ "", "_", "___", "0x_", "0b_2", "0xffg" }) |spelling| {
+        if (parseIntLiteral(spelling) != null) return error.InvalidLiteralAccepted;
+    }
+}
+
+/// Read the `[e; N]` / `vec![e; N]` count a Rust source spells out.
+///
+/// `N` is a number the generated 64-bit program states, so the parse is
+/// `u64`-wide and overflows at `u64::MAX` no matter how wide the translator
+/// host's pointers are. Null means "not a source constant this parser can
+/// fold", which callers turn into their own refusal.
+fn parseVecRepeatCount(raw: []const u8) ?u64 {
     const trimmed_literal = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed_literal.len == 0) return null;
 
@@ -5393,7 +7335,7 @@ fn parseVecRepeatCount(raw: []const u8) ?usize {
         }
     }
 
-    var base: usize = 10;
+    var base: u64 = 10;
     var digits = literal;
     var has_base_prefix = false;
     if (literal.len >= 2 and literal[0] == '0') {
@@ -5421,7 +7363,7 @@ fn parseVecRepeatCount(raw: []const u8) ?usize {
     }
     if (digits.len == 0) return null;
 
-    var value: usize = 0;
+    var value: u64 = 0;
     var saw_digit = false;
     var previous_separator = false;
     for (digits, 0..) |character, index| {
@@ -5431,14 +7373,14 @@ fn parseVecRepeatCount(raw: []const u8) ?usize {
             continue;
         }
 
-        const digit: usize = switch (character) {
+        const digit: u64 = switch (character) {
             '0'...'9' => character - '0',
             'a'...'f' => character - 'a' + 10,
             'A'...'F' => character - 'A' + 10,
             else => return null,
         };
         if (digit >= base) return null;
-        if (value > (std.math.maxInt(usize) - digit) / base) return null;
+        if (value > (std.math.maxInt(u64) - digit) / base) return null;
         value = value * base + digit;
         saw_digit = true;
         previous_separator = false;
@@ -5448,38 +7390,85 @@ fn parseVecRepeatCount(raw: []const u8) ?usize {
     return value;
 }
 
-fn checkedArrayLenBinary(op: exprs.BinaryOp, lhs: usize, rhs: usize) ?usize {
+/// Fold one binary step of a source-written array length.
+///
+/// The operands are target counts, so every bound here is `u64`: a shift by
+/// 32 is a legal `[e; 1 << 32]` whether or not the translator's own pointers
+/// are 32 bits wide, and a step that would leave the `u64` count range is
+/// simply not foldable.
+fn checkedArrayLenBinary(op: exprs.BinaryOp, lhs: u64, rhs: u64) ?u64 {
     return switch (op) {
-        .add => std.math.add(usize, lhs, rhs) catch null,
-        .sub => std.math.sub(usize, lhs, rhs) catch null,
-        .mul => std.math.mul(usize, lhs, rhs) catch null,
+        .add => std.math.add(u64, lhs, rhs) catch null,
+        .sub => std.math.sub(u64, lhs, rhs) catch null,
+        .mul => std.math.mul(u64, lhs, rhs) catch null,
         .div => if (rhs == 0) null else lhs / rhs,
         .rem => if (rhs == 0) null else lhs % rhs,
         .bit_and => lhs & rhs,
         .bit_or => lhs | rhs,
         .bit_xor => lhs ^ rhs,
         .shl => blk: {
-            if (rhs >= @bitSizeOf(usize)) break :blk null;
-            const shift: std.math.Log2Int(usize) = @intCast(rhs);
-            if (lhs > (@as(usize, std.math.maxInt(usize)) >> shift)) break :blk null;
+            if (rhs >= @bitSizeOf(u64)) break :blk null;
+            const shift: std.math.Log2Int(u64) = @intCast(rhs);
+            if (lhs > (@as(u64, std.math.maxInt(u64)) >> shift)) break :blk null;
             break :blk lhs << shift;
         },
         .shr => blk: {
-            if (rhs >= @bitSizeOf(usize)) break :blk null;
-            break :blk lhs >> @as(std.math.Log2Int(usize), @intCast(rhs));
+            if (rhs >= @bitSizeOf(u64)) break :blk null;
+            break :blk lhs >> @as(std.math.Log2Int(u64), @intCast(rhs));
         },
         else => null,
     };
 }
 
-fn constArrayLenFromExpr(e: *const Ext, node_id: exprs.NodeId, remaining: usize) ?usize {
+// A count is metadata about the translated program, so every bound here is
+// `u64` rather than the translator host's pointer width: a 32-bit host used to
+// refuse `4294967296` outright and to reject the `1 << 32` shift that names it.
+test "array and vec repeat counts fold across the whole u64 range" {
+    const foldable = [_]struct {
+        token: []const u8,
+        count: u64,
+    }{
+        .{ .token = "4294967296", .count = 4294967296 },
+        .{ .token = "4294967296_usize", .count = 4294967296 },
+        .{ .token = "0x1_0000_0000", .count = 4294967296 },
+        .{ .token = "18446744073709551615", .count = std.math.maxInt(u64) },
+    };
+    for (foldable) |case| {
+        try std.testing.expectEqual(
+            case.count,
+            parseVecRepeatCount(case.token) orelse return error.CountRejected,
+        );
+    }
+    // One past the widest count is not a count, not a wrapped zero.
+    try std.testing.expect(parseVecRepeatCount("18446744073709551616") == null);
+
+    try std.testing.expectEqual(
+        @as(u64, 1 << 32),
+        checkedArrayLenBinary(.shl, 1, 32) orelse return error.CountRejected,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 4294967296),
+        checkedArrayLenBinary(.mul, 65536, 65536) orelse return error.CountRejected,
+    );
+    // A shift by the count's own width, and any step past `u64`, is a step
+    // this folder cannot fold; it never produces a narrowed answer.
+    try std.testing.expect(checkedArrayLenBinary(.shl, 1, 64) == null);
+    try std.testing.expect(checkedArrayLenBinary(.mul, 4294967296, 4294967296) == null);
+    try std.testing.expect(checkedArrayLenBinary(.add, std.math.maxInt(u64), 1) == null);
+}
+
+/// The constant value of an already-lowered node used as an array length.
+///
+/// `remaining` bounds the walk; it is host recursion fuel and stays `usize`.
+/// The value it returns is a target count and is `u64` throughout.
+fn constArrayLenFromExpr(e: *const Ext, node_id: exprs.NodeId, remaining: usize) ?u64 {
     if (remaining == 0 or node_id >= e.ctx.exprs.items.len) return null;
     return switch (e.ctx.exprs.items[node_id].kind) {
         .literal => |literal| switch (literal) {
             .int => |integer| blk: {
                 if (integer.value < 0) break :blk null;
-                const max_usize: i128 = @intCast(std.math.maxInt(usize));
-                if (integer.value > max_usize) break :blk null;
+                const max_count: i128 = @intCast(std.math.maxInt(u64));
+                if (integer.value > max_count) break :blk null;
                 break :blk @intCast(integer.value);
             },
             else => null,
@@ -5502,7 +7491,12 @@ fn constArrayLenFromExpr(e: *const Ext, node_id: exprs.NodeId, remaining: usize)
     };
 }
 
-fn constArrayLenFromCst(e: *const Ext, node: ts.Node, remaining: usize) ?usize {
+/// The constant length a source `[e; N]` spells out, before it is lowered.
+///
+/// `remaining` bounds the walk; it is host recursion fuel and stays `usize`.
+/// The length it returns is a target count and is `u64` throughout, so a
+/// 64-bit target's `[e; 4294967296]` folds the same way on a 32-bit host.
+fn constArrayLenFromCst(e: *const Ext, node: ts.Node, remaining: usize) ?u64 {
     if (remaining == 0) return null;
     const kind = node.kind();
     if (std.mem.eql(u8, kind, "integer_literal")) {
@@ -5546,48 +7540,162 @@ fn constArrayLenFromCst(e: *const Ext, node: ts.Node, remaining: usize) ?usize {
     return null;
 }
 
-fn sourceDeterminedExprType(e: *const Ext, node_id: exprs.NodeId) ?types.Type {
+/// The type `b"..."` is: `&'static [u8; N]`.
+///
+/// Both halves belong to the literal itself. The element is a byte, and the
+/// length is the number of bytes the source wrote, so there is nothing here for
+/// a surrounding constraint to decide — which is why this is asked of the
+/// literal rather than left for the solver. The borrow is part of the type
+/// rather than an inference about the position, the same reading
+/// `resolve_methods.sharedRefType` gives the same literal.
+fn byteStringType(e: *const Ext, len: usize) std.mem.Allocator.Error!?types.Type {
+    const array = try e.ctx.alloc.create(types.Array);
+    errdefer e.ctx.alloc.destroy(array);
+    array.* = .{ .elem = .{ .prim = .u8 }, .len = .{ .literal = @intCast(len) } };
+    const reference = try e.ctx.alloc.create(types.Ref);
+    errdefer e.ctx.alloc.destroy(reference);
+    reference.* = .{ .mut = false, .pointee = .{ .array = array } };
+    return .{ .reference = reference };
+}
+
+fn sourceDeterminedExprType(e: *const Ext, node_id: exprs.NodeId) std.mem.Allocator.Error!?types.Type {
     if (node_id >= e.ctx.exprs.items.len) return null;
     const expression = e.ctx.exprs.items[node_id];
+    // A published row is an answer only where the row is one. The `_`
+    // placeholder is the type table's stand-in for a Rust `_`, and every other
+    // reader of this chain refuses it before taking it for a decision:
+    // `declaredPeerType`, `pinKnownType`, `setKnownType`, `isUnnamedElement`
+    // and `containerAlreadyNamed` all read it as "nothing has been said here".
+    // Handing it back as an answer made a slot nothing had decided look
+    // decided, and a row holding one is a row `validate` refuses — including
+    // the nested case, where the placeholder row is a whole sub-row nothing
+    // can complete: `refineSourceTupleRow` writes only the elements it reads.
     if (expression.ty) |type_id| {
-        if (type_id < e.ctx.types.items.len) return e.ctx.types.items[type_id];
+        if (type_id < e.ctx.types.items.len) {
+            const published = e.ctx.types.items[type_id];
+            if (!infer.isInferPlaceholderType(published)) return published;
+        }
     }
     switch (expression.kind) {
         .literal => |literal| return switch (literal) {
-            .int => |integer| if (integer.ty_suffix != null)
-                knownCastOperandType(e, node_id)
-            else
-                null,
-            .float => |float| if (std.mem.endsWith(u8, float.text, "f32") or
-                std.mem.endsWith(u8, float.text, "f64"))
-                knownCastOperandType(e, node_id)
-            else
-                null,
+            .int => |integer| if (integer.ty_suffix != null) knownCastOperandType(e, node_id) else null,
+            .float => |float| if (std.mem.endsWith(u8, float.text, "f32") or std.mem.endsWith(u8, float.text, "f64")) knownCastOperandType(e, node_id) else null,
             .boolean => .{ .prim = .bool },
             .character => .{ .prim = .char },
-            else => null,
+            .string => knownCastOperandType(e, node_id),
+            // `"..."` answers `&str` just above and `b"..."` answers its own
+            // bytes here. Falling through to a refusal made the whole literal
+            // a hole: a byte string in a tuple or array literal position left
+            // `unattributedType` — the `_` placeholder — in that row, and the
+            // row is what `validate` reads, so a value the source fully
+            // determined was refused for a slot nothing was left to fill.
+            .byte_array => |bytes| byteStringType(e, bytes.items.len),
         },
+        .unary => |unary| {
+            const operand = (try sourceDeterminedExprType(e, unary.operand)) orelse return null;
+            return switch (unary.op) {
+                .ref => |mode| blk: {
+                    const reference = try e.ctx.alloc.create(types.Ref);
+                    reference.* = .{ .mut = mode == .mutable, .pointee = operand };
+                    break :blk .{ .reference = reference };
+                },
+                .deref => switch (operand) {
+                    .reference => |reference| reference.pointee,
+                    .raw_ptr => |pointer| pointer.pointee,
+                    else => null,
+                },
+                .negate, .bit_not, .logical_not => operand,
+            };
+        },
+        .index => |index| {
+            const base = (try sourceDeterminedExprType(e, index.base)) orelse return null;
+            if (index.index >= e.ctx.exprs.items.len or e.ctx.exprs.items[index.index].kind != .range) return indexedElementType(base);
+            var sequence = base;
+            for (0..128) |_| {
+                switch (sequence) {
+                    .reference => |reference| sequence = reference.pointee,
+                    .boxed => |boxed| sequence = boxed.*,
+                    else => break,
+                }
+            }
+            const element = indexedElementType(sequence) orelse return null;
+            const view = try e.ctx.alloc.create(types.Slice);
+            view.* = .{ .const_ = if (sequence == .slice) sequence.slice.const_ else true, .elem = element };
+            return .{ .slice = view };
+        },
+        // A constructor IS a value of the enum that declares it, and that is
+        // written in the source: `Sign::Plus` says `Sign` before inference
+        // runs. `knownCastOperandType` has no arm for a variant at all, so the
+        // `.else` below answered null and `attachKnownTupleType` put
+        // `unattributedType` — the `_` placeholder — into a slot the source had
+        // already decided, and a row is what `validate` reads whether or not an
+        // expression still points at it.
+        .enum_variant => |variant| return sourceDeterminedVariantType(e, variant),
         else => return knownCastOperandType(e, node_id),
     }
 }
 
+/// What an enum-constructor expression IS, read off the declaration it names.
+///
+/// This is the extraction-time half of what the inference pass answers for the
+/// same node — `knownSourceEnumVariantType` for a crate's own enum,
+/// `preludeVariantType` for the prelude's — and it keeps that pass's refusal.
+/// An enum that declares type parameters has no identity until a position picks
+/// the arguments: `Some(v)` is `Option<T>` and `None` is `Option<T>` with `T`
+/// still the enum's own parameter, so neither answers anything here and the
+/// slot stays a question for the constraint around it. That is exactly what a
+/// `None` needs, because it carries no payload to read a type out of.
+fn sourceDeterminedVariantType(
+    e: *const Ext,
+    variant: exprs.EnumVariant,
+) std.mem.Allocator.Error!?types.Type {
+    if (variant.def >= e.ctx.bodies_list.items.len) return null;
+    const owner = switch (e.ctx.bodies_list.items[variant.def]) {
+        .enum_ => |body| body,
+        else => return null,
+    };
+    if (owner.generic_params.len != 0) return null;
+    const entity = e.ctx.g.symbol_table.get(variant.def) orelse return null;
+    if (entity.name.len == 0) return null;
+    // A row that already names this declaration is the one the solver would
+    // find, spelling and all; minting a second, shorter path beside it would
+    // lock a different identity into a row nothing may overwrite afterwards.
+    for (e.ctx.types.items) |candidate| {
+        const path = switch (candidate) {
+            .path => |value| value,
+            else => continue,
+        };
+        if (path.segments.len == 0) continue;
+        if (path.segments[path.segments.len - 1].id == variant.def) return candidate;
+    }
+    const segments = try e.ctx.alloc.alloc(types.PathSegment, 1);
+    segments[0] = .{ .name = entity.name, .id = variant.def };
+    return .{ .path = .{ .segments = segments } };
+}
+
+/// Give an array literal the `[T; N]` type its elements and length name.
+///
+/// `len` is a target count. For the repeating form it is the source-written
+/// `[e; N]` count, which is `u64` because the array it describes belongs to a
+/// 64-bit target; for the explicit list form it is `elements.len`, the real
+/// number of nodes just lowered, widened from `usize`.
 fn attachKnownArrayType(
     e: *Ext,
     array_id: exprs.NodeId,
     elements: []const exprs.NodeId,
-    len: usize,
+    len: u64,
 ) !void {
     if (elements.len == 0) return;
-    const element_type = sourceDeterminedExprType(e, elements[0]) orelse return;
+    const element_type = (try sourceDeterminedExprType(e, elements[0])) orelse return;
     for (elements[1..]) |element| {
-        const candidate = sourceDeterminedExprType(e, element) orelse return;
+        const candidate = (try sourceDeterminedExprType(e, element)) orelse return;
         if (!infer.typeEqual(element_type, candidate)) return;
     }
     const array_type = try e.ctx.alloc.create(types.Array);
     errdefer e.ctx.alloc.destroy(array_type);
     array_type.* = .{
         .elem = element_type,
-        .len = .{ .literal = @intCast(len) },
+        .len = .{ .literal = len },
     };
     const aggregate: types.Type = .{ .array = array_type };
     if (!isConcreteDeclaredReturnType(aggregate)) return;
@@ -5610,9 +7718,12 @@ fn attachKnownTupleType(
     const tuple_types = try e.ctx.alloc.alloc(types.Type, elements.len);
     errdefer e.ctx.alloc.free(tuple_types);
     for (elements, 0..) |element, index| {
-        tuple_types[index] = sourceDeterminedExprType(e, element) orelse .{
-            .unsupported = .{ .reason = .cfg_gated, .message = "_", .span = span_of },
-        };
+        // A slot the source named — a generic parameter, a local's type, a
+        // suffixed literal — is a decision and stands as written. A slot
+        // nothing has typed yet is a hole, and the inference placeholder is
+        // what a hole looks like in this table.
+        tuple_types[index] = (try sourceDeterminedExprType(e, element)) orelse
+            try unattributedType(e);
     }
     const aggregate: types.Type = .{ .tuple = tuple_types };
     // Partial tuple rows belong to this literal. The solver fills their
@@ -5629,11 +7740,27 @@ fn attachKnownTupleType(
     e.ctx.exprs.items[tuple_id].ty = type_id;
 }
 
+/// The type of a construct nothing has attributed a type to yet.
+///
+/// This is the entry a written `_` lowers to, and solving rewrites it once the
+/// constraints around it name a type. An `unsupported` entry is not that: it is
+/// a terminal refusal, and a type row stays in the table whether or not any
+/// expression still points at it, so one refused element condemned the whole
+/// row before the inference that would have filled it had run.
+fn unattributedType(e: *Ext) std.mem.Allocator.Error!types.Type {
+    const path = try e.ctx.alloc.alloc([]const u8, 1);
+    path[0] = "_";
+    return .{ .external_nominal = .{ .path = path, .args = &.{} } };
+}
+
 fn lowerArrayExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     if (node.childByFieldName("length")) |length_node| {
         const element_node = node.childByFieldName("element") orelse
             node.childByFieldName("value") orelse
-            node.namedChild(0) orelse return error.MalformedCst;
+            firstValueChild(node) orelse return error.MalformedCst;
+        // The fold is `u64`-wide, so `[e; 4294967296]` is a count rather than
+        // a refusal on any host. The recursion bound is symbol and expression
+        // cardinality, so it stays host-sized.
         const repeat = constArrayLenFromCst(
             e,
             length_node,
@@ -5662,7 +7789,7 @@ fn lowerArrayExpression(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         .elements = owned_elements,
         .repeat = null,
     } });
-    try attachKnownArrayType(e, array_id, owned_elements, owned_elements.len);
+    try attachKnownArrayType(e, array_id, owned_elements, @intCast(owned_elements.len));
     return array_id;
 }
 
@@ -5673,23 +7800,26 @@ fn hexDigit(value: u8) ?u8 {
     return null;
 }
 
-/// Parse the `\u{...}` escape text — backslash through closing brace — into the
-/// scalar value it names.
-///
-/// Null when the text is not that escape, names no digits, or names something
-/// that is not a Unicode scalar value: a surrogate, or a code point past the
-/// end of the range. Rust rejects both at compile time, so neither may become
-/// a byte here either.
+/// Decode a Rust `\u{...}` escape into a Unicode scalar.
+/// Count one to six hex digits; underscore runs follow digits.
+/// Borrows `escape`, allocates nothing, and returns null for an invalid escape.
 fn decodeRustUnicodeEscape(escape: []const u8) ?u32 {
     if (escape.len < 5 or escape[0] != '\\' or escape[1] != 'u' or escape[2] != '{') {
         return null;
     }
     if (escape[escape.len - 1] != '}') return null;
     const digits = escape[3 .. escape.len - 1];
-    if (digits.len == 0 or digits.len > 6) return null;
+    if (digits.len == 0) return null;
     var value: u32 = 0;
+    var counted: usize = 0;
     for (digits) |digit| {
+        if (digit == '_') {
+            if (counted == 0) return null;
+            continue;
+        }
         const nibble = hexDigit(digit) orelse return null;
+        if (counted == 6) return null;
+        counted += 1;
         value = value * 16 + @as(u32, nibble);
     }
     if (!isUnicodeScalar(value)) return null;
@@ -5821,7 +7951,10 @@ fn decodeUtf8Codepoint(bytes: []const u8) ?u32 {
     return value;
 }
 
-fn decodeRustCharCodepoint(raw: []const u8) ?u32 {
+/// Decode a quoted Rust char literal to its Unicode scalar value.
+/// Return null for unsupported or invalid literal syntax.
+/// Borrows raw; allocates nothing.
+pub fn decodeRustCharCodepoint(raw: []const u8) ?u32 {
     if (raw.len < 3 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return null;
     const body = raw[1 .. raw.len - 1];
     if (body.len == 0) return null;
@@ -5909,6 +8042,22 @@ fn decodeRustRawString(allocator: std.mem.Allocator, raw: []const u8) !?[]const 
     return decodeRawBytes(allocator, raw, 1);
 }
 
+fn appendSourceStringLiteral(e: *Ext, bytes: []const u8) !exprs.NodeId {
+    const borrowed_str: types.Ref = .{ .mut = false, .pointee = types.str_type };
+    const candidate: types.Type = .{ .reference = &borrowed_str };
+    const type_id = infer.findTypeIndexInSlice(e.ctx.types.items, candidate) orelse blk: {
+        const reference = try e.ctx.alloc.create(types.Ref);
+        errdefer e.ctx.alloc.destroy(reference);
+        reference.* = borrowed_str;
+        const id: exprs.TypeId = @intCast(e.ctx.types.items.len);
+        try e.ctx.types.append(e.ctx.alloc, .{ .reference = reference });
+        break :blk id;
+    };
+    const node = try appendExpr(e, .{ .literal = .{ .string = .{ .bytes = bytes } } });
+    e.ctx.exprs.items[node].ty = type_id;
+    return node;
+}
+
 fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const raw = text(e, node);
     const kind = node.kind();
@@ -5923,7 +8072,7 @@ fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const raw_string = decodeRustRawString(e.ctx.alloc, raw) catch
         return unsupported(e, "invalid raw string");
     if (raw_string) |raw_body| {
-        return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = raw_body } } });
+        return appendSourceStringLiteral(e, raw_body);
     }
     if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') {
         return unsupported(e, "invalid string literal");
@@ -5936,7 +8085,7 @@ fn lowerStrLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     // of defect one level further on.
     const bytes = decodeEscapedBytes(e.ctx.alloc, raw[1 .. raw.len - 1], true) catch
         return unsupported(e, "unsupported string escape");
-    return appendExpr(e, .{ .literal = .{ .string = .{ .bytes = bytes } } });
+    return appendSourceStringLiteral(e, bytes);
 }
 fn lowerFloatLit(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const t = text(e, node);
@@ -6026,7 +8175,7 @@ fn lowerStructExpr(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 .shorthand = true,
             });
         } else if (std.mem.eql(u8, kind, "base_field_initializer")) {
-            const base_node = child.namedChild(0) orelse return error.MalformedCst;
+            const base_node = firstValueChild(child) orelse return error.MalformedCst;
             base_id = try lowerExpr(e, base_node);
         } else if (isBlockTrivia(child)) {
             continue;
@@ -6298,9 +8447,20 @@ fn lowerPattern(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         const type_node = node.childByFieldName("type") orelse return error.MalformedCst;
         var pat_nodes: std.ArrayListUnmanaged(ts.Node) = .empty;
         defer pat_nodes.deinit(e.ctx.alloc);
+        // Every ITEM of a tuple pattern occupies a position, including the ones
+        // no binding is read from: Rust writes `Variant(_, b)`, and that `_` is
+        // an item. Tree-sitter hides it from `namedChild` — the wildcard is a
+        // hidden rule around one anonymous token, so it inlines into this node
+        // and is not a named child — and a pattern read as `[b]` rather than
+        // `[_ , b]` renumbers `b` onto position 0, where it names the WHOLE
+        // payload instead of the field the source asked for. `child` reports
+        // every child in source order, so the items are walked over it and the
+        // punctuation around them is dropped by kind: `namedChild` never saw
+        // `(` and `,` either, and neither does `child`.
         var i: u32 = 0;
-        while (node.namedChild(i)) |child| : (i += 1) {
+        while (node.child(i)) |child| : (i += 1) {
             if (child.id == type_node.id or isBlockTrivia(child)) continue;
+            if (!child.isNamed() and !std.mem.eql(u8, child.kind(), "_")) continue;
             try pat_nodes.append(e.ctx.alloc, child);
         }
 
@@ -6647,8 +8807,11 @@ fn lowerGenericCallArgs(e: *Ext, node: ts.Node) anyerror![]const types.Type {
 }
 
 /// A declared return type is safe to pin only when every nested component is concrete.
-/// Null-id paths are lexical generic parameters and must remain for inference.
+/// Null-id paths are lexical generic parameters and must remain for inference, and
+/// a placeholder names nothing yet: a row holding one is not a finished type, and
+/// sharing it would couple two literals that each owe the slot their own type.
 fn isConcreteDeclaredReturnType(t: types.Type) bool {
+    if (infer.isInferPlaceholderType(t)) return false;
     return switch (t) {
         .prim => true,
         .path => |path| blk: {
@@ -6735,6 +8898,48 @@ fn appendDeclaredCallReturnType(
     e.ctx.exprs.items[call_id].ty = try appendType(e, fn_body.ret);
 }
 
+/// The type parameters the entity a call names actually declares, or null when
+/// none can be counted.
+///
+/// A `.method_ref` is a call-site reference with no declaration of its own, so
+/// its count is the one the owner it hangs under declares: a trait keeps its
+/// methods in its own body, and any other owner has the matching child.
+fn calleeTypeParamCount(e: *const Ext, def: spine.EntityId) ?usize {
+    if (def >= e.ctx.g.symbol_table.entities.items.len) return null;
+    const entity = e.ctx.g.symbol_table.get(def) orelse return null;
+    if (def < e.ctx.bodies_list.items.len) {
+        switch (e.ctx.bodies_list.items[def]) {
+            .fn_ => |body| return body.generic_params.len,
+            .struct_ => |body| return body.generic_params.len,
+            .enum_ => |body| return body.generic_params.len,
+            else => {},
+        }
+    }
+    if (entity.kind != .method_ref) return null;
+    const owner = entity.parent orelse return null;
+    if (owner >= e.ctx.bodies_list.items.len) return null;
+    switch (e.ctx.bodies_list.items[owner]) {
+        .trait_ => |body| {
+            for (body.methods) |method| {
+                if (std.mem.eql(u8, method.name, entity.name)) return method.generic_params.len;
+            }
+            return null;
+        },
+        else => {
+            for (e.ctx.g.symbol_table.entities.items) |child| {
+                if (child.kind != .fn_ or child.parent == null or child.parent.? != owner) continue;
+                if (!std.mem.eql(u8, child.name, entity.name)) continue;
+                if (child.id >= e.ctx.bodies_list.items.len) return null;
+                return switch (e.ctx.bodies_list.items[child.id]) {
+                    .fn_ => |body| body.generic_params.len,
+                    else => return null,
+                };
+            }
+        },
+    }
+    return null;
+}
+
 fn appendGenericCall(
     e: *Ext,
     call_kind: exprs.CallKind,
@@ -6751,11 +8956,26 @@ fn appendGenericCall(
             .associated => |def| def,
             .constructor => |def| def,
         };
-        const generic_type: types.Type = .{ .generic_inst = .{
-            .decl = generic_decl,
-            .args = .{ .params = generic_args },
-        } };
-        if (isConcreteDeclaredReturnType(generic_type)) {
+        var declared_arguments = true;
+        for (generic_args) |argument| {
+            if (isConcreteDeclaredReturnType(argument)) continue;
+            if (argument == .path and argument.path.segments.len == 1 and
+                argument.path.segments[0].id == null and
+                activeTypeParameter(e, argument.path.segments[0].name)) continue;
+            declared_arguments = false;
+            break;
+        }
+        // A `.generic_inst` fills the type parameters its DECLARATION declares,
+        // so an argument list of a different length is not an instantiation of
+        // that declaration — it is the receiver witness a trait or blanket call
+        // carries (`I::m()` names `I`; `u32::m()` names `u32`), and the callee
+        // declares no parameter for it. Minting the instantiation anyway records
+        // a type the crate never wrote, and `validateTypeContext` rejects it as
+        // the incomplete metadata it is. The declared return, bound to the
+        // receiver it names, is the honest type for the call — which is what
+        // the two arms below publish, in that order.
+        const callee_arity = calleeTypeParamCount(e, generic_decl);
+        if (declared_arguments and callee_arity != null and callee_arity.? == generic_args.len) {
             const owned_args = try e.ctx.alloc.dupe(types.Type, generic_args);
             errdefer e.ctx.alloc.free(owned_args);
             const type_id = (try appendType(e, .{ .generic_inst = .{
@@ -6763,11 +8983,153 @@ fn appendGenericCall(
                 .args = .{ .params = owned_args },
             } })) orelse unreachable;
             e.ctx.exprs.items[id].ty = type_id;
+        } else {
+            try appendDeclaredCallReturnType(e, call_kind, id);
+            try appendReceiverBoundCallReturnType(e, call_kind, generic_decl, id, generic_args);
         }
     } else {
         try appendDeclaredCallReturnType(e, call_kind, id);
     }
     return id;
+}
+
+/// The declared return of a callee whose type parameters belong to the `impl`
+/// it sits in, with the receiver bound to them.
+///
+/// `impl<I> FromRadix10Checked for I { fn from_radix_10_checked(..) -> (Option<I>, usize) }`
+/// declares no parameter of its own, so the argument list `appendGenericCall`
+/// was handed is the RECEIVER, not a type argument list — and the callee's
+/// declared return names the impl's parameter, which nothing in the callee can
+/// settle. `u8::from_radix_10_checked(..)` is the one statement in the source
+/// that says `I` is `u8`, and dropping it left the call node with no type at
+/// all. Nothing downstream could recover it either: the comparison beside it
+/// has no concrete peer to ask, so the `(Some(255), 3)` and `(None, 3)` tuple
+/// rows that comparison exists to type kept the `_` placeholder, and a row is
+/// what `validate` reads whether or not an expression still points at it.
+///
+/// The binding is admitted only where the owning `impl` declares exactly as
+/// many type parameters as the argument list supplies, and only where the
+/// result is CONCRETE afterwards. A call whose return stays open is left
+/// untyped, which is what it already was, rather than handed a substituted row
+/// nothing can act on. A declared return that names no parameter is unchanged
+/// by substitution, so this publishes exactly what `appendDeclaredCallReturnType`
+/// would have and only ever adds the rows the two together could not reach.
+/// Whether the call node already carries exactly the callee's declared return:
+/// the row `appendDeclaredCallReturnType` wrote when the declaration looked
+/// concrete enough to pin, before the receiver was bound. That row is the one
+/// thing this producer may still replace, and it is recognized WITHOUT
+/// touching heap payloads: the declared return is the callee's own value, so
+/// the published row only has to BE that value for the overwrite to be this
+/// producer answering its own question twice, never inference's answer being
+/// thrown away. Anything else the table holds is somebody else's decision,
+/// and this producer leaves the node exactly as it found it.
+fn rowStillReadsDeclared(published: types.Type, declared: types.Type) bool {
+    if (std.meta.activeTag(published) != std.meta.activeTag(declared)) return false;
+    return switch (published) {
+        .prim => |value| value == declared.prim,
+        .path => |path| blk: {
+            if (path.segments.len != declared.path.segments.len) break :blk false;
+            for (path.segments, declared.path.segments) |pub_seg, decl_seg| {
+                if (!std.mem.eql(u8, pub_seg.name, decl_seg.name)) break :blk false;
+                if ((pub_seg.id == null) != (decl_seg.id == null)) break :blk false;
+                if (pub_seg.id) |pub_id| {
+                    if (pub_id != decl_seg.id.?) break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .tuple => |tuple| blk: {
+            if (tuple.len == 0 or tuple.len != declared.tuple.len) break :blk false;
+            for (tuple, declared.tuple) |pub_elem, decl_elem| {
+                if (!rowStillReadsDeclared(pub_elem, decl_elem)) break :blk false;
+            }
+            break :blk true;
+        },
+        .option => |inner| declared == .option and
+            rowStillReadsDeclared(inner.*, declared.option.*),
+        else => false,
+    };
+}
+
+fn appendReceiverBoundCallReturnType(
+    e: *Ext,
+    call_kind: exprs.CallKind,
+    def: spine.EntityId,
+    call_id: exprs.NodeId,
+    receiver_args: []const types.Type,
+) anyerror!void {
+    switch (call_kind) {
+        .free, .associated => {},
+        .constructor => return,
+    }
+    if (receiver_args.len == 0) return;
+    if (def >= e.ctx.bodies_list.items.len) return;
+    const fn_body = switch (e.ctx.bodies_list.items[def]) {
+        .fn_ => |value| value,
+        else => return,
+    };
+    if (fn_body.generic_params.len != 0) return;
+    const entity = e.ctx.g.symbol_table.get(def) orelse return;
+    const owner = entity.parent orelse return;
+    if (owner >= e.ctx.bodies_list.items.len) return;
+    const impl_body = switch (e.ctx.bodies_list.items[owner]) {
+        .impl_ => |value| value,
+        else => return,
+    };
+    const params = impl_body.generics orelse return;
+    if (params.params.len != receiver_args.len) return;
+    const names = try e.ctx.alloc.alloc([]const u8, params.params.len);
+    defer e.ctx.alloc.free(names);
+    for (params.params, 0..) |param, index| {
+        switch (param) {
+            .type_ => |value| names[index] = value.name,
+            else => return,
+        }
+    }
+    const substituted = types.substType(e.ctx.alloc, fn_body.ret, names, receiver_args) catch return;
+    if (!isConcreteDeclaredReturnType(substituted)) {
+        types.freeSubstitutedType(e.ctx.alloc, fn_body.ret, substituted, names, receiver_args);
+        return;
+    }
+    // The row `appendDeclaredCallReturnType` wrote may still be there: the
+    // callee's own return, decided by nobody, which the receiver now binds.
+    // Overwriting THAT row is safe exactly because nothing decided it —
+    // `rowStillReadsDeclared` proves it still reads the declaration, leaf for
+    // leaf — while any other row is inference's or a peer's answer and this
+    // producer leaves it alone. A merely-nearby row never qualifies: the
+    // comparison walks only the containers the two rows share.
+    if (e.ctx.exprs.items[call_id].ty) |published_id| {
+        if (published_id >= e.ctx.types.items.len) {
+            types.freeSubstitutedType(e.ctx.alloc, fn_body.ret, substituted, names, receiver_args);
+            return;
+        }
+        if (!rowStillReadsDeclared(e.ctx.types.items[published_id], fn_body.ret)) {
+            // Somebody else's decision — inference's, or a peer producer's:
+            // the substitution dies with the guarded `freeSubstitutedType`
+            // the earlier arms already ran, and the node keeps its row.
+            types.freeSubstitutedType(e.ctx.alloc, fn_body.ret, substituted, names, receiver_args);
+            return;
+        }
+    }
+    // The published row OWNS what `substType` allocated. `appendType` copies the
+    // `Type` VALUE into the table, so the `.tuple` slice and the `.option`
+    // payload that value points at have to outlive the model. Releasing the
+    // substitution here — `freeSubstitutedType` destroys exactly those two
+    // containers — left the table row pointing at released memory, and every
+    // later reader of it walked garbage: `containsInferPlaceholderDepth` on a
+    // `(Option<u8>, usize)` row raised `switch on corrupt value` out of
+    // `isInferPlaceholderType`, from `pinKnownType`, on three atoi fixtures.
+    // `freeSubstitutedType` is documented to run "after its last use", and a row
+    // in the type table is used for the rest of the model's life, so that use
+    // does not end here and ownership passes to the arena with it. Publishing
+    // without releasing is the same rule `appendDeclaredCallReturnType`
+    // follows when it publishes an unsubstituted declared return.
+    const published = try appendType(e, substituted);
+    if (published == null) {
+        types.freeSubstitutedType(e.ctx.alloc, fn_body.ret, substituted, names, receiver_args);
+        return;
+    }
+    e.ctx.exprs.items[call_id].ty = published;
 }
 
 fn isReferenceExpr(e: *const Ext, node_id: exprs.NodeId) bool {
@@ -6816,8 +9178,13 @@ fn lowerMethodCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const method_def = try pushMethodRef(e, method_name);
     const args = try lowerArgs(e, arguments);
     const generic_args = try lowerGenericCallArgs(e, node);
+    const receiver_id = try lowerExpr(e, receiver);
+    if (generic_args.len == 0) {
+        if (try appendTypedStandardMethod(e, receiver_id, method_name, args)) |standard|
+            return standard;
+    }
     return appendExpr(e, .{ .method_call = .{
-        .receiver = try lowerExpr(e, receiver),
+        .receiver = receiver_id,
         .receiver_mode = .value,
         .method = method_def,
         .generic_args = generic_args,
@@ -6860,6 +9227,29 @@ fn stringCoreFunction(
     return null;
 }
 
+fn normalizedCrateNameEqual(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if ((if (a == '-') @as(u8, '_') else a) !=
+            (if (b == '-') @as(u8, '_') else b)) return false;
+    }
+    return true;
+}
+
+/// Cargo's dependency key is the source root, but `package` establishes the
+/// runtime identity. Do not admit an unrelated package renamed `rand_core`.
+fn externalPackageRootMatches(e: *const Ext, source_root: []const u8, package: []const u8) bool {
+    for (e.ctx.g.crates.items) |crate| {
+        if (!e.ctx.g.entityBelongsToRoot(e.fn_id, crate.root)) continue;
+        for (crate.deps) |dependency| {
+            if (normalizedCrateNameEqual(source_root, dependency.local_alias) or
+                normalizedCrateNameEqual(source_root, dependency.extern_name))
+                return normalizedCrateNameEqual(dependency.extern_name, package);
+        }
+    }
+    return normalizedCrateNameEqual(source_root, package);
+}
+
 fn coreFunction(e: *const Ext, path_text: []const u8) !?exprs.CoreFunction {
     if (try stringCoreFunction(e, path_text)) |function| return function;
     const path = if (std.mem.startsWith(u8, path_text, "::")) path_text[2..] else path_text;
@@ -6888,6 +9278,9 @@ fn coreFunction(e: *const Ext, path_text: []const u8) !?exprs.CoreFunction {
         if (source_count != canonical.len) return null;
         canonical = source_parts;
     }
+    if (externalPackageRootMatches(e, canonical[0], "rand_core") and
+        std.mem.eql(u8, canonical[1], "impls") and
+        std.mem.eql(u8, canonical[2], "fill_bytes_via_next")) return .rng_fill_bytes_via_next;
     if (!std.mem.eql(u8, canonical[0], "core") and
         !std.mem.eql(u8, canonical[0], "std")) return null;
     const entries = [_]struct { namespace: []const u8, name: []const u8, function: exprs.CoreFunction }{
@@ -6979,6 +9372,22 @@ fn textNamesStandardTrait(
             parts[count] = part;
             count += 1;
         }
+        // A module-qualified head names itself through the module's own `use`:
+        // `use core::hash;` followed by `impl hash::Hasher for T` IS
+        // `core::hash::Hasher`, and the source never wrote that path out. The
+        // written segments alone would answer no for that spelling and yes for
+        // the spelled-out one, so the head is resolved to the identity the
+        // import proves BEFORE the standard path is compared. A head no import
+        // binds keeps the spelling it was written with, and the comparison is
+        // over the whole path — never a leaf, never a prefix — so a crate's own
+        // homonym stays refused.
+        if (try externalNominalForPath(e, raw)) |canonical| {
+            defer {
+                for (canonical.path) |segment| e.ctx.alloc.free(segment);
+                e.ctx.alloc.free(canonical.path);
+            }
+            return externalPathMatchesStandard(canonical.path, wanted);
+        }
         return externalPathMatchesStandard(parts[0..count], wanted);
     }
     if (!std.mem.eql(u8, raw, wanted_name)) return false;
@@ -7007,16 +9416,54 @@ fn traitHasStandardSupertrait(
     };
     for (trait_body.supertraits) |supertrait| {
         if (try textNamesStandardTrait(e, supertrait, wanted)) return true;
-        var raw = std.mem.trim(u8, supertrait, " \t\r\n");
-        if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| raw = raw[0..generic_start];
-        const name = if (std.mem.lastIndexOf(u8, raw, "::")) |sep|
-            raw[sep + 2 ..]
-        else
-            raw;
-        const super_id = resolveName(e, name) orelse continue;
+        const super_id = resolveSupertraitPath(e, trait_id, supertrait) orelse continue;
         if (try traitHasStandardSupertrait(e, super_id, wanted, depth + 1)) return true;
     }
     return false;
+}
+
+/// Supertraits of the standard numeric traits this translator admits by name.
+///
+/// `num_traits` is an external crate, so its trait declarations are not graph
+/// entities and their supertrait lists cannot be read — the graph walk in
+/// `traitHasStandardSupertrait` has nothing to descend. Without these edges a
+/// bound that reaches `One` only through `Signed: Num: One` is refused for a
+/// capability it really grants, which is exactly how `atoi` writes
+/// `pub fn signum<I>(self) -> I where I: Signed { I::one() }`.
+const standard_numeric_supertraits = [_]struct { trait_name: []const u8, super_name: []const u8 }{
+    .{ .trait_name = "Num", .super_name = "Zero" },
+    .{ .trait_name = "Num", .super_name = "One" },
+    .{ .trait_name = "Signed", .super_name = "Num" },
+    .{ .trait_name = "Unsigned", .super_name = "Num" },
+    .{ .trait_name = "PrimInt", .super_name = "Num" },
+    .{ .trait_name = "PrimInt", .super_name = "Bounded" },
+};
+
+fn numericTraitReachesByName(name: []const u8, wanted: []const []const u8, depth: usize) bool {
+    if (depth > 4 or wanted.len == 0) return false;
+    if (std.mem.eql(u8, name, wanted[wanted.len - 1])) return true;
+    for (standard_numeric_supertraits) |edge| {
+        if (!std.mem.eql(u8, edge.trait_name, name)) continue;
+        if (numericTraitReachesByName(edge.super_name, wanted, depth + 1)) return true;
+    }
+    return false;
+}
+
+/// Whether an EXTERNAL standard trait reaches `wanted` by name, following the
+/// supertrait edges above.
+///
+/// Only a bound whose terminal carries no entity reaches this, so a crate's own
+/// `Signed` — which does have an entity, and keeps its own meaning — never does.
+fn externalNumericTraitReaches(
+    bound: types.Bound,
+    wanted: []const []const u8,
+    depth: usize,
+) bool {
+    if (depth > 4) return false;
+    if (bound.path.segments.len == 0 or wanted.len == 0) return false;
+    const terminal = bound.path.segments[bound.path.segments.len - 1];
+    if (terminal.id != null) return false;
+    return numericTraitReachesByName(terminal.name, wanted, depth);
 }
 
 fn genericHasStandardTraitBound(
@@ -7042,6 +9489,8 @@ fn genericHasStandardTraitBound(
                     if (bound.optional) continue;
                     if (boundTraitEntity(e, bound)) |trait_id| {
                         if (try traitHasStandardSupertrait(e, trait_id, trait_path, 0)) return true;
+                    } else if (externalNumericTraitReaches(bound, trait_path, 0)) {
+                        return true;
                     }
                 }
             }
@@ -7055,6 +9504,8 @@ fn genericHasStandardTraitBound(
                     if (bound.optional) continue;
                     if (boundTraitEntity(e, bound)) |trait_id| {
                         if (try traitHasStandardSupertrait(e, trait_id, trait_path, 0)) return true;
+                    } else if (externalNumericTraitReaches(bound, trait_path, 0)) {
+                        return true;
                     }
                 }
             }
@@ -7103,13 +9554,7 @@ fn declaringAssociatedConstTrait(
     };
     var found: ?spine.EntityId = null;
     for (trait_body.supertraits) |supertrait| {
-        var raw = std.mem.trim(u8, supertrait, " \t\r\n");
-        if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| raw = raw[0..generic_start];
-        const super_name = if (std.mem.lastIndexOf(u8, raw, "::")) |separator|
-            raw[separator + 2 ..]
-        else
-            raw;
-        const super_id = resolveName(e, super_name) orelse continue;
+        const super_id = resolveSupertraitPath(e, trait_id, supertrait) orelse continue;
         const candidate = declaringAssociatedConstTrait(e, super_id, name, depth + 1) orelse continue;
         if (found) |existing| {
             if (existing != candidate) return null;
@@ -7139,13 +9584,7 @@ fn declaringAssociatedMethodTrait(
     };
     var found: ?spine.EntityId = null;
     for (trait_body.supertraits) |supertrait| {
-        var raw = std.mem.trim(u8, supertrait, " \t\r\n");
-        if (std.mem.indexOfScalar(u8, raw, '<')) |generic_start| raw = raw[0..generic_start];
-        const super_name = if (std.mem.lastIndexOf(u8, raw, "::")) |separator|
-            raw[separator + 2 ..]
-        else
-            raw;
-        const super_id = resolveName(e, super_name) orelse continue;
+        const super_id = resolveSupertraitPath(e, trait_id, supertrait) orelse continue;
         const candidate = declaringAssociatedMethodTrait(e, super_id, name, depth + 1) orelse continue;
         if (found) |existing| {
             if (existing != candidate) return null;
@@ -7370,6 +9809,40 @@ fn lowerBoundCoreAssociatedCall(
     // `from`. This is the same admission `String::from` already had, widened
     // to every container `From` is written on, not a second path beside it.
     var receiver = try activeGenericReceiver(e, receiver_name);
+    if (receiver) |generic_receiver| {
+        if (args.len == 0 and boundAssociatedMethodTrait(e, receiver_name, method_name) == null) {
+            const identity_trait: ?[]const u8 = if (std.mem.eql(u8, method_name, "zero"))
+                "Zero"
+            else if (std.mem.eql(u8, method_name, "one"))
+                "One"
+            else
+                null;
+            const is_min = std.mem.eql(u8, method_name, "min_value");
+            const is_max = std.mem.eql(u8, method_name, "max_value");
+            const trait_name = identity_trait orelse if (is_min or is_max) "Bounded" else "";
+            const module_name = if (identity_trait != null) "identities" else "bounds";
+            if (trait_name.len > 0 and
+                ((try genericHasStandardTraitBound(e, generic_receiver, &.{ "num_traits", trait_name })) or
+                    (try genericHasStandardTraitBound(e, generic_receiver, &.{ "num_traits", module_name, trait_name })) or
+                    (try genericHasStandardTraitBound(e, generic_receiver, &.{ "num_traits", "PrimInt" })) or
+                    (try genericHasStandardTraitBound(e, generic_receiver, &.{ "num_traits", "int", "PrimInt" }))))
+            {
+                const target = (try appendType(e, generic_receiver)) orelse unreachable;
+                const id = try appendExpr(e, .{ .core_call = .{
+                    .function = if (identity_trait != null)
+                        (if (std.mem.eql(u8, method_name, "zero")) .numeric_zero else .numeric_one)
+                    else if (is_min)
+                        .numeric_min_value
+                    else
+                        .numeric_max_value,
+                    .generic_args = try e.ctx.alloc.dupe(types.Type, &.{generic_receiver}),
+                    .args = args,
+                } });
+                e.ctx.exprs.items[id].ty = target;
+                return id;
+            }
+        }
+    }
     var named_receiver = false;
     if (receiver == null and std.mem.eql(u8, method_name, "from") and
         resolveName(e, receiver_name) == null)
@@ -7415,8 +9888,170 @@ fn lowerBoundCoreAssociatedCall(
     return result;
 }
 
+/// The canonical generic owner of `MaybeUninit::<T>::uninit()`.
+/// A source homonym remains a source call: its owner is not this external type.
+fn appendMaybeUninitUninit(
+    e: *Ext,
+    owner: types.ExternalNominal,
+    method_name: []const u8,
+    args: []const exprs.NodeId,
+) anyerror!?exprs.NodeId {
+    if (!std.mem.eql(u8, method_name, "uninit") or
+        owner.args.len != 1 or owner.path.len != 3 or
+        !std.mem.eql(u8, owner.path[0], "core") or
+        !std.mem.eql(u8, owner.path[1], "mem") or
+        !std.mem.eql(u8, owner.path[2], "MaybeUninit"))
+    {
+        return null;
+    }
+    if (args.len != 0) {
+        e.ctx.alloc.free(args);
+        return try unsupported(e, "MaybeUninit::uninit call takes no arguments");
+    }
+    const call = try appendExpr(e, .{ .core_call = .{
+        .function = .maybe_uninit_uninit,
+        .generic_args = owner.args,
+        .args = args,
+    } });
+    // The semantic result stays MaybeUninit<T>; only backend layout erases it.
+    // Its enclosing array literal, not this element, owns the repeat length.
+    e.ctx.exprs.items[call].ty = try appendType(e, .{ .external_nominal = owner });
+    return call;
+}
+
+fn pinKnownOperand(e: *Ext, id: exprs.NodeId) anyerror!?types.Type {
+    const ty = knownCastOperandType(e, id) orelse return null;
+    if (e.ctx.exprs.items[id].ty == null) e.ctx.exprs.items[id].ty = try appendType(e, ty);
+    return ty;
+}
+
+fn appendTypedStandardMethod(e: *Ext, receiver: exprs.NodeId, name: []const u8, args: []const exprs.NodeId) anyerror!?exprs.NodeId {
+    const declared = (try pinKnownOperand(e, receiver)) orelse return null;
+    const ty = if (declared == .reference) declared.reference.pointee else declared;
+    if (std.mem.eql(u8, name, "copy_to_nonoverlapping") and ty == .raw_ptr and args.len == 2) {
+        const generics = try e.ctx.alloc.dupe(types.Type, &.{ty.raw_ptr.pointee});
+        const source = if (declared == .reference) blk: {
+            const deref = try appendExpr(e, .{ .unary = .{ .op = .deref, .operand = receiver } });
+            e.ctx.exprs.items[deref].ty = try appendType(e, ty);
+            break :blk deref;
+        } else receiver;
+        const ordered = try e.ctx.alloc.dupe(exprs.NodeId, &.{ source, args[0], args[1] });
+        for (ordered) |arg| _ = try pinKnownOperand(e, arg);
+        const id = try appendExpr(e, .{ .core_call = .{
+            .function = .ptr_copy_nonoverlapping,
+            .generic_args = generics,
+            .args = ordered,
+        } });
+        e.ctx.exprs.items[id].ty = try appendType(e, .{ .prim = .unit });
+        e.ctx.alloc.free(args);
+        return id;
+    }
+    if (std.mem.eql(u8, name, "to_vec") and args.len == 0 and (ty == .slice or ty == .array)) {
+        var owner = (try externalNominalForPath(e, "alloc::vec::Vec")) orelse return null;
+        owner.args = try e.ctx.alloc.dupe(types.Type, &.{if (ty == .slice) ty.slice.elem else ty.array.elem});
+        const target: types.Type = .{ .external_nominal = owner };
+        const id = try appendExpr(e, .{ .core_call = .{
+            .function = .convert_from,
+            .generic_args = try e.ctx.alloc.dupe(types.Type, &.{target}),
+            .args = try e.ctx.alloc.dupe(exprs.NodeId, &.{receiver}),
+        } });
+        e.ctx.exprs.items[id].ty = try appendType(e, target);
+        e.ctx.alloc.free(args);
+        return id;
+    }
+    return null;
+}
+
+fn appendHasherUfcs(e: *Ext, raw: []const u8, args: []const exprs.NodeId) anyerror!?exprs.NodeId {
+    const separator = std.mem.lastIndexOf(u8, raw, "::") orelse return null;
+    const method = raw[separator + 2 ..];
+    // `Hasher::write` is the one standard method whose payload is not a
+    // primitive: it takes a byte slice, so there is no `mapPrim` spelling to
+    // read. The `write_` spellings keep their exact primitive whitelist, and a
+    // bare `write` is admitted with no payload at all — which is what makes the
+    // `hash_write_primitive` fallback below unreachable for it.
+    if (args.len != 2) return null;
+    const bare_write = std.mem.eql(u8, method, "write");
+    if (!bare_write and !std.mem.startsWith(u8, method, "write_")) return null;
+    const primitive: ?types.Prim = if (bare_write) null else (mapPrim(method["write_".len..]) orelse return null);
+    if (primitive) |payload| {
+        switch (payload) {
+            .u8, .u16, .u32, .u64, .usize, .i8, .i16, .i32, .i64, .isize => {},
+            else => return null,
+        }
+    }
+    const owner = (try externalNominalForPath(e, raw[0..separator])) orelse return null;
+    defer {
+        for (owner.path) |part| e.ctx.alloc.free(part);
+        e.ctx.alloc.free(owner.path);
+    }
+    if (owner.path.len != 3 or
+        (!std.mem.eql(u8, owner.path[0], "core") and !std.mem.eql(u8, owner.path[0], "std")) or
+        !std.mem.eql(u8, owner.path[1], "hash") or !std.mem.eql(u8, owner.path[2], "Hasher")) return null;
+    const receiver = (try pinKnownOperand(e, args[0])) orelse return null;
+    const actual = if (receiver == .reference) receiver.reference.pointee else receiver;
+    if (actual == .path and actual.path.segments.len == 1 and actual.path.segments[0].id == null and
+        (try genericHasStandardTraitBound(e, actual, &.{ "core", "hash", "Hasher" })))
+    {
+        const id = try appendExpr(e, .{ .method_call = .{
+            .receiver = args[0],
+            .receiver_mode = .mutable,
+            .method = try pushMethodRef(e, method),
+            .args = try e.ctx.alloc.dupe(exprs.NodeId, args[1..]),
+        } });
+        e.ctx.exprs.items[id].ty = try appendType(e, .{ .prim = .unit });
+        e.ctx.alloc.free(args);
+        return id;
+    }
+    // Two impls of `core::hash::Hasher` for one receiver would be a coherence
+    // error rustc rejects long before this point, so a second answer means the
+    // graph lost a distinction the source kept: binding either one would emit a
+    // call into an implementation the source never named.
+    var bound: ?spine.EntityId = null;
+    for (e.ctx.g.symbol_table.entities.items) |implementation| {
+        if (implementation.kind != .impl_ or implementation.id >= e.ctx.bodies_list.items.len) continue;
+        const body = switch (e.ctx.bodies_list.items[implementation.id]) {
+            .impl_ => |value| value,
+            else => continue,
+        };
+        if (!infer.typeEqual(body.self_ty, actual)) continue;
+        const trait_path = body.trait_path orelse continue;
+        // The impl's OWN scope names the trait, not the scope this call is
+        // lowered in: siphasher writes `impl hash::Hasher for SipHasher13`
+        // beside a `use core::hash;` in `sip.rs` and calls `Hasher::write`
+        // from `tests.rs`, which imports `Hasher` and nothing named `hash`,
+        // so the written spelling resolved against the current module found
+        // no `hash` to expand and the call fell through to `unresolved call`.
+        // `boundPathMatches` reads the segments the binder already resolved
+        // and falls back to the OWNER's `use` chain, and it is the matcher the
+        // method pass uses for this same impl, so the two cannot disagree.
+        if (!bodies.boundPathMatches(e.ctx.g, implementation.id, trait_path, &.{ "core", "hash", "Hasher" })) continue;
+        for (e.ctx.g.symbol_table.entities.items) |source_method| {
+            if (source_method.kind != .fn_ or source_method.parent != implementation.id or
+                !std.mem.eql(u8, source_method.name, method)) continue;
+            if (bound != null) return null;
+            bound = source_method.id;
+        }
+    }
+    if (bound) |target| return try appendGenericCall(e, .{ .associated = target }, args, &.{});
+    // The native primitive write is the LAST resort for a receiver this crate
+    // does not implement `core::hash::Hasher` for. A bare `write` carries a
+    // byte slice, not a primitive, so fabricating one here would silently
+    // miscompile the call: without a source-backed implementation there is
+    // nothing honest to lower it to.
+    const payload = primitive orelse return null;
+    e.ctx.exprs.items[args[1]].ty = try appendType(e, .{ .prim = payload });
+    const id = try appendExpr(e, .{ .core_call = .{
+        .function = .hash_write_primitive,
+        .generic_args = try e.ctx.alloc.dupe(types.Type, &.{.{ .prim = payload }}),
+        .args = args,
+    } });
+    e.ctx.exprs.items[id].ty = try appendType(e, .{ .prim = .unit });
+    return id;
+}
+
 fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
-    const callee = node.namedChild(0) orelse return error.MalformedCst;
+    const callee = firstValueChild(node) orelse return error.MalformedCst;
     var callee_base = callee;
     var generic_args: []const types.Type = &.{};
     if (std.mem.eql(u8, callee.kind(), "generic_function")) {
@@ -7426,6 +10061,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             var found_function = false;
             var child_index: u32 = 0;
             while (callee.namedChild(child_index)) |child| : (child_index += 1) {
+                if (isBlockTrivia(child)) continue;
                 if (std.mem.eql(u8, child.kind(), "type_arguments")) continue;
                 callee_base = child;
                 found_function = true;
@@ -7446,8 +10082,8 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 
     // method call: recv.method(args)
     if (std.mem.eql(u8, callee_base.kind(), "field_expression")) {
-        const recv = callee_base.namedChild(0) orelse return error.MalformedCst;
-        const method = callee_base.namedChild(1) orelse return error.MalformedCst;
+        const recv = valueChild(callee_base, 0) orelse return error.MalformedCst;
+        const method = valueChild(callee_base, 1) orelse return error.MalformedCst;
         const mname = text(e, method);
         if (mname.len == 0) return error.MalformedCst;
         if ((std.mem.eql(u8, mname, "sum") or std.mem.eql(u8, mname, "collect")) and
@@ -7495,13 +10131,28 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             if (try appendToNeBytes(e, try lowerExpr(e, recv))) |bytes| return bytes;
         }
 
+        // Rust `x.to_le_bytes()` → the little-endian encoding. It cannot share
+        // the native-endian path above, because on a big-endian target the two
+        // differ by a byte swap and only one of them is the value the source
+        // asked for.
+        if (std.mem.eql(u8, mname, "to_le_bytes") and generic_args.len == 0 and
+            iteratorArgumentsEmpty(call_args))
+        {
+            if (try appendToLeBytes(e, try lowerExpr(e, recv))) |bytes| return bytes;
+        }
+
         const method_def = try pushMethodRef(e, mname);
         const args = try lowerArgs(e, call_args);
+        const receiver_id = try lowerExpr(e, recv);
+        if (generic_args.len == 0) {
+            if (try appendTypedStandardMethod(e, receiver_id, mname, args)) |standard|
+                return standard;
+        }
         // The turbofish on `recv.method::<T>(..)` is the callee's own, so it is
         // recorded here rather than dropped. `generic_args` is freed on
         // function exit, hence the dupe.
         return appendExpr(e, .{ .method_call = .{
-            .receiver = try lowerExpr(e, recv),
+            .receiver = receiver_id,
             .receiver_mode = .value,
             .method = method_def,
             .generic_args = try e.ctx.alloc.dupe(types.Type, generic_args),
@@ -7510,15 +10161,44 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     }
 
     // free / associated / enum-variant / constructor call
-    var arg_list: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
-    defer arg_list.deinit(e.ctx.alloc);
-    {
-        var j: u32 = 0;
-        while (call_args.namedChild(j)) |a| : (j += 1) {
-            try arg_list.append(e.ctx.alloc, try lowerExpr(e, a));
+    const args: []const exprs.NodeId = try lowerArgs(e, call_args);
+    if (callee_base.childByFieldName("path")) |owner_node| {
+        if (std.mem.eql(u8, owner_node.kind(), "generic_type") or
+            std.mem.eql(u8, owner_node.kind(), "generic_type_with_turbofish"))
+        {
+            const owner_type: ?types.Type = mapCstNamedType(e, owner_node) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            const variant_node = callee_base.childByFieldName("name") orelse callee_base.namedChild(1);
+            if (owner_type != null and owner_type.? == .external_nominal and variant_node != null) {
+                const owner = owner_type.?.external_nominal;
+                const variant = text(e, variant_node.?);
+                if (generic_args.len == 0) {
+                    if (try appendMaybeUninitUninit(e, owner, variant, args)) |uninit| {
+                        return uninit;
+                    }
+                }
+                if (owner.path.len == 3 and
+                    (std.mem.eql(u8, owner.path[0], "alloc") or std.mem.eql(u8, owner.path[0], "std")) and
+                    std.mem.eql(u8, owner.path[1], "borrow") and std.mem.eql(u8, owner.path[2], "Cow") and
+                    (std.mem.eql(u8, variant, "Owned") or std.mem.eql(u8, variant, "Borrowed")))
+                {
+                    const id = try appendExpr(e, .{ .external_variant = .{
+                        .owner = owner,
+                        .variant = try e.ctx.alloc.dupe(u8, variant),
+                        .tuple_fields = args,
+                        .named_fields = &.{},
+                    } });
+                    e.ctx.exprs.items[id].ty = try appendType(e, owner_type.?);
+                    return id;
+                }
+            }
         }
     }
-    const args = try arg_list.toOwnedSlice(e.ctx.alloc);
+    if (generic_args.len == 0) {
+        if (try appendHasherUfcs(e, text(e, callee_base), args)) |hash_call| return hash_call;
+    }
     if (std.mem.eql(u8, callee_base.kind(), "scoped_identifier") or
         std.mem.eql(u8, callee_base.kind(), "scoped_type_identifier"))
     {
@@ -7527,11 +10207,17 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         }
     }
     if (try coreFunction(e, text(e, callee_base))) |function| {
-        return appendExpr(e, .{ .core_call = .{
+        if (function == .rng_fill_bytes_via_next) {
+            for (args) |arg| _ = try pinKnownOperand(e, arg);
+        }
+        const id = try appendExpr(e, .{ .core_call = .{
             .function = function,
             .generic_args = try e.ctx.alloc.dupe(types.Type, generic_args),
             .args = args,
         } });
+        if (function == .rng_fill_bytes_via_next)
+            e.ctx.exprs.items[id].ty = try appendType(e, .{ .prim = .unit });
+        return id;
     }
 
     if (std.mem.eql(u8, callee_base.kind(), "scoped_identifier") or
@@ -7539,6 +10225,11 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     {
         // Struct::method(...) / Enum::Variant(...) / Self::method(...) /
         // Type::constructor(...). Split the scoped path at "::".
+        if (try primitiveSourceAssociatedCall(e, text(e, callee_base), args, generic_args)) |source_call|
+            return source_call;
+        if (try traitMethodForPath(e, callee_base)) |method| {
+            return appendGenericCall(e, .{ .associated = method }, args, generic_args);
+        }
         const t = text(e, callee_base);
         if (primitiveTryFromTarget(t)) |target_primitive| {
             if (generic_args.len != 0) {
@@ -7561,8 +10252,19 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
             }
             return appendPrimitiveFromNeBytes(e, target_primitive, args);
         }
-        if (try traitMethodForPath(e, callee_base)) |method| {
-            return appendGenericCall(e, .{ .associated = method }, args, generic_args);
+        if (primitiveFromLeBytesTarget(t)) |target_primitive| {
+            if (generic_args.len != 0) {
+                e.ctx.alloc.free(args);
+                return unsupported(e, "primitive from_le_bytes call");
+            }
+            return appendPrimitiveFromLeBytes(e, target_primitive, args);
+        }
+        if (primitiveAssocConstTarget(t)) |assoc_const| {
+            if (generic_args.len != 0) {
+                e.ctx.alloc.free(args);
+                return unsupported(e, "primitive associated const call");
+            }
+            return appendPrimitiveAssocConst(e, assoc_const.prim, assoc_const.entry, args);
         }
         // Resolve the complete path before interpreting the first segment as
         // a type name. A path-qualified function is free, but a type-qualified
@@ -7670,7 +10372,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         // from whichever bound declares it. A bound this crate has no entity
         // for — a trait from an external crate, say — resolves to nothing, and
         // the path then keeps whatever refusal it had before this arm.
-        if ((try activeGenericReceiver(e, base_name)) != null) {
+        if (try activeGenericReceiver(e, base_name)) |generic_receiver| {
             const trait_id = boundAssociatedMethodTrait(e, base_name, leaf);
             const method_id = if (trait_id) |owner|
                 try ensureTraitMethodRefEntity(e, owner, leaf)
@@ -7681,7 +10383,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                     e,
                     .{ .associated = resolved },
                     args,
-                    generic_args,
+                    if (generic_args.len == 0) &.{generic_receiver} else generic_args,
                 );
             }
         }
@@ -7703,7 +10405,7 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         // An associated function of an external nominal — `io::Cursor::new` —
         // admitted last, after every local owner has had its chance. The
         // backend decides whether it can lower it.
-        if (try lowerExternalAssociatedCall(e, t, args)) |external_call| {
+        if (try lowerExternalAssociatedCall(e, t, args, generic_args)) |external_call| {
             return external_call;
         }
         return unsupported(e, "unresolved call");
@@ -7769,7 +10471,7 @@ fn findLetCondition(node: ts.Node) ?ts.Node {
 fn splitLetCondition(e: *const Ext, node: ts.Node) anyerror!?LetCondition {
     const let_node = findLetCondition(node) orelse return null;
     const pattern = let_node.childByFieldName("pattern") orelse
-        let_node.namedChild(0) orelse return error.MalformedCst;
+        firstValueChild(let_node) orelse return error.MalformedCst;
     var value: ?ts.Node = let_node.childByFieldName("value");
     var i: u32 = 0;
     while (let_node.namedChild(i)) |child| : (i += 1) {
@@ -7789,6 +10491,7 @@ fn lowerArgs(e: *Ext, args_node: ?ts.Node) anyerror![]const exprs.NodeId {
     if (args_node) |an| {
         var j: u32 = 0;
         while (an.namedChild(j)) |a| : (j += 1) {
+            if (isBlockTrivia(a)) continue;
             try out.append(e.ctx.alloc, try lowerExpr(e, a));
         }
     }
@@ -7808,6 +10511,16 @@ fn lowerElseBranch(e: *Ext, else_node: ?ts.Node) anyerror!exprs.ElseBranch {
         }
     }
     return else_branch;
+}
+
+/// The value an `else` branch produces, or null when it is not one expression
+/// — a chained `else if` is a conditional of its own and an absent branch
+/// produces nothing, so neither answers for the arms of this one.
+fn elseBranchTail(else_branch: exprs.ElseBranch) ?exprs.NodeId {
+    return switch (else_branch) {
+        .block => |block| block.tail,
+        .chain, .none => null,
+    };
 }
 
 fn lowerIf(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
@@ -7834,6 +10547,7 @@ fn lowerIf(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         const then_blk = try lowerBlock(e, then_node);
         e.locals.items.len = outer_local_count;
         const else_branch = try lowerElseBranch(e, else_node);
+        try pinStandardResultArms(e, then_blk.tail, elseBranchTail(else_branch));
         return appendExpr(e, .{ .if_let = .{
             .pattern = pattern,
             .scrutinee = scrutinee,
@@ -7846,6 +10560,7 @@ fn lowerIf(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     const then_blk = try lowerBlock(e, then_node);
     e.locals.items.len = outer_local_count;
     const else_branch = try lowerElseBranch(e, else_node);
+    try pinStandardResultArms(e, then_blk.tail, elseBranchTail(else_branch));
     return appendExpr(e, .{ .if_else = .{
         .cond = cond_id,
         .then_ = then_blk,
@@ -8005,6 +10720,162 @@ fn isBuiltinFormatMacroName(raw: []const u8, basename: []const u8) bool {
         std.mem.eql(u8, segments[1], basename);
 }
 
+/// Lower `matches!(scrutinee, pattern)` to the IR shape a source `match`
+/// already produces: one arm whose patterns are the `|`-separated alternatives
+/// answering `true`, and a wildcard arm answering `false` — the two arms the
+/// macro's own expansion spells. The pattern text is parsed through the same
+/// wrapper-subexpression parse `parseAndLowerSubExpr` uses, so each
+/// alternative reaches `lowerPattern` through the identical node shape a
+/// `match_arm`'s own pattern does; a token tree the grammar will not accept
+/// as a pattern is a fatal `MalformedCst`, never a guessed variant. Bodies
+/// are boolean literals, so inference unifies the arms to `bool` exactly as
+/// it does for a source match over literals, and the backend lowers the same
+/// `.match` it already lowers. An or-alternative that lowers to an
+/// `.unsupported` pattern marks the whole invocation the way `lowerMatch`
+/// marks a source match whose pattern it cannot admit.
+fn lowerMatchesMacro(e: *Ext, raw_tokens: []const u8) anyerror!exprs.NodeId {
+    const macro_args = try expand.splitMacroArgs(e.ctx.alloc, raw_tokens);
+    defer e.ctx.alloc.free(macro_args);
+    if (macro_args.len != 2)
+        return unsupported(e, "matches macro requires a scrutinee and a pattern");
+    const scrutinee = try parseAndLowerSubExpr(e, macro_args[0]);
+    const pattern_text = std.mem.trim(u8, macro_args[1], " \t\r\n");
+    if (pattern_text.len == 0) return unsupported(e, "matches macro requires a pattern");
+
+    var alternatives: std.ArrayListUnmanaged(exprs.NodeId) = .empty;
+    defer alternatives.deinit(e.ctx.alloc);
+    var cursor: usize = 0;
+    var depth_paren: usize = 0;
+    var depth_bracket: usize = 0;
+    var depth_brace: usize = 0;
+    var alternative_start: usize = 0;
+    while (cursor < pattern_text.len) {
+        const c = pattern_text[cursor];
+        switch (c) {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -|= 1,
+            '[' => depth_bracket += 1,
+            ']' => depth_bracket -|= 1,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -|= 1,
+            '|' => if (depth_paren == 0 and depth_bracket == 0 and depth_brace == 0) {
+                const fragment = std.mem.trim(u8, pattern_text[alternative_start..cursor], " \t\r\n");
+                if (fragment.len == 0) return unsupported(e, "matches macro requires a pattern");
+                try alternatives.append(e.ctx.alloc, try parseMatchPatternText(e, fragment));
+                alternative_start = cursor + 1;
+            },
+            else => {},
+        }
+        cursor += 1;
+    }
+    const last = std.mem.trim(u8, pattern_text[alternative_start..], " \t\r\n");
+    if (last.len == 0) return unsupported(e, "matches macro requires a pattern");
+    try alternatives.append(e.ctx.alloc, try parseMatchPatternText(e, last));
+
+    for (alternatives.items) |pat_id| {
+        if (patternContainsUnsupported(e, pat_id))
+            return unsupported(e, "unsupported matches pattern");
+    }
+
+    const hit_arm_body = try appendExpr(e, .{ .literal = .{ .boolean = true } });
+    const miss_arm_body = try appendExpr(e, .{ .literal = .{ .boolean = false } });
+    const miss_pat = try appendPat(e, .{ .wildcard = {} });
+    var arms: std.ArrayListUnmanaged(exprs.MatchArm) = .empty;
+    defer arms.deinit(e.ctx.alloc);
+    try arms.append(e.ctx.alloc, .{
+        .patterns = try alternatives.toOwnedSlice(e.ctx.alloc),
+        .guard = null,
+        .body = hit_arm_body,
+    });
+    const miss_patterns = try e.ctx.alloc.alloc(exprs.NodeId, 1);
+    miss_patterns[0] = miss_pat;
+    try arms.append(e.ctx.alloc, .{
+        .patterns = miss_patterns,
+        .guard = null,
+        .body = miss_arm_body,
+    });
+    return appendExpr(e, .{ .match = .{
+        .scrutinee = scrutinee,
+        .arms = try arms.toOwnedSlice(e.ctx.alloc),
+        .option_scrutinee = false,
+    } });
+}
+
+/// Parse one `matches!` or-alternative through the expression-statement
+/// wrapper `match_arm` patterns come from, so the node `lowerPattern` sees is
+/// the same `pattern` wrapper a source `match` hands it.
+fn parseMatchPatternText(e: *Ext, fragment: []const u8) anyerror!exprs.NodeId {
+    const prefix = "fn __macro_pat__() { let __probe = 0; match __probe { ";
+    const suffix = " => true, _ => false, } }";
+    const wrapped = try std.fmt.allocPrint(e.ctx.alloc, "{s}{s}{s}", .{ prefix, fragment, suffix });
+    defer e.ctx.alloc.free(wrapped);
+
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(rust.language());
+    const tree = parser.parseString(wrapped, null) orelse return error.MalformedCst;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    if (root.hasError()) return error.MalformedCst;
+    const fn_node = root.namedChild(0) orelse return error.MalformedCst;
+    var block_node: ?ts.Node = null;
+    var i: u32 = 0;
+    while (fn_node.namedChild(i)) |c| : (i += 1) {
+        if (std.mem.eql(u8, c.kind(), "block")) {
+            block_node = c;
+            break;
+        }
+    }
+    const blk = block_node orelse return error.MalformedCst;
+    var arm_node: ?ts.Node = null;
+    var j: u32 = 0;
+    while (blk.namedChild(j)) |c| : (j += 1) {
+        // `match_expression` is not in the grammar's `_expression`, so a bare
+        // `match` in statement position is never a block child directly: it
+        // arrives through `expression_statement`'s block-ending branch. The
+        // same wrapper is what `parseAndLowerSubExpr`, `lowerBlock` and
+        // `lowerIf` all step over, and reading past it here is what left
+        // `arm_node` null for every `matches!` alternative.
+        const unwrapped = if (std.mem.eql(u8, c.kind(), "expression_statement"))
+            c.namedChild(0)
+        else
+            c;
+        const match_node = unwrapped orelse continue;
+        if (!std.mem.eql(u8, match_node.kind(), "match_expression")) continue;
+        const body = match_node.childByFieldName("body") orelse return error.MalformedCst;
+        var k: u32 = 0;
+        while (body.namedChild(k)) |arm| : (k += 1) {
+            if (std.mem.eql(u8, arm.kind(), "match_arm")) {
+                arm_node = arm;
+                break;
+            }
+        }
+        break;
+    }
+    const arm = arm_node orelse return error.MalformedCst;
+    const pattern_wrapper = arm.childByFieldName("pattern") orelse return error.MalformedCst;
+    const pattern_node = firstMatchPatternChild(pattern_wrapper) orelse return error.MalformedCst;
+
+    const orig_src = e.ctx.src;
+    e.ctx.src = wrapped;
+    defer e.ctx.src = orig_src;
+    return lowerPattern(e, pattern_node);
+}
+
+/// `format!` is deliberately still a refusal, stated plainly. Its expansion —
+/// the rendered template as an OWNED `String` — has no producer: `write!`'s
+/// `format_write` shape needs a writer operand `format!` never writes, and no
+/// IR node carries an allocating sink the backend could lower. Guessing one
+/// would invent an emission that does not exist, so this honours the
+/// no-pin-a-refusal-as-a-shape contract by naming the limitation instead.
+/// This exists so `lowerMacroInvocation`'s pre-switch routing names the
+/// reason in one place rather than scattering string literals.
+fn lowerFormatMacro(e: *Ext, raw_tokens: []const u8) anyerror!exprs.NodeId {
+    _ = raw_tokens;
+    return unsupported(e, "macro format");
+}
+
 fn lowerFormatWrite(
     e: *Ext,
     raw_tokens: []const u8,
@@ -8079,6 +10950,19 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         kind = .assert_eq;
     } else if (std.mem.eql(u8, macro_base, "debug_assert_ne")) {
         kind = .assert_ne;
+    }
+
+    // `matches!` is a distinct shape the classifier keeps as `.custom` — the
+    // pattern it carries must reach the pattern lowering whole — so its
+    // basename is recognized here, beside `debug_assert!`, without touching
+    // the macro-kind enum. `format!` is a classified kind whose arm below used
+    // to join the refusal below, for the same reason: its template-first
+    // shape differs from `write!`'s writer-first one.
+    if (std.mem.eql(u8, macro_base, "matches")) {
+        return lowerMatchesMacro(e, raw_tokens);
+    }
+    if (kind == .format) {
+        return lowerFormatMacro(e, raw_tokens);
     }
 
     switch (kind) {
@@ -8162,11 +11046,22 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                     } });
                 },
                 .repeat => |repeat| {
-                    const count = parseVecRepeatCount(repeat.count) orelse
-                        return unsupported(e, "vec macro nonliteral repeat length");
+                    // `vec![e; N]` evaluates its element before its count, so
+                    // the element is lowered first and the count follows.
                     const lowered = try e.ctx.alloc.alloc(exprs.NodeId, 1);
                     errdefer e.ctx.alloc.free(lowered);
                     lowered[0] = try parseAndLowerSubExpr(e, repeat.element);
+                    // A count the translator already holds stays a number, so
+                    // every literal form lowers exactly as it did. Anything
+                    // else is an ordinary Rust expression and goes through the
+                    // SAME sub-expression parser the element used, in the same
+                    // lexical context: `vec![0u8; n]` then carries `n` — with
+                    // its own effects, type, and captures — where it used to be
+                    // a refusal.
+                    const count: exprs.VecRepeatCount = if (parseVecRepeatCount(repeat.count)) |literal|
+                        .{ .literal = literal }
+                    else
+                        .{ .expression = try parseAndLowerSubExpr(e, repeat.count) };
                     return appendExpr(e, .{ .vec_lit = .{
                         .elements = lowered,
                         .repeat = count,
@@ -8184,7 +11079,14 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
                 return unsupported(e, "unsupported qualified writeln macro");
             return lowerFormatWrite(e, raw_tokens, true);
         },
-        .println, .eprintln, .format => {
+        .println, .eprintln => {
+            return unsupported(e, try std.fmt.allocPrint(e.ctx.alloc, "macro {s}", .{@tagName(kind)}));
+        },
+        // `format!` used to join the refusal arm above. It no longer does:
+        // `lowerFormatMacro` is reached before this switch. This arm is the
+        // backstop if that routing is ever bypassed, and it names the same
+        // honest refusal rather than a new shape.
+        .format => {
             return unsupported(e, try std.fmt.allocPrint(e.ctx.alloc, "macro {s}", .{@tagName(kind)}));
         },
         .custom => {
@@ -8198,6 +11100,10 @@ fn lowerMacroInvocation(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
 /// Return the pattern node carried by a source parameter.
 fn paramPatternNode(node: ts.Node) ?ts.Node {
     if (std.mem.eql(u8, node.kind(), "self_parameter")) return null;
+    // `fn f(_: T)` puts its wildcard in the same anonymous `pattern` field a
+    // closure parameter uses, so the field is read before the named walk for
+    // the same reason.
+    if (node.childByFieldName("pattern")) |pattern| return pattern;
     var i: u32 = 0;
     while (node.namedChild(i)) |child| : (i += 1) {
         if (isPatternNode(child)) return child;
@@ -8228,6 +11134,12 @@ fn registerParamLocal(
     const pattern = paramPatternNode(source_node) orelse return error.MalformedCst;
     const def = try pushLocal(e, param.name);
     setLocalType(e, def, param.ty);
+    // `fn f(_: T)` binds nothing, so there is no destructuring to run: the
+    // typed binding IS the whole of it. Without this the wildcard reaches
+    // `lowerPattern` and emits `let _ = <param>;`, a prologue that discards
+    // the value the backend has just declared.
+    if (std.mem.eql(u8, pattern.kind(), "_") or
+        std.mem.eql(u8, pattern.kind(), "wildcard_pattern")) return;
     if (plainParamName(e, pattern) != null) return;
 
     const pattern_id = try lowerPattern(e, pattern);
@@ -8503,6 +11415,50 @@ test "a unicode escape contributes its UTF-8 encoding to a string" {
     // A unicode escape alongside the byte escapes the decoder already handled,
     // and several of each in one literal.
     const mixed = try decodeEscapedBytes(allocator, "a\\nb\\u{41}c\\u{7f}", true);
+    defer allocator.free(mixed);
+    try std.testing.expectEqualStrings("a\nb\x41c\x7f", mixed);
+}
+
+test "an underscore separator does not change the scalar a unicode escape names" {
+    const cases = [_]struct { raw: []const u8, value: u32 }{
+        .{ .raw = "'\\u{41}'", .value = 0x41 },
+        .{ .raw = "'\\u{7_f}'", .value = 0x7f },
+        .{ .raw = "'\\u{e9}'", .value = 0x00e9 },
+        .{ .raw = "'\\u{4_e_9}'", .value = 0x04e9 },
+        .{ .raw = "'\\u{1f642}'", .value = 0x1f642 },
+        .{ .raw = "'\\u{1_f_642___}'", .value = 0x1f642 },
+        .{ .raw = "'\\u{1__f642}'", .value = 0x1f642 },
+        .{ .raw = "'\\u{1_f6__4_2}'", .value = 0x1f642 },
+        .{ .raw = "'\\u{10ffff}'", .value = 0x10ffff },
+        .{ .raw = "'\\u{10_ffff_}'", .value = 0x10ffff },
+        .{ .raw = "'\\u{10ffff__}'", .value = 0x10ffff },
+        .{ .raw = "'\\u{000041}'", .value = 0x41 },
+        .{ .raw = "'\\u{0000_41}'", .value = 0x41 },
+        .{ .raw = "'\\u{0000_00}'", .value = 0x00 },
+        .{ .raw = "'\\u{a_}'", .value = 0x0a },
+        .{ .raw = "'\\u{0_}'", .value = 0x00 },
+    };
+    for (cases) |entry| {
+        const decoded = decodeRustCharCodepoint(entry.raw) orelse
+            return error.UnderscoredUnicodeEscapeRefused;
+        try std.testing.expectEqual(entry.value, decoded);
+    }
+}
+
+test "a char literal and the string spelling of an underscored escape agree" {
+    const allocator = std.testing.allocator;
+    const bytes = try decodeEscapedBytes(allocator, "\\u{1_f_642___}\\u{10_ffff_}", true);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("\xF0\x9F\x99\x82\xF4\x8F\xBF\xBF", bytes);
+
+    const scalar = decodeRustCharCodepoint("'\\u{1_f_642___}'") orelse
+        return error.UnderscoredUnicodeEscapeRefused;
+    try std.testing.expectEqual(@as(u32, 0x1f642), scalar);
+    var encoded: [4]u8 = undefined;
+    const encoded_len = try std.unicode.utf8Encode(@intCast(scalar), &encoded);
+    try std.testing.expectEqualSlices(u8, encoded[0..encoded_len], bytes[0..4]);
+
+    const mixed = try decodeEscapedBytes(allocator, "a\\nb\\u{4_1}c\\u{7_f}", true);
     defer allocator.free(mixed);
     try std.testing.expectEqualStrings("a\nb\x41c\x7f", mixed);
 }
@@ -8797,6 +11753,16 @@ test "lower built-in macro invocations in fn bodies" {
     try std.testing.expect(found_unsupported); // unresolved names remain explicit refusal
 }
 
+/// The number a `vec!` literal states outright, or null when the count is an
+/// expression the target evaluates instead. A test that means to pin a folded
+/// count says so here rather than reaching into the union at every site.
+fn vecRepeatLiteralCount(count: exprs.VecRepeatCount) ?u64 {
+    return switch (count) {
+        .literal => |value| value,
+        .expression => null,
+    };
+}
+
 test "lower literal vec macro forms to vec literals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8951,10 +11917,9 @@ test "lower literal vec macro forms to vec literals" {
         .vec_lit => |vec_lit| vec_lit,
         else => return error.ExpectedRepeatedVecLit,
     };
-    try std.testing.expectEqual(@as(usize, 1), repeated_vec.elements.len);
     try std.testing.expectEqual(
-        @as(usize, 200_000),
-        repeated_vec.repeat orelse return error.ExpectedRepeatedVecCount,
+        @as(u64, 200_000),
+        vecRepeatLiteralCount(repeated_vec.repeat orelse return error.ExpectedRepeatedVecCount),
     );
 
     const suffixed_decimal_let = switch (stmts_list.items[body.statements[3]].kind) {
@@ -8977,8 +11942,8 @@ test "lower literal vec macro forms to vec literals" {
     };
     try std.testing.expectEqual(@as(usize, 1), suffixed_decimal_vec.elements.len);
     try std.testing.expectEqual(
-        @as(usize, 1),
-        suffixed_decimal_vec.repeat orelse return error.ExpectedSuffixedDecimalVecCount,
+        @as(u64, 1),
+        vecRepeatLiteralCount(suffixed_decimal_vec.repeat orelse return error.ExpectedSuffixedDecimalVecCount),
     );
 
     const suffixed_hex_let = switch (stmts_list.items[body.statements[4]].kind) {
@@ -9001,8 +11966,170 @@ test "lower literal vec macro forms to vec literals" {
     };
     try std.testing.expectEqual(@as(usize, 1), suffixed_hex_vec.elements.len);
     try std.testing.expectEqual(
-        @as(usize, 255),
-        suffixed_hex_vec.repeat orelse return error.ExpectedSuffixedHexVecCount,
+        @as(u64, 255),
+        vecRepeatLiteralCount(suffixed_hex_vec.repeat orelse return error.ExpectedSuffixedHexVecCount),
+    );
+}
+
+/// The `vec!` literal a `let` binds, or an error naming the shape that broke.
+fn letVecLiteral(
+    stmts: []const exprs.Statement,
+    expressions: []const exprs.Expr,
+    block: exprs.BlockExpr,
+    index: usize,
+) !exprs.VecLit {
+    if (index >= block.statements.len) return error.MissingVecLet;
+    const statement = switch (stmts[block.statements[index]].kind) {
+        .let => |declaration| declaration,
+        else => return error.ExpectedVecLet,
+    };
+    const init = statement.init orelse return error.ExpectedVecInitializer;
+    return switch (expressions[init].kind) {
+        .vec_lit => |literal| literal,
+        else => return error.ExpectedVecLit,
+    };
+}
+
+// `vec![e; n]` counts in `usize` whatever `e` is, and `n` is an ordinary Rust
+// expression: it is not part of any `Vec`'s type, so it has to be an IR node
+// the backend evaluates rather than a number this layer invented. The count
+// reaches the IR through the SAME sub-expression parser the element uses, so
+// a path, a call, or an arithmetic expression all arrive as what the source
+// wrote them as. A count that is a plain integer still folds, and both live in
+// one function here so neither arm can quietly absorb the other.
+test "a vec! repeat count that is not a constant lowers as an expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var g = graph.CrateGraph.init(alloc);
+    defer g.deinit();
+    const span: spine.Span = .{
+        .start_line = 1,
+        .start_col = 1,
+        .end_line = 1,
+        .end_col = 1,
+    };
+
+    const root_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .module,
+        .name = try alloc.dupe(u8, ""),
+        .span = span,
+        .visibility = .public,
+        .parent = null,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = root_id,
+        .kind = .root,
+        .name = "",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = false,
+        .span = span,
+        .items = &.{},
+        .attributes = &.{},
+    });
+    const fn_id = try g.symbol_table.add(.{
+        .id = 0,
+        .kind = .fn_,
+        .name = try alloc.dupe(u8, "build_counts"),
+        .span = span,
+        .visibility = .private,
+        .parent = root_id,
+        .resolved = null,
+        .renamed_to = null,
+        .attributes = &.{},
+    });
+
+    var exprs_list: std.ArrayListUnmanaged(exprs.Expr) = .empty;
+    defer exprs_list.deinit(alloc);
+    var stmts_list: std.ArrayListUnmanaged(exprs.Statement) = .empty;
+    defer stmts_list.deinit(alloc);
+    var pats_list: std.ArrayListUnmanaged(exprs.Pattern) = .empty;
+    defer pats_list.deinit(alloc);
+    var types_list: std.ArrayListUnmanaged(types.Type) = .empty;
+    defer types_list.deinit(alloc);
+    var bodies_list: std.ArrayListUnmanaged(bodies.BodyKind) = .empty;
+    defer bodies_list.deinit(alloc);
+    try bodies_list.append(alloc, .none);
+    try bodies_list.append(alloc, .{ .fn_ = .{
+        .params = &.{},
+        .ret = .{ .prim = .unit },
+        .body = 0,
+    } });
+
+    var ctx: Ctx = .{
+        .alloc = alloc,
+        .g = &g,
+        .exprs = &exprs_list,
+        .stmts = &stmts_list,
+        .pats = &pats_list,
+        .types = &types_list,
+        .bodies_list = &bodies_list,
+        .src =
+        \\fn build_counts() {
+        \\    let count = 3usize;
+        \\    let byte = 0u8;
+        \\    let dynamic = vec![byte; count];
+        \\    let arithmetic = vec![byte; count - 1];
+        \\    let folded = vec![byte; 4];
+        \\    let suffixed = vec![byte; 0x_FF_usize];
+        \\}
+        ,
+        .mod_id = root_id,
+    };
+    try std.testing.expect(try extractFunction(&ctx, fn_id));
+
+    const body = switch (exprs_list.items[bodies_list.items[fn_id].fn_.body].kind) {
+        .block => |block| block,
+        else => return error.ExpectedFunctionBlock,
+    };
+    try std.testing.expectEqual(@as(usize, 6), body.statements.len);
+
+    // A count that names something is an EXPRESSION the backend evaluates, so
+    // the node has to exist and it has to be the path the source wrote. A
+    // refusal here would have been an `.unsupported` node instead.
+    const dynamic = try letVecLiteral(stmts_list.items, exprs_list.items, body, 2);
+    try std.testing.expectEqual(@as(usize, 1), dynamic.elements.len);
+    try std.testing.expect(dynamic.elements[0] < exprs_list.items.len);
+    try std.testing.expect(exprs_list.items[dynamic.elements[0]].kind != .unsupported);
+    const dynamic_count = switch (dynamic.repeat orelse return error.ExpectedDynamicVecCount) {
+        .expression => |count| count,
+        .literal => return error.DynamicCountWasFolded,
+    };
+    try std.testing.expect(dynamic_count < exprs_list.items.len);
+    try std.testing.expect(exprs_list.items[dynamic_count].kind == .path);
+
+    // `count - 1` folds to nothing this parser reads as one token, and it
+    // arrives as the binary expression the source wrote rather than as
+    // anything invented to stand in for it.
+    const arithmetic = try letVecLiteral(stmts_list.items, exprs_list.items, body, 3);
+    const arithmetic_count = switch (arithmetic.repeat orelse return error.ExpectedArithmeticVecCount) {
+        .expression => |count| count,
+        .literal => return error.ArithmeticCountWasFolded,
+    };
+    try std.testing.expect(arithmetic_count < exprs_list.items.len);
+    const arithmetic_expr = switch (exprs_list.items[arithmetic_count].kind) {
+        .binary => |binary| binary,
+        else => return error.ArithmeticCountIsNotBinary,
+    };
+    try std.testing.expect(arithmetic_expr.op == exprs.BinaryOp.sub);
+
+    // The forms that always folded still fold, in this same function, so the
+    // expression arm above is not quietly absorbing them.
+    const folded = try letVecLiteral(stmts_list.items, exprs_list.items, body, 4);
+    try std.testing.expectEqual(
+        @as(u64, 4),
+        vecRepeatLiteralCount(folded.repeat orelse return error.ExpectedFoldedVecCount),
+    );
+    const suffixed = try letVecLiteral(stmts_list.items, exprs_list.items, body, 5);
+    try std.testing.expectEqual(
+        @as(u64, 255),
+        vecRepeatLiteralCount(suffixed.repeat orelse return error.ExpectedSuffixedVecCount),
     );
 }
 
@@ -9409,7 +12536,7 @@ test "lowerCall resolves associated constructor through generic type alias" {
         .is_crate = true,
         .is_extern = false,
         .span = span,
-        .items = &.{ fletcher_id, alias_id, caller_id },
+        .items = try alloc.dupe(spine.EntityId, &.{ fletcher_id, alias_id, caller_id }),
         .attributes = &.{},
     });
 

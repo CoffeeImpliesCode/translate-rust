@@ -184,3 +184,17 @@ test "AsciiSet removal clears high chunk bits without changing neighbouring cont
         try std.testing.expectEqualStrings(case.expected, writer.buffered());
     }
 }
+
+// Native Zig formatting reaches the translated Display hook without a runtime adapter.
+test "translated Display supports native formatting and writer failure" {
+    const encoded = translated.percent_encode("foo bar?", translated.NON_ALPHANUMERIC);
+    var buffer: [32]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writer.print("{f}", .{encoded});
+    try std.testing.expectEqualStrings("foo%20bar%3F", writer.buffered());
+
+    var short_buffer: [3]u8 = undefined;
+    var short_writer: std.Io.Writer = .fixed(&short_buffer);
+    try std.testing.expectError(error.WriteFailed, short_writer.print("{f}", .{encoded}));
+    try std.testing.expectEqualStrings("foo", short_writer.buffered());
+}

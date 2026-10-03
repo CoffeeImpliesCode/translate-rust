@@ -1,7 +1,30 @@
+//! Rust `Result` in both shapes a lowered crate reaches for: the tagged
+//! `Result(T, E)` union, and the free functions that serve a fieldless error
+//! enum which became a Zig error union.
+//!
+//! A source `Result<T, E>` reaches here in one of two shapes. A fieldless error
+//! enum lowers to a Zig error union, and the free functions below serve it: the
+//! union has no runtime value to call a method on, so `expect_error_union`
+//! reads the `Ok` payload out and `expect_error_union_err` maps a native error
+//! back to the source enum's own variant. An error type whose variants carry
+//! payloads lowers to the `Result(T, E)` union declared here, which has real
+//! methods.
+//!
+//! Neither shape owns anything on the caller's behalf except through the
+//! allocator the abandoning paths are given. Every function here runs on the
+//! calling thread, synchronously, and a mapper runs inside the call that
+//! reached it and may reenter the value it was handed.
+
 const std = @import("std");
 const alloc = @import("alloc.zig");
 const panic_probe = @import("panic_probe.zig");
 
+/// Apply a Rust closure or `Fn`-shaped callable to one payload of type
+/// `Input`, at compile time.
+///
+/// `mapper` is a function or a struct with `call`. It runs exactly once on the
+/// calling thread and receives `value` by value. Ownership follows the mapper's
+/// contract. This helper does not release it. The mapper may reenter its input.
 pub fn invokeMapper(
     comptime Input: type,
     mapper: anytype,
@@ -130,13 +153,40 @@ pub fn errorTagValue(comptime E: type, tag: anyerror) E {
     );
 }
 
+/// Rust `Result<T, E>` for an error type that cannot become a Zig error set,
+/// which is exactly an error type whose variants carry payloads.
+///
+/// The union owns whichever arm is active, and the caller owns that storage:
+/// this type has no `deinit`, so a `T` or `E` that owns memory is released by
+/// the caller, exactly once, after the payload has been taken out. `unwrap`,
+/// `expect`, `unwrap_err` and `expect_err` move the active payload out whole,
+/// so the storage that comes back is the storage the union was holding.
+///
+/// Assignment copies the handle, not its allocation. Release an owned payload
+/// once. Consuming extraction moves the selected payload and releases the
+/// discarded payload through `gpa`. Use the allocator that created its storage.
+/// The runtime never calls an arbitrary user method named `deinit`.
+///
+/// A mapper runs on the calling thread, synchronously, inside the call that
+/// reached it, and only for the arm it maps.
+///
 pub fn Result(comptime T: type, comptime E: type) type {
     return union(enum) {
+        /// The success arm, holding the source's `T`.
         Ok: T,
+        /// The failure arm, holding the source's `E`.
         Err: E,
 
         const Self = @This();
 
+        /// Return the `Ok` payload, or panic with the fixed message.
+        ///
+        /// The payload is moved out whole and is the caller's to release; a
+        /// release on this path would free bytes that are still live. On the
+        /// `Err` arm the error is released through `gpa` first, so a runtime
+        /// container the union owned is freed exactly once, and then the
+        /// process panics. `gpa` is borrowed for the call and never retained.
+        ///
         pub fn unwrap(self: Self, gpa: std.mem.Allocator) T {
             return switch (self) {
                 .Ok => |value| value,
@@ -147,9 +197,14 @@ pub fn Result(comptime T: type, comptime E: type) type {
             };
         }
 
-        pub fn unwrap_err(self: Self) E {
+        /// Move the `Err` payload to the caller, or release `Ok` and panic.
+        /// `gpa` must be compatible with the discarded runtime storage.
+        pub fn unwrap_err(self: Self, gpa: std.mem.Allocator) E {
             return switch (self) {
-                .Ok => @panic("Result.unwrap_err called on Ok"),
+                .Ok => |value| {
+                    releaseAbandonedPayload(gpa, value);
+                    @panic("Result.unwrap_err called on Ok");
+                },
                 .Err => |error_value| error_value,
             };
         }
@@ -158,6 +213,9 @@ pub fn Result(comptime T: type, comptime E: type) type {
         /// fixed one. The `Err` is consumed on the way into the panic, so an
         /// `Err` that owns storage is released first, exactly as `unwrap`
         /// does.
+        ///
+        /// `msg` is evaluated before the union is inspected, so a caller that
+        /// builds one has already paid for it when the panic fires.
         pub fn expect(self: Self, gpa: std.mem.Allocator, msg: []const u8) T {
             return switch (self) {
                 .Ok => |value| value,
@@ -171,6 +229,9 @@ pub fn Result(comptime T: type, comptime E: type) type {
         /// `unwrap_err` with a message the caller chose. The `Ok` payload is
         /// the one abandoned on the panicking arm here, so it is released
         /// first — the mirror of what `expect` does to an `Err`.
+        ///
+        /// `msg` is evaluated before the union is inspected, so a caller that
+        /// builds one has already paid for it when the panic fires.
         pub fn expect_err(self: Self, gpa: std.mem.Allocator, msg: []const u8) E {
             return switch (self) {
                 .Ok => |value| {
@@ -181,6 +242,7 @@ pub fn Result(comptime T: type, comptime E: type) type {
             };
         }
 
+        /// Whether the active arm is `Ok`. Changes nothing.
         pub fn is_ok(self: Self) bool {
             return switch (self) {
                 .Ok => true,
@@ -188,6 +250,7 @@ pub fn Result(comptime T: type, comptime E: type) type {
             };
         }
 
+        /// Whether the active arm is `Err`. Changes nothing.
         pub fn is_err(self: Self) bool {
             return switch (self) {
                 .Ok => false,
@@ -195,20 +258,35 @@ pub fn Result(comptime T: type, comptime E: type) type {
             };
         }
 
-        pub fn ok(self: Self) ?T {
+        /// Move the `Ok` payload to the caller, or release `Err` and return null.
+        /// This consumes the union. Release returned runtime storage once.
+        pub fn ok(self: Self, gpa: std.mem.Allocator) ?T {
             return switch (self) {
                 .Ok => |value| value,
-                .Err => null,
+                .Err => |error_value| {
+                    releaseAbandonedPayload(gpa, error_value);
+                    return null;
+                },
             };
         }
 
-        pub fn err(self: Self) ?E {
+        /// Move the `Err` payload to the caller, or release `Ok` and return null.
+        /// This consumes the union. Release returned runtime storage once.
+        pub fn err(self: Self, gpa: std.mem.Allocator) ?E {
             return switch (self) {
-                .Ok => null,
+                .Ok => |value| {
+                    releaseAbandonedPayload(gpa, value);
+                    return null;
+                },
                 .Err => |error_value| error_value,
             };
         }
 
+        /// Borrow the active payload instead of moving it out.
+        ///
+        /// The returned union names this value's own storage, so a read through
+        /// it is a read of the original and the borrow is invalidated once the
+        /// original is released or overwritten.
         pub fn as_ref(self: *const Self) Result(*const T, *const E) {
             return switch (self.*) {
                 .Ok => |*value| .{ .Ok = value },
@@ -216,6 +294,11 @@ pub fn Result(comptime T: type, comptime E: type) type {
             };
         }
 
+        /// Borrow the active payload mutably instead of moving it out.
+        ///
+        /// The returned union names this value's own storage, so a write
+        /// through it changes the original and the borrow is invalidated once
+        /// the original is released or overwritten.
         pub fn as_mut(self: *Self) Result(*T, *E) {
             return switch (self.*) {
                 .Ok => |*value| .{ .Ok = value },
@@ -223,6 +306,11 @@ pub fn Result(comptime T: type, comptime E: type) type {
             };
         }
 
+        /// Apply `mapper` to the `Ok` payload, leaving an `Err` untouched.
+        ///
+        /// The result's payload type is read from the mapper's own result, so
+        /// the mapper decides `T`. It runs once, on the calling thread, and
+        /// only on the `Ok` arm; the `Err` arm is moved through without it.
         pub fn map(self: Self, mapper: anytype) Result(
             @TypeOf(invokeMapper(T, mapper, @as(T, undefined))),
             E,
@@ -235,6 +323,11 @@ pub fn Result(comptime T: type, comptime E: type) type {
             };
         }
 
+        /// Apply `mapper` to the `Err` payload, leaving an `Ok` untouched.
+        ///
+        /// The result's error type is read from the mapper's own result, so the
+        /// mapper decides `E`. It runs once, on the calling thread, and only on
+        /// the `Err` arm; the `Ok` arm is moved through without it.
         pub fn map_err(self: Self, mapper: anytype) Result(
             T,
             @TypeOf(invokeMapper(E, mapper, @as(E, undefined))),
@@ -319,26 +412,57 @@ const PanicErrorMapper = struct {
     }
 };
 
+/// The `free` a release-observing allocator runs: it reports the release on
+/// stderr, then frees for real.
+///
+/// An abandoning arm panics, so the only evidence it leaves behind is what it
+/// wrote on the way out. Each body below runs in a child process whose stderr
+/// the parent matches against `required`, so an arm that released its payload
+/// before dying prints exactly this line and an arm that did not stays silent.
+fn announceReleaseFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+    std.heap.page_allocator.rawFree(memory, alignment, return_address);
+    std.debug.print("released the abandoned payload before the panic\n", .{});
+}
+
+/// A page-backed allocator whose every release announces itself on stderr.
+///
+/// `table` holds the spliced vtable, so it must outlive the allocator the
+/// call site keeps: a local the test body owns, never a temporary.
+fn announcingAllocator(table: *std.mem.Allocator.VTable) std.mem.Allocator {
+    table.* = std.heap.page_allocator.vtable.*;
+    table.free = announceReleaseFree;
+    return .{ .ptr = std.heap.page_allocator.ptr, .vtable = table };
+}
+
+/// A mapper that must never run: `map_err` over the `Ok` arm hands the success
+/// through without calling it. (`PanicValueMapper` above already traps the
+/// `Err` arm of `map`, so the `map` passthrough test reuses it.)
+const NeverMapErrMapper = struct {
+    pub fn call(_: *@This(), _: u8) u8 {
+        @panic("map_err called for Ok");
+    }
+};
+
 test "unit Result supports state, extraction, and option conversion" {
     const UnitResult = Result(void, DecodeError);
     const success: UnitResult = .{ .Ok = {} };
 
     try std.testing.expect(success.is_ok());
     try std.testing.expect(!success.is_err());
-    try std.testing.expect(success.ok() != null);
-    try std.testing.expect(success.err() == null);
+    try std.testing.expect(success.ok(std.testing.allocator) != null);
+    try std.testing.expect(success.err(std.testing.allocator) == null);
     _ = success.unwrap(std.testing.allocator);
 
     const failure: UnitResult = .{ .Err = .odd_length };
     try std.testing.expect(failure.is_err());
     try std.testing.expect(!failure.is_ok());
-    try std.testing.expect(failure.ok() == null);
-    const decode_error = failure.err() orelse return error.ExpectedError;
+    try std.testing.expect(failure.ok(std.testing.allocator) == null);
+    const decode_error = failure.err(std.testing.allocator) orelse return error.ExpectedError;
     switch (decode_error) {
         .odd_length => {},
         .invalid_character => return error.ExpectedOddLength,
     }
-    switch (failure.unwrap_err()) {
+    switch (failure.unwrap_err(std.testing.allocator)) {
         .odd_length => {},
         .invalid_character => return error.ExpectedOddLength,
     }
@@ -358,14 +482,14 @@ test "Result reference adapters borrow original value and error storage" {
     var error_result: Result(u16, DecodeError) = .{
         .Err = .{ .invalid_character = .{ .value = 'x', .index = 3 } },
     };
-    const error_ref = error_result.as_ref().unwrap_err();
+    const error_ref = error_result.as_ref().unwrap_err(std.testing.allocator);
     const original_index = switch (error_ref.*) {
         .odd_length => return error.ExpectedInvalidCharacter,
         .invalid_character => |detail| detail.index,
     };
     try std.testing.expectEqual(@as(usize, 3), original_index);
 
-    const error_mut = error_result.as_mut().unwrap_err();
+    const error_mut = error_result.as_mut().unwrap_err(std.testing.allocator);
     switch (error_mut.*) {
         .odd_length => return error.ExpectedInvalidCharacter,
         .invalid_character => |*detail| {
@@ -373,7 +497,7 @@ test "Result reference adapters borrow original value and error storage" {
             detail.index = 8;
         },
     }
-    const moved_error = error_result.unwrap_err();
+    const moved_error = error_result.unwrap_err(std.testing.allocator);
     const moved_detail = switch (moved_error) {
         .odd_length => return error.ExpectedInvalidCharacter,
         .invalid_character => |detail| detail,
@@ -398,7 +522,7 @@ test "map invokes function and captured callable only for Ok" {
         .Err = .{ .invalid_character = .{ .value = 'q', .index = 12 } },
     };
     const trap: PanicValueMapper = .{};
-    const unchanged = failure.map(trap).unwrap_err();
+    const unchanged = failure.map(trap).unwrap_err(std.testing.allocator);
     const unchanged_detail = switch (unchanged) {
         .odd_length => return error.ExpectedInvalidCharacter,
         .invalid_character => |detail| detail,
@@ -418,7 +542,7 @@ test "map_err invokes captured callable only for Err" {
     const failure: Result(u8, DecodeError) = .{
         .Err = .{ .invalid_character = .{ .value = 'g', .index = 14 } },
     };
-    try std.testing.expectEqual(@as(usize, 14), failure.map_err(callable).unwrap_err());
+    try std.testing.expectEqual(@as(usize, 14), failure.map_err(callable).unwrap_err(std.testing.allocator));
     try std.testing.expectEqual(@as(u8, 1), calls);
 
     const success: Result(u8, DecodeError) = .{ .Ok = 31 };
@@ -627,4 +751,251 @@ test "expect_error_union_err panics with the caller's message on the Ok path" {
             }
         }.body,
     });
+}
+
+test "Result option extraction releases discarded owners and moves retained owners" {
+    const gpa = std.testing.allocator;
+    const failed: Result(u8, alloc.String) = .{
+        .Err = try alloc.String.from_str(gpa, "discarded error"),
+    };
+    try std.testing.expect(failed.ok(gpa) == null);
+    const succeeded: Result(alloc.String, u8) = .{
+        .Ok = try alloc.String.from_str(gpa, "discarded success"),
+    };
+    try std.testing.expect(succeeded.err(gpa) == null);
+
+    const kept: Result(alloc.String, u8) = .{
+        .Ok = try alloc.String.from_str(gpa, "kept success"),
+    };
+    var success = kept.ok(gpa) orelse return error.ExpectedSuccess;
+    defer success.deinit(gpa);
+    try std.testing.expectEqualStrings("kept success", success.as_str());
+    try std.testing.expectEqual(@intFromPtr(kept.Ok.as_bytes().ptr), @intFromPtr(success.as_bytes().ptr));
+
+    const kept_error: Result(u8, alloc.String) = .{
+        .Err = try alloc.String.from_str(gpa, "kept error"),
+    };
+    var failure = kept_error.err(gpa) orelse return error.ExpectedError;
+    defer failure.deinit(gpa);
+    try std.testing.expectEqualStrings("kept error", failure.as_str());
+    try std.testing.expectEqual(@intFromPtr(kept_error.Err.as_bytes().ptr), @intFromPtr(failure.as_bytes().ptr));
+}
+
+test "unwrap_err releases the owned success payload before panicking" {
+    try panic_probe.expectPanic(.{
+        .case_name = "unwrap-err-owned-ok",
+        .expected = "Result.unwrap_err called on Ok",
+        .required = &.{"released owned success before panic"},
+        .body = struct {
+            fn body() void {
+                const vtable = comptime blk: {
+                    var table = std.heap.page_allocator.vtable.*;
+                    table.free = free;
+                    break :blk table;
+                };
+                const gpa: std.mem.Allocator = .{
+                    .ptr = std.heap.page_allocator.ptr,
+                    .vtable = &vtable,
+                };
+                const value: Result(alloc.String, u8) = .{
+                    .Ok = alloc.String.from_str(gpa, "owned success") catch unreachable,
+                };
+                _ = value.unwrap_err(gpa);
+            }
+
+            fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+                std.heap.page_allocator.rawFree(memory, alignment, return_address);
+                std.debug.print("released owned success before panic\n", .{});
+            }
+        }.body,
+    });
+}
+
+test "unwrap releases an owned Err payload before it panics" {
+    try panic_probe.expectPanic(.{
+        .case_name = "unwrap-owned-err",
+        .expected = "Result.unwrap called on Err",
+        .required = &.{"released the abandoned payload before the panic"},
+        .body = struct {
+            fn body() void {
+                var table: std.mem.Allocator.VTable = undefined;
+                const gpa = announcingAllocator(&table);
+                const failure: Result(u8, alloc.String) = .{
+                    .Err = alloc.String.from_str(gpa, "owned error") catch unreachable,
+                };
+                _ = failure.unwrap(gpa);
+            }
+        }.body,
+    });
+}
+
+test "expect releases an owned Err payload before it panics" {
+    try panic_probe.expectPanic(.{
+        .case_name = "expect-owned-err",
+        .expected = "Should read number at index 3",
+        .required = &.{"released the abandoned payload before the panic"},
+        .body = struct {
+            fn body() void {
+                var table: std.mem.Allocator.VTable = undefined;
+                const gpa = announcingAllocator(&table);
+                const failure: Result(u8, alloc.String) = .{
+                    .Err = alloc.String.from_str(gpa, "owned error") catch unreachable,
+                };
+                _ = failure.expect(gpa, runtimeMessage("Should read number at index {d}", 3));
+            }
+        }.body,
+    });
+}
+
+test "expect_err releases an owned Ok payload before it panics" {
+    try panic_probe.expectPanic(.{
+        .case_name = "expect-err-owned-ok",
+        .expected = "Should not be Ok at index 0",
+        .required = &.{"released the abandoned payload before the panic"},
+        .body = struct {
+            fn body() void {
+                var table: std.mem.Allocator.VTable = undefined;
+                const gpa = announcingAllocator(&table);
+                const success: Result(alloc.String, u8) = .{
+                    .Ok = alloc.String.from_str(gpa, "owned success") catch unreachable,
+                };
+                _ = success.expect_err(gpa, runtimeMessage("Should not be Ok at index {d}", 0));
+            }
+        }.body,
+    });
+}
+
+test "expect_error_union_err releases an owned Ok payload before it panics" {
+    // The native-union twin of the tagged union's `unwrap_err`: the `Ok` arm
+    // the caller abandons still owns its storage, so it is released on the
+    // way into the panic and the payload the union was holding is freed
+    // exactly once.
+    try panic_probe.expectPanic(.{
+        .case_name = "expect-error-union-err-owned-ok",
+        .expected = "Should not be Ok at index 0",
+        .required = &.{"released the abandoned payload before the panic"},
+        .body = struct {
+            fn body() void {
+                var table: std.mem.Allocator.VTable = undefined;
+                const gpa = announcingAllocator(&table);
+                const success: anyerror!alloc.String = alloc.String.from_str(gpa, "owned success") catch unreachable;
+                _ = expect_error_union_err(Fault, gpa, success, runtimeMessage("Should not be Ok at index {d}", 0));
+            }
+        }.body,
+    });
+}
+
+test "map hands an untouched owned Err through without releasing it" {
+    // The `Err` arm of `map` is a move, not a release: the payload that
+    // reaches the caller is the same allocation the union held, the mapper
+    // never ran, and the caller's own release below is the only one.
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = tracking.allocator();
+
+    const carried: Result(u8, alloc.String) = .{
+        .Err = try alloc.String.from_str(gpa, "carried error"),
+    };
+    const address = @intFromPtr(carried.Err.as_bytes().ptr);
+    const trap: PanicValueMapper = .{};
+    const passed = carried.map(trap);
+    try std.testing.expect(passed.is_err());
+
+    var taken = passed.unwrap_err(gpa);
+    try std.testing.expectEqualStrings("carried error", taken.as_str());
+    try std.testing.expectEqual(address, @intFromPtr(taken.as_bytes().ptr));
+    const before_release = tracking.deallocations;
+    taken.deinit(gpa);
+    try std.testing.expectEqual(before_release + 1, tracking.deallocations);
+}
+
+test "map_err hands an untouched owned Ok through without releasing it" {
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = tracking.allocator();
+
+    const carried: Result(alloc.String, u8) = .{
+        .Ok = try alloc.String.from_str(gpa, "carried success"),
+    };
+    const address = @intFromPtr(carried.Ok.as_bytes().ptr);
+    const trap: NeverMapErrMapper = .{};
+    const passed = carried.map_err(trap);
+    try std.testing.expect(passed.is_ok());
+
+    var taken = passed.unwrap(gpa);
+    try std.testing.expectEqualStrings("carried success", taken.as_str());
+    try std.testing.expectEqual(address, @intFromPtr(taken.as_bytes().ptr));
+    const before_release = tracking.deallocations;
+    taken.deinit(gpa);
+    try std.testing.expectEqual(before_release + 1, tracking.deallocations);
+}
+
+test "a borrow of a runtime Result reaches the caller's storage and releases nothing" {
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = tracking.allocator();
+
+    // `as_ref` hands back a second union whose payloads are pointers into the
+    // caller's own union. Consuming the borrowed union (`unwrap` on it)
+    // releases nothing — the payload is a borrow, and the generic release
+    // does not follow one — while the caller's own union keeps its release,
+    // which frees exactly once.
+    var held: Result(alloc.String, u8) = .{
+        .Ok = try alloc.String.from_str(gpa, "borrowed success"),
+    };
+    const address = @intFromPtr(held.Ok.as_bytes().ptr);
+    const borrowed = held.as_ref();
+
+    const before_borrow_release = tracking.deallocations;
+    const read = borrowed.unwrap(gpa);
+    try std.testing.expectEqualStrings("borrowed success", read.as_str());
+    try std.testing.expectEqual(address, @intFromPtr(read.as_bytes().ptr));
+    alloc.dropTemporary(gpa, &borrowed);
+    try std.testing.expectEqual(before_borrow_release, tracking.deallocations);
+
+    const before_owner_release = tracking.deallocations;
+    alloc.dropTemporary(gpa, &held);
+    try std.testing.expectEqual(before_owner_release + 1, tracking.deallocations);
+}
+
+test "a moved runtime Result leaves its handle empty so the scope release frees nothing" {
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = tracking.allocator();
+
+    // The shape the backend emits for an owned payload moved out of a `Result`
+    // binding: `takeOwned` transfers the active arm and empties the handle in
+    // place, so the `defer dropTemporary` the frame armed over it finds
+    // nothing to free, and the moved descriptor is the payload's only owner.
+    var error_held: Result(u8, alloc.String) = .{
+        .Err = try alloc.String.from_str(gpa, "moved error"),
+    };
+    const error_address = @intFromPtr(error_held.Err.as_bytes().ptr);
+    const moved_error = alloc.takeOwned(Result(u8, alloc.String), &error_held);
+
+    const before_error_release = tracking.deallocations;
+    alloc.dropTemporary(gpa, &error_held);
+    try std.testing.expectEqual(before_error_release, tracking.deallocations);
+    try std.testing.expect(error_held.Err.is_empty());
+
+    var taken_error = moved_error.unwrap_err(gpa);
+    try std.testing.expectEqualStrings("moved error", taken_error.as_str());
+    try std.testing.expectEqual(error_address, @intFromPtr(taken_error.as_bytes().ptr));
+    const before_taken_error_release = tracking.deallocations;
+    taken_error.deinit(gpa);
+    try std.testing.expectEqual(before_taken_error_release + 1, tracking.deallocations);
+
+    var success_held: Result(alloc.String, u8) = .{
+        .Ok = try alloc.String.from_str(gpa, "moved success"),
+    };
+    const success_address = @intFromPtr(success_held.Ok.as_bytes().ptr);
+    const moved_success = alloc.takeOwned(Result(alloc.String, u8), &success_held);
+
+    const before_success_release = tracking.deallocations;
+    alloc.dropTemporary(gpa, &success_held);
+    try std.testing.expectEqual(before_success_release, tracking.deallocations);
+    try std.testing.expect(success_held.Ok.is_empty());
+
+    var taken_success = moved_success.ok(gpa) orelse return error.ExpectedSuccess;
+    try std.testing.expectEqualStrings("moved success", taken_success.as_str());
+    try std.testing.expectEqual(success_address, @intFromPtr(taken_success.as_bytes().ptr));
+    const before_taken_success_release = tracking.deallocations;
+    taken_success.deinit(gpa);
+    try std.testing.expectEqual(before_taken_success_release + 1, tracking.deallocations);
 }

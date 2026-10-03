@@ -1,4 +1,42 @@
-//! Allocation-free Rust `std::io` compatibility primitives.
+//! Rust `std::io` compatibility primitives: borrowed errors, exact-read and
+//! write-all loops over caller-owned receivers, the buffered-read surface
+//! (`fill_buf` / `consume` / `BufReader`), and borrowed handles to concrete
+//! `Read`, `Write` and `Error` implementors.
+//!
+//! Nothing here opens a file, allocates a buffer, or stores an allocator of
+//! its own, but not every call is allocation-free: `write_all` and `DynWrite`
+//! take an allocator because a receiver that is a caller-owned `Vec(u8)` grows
+//! through it. Every other receiver writes into storage the caller already
+//! owns, so those paths allocate nothing. An allocation failure on a vector
+//! receiver surfaces as `error.OutOfMemory`, never as an invented I/O
+//! category.
+//!
+//! Every type borrows. `SliceReader`, `SliceWriter`, `Cursor`, `DynRead`,
+//! `DynWrite` and `DynError` own nothing and free nothing; their pointers and
+//! slices must stay alive and unmodified for as long as a handle names them.
+//! `DynWrite` additionally borrows its allocator, and reaches it only when a
+//! write appends to a caller-owned vector.
+//!
+//! `BufReader` is the one type here that owns storage: it holds an 8 KiB
+//! window inline, beside the inner reader it was handed. That storage is
+//! bounded and fixed at construction, so the reader itself allocates nothing
+//! and has no allocator and no release step. A read that its inner reader
+//! performs may still allocate inside that reader, which is that reader's
+//! own business and not a property of this one.
+//!
+//! A buffer `fill_buf` hands back is a BORROW OF THAT INLINE WINDOW, not a
+//! buffer the caller receives ownership of: it points into the receiver's own
+//! storage, and this module never allocates it and never releases it. So the
+//! loop shape adler's `adler32` uses — `fill_buf`, exit on an empty buffer
+//! without a matching `consume` — releases nothing, because nothing is owned,
+//! and drops nothing, because the bytes never left the reader. The borrow is
+//! valid until the next operation that mutates the receiver, and a later refill
+//! writes through that same storage, which is what invalidates it.
+//!
+//! `Error` borrows its `explicit_message` and owns nothing. Its vtable
+//! dispatches on the calling thread, synchronously, inside the call that
+//! reaches it, and `DynError` adds no lifetime of its own to the borrowed
+//! error.
 
 const std = @import("std");
 const Result = @import("result.zig").Result;
@@ -9,6 +47,12 @@ const Result = @import("result.zig").Result;
 const io = @This();
 
 /// Rust's non-exhaustive categories for I/O failures.
+///
+/// A tag names a failure class, not a message. Every tag has one stable
+/// default message, which is what `Error.format` renders when
+/// `Error.explicit_message` is `null`. A receiver that reports one of these
+/// tags keeps it: `read_exact` and `write_all` never rewrite a concrete
+/// failure into another category, and retry only `Interrupted`.
 pub const ErrorKind = enum {
     NotFound,
     PermissionDenied,
@@ -101,12 +145,25 @@ pub const ErrorKind = enum {
     }
 };
 
-/// A borrowed I/O error with a Rust-compatible category and message.
+/// A borrowed I/O failure with a Rust-compatible category and message.
+///
+/// `Error` owns nothing: `explicit_message` is a slice the caller keeps and
+/// must outlive this value. Copying an `Error` copies that pointer, so a copy
+/// names the same message and needs no separate release.
 pub const Error = struct {
+    /// The Rust `ErrorKind` this failure stands for, preserved through every
+    /// operation that carries an `Error`.
     error_kind: ErrorKind,
+    /// Message text to render, borrowed from the caller. `null` means the
+    /// failure carries no message of its own, and `format` renders the stable
+    /// default for `error_kind` instead. It never means "no error": the
+    /// absence of a `Result` wrapper is what carries that.
     explicit_message: ?[]const u8 = null,
 
     /// Construct an error without copying the caller-borrowed message.
+    ///
+    /// `message` is borrowed, not retained as owned storage: it must stay alive
+    /// and unmodified for as long as the returned `Error` is read.
     pub fn new(error_kind: ErrorKind, message: []const u8) @This() {
         return .{
             .error_kind = error_kind,
@@ -114,7 +171,8 @@ pub const Error = struct {
         };
     }
 
-    /// Construct an error using the stable message for its category.
+    /// Construct an error using the stable message for its category, with
+    /// `explicit_message` left `null`.
     pub fn from_kind(error_kind: ErrorKind) @This() {
         return .{ .error_kind = error_kind };
     }
@@ -124,8 +182,15 @@ pub const Error = struct {
         return self.error_kind;
     }
 
-    /// Write the explicit message, or the category's stable default.
-    pub fn fmt(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    /// Rust `Display for io::Error`: write the explicit message, or the
+    /// category's stable default when `explicit_message` is `null`.
+    ///
+    /// This is the native Zig `{f}` hook as well, so the same receiver serves
+    /// `std.Io.Writer.print` and `r2z.format.write`. `writer` is borrowed for
+    /// the call, retains nothing, and its own failure — including a short
+    /// buffer — is returned unchanged, with the bytes written before it left
+    /// in place.
+    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll(self.explicit_message orelse self.error_kind.default_message());
     }
 };
@@ -162,9 +227,17 @@ fn hasMethod(comptime C: type, comptime name: []const u8) bool {
 
 /// Read until `bytes` is full, retrying only interrupted operations.
 ///
-/// A caller-owned byte-slice descriptor is advanced as it is copied, and it
-/// is advanced before the short read becomes `UnexpectedEof`, so the
-/// descriptor is drained on the failure path too.
+/// `reader` is a caller-owned object: an object with a `read` method, or a
+/// byte-slice descriptor, which is advanced in place as its bytes are copied
+/// and is therefore empty when the source runs out. `bytes` is the caller's
+/// storage and is written in place.
+///
+/// A short read is not an error: the loop keeps going. On the failing path
+/// every byte already transferred stays in `bytes[0..filled]`, the rest of
+/// `bytes` keeps whatever the caller passed, and the reader has already
+/// consumed exactly those bytes. `error.UnexpectedEof` means the source ran
+/// out at a short read; any other concrete category is returned unchanged.
+/// Allocating nothing.
 pub fn read_exact(reader: anytype, bytes: []u8) Result(void, Error) {
     var filled: usize = 0;
     while (filled < bytes.len) {
@@ -209,13 +282,75 @@ fn readChunk(reader: anytype, bytes: []u8) Result(usize, Error) {
     }
 }
 
+/// Borrow the reader's currently buffered bytes, Rust `BufRead::fill_buf`.
+///
+/// `reader` is a caller-owned object reached through a mutable handle — a
+/// `SliceReader`, a `Cursor(T)`, a `BufReader(R)`, or a byte-slice descriptor
+/// — and is never copied by value, so the borrow names the caller's own
+/// storage and `consume` advances that same storage. A byte-slice descriptor
+/// hands back its whole unread remainder, which is what
+/// `impl BufRead for &[u8]` does; the reader types hand back the window they
+/// already hold and reach their inner reader only when that window is empty.
+///
+/// The returned slice is a BORROW the runtime owns and lends out, never a
+/// buffer the caller owns: it aliases the receiver's own storage — the caller's
+/// slice, or the reader's inline window — and the runtime neither allocates it
+/// nor releases it. There is therefore nothing for a caller to free, and a
+/// loop that takes the window and exits WITHOUT calling `consume` — the shape
+/// adler's `adler32` has before it returns on an empty buffer — leaks nothing
+/// and loses nothing: the bytes stay in the receiver, and the next `fill_buf`
+/// hands back the same window from the same address.
+///
+/// The borrow stays valid until the next operation that mutates that receiver.
+/// A later refill writes through that same storage, so an already-handed-out
+/// slice then reads the NEW window's bytes. That is the invalidation the Rust
+/// borrow checker reports statically, and the reason a caller must be done with
+/// a window before it consumes, reads, or refills. Allocating nothing.
+pub fn fill_buf(reader: anytype) Result([]const u8, Error) {
+    if (comptime isSliceDescriptor(@TypeOf(reader))) {
+        return .{ .Ok = reader.* };
+    } else {
+        return reader.fill_buf();
+    }
+}
+
+/// Mark `count` of the reader's buffered bytes as read, Rust
+/// `BufRead::consume`.
+///
+/// `reader` is reached through a mutable handle exactly as `fill_buf` is, so
+/// the advance lands on the caller's own storage. The count is not clamped to
+/// what is buffered. A byte-slice descriptor advances by slicing, so a count
+/// past its end panics the way Rust's own `&self[amt..]` does, and `Cursor`
+/// adds to its position, which may therefore move past the end of its input.
+/// Allocating nothing.
+pub fn consume(reader: anytype, count: usize) void {
+    if (comptime isSliceDescriptor(@TypeOf(reader))) {
+        if (count > reader.*.len) {
+            std.debug.panic("io.consume: count {d} exceeds the {d} bytes buffered", .{
+                count,
+                reader.*.len,
+            });
+        }
+        reader.* = reader.*[count..];
+    } else {
+        reader.consume(count);
+    }
+}
+
 /// Write until `bytes` is consumed, retrying only interrupted operations.
 ///
 /// Only a caller-owned byte vector grows, and it grows through the allocator
 /// threaded in here; every other receiver writes into storage the caller
-/// already owns, so a successful run allocates nothing. A vector that cannot
-/// grow is a genuine allocation failure and surfaces as `error.OutOfMemory`,
-/// never as a fabricated I/O category.
+/// already owns, so those paths allocate nothing. A vector that cannot grow is
+/// a genuine allocation failure and surfaces as `error.OutOfMemory`, never as
+/// a fabricated I/O category. `gpa` is borrowed for the call and is never
+/// retained; a vector receiver must therefore outlive this call only.
+///
+/// A short write is not an error: the loop keeps going. On the failing path
+/// every byte already written stays where the receiver put it, the receiver
+/// has consumed exactly those bytes of `bytes`, and `error.WriteZero` means
+/// the receiver accepted nothing while `bytes` still had bytes left. Any
+/// other concrete category is returned unchanged.
 pub fn write_all(
     gpa: std.mem.Allocator,
     writer: anytype,
@@ -270,8 +405,16 @@ fn writeChunk(
 }
 
 /// A borrowed, cursor-based reader over an immutable byte slice.
+///
+/// `SliceReader` owns nothing and frees nothing: `input` is borrowed and must
+/// stay alive and unmodified for as long as the reader is used. A copy is a
+/// second cursor over the same input, not a second owner, so advancing either
+/// copy leaves the other where it was and neither needs a release.
 pub const SliceReader = struct {
+    /// The borrowed source. Its length bounds `position`.
     input: []const u8,
+    /// Bytes already consumed. `read` keeps it at or below `input.len`; a
+    /// value built by hand must satisfy that before the first `read`.
     position: usize = 0,
 
     /// Borrow `input` without allocating or copying it.
@@ -280,6 +423,12 @@ pub const SliceReader = struct {
     }
 
     /// Consume at most `bytes.len` bytes and return the count consumed.
+    ///
+    /// `position` advances by that count, and a read at the end of the input
+    /// returns `.Ok = 0` rather than a failure; end of input is the caller's
+    /// to detect, and `read_exact` reports it as `UnexpectedEof`. On success
+    /// `bytes[0..count]` holds the transferred bytes and the rest keeps
+    /// whatever the caller passed.
     pub fn read(self: *@This(), bytes: []u8) Result(usize, Error) {
         std.debug.assert(self.position <= self.input.len);
         const available = self.input.len - self.position;
@@ -288,11 +437,47 @@ pub const SliceReader = struct {
         self.position += count;
         return .{ .Ok = count };
     }
+
+    /// Borrow every byte not yet consumed, Rust `BufRead::fill_buf`.
+    ///
+    /// The window is the reader's own unread remainder of `input` and this
+    /// call does not advance `position`; `consume` is what advances it. An
+    /// exhausted reader returns an empty slice rather than a failure, which
+    /// is how end of input reaches a caller. The borrow is invalidated by the
+    /// next operation that mutates this reader. Allocating nothing.
+    pub fn fill_buf(self: *@This()) Result([]const u8, Error) {
+        std.debug.assert(self.position <= self.input.len);
+        return .{ .Ok = self.input[self.position..] };
+    }
+
+    /// Mark `count` bytes of the window read, Rust `BufRead::consume`.
+    ///
+    /// `count` is not clamped to the unread remainder: a count past the end
+    /// panics, which is what `&self[amt..]` does in Rust. Allocating nothing.
+    pub fn consume(self: *@This(), count: usize) void {
+        std.debug.assert(self.position <= self.input.len);
+        const available = self.input.len - self.position;
+        if (count > available) {
+            std.debug.panic("io.SliceReader.consume: count {d} exceeds the {d} unread bytes", .{
+                count,
+                available,
+            });
+        }
+        self.position += count;
+    }
 };
 
 /// A borrowed, cursor-based writer over a mutable byte slice.
+///
+/// `SliceWriter` owns nothing and frees nothing: `output` is the caller's
+/// storage and must stay alive for as long as the writer is used. A copy is a
+/// second cursor over the same storage, not a second owner, so writes through
+/// one are visible through the other and neither needs a release.
 pub const SliceWriter = struct {
+    /// The caller's destination. Its length bounds `position`.
     output: []u8,
+    /// Bytes already written. `write` keeps it at or below `output.len`; a
+    /// value built by hand must satisfy that before the first `write`.
     position: usize = 0,
 
     /// Borrow `output` without allocating or copying it.
@@ -301,6 +486,11 @@ pub const SliceWriter = struct {
     }
 
     /// Consume at most the remaining output capacity and return the count written.
+    ///
+    /// A full destination reports `.Ok = 0` rather than a failure, which
+    /// `write_all` turns into `WriteZero`. Bytes past the destination are never
+    /// written and are dropped; `bytes` is borrowed for the call and is not
+    /// retained.
     pub fn write(self: *@This(), bytes: []const u8) Result(usize, Error) {
         std.debug.assert(self.position <= self.output.len);
         const available = self.output.len - self.position;
@@ -315,12 +505,24 @@ pub const SliceWriter = struct {
 /// The source is held by value beside a read position, so a cursor over an
 /// owned array allocates nothing and a cursor over a borrowed slice leaves the
 /// borrow untouched.
+///
+/// `T` is either `[N]u8`, which the cursor holds inline and therefore owns, or
+/// a byte slice, which the cursor borrows and never frees. The borrowed form is
+/// a second view of storage the caller still owns, so the slice must stay
+/// alive and unmodified for as long as the cursor is used; the owned form
+/// needs no release because nothing was allocated.
 pub fn Cursor(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The source: owned inline for an array type, borrowed for a slice.
         inner: T,
-        position: usize = 0,
+        /// Bytes already consumed, as Rust's `Cursor::position`: a `u64`,
+        /// because `consume` adds to it and may carry it past the end of the
+        /// source. Reads clamp it to the source length, exactly as Rust's
+        /// `Cursor::split` does, so a position beyond the end reads as EOF
+        /// instead of producing an out-of-range index.
+        position: u64 = 0,
 
         /// Take ownership of, or borrow, the cursor's source.
         pub fn init(inner: T) Self {
@@ -328,13 +530,47 @@ pub fn Cursor(comptime T: type) type {
         }
 
         /// Consume at most the unread bytes left in the cursor's source.
+        ///
+        /// A read at the end of the source returns `.Ok = 0` rather than a
+        /// failure; `read_exact` reports that as `UnexpectedEof`. On success
+        /// `bytes[0..count]` holds the transferred bytes and the rest keeps
+        /// whatever the caller passed. Allocating nothing.
         pub fn read(self: *Self, bytes: []u8) Result(usize, Error) {
             const source = self.asBytes();
-            std.debug.assert(self.position <= source.len);
-            const count = @min(bytes.len, source.len - self.position);
-            @memcpy(bytes[0..count], source[self.position..][0..count]);
+            const offset = self.readOffset(source.len);
+            const count = @min(bytes.len, source.len - offset);
+            @memcpy(bytes[0..count], source[offset..][0..count]);
             self.position += count;
             return .{ .Ok = count };
+        }
+
+        /// Borrow every byte not yet consumed, Rust `BufRead::fill_buf`.
+        ///
+        /// The window is this cursor's own unread remainder of its source and
+        /// the call does not advance `position`; `consume` is what advances
+        /// it. A position past the end of the source — which `consume` can
+        /// produce — returns an empty slice rather than a failure, which is
+        /// how end of input reaches a caller. The borrow is invalidated by the
+        /// next operation that mutates this cursor. Allocating nothing.
+        pub fn fill_buf(self: *Self) Result([]const u8, Error) {
+            const source = self.asBytes();
+            return .{ .Ok = source[self.readOffset(source.len)..] };
+        }
+
+        /// Mark `count` bytes of the window read, Rust `BufRead::consume`.
+        ///
+        /// The count is added to `position` without being clamped, which is
+        /// what Rust's `set_position(self.position() + amt as u64)` does: a
+        /// `count` larger than the window carries the position past the end of
+        /// the source, and later reads then report EOF. Allocating nothing.
+        pub fn consume(self: *Self, count: usize) void {
+            self.position +|= @as(u64, count);
+        }
+
+        /// The position as a source index, clamped the way `Cursor::split`
+        /// clamps it, so a position beyond the source never indexes past it.
+        fn readOffset(self: *const Self, source_len: usize) usize {
+            return @intCast(@min(self.position, @as(u64, source_len)));
         }
 
         fn asBytes(self: *const Self) []const u8 {
@@ -349,20 +585,190 @@ pub fn Cursor(comptime T: type) type {
     };
 }
 
+/// The type `innerReceiver` reaches this reader's inner source through. A
+/// byte-slice source is a descriptor that has to advance in place, so it is
+/// passed by address; an `R` that is already a borrow is passed as that
+/// borrow; anything else is reached through a pointer to the value held here.
+fn BufReaderInner(comptime Reader: type) type {
+    if (@typeInfo(Reader) == .pointer) {
+        if (@typeInfo(Reader).pointer.size == .slice) return *Reader;
+        return Reader;
+    }
+    return *Reader;
+}
+
+/// Rust `io::BufReader<R>` with the default 8 KiB window, the receiver the
+/// module's `fill_buf` and `consume` work through on a `Read`.
+///
+/// This is the one type in the module that owns storage: `buffer` is a fixed
+/// 8 KiB window held inline, beside the inner reader `init` was handed. It
+/// holds no allocator, needs no release, and allocates nothing itself; a read
+/// its inner reader performs may still allocate inside that reader, which is
+/// that reader's own business.
+///
+/// `R` is the inner source. An `R` held by value — an array, a slice, or
+/// another reader struct — is this reader's own private copy, so advancing it
+/// leaves the caller's original where it was. An `R` that is a pointer is a
+/// borrow: every read reaches through it, so the caller's reader holds the
+/// read position and must stay alive and unmodified for as long as this
+/// reader is used.
+///
+/// Construction is in-place: `init` fills the caller's storage directly, so
+/// the window is never zeroed and never copied into place, and the reader
+/// holds no pointer to itself. The window's bytes are undefined until a refill
+/// initializes them, and only `fill_buf`'s window and `filled` describe them.
+///
+/// The failure residue is the module's: a refill that fails leaves an empty
+/// window — never a wedged reader — and returns the inner reader's own
+/// category and message unchanged. Bytes the inner reader wrote into the
+/// window before failing are not served, because `Result`'s failure arm
+/// carries no count to say how many there were.
+pub fn BufReader(comptime R: type) type {
+    return struct {
+        const Self = @This();
+
+        /// Rust's `DEFAULT_BUF_SIZE`, the capacity `BufReader::new` installs.
+        pub const default_buffer_len: usize = 8 * 1024;
+
+        /// The inner source: this reader's own copy when `R` is a value, or
+        /// the borrow it was handed when `R` is a pointer.
+        inner: R,
+        /// The refill window. Its bytes are undefined until a refill
+        /// initializes `buffer[0..filled]`.
+        buffer: [default_buffer_len]u8 = undefined,
+        /// Bytes of `buffer` the last refill initialized. Always at or above
+        /// `pos`; a failed refill leaves it at zero.
+        filled: usize = 0,
+        /// Offset into `buffer` of the first byte not yet consumed. Always at
+        /// or below `filled`.
+        pos: usize = 0,
+
+        /// Hold `inner` beside a fresh, empty window, allocating nothing.
+        ///
+        /// The window is left undefined rather than zeroed, and this reader
+        /// stores no pointer to itself, so it is constructed in the caller's
+        /// own storage with no copy of the window.
+        pub fn init(inner: R) Self {
+            return .{ .inner = inner };
+        }
+
+        /// Consume at most `bytes.len` bytes, Rust `BufReader`'s `Read`.
+        ///
+        /// When nothing is buffered and `bytes` is at least as large as the
+        /// whole window, the window is discarded and the inner reader is read
+        /// straight into `bytes`, which is what Rust does: a copy through the
+        /// window would not save an inner read at that size. Any other read
+        /// copies only what the window holds right now and advances `pos` by
+        /// exactly that much.
+        ///
+        /// A read that returns `.Ok = 0` is a value, not a failure, and
+        /// `read_exact` is what turns it into `UnexpectedEof`.
+        pub fn read(self: *Self, bytes: []u8) Result(usize, Error) {
+            if (self.pos == self.filled and bytes.len >= default_buffer_len) {
+                self.pos = 0;
+                self.filled = 0;
+                return readChunk(self.innerReceiver(), bytes);
+            }
+            const window = switch (self.fill_buf()) {
+                .Ok => |borrowed| borrowed,
+                .Err => |failure| return .{ .Err = failure },
+            };
+            const count = @min(bytes.len, window.len);
+            @memcpy(bytes[0..count], window[0..count]);
+            self.consume(count);
+            return .{ .Ok = count };
+        }
+
+        /// Borrow the buffered bytes, Rust `BufReader`'s `BufRead::fill_buf`.
+        ///
+        /// The window is served from what is already buffered and the inner
+        /// reader is reached only when there is nothing left in it. The
+        /// returned slice points into `buffer` itself, so it is a view of this
+        /// reader's own storage rather than a copy, and it stays valid until
+        /// the next operation that mutates this reader.
+        ///
+        /// A refill that fails returns the inner reader's own category and
+        /// message unchanged and leaves an empty window, so the next call
+        /// reaches the inner reader again rather than reporting end of input.
+        /// Allocating nothing.
+        pub fn fill_buf(self: *Self) Result([]const u8, Error) {
+            if (self.pos >= self.filled) {
+                switch (readChunk(self.innerReceiver(), self.buffer[0..])) {
+                    .Ok => |count| {
+                        if (count > default_buffer_len) {
+                            return .{
+                                .Err = Error.new(
+                                    .InvalidData,
+                                    "reader returned more bytes than requested",
+                                ),
+                            };
+                        }
+                        self.pos = 0;
+                        self.filled = count;
+                    },
+                    .Err => |failure| {
+                        self.pos = 0;
+                        self.filled = 0;
+                        return .{ .Err = failure };
+                    },
+                }
+            }
+            return .{ .Ok = self.buffer[self.pos..self.filled] };
+        }
+
+        /// Mark `count` buffered bytes read, Rust `BufReader`'s
+        /// `BufRead::consume`.
+        ///
+        /// The advance stops at what is buffered, exactly as Rust's
+        /// `cmp::min(self.pos + amt, self.filled)` does, so a count larger
+        /// than the window consumes the window and no more. Allocating
+        /// nothing.
+        pub fn consume(self: *Self, count: usize) void {
+            self.pos = @min(self.pos +| count, self.filled);
+        }
+
+        fn innerReceiver(self: *Self) BufReaderInner(R) {
+            if (@typeInfo(R) == .pointer) {
+                if (@typeInfo(R).pointer.size != .slice) return self.inner;
+            }
+            return &self.inner;
+        }
+    };
+}
+
 /// A borrowed handle to a concrete `std::io::Read` implementor, the fat
 /// pointer Rust's `&mut dyn Read` lowers to. The handle owns nothing and every
 /// call reaches the caller's own reader through the erased pointer, so read
 /// position and error state live exactly where the caller left them.
+///
+/// `reader` must stay alive and unmodified for as long as a handle names it;
+/// nothing checks that, and a handle to a released reader still dispatches.
+/// Copying a handle copies the pointer, so a copy is a second alias of one
+/// reader and not a second owner; both copies advance the same read position.
+///
+/// Every dispatch runs on the calling thread, synchronously, inside the call
+/// that reaches it, and a receiver may reenter the handle that called it.
 pub const DynRead = struct {
+    /// Erased pointer to the caller's reader, cast back with its concrete type
+    /// on every call.
     ptr: *anyopaque,
+    /// The dispatch table `init` built for the concrete type.
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Called with the erased pointer as `context` and the caller's
+        /// destination. It must return how many bytes it wrote into
+        /// `bytes[0..count]` and never write past `bytes.len`.
         read: *const fn (context: *anyopaque, bytes: []u8) Result(usize, Error),
     };
 
     /// Bind a handle to `reader`, which must publish `read` or be a
     /// caller-owned byte-slice descriptor.
+    ///
+    /// `reader` is borrowed, not captured by value: the handle stores its
+    /// address, so a byte-slice descriptor is advanced in place exactly as it
+    /// would be without the handle. The handle is valid for as long as
+    /// `reader` is, and needs no release.
     pub fn init(reader: anytype) DynRead {
         const Concrete = std.meta.Child(@TypeOf(reader));
         if (comptime !hasMethod(Concrete, "read") and !isSliceDescriptor(@TypeOf(reader))) {
@@ -382,11 +788,20 @@ pub const DynRead = struct {
     }
 
     /// Consume at most `bytes.len` bytes from the caller's reader.
+    ///
+    /// `bytes` is the caller's storage, written in place; the reader's own
+    /// state advances by the count returned. A count of zero is a value, not a
+    /// failure, and `read_exact` is what turns it into `UnexpectedEof`.
     pub inline fn read(self: DynRead, bytes: []u8) Result(usize, Error) {
         return self.vtable.read(self.ptr, bytes);
     }
 
     /// Fill `bytes` from the caller's reader, retrying only interruption.
+    ///
+    /// The failure residue is the module's: on the failing path every byte
+    /// already transferred stays in `bytes[0..filled]`, the rest keeps
+    /// whatever the caller passed, and the reader has consumed exactly those
+    /// bytes.
     pub fn read_exact(self: DynRead, bytes: []u8) Result(void, Error) {
         return io.read_exact(self, bytes);
     }
@@ -396,12 +811,31 @@ pub const DynRead = struct {
 /// pointer Rust's `&mut dyn Write` lowers to. The handle owns nothing; the
 /// allocator is borrowed too and reaches the writer only when appending to a
 /// caller-owned vector.
+///
+/// `writer` must stay alive and unmodified for as long as a handle names it;
+/// nothing checks that, and a handle to a released writer still dispatches.
+/// The stored `allocator` is borrowed and never retained by the callee, so it
+/// only has to outlive the handle. Copying a handle copies the pointer, so a
+/// copy is a second alias of one writer and not a second owner.
+///
+/// Every dispatch runs on the calling thread, synchronously, inside the call
+/// that reaches it, and a receiver may reenter the handle that called it.
 pub const DynWrite = struct {
+    /// Erased pointer to the caller's writer, cast back with its concrete type
+    /// on every call.
     ptr: *anyopaque,
+    /// Borrowed allocator, handed to a write that appends to a caller-owned
+    /// byte vector. It is not released by this handle.
     allocator: std.mem.Allocator,
+    /// The dispatch table `init` built for the concrete type.
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Called with the erased pointer as `context`, the handle's borrowed
+        /// allocator, and the caller's bytes. It must return how many bytes it
+        /// accepted and never accept more than `bytes.len`; only a byte-vector
+        /// receiver may use the allocator, and `error.OutOfMemory` from that
+        /// one growth reaches the caller unchanged.
         write: *const fn (
             context: *anyopaque,
             allocator: std.mem.Allocator,
@@ -412,6 +846,11 @@ pub const DynWrite = struct {
     /// Bind a handle to `writer`, which must publish `write` or be a
     /// caller-owned byte vector or byte-slice descriptor, and to the allocator
     /// its writes may need.
+    ///
+    /// `writer` is borrowed, not captured by value: a byte vector grows through
+    /// `allocator` exactly as it would without the handle, and a byte-slice
+    /// descriptor is advanced in place. The handle is valid for as long as
+    /// `writer` is, and needs no release.
     pub fn init(writer: anytype, allocator: std.mem.Allocator) DynWrite {
         const Concrete = std.meta.Child(@TypeOf(writer));
         if (comptime !hasMethod(Concrete, "write") and
@@ -439,6 +878,10 @@ pub const DynWrite = struct {
     }
 
     /// Write at most `bytes.len` bytes through the caller's writer.
+    ///
+    /// `bytes` is borrowed for the call and not retained. A count of zero is a
+    /// value, not a failure, and `write_all` is what turns it into
+    /// `WriteZero`; a byte-vector receiver may return `error.OutOfMemory`.
     pub inline fn write(
         self: DynWrite,
         bytes: []const u8,
@@ -448,6 +891,10 @@ pub const DynWrite = struct {
 
     /// Write `bytes` in full through the caller's writer, retrying only
     /// interruption.
+    ///
+    /// The failure residue is the module's: on the failing path every byte
+    /// already written stays where the receiver put it, and the receiver has
+    /// consumed exactly those bytes of `bytes`.
     pub fn write_all(
         self: DynWrite,
         bytes: []const u8,
@@ -460,35 +907,64 @@ pub const DynWrite = struct {
 /// pointer Rust's `&dyn Error` lowers to. Formatting and the cause chain both
 /// dispatch to the caller's own error value, so no message is reconstructed
 /// and no cause is invented.
+///
+/// `failure` must stay alive and unmodified for as long as a handle names it;
+/// nothing checks that, and a handle to a released error still dispatches.
+/// Copying a handle copies the pointer, so a copy is a second alias of one
+/// error and not a second owner. A cause handed back by `source` is itself a
+/// borrowed handle into the same error, so the whole chain dies with the
+/// error that carries it.
+///
+/// Every dispatch runs on the calling thread, synchronously, inside the call
+/// that reaches it, and a receiver may reenter the handle that called it.
 pub const DynError = struct {
+    /// Erased pointer to the caller's error, cast back with its concrete type
+    /// on every call.
     ptr: *const anyopaque,
+    /// The dispatch table `init` built for the concrete type.
     vtable: *const VTable,
 
     pub const VTable = struct {
-        fmt: *const fn (
+        /// Called with the erased pointer as `context` and the caller's
+        /// writer. It must render through the concrete type's own `format`
+        /// method and return that method's own failure unchanged.
+        format: *const fn (
             context: *const anyopaque,
             writer: *std.Io.Writer,
         ) std.Io.Writer.Error!void,
+        /// Called with the erased pointer as `context`. A concrete type with
+        /// no `source` method answers `null`, which is `std::error::Error`'s
+        /// own default rather than an invented cause.
         source: *const fn (context: *const anyopaque) ?DynError,
     };
 
-    /// Bind a handle to `failure`, which must publish `fmt`. A type with no
+    /// Bind a handle to `failure`, which must publish `format`. A type with no
     /// explicit `source` keeps `std::error::Error`'s default, which is none.
+    ///
+    /// `failure` must declare a `format` callable as
+    /// `format(self, writer: *std.Io.Writer) std.Io.Writer.Error!void` — the
+    /// native hook a translated `Display` lowers to, with a by-value or by-
+    /// pointer receiver. A type with no such declaration is a compile error,
+    /// so a handle never exists for an error that cannot render itself.
+    ///
+    /// `failure` is borrowed, not captured by value: the handle stores its
+    /// address, and a `*const` handle can therefore never mutate it. The
+    /// handle is valid for as long as `failure` is, and needs no release.
     pub fn init(failure: anytype) DynError {
         const Concrete = std.meta.Child(@TypeOf(failure));
-        if (!@hasDecl(Concrete, "fmt")) {
-            @compileError("io.DynError needs a concrete type with a fmt method");
+        if (!@hasDecl(Concrete, "format")) {
+            @compileError("io.DynError needs a concrete type with a format method");
         }
         return .{
             .ptr = failure,
             .vtable = &.{
-                .fmt = struct {
+                .format = struct {
                     fn call(
                         context: *const anyopaque,
                         writer: *std.Io.Writer,
                     ) std.Io.Writer.Error!void {
                         const self: *const Concrete = @ptrCast(@alignCast(context));
-                        return self.fmt(writer);
+                        return self.format(writer);
                     }
                 }.call,
                 .source = struct {
@@ -506,16 +982,26 @@ pub const DynError = struct {
     }
 
     /// Borrow the cause this error carries, or null when it carries none.
+    ///
+    /// The returned handle borrows the cause the concrete error names, so it
+    /// is valid exactly as long as that error is. A chain that ends reports
+    /// `null`, never itself.
     pub inline fn source(self: DynError) ?DynError {
         return self.vtable.source(self.ptr);
     }
 
-    /// Render this error through its own `fmt`.
-    pub inline fn fmt(
+    /// Render this error through the concrete type's own `format`.
+    ///
+    /// This is the native Zig `{f}` hook as well, so a `DynError` renders
+    /// through `std.Io.Writer.print` and through `r2z.format.write` without a
+    /// second route. `writer` is borrowed for the call, retains nothing, and
+    /// the concrete hook's own failure — including a short buffer — is
+    /// returned unchanged, with the bytes written before it left in place.
+    pub inline fn format(
         self: DynError,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
-        return self.vtable.fmt(self.ptr, writer);
+        return self.vtable.format(self.ptr, writer);
     }
 };
 
@@ -603,7 +1089,7 @@ const CauseFailure = struct {
     message: []const u8,
     rendered: *usize,
 
-    pub fn fmt(self: CauseFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: CauseFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         self.rendered.* += 1;
         try writer.writeAll(self.message);
     }
@@ -611,12 +1097,12 @@ const CauseFailure = struct {
 
 /// Test-only error that borrows a cause the way a Rust error enum variant
 /// wrapping another failure does: `source` hands back a handle onto the stored
-/// cause, and `fmt` renders this level's own message.
+/// cause, and `format` renders this level's own message.
 const WrappedFailure = struct {
     message: []const u8,
     cause: *const CauseFailure,
 
-    pub fn fmt(self: WrappedFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: WrappedFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll(self.message);
     }
 
@@ -631,7 +1117,7 @@ const WrappedFailure = struct {
 const PlainFailure = struct {
     message: []const u8,
 
-    pub fn fmt(self: PlainFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: PlainFailure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll(self.message);
     }
 };
@@ -653,7 +1139,7 @@ fn expectFailure(result: Result(void, Error)) !Error {
 fn expectErrorText(expected: []const u8, failure: anytype) !void {
     var buffer: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try failure.fmt(&writer);
+    try failure.format(&writer);
     try std.testing.expectEqualStrings(expected, writer.buffered());
 }
 
@@ -665,6 +1151,119 @@ test "Error preserves its kind and borrowed explicit message" {
     const by_kind = Error.from_kind(.BrokenPipe);
     try std.testing.expectEqual(ErrorKind.BrokenPipe, by_kind.kind());
     try expectErrorText("broken pipe", by_kind);
+}
+
+test "Error borrows its explicit message rather than copying it" {
+    // `Error` owns nothing, so a caller that keeps its own mutable buffer sees
+    // the failure render whatever that buffer now says. A runtime that copied
+    // the message would keep answering with the stale text.
+    var message = [_]u8{0} ** "source is locked".len;
+    @memcpy(&message, "source is locked");
+    const failure = Error.new(.PermissionDenied, &message);
+    try expectErrorText("source is locked", failure);
+
+    message[0] = 'p';
+    try expectErrorText("psurce is locked", failure);
+
+    // The category is stored by value, so it does not move with the message.
+    try std.testing.expectEqual(ErrorKind.PermissionDenied, failure.kind());
+}
+
+/// The `std::io::ErrorKind` variants the translator admits in value position
+/// (`ts_ext.zig`'s `std_enum_variants`). Each reaches the generated program as
+/// `r2z.io.ErrorKind.<name>`, so a name admitted there that this enum does not
+/// declare is a program that cannot build against the runtime.
+const emitted_error_kind_variants = [_][]const u8{
+    "Other",
+    "NotFound",
+    "PermissionDenied",
+    "ConnectionRefused",
+    "ConnectionReset",
+    "HostUnreachable",
+    "NetworkUnreachable",
+    "ConnectionAborted",
+    "NotConnected",
+    "AddrInUse",
+    "AddrNotAvailable",
+    "NetworkDown",
+    "BrokenPipe",
+    "AlreadyExists",
+    "WouldBlock",
+    "InvalidInput",
+    "InvalidData",
+    "TimedOut",
+    "WriteZero",
+    "UnexpectedEof",
+    "Interrupted",
+    "Unsupported",
+    "OutOfMemory",
+};
+
+test "every emitted io::ErrorKind variant names a member of the runtime enum" {
+    for (emitted_error_kind_variants) |name| {
+        // A spelling the translator admits reaches the generated program as
+        // `r2z.io.ErrorKind.<name>`, so a name with no member here is a
+        // program that cannot build against this runtime.
+        try std.testing.expect(std.meta.stringToEnum(ErrorKind, name) != null);
+    }
+}
+
+// The categories this module produces on its own, rather than carrying
+// through from a receiver: a reader or writer that ran dry, and a receiver
+// that claimed more than the caller's storage held. Both are this runtime's
+// own judgement and neither may be confused with a category a caller produced.
+test "read_exact and write_all report their own categories, not the receiver's" {
+    const steps = [_]ReadStep{.{ .transfer = 0 }};
+    var reader = ScriptedReader.init("abcd", &steps);
+    var destination = [_]u8{0} ** 4;
+    const read_failure = try expectFailure(read_exact(&reader, &destination));
+    try std.testing.expectEqual(ErrorKind.UnexpectedEof, read_failure.kind());
+
+    var destination_buffer = [_]u8{0} ** 2;
+    var writer = SliceWriter.init(&destination_buffer);
+    const write_failure = try expectFailure(try write_all(std.testing.allocator, &writer, "abcd"));
+    try std.testing.expectEqual(ErrorKind.WriteZero, write_failure.kind());
+
+    // Both render their category's stable default, which is how a caller tells
+    // them apart from a failure that carried its own message.
+    try expectErrorText("failed to fill whole buffer", read_failure);
+    try expectErrorText("failed to write whole buffer", write_failure);
+}
+
+test "every ErrorKind renders its own non-empty default message" {
+    // A tag names a failure class, so two classes that render the same text
+    // are indistinguishable to anything reading the message alone. Every
+    // variant is rendered here, and each must be nonempty and unique across
+    // the whole enum. The messages are collected first and compared pairwise
+    // at runtime, so adding a variant cannot blow the test up quadratically at
+    // compile time.
+    const fields = @typeInfo(ErrorKind).@"enum".fields;
+    try std.testing.expect(fields.len > 0);
+
+    var rendered: [fields.len][64]u8 = undefined;
+    var lengths: [fields.len]usize = undefined;
+    for (fields, 0..) |field, index| {
+        var writer: std.Io.Writer = .fixed(&rendered[index]);
+        try Error.from_kind(@field(ErrorKind, field.name)).format(&writer);
+        lengths[index] = writer.buffered().len;
+        try std.testing.expect(lengths[index] > 0);
+    }
+
+    for (fields, 0..) |field, index| {
+        for (fields[0..index], 0..) |earlier, earlier_index| {
+            std.testing.expect(!std.mem.eql(
+                u8,
+                rendered[index][0..lengths[index]],
+                rendered[earlier_index][0..lengths[earlier_index]],
+            )) catch |failure| {
+                std.debug.print(
+                    "ErrorKind.{s} and .{s} render the same message: {s}\n",
+                    .{ field.name, earlier.name, rendered[index][0..lengths[index]] },
+                );
+                return failure;
+            };
+        }
+    }
 }
 
 test "read_exact completes short reads and retries interruption" {
@@ -1037,6 +1636,58 @@ test "DynError formats a borrowed std::io::Error and reports no source" {
     try std.testing.expect(dynamic.source() == null);
 }
 
+test "Error and DynError render through Zig's own {f} specifier" {
+    var rendered: usize = 0;
+    var cause: CauseFailure = .{
+        .message = "underlying io failure",
+        .rendered = &rendered,
+    };
+    var wrapped: WrappedFailure = .{
+        .message = "number could not be read",
+        .cause = &cause,
+    };
+    var failure = Error.new(.PermissionDenied, "read access denied");
+
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writer.print("{f} {f} {f} {f}", .{
+        failure,
+        Error.from_kind(.BrokenPipe),
+        DynError.init(&failure),
+        DynError.init(&wrapped),
+    });
+    try std.testing.expectEqualStrings(
+        "read access denied broken pipe read access denied number could not be read",
+        writer.buffered(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), rendered);
+
+    // The chain is walked through the handle, so the cause renders only when
+    // `source` reaches it.
+    const borrowed = DynError.init(&wrapped).source() orelse return error.ExpectedSource;
+    var cause_buffer: [64]u8 = undefined;
+    var cause_writer: std.Io.Writer = .fixed(&cause_buffer);
+    try cause_writer.print("{f}", .{borrowed});
+    try std.testing.expectEqualStrings("underlying io failure", cause_writer.buffered());
+    try std.testing.expectEqual(@as(usize, 1), rendered);
+}
+
+test "a short buffer fails through the Error and DynError hooks" {
+    var failure = Error.new(.StorageFull, "the volume is out of space");
+    var buffer: [4]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try std.testing.expectError(error.WriteFailed, writer.print("{f}", .{failure}));
+    try std.testing.expectEqualStrings("the ", writer.buffered());
+
+    var handle_buffer: [4]u8 = undefined;
+    var handle_writer: std.Io.Writer = .fixed(&handle_buffer);
+    try std.testing.expectError(
+        error.WriteFailed,
+        handle_writer.print("{f}", .{DynError.init(&failure)}),
+    );
+    try std.testing.expectEqualStrings("the ", handle_writer.buffered());
+}
+
 test "Cursor over an owned byte array advances its read position" {
     var cursor = Cursor([1]u8).init(.{0});
     var destination = [_]u8{0xee} ** 2;
@@ -1044,7 +1695,7 @@ test "Cursor over an owned byte array advances its read position" {
     try std.testing.expectEqual(@as(usize, 1), cursor.read(&destination).unwrap(std.testing.allocator));
     try std.testing.expectEqual(@as(u8, 0), destination[0]);
     try std.testing.expectEqual(@as(u8, 0xee), destination[1]);
-    try std.testing.expectEqual(@as(usize, 1), cursor.position);
+    try std.testing.expectEqual(@as(u64, 1), cursor.position);
     try std.testing.expectEqual(@as(usize, 0), cursor.read(&destination).unwrap(std.testing.allocator));
 }
 
@@ -1056,7 +1707,7 @@ test "Cursor over a borrowed slice leaves the borrow untouched" {
     try expectSuccess(read_exact(&cursor, &destination));
     try std.testing.expectEqualStrings("abcd", &destination);
     try std.testing.expectEqualStrings("abcdef", backing);
-    try std.testing.expectEqual(@as(usize, 4), cursor.position);
+    try std.testing.expectEqual(@as(u64, 4), cursor.position);
 }
 
 test "Cursor over a borrowed slice drains before reporting EOF" {
@@ -1069,7 +1720,407 @@ test "Cursor over a borrowed slice drains before reporting EOF" {
     try expectErrorText("failed to fill whole buffer", failure);
     try std.testing.expectEqualStrings("ab", destination[0..2]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa }, destination[2..]);
-    try std.testing.expectEqual(@as(usize, 2), cursor.position);
+    try std.testing.expectEqual(@as(u64, 2), cursor.position);
+}
+
+/// A source with a known byte at every offset, so the contents a refill
+/// hands back can be checked against the offset that refill started at.
+fn indexedSource(comptime length: usize) [length]u8 {
+    var source: [length]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = @truncate(index);
+    return source;
+}
+
+fn expectFillFailure(result: Result([]const u8, Error)) !Error {
+    return switch (result) {
+        .Ok => error.ExpectedFailure,
+        .Err => |failure| failure,
+    };
+}
+
+test "fill_buf borrows a slice descriptor's whole remainder and consume advances it" {
+    var readable: []const u8 = "abcdef";
+
+    try std.testing.expectEqualStrings("abcdef", fill_buf(&readable).unwrap(std.testing.allocator));
+    consume(&readable, 2);
+    try std.testing.expectEqualStrings("cdef", fill_buf(&readable).unwrap(std.testing.allocator));
+    consume(&readable, 4);
+    try std.testing.expectEqualStrings("", fill_buf(&readable).unwrap(std.testing.allocator));
+    try std.testing.expectEqualStrings("", readable);
+}
+
+test "SliceReader fill_buf borrows the unread window and consume advances it" {
+    var reader = SliceReader.init("abcdef");
+
+    try std.testing.expectEqualStrings("abcdef", fill_buf(&reader).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), reader.position);
+    consume(&reader, 3);
+    try std.testing.expectEqualStrings("def", fill_buf(&reader).unwrap(std.testing.allocator));
+    consume(&reader, 3);
+    try std.testing.expectEqualStrings("", fill_buf(&reader).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 6), reader.position);
+}
+
+test "Cursor fill_buf borrows without advancing and consume moves the position" {
+    const backing: []const u8 = "abcdef";
+    var cursor = Cursor([]const u8).init(backing);
+
+    try std.testing.expectEqualStrings("abcdef", fill_buf(&cursor).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(u64, 0), cursor.position);
+    consume(&cursor, 2);
+    try std.testing.expectEqual(@as(u64, 2), cursor.position);
+    try std.testing.expectEqualStrings("cdef", fill_buf(&cursor).unwrap(std.testing.allocator));
+    try std.testing.expectEqualStrings("abcdef", backing);
+}
+
+test "fill_buf hands back a view of each reader's own storage, never a copy" {
+    // The window is a BORROW: the runtime hands the caller a slice into
+    // storage the receiver already holds, and never a fresh allocation the
+    // caller would then own. Each receiver below is pinned by address, so a
+    // runtime that copied the window out would fail this.
+    var readable: []const u8 = "abcdef";
+    const descriptor_window = fill_buf(&readable).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(readable.ptr), @intFromPtr(descriptor_window.ptr));
+    // The borrow names the caller's own descriptor, so consuming it moves the
+    // descriptor and the next borrow starts inside the bytes it already lent.
+    consume(&readable, 2);
+    const descriptor_rest = fill_buf(&readable).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(descriptor_window.ptr + 2), @intFromPtr(descriptor_rest.ptr));
+
+    var slice_reader = SliceReader.init("abcdef");
+    const slice_window = fill_buf(&slice_reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(slice_reader.input.ptr), @intFromPtr(slice_window.ptr));
+    consume(&slice_reader, 2);
+    const slice_rest = fill_buf(&slice_reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(slice_reader.input.ptr + 2), @intFromPtr(slice_rest.ptr));
+
+    const backing: []const u8 = "abcdef";
+    var cursor = Cursor([]const u8).init(backing);
+    const cursor_window = fill_buf(&cursor).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(backing.ptr), @intFromPtr(cursor_window.ptr));
+    consume(&cursor, 2);
+    const cursor_rest = fill_buf(&cursor).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(backing.ptr + 2), @intFromPtr(cursor_rest.ptr));
+    try std.testing.expectEqualStrings("cdef", cursor_rest);
+
+    // A cursor over an owned array lends the array it holds, not a copy of it.
+    var owned = Cursor([6]u8).init(.{ 'a', 'b', 'c', 'd', 'e', 'f' });
+    const owned_window = fill_buf(&owned).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(&owned.inner[0]), @intFromPtr(owned_window.ptr));
+    consume(&owned, 2);
+    const owned_rest = fill_buf(&owned).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(&owned.inner[2]), @intFromPtr(owned_rest.ptr));
+    try std.testing.expectEqualStrings("cdef", owned_rest);
+}
+
+test "an abandoned fill_buf window is still buffered and is served again unchanged" {
+    // The early-exit question: adler's loop takes `buf.len()`, hashes it, and
+    // calls `consume` — but a loop that exits between `fill_buf` and `consume`
+    // abandons the window. Nothing is released (it was never owned) and
+    // nothing is lost (it is still the reader's), so the next borrow returns
+    // the same bytes from the same address without reaching the inner reader.
+    const source = indexedSource(20_000);
+    const steps = [_]ReadStep{
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = 0 },
+    };
+    var inner = ScriptedReader.init(&source, &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    const abandoned = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 8_192), abandoned.len);
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+
+    // The borrow was dropped without `consume`, so nothing moved.
+    const again = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(abandoned.ptr), @intFromPtr(again.ptr));
+    try std.testing.expectEqualSlices(u8, abandoned, again);
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+    try std.testing.expectEqual(@as(usize, 0), reader.pos);
+
+    // And the drain still completes over every byte of the source.
+    var drained: usize = again.len;
+    consume(&reader, again.len);
+    while (true) {
+        const window = fill_buf(&reader).unwrap(std.testing.allocator);
+        if (window.len == 0) break;
+        try std.testing.expectEqualSlices(u8, source[drained..][0..window.len], window);
+        drained += window.len;
+        consume(&reader, window.len);
+    }
+    try std.testing.expectEqual(@as(usize, 20_000), drained);
+}
+
+test "a borrowed window names the reader's own bytes, so a refill overwrites it" {
+    // The other half of the ownership question. Because the caller borrows the
+    // reader's storage rather than owning a copy, the bytes a window names are
+    // the reader's: a later refill into that same storage changes what an
+    // already-handed-out slice reads as. That is the invalidation the
+    // `fill_buf` contract documents, observed rather than assumed.
+    const source = indexedSource(20_000);
+    const steps = [_]ReadStep{
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+    };
+    var inner = ScriptedReader.init(&source, &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    const first = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, source[0..first.len], first);
+
+    consume(&reader, first.len);
+    const second = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@intFromPtr(first.ptr), @intFromPtr(second.ptr));
+    try std.testing.expectEqualSlices(u8, source[8_192..][0..second.len], second);
+
+    // The first window pointed at the reader's window all along, so it now
+    // reads the refilled bytes.
+    try std.testing.expectEqualSlices(u8, source[8_192..][0..first.len], first);
+}
+
+test "consume stops at the buffered window instead of skipping past it" {
+    // Rust's `BufRead::consume` for `BufReader` is `cmp::min(pos + amt,
+    // filled)`. A count past the window therefore consumes the window and no
+    // more, which is what keeps a miscounted caller from silently dropping the
+    // bytes of the NEXT refill.
+    const source = indexedSource(20_000);
+    const steps = [_]ReadStep{
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+    };
+    var inner = ScriptedReader.init(&source, &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    try std.testing.expectEqual(@as(usize, 8_192), fill_buf(&reader).unwrap(std.testing.allocator).len);
+    consume(&reader, 30_000);
+    try std.testing.expectEqual(@as(usize, 8_192), reader.pos);
+    try std.testing.expectEqual(@as(usize, 8_192), reader.filled);
+
+    // The next refill starts where the last window ended, not past the input
+    // the over-count named.
+    const window = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, source[8_192..][0..window.len], window);
+}
+
+test "BufReader consume stops at the window and SliceReader consume refuses to pass it" {
+    // The two clamped-and-panicking receivers differ deliberately: `BufReader`
+    // clamps, `SliceReader` panics the way `&self[amt..]` does. A caller that
+    // relied on the runtime to silently truncate a `SliceReader` would get a
+    // panic here instead, so both behaviours are pinned.
+    var reader = BufReader([]const u8).init("abcdef");
+    try std.testing.expectEqualStrings("abcdef", fill_buf(&reader).unwrap(std.testing.allocator));
+    consume(&reader, 4);
+    consume(&reader, 30_000);
+    try std.testing.expectEqual(@as(usize, 6), reader.pos);
+    try std.testing.expectEqual(@as(usize, 6), reader.filled);
+    try std.testing.expectEqualStrings("", fill_buf(&reader).unwrap(std.testing.allocator));
+
+    var slice_reader = SliceReader.init("abcdef");
+    consume(&slice_reader, 4);
+    try std.testing.expectEqual(@as(usize, 4), slice_reader.position);
+    try std.testing.expectEqualStrings("ef", fill_buf(&slice_reader).unwrap(std.testing.allocator));
+}
+
+test "Cursor past the end of its input reads as EOF and keeps its position" {
+    var cursor = Cursor([]const u8).init("ab");
+    consume(&cursor, 30_000);
+
+    try std.testing.expectEqual(@as(u64, 30_000), cursor.position);
+    try std.testing.expectEqualStrings("", fill_buf(&cursor).unwrap(std.testing.allocator));
+    var destination = [_]u8{0xaa} ** 4;
+    try std.testing.expectEqual(@as(usize, 0), cursor.read(&destination).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(u64, 30_000), cursor.position);
+
+    const failure = try expectFailure(read_exact(&cursor, &destination));
+    try std.testing.expectEqual(ErrorKind.UnexpectedEof, failure.kind());
+    try std.testing.expectEqual(@as(u64, 30_000), cursor.position);
+}
+
+test "BufReader refills the default eight-kilobyte window and reports EOF after it" {
+    const source = indexedSource(20_000);
+    const steps = [_]ReadStep{
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = 0 },
+    };
+    var inner = ScriptedReader.init(&source, &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    var total: usize = 0;
+    const first = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 8_192), first.len);
+    try std.testing.expectEqualSlices(u8, source[0..8_192], first);
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+    total += first.len;
+    consume(&reader, first.len);
+
+    const second = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 8_192), second.len);
+    try std.testing.expectEqualSlices(u8, source[8_192..16_384], second);
+    try std.testing.expectEqual(@as(usize, 2), inner.calls);
+    total += second.len;
+    consume(&reader, second.len);
+
+    const last = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3_616), last.len);
+    try std.testing.expectEqualSlices(u8, source[16_384..20_000], last);
+    try std.testing.expectEqual(@as(usize, 3), inner.calls);
+    total += last.len;
+    consume(&reader, last.len);
+
+    try std.testing.expectEqualStrings("", fill_buf(&reader).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 4), inner.calls);
+    try std.testing.expectEqual(@as(usize, 20_000), total);
+    try std.testing.expectEqual(@as(usize, 20_000), inner.source_position);
+}
+
+test "BufReader serves a small read from the cached window without reaching its inner reader" {
+    const source = indexedSource(20_000);
+    const steps = [_]ReadStep{.{ .transfer = std.math.maxInt(usize) }};
+    var inner = ScriptedReader.init(&source, &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    try std.testing.expectEqual(@as(usize, 8_192), fill_buf(&reader).unwrap(std.testing.allocator).len);
+    consume(&reader, 8_191);
+
+    var destination: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), reader.read(&destination).unwrap(std.testing.allocator));
+    try std.testing.expectEqualSlices(u8, source[8_191..8_192], destination[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+}
+
+test "BufReader bypasses an empty window only for a read at least as large as it" {
+    const source = indexedSource(20_000);
+    const steps = [_]ReadStep{
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+    };
+    var inner = ScriptedReader.init(&source, &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    var large: [10_000]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 10_000), reader.read(&large).unwrap(std.testing.allocator));
+    try std.testing.expectEqualSlices(u8, source[0..10_000], &large);
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+    try std.testing.expectEqual(@as(usize, 10_000), inner.source_position);
+
+    var small: [8_191]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 8_191), reader.read(&small).unwrap(std.testing.allocator));
+    try std.testing.expectEqualSlices(u8, source[10_000..18_191], &small);
+    try std.testing.expectEqual(@as(usize, 2), inner.calls);
+}
+
+test "BufReader interleaves read and fill_buf over one cached window" {
+    const source = indexedSource(20_000);
+    const steps = [_]ReadStep{
+        .{ .transfer = std.math.maxInt(usize) },
+        .{ .transfer = std.math.maxInt(usize) },
+    };
+    var inner = ScriptedReader.init(&source, &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    var destination: [10]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 10), reader.read(&destination).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+
+    // The window that read filled is still there: fill_buf borrows it without
+    // another read, and consume empties exactly what the caller was lent.
+    const window = fill_buf(&reader).unwrap(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 8_182), window.len);
+    try std.testing.expectEqual(@intFromPtr(&reader.buffer[10]), @intFromPtr(window.ptr));
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+    consume(&reader, 8_182);
+
+    try std.testing.expectEqual(@as(usize, 10), reader.read(&destination).unwrap(std.testing.allocator));
+    try std.testing.expectEqualSlices(u8, source[8_192..8_202], &destination);
+    try std.testing.expectEqual(@as(usize, 2), inner.calls);
+}
+
+test "BufReader returns a concrete refill failure without dropping buffered bytes" {
+    const steps = [_]ReadStep{
+        .{ .transfer = 4 },
+        .{ .failure = Error.new(.PermissionDenied, "source is locked") },
+        .{ .transfer = 2 },
+        .{ .transfer = 0 },
+    };
+    var inner = ScriptedReader.init("abcdef", &steps);
+    var reader = BufReader(*ScriptedReader).init(&inner);
+
+    try std.testing.expectEqualStrings("abcd", fill_buf(&reader).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+
+    // A refill that is not needed never reaches the inner reader, so the
+    // bytes already buffered outlive the failure that follows them.
+    consume(&reader, 2);
+    try std.testing.expectEqualStrings("cd", fill_buf(&reader).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
+
+    consume(&reader, 2);
+    const failure = try expectFillFailure(fill_buf(&reader));
+    try std.testing.expectEqual(ErrorKind.PermissionDenied, failure.kind());
+    try expectErrorText("source is locked", failure);
+    try std.testing.expectEqual(@as(usize, 2), inner.calls);
+    try std.testing.expectEqual(@as(usize, 4), inner.source_position);
+    try std.testing.expectEqual(@as(usize, 0), reader.pos);
+    try std.testing.expectEqual(@as(usize, 0), reader.filled);
+
+    // A failed refill leaves an empty window, not a wedged reader: the next
+    // fill reaches the inner reader again and serves what comes after it.
+    try std.testing.expectEqualStrings("ef", fill_buf(&reader).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 3), inner.calls);
+    try std.testing.expectEqual(@as(usize, 6), inner.source_position);
+    consume(&reader, 2);
+    try std.testing.expectEqualStrings("", fill_buf(&reader).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 4), inner.calls);
+}
+
+test "BufReader advances a borrowed inner reader and leaves a copied one alone" {
+    var borrowed = SliceReader.init("abcdef");
+    var reader = BufReader(*SliceReader).init(&borrowed);
+
+    try std.testing.expectEqualStrings("abcdef", fill_buf(&reader).unwrap(std.testing.allocator));
+    consume(&reader, 2);
+    var destination: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), reader.read(&destination).unwrap(std.testing.allocator));
+    try std.testing.expectEqualStrings("cd", &destination);
+    // The refill drained the caller's own reader, and the buffered reader's
+    // later `consume` never reached it again.
+    try std.testing.expectEqual(@as(usize, 6), borrowed.position);
+
+    // A reader held by value is this reader's own: draining it leaves the
+    // caller's original at its own position.
+    const copied = SliceReader.init("abcdef");
+    var owner = BufReader(SliceReader).init(copied);
+    var owned_destination: [6]u8 = undefined;
+    try expectSuccess(read_exact(&owner, &owned_destination));
+    try std.testing.expectEqualStrings("abcdef", &owned_destination);
+    try std.testing.expectEqualStrings("", fill_buf(&owner).unwrap(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 0), copied.position);
+}
+
+test "a BufReader over a borrowed slice refills and drains window by window" {
+    // The shape adler's own `bufread` test uses: `BufReader::new(data)` over a
+    // borrowed slice, drained window by window until the source runs out.
+    const source = indexedSource(20_000);
+    const readable: []const u8 = &source;
+    var reader = BufReader([]const u8).init(readable);
+    var drained: usize = 0;
+    while (true) {
+        const window = fill_buf(&reader).unwrap(std.testing.allocator);
+        if (window.len == 0) break;
+        try std.testing.expect(window.len <= 8_192);
+        try std.testing.expectEqualSlices(u8, source[drained..][0..window.len], window);
+        drained += window.len;
+        consume(&reader, window.len);
+    }
+    try std.testing.expectEqual(@as(usize, 20_000), drained);
+    // `BufReader::new` takes its source by value and `&[u8]` is `Copy`, so the
+    // caller's own descriptor is untouched while the buffered reader's copy is
+    // the one that drained.
+    try std.testing.expectEqualStrings(&source, readable);
 }
 
 test "DynRead reads through a cursor over an owned byte array" {
@@ -1079,7 +2130,7 @@ test "DynRead reads through a cursor over an owned byte array" {
 
     try expectSuccess(dynamic.read_exact(&destination));
     try std.testing.expectEqual(@as(u8, 0), destination[0]);
-    try std.testing.expectEqual(@as(usize, 1), cursor.position);
+    try std.testing.expectEqual(@as(u64, 1), cursor.position);
 }
 
 test "DynRead.read_exact drains a native immutable slice descriptor" {

@@ -16,15 +16,30 @@ const ast = @import("ast.zig");
 pub fn emitFile(
     allocator: std.mem.Allocator,
     file: *const ast.File,
-) (std.mem.Allocator.Error || ast.ValidationError)![]const u8 {
+) (std.mem.Allocator.Error || ast.ValidationError || EmitError)![]const u8 {
     try ast.validateFileForTranslation(file);
+    // Before a single byte is written, and for the reason in
+    // `requireLabelledBlockPositions`: an emission that Zig cannot parse is
+    // worth nothing, and this is the last point at which the file is still a
+    // question rather than a package someone has to debug.
+    try requireLabelledBlockPositions(file.*);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
+    // 0. File documentation. Zig reads `//!` only ahead of every declaration
+    // and import, so it must come first.
+    if (file.documentation.len != 0) {
+        try emitModuleDocLines(allocator, &buf, file.documentation);
+        if (file.imports.len != 0 or file.decls.len != 0 or file.tests.len != 0) {
+            try buf.appendSlice(allocator, "\n");
+        }
+    }
+
     // 1. Imports
     if (file.imports.len > 0) {
         for (file.imports) |imp| {
+            try emitDocLines(allocator, &buf, imp.documentation, 0);
             if (imp.is_pub) {
                 try buf.appendSlice(allocator, "pub ");
             }
@@ -71,6 +86,336 @@ pub fn emitFile(
     }
 
     return buf.toOwnedSlice(allocator);
+}
+
+/// Failures only this emitter can raise, as distinct from the AST's own
+/// validation errors: shapes that validate and still cannot be written as Zig.
+pub const EmitError = error{
+    /// A labelled block reached a position with no carrier for its value. The
+    /// name says the POSITION, which is the whole of the diagnosis: there is
+    /// no spelling of `label: { … }` there, so the emitter is not going to
+    /// invent one.
+    LabelledBlockWithoutACarrier,
+};
+
+/// Where the emitter is about to write a labelled block. Every position the
+/// AST can carry one is named here, and `labelledBlockIsLegalIn` answers for
+/// all of them, so a new emission site cannot pick a verdict of its own: it
+/// states where the block sits and the one predicate decides.
+const LabelledBlockPosition = enum {
+    /// An `if`/`else` BRANCH, including a branch of a nested `if` — the
+    /// exemption comes from the STRUCTURE, because the walk below reaches
+    /// this value only by stepping into an `if` arm, never from a flag a
+    /// caller could set on an arbitrary node.
+    if_branch,
+    /// A position with something in front of the block to carry its value: a
+    /// `const`/`var` initializer (`const answer = <label>: { … };`), a `return`
+    /// payload, a `_ = ` discard, a call argument, a match prong value, a
+    /// `break :other <label>: { … }` payload, a tuple or array element, a cast
+    /// operand. These are the positions the emitted corpus is made of.
+    expression,
+    /// A STATEMENT of its own: nothing in front of the block and no `;` after
+    /// it. Measured in Zig 0.16: `{ <label>: { … } }` as a block tail fails
+    /// `expected ';' after statement`, and the parenthesised spelling
+    /// `( <label>: { … } )` fails `value of type 'u8' ignored` — the
+    /// parentheses help only as a direct `if` branch. No emitter choice makes
+    /// this position parse, so it is refused rather than written.
+    bare_statement,
+};
+
+/// The one predicate that decides whether a labelled block may be written
+/// where it has landed. Nothing else in this file answers that question.
+fn labelledBlockIsLegalIn(position: LabelledBlockPosition) bool {
+    return switch (position) {
+        .if_branch, .expression => true,
+        .bare_statement => false,
+    };
+}
+
+/// Which of the three ways a scope ends its tail decides the position that
+/// tail is written in.
+const TailKind = enum {
+    /// `break :<label> <tail>` when the tail carries the value, nothing in
+    /// front of it when it does not — `emitBlockScoped`.
+    nested_block,
+    /// The same question with a `return` in place of the `break` —
+    /// `emitFnDecl`.
+    fn_body,
+    /// A test body writes its tail as a statement whatever it carries, so a
+    /// labelled block there is always a bare statement.
+    test_body,
+};
+
+fn blockTailPosition(kind: TailKind, tail: ast.Expr) LabelledBlockPosition {
+    return switch (kind) {
+        .test_body => .bare_statement,
+        .nested_block, .fn_body => if (blockTailRole(tail) == .value)
+            .expression
+        else
+            .bare_statement,
+    };
+}
+
+/// Refuses a labelled block in a position Zig has no spelling for.
+///
+/// This runs over the AST before anything is emitted, so the answer cannot
+/// depend on how a particular emission path happens to be written: a labelled
+/// block that reaches `bare_statement` is refused whether it came in as a
+/// statement, a function tail or a nested block tail. That is the property
+/// worth having here, and it is why this is a walk over the AST rather than a
+/// check at each emission site.
+fn requireLabelledBlockPositions(file: ast.File) EmitError!void {
+    for (file.decls) |decl| try requireLabelledBlockInDecl(decl);
+    for (file.tests) |test_decl| {
+        try requireLabelledBlockInBlock(test_decl.body, .test_body);
+    }
+}
+
+fn requireLabelledBlockInDecl(decl: ast.Decl) EmitError!void {
+    switch (decl) {
+        .const_decl => |const_decl| {
+            try requireLabelledBlockInExpr(const_decl.init, .expression);
+        },
+        .var_decl => |var_decl| {
+            try requireLabelledBlockInExpr(var_decl.init, .expression);
+        },
+        .fn_decl => |fn_decl| {
+            if (fn_decl.body) |body| try requireLabelledBlockInBlock(body, .fn_body);
+        },
+        .struct_decl => |struct_decl| {
+            for (struct_decl.fields) |field| {
+                if (field.default_val) |value| {
+                    try requireLabelledBlockInExpr(value.*, .expression);
+                }
+            }
+            for (struct_decl.decls) |inner| try requireLabelledBlockInDecl(inner);
+        },
+        .enum_decl => |enum_decl| {
+            for (enum_decl.variants) |variant| {
+                if (variant.value) |value| {
+                    try requireLabelledBlockInExpr(value.*, .expression);
+                }
+            }
+            for (enum_decl.decls) |inner| try requireLabelledBlockInDecl(inner);
+        },
+        .union_decl => |union_decl| {
+            // A union field is a type rather than an initialiser, so there is
+            // nothing here for a labelled block to hide in.
+            for (union_decl.decls) |inner| try requireLabelledBlockInDecl(inner);
+        },
+        .trait_descriptor => |descriptor| {
+            for (descriptor.cases) |case| {
+                for (case.members) |member| {
+                    switch (member) {
+                        .const_ => |member_const| {
+                            try requireLabelledBlockInExpr(member_const.value, .expression);
+                        },
+                        .type_ => {},
+                    }
+                }
+            }
+        },
+        .comment => {},
+    }
+}
+
+fn requireLabelledBlockInBlock(block: ast.Block, kind: TailKind) EmitError!void {
+    for (block.stmts) |stmt| try requireLabelledBlockInStmt(stmt);
+    if (block.expr) |tail| {
+        try requireLabelledBlockInExpr(tail.*, blockTailPosition(kind, tail.*));
+    }
+}
+
+fn requireLabelledBlockInStmt(stmt: ast.Stmt) EmitError!void {
+    switch (stmt) {
+        .let_stmt => |let_stmt| {
+            try requireLabelledBlockInExpr(let_stmt.init, .expression);
+        },
+        .assign => |assignment| {
+            try requireLabelledBlockInExpr(assignment.target, .expression);
+            try requireLabelledBlockInExpr(assignment.val, .expression);
+        },
+        .defer_stmt => |defer_stmt| {
+            try requireLabelledBlockInExpr(defer_stmt.expr, .expression);
+        },
+        .expr_stmt => |expression| {
+            // `statementForm` is the emitter's own answer to "is anything in
+            // front of this, or a `;` after it", so this position can never
+            // disagree with the text that would have been written. A `bare`
+            // form of a labelled block is a bare statement, and that is the
+            // one position Zig measures as unspellable.
+            const form = statementForm(expression.*);
+            const position: LabelledBlockPosition = switch (form) {
+                .bare => .bare_statement,
+                .semicolon, .discard_value => .expression,
+            };
+            try requireLabelledBlockInExpr(expression.*, position);
+        },
+    }
+}
+
+fn requireLabelledBlockInExpr(
+    expression: ast.Expr,
+    position: LabelledBlockPosition,
+) EmitError!void {
+    switch (expression) {
+        .block => |block| {
+            if (block.label != null and !labelledBlockIsLegalIn(position)) {
+                return error.LabelledBlockWithoutACarrier;
+            }
+            try requireLabelledBlockInBlock(block, .nested_block);
+        },
+        // The condition, the scrutinee, an operand and a payload all put
+        // something in front of what they hold, so a labelled block anywhere
+        // below them is in an expression position.
+        .field_access => |field_access| {
+            try requireLabelledBlockInExpr(field_access.target.*, .expression);
+        },
+        .call => |call| {
+            try requireLabelledBlockInExpr(call.callee.*, .expression);
+            for (call.args) |argument| {
+                try requireLabelledBlockInExpr(argument, .expression);
+            }
+        },
+        .match_expr => |match| {
+            try requireLabelledBlockInExpr(match.target.*, .expression);
+            for (match.arms) |arm| {
+                try requireLabelledBlockInExpr(arm.body, .expression);
+            }
+        },
+        .bin_op => |binary| {
+            try requireLabelledBlockInExpr(binary.lhs.*, .expression);
+            try requireLabelledBlockInExpr(binary.rhs.*, .expression);
+        },
+        .unary_op => |unary| {
+            try requireLabelledBlockInExpr(unary.operand.*, .expression);
+        },
+        .cast => |cast| try requireLabelledBlockInExpr(cast.operand.*, .expression),
+        .struct_init => |literal| {
+            for (literal.fields) |field| {
+                try requireLabelledBlockInExpr(field.expr, .expression);
+            }
+        },
+        .array_init => |array| {
+            for (array.elements) |element| {
+                try requireLabelledBlockInExpr(element, .expression);
+            }
+        },
+        .repeat => |repeat| try requireLabelledBlockInExpr(repeat.elem.*, .expression),
+        .multi_array => |array| {
+            for (array.elements) |element| {
+                try requireLabelledBlockInExpr(element, .expression);
+            }
+        },
+        .tuple => |elements| {
+            for (elements) |element| {
+                try requireLabelledBlockInExpr(element, .expression);
+            }
+        },
+        .builtin => |builtin| {
+            for (builtin.args) |argument| {
+                try requireLabelledBlockInExpr(argument, .expression);
+            }
+        },
+        .if_expr => |if_expression| {
+            try requireLabelledBlockInExpr(if_expression.cond.*, .expression);
+            // The one exemption, and it is reached by stepping into an arm of
+            // this `if` and nowhere else.
+            try requireLabelledBlockInExpr(if_expression.then_body.*, .if_branch);
+            if (if_expression.else_body) |else_body| {
+                try requireLabelledBlockInExpr(else_body.*, .if_branch);
+            }
+        },
+        .while_expr => |while_expression| {
+            try requireLabelledBlockInExpr(while_expression.cond.*, .expression);
+            if (while_expression.continue_expr) |continue_expression| {
+                try requireLabelledBlockInExpr(continue_expression.*, .expression);
+            }
+            try requireLabelledBlockInBlock(while_expression.body, .nested_block);
+            if (while_expression.else_body) |else_body| {
+                try requireLabelledBlockInExpr(else_body.*, .expression);
+            }
+        },
+        .for_expr => |for_expression| {
+            for (for_expression.inputs) |input| {
+                try requireLabelledBlockInExpr(input, .expression);
+            }
+            try requireLabelledBlockInBlock(for_expression.body, .nested_block);
+            if (for_expression.else_body) |else_body| {
+                try requireLabelledBlockInExpr(else_body.*, .expression);
+            }
+        },
+        .range => |range| {
+            try requireLabelledBlockInExpr(range.start.*, .expression);
+            if (range.end) |end| try requireLabelledBlockInExpr(end.*, .expression);
+        },
+        .return_expr => |value| {
+            if (value) |inner| try requireLabelledBlockInExpr(inner.*, .expression);
+        },
+        .break_expr => |break_expr| {
+            if (break_expr.value) |inner| {
+                try requireLabelledBlockInExpr(inner.*, .expression);
+            }
+        },
+        // Nothing below a `continue`, nothing an identifier can hold, and
+        // nothing a type value can hold: a label cannot be reached through any
+        // of them.
+        .ident,
+        .continue_expr,
+        .type_value,
+        .lit,
+        .unit,
+        .unsupported,
+        .panic_,
+        .unreachable_,
+        => {},
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Documentation
+// ---------------------------------------------------------------------------
+
+/// Emit `///` documentation lines at `depth`, one per authored line. Empty
+/// documentation emits nothing, so no declaration is ever followed by a `///`
+/// with no text; a blank line inside a multi-line block becomes a bare `///`,
+/// which is how Zig spells a paragraph break.
+pub fn emitDocLines(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    documentation: []const u8,
+    depth: usize,
+) std.mem.Allocator.Error!void {
+    if (documentation.len == 0) return;
+    var lines = std.mem.splitScalar(u8, documentation, '\n');
+    while (lines.next()) |line| {
+        try emitIndent(allocator, buf, depth);
+        try buf.appendSlice(allocator, "///");
+        if (line.len != 0) {
+            try buf.appendSlice(allocator, " ");
+            try buf.appendSlice(allocator, line);
+        }
+        try buf.appendSlice(allocator, "\n");
+    }
+}
+
+/// Emit `//!` file documentation lines. Zig reads these only ahead of every
+/// declaration and import, so the caller places them at the top of the file.
+pub fn emitModuleDocLines(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    documentation: []const u8,
+) std.mem.Allocator.Error!void {
+    if (documentation.len == 0) return;
+    var lines = std.mem.splitScalar(u8, documentation, '\n');
+    while (lines.next()) |line| {
+        try buf.appendSlice(allocator, "//!");
+        if (line.len != 0) {
+            try buf.appendSlice(allocator, " ");
+            try buf.appendSlice(allocator, line);
+        }
+        try buf.appendSlice(allocator, "\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,9 +543,7 @@ fn emitEscapedString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(
                 if (c >= 0x20 and c <= 0x7e) {
                     try buf.append(allocator, c);
                 } else {
-                    var hex_buf: [4]u8 = undefined;
-                    const hex = std.fmt.bufPrint(&hex_buf, "\\x{x:0>2}", .{c}) catch unreachable;
-                    try buf.appendSlice(allocator, hex);
+                    try buf.print(allocator, "\\x{x:0>2}", .{c});
                 }
             },
         }
@@ -211,12 +554,28 @@ fn emitEscapedString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(
 // Declaration Emission
 // ---------------------------------------------------------------------------
 
+/// The documentation attached to a declaration, or `""` for the declaration
+/// kinds that carry none. Read before the declaration is written so the
+/// `///` block lands at the declaration's own indentation.
+fn declDocumentation(decl: ast.Decl) []const u8 {
+    return switch (decl) {
+        .struct_decl => |sd| sd.documentation,
+        .enum_decl => |ed| ed.documentation,
+        .union_decl => |ud| ud.documentation,
+        .fn_decl => |fd| fd.documentation,
+        .const_decl => |cd| cd.documentation,
+        .var_decl => |vd| vd.documentation,
+        .trait_descriptor, .comment => "",
+    };
+}
+
 pub fn emitDecl(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     decl: ast.Decl,
     depth: usize,
 ) std.mem.Allocator.Error!void {
+    try emitDocLines(allocator, buf, declDocumentation(decl), depth);
     switch (decl) {
         .trait_descriptor => |descriptor| {
             try emitTraitDescriptorDecl(allocator, buf, descriptor, depth);
@@ -335,6 +694,14 @@ fn emitFnDecl(
     fd: ast.FnDecl,
     depth: usize,
 ) std.mem.Allocator.Error!void {
+    // `emitFile` validates before it emits, and `validateDecl` rejects a
+    // translated function that carries no body, so a dropped body can never
+    // reach here. Synthesising `{}` for one would emit a function that
+    // compiles and silently does nothing, which is the exact loss the
+    // validator exists to catch, so the invariant is unwrapped here — ahead of
+    // the parameters, whose spelling depends on what the body reads.
+    const body = fd.body.?;
+
     try emitIndent(allocator, buf, depth);
     if (fd.is_pub) try buf.appendSlice(allocator, "pub ");
     try buf.appendSlice(allocator, "fn ");
@@ -364,6 +731,22 @@ fn emitFnDecl(
             try buf.appendSlice(allocator, "type");
         }
     }
+    // Zig 0.16 accepts NO spelling for a parameter the body never reads: an
+    // unnamed parameter is `error: missing parameter name` and a `_`-prefixed
+    // one is still `error: unused function parameter`. The only form that
+    // compiles is the parameter keeping its name and the body discarding it,
+    // which is the same `_ = <name>;` this file already emits for an unread
+    // `self` receiver and for an unread local. So the name is always written
+    // verbatim — which also keeps the position and the spelling the generated
+    // documentation quotes — and the discard goes in the body below.
+    //
+    // A `comptime T: type` parameter is a TYPE parameter and is exempt: its
+    // references live in the SIGNATURE (`reader: T`), not the body, so a
+    // body-only scan would discard a parameter the signature still needs. Those
+    // arrive in `fd.params` with `is_comptime` set, not through
+    // `fd.generic_params`.
+    var discarded_params: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer discarded_params.deinit(allocator);
     for (fd.params[ordinary_param_start..]) |p| {
         if (!first_param) try buf.appendSlice(allocator, ", ");
         first_param = false;
@@ -371,20 +754,29 @@ fn emitFnDecl(
         try emitIdent(allocator, buf, p.name);
         try buf.appendSlice(allocator, ": ");
         try emitType(allocator, buf, p.ty);
+        // Every unread ordinary parameter is discarded, whatever it is called.
+        // A source name that already begins with `_` is still a live parameter
+        // to Zig — `_unit: u8` is `error: unused function parameter`, not a
+        // discard — so it needs the body statement too. The `_`-prefix check
+        // belongs to the switch-CAPTURE spelling and has no say here.
+        if (!p.is_comptime and !bodyReadsParam(body, p.name)) {
+            try discarded_params.append(allocator, p.name);
+        }
     }
     try buf.appendSlice(allocator, ") ");
     try emitType(allocator, buf, fd.ret_type);
 
-    // `emitFile` validates before it emits, and `validateDecl` rejects a
-    // translated function that carries no body, so a dropped body can never
-    // reach here. Synthesising `{}` for one would emit a function that
-    // compiles and silently does nothing, which is the exact loss the
-    // validator exists to catch, so the invariant is unwrapped here.
-    const body = fd.body.?;
     try buf.appendSlice(allocator, " {\n");
-    // Rust permits an unused receiver; Zig requires an explicit discard.
+    // Rust permits an unused receiver or an unused parameter; Zig requires an
+    // explicit discard for each, and `fd.params` names them all.
+    for (discarded_params.items) |name| {
+        try emitIndent(allocator, buf, depth + 1);
+        try buf.appendSlice(allocator, "_ = ");
+        try emitIdent(allocator, buf, name);
+        try buf.appendSlice(allocator, ";\n");
+    }
     if (fd.params.len > 0 and std.mem.eql(u8, fd.params[0].name, "self") and
-        !blockReadsNameOutside(body, body.stmts.len, "self"))
+        !bodyReadsParam(body, "self"))
     {
         try emitIndent(allocator, buf, depth + 1);
         try buf.appendSlice(allocator, "_ = self;\n");
@@ -399,16 +791,24 @@ fn emitFnDecl(
     }
     if (body.expr) |tail_expr| {
         try emitIndent(allocator, buf, depth + 1);
-        if (tail_expr.* == .return_expr or tail_expr.* == .panic_) {
-            try emitExpr(allocator, buf, tail_expr.*, depth + 1);
-            try buf.appendSlice(allocator, ";\n");
-        } else if (isStatementLike(tail_expr.*) and !exprCarriesValue(tail_expr.*)) {
-            try emitExpr(allocator, buf, tail_expr.*, depth + 1);
-            try buf.appendSlice(allocator, "\n");
-        } else {
-            try buf.appendSlice(allocator, "return ");
-            try emitExpr(allocator, buf, tail_expr.*, depth + 1);
-            try buf.appendSlice(allocator, ";\n");
+        // A tail leaves a function body exactly as it leaves a block, so both
+        // ask `blockTailRole` rather than repeating its cases: a unit loop is
+        // already a statement, a control exit needs no `return`, and only a
+        // tail that carries a value has to hand one back.
+        switch (blockTailRole(tail_expr.*)) {
+            .value => {
+                try buf.appendSlice(allocator, "return ");
+                try emitExpr(allocator, buf, tail_expr.*, depth + 1);
+                try buf.appendSlice(allocator, ";\n");
+            },
+            .statement => {
+                try emitExpr(allocator, buf, tail_expr.*, depth + 1);
+                try buf.appendSlice(allocator, "\n");
+            },
+            .exit => {
+                try emitExpr(allocator, buf, tail_expr.*, depth + 1);
+                try buf.appendSlice(allocator, ";\n");
+            },
         }
     }
     try emitIndent(allocator, buf, depth);
@@ -469,6 +869,7 @@ fn emitStructBody(
         try buf.appendSlice(allocator, "const Self = @This();\n\n");
     }
     for (sd.fields) |f| {
+        try emitDocLines(allocator, buf, f.documentation, depth + 1);
         try emitIndent(allocator, buf, depth + 1);
         try emitIdent(allocator, buf, f.name);
         try buf.appendSlice(allocator, ": ");
@@ -511,6 +912,7 @@ fn emitEnumDecl(
     try buf.appendSlice(allocator, " {\n");
 
     for (ed.variants) |v| {
+        try emitDocLines(allocator, buf, v.documentation, depth + 1);
         try emitIndent(allocator, buf, depth + 1);
         try emitIdent(allocator, buf, v.name);
         if (v.value) |val| {
@@ -556,6 +958,7 @@ fn emitUnionDecl(
     try buf.appendSlice(allocator, " {\n");
 
     for (ud.fields) |f| {
+        try emitDocLines(allocator, buf, f.documentation, depth + 1);
         try emitIndent(allocator, buf, depth + 1);
         try emitIdent(allocator, buf, f.name);
         try buf.appendSlice(allocator, ": ");
@@ -644,7 +1047,10 @@ fn emitStmtScoped(
             const keyword = if (defer_stmt.is_errdefer) "errdefer " else "defer ";
             try buf.appendSlice(allocator, keyword);
             try emitExprScoped(context, allocator, buf, defer_stmt.expr, depth);
-            try buf.appendSlice(allocator, ";\n");
+            if (defer_stmt.expr != .block) {
+                try buf.appendSlice(allocator, ";");
+            }
+            try buf.appendSlice(allocator, "\n");
         },
         .expr_stmt => |es| {
             try emitIndent(allocator, buf, depth);
@@ -723,6 +1129,16 @@ fn exprCarriesValue(expr: ast.Expr) bool {
     };
 }
 
+/// Whether `emitExpr` writes the expression as a Zig statement instead of as a
+/// value. This is the one question every site asks before it consumes an
+/// expression, because the two spellings are not interchangeable: a unit loop
+/// is a statement, and `emitChunkLoop` writes a prelude and a `while`, so a
+/// `break` payload prefixed onto it lands in the middle of a line and the file
+/// stops parsing there.
+fn writesAsStatement(expr: ast.Expr) bool {
+    return isStatementLike(expr) and !exprCarriesValue(expr);
+}
+
 /// True when two source labels name the same target. A null label is the
 /// unlabeled exit, and it matches only another null.
 fn sameSourceLabel(left: ?[]const u8, right: ?[]const u8) bool {
@@ -730,13 +1146,40 @@ fn sameSourceLabel(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
+/// What a tail expression has to be written as. A function body, a block and a
+/// loop body all answer the question the same way, so they ask it the same way.
+///
+/// A shape outside `isStatementLike` is a value tail whatever it looks like:
+/// `break :label if (c) blk: { … } else blk: { … }` carries a value through a
+/// `break` because `if` is one inline Zig expression whose arms are themselves
+/// value blocks. A `break` payload is well formed exactly when it is a single
+/// inline expression; only a form Zig can write *solely* as a statement — a
+/// block, a unit `while`, a `for` — may never carry one.
+const TailRole = enum {
+    /// A control exit: `return`, `break`, `continue`, `unreachable`, `panic`.
+    /// It stands alone once terminated.
+    exit,
+    /// A unit `while`, a `for`, or a block that carries no value. Zig writes
+    /// these as statements, so nothing may be prefixed onto them.
+    statement,
+    /// The scope's own value. It leaves through the label that scope carries.
+    value,
+};
+
+/// What a tail is worth, which is the whole of the statement/value split. A
+/// Rust `for` is `()`, and so is a `while` no value `break` leaves, so neither
+/// is ever the value of the scope it ends.
+fn blockTailRole(tail: ast.Expr) TailRole {
+    return switch (tail) {
+        .return_expr, .break_expr, .continue_expr, .unreachable_, .panic_ => .exit,
+        else => if (writesAsStatement(tail)) .statement else .value,
+    };
+}
+
 fn blockHasValue(block: ast.Block) bool {
     if (blockHasLabelledValueExit(block)) return true;
     const tail = block.expr orelse return false;
-    return switch (tail.*) {
-        .return_expr, .break_expr, .continue_expr, .unreachable_, .panic_ => false,
-        else => true,
-    };
+    return blockTailRole(tail.*) == .value;
 }
 
 /// Which control exit a subtree scan counts as reaching the scope it was
@@ -884,6 +1327,7 @@ fn exprsHaveLoopExitTo(exprs: []const ast.Expr, query: ExitQuery) bool {
 
 fn exprHasLoopExitTo(expr: ast.Expr, query: ExitQuery) bool {
     return switch (expr) {
+        .type_value => false,
         // An unlabeled `break` leaves the innermost enclosing loop, so a
         // nested loop claims it before the loop around it can. An exit that
         // names the label says which loop it belongs to and passes through.
@@ -1079,49 +1523,117 @@ fn lexicalRoot(value: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, value, '.') orelse value.len;
     return value[0..end];
 }
-fn typeContainsGeneratedMatchName(ty: ast.Type, name: []const u8) bool {
+/// What a mention of a name MEANS to the question being asked about it.
+///
+/// `.occurrence` is the GENERATED-name question: any mention collides, because
+/// a fresh label that lands on a binding, a capture or a field name is as
+/// unusable as one that lands on a read. `.read` is the PARAMETER question:
+/// only a read keeps a parameter alive, and a BINDING that shadows the name
+/// ends the count for the rest of its own scope.
+const NameScanMode = enum {
+    occurrence,
+    read,
+};
+
+/// One name question in flight. `shadowed` is set once a binding in the scope
+/// being walked has introduced `name` again, from which point a mention is the
+/// local's and not the outer one's — which is why it is carried down rather
+/// than re-decided per arm.
+const NameScan = struct {
+    name: []const u8,
+    mode: NameScanMode,
+    shadowed: bool = false,
+
+    /// This question, one scope deeper, with `name` shadowed by a binding. The
+    /// binding that did it is not recorded: `shadowed` is a property of the
+    /// scope being walked, and every scope that sets it has already asked
+    /// `shadowedByBinding` of the name that introduced it.
+    fn shadowedBy(self: NameScan) NameScan {
+        return .{ .name = self.name, .mode = self.mode, .shadowed = true };
+    }
+
+    /// Whether a mention of `value` counts for this question. A shadowed name
+    /// is the local's, so nothing after the binding counts as a read of the
+    /// parameter.
+    fn mentions(self: NameScan, value: []const u8) bool {
+        if (self.mode == .read and self.shadowed) return false;
+        return generatedMatchNameEquals(lexicalRoot(value), self.name);
+    }
+
+    /// Whether a mention that is NOT a value read counts: a variant tag, a
+    /// field name, a label, or a type name. Those positions name a variant, a
+    /// field, an exit and a type — never the value in scope — so they are
+    /// always a collision and never a read.
+    ///
+    /// The read case is what makes this worth stating: reporting one as a read
+    /// would call an unread parameter live, the discard would be omitted, and
+    /// the package would fail with `unused function parameter`. That is the
+    /// same failure a shadowing binding caused, reached from the other side.
+    fn namesSomethingElse(self: NameScan, value: []const u8) bool {
+        if (self.mode != .occurrence) return false;
+        return generatedMatchNameEquals(lexicalRoot(value), self.name);
+    }
+
+    /// Whether this binding SHADOWS the name, which is what ends the count.
+    /// Rust introduces the local only after its initialiser is produced, so the
+    /// initialiser and the type annotation are read while the outer name is
+    /// still the only one in scope — which is why this is asked of the
+    /// DECLARATION and the initialiser is scanned before it.
+    fn shadowedByBinding(self: NameScan, binding: []const u8) bool {
+        return self.mode == .read and
+            generatedMatchNameEquals(lexicalRoot(binding), self.name);
+    }
+};
+
+/// The GENERATED-name question about `name`, which is every collision.
+fn occurrenceScan(name: []const u8) NameScan {
+    return .{ .name = name, .mode = .occurrence };
+}
+
+fn typeContainsGeneratedMatchName(scan: NameScan, ty: ast.Type) bool {
     return switch (ty) {
         .prim, .any_opaque, .void_type => false,
-        .ptr => |pointer| typeContainsGeneratedMatchName(pointer.elem.*, name),
-        .slice => |slice| typeContainsGeneratedMatchName(slice.elem.*, name),
-        .opt => |inner| typeContainsGeneratedMatchName(inner.*, name),
+        .ptr => |pointer| typeContainsGeneratedMatchName(scan, pointer.elem.*),
+        .slice => |slice| typeContainsGeneratedMatchName(scan, slice.elem.*),
+        .opt => |inner| typeContainsGeneratedMatchName(scan, inner.*),
         .err_union => |error_union| {
             if (error_union.err_set) |error_set| {
-                if (generatedMatchNameEquals(lexicalRoot(error_set), name)) return true;
+                if (scan.namesSomethingElse(error_set)) return true;
             }
-            return typeContainsGeneratedMatchName(error_union.payload.*, name);
+            return typeContainsGeneratedMatchName(scan, error_union.payload.*);
         },
-        .projected => |projected| typeContainsGeneratedMatchName(projected.receiver.*, name),
-        .named => |value| generatedMatchNameEquals(lexicalRoot(value), name),
+        .projected => |projected| typeContainsGeneratedMatchName(scan, projected.receiver.*),
+        .named => |value| scan.namesSomethingElse(value),
         .generic => |generic| {
-            if (generatedMatchNameEquals(lexicalRoot(generic.name), name)) return true;
+            if (scan.namesSomethingElse(generic.name)) return true;
             for (generic.params) |param| {
-                if (typeContainsGeneratedMatchName(param, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, param)) return true;
             }
             return false;
         },
-        .array => |array| typeContainsGeneratedMatchName(array.elem.*, name),
+        .array => |array| typeContainsGeneratedMatchName(scan, array.elem.*),
         .array_expr => |array| {
-            if (typeContainsGeneratedMatchName(array.elem.*, name)) return true;
-            return exprContainsGeneratedMatchName(array.len.*, name);
+            if (typeContainsGeneratedMatchName(scan, array.elem.*)) return true;
+            return exprContainsGeneratedMatchName(scan, array.len.*);
         },
+        .expr => |expr| exprContainsGeneratedMatchName(scan, expr.*),
         .tuple => |tuple| {
             for (tuple) |element| {
-                if (typeContainsGeneratedMatchName(element, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, element)) return true;
             }
             return false;
         },
         .fn_ptr => |function| {
             for (function.params) |param| {
-                if (typeContainsGeneratedMatchName(param, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, param)) return true;
             }
-            return typeContainsGeneratedMatchName(function.ret.*, name);
+            return typeContainsGeneratedMatchName(scan, function.ret.*);
         },
         .anon_struct => |anonymous| {
             for (anonymous.fields) |field| {
-                if (typeContainsGeneratedMatchName(field.ty, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, field.ty)) return true;
                 if (field.default_val) |value| {
-                    if (exprContainsGeneratedMatchName(value.*, name)) return true;
+                    if (exprContainsGeneratedMatchName(scan, value.*)) return true;
                 }
             }
             return false;
@@ -1129,208 +1641,281 @@ fn typeContainsGeneratedMatchName(ty: ast.Type, name: []const u8) bool {
     };
 }
 
-fn patternContainsGeneratedMatchName(pattern: ast.Pattern, name: []const u8) bool {
+/// Whether this pattern SHADOWS the scanned name, which is the whole of what a
+/// pattern contributes to the read question: a `binding` introduces the name
+/// for the arm's own body. A variant name and a field name introduce nothing,
+/// so neither can shadow — they name a tag and a field, and the arm they guard
+/// still sees the outer name.
+fn patternShadowsName(scan: NameScan, pattern: ast.Pattern) bool {
     return switch (pattern) {
-        .wildcard, .lit, .range_pat => false,
-        .binding, .enum_literal => |value| generatedMatchNameEquals(lexicalRoot(value), name),
+        .wildcard, .lit, .range_pat, .enum_literal => false,
+        .binding => |value| scan.shadowedByBinding(value),
         .tuple => |patterns| {
             for (patterns) |child| {
-                if (patternContainsGeneratedMatchName(child, name)) return true;
+                if (patternShadowsName(scan, child)) return true;
+            }
+            return false;
+        },
+        .struct_pat => |struct_pattern| {
+            for (struct_pattern.fields) |field| {
+                if (patternShadowsName(scan, field.pat)) return true;
+            }
+            return false;
+        },
+    };
+}
+
+/// Whether the pattern contributes a COUNT for this question. In read mode a
+/// `binding` never does: it is a shadow, which stops the count rather than
+/// answering it, and `patternShadowsName` is where that is noticed. In
+/// occurrence mode it still counts, because a generated name that collides
+/// with a binding is just as unusable as one that collides with a read.
+fn patternContainsGeneratedMatchName(scan: NameScan, pattern: ast.Pattern) bool {
+    return switch (pattern) {
+        .wildcard, .lit, .range_pat => false,
+        .binding => |value| scan.namesSomethingElse(value),
+        .enum_literal => |value| scan.namesSomethingElse(value),
+        .tuple => |patterns| {
+            for (patterns) |child| {
+                if (patternContainsGeneratedMatchName(scan, child)) return true;
             }
             return false;
         },
         .struct_pat => |struct_pattern| {
             if (struct_pattern.name) |value| {
-                if (generatedMatchNameEquals(lexicalRoot(value), name)) return true;
+                if (scan.namesSomethingElse(value)) return true;
             }
             for (struct_pattern.fields) |field| {
-                if (generatedMatchNameEquals(lexicalRoot(field.name), name)) return true;
-                if (patternContainsGeneratedMatchName(field.pat, name)) return true;
+                if (scan.namesSomethingElse(field.name)) return true;
+                if (patternContainsGeneratedMatchName(scan, field.pat)) return true;
             }
             return false;
         },
     };
 }
 
-fn stmtContainsGeneratedMatchName(stmt: ast.Stmt, name: []const u8) bool {
+fn stmtContainsGeneratedMatchName(scan: NameScan, stmt: ast.Stmt) bool {
     return switch (stmt) {
         .let_stmt => |let_statement| {
-            if (generatedMatchNameEquals(lexicalRoot(let_statement.name), name)) return true;
+            // The name a `let` binds is a collision, not a read; the shadow
+            // itself is `blockContainsGeneratedMatchName`'s business.
+            if (scan.namesSomethingElse(let_statement.name)) return true;
             if (let_statement.ty) |ty| {
-                if (typeContainsGeneratedMatchName(ty, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, ty)) return true;
             }
-            return exprContainsGeneratedMatchName(let_statement.init, name);
+            return exprContainsGeneratedMatchName(scan, let_statement.init);
         },
         .assign => |assignment| {
-            return exprContainsGeneratedMatchName(assignment.target, name) or
-                exprContainsGeneratedMatchName(assignment.val, name);
+            return exprContainsGeneratedMatchName(scan, assignment.target) or
+                exprContainsGeneratedMatchName(scan, assignment.val);
         },
-        .defer_stmt => |defer_statement| exprContainsGeneratedMatchName(defer_statement.expr, name),
-        .expr_stmt => |expression| exprContainsGeneratedMatchName(expression.*, name),
+        .defer_stmt => |defer_statement| exprContainsGeneratedMatchName(scan, defer_statement.expr),
+        .expr_stmt => |expression| exprContainsGeneratedMatchName(scan, expression.*),
     };
 }
 
-fn blockContainsGeneratedMatchName(block: ast.Block, name: []const u8) bool {
+/// Walks one block's statements IN ORDER, which is what makes the shadowing
+/// rule mean anything: a `let` is read through its own initialiser and type,
+/// and everything after it in THIS block reads the local instead. The rule is
+/// stated once, here, so it holds in a nested block and a match arm as well as
+/// in the body of a function — the hand-rolled loop that used to live in
+/// `bodyReadsParam` covered only the top-level statement list and reported the
+/// read it could not prove absent, which cost a package Zig refuses.
+fn blockContainsGeneratedMatchName(block: ast.Block, scan: NameScan) bool {
+    // A label names an exit, never a value, so it is not a read; it is still a
+    // collision worth avoiding when the question is about a generated name.
     if (block.label) |label| {
-        if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+        if (scan.namesSomethingElse(label)) return true;
     }
+    var inner = scan;
     for (block.stmts) |stmt| {
-        if (stmtContainsGeneratedMatchName(stmt, name)) return true;
+        if (stmtContainsGeneratedMatchName(inner, stmt)) return true;
+        if (stmt == .let_stmt and inner.shadowedByBinding(stmt.let_stmt.name)) {
+            inner = inner.shadowedBy();
+        }
     }
-    if (block.expr) |expression| return exprContainsGeneratedMatchName(expression.*, name);
+    if (block.expr) |expression| return exprContainsGeneratedMatchName(inner, expression.*);
     return false;
 }
 
-fn matchContainsGeneratedMatchName(match: ast.Match, name: []const u8) bool {
-    if (exprContainsGeneratedMatchName(match.target.*, name)) return true;
+fn matchContainsGeneratedMatchName(match: ast.Match, scan: NameScan) bool {
+    if (exprContainsGeneratedMatchName(scan, match.target.*)) return true;
     for (match.arms) |arm| {
+        // The scrutinee is read once, outside every arm: an arm that binds the
+        // name shadows it for that arm's body and for nothing else.
+        var arm_scan = scan;
         for (arm.patterns) |pattern| {
-            if (patternContainsGeneratedMatchName(pattern, name)) return true;
+            if (patternContainsGeneratedMatchName(scan, pattern)) return true;
+            if (patternShadowsName(scan, pattern)) arm_scan = arm_scan.shadowedBy();
         }
         if (arm.capture) |capture| {
-            if (generatedMatchNameEquals(capture.name, name)) return true;
+            if (scan.namesSomethingElse(capture.name)) return true;
+            if (scan.shadowedByBinding(capture.name)) arm_scan = arm_scan.shadowedBy();
         }
-        if (exprContainsGeneratedMatchName(arm.body, name)) return true;
+        if (exprContainsGeneratedMatchName(arm_scan, arm.body)) return true;
     }
     return false;
 }
 
-fn exprContainsGeneratedMatchName(expression: ast.Expr, name: []const u8) bool {
+fn exprContainsGeneratedMatchName(scan: NameScan, expression: ast.Expr) bool {
     return switch (expression) {
         .lit, .unit, .unsupported, .panic_, .unreachable_ => false,
-        .ident => |value| generatedMatchNameEquals(lexicalRoot(value), name),
-        .field_access => |field_access| exprContainsGeneratedMatchName(field_access.target.*, name),
+        .ident => |value| scan.mentions(value),
+        .field_access => |field_access| exprContainsGeneratedMatchName(scan, field_access.target.*),
         .call => |call| {
-            if (exprContainsGeneratedMatchName(call.callee.*, name)) return true;
+            if (exprContainsGeneratedMatchName(scan, call.callee.*)) return true;
             for (call.generic_args) |argument| {
-                if (typeContainsGeneratedMatchName(argument, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, argument)) return true;
             }
             for (call.args) |argument| {
-                if (exprContainsGeneratedMatchName(argument, name)) return true;
+                if (exprContainsGeneratedMatchName(scan, argument)) return true;
             }
             return false;
         },
-        .block => |block| blockContainsGeneratedMatchName(block, name),
-        .match_expr => |match| matchContainsGeneratedMatchName(match, name),
-        .bin_op => |binary| exprContainsGeneratedMatchName(binary.lhs.*, name) or
-            exprContainsGeneratedMatchName(binary.rhs.*, name),
-        .unary_op => |unary| exprContainsGeneratedMatchName(unary.operand.*, name),
-        .cast => |cast| typeContainsGeneratedMatchName(cast.target, name) or
-            exprContainsGeneratedMatchName(cast.operand.*, name),
+        .block => |block| blockContainsGeneratedMatchName(block, scan),
+        .match_expr => |match| matchContainsGeneratedMatchName(match, scan),
+        .bin_op => |binary| exprContainsGeneratedMatchName(scan, binary.lhs.*) or
+            exprContainsGeneratedMatchName(scan, binary.rhs.*),
+        .unary_op => |unary| exprContainsGeneratedMatchName(scan, unary.operand.*),
+        .cast => |cast| typeContainsGeneratedMatchName(scan, cast.target) or
+            exprContainsGeneratedMatchName(scan, cast.operand.*),
         .struct_init => |literal| {
             if (literal.type_name) |ty| {
-                if (typeContainsGeneratedMatchName(ty, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, ty)) return true;
             }
             for (literal.fields) |field| {
-                if (generatedMatchNameEquals(lexicalRoot(field.name), name)) return true;
-                if (exprContainsGeneratedMatchName(field.expr, name)) return true;
+                if (scan.namesSomethingElse(field.name)) return true;
+                if (exprContainsGeneratedMatchName(scan, field.expr)) return true;
             }
             return false;
         },
         .array_init => |array| {
             if (array.type_name) |ty| {
-                if (typeContainsGeneratedMatchName(ty, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, ty)) return true;
             }
             for (array.elements) |element| {
-                if (exprContainsGeneratedMatchName(element, name)) return true;
+                if (exprContainsGeneratedMatchName(scan, element)) return true;
             }
             return false;
         },
         .repeat => |repeat| {
             if (repeat.type_name) |ty| {
-                if (typeContainsGeneratedMatchName(ty, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, ty)) return true;
             }
-            return exprContainsGeneratedMatchName(repeat.elem.*, name);
+            return exprContainsGeneratedMatchName(scan, repeat.elem.*);
         },
         .multi_array => |array| {
             if (array.type_name) |ty| {
-                if (typeContainsGeneratedMatchName(ty, name)) return true;
+                if (typeContainsGeneratedMatchName(scan, ty)) return true;
             }
             for (array.elements) |element| {
-                if (exprContainsGeneratedMatchName(element, name)) return true;
+                if (exprContainsGeneratedMatchName(scan, element)) return true;
             }
             return false;
         },
         .tuple => |elements| {
             for (elements) |element| {
-                if (exprContainsGeneratedMatchName(element, name)) return true;
+                if (exprContainsGeneratedMatchName(scan, element)) return true;
             }
             return false;
         },
         .builtin => |builtin| {
-            if (generatedMatchNameEquals(lexicalRoot(builtin.name), name)) return true;
+            if (scan.namesSomethingElse(builtin.name)) return true;
             for (builtin.args) |argument| {
-                if (exprContainsGeneratedMatchName(argument, name)) return true;
+                if (exprContainsGeneratedMatchName(scan, argument)) return true;
             }
             return false;
         },
         .if_expr => |if_expression| {
-            if (exprContainsGeneratedMatchName(if_expression.cond.*, name)) return true;
-            if (exprContainsGeneratedMatchName(if_expression.then_body.*, name)) return true;
+            if (exprContainsGeneratedMatchName(scan, if_expression.cond.*)) return true;
+            // A capture binds the payload for its own branch only, so the
+            // `else` arm is scanned with the name still unshadowed.
+            var then_scan = scan;
+            if (if_expression.then_capture) |capture| {
+                if (scan.namesSomethingElse(capture.name)) return true;
+                if (scan.shadowedByBinding(capture.name)) then_scan = then_scan.shadowedBy();
+            }
+            if (exprContainsGeneratedMatchName(then_scan, if_expression.then_body.*)) return true;
             if (if_expression.else_body) |else_body| {
-                return exprContainsGeneratedMatchName(else_body.*, name);
+                var else_scan = scan;
+                if (if_expression.else_capture) |capture| {
+                    if (scan.namesSomethingElse(capture.name)) return true;
+                    if (scan.shadowedByBinding(capture.name)) {
+                        else_scan = else_scan.shadowedBy();
+                    }
+                }
+                return exprContainsGeneratedMatchName(else_scan, else_body.*);
             }
             return false;
         },
         .while_expr => |while_expression| {
             if (while_expression.label) |label| {
-                if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+                if (scan.namesSomethingElse(label)) return true;
             }
-            if (exprContainsGeneratedMatchName(while_expression.cond.*, name)) return true;
+            if (exprContainsGeneratedMatchName(scan, while_expression.cond.*)) return true;
+            var body_scan = scan;
             if (while_expression.captures) |captures| {
                 for (captures) |capture| {
-                    if (generatedMatchNameEquals(lexicalRoot(capture), name)) return true;
+                    if (scan.namesSomethingElse(capture)) return true;
+                    if (scan.shadowedByBinding(capture)) body_scan = body_scan.shadowedBy();
                 }
             }
             if (while_expression.continue_expr) |continue_expression| {
-                if (exprContainsGeneratedMatchName(continue_expression.*, name)) return true;
+                if (exprContainsGeneratedMatchName(body_scan, continue_expression.*)) return true;
             }
-            if (blockContainsGeneratedMatchName(while_expression.body, name)) return true;
+            if (blockContainsGeneratedMatchName(while_expression.body, body_scan)) return true;
             if (while_expression.else_body) |else_body| {
-                return exprContainsGeneratedMatchName(else_body.*, name);
+                return exprContainsGeneratedMatchName(scan, else_body.*);
             }
             return false;
         },
         .for_expr => |for_expression| {
             if (for_expression.label) |label| {
-                if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+                if (scan.namesSomethingElse(label)) return true;
             }
+            // The inputs are read before the loop binds anything, and the `else`
+            // arm runs once the loop is over, outside the capture's scope.
             for (for_expression.inputs) |input| {
-                if (exprContainsGeneratedMatchName(input, name)) return true;
+                if (exprContainsGeneratedMatchName(scan, input)) return true;
             }
+            var body_scan = scan;
             for (for_expression.captures) |capture| {
-                if (generatedMatchNameEquals(lexicalRoot(capture.name), name)) return true;
+                if (scan.namesSomethingElse(capture.name)) return true;
+                if (scan.shadowedByBinding(capture.name)) {
+                    body_scan = body_scan.shadowedBy();
+                }
             }
-            if (blockContainsGeneratedMatchName(for_expression.body, name)) return true;
+            if (blockContainsGeneratedMatchName(for_expression.body, body_scan)) return true;
             if (for_expression.else_body) |else_body| {
-                return exprContainsGeneratedMatchName(else_body.*, name);
+                return exprContainsGeneratedMatchName(scan, else_body.*);
             }
             return false;
         },
         .range => |range| {
-            if (exprContainsGeneratedMatchName(range.start.*, name)) return true;
-            if (range.end) |end| return exprContainsGeneratedMatchName(end.*, name);
+            if (exprContainsGeneratedMatchName(scan, range.start.*)) return true;
+            if (range.end) |end| return exprContainsGeneratedMatchName(scan, end.*);
             return false;
         },
         .return_expr => |value| {
-            if (value) |inner| return exprContainsGeneratedMatchName(inner.*, name);
+            if (value) |inner| return exprContainsGeneratedMatchName(scan, inner.*);
             return false;
         },
         .break_expr => |break_expr| {
             if (break_expr.label) |label| {
-                if (generatedMatchNameEquals(lexicalRoot(label), name)) return true;
+                if (scan.namesSomethingElse(label)) return true;
             }
             if (break_expr.value) |inner| {
-                return exprContainsGeneratedMatchName(inner.*, name);
+                return exprContainsGeneratedMatchName(scan, inner.*);
             }
             return false;
         },
         .continue_expr => |continue_expr| {
             if (continue_expr.label) |label| {
-                return generatedMatchNameEquals(lexicalRoot(label), name);
+                return scan.namesSomethingElse(label);
             }
             return false;
         },
+        .type_value => |ty| typeContainsGeneratedMatchName(scan, ty),
     };
 }
 
@@ -1341,7 +1926,7 @@ fn freshGeneratedMatchName(
     base: []const u8,
 ) GeneratedMatchName {
     var suffix: usize = 0;
-    while (suffix < 1024) : (suffix += 1) {
+    while (true) : (suffix += 1) {
         const candidate: GeneratedMatchName = .{ .base = base, .suffix = suffix };
         var active = false;
         for (active_names) |name| {
@@ -1360,11 +1945,10 @@ fn freshGeneratedMatchName(
                 }
             }
         }
-        if (!active and !matchContainsGeneratedMatchName(match, candidate_text)) {
+        if (!active and !matchContainsGeneratedMatchName(match, occurrenceScan(candidate_text))) {
             return candidate;
         }
     }
-    @panic("exhausted generated match names");
 }
 
 /// Picks the label the emitter writes for `scope`, a loop or a block it is
@@ -1382,13 +1966,14 @@ fn freshGeneratedLabel(
     depth: usize,
 ) []const u8 {
     var suffix = depth;
-    while (suffix < depth + 1024) : (suffix += 1) {
+    while (true) : (suffix += 1) {
         // The label is spelled with the suffix even at zero, so the text the
         // scope is searched for is the text the emitter writes.
         const candidate_text = std.fmt.bufPrint(buffer, "{s}_{d}", .{ base, suffix }) catch unreachable;
-        if (!exprContainsGeneratedMatchName(scope, candidate_text)) return candidate_text;
+        if (!exprContainsGeneratedMatchName(occurrenceScan(candidate_text), scope)) {
+            return candidate_text;
+        }
     }
-    @panic("exhausted generated label names");
 }
 
 pub fn emitExpr(
@@ -1405,6 +1990,17 @@ pub fn emitExpr(
 // Expression Emission
 // ---------------------------------------------------------------------------
 
+/// Lowers `for x in chunks.iter()` and the chunk forms to a runtime `while`
+/// over an iterator or index. `ForExpr.is_inline` is not honoured here, and
+/// cannot be: this path is taken only for a loop driven by a runtime iterator,
+/// and Zig unrolls a loop only when its condition is comptime-known. An inline
+/// loop always arrives on the plain path.
+///
+/// Each form's prelude is a statement, and the caller has already placed the
+/// first line, so this writes whole lines rather than text to be continued.
+/// That is what makes the result a Zig statement — what `writesAsStatement`
+/// says a `for` is — and not something a `break` payload could be prefixed
+/// onto, which is why no site may put one in front of it.
 fn emitChunkLoop(
     context: *const EmitContext,
     allocator: std.mem.Allocator,
@@ -1831,9 +2427,7 @@ fn emitExprScoped(
             try buf.appendSlice(allocator, "{ ");
             try emitExprScoped(context, allocator, buf, rp.elem.*, depth);
             try buf.appendSlice(allocator, " } ** ");
-            var len_buf: [32]u8 = undefined;
-            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{rp.len}) catch unreachable;
-            try buf.appendSlice(allocator, len_str);
+            try buf.print(allocator, "{d}", .{rp.len});
         },
         .builtin => |bi| {
             if (std.mem.eql(u8, bi.name, "index") and bi.args.len == 2) {
@@ -1922,6 +2516,9 @@ fn emitExprScoped(
             const label = usedLoopLabel(fe.body, target);
             if (try emitChunkLoop(&loop_context, allocator, buf, fe, label, depth)) return;
             try emitSourceLoopLabel(allocator, buf, label);
+            // Zig reads a block label, then an optional `inline`, then `for`,
+            // so the keyword goes after whatever label was just written.
+            if (fe.is_inline) try buf.appendSlice(allocator, "inline ");
             try buf.appendSlice(allocator, "for (");
             for (fe.inputs, 0..) |inp, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
@@ -1999,6 +2596,7 @@ fn emitExprScoped(
             }
         },
         .unreachable_ => try buf.appendSlice(allocator, "unreachable"),
+        .type_value => |ty| try emitType(allocator, buf, ty),
     }
 }
 
@@ -2197,14 +2795,14 @@ fn emitMatchExpr(
             // Zig refuses a capture nothing reads: naming one is `error: unused
             // capture`, and discarding it as `_` is `error: discard of
             // capture`. An arm that only tests the tag writes no capture.
-            if (exprContainsGeneratedMatchName(arm.body, capture.name)) {
+            if (exprContainsGeneratedMatchName(occurrenceScan(capture.name), arm.body)) {
                 try buf.appendSlice(allocator, " |");
                 if (capture.by_ref) try buf.appendSlice(allocator, "*");
                 try emitIdent(allocator, buf, capture.name);
                 try buf.appendSlice(allocator, "|");
             }
         } else if (direct_binding) |binding| {
-            if (exprContainsGeneratedMatchName(arm.body, binding)) {
+            if (exprContainsGeneratedMatchName(occurrenceScan(binding), arm.body)) {
                 try buf.appendSlice(allocator, " |");
                 try emitIdent(allocator, buf, binding);
                 try buf.appendSlice(allocator, "|");
@@ -2366,16 +2964,6 @@ fn emitMatchDestructureBody(
     try buf.appendSlice(allocator, "}");
 }
 
-fn emitBlock(
-    allocator: std.mem.Allocator,
-    buf: *std.ArrayListUnmanaged(u8),
-    block: ast.Block,
-    depth: usize,
-) std.mem.Allocator.Error!void {
-    const context: EmitContext = .{};
-    try emitBlockScoped(&context, allocator, buf, block, depth);
-}
-
 /// Zig refuses a local nothing reads; Rust allows an unused binding. A
 /// declaration no other statement in its block names is therefore emitted as
 /// `_ = <init>;`: the initialiser still runs for its effects and the
@@ -2393,7 +2981,7 @@ fn unusedBindingAsDiscard(
         else => return stmt,
     };
     const name = let_stmt.name;
-    if (name.len == 0 or std.mem.startsWith(u8, name, "_")) return stmt;
+    if (name.len == 0 or std.mem.eql(u8, name, "_")) return stmt;
     // A `.unit` initialiser is either "no initialiser" — the source bound the
     // name and assigned it later, and that assignment is the use this scan
     // cannot see — or a real unit value, which `_ =` would not accept.
@@ -2402,15 +2990,48 @@ fn unusedBindingAsDiscard(
     return .{ .assign = .{ .target = .{ .ident = "_" }, .val = let_stmt.init } };
 }
 
+/// Whether a function body reads the parameter `name`. The `self` receiver and
+/// every ordinary parameter ask this one question, so the two rules cannot
+/// disagree about what "read" means.
+///
+/// The scan descends through every block, loop, match arm and inlined closure
+/// body the AST can carry, so a read that happens only inside one of those
+/// still counts. Nothing can hide a read behind an opaque node: the Zig AST has
+/// no closure and no macro variant, because the lowerer inlines a closure at
+/// its call site and the frontend has already expanded a macro, so both reach
+/// the emitter as ordinary statements.
+///
+/// What it asks is the READ question, not the occurrence question: a binding
+/// that shadows `name` is not a read of it, and the rest of the scope that
+/// binding opens stops counting. Every kind of binding is covered by that one
+/// rule, in whatever scope it appears — a `let`, a match pattern, an arm
+/// capture, a `for` or `while` payload, an `if` capture — because
+/// `blockContainsGeneratedMatchName` carries a `shadowed` flag down through
+/// each of them rather than re-deciding the question per arm. A closure
+/// parameter arrives as one of those (the lowerer inlines the closure and its
+/// parameters become a payload or a `let`), so it needs no case of its own.
+///
+/// The other direction is what makes the rule safe to apply: Rust introduces a
+/// local only after its initialiser is produced, so a shadowing `let`'s
+/// initialiser and type annotation still read the parameter and a read BEFORE
+/// the shadow still counts. Both are scanned before the shadow is set.
+fn bodyReadsParam(body: ast.Block, name: []const u8) bool {
+    return blockContainsGeneratedMatchName(body, .{ .name = name, .mode = .read });
+}
+
 /// Whether any statement other than `index`, or the block's tail, names
-/// `name`.
+/// `name`. This is the LOCAL-binding rule, and it asks the OCCURRENCE
+/// question on purpose: it cannot tell a shadowing `let` from a read, and a
+/// name that occurs anywhere else in the block has to keep its binding,
+/// because a false positive here would discard a value that is live.
 fn blockReadsNameOutside(block: ast.Block, index: usize, name: []const u8) bool {
+    const scan = occurrenceScan(name);
     for (block.stmts, 0..) |stmt, other| {
         if (other == index) continue;
-        if (stmtContainsGeneratedMatchName(stmt, name)) return true;
+        if (stmtContainsGeneratedMatchName(scan, stmt)) return true;
     }
     if (block.expr) |tail| {
-        if (exprContainsGeneratedMatchName(tail.*, name)) return true;
+        if (exprContainsGeneratedMatchName(scan, tail.*)) return true;
     }
     return false;
 }
@@ -2465,21 +3086,27 @@ fn emitBlockScoped(
     }
     if (block.expr) |tail| {
         try emitIndent(allocator, buf, depth + 1);
-        if (tail.* == .return_expr or tail.* == .break_expr or
-            tail.* == .continue_expr or tail.* == .unreachable_ or
-            tail.* == .panic_)
-        {
-            try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
-            try buf.appendSlice(allocator, ";\n");
-        } else if (value_label) |label| {
-            try buf.appendSlice(allocator, "break :");
-            try emitIdent(allocator, buf, label);
-            try buf.appendSlice(allocator, " ");
-            try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
-            try buf.appendSlice(allocator, ";\n");
-        } else {
-            try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
-            try buf.appendSlice(allocator, "\n");
+        // The same rule a function body tail follows. The label above is
+        // written when `blockHasValue` holds, and that is exactly when the
+        // tail is a value, so a `value` tail always has a label to leave
+        // through — while a unit `for` tail, which Zig spells as a statement,
+        // must not have one prefixed onto it.
+        switch (blockTailRole(tail.*)) {
+            .value => {
+                try buf.appendSlice(allocator, "break :");
+                try emitIdent(allocator, buf, value_label.?);
+                try buf.appendSlice(allocator, " ");
+                try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
+                try buf.appendSlice(allocator, ";\n");
+            },
+            .statement => {
+                try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
+                try buf.appendSlice(allocator, "\n");
+            },
+            .exit => {
+                try emitExprScoped(&block_context, allocator, buf, tail.*, depth + 1);
+                try buf.appendSlice(allocator, ";\n");
+            },
         }
     }
     try emitIndent(allocator, buf, depth);
@@ -2489,14 +3116,10 @@ fn emitBlockScoped(
 fn emitLiteral(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), lit: ast.Literal) !void {
     switch (lit) {
         .int => |i| {
-            var num_buf: [48]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch unreachable;
-            try buf.appendSlice(allocator, s);
+            try buf.print(allocator, "{d}", .{i});
         },
         .uint => |u| {
-            var num_buf: [48]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{u}) catch unreachable;
-            try buf.appendSlice(allocator, s);
+            try buf.print(allocator, "{d}", .{u});
         },
         .float => |f| {
             if (std.math.isNan(f)) {
@@ -2506,9 +3129,9 @@ fn emitLiteral(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), l
             } else if (std.math.isNegativeInf(f)) {
                 try buf.appendSlice(allocator, "-@as(f64, std.math.inf(f64))");
             } else {
-                var num_buf: [48]u8 = undefined;
-                const s = std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch unreachable;
-                try buf.appendSlice(allocator, s);
+                const start = buf.items.len;
+                try buf.print(allocator, "{d}", .{f});
+                const s = buf.items[start..];
                 if (!std.mem.containsAtLeast(u8, s, 1, ".") and
                     !std.mem.containsAtLeast(u8, s, 1, "e") and
                     !std.mem.containsAtLeast(u8, s, 1, "E"))
@@ -2537,9 +3160,7 @@ fn emitLiteral(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), l
             } else if (c >= 0x20 and c <= 0x7e) {
                 try buf.append(allocator, @intCast(c));
             } else {
-                var hex_buf: [16]u8 = undefined;
-                const hex = std.fmt.bufPrint(&hex_buf, "\\u{{{x}}}", .{c}) catch unreachable;
-                try buf.appendSlice(allocator, hex);
+                try buf.print(allocator, "\\u{{{x}}}", .{c});
             }
             try buf.appendSlice(allocator, "'");
         },
@@ -2618,6 +3239,34 @@ pub fn emitPattern(
 // Type Emission
 // ---------------------------------------------------------------------------
 
+/// Zig's type grammar, narrowed to the shapes this AST can spell: a name, a
+/// qualified name, a generic call, a builtin, and a compile-time `if` whose
+/// branches are types. That last one is how a conditional borrow is written:
+/// `if (rustHashRefIsFat(D)) RustHashRef(D, true) else RustHashRef(D, false)`.
+/// Every other expression is a value, and splicing one behind the `*`, `[]`,
+/// or `?` it is nested in would let that surrounding type bind part of it and
+/// read as a different type, so it is wrapped instead of read.
+fn isTypeExpr(expr: ast.Expr) bool {
+    return switch (expr) {
+        .ident, .field_access, .call, .builtin, .if_expr, .type_value => true,
+        else => false,
+    };
+}
+
+/// Emits the expression that names a `Type.expr`. Depth and the empty context
+/// are the ones `array_expr` uses for its length: a type value stands where a
+/// length expression does, and neither carries a loop scope of its own.
+fn emitTypeExpr(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    expr: ast.Expr,
+) std.mem.Allocator.Error!void {
+    const is_type = isTypeExpr(expr);
+    if (!is_type) try buf.append(allocator, '(');
+    try emitExpr(allocator, buf, expr, 0);
+    if (!is_type) try buf.append(allocator, ')');
+}
+
 pub fn emitType(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
@@ -2656,9 +3305,7 @@ pub fn emitType(
                 .c => try buf.appendSlice(allocator, "[*c]"),
             }
             if (p.alignment) |alignment| {
-                var alignment_buffer: [32]u8 = undefined;
-                const qualifier = std.fmt.bufPrint(&alignment_buffer, "align({d}) ", .{alignment}) catch unreachable;
-                try buf.appendSlice(allocator, qualifier);
+                try buf.print(allocator, "align({d}) ", .{alignment});
             }
             if (p.is_allowzero) try buf.appendSlice(allocator, "allowzero ");
             if (p.is_const) {
@@ -2708,9 +3355,7 @@ pub fn emitType(
             try buf.appendSlice(allocator, ")");
         },
         .array => |a| {
-            var len_buf: [32]u8 = undefined;
-            const len_str = std.fmt.bufPrint(&len_buf, "[{d}]", .{a.len}) catch unreachable;
-            try buf.appendSlice(allocator, len_str);
+            try buf.print(allocator, "[{d}]", .{a.len});
             try emitType(allocator, buf, a.elem.*);
         },
         .array_expr => |a| {
@@ -2719,6 +3364,7 @@ pub fn emitType(
             try buf.appendSlice(allocator, "]");
             try emitType(allocator, buf, a.elem.*);
         },
+        .expr => |expr| try emitTypeExpr(allocator, buf, expr.*),
         .tuple => |tup| {
             try buf.appendSlice(allocator, "struct { ");
             for (tup, 0..) |elem, i| {
@@ -3229,4 +3875,427 @@ test "emitFile: a value-carrying loop tail is returned instead of dropped" {
     defer std.testing.allocator.free(source);
     try std.testing.expect(std.mem.indexOf(u8, source, "return __r2z_value_loop_1: {") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "break :__r2z_value_loop_1 i;") != null);
+}
+
+test "generated names remain fresh beyond 1024 source bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const bindings = try allocator.alloc(ast.Stmt, 1030);
+    const capture_names = try allocator.alloc([]const u8, bindings.len);
+    for (bindings, capture_names, 0..) |*binding, *capture, index| {
+        binding.* = .{ .let_stmt = .{
+            .name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ value_block_base, index }),
+            .init = .{ .lit = .{ .uint = 0 } },
+        } };
+        capture.* = if (index == 0)
+            match_payload_base
+        else
+            try std.fmt.allocPrint(allocator, "{s}_{d}", .{ match_payload_base, index });
+    }
+    const scope: ast.Expr = .{ .block = .{ .stmts = bindings } };
+    var label_buffer: [64]u8 = undefined;
+    const label = freshGeneratedLabel(&label_buffer, scope, value_block_base, 0);
+    try std.testing.expect(!exprContainsGeneratedMatchName(occurrenceScan(label), scope));
+
+    const target: ast.Expr = .{ .lit = .{ .uint = 0 } };
+    const payload = freshGeneratedMatchName(.{ .target = &target }, &.{}, capture_names, match_payload_base);
+    var payload_buffer: [64]u8 = undefined;
+    const payload_name = generatedMatchNameText(&payload_buffer, payload);
+    for (capture_names) |capture| {
+        try std.testing.expect(!std.mem.eql(u8, capture, payload_name));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The parameter discard, and every way a binding SHADOWS the parameter
+// ---------------------------------------------------------------------------
+
+/// Emits a `void` function whose one parameter is `unit`, with `body` as its
+/// body, and hands back the generated source. The `_ = unit;` Zig refuses a
+/// function to go without is decided by `bodyReadsParam`, so the only thing
+/// these tests vary is the body.
+fn shadowProbe(body: ast.Block) ![]const u8 {
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "probe",
+            .params = &.{.{ .name = "unit", .ty = .{ .prim = .u8 } }},
+            .ret_type = .{ .void_type = {} },
+            .body = body,
+        } }},
+    };
+    return emitFile(std.testing.allocator, &file);
+}
+
+/// A statement that reads `unit`, which is the one shape that keeps the
+/// parameter live. `callee` is the caller's own stable home for the callee,
+/// because `Expr` holds that operand behind a pointer.
+fn readUnitThrough(callee: *const ast.Expr) ast.Expr {
+    return .{ .call = .{
+        .callee = callee,
+        .args = &[_]ast.Expr{.{ .ident = "unit" }},
+    } };
+}
+
+// A match pattern that BINDS the parameter's name introduces it for that arm,
+// so the arm body is not reading the parameter and the parameter needs its
+// discard. The other direction is in the same test: the scrutinee is the
+// parameter, read before any binding can shadow it, so there the discard must
+// NOT appear — a rule that cannot tell the two apart drops a discard Zig
+// requires exactly as surely as it adds one Zig forbids.
+test "bodyReadsParam: a match pattern that binds the parameter's name shadows it" {
+    const void_value: ast.Expr = .{ .unit = {} };
+    const shadowing_arms = [_]ast.MatchArm{.{
+        .patterns = &[_]ast.Pattern{.{ .binding = "unit" }},
+        .body = void_value,
+    }};
+    const other: ast.Expr = .{ .ident = "kind" };
+    const shadowed: ast.Expr = .{ .match_expr = .{
+        .target = &other,
+        .arms = &shadowing_arms,
+    } };
+    const shadowed_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &shadowed },
+    } });
+    defer std.testing.allocator.free(shadowed_out);
+    try std.testing.expect(std.mem.indexOf(u8, shadowed_out, "_ = unit;\n") != null);
+
+    const unit_target: ast.Expr = .{ .ident = "unit" };
+    const live: ast.Expr = .{ .match_expr = .{
+        .target = &unit_target,
+        .arms = &shadowing_arms,
+    } };
+    const live_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &live },
+    } });
+    defer std.testing.allocator.free(live_out);
+    try std.testing.expect(std.mem.indexOf(u8, live_out, "_ = unit;") == null);
+}
+
+// The same rule one position over: the arm CAPTURE, rather than the pattern,
+// is what introduces the name.
+test "bodyReadsParam: a match arm capture that binds the parameter's name shadows it" {
+    const void_value: ast.Expr = .{ .unit = {} };
+    const capturing_arms = [_]ast.MatchArm{.{
+        .patterns = &[_]ast.Pattern{.{ .enum_literal = "Found" }},
+        .capture = .{ .name = "unit" },
+        .body = void_value,
+    }};
+    const other: ast.Expr = .{ .ident = "kind" };
+    const shadowed: ast.Expr = .{ .match_expr = .{
+        .target = &other,
+        .arms = &capturing_arms,
+    } };
+    const shadowed_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &shadowed },
+    } });
+    defer std.testing.allocator.free(shadowed_out);
+    try std.testing.expect(std.mem.indexOf(u8, shadowed_out, "_ = unit;\n") != null);
+
+    // The read is a statement of its own, so it happens while `unit` can only
+    // be the parameter; the capture below it shadows the name from there down.
+    const consume: ast.Expr = .{ .ident = "consume" };
+    const read = readUnitThrough(&consume);
+    const live_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &read },
+        .{ .expr_stmt = &shadowed },
+    } });
+    defer std.testing.allocator.free(live_out);
+    try std.testing.expect(std.mem.indexOf(u8, live_out, "_ = unit;") == null);
+}
+
+// A `for` payload binds the element for the loop's own body, and the inputs
+// beside it are read before anything binds — so a name that is only in the
+// body is the local's, and one in an input is the parameter's.
+test "bodyReadsParam: a for payload that binds the parameter's name shadows it" {
+    const items: ast.Expr = .{ .ident = "items" };
+    const void_value: ast.Expr = .{ .unit = {} };
+    const body_stmt: ast.Stmt = .{ .expr_stmt = &void_value };
+    const shadowed: ast.Expr = .{ .for_expr = .{
+        .inputs = &[_]ast.Expr{items},
+        .captures = &[_]ast.Capture{.{ .name = "unit" }},
+        .body = .{ .stmts = &[_]ast.Stmt{body_stmt} },
+    } };
+    const shadowed_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &shadowed },
+    } });
+    defer std.testing.allocator.free(shadowed_out);
+    try std.testing.expect(std.mem.indexOf(u8, shadowed_out, "_ = unit;\n") != null);
+
+    const consume: ast.Expr = .{ .ident = "consume" };
+    const read = readUnitThrough(&consume);
+    const live_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &read },
+        .{ .expr_stmt = &shadowed },
+    } });
+    defer std.testing.allocator.free(live_out);
+    try std.testing.expect(std.mem.indexOf(u8, live_out, "_ = unit;") == null);
+}
+
+// The nested `let`: a block one scope down that rebinds the name shadows it
+// for the REST OF THAT BLOCK and nothing else. This is the shape the old
+// top-level-only rule reported as a read, and the report cost a package Zig
+// refuses with `unused function parameter`. The shadowing block also READS the
+// name it bound, which is what proves the rule is about scope and not about
+// counting occurrences: a read of the local is not a read of the parameter.
+test "bodyReadsParam: a let in a nested block that binds the parameter's name shadows it" {
+    const consume: ast.Expr = .{ .ident = "consume" };
+    const read = readUnitThrough(&consume);
+    const shadowing_let: ast.Stmt = .{ .let_stmt = .{
+        .name = "unit",
+        .init = .{ .lit = .{ .uint = 3 } },
+    } };
+    const shadowed: ast.Expr = .{ .block = .{
+        .stmts = &[_]ast.Stmt{ shadowing_let, .{ .expr_stmt = &read } },
+    } };
+    const shadowed_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &shadowed },
+    } });
+    defer std.testing.allocator.free(shadowed_out);
+    try std.testing.expect(std.mem.indexOf(u8, shadowed_out, "_ = unit;\n") != null);
+
+    // Read first, shadowed second: the read is of the parameter and keeps it
+    // live, so the nested block below changes nothing about it.
+    const outer_read = readUnitThrough(&consume);
+    const live_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &outer_read },
+        .{ .expr_stmt = &shadowed },
+    } });
+    defer std.testing.allocator.free(live_out);
+    try std.testing.expect(std.mem.indexOf(u8, live_out, "_ = unit;") == null);
+}
+
+// The two payload shapes the match arm and the loop do not cover: an `if`
+// capture and a `while` payload. Both bind for their own body only, so the
+// `else` arm of that `if` still sees the parameter — which is the scope half of
+// the rule, stated where the shadow has to stop.
+test "bodyReadsParam: an if capture and a while payload bind the parameter's name too" {
+    const void_value: ast.Expr = .{ .unit = {} };
+    const ready: ast.Expr = .{ .ident = "ready" };
+    const shadowing_if: ast.Expr = .{ .if_expr = .{
+        .cond = &ready,
+        .then_capture = .{ .name = "unit" },
+        .then_body = &void_value,
+    } };
+    const if_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &shadowing_if },
+    } });
+    defer std.testing.allocator.free(if_out);
+    try std.testing.expect(std.mem.indexOf(u8, if_out, "_ = unit;\n") != null);
+
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const body_stmt: ast.Stmt = .{ .expr_stmt = &void_value };
+    const shadowing_while: ast.Expr = .{ .while_expr = .{
+        .cond = &condition,
+        .captures = &[_][]const u8{"unit"},
+        .body = .{ .stmts = &[_]ast.Stmt{body_stmt} },
+    } };
+    const while_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &shadowing_while },
+    } });
+    defer std.testing.allocator.free(while_out);
+    try std.testing.expect(std.mem.indexOf(u8, while_out, "_ = unit;\n") != null);
+
+    // The shadow stops at the branch it opens: the `else` arm is a sibling
+    // scope, so a read there is a read of the parameter.
+    const consume: ast.Expr = .{ .ident = "consume" };
+    const read = readUnitThrough(&consume);
+    const else_reads: ast.Expr = .{ .if_expr = .{
+        .cond = &ready,
+        .then_capture = .{ .name = "unit" },
+        .then_body = &void_value,
+        .else_body = &read,
+    } };
+    const else_out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        .{ .expr_stmt = &else_reads },
+    } });
+    defer std.testing.allocator.free(else_out);
+    try std.testing.expect(std.mem.indexOf(u8, else_out, "_ = unit;") == null);
+}
+
+// A shadowing `let`'s own INITIALISER is read while the parameter is still the
+// only `unit` in scope, and Rust introduces the local only after it has been
+// produced. This is the direction the rule exists to keep: reading through the
+// declaration is a read of the parameter, and dropping the discard there would
+// leave a live parameter with nothing keeping it alive.
+test "bodyReadsParam: a shadowing initialiser still reads the parameter" {
+    const consume: ast.Expr = .{ .ident = "consume" };
+    const read = readUnitThrough(&consume);
+    const shadowing_let: ast.Stmt = .{ .let_stmt = .{
+        .name = "unit",
+        .init = .{ .ident = "unit" },
+    } };
+    // The shadowing local is read below its own declaration, so it keeps its
+    // binding instead of being written as `_ = unit;` — the same text the
+    // parameter's discard would be, which would make the assertion below
+    // unable to tell the two apart. Only the parameter can be discarded here.
+    const out = try shadowProbe(.{ .stmts = &[_]ast.Stmt{
+        shadowing_let,
+        .{ .expr_stmt = &read },
+    } });
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = unit;\n") == null);
+}
+
+// ---------------------------------------------------------------------------
+// Where a labelled block may be written
+// ---------------------------------------------------------------------------
+
+/// The labelled chain a guarded `match` lowers to: a label, exits that name
+/// it, and the `unreachable` that closes an ordered chain.
+///
+/// Both labels are `comptime` so the whole fixture is evaluated at comptime:
+/// every node it names then lives in static storage, which is what lets the
+/// expression be handed to a test that keeps it for longer than this frame.
+fn labelledChainFixture(comptime label: []const u8, comptime exit_label: []const u8) ast.Expr {
+    const payload: ast.Expr = .{ .ident = "payload" };
+    const exit: ast.Expr = .{ .break_expr = .{ .value = &payload, .label = exit_label } };
+    const void_value: ast.Expr = .{ .unit = {} };
+    const exit_stmt: ast.Stmt = .{ .expr_stmt = &exit };
+    const dispatch: ast.Expr = .{ .match_expr = .{
+        .target = &.{ .ident = "input" },
+        .arms = &[_]ast.MatchArm{.{ .patterns = &[_]ast.Pattern{.{ .wildcard = {} }}, .body = void_value }},
+    } };
+    const dispatch_stmt: ast.Stmt = .{ .expr_stmt = &dispatch };
+    const done: ast.Expr = .{ .unreachable_ = {} };
+    const done_stmt: ast.Stmt = .{ .expr_stmt = &done };
+    return .{ .block = .{
+        .label = label,
+        .stmts = &[_]ast.Stmt{ exit_stmt, dispatch_stmt, done_stmt },
+    } };
+}
+
+test "every labelled-block position has a verdict, and only a bare statement has no carrier" {
+    // The table is the position list, and its length is checked against the
+    // enum: a position added without a verdict here fails this test rather
+    // than inheriting one by accident.
+    const verdicts = [_]struct { position: LabelledBlockPosition, legal: bool }{
+        .{ .position = .if_branch, .legal = true },
+        .{ .position = .expression, .legal = true },
+        .{ .position = .bare_statement, .legal = false },
+    };
+    try std.testing.expectEqual(
+        @typeInfo(LabelledBlockPosition).@"enum".fields.len,
+        verdicts.len,
+    );
+    for (verdicts) |verdict| {
+        try std.testing.expectEqual(
+            verdict.legal,
+            labelledBlockIsLegalIn(verdict.position),
+        );
+    }
+}
+
+test "a labelled block with no carrier is refused by name, not written" {
+    const chain = labelledChainFixture("__r2z_match_block", "__r2z_match_block");
+
+    // A statement of its own: nothing in front of the block and no `;` after
+    // it. This is the position Zig measures as unspellable, and the refusal
+    // happens before a byte is written.
+    const bare: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "bare",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .stmts = &[_]ast.Stmt{.{ .expr_stmt = &chain }} },
+        } }},
+    };
+    try std.testing.expectError(
+        error.LabelledBlockWithoutACarrier,
+        emitFile(std.testing.allocator, &bare),
+    );
+
+    // The same block as a `const` initializer, which is a carrier, so the very
+    // same shape that was refused a line above is emitted here.
+    const bound: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "bound",
+            .ret_type = .{ .prim = .u8 },
+            .body = .{
+                .stmts = &[_]ast.Stmt{.{ .let_stmt = .{
+                    .name = "__r2z_chain",
+                    .init = chain,
+                } }},
+                .expr = &.{ .ident = "__r2z_chain" },
+            },
+        } }},
+    };
+    const bound_out = try emitFile(std.testing.allocator, &bound);
+    defer std.testing.allocator.free(bound_out);
+    try std.testing.expect(
+        std.mem.indexOf(u8, bound_out, "const __r2z_chain = __r2z_match_block: {") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, bound_out, "break :__r2z_match_block payload;") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bound_out, "return __r2z_chain;") != null);
+}
+
+test "a labelled block in an if branch is exempt, and the exemption is structural" {
+    const then_chain = labelledChainFixture("__r2z_match_block", "__r2z_match_block");
+    const else_chain = labelledChainFixture("__r2z_other_block", "__r2z_other_block");
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+    const conditional: ast.Expr = .{ .if_expr = .{
+        .cond = &condition,
+        .then_body = &then_chain,
+        .else_body = &else_chain,
+    } };
+
+    // Both arms are blocks, so the `if` is a whole Zig statement — which is
+    // the `bare` statement FORM, and is exactly why the exemption cannot come
+    // from the statement form: it comes from being an arm of this `if`.
+    try std.testing.expectEqual(StatementForm.bare, statementForm(conditional));
+
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "guarded",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .stmts = &[_]ast.Stmt{.{ .expr_stmt = &conditional }} },
+        } }},
+    };
+    const out = try emitFile(std.testing.allocator, &file);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "if (true) __r2z_match_block: {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "} else __r2z_other_block: {") != null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, out, "__r2z_match_block: {"),
+    );
+}
+
+test "a labelled block in a loop body or a test tail has no carrier either" {
+    const loop_chain = labelledChainFixture("__r2z_loop_block", "__r2z_loop_block");
+    const body: ast.Block = .{ .stmts = &[_]ast.Stmt{.{ .expr_stmt = &loop_chain }} };
+    const condition: ast.Expr = .{ .lit = .{ .bool_lit = true } };
+
+    const file: ast.File = .{
+        .path = "src/root.zig",
+        .decls = &.{.{ .fn_decl = .{
+            .name = "looped",
+            .ret_type = .{ .void_type = {} },
+            .body = .{ .stmts = &[_]ast.Stmt{.{ .expr_stmt = &.{ .while_expr = .{
+                .cond = &condition,
+                .body = body,
+            } } }} },
+        } }},
+    };
+    try std.testing.expectError(
+        error.LabelledBlockWithoutACarrier,
+        emitFile(std.testing.allocator, &file),
+    );
+
+    // A test body writes its tail as a statement whatever it carries, so a
+    // labelled block there is refused for the same reason.
+    const test_file: ast.File = .{
+        .path = "src/root.zig",
+        .imports = &.{.{ .local_name = "std", .module_or_path = "std" }},
+        .tests = &.{.{ .name = "tail", .body = .{ .expr = &loop_chain } }},
+    };
+    try std.testing.expectError(
+        error.LabelledBlockWithoutACarrier,
+        emitFile(std.testing.allocator, &test_file),
+    );
 }

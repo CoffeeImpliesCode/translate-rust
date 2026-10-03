@@ -8,7 +8,7 @@ const std = @import("std");
 pub const ast = @import("ast.zig");
 /// Text emitter: ast.Package/File -> Zig source.
 pub const emit = @import("emit.zig");
-/// Package writer: ast.Package -> files on disk (build.zig, build.zig.zon, src/*).
+/// Package writer: manifests, translated sources and the required vendored runtime.
 pub const package = @import("package.zig");
 /// Lowering engine: RustIr to ast.Package.
 pub const lower = @import("lower.zig");
@@ -18,6 +18,8 @@ pub const lower_test = @import("lower_test.zig");
 pub const emit_test = @import("emit_test.zig");
 /// JSON encoder/decoder for ast.Package.
 pub const serialize = @import("serialize.zig");
+/// Documentation contract tests.
+pub const documentation_test = @import("documentation_test.zig");
 /// Pluggable lowering strategies.
 pub const strategies = @import("strategies/root.zig");
 

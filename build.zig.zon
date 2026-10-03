@@ -4,10 +4,10 @@
     .fingerprint = 0xc8c692767721f1d9, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // tree-sitter runtime + Zig bindings. Transitive dep: the C core.
+        // Pinned C runtime. Local bindings keep node aggregates inside C.
         .tree_sitter = .{
-            .url = "git+https://github.com/tree-sitter/zig-tree-sitter#b562510b5563dcf3b7fcac4a5fe9d60834c84667",
-            .hash = "tree_sitter-0.26.0-8heIf-vDAQDh0HhAAUVwVZFmLrwSKMZl5gRaVFqtas0W",
+            .url = "git+https://github.com/tree-sitter/tree-sitter#24a64db7ccb7dff830789cf44ecfeaacf7fee822",
+            .hash = "tree_sitter-0.27.0-Tw2sR0TDCwBUIKjCd2avkJKfxXvSNZmdynJqiXMUYgAv",
         },
         .serde = .{
             .url = "git+https://github.com/OrlovEvgeny/serde.zig#dd8cc6f97c240c7fb73c69dad2722c806e59a81b",

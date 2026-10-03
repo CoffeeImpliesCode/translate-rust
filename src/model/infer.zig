@@ -200,7 +200,12 @@ pub fn substType(
             bx_ptr.* = sub_inner;
             return .{ .boxed = bx_ptr };
         },
-        .generic_inst, .fn_ptr, .unsupported => return t,
+        // `.generic_inst` and `.fn_ptr` are returned unchanged even though they
+        // hold type arguments; these three join them, because rewriting a
+        // bound list or an external nominal's arguments would need heap copies
+        // whose release has to mirror exactly, and `typeContainsParam` already
+        // reports these arms as parameter-free so the two agree.
+        .generic_inst, .fn_ptr, .unsupported, .external_nominal, .@"opaque", .dyn_trait => return t,
     }
 }
 
@@ -557,6 +562,7 @@ fn walkBlock(ctx: *Ctx, blk: exprs.BlockExpr, fn_body: exprs.NodeId, blk_node: ?
 /// caller's temporary storage is freed.
 fn addInstantiation(ctx: *Ctx, node: exprs.NodeId, inst: types.Instantiation) std.mem.Allocator.Error!void {
     const owned = try ctx.alloc.dupe(types.Type, inst.args.params);
+    errdefer ctx.alloc.free(owned);
     const gop = try ctx.g.instantiations.getOrPut(ctx.alloc, node);
     if (gop.found_existing) {
         // Supersede the prior record's args without leaking it.
@@ -590,11 +596,14 @@ fn cloneInstantiationMap(
     var it = source.iterator();
     while (it.next()) |entry| {
         const owned = try alloc.dupe(types.Type, entry.value_ptr.args.params);
-        try out.put(alloc, entry.key_ptr.*, .{
+        out.put(alloc, entry.key_ptr.*, .{
             .generic_id = entry.value_ptr.generic_id,
             .args = .{ .params = owned },
             .zig_suffix = entry.value_ptr.zig_suffix,
-        });
+        }) catch |err| {
+            alloc.free(owned);
+            return err;
+        };
     }
     return out;
 }
@@ -639,6 +648,11 @@ fn collectTypeParamNamesFromType(
         },
         .boxed => |bx| try collectTypeParamNamesFromType(alloc, b, buf, bx.*),
         .unsupported => {},
+        // An external nominal's path segments carry no `EntityId` at all, so
+        // reading them by the rule above would file `alloc`, `core` and `Cow`
+        // as generic parameter names. A trait bound names a resolved trait,
+        // not a parameter, so none of these three contributes a name.
+        .external_nominal, .@"opaque", .dyn_trait => {},
     }
 }
 
@@ -884,6 +898,13 @@ fn typeContainsParam(t: types.Type, param_names: []const []const u8) bool {
             return typeContainsParam(res.ok, param_names) or typeContainsParam(res.err, param_names);
         },
         .boxed => |bx| return typeContainsParam(bx.*, param_names),
+        // `external_nominal`, `opaque` and `dyn_trait` carry types only as
+        // generic arguments and trait bounds — provenance this pass does not
+        // rewrite. Reporting "no parameter here" keeps them on the same
+        // footing as `.generic_inst` and `.fn_ptr`, whose arguments are left
+        // alone here too, and keeps `substitutedTypeId` from handing an
+        // unresolved type to `findTypeIndex`.
+        .external_nominal, .@"opaque", .dyn_trait => return false,
     }
 }
 
@@ -933,6 +954,9 @@ fn freeTypeTree(alloc: std.mem.Allocator, t: types.Type) void {
             freeTypeTree(alloc, bx.*);
             alloc.destroy(bx);
         },
+        // Nothing here is heap-owned by this pass: `substType` returns these
+        // three unchanged, so there is no substitution tree to release.
+        .external_nominal, .@"opaque", .dyn_trait => {},
     }
 }
 
@@ -954,7 +978,28 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .literal => |lit| try walkLiteral(ctx, node, lit),
         .vec_lit => |vec| {
             for (vec.elements) |element| try walkExpr(ctx, element, fn_body);
+            // `vec![e; n]` evaluates the element once and the count once, so a
+            // count the target evaluates is a node this walk reaches: a
+            // definition or generic instantiation used only there is still
+            // reachable from the literal.
+            if (vec.repeat) |count| switch (count) {
+                .literal => {},
+                .expression => |id| try walkExpr(ctx, id, fn_body),
+            };
         },
+        // `[a, b]` and `[e; N]`: unlike `vec!`, the length is part of the
+        // type and is a number the translator already holds, so there is no
+        // count node to reach.
+        .array => |arr| {
+            for (arr.elements) |element| try walkExpr(ctx, element, fn_body);
+        },
+        // `start..end`: the absent end of an open-ended range is no node.
+        .range => |r| {
+            try walkExpr(ctx, r.start, fn_body);
+            if (r.end) |end| try walkExpr(ctx, end, fn_body);
+        },
+        // `panic!` / `unreachable!` diverge and own no child node.
+        .panic_ => {},
         .path => |p| {
             try walkPath(ctx, node, p);
             if (p.generic_args.len > 0) {
@@ -995,6 +1040,15 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
         .call => |c| {
             try handleCall(ctx, node, c, fn_body);
         },
+        // A core-library call names no local entity, so there is no
+        // `walkPath` and no instantiation to record; its arguments are ordinary
+        // expression nodes and are reached from here.
+        .core_call => |cc| {
+            for (cc.args) |a| try walkExpr(ctx, a, fn_body);
+        },
+        // A core-library function item carries type arguments but no value
+        // arguments, so it owns no child node.
+        .core_function => {},
         .method_call => |m| {
             try walkMethodCall(ctx, node, m, fn_body);
         },
@@ -1005,12 +1059,26 @@ fn walkExpr(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Alloca
             for (ev.tuple_fields) |f| try walkExpr(ctx, f, fn_body);
             for (ev.named_fields) |f| try walkExpr(ctx, f.value, fn_body);
         },
+        .external_variant => |ev| {
+            for (ev.tuple_fields) |f| try walkExpr(ctx, f, fn_body);
+            for (ev.named_fields) |f| try walkExpr(ctx, f.value, fn_body);
+        },
+        // `write!(w, "{}", x)`: the writer is evaluated first, then each arg.
+        .format_write => |fw| {
+            try walkExpr(ctx, fw.writer, fn_body);
+            for (fw.args) |a| try walkExpr(ctx, a, fn_body);
+        },
         .field => |f| {
             try walkExpr(ctx, f.base, fn_body);
         },
         .index => |ix| {
             try walkExpr(ctx, ix.base, fn_body);
             try walkExpr(ctx, ix.index, fn_body);
+        },
+        // `source_type` and `target` are types, not expression nodes; the
+        // operand is the only node the conversion reaches.
+        .cast => |c| {
+            try walkExpr(ctx, c.operand, fn_body);
         },
         .binary => |bin| try walkBinary(ctx, node, bin, fn_body),
         .unary => |u| {
@@ -1282,9 +1350,11 @@ pub fn solveWithGen(
     const num_exprs = b.exprs.len;
     if (num_exprs == 0) {
         // Zero exprs: still hand over any recorded instantiations (rare no-body case).
+        const result_types = try alloc.alloc(?exprs.TypeId, 0);
+        errdefer alloc.free(result_types);
         return .{
-            .types = try alloc.alloc(?exprs.TypeId, 0),
-            .instantiations = cloneInstantiationMap(alloc, g.instantiations) catch .empty,
+            .types = result_types,
+            .instantiations = try cloneInstantiationMap(alloc, g.instantiations),
         };
     }
 
@@ -1380,6 +1450,7 @@ pub fn solveWithGen(
 
     // Assemble Inferred result array.
     const result_types = try alloc.alloc(?exprs.TypeId, num_exprs);
+    errdefer alloc.free(result_types);
     for (0..num_exprs) |i| {
         const root = findRoot(parent, @intCast(i));
         result_types[i] = concrete[root];
@@ -1387,7 +1458,7 @@ pub fn solveWithGen(
 
     return .{
         .types = result_types,
-        .instantiations = cloneInstantiationMap(alloc, g.instantiations) catch .empty,
+        .instantiations = try cloneInstantiationMap(alloc, g.instantiations),
     };
 }
 
@@ -1645,5 +1716,140 @@ test "substType substitutes generic type parameters structurally" {
         // and the substituted reference node itself.
         a.destroy(subst.reference);
         break :init_heap;
+    }
+}
+
+fn checkInstantiationCloneAllocationFailures(alloc: std.mem.Allocator, expression_count: usize) !void {
+    const source_allocator = std.testing.allocator;
+    var constraints: Gen = .{};
+    defer constraints.deinit(source_allocator);
+    const owned_args = try source_allocator.dupe(types.Type, &.{.{ .prim = .u32 }});
+    constraints.instantiations.put(source_allocator, 0, .{
+        .generic_id = 7,
+        .args = .{ .params = owned_args },
+        .zig_suffix = "u32",
+    }) catch |err| {
+        source_allocator.free(owned_args);
+        return err;
+    };
+    const expressions = [_]exprs.Expr{.{
+        .id = 0,
+        .span = test_span,
+        .ty = null,
+        .kind = .{ .literal = .{ .int = .{
+            .text = "1u32",
+            .value = 1,
+            .base = .dec,
+            .ty_suffix = "u32",
+        } } },
+    }};
+    const body: bodies.Bodies = .{
+        .exprs = expressions[0..expression_count],
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var inferred = try solveWithGen(alloc, &body, &constraints);
+    defer inferred.deinit(alloc);
+    const cloned = inferred.getInstantiation(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(exprs.DefId, 7), cloned.generic_id);
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, cloned.args.params[0]);
+    try std.testing.expect(cloned.args.params.ptr != owned_args.ptr);
+}
+
+test "solveWithGen preserves instantiations or propagates allocation failure" {
+    for ([_]usize{ 0, 1 }) |expression_count| {
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            checkInstantiationCloneAllocationFailures,
+            .{expression_count},
+        );
+    }
+}
+
+/// `addInstantiation` duplicates the caller's args, so the source slice is
+/// borrowed throughout and the map owns the copy. Sweeping every allocation
+/// point covers three shapes: a fresh node key, a key that already holds a
+/// record, and the exact moment between the duplicate and the map insert.
+fn checkAddInstantiationAllocationFailures(alloc: std.mem.Allocator, replace_existing: bool) !void {
+    const source_allocator = std.testing.allocator;
+    const b: bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &.{},
+    };
+    var constraints: Gen = .{};
+    defer constraints.deinit(alloc);
+    var ctx: Ctx = .{ .alloc = alloc, .b = &b, .g = &constraints };
+
+    const prior_args = try source_allocator.dupe(types.Type, &.{.{ .prim = .i64 }});
+    defer source_allocator.free(prior_args);
+    const next_args = try source_allocator.dupe(
+        types.Type,
+        &.{ .{ .prim = .u32 }, .{ .prim = .bool } },
+    );
+    defer source_allocator.free(next_args);
+
+    if (replace_existing) {
+        addInstantiation(&ctx, 3, .{
+            .generic_id = 7,
+            .args = .{ .params = prior_args },
+            .zig_suffix = "i64",
+        }) catch |err| {
+            // Seeding the prior record can itself exhaust the budget; the map
+            // stays empty and the caller's storage is untouched.
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(constraints.instantiations.get(3) == null);
+            try std.testing.expectEqual(types.Type{ .prim = .i64 }, prior_args[0]);
+            return err;
+        };
+    }
+
+    addInstantiation(&ctx, 3, .{
+        .generic_id = 9,
+        .args = .{ .params = next_args },
+        .zig_suffix = "u32",
+    }) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        // A refused recording leaves the map exactly as it stood before.
+        if (replace_existing) {
+            const kept = constraints.instantiations.get(3) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(exprs.DefId, 7), kept.generic_id);
+            try std.testing.expectEqual(@as(usize, 1), kept.args.params.len);
+            try std.testing.expectEqual(types.Type{ .prim = .i64 }, kept.args.params[0]);
+            try std.testing.expectEqual(@as([]const u8, "i64"), kept.zig_suffix);
+        } else {
+            try std.testing.expect(constraints.instantiations.get(3) == null);
+        }
+        // The caller's own slice is borrowed and comes back unchanged.
+        try std.testing.expectEqual(types.Type{ .prim = .u32 }, next_args[0]);
+        try std.testing.expectEqual(types.Type{ .prim = .bool }, next_args[1]);
+        return err;
+    };
+
+    const recorded = constraints.instantiations.get(3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(exprs.DefId, 9), recorded.generic_id);
+    try std.testing.expectEqual(@as(usize, 2), recorded.args.params.len);
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, recorded.args.params[0]);
+    try std.testing.expectEqual(types.Type{ .prim = .bool }, recorded.args.params[1]);
+    try std.testing.expectEqual(@as([]const u8, "u32"), recorded.zig_suffix);
+    // The map holds the duplicate, never the caller's slice.
+    try std.testing.expect(recorded.args.params.ptr != next_args.ptr);
+    // A replaced record is superseded, not accumulated.
+    try std.testing.expectEqual(@as(usize, 1), constraints.instantiations.count());
+    try std.testing.expectEqual(types.Type{ .prim = .u32 }, next_args[0]);
+    try std.testing.expectEqual(types.Type{ .prim = .bool }, next_args[1]);
+}
+
+test "addInstantiation rollback" {
+    for ([_]bool{ false, true }) |replace_existing| {
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            checkAddInstantiationAllocationFailures,
+            .{replace_existing},
+        );
     }
 }

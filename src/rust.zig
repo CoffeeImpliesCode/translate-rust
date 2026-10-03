@@ -108,3 +108,88 @@ test "reports errors on malformed input" {
 
     try std.testing.expect(tree.rootNode().hasError());
 }
+
+test "node navigation preserves byte spans and absent children" {
+    const source = "fn café() {} fn other() {}";
+    var parser = try Parser.init();
+    defer parser.deinit();
+    const tree = parser.parse(source).?;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    try std.testing.expect(!root.hasError());
+    try std.testing.expectEqual(@as(u32, 2), root.namedChildCount());
+    const first = root.namedChild(0).?;
+    const name = first.childByFieldName("name").?;
+    try std.testing.expect(name.isNamed());
+    try std.testing.expectEqualStrings("café", source[name.startByte()..name.endByte()]);
+    try std.testing.expectEqualStrings("name", first.fieldNameForNamedChild(0).?);
+    try std.testing.expect(root.fieldNameForNamedChild(0) == null);
+    try std.testing.expect(first.fieldNameForNamedChild(first.namedChildCount()) == null);
+
+    const punctuation = first.childByFieldName("body").?.child(0).?;
+    try std.testing.expect(!punctuation.isNamed());
+    try std.testing.expectEqualStrings("{", source[punctuation.startByte()..punctuation.endByte()]);
+
+    const second = first.nextNamedSibling().?;
+    try std.testing.expect(!first.eql(second));
+    try std.testing.expect(first.eql(second.prevNamedSibling().?));
+    const second_name = second.childByFieldName("name").?;
+    try std.testing.expectEqualStrings("other", source[second_name.startByte()..second_name.endByte()]);
+    const previous_name = second.prevNamedSibling().?.childByFieldName("name").?;
+    try std.testing.expectEqualStrings("café", source[previous_name.startByte()..previous_name.endByte()]);
+    try std.testing.expect(first.prevNamedSibling() == null);
+    try std.testing.expect(second.nextNamedSibling() == null);
+    try std.testing.expect(root.namedChild(2) == null);
+    try std.testing.expect(first.childByFieldName("return_type") == null);
+}
+
+test "unicode escapes with underscore separators lex as one token" {
+    const source =
+        \\fn escapes() {
+        \\    let astral = '\u{1_F980}';
+        \\    let max = '\u{10_FFFF}';
+        \\    let padded = '\u{1_F980__}';
+        \\    let text = "a\u{1_F980} b\u{10_FFFF} c\u{1_F980__}";
+        \\}
+    ;
+    const char_spellings = [_][]const u8{
+        "'\\u{1_F980}'",
+        "'\\u{10_FFFF}'",
+        "'\\u{1_F980__}'",
+    };
+    const escape_spellings = [_][]const u8{
+        "\\u{1_F980}",
+        "\\u{10_FFFF}",
+        "\\u{1_F980__}",
+    };
+    var parser = try Parser.init();
+    defer parser.deinit();
+    const tree = parser.parse(source).?;
+    defer tree.destroy();
+    const root = tree.rootNode();
+    try std.testing.expect(!root.hasError());
+    const function = root.namedChild(0).?;
+    try std.testing.expectEqualStrings("function_item", function.kind());
+    const body = function.childByFieldName("body").?;
+    try std.testing.expectEqual(@as(u32, char_spellings.len + 1), body.namedChildCount());
+
+    for (char_spellings, 0..) |spelling, index| {
+        const value = body.namedChild(@intCast(index)).?.childByFieldName("value").?;
+        try std.testing.expectEqualStrings("char_literal", value.kind());
+        try std.testing.expectEqualStrings(spelling, source[value.startByte()..value.endByte()]);
+    }
+    const string = body.namedChild(char_spellings.len).?.childByFieldName("value").?;
+    try std.testing.expectEqualStrings("string_literal", string.kind());
+    var escape_index: usize = 0;
+    var child_index: u32 = 0;
+    while (string.namedChild(child_index)) |child| : (child_index += 1) {
+        if (!std.mem.eql(u8, child.kind(), "escape_sequence")) continue;
+        try std.testing.expectEqualStrings(
+            escape_spellings[escape_index],
+            source[child.startByte()..child.endByte()],
+        );
+        escape_index += 1;
+    }
+    try std.testing.expectEqual(escape_spellings.len, escape_index);
+}
