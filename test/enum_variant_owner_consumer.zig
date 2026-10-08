@@ -273,6 +273,35 @@ fn tagName(value: translated.Payload) []const u8 {
 
 // ── the tests ────────────────────────────────────────────────────────────
 
+test "generated enum build returns each variant and its owned payload to the caller" {
+    const modes = [_]u8{ 0, 1, 2, 3, out_of_range_mode };
+    for (modes, 0..) |mode, index| {
+        const variant = variants[@min(index, variants.len - 1)];
+        var ledger = Ledger.init(std.testing.allocator);
+        const gpa = ledger.allocator();
+
+        const carrier = try translated.build(gpa, mode);
+        try std.testing.expectEqualStrings(variant.tag, tagName(carrier));
+        const address = ledger.onlyAddress() orelse
+            return error.PayloadBytesNotRecorded;
+        try std.testing.expectEqual(address, ledger.onlyLiveAddress() orelse
+            return error.PayloadBytesNotHeldOnce);
+        try std.testing.expectEqual(@as(usize, 0), ledger.totalReleases());
+
+        // `build` returns the carrier, unlike `dispatch`, which constructs it
+        // internally. The caller owns and releases this carrier's payload.
+        switch (carrier) {
+            .Text, .Number, .Flag, .Blank => |payload| {
+                var owned = payload;
+                try std.testing.expectEqualStrings(variant.text, owned.as_str());
+                try std.testing.expectEqual(address, @intFromPtr(owned.as_bytes().ptr));
+                owned.deinit(gpa);
+            },
+        }
+        try expectPayloadReleasedExactlyOnce(&ledger, address);
+    }
+}
+
 test "generated enum variants move their payload out to the caller exactly once" {
     // Each variant gets its own ledger, so "exactly once" is a per-variant
     // claim rather than a running total that a second release could hide
@@ -281,21 +310,17 @@ test "generated enum variants move their payload out to the caller exactly once"
         var ledger = Ledger.init(std.testing.allocator);
         const gpa = ledger.allocator();
 
-        // The carrier the frame built. It is a live owner of the payload at
-        // this point, and it stays one until `dispatch` hands the payload out
-        // of it — which is the window a second release has to land in for this
-        // fixture's claim to break.
-        const carrier = try translated.build(gpa, @intCast(mode));
-        try std.testing.expectEqualStrings(variant.tag, tagName(carrier));
+        // `dispatch` constructs the carrier internally and moves its payload
+        // out. The ledger observes that construction without creating a second,
+        // unrelated carrier in the caller.
+        var moved = try translated.dispatch(gpa, @intCast(mode));
+        const address = ledger.onlyAddress() orelse
+            return error.PayloadBytesNotRecorded;
+        try std.testing.expectEqual(address, ledger.onlyLiveAddress() orelse
+            return error.PayloadBytesNotHeldOnce);
 
-        // One allocation so far, and it is the payload's own bytes.
-        const address = ledger.onlyLiveAddress() orelse
-            return error.PayloadBytesNotHeldOnce;
-
-        // The dispatch moves the payload out and hands it back, so before the
-        // caller releases anything NOTHING may have been released: the moved
-        // payload is still live, and the carrier must not have freed it.
-        var moved = try translated.dispatch(gpa, carrier);
+        // Before the caller releases anything, the moved payload remains live
+        // and the dispatch frame must not have released it.
         try std.testing.expectEqualStrings(variant.text, moved.as_str());
         try std.testing.expectEqual(@as(usize, 0), ledger.totalReleases());
         try std.testing.expectEqual(@as(usize, 1), ledger.liveCount());
@@ -333,12 +358,11 @@ test "generated enum carriers route an unlisted mode to the chain's last variant
     var ledger = Ledger.init(std.testing.allocator);
     const gpa = ledger.allocator();
 
-    const carrier = try translated.build(gpa, out_of_range_mode);
-    try std.testing.expectEqualStrings(variants[variants.len - 1].tag, tagName(carrier));
-    const address = ledger.onlyLiveAddress() orelse
-        return error.PayloadBytesNotHeldOnce;
-
-    var moved = try translated.dispatch(gpa, carrier);
+    var moved = try translated.dispatch(gpa, out_of_range_mode);
+    const address = ledger.onlyAddress() orelse
+        return error.PayloadBytesNotRecorded;
+    try std.testing.expectEqual(address, ledger.onlyLiveAddress() orelse
+        return error.PayloadBytesNotHeldOnce);
     try std.testing.expectEqualStrings(variants[variants.len - 1].text, moved.as_str());
     try std.testing.expectEqual(@as(usize, 0), ledger.totalReleases());
     try std.testing.expectEqual(address, @intFromPtr(moved.as_bytes().ptr));
@@ -354,7 +378,7 @@ test "generated enum carriers route an unlisted mode to the chain's last variant
 // first allocation the body makes, so the frames that would have to release on
 // the way out are exactly the ones under test.
 fn movedPayloadWithAllocationFailures(gpa: std.mem.Allocator) !void {
-    var moved = try translated.dispatch(gpa, try translated.build(gpa, 0));
+    var moved = try translated.dispatch(gpa, 0);
     defer moved.deinit(gpa);
     try std.testing.expectEqualStrings("alpha", moved.as_str());
 }

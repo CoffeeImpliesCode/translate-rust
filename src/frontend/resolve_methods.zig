@@ -836,6 +836,8 @@ pub fn lookupStdMethod(
             // growing methods are admitted for every element and the backend
             // appends whichever one the argument carries.
             if (isExactAllocNominal(external, "vec", "Vec", 1)) {
+                if (std.mem.eql(u8, method_name, "iter")) return .slice_iter;
+                if (std.mem.eql(u8, method_name, "iter_mut")) return .slice_iter_mut;
                 if (std.mem.eql(u8, method_name, "push")) return .vec_push;
                 if (std.mem.eql(u8, method_name, "extend")) return .vec_extend;
                 // `len` counts the same elements `push` appends, and the
@@ -2469,6 +2471,11 @@ fn isRetainedIteratorProjectionMethod(
     projection: RetainedIteratorProjection,
     method_name: []const u8,
 ) bool {
+    // Copied retains this canonical slice projection in IR so its value Item
+    // mode survives extraction. It is not a copied stage over a cloned source.
+    if (projection == .slice_iterator and std.mem.eql(u8, method_name, "copied")) {
+        return true;
+    }
     if (std.mem.eql(u8, method_name, "cloned") or
         std.mem.eql(u8, method_name, "rev"))
     {

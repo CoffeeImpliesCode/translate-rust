@@ -38,7 +38,12 @@ pub const U32X4 = struct {
     /// Runs the translated Rust operation `rem_assign`.
     pub fn rem_assign(self: *U32X4, quotient: u32) void {
         for (self.@"0"[0..]) |*s| {
-            s.* %= quotient;
+            {
+                const __r2z_compound_rhs: u32 = quotient;
+                const __r2z_compound_place = &s.*;
+                const __r2z_compound_lhs = __r2z_compound_place.*;
+                __r2z_compound_place.* = @rem(__r2z_compound_lhs, __r2z_compound_rhs);
+            }
         }
     }
 

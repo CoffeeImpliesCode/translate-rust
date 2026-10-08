@@ -16,38 +16,28 @@
 //!
 //! The positive rows are `mini`, `fnv`, `compat`, `wyhash`, `adler`, `hex`,
 //! `multimod`, `xxhash-rust` under both its empty default and an explicit
-//! `xxh32`, `percent-encoding` and `itoa`. Compat also runs through Rust IR
-//! and Zig AST serialization. Multimod covers the three-file, two-level
+//! `xxh32`, `percent-encoding`, `differential` and `itoa`. Compat also runs
+//! through Rust IR and Zig AST serialization. Multimod covers the three-file, two-level
 //! module→file mapping (`foo.rs`→`foo.zig`, `foo/bar.rs`→`foo/bar.zig`,
-//! `custom.rs`→`custom_pub.zig`) that no other fixture exercises. Fnv and
-//! percent-encoding each compile and run a consumer against their staged
-//! package, and itoa runs the shared consumer in
+//! `custom.rs`→`custom_pub.zig`) that no other fixture exercises. Fnv,
+//! percent-encoding and differential each compile and run a consumer against
+//! their staged package, and itoa runs the shared consumer in
 //! `test/promoted_crates_consumer.zig`.
 //!
-//! Alongside those sits the ownership block: sixteen fixture crates whose only
-//! claim is a runtime ownership boundary — a zero-field struct shape, an
-//! option reached through a mutable borrow, a payload moved out of a `Result`
-//! arm, an owner held across a guard that falls through, an owner inside a
-//! fixed-size array, an allocation that fails part way through, owners around
-//! every exit a loop can take, the owned fields behind a named struct and
-//! behind an enum variant, a borrowed payload handed over to an owning `Cow`,
-//! an owner passed into a generic and handed back out through it, an owner
-//! captured by a closure, an owner replaced in a place that already holds one,
-//! and the intermediates an iterator chain builds behind an adapter. Each is
-//! staged into its own directory and then compiled and RUN against the
-//! consumer beside it, through `expectOwnershipFixtureTranslated`, so the
-//! claim is an executed one. Four of the sixteen are red by construction and
-//! stay that way until the defects they name are closed; the block above
-//! their call sites says which.
+//! Sixteen ownership fixtures cover borrowed mutation, payload and field moves,
+//! guards, arrays, allocation failures, loop exits, Cow and generic handoffs,
+//! closure captures, overwritten owners, iterator chains, and match subjects.
+//! A separate fixture covers zero-field struct shapes. Each fixture is staged
+//! into its own directory, then compiled and run against its consumer in Debug
+//! and ReleaseSafe.
 //!
 //! Every crate that must NOT publish a package is a row of
-//! `refused_source_crates` below, each bound to the EXACT typed error it
-//! refuses with. That table is the point of the negative half: a crate that
-//! starts failing for a DIFFERENT reason fails this test instead of hiding
-//! behind a generic "it rejected" claim, and a crate that starts succeeding
-//! fails it too. A refusal is a statement that a construct cannot be
-//! represented faithfully yet, never a licence to emit wrong Zig for valid
-//! Rust.
+//! `refused_source_crates` below. Six construct refusals pin their exact typed
+//! errors, so a different failure cannot hide behind a generic rejection.
+//! Siphasher instead checks the refusal/publication boundary and reports the
+//! actual error without pinning an incidental implementation failure. Every
+//! row fails if translation succeeds or publishes output. Refusal is never a
+//! licence to emit wrong Zig for valid Rust.
 //!
 //! The test also exercises the fingerprint boundary with both failing and
 //! valid probes, and drives `driver.translateWithOptions` to a published
@@ -169,27 +159,25 @@ fn expectSourceCrateRejected(
     try writeMsg(io, stdout, "e2e: rejecting incomplete source fixture `{s}`", .{crate_dir});
     if (driver.translate(gpa, io, crate_dir, out_dir)) |_| {
         return error.IncompleteSourceTranslated;
-    } else |_| {}
+    } else |err| {
+        try writeMsg(
+            io,
+            stdout,
+            "e2e: source fixture `{s}` refused with `{s}`",
+            .{ crate_dir, @errorName(err) },
+        );
+    }
     try expectOutputDirectoryAbsent(io, out_dir);
 }
 
-/// Reject a source crate, and bind it to the typed error it refuses with when
-/// `expected_error` is one.
-///
-/// A null `expected_error` marks a row whose exact error the current tree does
-/// not determine. That row is still an assertion — the crate must refuse and
-/// must publish no package — but only its stop location is unpinned, and the
-/// error that refused it is printed instead of compared, so the next run says
-/// what the row should be pinned to. Printing rather than swallowing it is the
-/// whole point: a row left unpinned without a receipt is a row nobody can
-/// repair.
+/// Reject a source crate and bind it to the exact typed error it refuses with.
 fn expectSourceCrateRejectedWithError(
     gpa: std.mem.Allocator,
     io: std.Io,
     stdout: std.Io.File,
     crate_dir: []const u8,
     out_dir: []const u8,
-    expected_error: ?anyerror,
+    expected_error: anyerror,
 ) !void {
     try deleteTreeIfExists(io, out_dir);
     defer deleteTreeIfExists(io, out_dir) catch {};
@@ -198,16 +186,7 @@ fn expectSourceCrateRejectedWithError(
     if (driver.translate(gpa, io, crate_dir, out_dir)) |_| {
         return error.UnsupportedSourceTranslated;
     } else |err| {
-        if (expected_error) |expected| {
-            if (err != expected) return err;
-        } else {
-            try writeMsg(
-                io,
-                stdout,
-                "e2e: `{s}` refused with `{s}`: RE-MEASURED, pin this row to it",
-                .{ crate_dir, @errorName(err) },
-            );
-        }
+        if (err != expected_error) return err;
     }
     try expectOutputDirectoryAbsent(io, out_dir);
 }
@@ -518,6 +497,36 @@ fn expectPercentEncodingSourceCrateTranslated(
     );
 }
 
+fn expectDifferentialSourceCrateTranslated(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+) !void {
+    const out_dir = "zig-out/e2e-translated-source-differential";
+    try deleteTreeIfExists(io, out_dir);
+    defer deleteTreeIfExists(io, out_dir) catch {};
+    try writeMsg(io, stdout, "e2e: translating differential and executing value and ownership consumers", .{});
+    try driver.translate(gpa, io, "test/crates/differential", out_dir);
+    try runZigTest(
+        gpa,
+        io,
+        stdout,
+        &.{
+            "--dep",
+            "translated",
+            "--dep",
+            "r2z",
+            "-Mroot=test/differential_consumer.zig",
+            "--dep",
+            "r2z",
+            "-Mtranslated=zig-out/e2e-translated-source-differential/src/root.zig",
+            "-Mr2z=r2z-core/src/root.zig",
+        },
+        null,
+        error.DifferentialConsumerFailed,
+    );
+}
+
 /// Stage one ownership fixture and run its consumer against the staged
 /// package. This is the `expectPercentEncodingSourceCrateTranslated` shape:
 /// remove any stale output, translate the crate under test, then compile and
@@ -567,7 +576,13 @@ fn expectOwnershipFixtureTranslated(
     defer gpa.free(consumer_module);
     try args.appendSlice(gpa, &.{ consumer_module, "--dep", "r2z", translated_module });
     try args.append(gpa, "-Mr2z=r2z-core/src/root.zig");
-    try runZigTest(gpa, io, stdout, args.items, null, failure);
+    const mode_index = args.items.len;
+    try args.append(gpa, "-ODebug");
+    for ([_][]const u8{ "-ODebug", "-OReleaseSafe" }) |mode| {
+        args.items[mode_index] = mode;
+        try writeMsg(io, stdout, "e2e: executing `{s}` with {s}", .{ consumer_source, mode });
+        try runZigTest(gpa, io, stdout, args.items, null, failure);
+    }
 }
 
 /// `zero-field-shapes`: a zero-field tuple struct, a unit struct and a
@@ -651,6 +666,50 @@ fn expectShadowedInnerOwnerTranslated(gpa: std.mem.Allocator, io: std.Io, stdout
         false,
         error.ShadowedInnerOwnerConsumerFailed,
     );
+}
+
+/// `guarded-owned-fallthrough`: failed guards preserve payload ownership, and
+/// nested tuple dispatch releases wildcard fields without releasing the label
+/// handed to the caller. Run all six consumer tests, including the allocation
+/// failure sweep, with safety checks enabled in Debug and ReleaseSafe.
+fn expectGuardedOwnedFallthroughTranslated(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stdout: std.Io.File,
+) !void {
+    const crate_dir = "test/crates/guarded-owned-fallthrough";
+    const out_dir = "zig-out/e2e-translated-source-guarded-owned-fallthrough";
+    const consumer_source = "test/guarded_owned_fallthrough_consumer.zig";
+    try deleteTreeIfExists(io, out_dir);
+    defer deleteTreeIfExists(io, out_dir) catch {};
+    try writeMsg(io, stdout, "e2e: translating `{s}`", .{crate_dir});
+    try driver.translate(gpa, io, crate_dir, out_dir);
+
+    for ([_][]const u8{ "-ODebug", "-OReleaseSafe" }) |optimize_flag| {
+        try writeMsg(io, stdout, "e2e: executing `{s}` with {s}", .{
+            consumer_source,
+            optimize_flag,
+        });
+        try runZigTest(
+            gpa,
+            io,
+            stdout,
+            &.{
+                optimize_flag,
+                "--dep",
+                "translated",
+                "-Mroot=" ++ consumer_source,
+                optimize_flag,
+                "--dep",
+                "r2z",
+                "-Mtranslated=" ++ out_dir ++ "/src/root.zig",
+                optimize_flag,
+                "-Mr2z=r2z-core/src/root.zig",
+            },
+            null,
+            error.GuardedOwnedFallthroughConsumerFailed,
+        );
+    }
 }
 
 /// `array-wrapped-owner`: an owner inside a fixed-size array, so one release
@@ -1180,11 +1239,10 @@ fn expectAnalysisOptionsReachStagedPackage(
 /// and run against it, so the crate is covered by real execution rather than by
 /// a claim that a translation happened.
 ///
-/// `siphasher`, `seahash` and `atoi` analyse cleanly and still refuse at a
-/// typed boundary, so they publish no package for a consumer to import and
-/// have no row here: they are rows of `refused_source_crates` below. The day one
-/// of them does publish a package, its refusal row fails with
-/// `UnsupportedSourceTranslated`, which is what stops its vectors from quietly
+/// `siphasher`, `seahash` and `atoi` analyse cleanly and still refuse, so they
+/// publish no package for a consumer to import and have no row here: they are
+/// rows of `refused_source_crates` below. The day one of them translates
+/// successfully, its refusal row fails, which stops its vectors from quietly
 /// disappearing from the consumer.
 fn expectItoaCrateCompiled(
     gpa: std.mem.Allocator,
@@ -1229,23 +1287,13 @@ fn expectItoaCrateCompiled(
     );
 }
 
-/// Every source crate in the corpus that must refuse, with the one typed error
-/// it refuses with and the construct that stops it.
+/// Every source crate in the corpus that must refuse without publishing output.
 ///
-/// The error is the contract, not a decoration: each row is compared against
-/// the error the pipeline actually raised, so a crate that later refuses for a
-/// different reason — or stops refusing at all — fails this executable instead
-/// of moving silently between the two halves of this file. `stops_at` names
-/// the boundary that raises it, because a bare error name says nothing about
-/// which stage gave up, and the reason text the frontend records for an
-/// unsupported node says nothing about the type of the operand that caused it.
-///
-/// `expected_error` is nullable for one reason only: a row whose exact error
-/// the current tree does not determine. It is not a licence to guess — a
-/// guessed value is worse than an absent one, because it fails on the error
-/// name and reads as a measurement. Such a row says so in `stops_at`, still
-/// asserts that the crate refuses, and has the refusing error printed so the
-/// next run pins it.
+/// Six rows pin the exact error for a construct boundary, so a different
+/// pipeline failure fails this executable rather than silently changing the
+/// contract. Siphasher checks refusal and absent output without pinning an
+/// incidental error; its actual refusal is reported by the untyped helper.
+/// `stops_at` describes the current coverage gap, not a replacement error pin.
 const refused_source_crates = [_]struct {
     name: []const u8,
     expected_error: ?anyerror,
@@ -1259,7 +1307,7 @@ const refused_source_crates = [_]struct {
     .{
         .name = "fletcher",
         .expected_error = error.ExternalMacroSourceUnavailable,
-        .stops_at = "the checksum tables live behind external `macro_rules!` expansions",
+        .stops_at = "its cfg(test) quickcheck! macros require source that is not vendored",
     },
     .{
         .name = "crc16",
@@ -1269,12 +1317,12 @@ const refused_source_crates = [_]struct {
     .{
         .name = "leb128",
         .expected_error = error.UnsupportedExternalUse,
-        .stops_at = "`tests/quickchecks.rs` opens with `use quickcheck;`, a re-export of a dev-dependency no mapped external declares",
+        .stops_at = "the bare `use std;` in src/lib.rs cannot be mapped as an external use",
     },
     .{
         .name = "siphasher",
-        .expected_error = error.IncompleteGenericMetadata,
-        .stops_at = "`validateInstantiations` finds an instantiation whose argument list does not match its declaration's generic arity",
+        .expected_error = null,
+        .stops_at = "native lowering cannot yet map all of its external uses to lowerable targets",
     },
     .{
         .name = "seahash",
@@ -1285,11 +1333,6 @@ const refused_source_crates = [_]struct {
         .name = "atoi",
         .expected_error = error.MissingExpressionType,
         .stops_at = "the BACKEND, not the frontend: `driver/pipeline.zig` validates before it lowers, so no node is left refused by the analysis and the emitter is the stage that gives up, on an expression whose type it could not read",
-    },
-    .{
-        .name = "differential",
-        .expected_error = null,
-        .stops_at = "NEEDS RE-MEASUREMENT — no error is pinned here and none can be derived by reading. `error.UnsupportedExpression` reached this crate through `ir/validate.zig`'s refusal of a non-assertion `.unsupported` marker, and `src/frontend/ts_ext_test.zig` now runs `expectNothingLeftOpen` over this exact source, so that path is closed; the source carries no `assert!` at all, which is what the old count of 147 sanctioned markers counted. The backend hole `lower.zig` documents — `String::from_utf8(..).map_err(..)?` refusing as `UnsupportedStandardMethod` because the peel reached a tagged `.result` and missed the `core::result::Result` nominal — is closed by `taggedResultType`, so the error the README census measured for this crate no longer names it either. Which boundary it reaches now depends on emission order across the whole file, and reading cannot answer that",
     },
 };
 
@@ -1314,22 +1357,25 @@ fn expectRefusedSourceCrates(
                 "e2e: `{s}` must refuse with `{s}`: {s}",
                 .{ refused.name, @errorName(expected_error), refused.stops_at },
             );
+            try expectSourceCrateRejectedWithError(
+                gpa,
+                io,
+                stdout,
+                crate_dir,
+                out_dir,
+                expected_error,
+            );
         } else {
+            try deleteTreeIfExists(io, out_dir);
+            defer deleteTreeIfExists(io, out_dir) catch {};
             try writeMsg(
                 io,
                 stdout,
-                "e2e: `{s}` must refuse, error NOT pinned: {s}",
+                "e2e: `{s}` must refuse without publishing a package: {s}",
                 .{ refused.name, refused.stops_at },
             );
+            try expectSourceCrateRejected(gpa, io, stdout, crate_dir, out_dir);
         }
-        try expectSourceCrateRejectedWithError(
-            gpa,
-            io,
-            stdout,
-            crate_dir,
-            out_dir,
-            refused.expected_error,
-        );
     }
 }
 
@@ -1496,6 +1542,7 @@ pub fn main(init: std.process.Init) !void {
     try expectFnvSourceCrateTranslated(init.gpa, io, stdout);
     try expectCompatSourceCrateTranslated(init.gpa, io, stdout);
     try expectPercentEncodingSourceCrateTranslated(init.gpa, io, stdout);
+    try expectDifferentialSourceCrateTranslated(init.gpa, io, stdout);
     //
     // ── the ownership fixtures ─────────────────────────────────────────
     // One row per fixture crate under `test/crates/` that exists to pin a
@@ -1504,28 +1551,12 @@ pub fn main(init: std.process.Init) !void {
     // allocator, so every claim below is an executed one rather than a
     // statement that a translation happened.
     //
-    // Four of these are RED against the current lowering, by construction and
-    // on purpose. `let-bound-result-match` exposes a genuine double-release of
-    // a moved payload out of a let-bound owning `Result` carrier.
-    // `struct-field-owner-move` and `enum-variant-owner-move` document that a
-    // NAMED struct is not treated as an owner type, so a struct's or an enum
-    // variant's remaining owned fields get no release; their consumers assert
-    // that boundary instead of papering over it. `generic-owner-transfer`
-    // documents that `ownedRuntimeContainerType` asks for
-    // `ownedRuntimeStorageAt(ty, 0, false)`, so a generic that DROPS its own
-    // `T` parameter never arms a parameter release and leaks. A red fixture
-    // naming a real defect is worth more than a fixture quietly left out of
-    // the build, so no row here is weakened and no row is commented out to go
-    // green.
     try expectZeroFieldShapesTranslated(init.gpa, io, stdout);
     try expectOptionRefMutIndexTranslated(init.gpa, io, stdout);
     try expectResultArmPayloadMoveTranslated(init.gpa, io, stdout);
     try expectLetBoundResultMatchTranslated(init.gpa, io, stdout);
     try expectShadowedInnerOwnerTranslated(init.gpa, io, stdout);
-    // `test/guarded_owned_fallthrough_consumer.zig` is the reproducer for an open
-    // lowering gap and stays unwired until it closes: an owned variant field whose
-    // pattern is a wildcard is bound by neither `matchCapturePayload`'s
-    // `.struct_pat` branch nor `emitMatchDestructureBody`, so it is never released.
+    try expectGuardedOwnedFallthroughTranslated(init.gpa, io, stdout);
     try expectArrayWrappedOwnerTranslated(init.gpa, io, stdout);
     try expectAllocatorFailureOwnershipTranslated(init.gpa, io, stdout);
     try expectLoopOwnershipExitsTranslated(init.gpa, io, stdout);
@@ -1575,17 +1606,15 @@ pub fn main(init: std.process.Init) !void {
     // validator or the backend AST does not model, so the crate must reject
     // rather than publish a wrong package. Refusing is not a licence to emit
     // wrong Zig — wrong output for valid Rust is a defect wherever it appears.
-    // The contract pins the EXACT typed error each crate refuses with, so a
-    // change in which error a crate fails with fails here instead of hiding
-    // inside a generic "it rejected" claim — except for the one row whose exact
-    // error the current tree does not determine, which is marked unpinned
-    // rather than guessed at and prints the error it refused with.
+    // Six construct refusals pin their EXACT typed errors. Siphasher exercises
+    // the refusal/publication boundary without an incidental error pin and
+    // reports the actual refusal so a root regression remains visible.
     try expectRefusedSourceCrates(init.gpa, io, stdout);
     try expectAnalysisOptionsReachStagedPackage(init.gpa, io, stdout);
     try writeMsg(
         io,
         stdout,
-        "e2e: mini/fnv/wyhash/adler/hex/multimod/compat/percent-encoding translated and itoa promoted through the shared consumer, xxhash-rust published under both its empty default and an explicit xxh32; allocating-fmt/fletcher/crc16/leb128/siphasher/seahash/atoi refused with pinned typed errors and differential refused with its error unpinned pending re-measurement; fnv/fletcher/mini-rustdoc wire rejected; sixteen ownership fixtures each executed against a staged package; translateWithOptions honoured",
+        "e2e: mini/fnv/wyhash/adler/hex/multimod/compat/percent-encoding/differential translated with differential value and ownership consumers executed and itoa promoted through the shared consumer, xxhash-rust published under both its empty default and an explicit xxh32; six construct refusals (allocating-fmt/fletcher/crc16/leb128/seahash/atoi) pinned typed errors; siphasher refused without publishing a package and reported its actual error; fnv/fletcher/mini-rustdoc wire rejected; sixteen ownership fixtures each executed against a staged package; translateWithOptions honoured",
         .{},
     );
 }

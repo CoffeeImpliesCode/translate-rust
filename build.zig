@@ -699,17 +699,6 @@ pub fn build(b: *std.Build) void {
     // pruned by this step; the script keeps each run's directory and names it
     // on stderr, so a recorded stream stays available for inspection and
     // removal stays an operator decision.
-    //
-    // The crate this step consumes does not publish a package today: it is a
-    // refusal row, and the e2e program's refusal table holds its
-    // `.name = "differential"` row bound to one typed error. That makes the
-    // staging line below the line that fails, so this step is red — and it
-    // stays wired and red: the Rust-versus-Zig byte comparison is a contract
-    // of its own, and deleting or skipping it to make the suite green would be
-    // removing the evidence rather than the defect. Which typed error the
-    // crate refuses with is the refusal table's business and not this
-    // comment's; `set -eu` stops at the translator's own diagnostic, and that
-    // diagnostic names the error itself.
     const rustc_option = b.option(
         []const u8,
         "rustc",
@@ -1607,18 +1596,6 @@ fn findUndocumentedCommands(
 ///                   `src/frontend/cst.zig`'s `cfgBuiltinRequiresTarget`
 ///                   refuses exactly those keys rather than guessing.
 ///
-///   guarded-owned-fallthrough
-///                   neither of the two above, and the reason this table is not
-///                   only about the translator giving up. The crate analyses,
-///                   lowers, compiles and publishes a staging package; what
-///                   fails is that package's own test RUN, because an arm
-///                   matching a MULTI-field variant binds only the fields its
-///                   pattern names, so the one a wildcard occupies is never
-///                   bound and never released. That is a run failure rather than
-///                   a build failure, which is what `GeneratedPackageRunFailed`
-///                   names — the errors above are the ones a refusal reports
-///                   when it never reaches the gate.
-///
 /// The `syn` boundary is deliberate and fail-closed, not an oversight: `cfg`
 /// only ever decides what to DROP, so a predicate that is false for the target
 /// may prune safely and one that is true may not, and with no target
@@ -1631,7 +1608,6 @@ fn findUndocumentedCommands(
 /// drift from how the code reports it.
 const rejected_source_specs = [_][3][]const u8{
     .{ "test/crates/allocating-fmt", "allocating-fmt", "UnsupportedAllocatingFormatter" },
-    .{ "test/crates/guarded-owned-fallthrough", "guarded-owned-fallthrough", "GeneratedPackageRunFailed" },
     .{ "test/crates/syn", "syn", "UnsupportedCfgPredicate" },
 };
 
@@ -1707,13 +1683,8 @@ const CorpusOwner = enum {
     refused_source,
     /// The differential oracle step compiles the crate's translated sources
     /// into an oracle and compares its output with the Rust oracle's byte for
-    /// byte. That is not a claim that the crate publishes a package, so a
-    /// crate may hold this owner and a refusal row at once: the step then fails
-    /// on the refusal, loudly and by name — which is the state the tree is in
-    /// while `test/crates/differential` holds the `refusal` row in the table
-    /// below. Which typed error that refusal raises is pinned by the e2e
-    /// program's refusal table and not here: holding this owner says the step
-    /// exists and what it compares, not what the translator raises today.
+    /// byte. This owner alone does not claim that a crate publishes a package;
+    /// the corpus row and its staging owner record that separate contract.
     differential_oracle,
 };
 
@@ -1767,8 +1738,8 @@ const corpus_rows = [_]struct {
     .{ .name = "crc16", .row = .refusal, .owners = &.{.e2e_refusal}, .reason = "" },
     .{
         .name = "differential",
-        .row = .refusal,
-        .owners = &.{ .e2e_refusal, .differential_oracle },
+        .row = .positive,
+        .owners = &.{ .e2e_positive, .differential_oracle },
         .reason = "",
     },
     .{
@@ -1787,8 +1758,8 @@ const corpus_rows = [_]struct {
     },
     .{
         .name = "guarded-owned-fallthrough",
-        .row = .refusal,
-        .owners = &.{.refused_source},
+        .row = .positive,
+        .owners = &.{.e2e_positive},
         .reason = "",
     },
     .{ .name = "hex", .row = .positive, .owners = &.{.e2e_positive}, .reason = "" },
@@ -1817,6 +1788,7 @@ const corpus_rows = [_]struct {
         .owners = &.{.e2e_positive},
         .reason = "",
     },
+    .{ .name = "match-subject-handoff", .row = .positive, .owners = &.{.e2e_positive}, .reason = "" },
     .{ .name = "mini", .row = .positive, .owners = &.{.e2e_positive}, .reason = "" },
     .{ .name = "multimod", .row = .positive, .owners = &.{.e2e_positive}, .reason = "" },
     .{

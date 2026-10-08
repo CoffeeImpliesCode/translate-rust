@@ -275,7 +275,7 @@ fn overwrittenOwnersWithAllocationFailures(gpa: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("outer", shadowed.as_str());
     shadowed.deinit(gpa);
 
-    const rounds = [_]u8{ 0, 1, 2, 5 };
+    const rounds = [_]u8{ 0, 1, 2, 3, 5 };
     const expected = [_][]const u8{ "seed", "round", "round", "round", "round" };
     for (rounds, expected) |count, want| {
         var looped: Survivor = try translated.overwrite_loop(gpa, count);

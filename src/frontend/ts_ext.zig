@@ -1670,125 +1670,12 @@ fn lowerExternalUnitStructPath(e: *Ext, raw_path: []const u8) anyerror!?exprs.No
     return try appendExpr(e, .{ .path = .{ .def = struct_id, .generic_args = &.{} } });
 }
 
-/// One parameter of a known standard-library associated function.
-const StdAssocParam = struct { name: []const u8, ty_param: []const u8 };
-
-/// An associated function of a standard-library type, recorded with the
-/// signature the standard library actually declares.
-///
-/// An entity in the graph carries a signature, and a wrong one is worse than
-/// no entity at all: the backend checks arity against `params` and reads the
-/// declared return when inferring the call. A placeholder would be a fabricated
-/// fact, not an admission. So only the functions this table names are admitted,
-/// and only with the signature it gives. Anything else keeps the refusal it
-/// already has — a typed `unsupported`, which is accurate — until its real
-/// declaration is known.
-///
-/// `std::io::Cursor::new` is, verbatim from the standard library:
-/// `impl<T> Cursor<T> { pub const fn new(inner: T) -> Cursor<T> }`.
-const StdAssocFn = struct {
-    owner: []const []const u8,
-    /// The other standard spellings of that same declaration. `std::vec::Vec`
-    /// and `alloc::vec::Vec` are one item the standard library publishes under
-    /// both roots, and a source may write either. Keeping the aliases beside
-    /// the signature is what lets both spellings reach ONE declaration instead
-    /// of two that could answer differently.
-    owner_aliases: []const []const []const u8 = &.{},
-    name: []const u8,
-    type_params: []const []const u8,
-    params: []const StdAssocParam,
-    ret_owner: []const []const u8,
-    ret_args: []const []const u8,
-};
-
-const std_assoc_fns = [_]StdAssocFn{
-    .{
-        .owner = &.{ "std", "io", "Cursor" },
-        .name = "new",
-        .type_params = &.{"T"},
-        .params = &.{.{ .name = "inner", .ty_param = "T" }},
-        .ret_owner = &.{ "std", "io", "Cursor" },
-        .ret_args = &.{"T"},
-    },
-    // `impl<R: Read> BufReader<R> { pub fn new(inner: R) -> BufReader<R> }`,
-    // verbatim. `R` is the reader the buffer wraps, so `BufReader::new(data)`
-    // hands back a `BufReader` over exactly the argument's own type — which is
-    // what makes `fill_buf` and `consume` on the result the same two
-    // `std::io::BufRead` methods `runtime_io_methods` admits on any other
-    // `BufRead`-bounded receiver.
-    .{
-        .owner = &.{ "std", "io", "BufReader" },
-        .name = "new",
-        .type_params = &.{"R"},
-        .params = &.{.{ .name = "inner", .ty_param = "R" }},
-        .ret_owner = &.{ "std", "io", "BufReader" },
-        .ret_args = &.{"R"},
-    },
-    // `impl<T> Vec<T> { pub const fn new() -> Vec<T> }`, verbatim. The element
-    // type is not an argument here — `Vec::new()` takes none — so `T` is the
-    // element the surrounding position fixes, and this declares the call with
-    // that parameter open rather than inventing one.
-    .{
-        .owner = &.{ "alloc", "vec", "Vec" },
-        .owner_aliases = &.{&.{ "std", "vec", "Vec" }},
-        .name = "new",
-        .type_params = &.{"T"},
-        .params = &.{},
-        .ret_owner = &.{ "alloc", "vec", "Vec" },
-        .ret_args = &.{"T"},
-    },
-    // `impl String { pub const fn new() -> String }`, verbatim. A `String`
-    // carries no type parameter, so this one is declared with its whole
-    // signature and the call it builds is typed at extraction.
-    .{
-        .owner = &.{ "alloc", "string", "String" },
-        .owner_aliases = &.{&.{ "std", "string", "String" }},
-        .name = "new",
-        .type_params = &.{},
-        .params = &.{},
-        .ret_owner = &.{ "alloc", "string", "String" },
-        .ret_args = &.{},
-    },
-    // `impl<K, V> HashMap<K, V> { pub fn new() -> HashMap<K, V> }`, verbatim.
-    // The key and the value are the ones the surrounding position fixes, for
-    // the same reason `Vec::new` leaves its element open.
-    .{
-        .owner = &.{ "std", "collections", "HashMap" },
-        .name = "new",
-        .type_params = &.{ "K", "V" },
-        .params = &.{},
-        .ret_owner = &.{ "std", "collections", "HashMap" },
-        .ret_args = &.{ "K", "V" },
-    },
-};
-
 fn externalPathSlicesEqual(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
     for (left, right) |a, b| {
         if (!std.mem.eql(u8, a, b)) return false;
     }
     return true;
-}
-
-/// The known signature for `Owner::assoc`, or null when this function is not
-/// one this translator can declare. Matching is on the RESOLVED owner path, so
-/// a crate's own `Cursor` is never claimed by the standard library's, and a
-/// standard name published under both roots reaches the one declaration it is.
-fn findStdAssocFn(owner_path: []const []const u8, assoc_name: []const u8) ?*const StdAssocFn {
-    for (&std_assoc_fns) |*entry| {
-        if (!std.mem.eql(u8, entry.name, assoc_name)) continue;
-        if (!externalPathSlicesEqual(entry.owner, owner_path)) {
-            var published_under = false;
-            for (entry.owner_aliases) |alias| {
-                if (!externalPathSlicesEqual(alias, owner_path)) continue;
-                published_under = true;
-                break;
-            }
-            if (!published_under) continue;
-        }
-        return entry;
-    }
-    return null;
 }
 
 /// A type an entry's own type parameter names, in the representation every
@@ -1814,7 +1701,7 @@ fn ensureExternalAssociatedFn(
     assoc_name: []const u8,
 ) anyerror!?spine.EntityId {
     if (owner_path.len < 2 or assoc_name.len == 0) return null;
-    const known = findStdAssocFn(owner_path, assoc_name) orelse return null;
+    const known = ir.std_model.findStdAssocFn(owner_path, assoc_name) orelse return null;
 
     const module_id = try ensureExternalModuleChain(e, owner_path[0 .. owner_path.len - 1]);
     // `(module, name)` is NOT the identity of an associated function: every
@@ -4262,7 +4149,9 @@ fn lowerIteratorSource(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
     if (!iteratorArgumentsEmpty(iter_arguments)) return error.UnsupportedIteratorChain;
     const iter_receiver = receiverOf(iter_call) orelse return error.UnsupportedIteratorChain;
     if (!isStandardIteratorSource(e, iter_receiver)) return error.UnsupportedIteratorChain;
-    return lowerExpr(e, iter_receiver);
+    // Keep the copied call as the source's item-mode marker. Its underlying
+    // sequence can itself be borrowed, which is distinct from borrowed items.
+    return lowerExpr(e, current);
 }
 
 fn lowerIteratorChainParts(
@@ -4439,10 +4328,8 @@ fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
             }
 
             if (std.mem.eql(u8, name, "copied")) {
-                // `xs.iter().copied()` hands out the elements themselves, and
-                // that is what a Zig `for` over `xs` already binds. Keeping the
-                // iterator would bind a borrow per element instead, and every
-                // use of the element against its own type would then fail.
+                // Keep the copied call so inference and lowering distinguish
+                // value items from a borrow of the underlying sequence.
                 const copied_recv = receiverOf(node);
                 if (copied_recv) |recv| {
                     const iter_call = peelParenthesized(recv);
@@ -4451,9 +4338,10 @@ fn unwrapIterable(e: *Ext, node: ts.Node) anyerror!UnwrappedIter {
                             if (std.mem.eql(u8, iter_name, "iter") or
                                 std.mem.eql(u8, iter_name, "iter_mut"))
                             {
-                                const iter_recv = receiverOf(iter_call) orelse
-                                    return error.MalformedCst;
-                                return unwrapIterable(e, iter_recv);
+                                return .{
+                                    .kind = .{ .slice = {} },
+                                    .eid = try lowerExpr(e, node),
+                                };
                             }
                         }
                     }
@@ -10318,13 +10206,13 @@ fn lowerCall(e: *Ext, node: ts.Node) anyerror!exprs.NodeId {
         const leaf = t[sep + 2 ..];
         if (base_name.len == 0 or leaf.len == 0) return unsupported(e, "unresolved call");
 
-        // Base type resolution: `Self` → the enclosing impl's type; else the
-        // named module-scope type.
+        // Resolve the owner in lexical scope. A crate-wide nominal-name scan
+        // would let an unrelated module's `String` shadow the prelude owner.
         var base_def: ?spine.EntityId = null;
         if (std.mem.eql(u8, base_name, "Self")) {
             base_def = e.self_ty;
         } else {
-            base_def = resolveNominalName(e, base_name);
+            base_def = resolveName(e, base_name);
         }
 
         if (base_def) |bid| {

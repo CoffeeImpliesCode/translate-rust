@@ -4,8 +4,15 @@ version = "1.0.7"
 edition = "2018"
 publish = false
 
-# Source vendored from https://crates.io/crates/fnv (servo/rust-fnv), MIT/Apache-2.0.
-# Zero dependencies; no_std with optional `std` feature.
+# Fixture provenance: fnv 1.0.7, compared on 2026-10-08.
+# Source: https://static.crates.io/crates/fnv/fnv-1.0.7.crate
+# lib.rs matches the archive byte-for-byte. No Rust source is omitted or added.
+# This local manifest replaces Cargo's normalized registry manifest.
+# It adds edition = "2018" and publish = false, and removes the generated header,
+# authors, description, documentation, readme, license, repository, and lib.name.
+# The std features and lib.path are unchanged. Cargo.toml.orig is not retained.
+# Other omitted files: .cargo_vcs_info.json, .gitignore, .travis.yml,
+# LICENSE-APACHE, LICENSE-MIT, README.md.
 [features]
 default = ["std"]
 std = []

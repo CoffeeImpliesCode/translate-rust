@@ -91,7 +91,7 @@ pub fn wyhash_core(bytes: []const u8, _seed: u64) u64 {
     const rest: usize = bytes.len & 31;
     if (rest != 0) __r2z_value_block_1: {
         const start: usize = bytes.len & ~@as(usize, 31);
-        break :__r2z_value_block_1 switch ((bytes.len -% 1 & 31) / 8) {
+        break :__r2z_value_block_1 switch (@divTrunc(bytes.len -% 1 & 31, 8)) {
             0 => __r2z_value_block_3: {
                 seed = wymum(seed, read_rest(bytes[start..]) ^ P1);
                 break :__r2z_value_block_3 @as(void, {});

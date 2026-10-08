@@ -8,6 +8,191 @@
 const std = @import("std");
 const spine = @import("spine.zig");
 const graph = @import("graph.zig");
+const bodies = @import("bodies.zig");
+const types = @import("types.zig");
+
+fn externalPathIs(actual: []const []const u8, wanted: []const []const u8) bool {
+    if (actual.len != wanted.len) return false;
+    for (actual, wanted) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+/// Standard constructors emitted through runtime intrinsics rather than an
+/// external source module. These calls keep the catalog's declared signature.
+pub const StdConstructor = enum { string_new };
+
+/// One parameter of a known standard-library associated function.
+const StdAssocParam = struct { name: []const u8, ty_param: []const u8 };
+
+/// An associated function of a standard-library type, recorded with the
+/// signature the standard library actually declares.
+///
+/// An entity in the graph carries a signature, and a wrong one is worse than
+/// no entity at all: the backend checks arity against `params` and reads the
+/// declared return when inferring the call. A placeholder would be a fabricated
+/// fact, not an admission. So only the functions this table names are admitted,
+/// and only with the signature it gives. Anything else keeps the refusal it
+/// already has — a typed `unsupported`, which is accurate — until its real
+/// declaration is known.
+///
+/// `std::io::Cursor::new` is, verbatim from the standard library:
+/// `impl<T> Cursor<T> { pub const fn new(inner: T) -> Cursor<T> }`.
+pub const StdAssocFn = struct {
+    owner: []const []const u8,
+    /// The other standard spellings of that same declaration. `std::vec::Vec`
+    /// and `alloc::vec::Vec` are one item the standard library publishes under
+    /// both roots, and a source may write either. Keeping the aliases beside
+    /// the signature is what lets both spellings reach ONE declaration instead
+    /// of two that could answer differently.
+    owner_aliases: []const []const []const u8 = &.{},
+    name: []const u8,
+    type_params: []const []const u8,
+    params: []const StdAssocParam,
+    ret_owner: []const []const u8,
+    ret_args: []const []const u8,
+    constructor: ?StdConstructor = null,
+};
+
+const std_assoc_fns = [_]StdAssocFn{
+    .{
+        .owner = &.{ "std", "io", "Cursor" },
+        .name = "new",
+        .type_params = &.{"T"},
+        .params = &.{.{ .name = "inner", .ty_param = "T" }},
+        .ret_owner = &.{ "std", "io", "Cursor" },
+        .ret_args = &.{"T"},
+    },
+    // `impl<R: Read> BufReader<R> { pub fn new(inner: R) -> BufReader<R> }`,
+    // verbatim. `R` is the reader the buffer wraps, so `BufReader::new(data)`
+    // hands back a `BufReader` over exactly the argument's own type — which is
+    // what makes `fill_buf` and `consume` on the result the same two
+    // `std::io::BufRead` methods `runtime_io_methods` admits on any other
+    // `BufRead`-bounded receiver.
+    .{
+        .owner = &.{ "std", "io", "BufReader" },
+        .name = "new",
+        .type_params = &.{"R"},
+        .params = &.{.{ .name = "inner", .ty_param = "R" }},
+        .ret_owner = &.{ "std", "io", "BufReader" },
+        .ret_args = &.{"R"},
+    },
+    // `impl<T> Vec<T> { pub const fn new() -> Vec<T> }`, verbatim. The element
+    // type is not an argument here — `Vec::new()` takes none — so `T` is the
+    // element the surrounding position fixes, and this declares the call with
+    // that parameter open rather than inventing one.
+    .{
+        .owner = &.{ "alloc", "vec", "Vec" },
+        .owner_aliases = &.{&.{ "std", "vec", "Vec" }},
+        .name = "new",
+        .type_params = &.{"T"},
+        .params = &.{},
+        .ret_owner = &.{ "alloc", "vec", "Vec" },
+        .ret_args = &.{"T"},
+    },
+    // `impl String { pub const fn new() -> String }`, verbatim. A `String`
+    // carries no type parameter, so this one is declared with its whole
+    // signature and the call it builds is typed at extraction.
+    .{
+        .owner = &.{ "alloc", "string", "String" },
+        .owner_aliases = &.{&.{ "std", "string", "String" }},
+        .name = "new",
+        .type_params = &.{},
+        .params = &.{},
+        .ret_owner = &.{ "alloc", "string", "String" },
+        .ret_args = &.{},
+        .constructor = .string_new,
+    },
+    // `impl<K, V> HashMap<K, V> { pub fn new() -> HashMap<K, V> }`, verbatim.
+    // The key and the value are the ones the surrounding position fixes, for
+    // the same reason `Vec::new` leaves its element open.
+    .{
+        .owner = &.{ "std", "collections", "HashMap" },
+        .name = "new",
+        .type_params = &.{ "K", "V" },
+        .params = &.{},
+        .ret_owner = &.{ "std", "collections", "HashMap" },
+        .ret_args = &.{ "K", "V" },
+    },
+};
+
+/// The known signature for `Owner::assoc`, or null when this function is not
+/// one this translator can declare. Matching is on the RESOLVED owner path, so
+/// a crate's own `Cursor` is never claimed by the standard library's, and a
+/// standard name published under both roots reaches the one declaration it is.
+pub fn findStdAssocFn(owner_path: []const []const u8, assoc_name: []const u8) ?*const StdAssocFn {
+    for (&std_assoc_fns) |*entry| {
+        if (!std.mem.eql(u8, entry.name, assoc_name)) continue;
+        if (!externalPathIs(entry.owner, owner_path)) {
+            var published_under = false;
+            for (entry.owner_aliases) |alias| {
+                if (!externalPathIs(alias, owner_path)) continue;
+                published_under = true;
+                break;
+            }
+            if (!published_under) continue;
+        }
+        return entry;
+    }
+    return null;
+}
+
+/// Match the canonical external module chain, not a source module with the
+/// same basename. Graph module rows and symbol entity IDs are distinct.
+fn standardAssociatedModule(
+    g: *const graph.CrateGraph,
+    parent: spine.EntityId,
+    owner_path: []const []const u8,
+) bool {
+    var current: ?spine.EntityId = parent;
+    var remaining = owner_path.len - 1;
+    while (remaining > 0) {
+        remaining -= 1;
+        const entity_id = current orelse return false;
+        const module = g.moduleForEntity(entity_id) orelse return false;
+        if (!module.is_extern or !std.mem.eql(u8, module.name, owner_path[remaining])) return false;
+        current = module.parent;
+    }
+    return current == null;
+}
+
+/// Classify a standard associated constructor from its external owner and
+/// catalog signature. This never claims a source `String::new`, and does not
+/// create an import or an allocation. The call keeps its declared return type.
+pub fn standardConstructor(
+    g: *const graph.CrateGraph,
+    b: *const bodies.Bodies,
+    def: spine.EntityId,
+) ?StdConstructor {
+    const entity = g.symbol_table.get(def) orelse return null;
+    if (entity.kind != .fn_ or def >= b.bodies.len) return null;
+    if (entity.renamed_to) |renamed| {
+        if (!std.mem.eql(u8, renamed, entity.name)) return null;
+    }
+    const declared = switch (b.bodies[def]) {
+        .fn_ => |value| value,
+        else => return null,
+    };
+    const result = switch (declared.ret) {
+        .external_nominal => |value| value,
+        else => return null,
+    };
+    const known = findStdAssocFn(result.path, entity.name) orelse return null;
+    const constructor = known.constructor orelse return null;
+    if (!externalPathIs(result.path, known.ret_owner) or result.args.len != known.ret_args.len or
+        declared.params.len != known.params.len or declared.generic_params.len != known.type_params.len or
+        declared.is_allocating) return null;
+    if (declared.generics) |generics| {
+        if (generics.params.len != known.type_params.len or generics.where_clauses.len != 0) return null;
+    }
+    const parent = entity.parent orelse return null;
+    if (standardAssociatedModule(g, parent, known.owner)) return constructor;
+    for (known.owner_aliases) |alias| {
+        if (standardAssociatedModule(g, parent, alias)) return constructor;
+    }
+    return null;
+}
 
 pub const TraitInfo = struct {
     name: []const u8,
@@ -460,4 +645,99 @@ test "findEntity returns null for nonexistent symbol" {
     try std.testing.expect(findEntity(&g, "NonExistentSymbol12345") == null);
     try std.testing.expect(findTrait(&g, "NonExistentTrait") == null);
     try std.testing.expect(findType(&g, "NonExistentType") == null);
+}
+
+test "standard String constructor requires its external module and exact catalog signature" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g = graph.CrateGraph.init(a);
+    // Leave an unrelated entity before the module rows: entity IDs are not
+    // dense module-row indices.
+    const root: spine.EntityId = 1;
+    const module: spine.EntityId = 2;
+    const constructor: spine.EntityId = 3;
+    const declarations = [_]struct { kind: spine.EntityKind, name: []const u8, parent: ?spine.EntityId }{
+        .{ .kind = .struct_, .name = "Unrelated", .parent = null },
+        .{ .kind = .module, .name = "alloc", .parent = null },
+        .{ .kind = .module, .name = "string", .parent = root },
+        .{ .kind = .fn_, .name = "new", .parent = module },
+    };
+    for (declarations) |declaration| {
+        _ = try g.symbol_table.add(.{
+            .id = 0,
+            .kind = declaration.kind,
+            .name = try a.dupe(u8, declaration.name),
+            .span = zero_span,
+            .visibility = .public,
+            .parent = declaration.parent,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
+    }
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .root,
+        .name = "alloc",
+        .parent = null,
+        .source_path = null,
+        .is_crate = true,
+        .is_extern = true,
+        .span = zero_span,
+        .items = &.{module},
+        .attributes = &.{},
+    });
+    _ = try g.addModule(.{
+        .id = 0,
+        .kind = .@"inline",
+        .name = "string",
+        .parent = root,
+        .source_path = null,
+        .is_crate = false,
+        .is_extern = true,
+        .span = zero_span,
+        .items = &.{constructor},
+        .attributes = &.{},
+    });
+    const string: types.Type = .{ .external_nominal = .{
+        .path = &.{ "alloc", "string", "String" },
+        .args = &.{},
+    } };
+    var body_store = [_]bodies.BodyKind{ .none, .none, .none, .{ .fn_ = .{
+        .params = &.{},
+        .ret = string,
+        .body = 0,
+    } } };
+    const b: bodies.Bodies = .{
+        .exprs = &.{},
+        .stmts = &.{},
+        .pats = &.{},
+        .types = &.{},
+        .bodies = &body_store,
+    };
+    try std.testing.expectEqual(
+        StdConstructor.string_new,
+        standardConstructor(&g, &b, constructor).?,
+    );
+    g.modules.items[0].is_extern = false;
+    try std.testing.expect(standardConstructor(&g, &b, constructor) == null);
+    g.modules.items[0].is_extern = true;
+    g.modules.items[1].is_extern = false;
+    try std.testing.expect(standardConstructor(&g, &b, constructor) == null);
+    g.modules.items[1].is_extern = true;
+    body_store[constructor].fn_.ret = .{ .prim = .u8 };
+    try std.testing.expect(standardConstructor(&g, &b, constructor) == null);
+    body_store[constructor].fn_.ret = string;
+    body_store[constructor].fn_.params = &.{.{ .name = "input", .ty = string, .span = zero_span }};
+    try std.testing.expect(standardConstructor(&g, &b, constructor) == null);
+    body_store[constructor].fn_.params = &.{};
+    body_store[constructor].fn_.generic_params = &.{"T"};
+    try std.testing.expect(standardConstructor(&g, &b, constructor) == null);
+    body_store[constructor].fn_.generic_params = &.{};
+    body_store[constructor].fn_.is_allocating = true;
+    try std.testing.expect(standardConstructor(&g, &b, constructor) == null);
+    body_store[constructor].fn_.is_allocating = false;
+    g.symbol_table.entities.items[constructor].renamed_to = "not_new";
+    try std.testing.expect(standardConstructor(&g, &b, constructor) == null);
 }

@@ -660,8 +660,10 @@ test "collections: a grow path leaves the caller's key storage where it was" {
     defer map.deinit();
 
     var capacity_after_first: ?usize = null;
+    // Different slice lengths make distinct keys without changing the caller's
+    // all-'k' bytes, so every insertion can contribute to the grow path.
     for (0..key_count) |index| {
-        try map.put(storage[index * key_width ..][0..key_width], @intCast(index));
+        try map.put(storage[index * key_width ..], @intCast(index));
         if (index == 0) capacity_after_first = map.capacity();
     }
     try std.testing.expect(map.capacity() > capacity_after_first.?);
@@ -670,11 +672,11 @@ test "collections: a grow path leaves the caller's key storage where it was" {
     for (0..key_count) |index| {
         try std.testing.expectEqual(
             @as(?u64, @intCast(index)),
-            map.get(storage[index * key_width ..][0..key_width]),
+            map.get(storage[index * key_width ..]),
         );
     }
     try std.testing.expectEqual(address, @intFromPtr(storage.ptr));
-    try std.testing.expectEqualSlices(u8, &.{'k'} ** (key_count * key_width), storage);
+    try std.testing.expectEqualSlices(u8, &([_]u8{'k'} ** (key_count * key_width)), storage);
 }
 
 test "collections: no read path reallocates while a caller holds a borrowed key or value" {
@@ -753,27 +755,30 @@ test "collections: the runtime releases a map's table and never its entries" {
     var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = tracking.allocator();
 
-    var map = FnvMap().init(gpa);
-
     var storage: [32]u8 = undefined;
     @memset(&storage, 'k');
     const borrowed_first: []const u8 = storage[0..8];
-    const borrowed_second: []const u8 = storage[8..16];
-    try map.put(borrowed_first, 1);
-    try map.put(borrowed_second, 2);
+    // Unequal lengths distinguish the keys while every caller-owned byte stays 'k'.
+    const borrowed_second: []const u8 = storage[8..24];
+    const frees = table: {
+        var map = FnvMap().init(gpa);
+        defer map.deinit();
+        try map.put(borrowed_first, 1);
+        try map.put(borrowed_second, 2);
 
-    const frees = tracking.deallocations;
-    core.alloc.dropTemporary(gpa, &map);
-    try std.testing.expectEqual(frees, tracking.deallocations);
+        const before_release = tracking.deallocations;
+        core.alloc.dropTemporary(gpa, &map);
+        try std.testing.expectEqual(before_release, tracking.deallocations);
 
-    // The table is untouched, so the entries are still there to be reached.
-    try std.testing.expectEqual(@as(usize, 2), map.count());
-    try std.testing.expectEqual(@as(?u64, 1), map.get(borrowed_first));
-    try std.testing.expectEqual(@as(?u64, 2), map.get(borrowed_second));
+        // The table is untouched, so the entries are still there to be reached.
+        try std.testing.expectEqual(@as(usize, 2), map.count());
+        try std.testing.expectEqual(@as(?u64, 1), map.get(borrowed_first));
+        try std.testing.expectEqual(@as(?u64, 2), map.get(borrowed_second));
+        break :table before_release;
+    };
 
     // The map is not a no-op owner: its own `deinit` frees exactly the table
     // allocation, and the caller's key storage is untouched by the release.
-    map.deinit();
     try std.testing.expectEqual(frees + 1, tracking.deallocations);
     for (storage) |byte| try std.testing.expectEqual(@as(u8, 'k'), byte);
 }

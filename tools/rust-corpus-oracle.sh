@@ -3,16 +3,16 @@
 #
 # What this script does, in order:
 #
-# 1. Copies the oracle crate and all seven pristine crate roots into a *new*,
+# 1. Copies the oracle crate and all seven checkout crate roots into a *new*,
 #    owned, local scratch tree that mirrors `test/`'s layout (oracle next to
 #    `crates/<name>`), so the oracle's `../crates/<name>` path dependencies keep
 #    working. Nothing under the repository is ever written: cargo would create
-#    `Cargo.lock`, `target/` and registry state next to the sources otherwise,
-#    and the published fixtures must stay byte-identical to their archives.
-# 2. Verifies the transport: every staged file's sha256 must equal the source
-#    file's sha256, no symlinks may appear in a staged tree, and the three
-#    archived roots' upstream git sha1 (from `.cargo_vcs_info.json`) must match
-#    the published values.
+#    `Cargo.lock`, `target/` and registry state next to the sources otherwise.
+# 2. Verifies transport: every staged file's sha256 must equal the checkout
+#    file's sha256, and no symlinks may appear in a staged tree. It also checks
+#    three pinned git sha1 strings from `.cargo_vcs_info.json`.
+#    These checks do not compare files with registry archives or prove archive
+#    equivalence. Each vendored Cargo.toml records a separate provenance comparison.
 # 3. Pins the toolchain. `test/crates/atoi` ships a `rust-toolchain.toml`
 #    pinning 1.57.0; `RUSTUP_TOOLCHAIN` overrides that child selection with the
 #    host's installed modern toolchain, and the script verifies the override is
@@ -76,9 +76,9 @@ repo_root="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 oracle_source="$repo_root/test/rust-corpus-oracle"
 crud_crates=(wyhash adler xxhash-rust siphasher itoa seahash atoi)
 
-# Upstream git sha1 from `.cargo_vcs_info.json`, for the three roots whose
-# published archives were verified against crates.io. The other four are
-# printed but not claimed to be archive-verified here.
+# Pinned git sha1 metadata from `.cargo_vcs_info.json` for three crate roots.
+# The other four values are printed but not pinned. This table checks metadata,
+# not source bytes against archives. A recorded git sha1 is not a tree checksum.
 declare -A archived_sha1=(
     [wyhash]=6d388f5906d655dc1840589334390dd802a4d9cb
     [adler]=a94f525f62698d699d1fb3cc9112db8c35662b16
@@ -370,7 +370,7 @@ for crate in "${crud_crates[@]}"; do
     stage_tree "$crate" "$repo_root/test/crates/$crate" "crates/$crate"
 done
 
-# Archive provenance for the roots whose published archives were verified.
+# Check the three pinned VCS metadata strings, not archive-to-checkout equivalence.
 for crate in "${!archived_sha1[@]}"; do
     vcs_file="$tree/crates/$crate/.cargo_vcs_info.json"
     [[ -r "$vcs_file" ]] || die "$crate has no .cargo_vcs_info.json; cannot confirm archive provenance"

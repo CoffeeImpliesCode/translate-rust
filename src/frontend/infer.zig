@@ -3295,6 +3295,13 @@ fn iteratorItemType(ctx: *Ctx, ty: types.Type) ?types.Type {
             {
                 return iteratorItemType(ctx, external.args[0]);
             }
+            if (publicIteratorPath(external, "iter", "Copied") and external.args.len == 1) {
+                const item = iteratorItemType(ctx, external.args[0]) orelse return null;
+                return switch (item) {
+                    .reference => |reference| reference.pointee,
+                    else => null,
+                };
+            }
             if (publicIteratorPath(external, "iter", "Enumerate") and external.args.len == 1) {
                 const element = iteratorItemType(ctx, external.args[0]) orelse return null;
                 const tuple = ctx.alloc.alloc(types.Type, 2) catch return null;
@@ -3334,6 +3341,11 @@ fn knownIteratorMethodType(
                 &.{ "core", "slice", "IterMut" },
             &.{element},
         );
+    }
+    if (std.mem.eql(u8, method_name, "copied")) {
+        const item = iteratorItemType(ctx, receiver) orelse return null;
+        if (item != .reference) return null;
+        return makeExternalNominalType(ctx, &.{ "core", "iter", "Copied" }, &.{receiver});
     }
     if (std.mem.eql(u8, method_name, "step_by") or
         std.mem.eql(u8, method_name, "skip") or
@@ -4818,6 +4830,17 @@ fn walkCoreCall(ctx: *Ctx, node: exprs.NodeId, fn_body: exprs.NodeId) std.mem.Al
         .cmp_min, .cmp_max => if (coreTypeArgument(ctx, call.*)) |argument| {
             for (call.args) |arg| try constrainExpectedType(ctx, arg, argument);
         },
+        .string_from_utf8 => {
+            // The canonical signature consumes Vec<u8>; its byte element
+            // constrains unsuffixed integers before the solver defaults them.
+            if (call.args.len != 1) return;
+            const bytes = makeExternalNominalType(
+                ctx,
+                &.{ "alloc", "vec", "Vec" },
+                &.{.{ .prim = .u8 }},
+            ) orelse return;
+            try constrainExpectedType(ctx, call.args[0], bytes);
+        },
         .ptr_copy_nonoverlapping, .ptr_write_bytes => {
             if (call.args.len != 3) return;
             try constrainExpectedType(ctx, call.args[2], .{ .prim = .usize });
@@ -5057,6 +5080,17 @@ fn getKnownType(ctx: *Ctx, node: exprs.NodeId) ?types.Type {
     const e = ctx.b.exprs[node];
     switch (e.kind) {
         .array => |literal| return knownSourceArrayType(ctx, node, literal),
+        .block => |block| {
+            // The block owns the identity of its tail before solving equality
+            // edges. A later borrow must see that identity, not constrain the
+            // block and its owning locals to the borrowed view's pointee.
+            if (block.tail) |tail| {
+                if (getKnownType(ctx, tail)) |known| return known;
+            }
+            if (e.ty) |tid| {
+                if (tid < ctx.b.types.len) return ctx.b.types[tid];
+            }
+        },
         .enum_variant => |variant| {
             if (knownSourceEnumVariantType(ctx, node, variant)) |known| return known;
             if (e.ty) |id| {
@@ -5876,6 +5910,16 @@ fn loopCarrierElementType(ctx: *Ctx, iterable: exprs.NodeId) ?types.Type {
         .external_nominal => return iteratorItemType(ctx, iterable_ty),
         .reference => |reference| switch (reference.pointee) {
             .array => |array| return makeReferenceType(ctx, array.elem, reference.mut),
+            .slice => |slice| return makeReferenceType(ctx, slice.elem, reference.mut),
+            .external_nominal => |external| {
+                const is_vec = external.path.len == 3 and
+                    (std.mem.eql(u8, external.path[0], "alloc") or
+                        std.mem.eql(u8, external.path[0], "std")) and
+                    std.mem.eql(u8, external.path[1], "vec") and
+                    std.mem.eql(u8, external.path[2], "Vec") and
+                    external.args.len == 1;
+                if (is_vec) return makeReferenceType(ctx, external.args[0], reference.mut);
+            },
             else => {},
         },
         // `for x in xs` walks the elements; only `xs.iter()` hands out a
@@ -6313,6 +6357,26 @@ fn constrainExpectedType(
     if (node >= ctx.b.exprs.len) return;
     if (getKnownType(ctx, node)) |known| {
         if (known == .prim and known.prim == .never) return;
+        // Deref coercion changes the borrowed view, not the owner's identity.
+        // Propagating `&str` into `&String` would pin the local initializer
+        // to `str` and erase the frame's allocation and release obligation.
+        const demanded = switch (expected) {
+            .reference => |reference| reference.pointee,
+            else => expected,
+        };
+        if (types.isStr(demanded)) {
+            if (externalNominalBase(known)) |external| {
+                if (external.args.len == 0 and external.path.len == 3 and
+                    (std.mem.eql(u8, external.path[0], "alloc") or
+                        std.mem.eql(u8, external.path[0], "std")) and
+                    std.mem.eql(u8, external.path[1], "string") and
+                    std.mem.eql(u8, external.path[2], "String"))
+                {
+                    try ctx.expected_types.put(ctx.alloc, node, expected);
+                    return;
+                }
+            }
+        }
     }
     var target = expected;
     if (ctx.b.exprs[node].kind == .array and expected == .slice) {
@@ -6349,6 +6413,20 @@ fn constrainExpectedType(
             // equating only the whole reference would default its child.
             if (ctx.def_map.get(path.def)) |initializer| {
                 if (initializer != node) try constrainExpectedType(ctx, initializer, target);
+            }
+        },
+        .block => |block| {
+            if (block.tail) |tail| try constrainExpectedType(ctx, tail, target);
+        },
+        .vec_lit => |vector| {
+            const external = externalNominalBase(target) orelse return;
+            if (external.path.len != 3 or external.args.len != 1 or
+                (!std.mem.eql(u8, external.path[0], "alloc") and
+                    !std.mem.eql(u8, external.path[0], "std")) or
+                !std.mem.eql(u8, external.path[1], "vec") or
+                !std.mem.eql(u8, external.path[2], "Vec")) return;
+            for (vector.elements) |element| {
+                try constrainExpectedType(ctx, element, external.args[0]);
             }
         },
         .array => |array| switch (target) {

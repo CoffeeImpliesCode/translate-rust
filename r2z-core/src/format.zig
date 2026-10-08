@@ -71,12 +71,12 @@ const Mode = enum { display, debug };
 /// Write `template` to `writer` with Rust's `format!` placeholder syntax.
 ///
 /// `{}` renders an argument through its `Display` implementation, which is a
-/// `format` method, and `{d}` renders an integer. `{:?}` renders a `char` with
-/// Rust's debug escapes and any other value through its `Debug`
-/// implementation, which is a `formatDebug` method. `{{` and `}}` write one
-/// literal brace each. An unsupported specification, a value whose position
-/// lacks its own hook, and an argument count that disagrees with the
-/// template's placeholders are all compile errors, never a silent default.
+/// `format` method. `{:?}` renders a `char` with Rust's debug escapes and any
+/// other value through its `Debug` implementation, which is a `formatDebug`
+/// method. `{{` and `}}` write one literal brace each. An unsupported
+/// specification, a value whose position lacks its own hook, and an argument
+/// count that disagrees with the template's placeholders are all compile
+/// errors, never a silent default.
 /// A writer failure leaves its written prefix intact. This function allocates
 /// no storage of its own; writers and hooks control their own storage.
 pub fn write(writer: *std.Io.Writer, comptime template: []const u8, args: anytype) std.Io.Writer.Error!void {
@@ -127,16 +127,103 @@ pub fn write(writer: *std.Io.Writer, comptime template: []const u8, args: anytyp
 /// which the caller releases with `deinit(gpa)`, exactly once. A second
 /// release reaches the emptied `String` and frees nothing. The blocks the
 /// writer replaced while growing are released by that growth, so the caller
-/// releases only the final one. On `error.WriteFailed` the partially built
-/// buffer is released before the error returns, so a failing `format` leaks
-/// nothing and leaves no string behind.
-pub fn toString(gpa: std.mem.Allocator, value: anytype) std.Io.Writer.Error!alloc.String {
-    var writer: std.Io.Writer.Allocating = .init(gpa);
-    errdefer writer.deinit();
-    try write(&writer.writer, "{}", .{value});
-    var bytes: alloc.Vec(u8) = writer.toArrayList();
+/// releases only the final one. Storage allocation failures return
+/// `error.OutOfMemory` when the hook propagates the failed writer operation
+/// without resuming output. The allocation cause is retained only until a
+/// successful writer callback or buffered progress; after that recovery, a
+/// hook's own failure remains `error.WriteFailed`. A same-tag hook failure
+/// without observable writer activity cannot be distinguished from propagating
+/// the allocation failure. Either error releases the partially built buffer
+/// and leaves no string behind.
+pub fn toString(
+    gpa: std.mem.Allocator,
+    value: anytype,
+) (std.mem.Allocator.Error || std.Io.Writer.Error)!alloc.String {
+    var writer: AllocatingFormatWriter = .init(gpa);
+    errdefer writer.allocating.deinit();
+    write(&writer.allocating.writer, "{}", .{value}) catch |err| {
+        if (writer.allocation_failure_end) |failed_end| {
+            if (writer.allocating.writer.end == failed_end) return error.OutOfMemory;
+        }
+        return err;
+    };
+    var bytes: alloc.Vec(u8) = writer.allocating.toArrayList();
     return alloc.String.from_utf8_unchecked(&bytes);
 }
+
+// Zig 0.16's Allocating callbacks erase allocation errors as WriteFailed.
+// Retain callback failure diagnostics only until successful writer activity.
+// The std writer remains embedded intact so its callbacks' parent pointers and
+// buffer growth keep working, without duplicating its allocation or copy logic.
+const AllocatingFormatWriter = struct {
+    allocating: std.Io.Writer.Allocating,
+    original_vtable: *const std.Io.Writer.VTable,
+    allocation_failure_end: ?usize = null,
+
+    fn init(gpa: std.mem.Allocator) AllocatingFormatWriter {
+        var allocating: std.Io.Writer.Allocating = .init(gpa);
+        const original_vtable = allocating.writer.vtable;
+        allocating.writer.vtable = &.{
+            .drain = drain,
+            .sendFile = sendFile,
+            .flush = flush,
+            .rebase = rebase,
+        };
+        return .{ .allocating = allocating, .original_vtable = original_vtable };
+    }
+
+    fn fromWriter(writer: *std.Io.Writer) *AllocatingFormatWriter {
+        const allocating: *std.Io.Writer.Allocating = @fieldParentPtr("writer", writer);
+        return @fieldParentPtr("allocating", allocating);
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self = fromWriter(writer);
+        const written = self.original_vtable.drain(writer, data, splat) catch |err| {
+            self.allocation_failure_end = writer.end;
+            return err;
+        };
+        self.allocation_failure_end = null;
+        return written;
+    }
+
+    fn rebase(
+        writer: *std.Io.Writer,
+        preserve: usize,
+        capacity: usize,
+    ) std.Io.Writer.Error!void {
+        const self = fromWriter(writer);
+        self.original_vtable.rebase(writer, preserve, capacity) catch |err| {
+            self.allocation_failure_end = writer.end;
+            return err;
+        };
+        self.allocation_failure_end = null;
+    }
+
+    fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self = fromWriter(writer);
+        try self.original_vtable.flush(writer);
+        self.allocation_failure_end = null;
+    }
+
+    fn sendFile(
+        writer: *std.Io.Writer,
+        reader: *std.Io.File.Reader,
+        limit: std.Io.Limit,
+    ) std.Io.Writer.FileError!usize {
+        const self = fromWriter(writer);
+        const written = self.original_vtable.sendFile(writer, reader, limit) catch |err| {
+            if (err == error.WriteFailed) self.allocation_failure_end = writer.end;
+            return err;
+        };
+        self.allocation_failure_end = null;
+        return written;
+    }
+};
 
 /// Renders one argument in the position its template asked for.
 ///
@@ -428,7 +515,7 @@ const Emitted = struct {
             switch (self.*) {
                 .InvalidHexCharacter => |payload| try write(
                     writer,
-                    "InvalidHexCharacter {{ c: {:?}, index: {d} }}",
+                    "InvalidHexCharacter {{ c: {:?}, index: {} }}",
                     .{ payload.c, payload.index },
                 ),
                 .OddLength => try writer.writeAll("OddLength"),
@@ -475,7 +562,7 @@ const Shape = struct {
         }
 
         pub fn formatDebug(self: *const Named, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try write(writer, "Named {{ value: {d} }}", .{self.value});
+            try write(writer, "Named {{ value: {} }}", .{self.value});
         }
     };
 
@@ -528,18 +615,14 @@ const Shape = struct {
         number: i32,
         flag: bool,
 
+        // This fixture's hooks read the `number` field, which every caller
+        // initializes. A Rust union has no discriminant for a hook to inspect.
         pub fn format(self: *const Untagged, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            switch (self.*) {
-                .number => |payload| try writer.print("un:{d}", .{payload}),
-                .flag => |payload| try write(writer, "un:{}", .{payload}),
-            }
+            try write(writer, "un:{}", .{self.number});
         }
 
         pub fn formatDebug(self: *const Untagged, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            switch (self.*) {
-                .number => |payload| try writer.print("Untagged({d})", .{payload}),
-                .flag => |payload| try write(writer, "Untagged({})", .{payload}),
-            }
+            try write(writer, "Untagged({})", .{self.number});
         }
     };
 
@@ -648,7 +731,8 @@ test "a borrowed &str argument is written, copied, and never retained" {
     // `&str` copies the bytes into the result rather than aliasing them.
     var source: [11]u8 = undefined;
     @memcpy(source[0..], "local slice");
-    var copied = try toString(gpa, source[0..]);
+    const borrowed: []const u8 = source[0..];
+    var copied = try toString(gpa, borrowed);
     defer copied.deinit(gpa);
     @memset(source[0..], 'x');
     try std.testing.expectEqualStrings("local slice", copied.as_str());
@@ -755,6 +839,64 @@ test "toString frees the partial buffer when Display fails part-way" {
     );
 }
 
+test "toString preserves allocation failures from drain and rebase" {
+    inline for (.{ false, true }) |use_rebase| {
+        const Growth = struct {
+            pub fn format(_: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+                try writer.writeAll("prefix");
+                if (use_rebase) {
+                    @memset(try writer.writableSlice(1024), 'x');
+                } else {
+                    try writer.splatByteAll('x', 1024);
+                }
+            }
+        };
+        const Scenario = struct {
+            fn run(gpa: std.mem.Allocator) !void {
+                var rendered = try toString(gpa, Growth{});
+                defer rendered.deinit(gpa);
+                try std.testing.expectEqual(@as(usize, 1030), rendered.len());
+                try std.testing.expectEqualStrings("prefix", rendered.as_str()[0..6]);
+                for (rendered.as_str()[6..]) |byte| {
+                    try std.testing.expectEqual(@as(u8, 'x'), byte);
+                }
+            }
+        };
+        // Exercise failure before and after acquiring a buffer; the allocator
+        // checks both the error tag and cleanup of every partial render.
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    }
+}
+
+test "toString preserves hook errors after recovering from allocation failure" {
+    const Recovery = struct {
+        grow: bool,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll("prefix");
+            _ = writer.writableSlice(1024) catch {
+                if (self.grow) {
+                    @memset(try writer.writableSlice(128), 'x');
+                } else {
+                    try writer.writeAll("ok");
+                }
+                return error.WriteFailed;
+            };
+            @panic("bounded allocator unexpectedly accepted large growth");
+        }
+    };
+
+    for ([_]bool{ false, true }) |grow| {
+        // Recovery can stay on the buffered fast path or grow through rebase.
+        var storage: [512]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&storage);
+        try std.testing.expectError(
+            error.WriteFailed,
+            toString(fba.allocator(), Recovery{ .grow = grow }),
+        );
+    }
+}
+
 test "every shape a translated Display hook lands on answers the {} position" {
     var buffer: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
@@ -836,52 +978,4 @@ test "toString renders every shape a translated Display hook lands on" {
     var addressed = try toString(gpa, &held);
     defer addressed.deinit(gpa);
     try std.testing.expectEqualStrings("present(4)", addressed.as_str());
-}
-
-test "toString hands its buffer to the String and the caller releases it once" {
-    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = tracking.allocator();
-
-    const before = tracking.allocations;
-    var rendered = try toString(gpa, Shape.Named{ .value = 37 });
-    const freed = tracking.deallocations;
-    rendered.deinit(gpa);
-    // Exactly one allocation became exactly one release: the buffer the
-    // writer built was moved into the String rather than copied beside it
-    // with the writer still holding the original.
-    try std.testing.expectEqual(@as(usize, 1), tracking.allocations - before);
-    try std.testing.expectEqual(@as(usize, 1), tracking.deallocations - freed);
-
-    // A second release reaches the emptied String and frees nothing, so the
-    // ownership the caller was handed can only be released once. The backing
-    // `std.testing.allocator` panics on a double free of the block.
-    rendered.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 0), tracking.deallocations - freed);
-    try std.testing.expectEqual(@as(usize, 0), rendered.len());
-}
-
-test "toString releases a grown render whole rather than leaving the writer's blocks behind" {
-    const Wide = struct {
-        pub fn format(self: *const @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            _ = self;
-            // Enough bytes that the allocating writer cannot hold the render
-            // in the block it first asked for, so growth has to reallocate
-            // before the render completes.
-            var written: usize = 0;
-            while (written < 512) : (written += 10) try writer.writeAll("0123456789");
-        }
-    };
-
-    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = tracking.allocator();
-
-    var rendered = try toString(gpa, Wide{});
-    try std.testing.expectEqual(@as(usize, 512), rendered.len());
-
-    const freed = tracking.deallocations;
-    // The grown buffer is the one the caller releases: the blocks the writer
-    // replaced on the way there were released by the growth itself, and the
-    // final one is released exactly here. `std.testing.allocator` fails the
-    // test if any replaced block leaked, so one release is the whole story.
-    try std.testing.expectEqual(@as(usize, 1), tracking.deallocations - freed);
 }

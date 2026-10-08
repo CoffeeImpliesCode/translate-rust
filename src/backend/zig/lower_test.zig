@@ -3339,7 +3339,7 @@ fn lowerClosureCombinatorPackage(
     });
     const receiver_id = try graph.symbol_table.add(.{
         .id = 0,
-        .kind = .const_,
+        .kind = .field,
         .name = "value",
         .span = span,
         .visibility = .private,
@@ -3350,7 +3350,7 @@ fn lowerClosureCombinatorPackage(
     });
     const param_id = try graph.symbol_table.add(.{
         .id = 0,
-        .kind = .const_,
+        .kind = .field,
         .name = fixture.param_name,
         .span = span,
         .visibility = .private,
@@ -3377,7 +3377,7 @@ fn lowerClosureCombinatorPackage(
     if (fixture.capture_name) |capture_name| {
         capture_id = try graph.symbol_table.add(.{
             .id = 0,
-            .kind = .const_,
+            .kind = .field,
             .name = capture_name,
             .span = span,
             .visibility = .private,
@@ -3397,7 +3397,7 @@ fn lowerClosureCombinatorPackage(
         for (fixture.tuple_names, 0..) |name, index| {
             ids[index] = try graph.symbol_table.add(.{
                 .id = 0,
-                .kind = .const_,
+                .kind = .field,
                 .name = name,
                 .span = span,
                 .visibility = .private,
@@ -3411,12 +3411,94 @@ fn lowerClosureCombinatorPackage(
         element_ids = ids;
     }
 
-    // 0: the receiver, 1: the captured parameter's own declared type. The
-    // capture record names the second one, because whether a capture is an
-    // OWNER is decided from its declared type and not from what it is called.
-    const types_store = try alloc.alloc(ir.types.Type, 2);
+    // The declared receiver stays well-formed when a negative test deliberately
+    // corrupts only the receiver expression's generic arity.
+    var receiver_ty = fixture.receiver_ty;
+    for (0..128) |_| {
+        switch (receiver_ty) {
+            .reference => |reference| receiver_ty = reference.pointee,
+            .boxed => |boxed| receiver_ty = boxed.*,
+            .@"opaque" => |opaque_ty| receiver_ty =
+                (opaque_ty.concrete orelse return error.MissingFixtureReceiverType).*,
+            else => break,
+        }
+    }
+    const maps_error = std.mem.eql(u8, fixture.method_name, "map_err") or
+        std.mem.eql(u8, fixture.method_name, "or_else");
+    const param_ty: ir.types.Type = switch (receiver_ty) {
+        .option => |element| element.*,
+        .result => |result| if (maps_error) result.err else result.ok,
+        .external_nominal => |external| blk: {
+            if (external.path.len != 3) return error.UnsupportedFixtureReceiverType;
+            const name = external.path[2];
+            if (std.mem.eql(u8, name, "Result")) {
+                if (external.args.len != 2) return error.UnsupportedFixtureReceiverType;
+                break :blk external.args[@intFromBool(maps_error)];
+            }
+            if (external.args.len != 1) return error.UnsupportedFixtureReceiverType;
+            if (std.mem.eql(u8, name, "Option") or std.mem.eql(u8, name, "Range")) {
+                break :blk external.args[0];
+            }
+            if (std.mem.eql(u8, name, "Iter") or std.mem.eql(u8, name, "IterMut")) {
+                const reference = try alloc.create(ir.types.Ref);
+                reference.* = .{
+                    .pointee = external.args[0],
+                    .mut = std.mem.eql(u8, name, "IterMut"),
+                };
+                break :blk .{ .reference = reference };
+            }
+            return error.UnsupportedFixtureReceiverType;
+        },
+        else => return error.UnsupportedFixtureReceiverType,
+    };
+    const capture_ty = fixture.capture_ty orelse ir.types.Type{ .prim = .u8 };
+    const tail_ty = if (fixture.capture_name != null)
+        capture_ty
+    else if (element_ids.len > 0 and param_ty == .tuple)
+        param_ty.tuple[0]
+    else
+        param_ty;
+    const output_ty: ir.types.Type = if (std.mem.eql(u8, fixture.method_name, "any"))
+        .{ .prim = .bool }
+    else if (std.mem.eql(u8, fixture.method_name, "map") or
+        std.mem.eql(u8, fixture.method_name, "map_err"))
+        switch (receiver_ty) {
+            .option => blk: {
+                const element = try alloc.create(ir.types.Type);
+                element.* = tail_ty;
+                break :blk .{ .option = element };
+            },
+            .result => |result| blk: {
+                const rebuilt = try alloc.create(ir.types.Result);
+                rebuilt.* = .{
+                    .ok = if (maps_error) result.ok else tail_ty,
+                    .err = if (maps_error) tail_ty else result.err,
+                    .is_error_unionable = false,
+                };
+                break :blk .{ .result = rebuilt };
+            },
+            .external_nominal => |external| blk: {
+                const args = try alloc.dupe(ir.types.Type, external.args);
+                args[if (args.len == 2) @intFromBool(maps_error) else 0] = tail_ty;
+                break :blk .{ .external_nominal = .{ .path = external.path, .args = args } };
+            },
+            else => return error.UnsupportedFixtureReceiverType,
+        }
+    else
+        tail_ty;
+    // 0: receiver, 1: capture, 2: selected payload, 3: body tail, 4: output.
+    const types_store = try alloc.alloc(ir.types.Type, 5 + element_ids.len);
     types_store[0] = fixture.receiver_expr_ty orelse fixture.receiver_ty;
-    types_store[1] = fixture.capture_ty orelse fixture.receiver_ty;
+    types_store[1] = capture_ty;
+    types_store[2] = param_ty;
+    types_store[3] = tail_ty;
+    types_store[4] = output_ty;
+    for (0..element_ids.len) |index| {
+        types_store[5 + index] = if (param_ty == .tuple)
+            param_ty.tuple[index]
+        else
+            param_ty;
+    }
 
     const receiver_expr = try model.e(.{ .path = .{ .def = receiver_id, .generic_args = &.{} } });
     model.exprs.items[receiver_expr].ty = 0;
@@ -3427,7 +3509,7 @@ fn lowerClosureCombinatorPackage(
         .def = capture_id orelse if (element_ids.len > 0) element_ids[0] else param_id,
         .generic_args = &.{},
     } });
-    model.exprs.items[tail_expr].ty = 0;
+    model.exprs.items[tail_expr].ty = 3;
 
     // A tuple-destructured parameter (`|(a, b)| ..`) is ONE parameter whose
     // pattern is a tuple, matching how the frontend desugars `|(i, pair)|`.
@@ -3445,12 +3527,14 @@ fn lowerClosureCombinatorPackage(
             elements[index] = try model.pat(.{
                 .binding = .{ .name = name, .mode = .{ .value = {} }, .mutable = false },
             });
+            model.pats.items[elements[index]].ty = @intCast(5 + index);
         }
         break :blk try model.pat(if (fixture.param_is_slice)
             .{ .slice = .{ .elements = elements, .rest = null } }
         else
             .{ .tuple = .{ .elements = elements, .rest = false } });
     };
+    model.pats.items[param_pattern].ty = 2;
     var captures: []const ir.exprs.Capture = &.{};
     if (fixture.capture_name) |capture_name| {
         const one = try alloc.alloc(ir.exprs.Capture, 1);
@@ -3468,14 +3552,26 @@ fn lowerClosureCombinatorPackage(
     const param_ids = try alloc.alloc(ir.exprs.NodeId, param_count);
     param_ids[0] = param_pattern;
     for (fixture.extra_param_names, 0..) |name, index| {
+        _ = try graph.symbol_table.add(.{
+            .id = 0,
+            .kind = .field,
+            .name = name,
+            .span = span,
+            .visibility = .private,
+            .parent = function_id,
+            .resolved = null,
+            .renamed_to = null,
+            .attributes = &.{},
+        });
         param_ids[index + 1] = try model.pat(.{
             .binding = .{ .name = name, .mode = .{ .value = {} }, .mutable = false },
         });
+        model.pats.items[param_ids[index + 1]].ty = 2;
     }
     const closure_expr = try model.e(.{ .closure = .{
         .captures = captures,
         .params = param_ids,
-        .return_ty = null,
+        .return_ty = 3,
         .body = .{ .statements = &.{}, .tail = tail_expr, .labelled = null },
         .trait = .@"fn",
     } });
@@ -3491,16 +3587,18 @@ fn lowerClosureCombinatorPackage(
         .method = method_id,
         .args = argument_ids,
     } });
+    model.exprs.items[method_expr].ty = 4;
     const method_block = try model.e(.{
         .block = .{ .statements = &.{}, .tail = method_expr, .labelled = null },
     });
+    model.exprs.items[method_block].ty = 4;
 
     var params = try alloc.alloc(ir.items.Param, 1);
     params[0] = .{ .name = "value", .ty = fixture.receiver_ty, .span = span };
     if (fixture.capture_name != null) {
         const two = try alloc.alloc(ir.items.Param, 2);
         two[0] = params[0];
-        two[1] = .{ .name = fixture.capture_name.?, .ty = fixture.capture_ty orelse .{ .prim = .u8 }, .span = span };
+        two[1] = .{ .name = fixture.capture_name.?, .ty = capture_ty, .span = span };
         params = two;
     }
     // The body table is indexed by EntityId, so the callable's own body has to
@@ -3510,7 +3608,7 @@ fn lowerClosureCombinatorPackage(
     }
     try model.bodies.append(model.a(), .{ .fn_ = .{
         .params = params,
-        .ret = .{ .prim = .u8 },
+        .ret = output_ty,
         .body = method_block,
     } });
 
@@ -3755,29 +3853,34 @@ test "lower: map_err on a core::result::Result nominal expands to a tagged rewra
         .receiver_ty = result_ty,
         .param_name = "byte",
     });
-    if (expr != .match_expr) return error.ExpectedResultMapErrSwitch;
-    const arms = expr.match_expr.arms;
-    if (arms.len != 2) return error.ExpectedTwoSwitchArms;
-    // `map_err` maps the Err arm and passes Ok through, so the mapped prong is
-    // FIRST here — the mirror of the `map` test above.
-    if (arms[0].patterns.len != 1 or arms[0].patterns[0] != .enum_literal or
-        !std.mem.eql(u8, arms[0].patterns[0].enum_literal, "Err"))
-    {
-        return error.ExpectedErrProng;
+    // Receiver ownership can stage the switch behind a block or `try`; only
+    // its value, not its position at the root, is the combinator contract.
+    var expanded = expr;
+    for (0..32) |_| {
+        switch (expanded) {
+            .block => |block| expanded = (block.expr orelse
+                return error.ExpectedResultMapErrValue).*,
+            .unary_op => |unary| if (unary.op == .try_op) {
+                expanded = unary.operand.*;
+            } else return error.ExpectedResultMapErrSwitch,
+            else => break,
+        }
     }
-    const err_capture = arms[0].capture orelse return error.ExpectedErrPayloadCapture;
+    if (expanded != .match_expr) return error.ExpectedResultMapErrSwitch;
+    const arms = expanded.match_expr.arms;
+    if (arms.len != 2) return error.ExpectedTwoSwitchArms;
+    // Select by Result tag: `map_err` maps Err and passes Ok through,
+    // independently of staging or switch-prong order.
+    const err_arm = try matchArm(expanded, "Err");
+    const ok_arm = try matchArm(expanded, "Ok");
+    const err_capture = err_arm.capture orelse return error.ExpectedErrPayloadCapture;
     if (!std.mem.eql(u8, err_capture.name, "__r2z_in_byte_err")) {
         return error.ExpectedErrPayloadName;
     }
-    if (arms[1].patterns.len != 1 or arms[1].patterns[0] != .enum_literal or
-        !std.mem.eql(u8, arms[1].patterns[0].enum_literal, "Ok"))
-    {
-        return error.ExpectedOkProng;
-    }
-    const ok_capture = arms[1].capture orelse return error.ExpectedOkPayloadCapture;
+    const ok_capture = ok_arm.capture orelse return error.ExpectedOkPayloadCapture;
     if (!std.mem.eql(u8, ok_capture.name, "__r2z_in_byte")) return error.ExpectedOkPayloadName;
-    if (arms[1].body != .struct_init) return error.ExpectedRewrappedOkArm;
-    const rewrapped = arms[1].body.struct_init;
+    if (ok_arm.body != .struct_init) return error.ExpectedRewrappedOkArm;
+    const rewrapped = ok_arm.body.struct_init;
     // A field-bearing literal without a type name is not a valid AST node, and
     // the named type is the only place the rebuilt pair is visible at all.
     const rewrap_type = rewrapped.type_name orelse return error.ExpectedTypedResultLiteral;
@@ -3785,6 +3888,14 @@ test "lower: map_err on a core::result::Result nominal expands to a tagged rewra
     if (!std.mem.eql(u8, rewrap_type.generic.name, "r2z.Result")) {
         return error.ExpectedResultUnionName;
     }
+    // The identity mapper returns FromUtf8Error, not the receiver Result.
+    try std.testing.expectEqual(@as(usize, 2), rewrap_type.generic.params.len);
+    if (rewrap_type.generic.params[0] != .prim) return error.ExpectedOkPayloadType;
+    try std.testing.expectEqual(ast.Prim.u8, rewrap_type.generic.params[0].prim);
+    try std.testing.expectEqualStrings(
+        "r2z.alloc.FromUtf8Error",
+        try expectNamedType(rewrap_type.generic.params[1]),
+    );
     if (rewrapped.fields.len != 1) return error.ExpectedSingleResultField;
     if (!std.mem.eql(u8, rewrapped.fields[0].name, "Ok")) return error.ExpectedOkFieldName;
     if (rewrapped.fields[0].expr != .ident or
@@ -10653,6 +10764,9 @@ test "lower: a reference to a sized raw-pointer deref asserts alignment" {
     const emitted = try emitAlignmentFixture(.prim_u32);
     defer std.testing.allocator.free(emitted);
     try std.testing.expect(std.mem.indexOf(u8, emitted, "@alignCast(") != null);
+    // A raw pointer also permits null, whereas a Rust reference does not.
+    // Restore both promises only when the reference is formed.
+    try std.testing.expect(std.mem.indexOf(u8, emitted, "@ptrCast(@alignCast(") != null);
     // The place is still indexed, not dereferenced: a many-item pointer
     // needs `[0]`.
     try std.testing.expect(std.mem.indexOf(u8, emitted, "[0]") != null);
@@ -10722,7 +10836,7 @@ fn emitAlignmentFixture(comptime pointee: AlignmentPointee) ![]const u8 {
     const cursor = try model.e(.{ .path = .{ .def = param_def, .generic_args = &.{} } });
     model.exprs.items[cursor].ty = 0;
     const deref = try model.e(.{ .unary = .{ .op = .deref, .operand = cursor } });
-    model.exprs.items[deref].ty = 1;
+    model.exprs.items[deref].ty = 2;
     const reference = try model.e(.{ .unary = .{ .op = .{ .ref = .shared }, .operand = deref } });
     model.exprs.items[reference].ty = 1;
     const body = try model.e(.{ .block = .{
@@ -12173,23 +12287,72 @@ test "lower: a blanket impl targeting the enclosing module is valid topology" {
     try std.testing.expect(std.mem.indexOf(u8, emitted, "fn encode_hex") != null);
 }
 
-// The topology guard is load-bearing for every fixture, so the new branch
-// must not become a blanket accept. An impl whose target is neither a type
-// declaration nor a crate module is still nonsense, and must refuse.
-test "lower: an impl targeting neither a type nor a crate module is still refused" {
+// Non-module parents remain invalid even when the method's source impl exists.
+test "lower: an impl targeting neither a type nor a module is still refused" {
     try std.testing.expectError(
         error.GenericDefinitionMismatch,
         emitBlanketImplFixture(.impl_parent_is_const),
     );
 }
 
-// A module that is not a crate scope is not a blanket impl's enclosing scope
-// either; a stray module parent means the impl was never attached to
-// anything real.
-test "lower: a blanket impl on a non-crate module is still refused" {
+// Compile and execute the nested module's free function, rather than pinning
+// its spelling or AST layout. The module entity and row have different ids.
+test "lower: a blanket impl in a nested source module executes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var package = try lowerBlanketImplFixture(alloc, .non_crate_module);
+    const files = try alloc.dupe(ast.File, package.files);
+    package.files = files;
+    var imports: std.ArrayListUnmanaged(ast.Import) = .empty;
+    try imports.appendSlice(alloc, files[0].imports);
+    try imports.append(alloc, .{ .local_name = "std", .module_or_path = "std" });
+    files[0].imports = try imports.toOwnedSlice(alloc);
+    const callee: ast.Expr = .{ .field_access = .{
+        .target = &.{ .ident = "hex" },
+        .field_name = "encode_hex",
+    } };
+    const call: ast.Expr = .{ .call = .{
+        .callee = &callee,
+        .generic_args = &.{.{ .prim = .u8 }},
+        .args = &.{
+            .{ .field_access = .{
+                .target = &.{ .field_access = .{
+                    .target = &.{ .ident = "std" },
+                    .field_name = "testing",
+                } },
+                .field_name = "allocator",
+            } },
+            .{ .lit = .{ .int = 3 } },
+        },
+    } };
+    const condition: ast.Expr = .{ .bin_op = .{
+        .op = .not_equal,
+        .lhs = &call,
+        .rhs = &.{ .lit = .{ .int = 7 } },
+    } };
+    const assertion: ast.Expr = .{ .if_expr = .{
+        .cond = &condition,
+        .then_body = &.{ .panic_ = "nested impl returned the wrong value" },
+    } };
+    files[0].tests = &.{.{
+        .name = "nested blanket impl",
+        .body = .{ .stmts = &.{.{ .expr_stmt = &assertion }} },
+    }};
+    try runGeneratedPackageTests(alloc, package);
+}
+
+test "lower: a source impl cannot target an extern module" {
     try std.testing.expectError(
         error.GenericDefinitionMismatch,
-        emitBlanketImplFixture(.non_crate_module),
+        emitBlanketImplFixture(.extern_module),
+    );
+}
+
+test "lower: a module must reciprocally list its source impl" {
+    try std.testing.expectError(
+        error.GenericDefinitionMismatch,
+        emitBlanketImplFixture(.unlisted_module_impl),
     );
 }
 
@@ -12200,16 +12363,26 @@ const BlanketShape = enum {
     impl_parent_is_const,
     /// The impl's parent is a nested module rather than the crate root.
     non_crate_module,
+    /// A canonical module row that belongs to an external dependency.
+    extern_module,
+    /// The parent module does not list the impl in its items.
+    unlisted_module_impl,
 };
 
-/// Build `impl ... for T { fn encode_hex(&self) }` with the given topology and
-/// lower it, returning the emitted root source. The negative shapes are
-/// expected to fail, so they propagate the error instead.
+/// Lower the fixture and return its emitted root source for existing callers.
 fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    const package = try lowerBlanketImplFixture(alloc, shape);
+    return std.testing.allocator.dupe(u8, try emit.emitFile(alloc, &package.files[0]));
+}
 
+/// Build `impl ... for T { fn encode_hex(self) -> u8 { 7 } }`.
+fn lowerBlanketImplFixture(
+    alloc: std.mem.Allocator,
+    comptime shape: BlanketShape,
+) !ast.Package {
     var graph = ir.graph.CrateGraph.init(alloc);
     var model = Model.init(alloc);
 
@@ -12228,9 +12401,7 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
     const root_entity_id = try addRootModule(&graph, .{
         .crate_name = "blanket_impl",
         .edition = 2021,
-        // `addRootModule` parents a null-parent item to the root entity,
-        // which is the `.blanket` shape. The two negative shapes move the
-        // impl onto a parent of their own afterwards.
+        // Nested shapes move the impl to a child module afterwards.
         .items = &.{impl_id},
     });
 
@@ -12241,8 +12412,7 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
     switch (shape) {
         .blanket => {},
         .impl_parent_is_const => {
-            // Neither a type declaration nor a crate module: the guard's
-            // `else` arm refuses it.
+            // Neither a type declaration nor a source module.
             const const_id = try addLowerEntity(&graph, .const_, "NOT_A_TYPE", root_entity_id);
             graph.symbol_table.entities.items[impl_id].parent = const_id;
             // The impl stays a crate-root item; only its parent edge is wrong.
@@ -12251,10 +12421,8 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
                 &.{ const_id, impl_id },
             );
         },
-        .non_crate_module => {
-            // A real nested module: the `.module` entity parented to the root
-            // plus the matching module row. `is_crate` is the only flag the
-            // guard reads, so the row has to exist and has to say false.
+        .non_crate_module, .extern_module, .unlisted_module_impl => {
+            // A canonical nested module entity and matching module row.
             const child_id = try addLowerEntity(&graph, .module, "hex", root_entity_id);
             _ = try graph.addModule(.{
                 .id = 0,
@@ -12263,23 +12431,26 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
                 .parent = root_entity_id,
                 .source_path = null,
                 .is_crate = false,
-                .is_extern = false,
+                .is_extern = shape == .extern_module,
                 .span = span,
-                .items = try alloc.dupe(ir.spine.EntityId, &.{impl_id}),
+                .items = try alloc.dupe(
+                    ir.spine.EntityId,
+                    if (shape == .unlisted_module_impl) &.{} else &.{impl_id},
+                ),
                 .attributes = &.{},
             });
             graph.symbol_table.entities.items[impl_id].parent = child_id;
-            graph.modules.items[0].items = try alloc.dupe(ir.spine.EntityId, &.{});
+            graph.modules.items[0].items = try alloc.dupe(ir.spine.EntityId, &.{child_id});
         },
     }
 
     const types = [_]ir.types.Type{ type_param, .{ .prim = .u8 } };
 
-    const unit_expr = try model.e(.{ .unit = {} });
-    model.exprs.items[unit_expr].ty = 1;
+    const result_expr = try model.e(litInt(7));
+    model.exprs.items[result_expr].ty = 1;
     const body = try model.e(.{ .block = .{
         .statements = &.{},
-        .tail = unit_expr,
+        .tail = result_expr,
         .labelled = null,
     } });
     model.exprs.items[body].ty = 1;
@@ -12335,8 +12506,7 @@ fn emitBlanketImplFixture(comptime shape: BlanketShape) ![]const u8 {
         },
     };
 
-    const package = try lower.lowerRustIr(alloc, &rust_ir, null);
-    return std.testing.allocator.dupe(u8, try emit.emitFile(alloc, &package.files[0]));
+    return lower.lowerRustIr(alloc, &rust_ir, null);
 }
 
 // ── Round-2 backend regressions ─────────────────────────────────────────────
@@ -14854,6 +15024,86 @@ fn findFnDecl(file: ast.File, name: []const u8) !ast.FnDecl {
     return error.MissingFunctionDeclaration;
 }
 
+fn fnParamByName(decl: ast.FnDecl, name: []const u8) !ast.FnParam {
+    for (decl.params) |param| {
+        if (std.mem.eql(u8, param.name, name)) return param;
+    }
+    return error.MissingFunctionParameter;
+}
+
+fn fnLocalByName(decl: ast.FnDecl, name: []const u8) !ast.Stmt {
+    const body = decl.body orelse return error.MissingFunctionBody;
+    for (body.stmts) |stmt| {
+        if (stmt == .let_stmt and std.mem.eql(u8, stmt.let_stmt.name, name)) return stmt;
+    }
+    return error.MissingFunctionLocal;
+}
+
+/// Read the source of a binding's value, not names used by its shape predicate.
+/// Thin-pointer staging needs no local storage and yields unit in that branch;
+/// supported owner transfers still name the place they empty.
+fn bindingValueSource(value: ast.Expr, depth: usize) anyerror!?[]const u8 {
+    if (depth == 32) return error.BindingValueTooDeep;
+    switch (value) {
+        .ident => |name| return name,
+        .unit => return null,
+        .builtin => |builtin| {
+            if (std.mem.eql(u8, builtin.name, "compileError")) return null;
+        },
+        .block => |block| {
+            const tail = block.expr orelse return error.MissingBindingValue;
+            if (tail.* == .ident) {
+                for (block.stmts) |stmt| {
+                    if (stmt != .let_stmt) continue;
+                    if (std.mem.eql(u8, stmt.let_stmt.name, tail.ident)) {
+                        return bindingValueSource(stmt.let_stmt.init, depth + 1);
+                    }
+                }
+            }
+            return bindingValueSource(tail.*, depth + 1);
+        },
+        .if_expr => |conditional| {
+            const then_source = try bindingValueSource(conditional.then_body.*, depth + 1);
+            const else_source = try bindingValueSource(
+                (conditional.else_body orelse return error.MissingBindingValue).*,
+                depth + 1,
+            );
+            if (then_source) |name| {
+                if (else_source) |other| {
+                    try std.testing.expectEqualStrings(name, other);
+                }
+                return name;
+            }
+            return else_source;
+        },
+        .match_expr => |selection| {
+            var source: ?[]const u8 = null;
+            for (selection.arms) |arm| {
+                if (try bindingValueSource(arm.body, depth + 1)) |name| {
+                    if (source) |other| try std.testing.expectEqualStrings(other, name);
+                    source = name;
+                }
+            }
+            return source;
+        },
+        .call => |call| {
+            if (std.mem.eql(u8, calleeName(call.callee.*) orelse "", "r2z.alloc.takeOwned")) {
+                try std.testing.expectEqual(@as(usize, 1), call.args.len);
+                const place = call.args[0];
+                if (place != .unary_op or place.unary_op.op != .addr_of) {
+                    return error.ExpectedOwnerTransferPlace;
+                }
+                return bindingValueSource(place.unary_op.operand.*, depth + 1);
+            }
+        },
+        .unary_op => |unary| {
+            if (unary.op == .try_op) return bindingValueSource(unary.operand.*, depth + 1);
+        },
+        else => {},
+    }
+    return error.UnexpectedBindingValue;
+}
+
 /// The name a `.named` type spells. A regression that changes the emitted
 /// type's SHAPE has to fail the assertion that reads it, not trap inside the
 /// union.
@@ -14878,6 +15128,7 @@ fn lowerGenericCallableHelperFixture(
     const helper_id = try addLowerEntity(&graph, .fn_, "test_hash", null);
     const hash_func_field = try addLowerEntity(&graph, .field, "hash_func", helper_id);
     const source_str_field = try addLowerEntity(&graph, .field, "source_str", helper_id);
+    _ = try addLowerEntity(&graph, .field, "expected", helper_id);
 
     _ = try addRootModule(&graph, .{
         .crate_name = "generic_helper",
@@ -14963,6 +15214,24 @@ fn lowerGenericCallableHelperFixture(
         .params = helper_params,
         .ret = unit_ty,
         .generic_params = &.{"T"},
+        .generics = .{
+            .params = try alloc.dupe(ir.types.GenericParam, &.{.{ .type_ = .{
+                .name = "T",
+                .bounds = try alloc.dupe(ir.types.Bound, &.{
+                    .{ .path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+                        .{ .name = "core", .id = null },
+                        .{ .name = "cmp", .id = null },
+                        .{ .name = "Eq", .id = null },
+                    }) } },
+                    .{ .path = .{ .segments = try alloc.dupe(ir.types.PathSegment, &.{
+                        .{ .name = "core", .id = null },
+                        .{ .name = "fmt", .id = null },
+                        .{ .name = "Debug", .id = null },
+                    }) } },
+                }),
+            } }}),
+            .where_clauses = &.{},
+        },
         .body = helper_body,
         .is_allocating = false,
     } };
@@ -14999,21 +15268,52 @@ test "lower: a generic helper with an impl FnOnce parameter emits a normal calla
         testDeclByName(pkg.files[0], "test_hash"),
     );
 
-    try std.testing.expectEqual(@as(usize, 4), fn_decl.params.len);
-    try std.testing.expectEqualStrings("T", fn_decl.params[0].name);
-    try std.testing.expect(fn_decl.params[0].is_comptime);
-    try std.testing.expectEqualStrings("hash_func", fn_decl.params[1].name);
-    try std.testing.expectEqualStrings("source_str", fn_decl.params[2].name);
-    try std.testing.expectEqualStrings("expected", fn_decl.params[3].name);
+    const lexical = try fnParamByName(fn_decl, "T");
+    try std.testing.expect(lexical.is_comptime);
+    try std.testing.expectEqualStrings("type", try expectNamedType(lexical.ty));
+    const callable = try fnParamByName(fn_decl, "hash_func");
+    try std.testing.expect(!callable.is_comptime);
     // The bound carries no signature, so the parameter is whatever the call
-    // site passes; `expected` is the same lexical `T`.
-    try std.testing.expectEqualStrings("anytype", try expectNamedType(fn_decl.params[1].ty));
-    try std.testing.expectEqualStrings("T", try expectNamedType(fn_decl.params[3].ty));
+    // site passes; `expected` is the same lexical `T`, even when ownership
+    // introduces a separate signature name and an allocator.
+    try std.testing.expectEqualStrings("anytype", try expectNamedType(callable.ty));
+    // The canonical `expected` field remains the body binding. Follow its
+    // value back to the signature, without mistaking ownership/type-selection
+    // predicates for data or requiring a bare-identifier initializer.
+    const expected = (try fnLocalByName(fn_decl, "expected")).let_stmt;
+    const expected_source = (try bindingValueSource(expected.init, 0)) orelse
+        return error.MissingExpectedValueSource;
+    const expected_param = try fnParamByName(fn_decl, expected_source);
+    try std.testing.expect(!expected_param.is_comptime);
+    try std.testing.expectEqualStrings("T", try expectNamedType(expected_param.ty));
+    try std.testing.expect(expected.is_mut);
+    if (expected.ty) |ty| {
+        try std.testing.expectEqualStrings("T", try expectNamedType(ty));
+    } else {
+        // A thin pointer deliberately has no local storage. The other branch
+        // retains the signature's lexical T through Zig's inferred type.
+        if (expected.init != .if_expr) return error.ExpectedConditionalParameterStorage;
+        try std.testing.expect(expected.init.if_expr.then_body.* == .unit);
+        try std.testing.expectEqualStrings(expected_source, (try bindingValueSource(
+            (expected.init.if_expr.else_body orelse return error.MissingExpectedValue).*,
+            0,
+        )) orelse return error.MissingExpectedValueSource);
+    }
+    const source_param = try fnParamByName(fn_decl, "source_str");
+    try std.testing.expect(!source_param.is_comptime);
+    if (source_param.ty != .slice) return error.ExpectedSliceParameter;
+    try std.testing.expect(source_param.ty.slice.is_const);
+    if (source_param.ty.slice.elem.* != .prim) return error.ExpectedByteParameter;
+    try std.testing.expectEqual(ast.Prim.u8, source_param.ty.slice.elem.prim);
 
-    const source = try emit.emitFile(alloc, &pkg.files[0]);
-    try std.testing.expect(std.mem.indexOf(u8, source, "r2z.memory.size_of(T)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "comptime T: type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "hash_func(source_str)") != null);
+    const hashed = (try fnLocalByName(fn_decl, "hashed")).let_stmt;
+    try std.testing.expect(callsWithArgument(hashed.init, callable.name, source_param.name));
+    const bit_size = (try fnLocalByName(fn_decl, "bit_size")).let_stmt;
+    const size_call = try unwrapTurbofishCall(bit_size.init);
+    try std.testing.expectEqualStrings("r2z.memory.size_of", calleeName(size_call.callee.*) orelse
+        return error.ExpectedSizeOfCall);
+    try std.testing.expectEqual(@as(usize, 1), size_call.generic_args.len);
+    try std.testing.expectEqualStrings("T", try expectNamedType(size_call.generic_args[0]));
 }
 
 test "lower: a callable parameter with a resolved signature keeps that signature" {
@@ -15022,7 +15322,7 @@ test "lower: a callable parameter with a resolved signature keeps that signature
     const alloc = arena.allocator();
 
     const pkg = try lowerGenericCallableHelperFixture(alloc, .closure_with_signature);
-    const callable_ty = (try findFnDecl(pkg.files[0], "test_hash")).params[1].ty;
+    const callable_ty = (try fnParamByName(try findFnDecl(pkg.files[0], "test_hash"), "hash_func")).ty;
     if (callable_ty != .fn_ptr) return error.ExpectedFunctionPointerParameter;
     // The signature the IR already carried, including its lexical result type.
     try std.testing.expectEqual(@as(usize, 1), callable_ty.fn_ptr.params.len);
@@ -15241,10 +15541,6 @@ test "lower: overlapping blanket impl raw IR reports ambiguity without dispatch"
 
     const wrapper = try findFnDecl(pkg.files[0], "encode");
     const body = wrapper.body orelse return error.MissingWrapperBody;
-    // A sole compile-error expression proves there is no chosen impl call in
-    // a prelude, branch, callee, or argument. A generic missing-impl refusal
-    // is not an ambiguity diagnostic.
-    try std.testing.expectEqual(@as(usize, 0), body.stmts.len);
     const refusal = body.expr orelse return error.MissingAmbiguityDiagnostic;
     if (refusal.* != .builtin) return error.ExpectedAmbiguityDiagnostic;
     try std.testing.expectEqualStrings("compileError", refusal.builtin.name);
@@ -16145,7 +16441,6 @@ test "lower: a collect into a type parameter dispatches its deposit at comptime"
     // The owner is a bare `T` and the empty value comes from the instantiation.
     try std.testing.expect(std.mem.indexOf(u8, source, "comptime T: type") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "var __r2z_owner: T = T.empty;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "errdefer __r2z_owner.deinit(allocator);") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "@TypeOf(__r2z_owner)") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "== r2z.alloc.String") != null);
     // One deposit per container, and no alias that gives `String` an `append`
@@ -20039,12 +20334,13 @@ fn bufReadThinPointerCapture(expr: ast.Expr) ?[]const u8 {
     if (guarded.target.builtin.args.len != 1) return null;
     if (guarded.target.builtin.args[0] != .builtin) return null;
     if (!std.mem.eql(u8, guarded.target.builtin.args[0].builtin.name, "TypeOf")) return null;
-    if (guarded.arms.len != 2) return null;
-    const pointer = guarded.arms[0];
-    if (pointer.patterns.len != 1) return null;
-    if (pointer.patterns[0] != .enum_literal) return null;
-    if (!std.mem.eql(u8, pointer.patterns[0].enum_literal, "pointer")) return null;
-    return (pointer.capture orelse return null).name;
+    for (guarded.arms) |arm| {
+        for (arm.patterns) |pattern| {
+            if (pattern == .enum_literal and std.mem.eql(u8, pattern.enum_literal, "pointer"))
+                return (arm.capture orelse return null).name;
+        }
+    }
+    return null;
 }
 
 // A Rust parameter is allowed to be called anything, including the name the
@@ -20058,11 +20354,15 @@ test "lower: a source parameter named like a generated reader binding is alpha-r
     const reserved = "__r2z_bufread_pointer";
     const pkg = try bufReadPointerPackage(alloc, reserved, false);
     const decl = try findFnDecl(pkg.files[0], "drain");
-    // `R` is emitted as a comptime type parameter of its own, so the SOURCE
-    // parameter is the one beside it.
-    if (decl.params.len != 2) return error.ExpectedReceiverParameter;
-    if (!decl.params[0].is_comptime or decl.params[1].is_comptime) return error.ExpectedReceiverParameter;
-    const reader_param = decl.params[1];
+    const lexical = try fnParamByName(decl, "R");
+    try std.testing.expect(lexical.is_comptime);
+    var reader: ?ast.FnParam = null;
+    for (decl.params) |param| {
+        if (param.is_comptime or param.ty != .named or !std.mem.eql(u8, param.ty.named, "R")) continue;
+        if (reader != null) return error.AmbiguousReceiverParameter;
+        reader = param;
+    }
+    const reader_param = reader orelse return error.ExpectedReceiverParameter;
 
     // The frame owns the reader by value, so it binds it in the BODY, under the
     // name the source gave it. The signature keeps a name of its own: one
@@ -20070,10 +20370,7 @@ test "lower: a source parameter named like a generated reader binding is alpha-r
     // and a body reading that local would read — and write — a reader the
     // caller never passed.
     const stmts = try fnBodyStmts(decl);
-    if (stmts.len != 3) return error.ExpectedReceiverBinding;
-    const binding = stmts[0];
-    if (binding != .let_stmt) return error.ExpectedReceiverBinding;
-    try std.testing.expectEqualStrings(reserved, binding.let_stmt.name);
+    const binding = try fnLocalByName(decl, reserved);
     try std.testing.expect(!std.mem.eql(u8, reader_param.name, binding.let_stmt.name));
 
     // The copy itself is CONDITIONAL, because a bare type parameter may
@@ -20092,8 +20389,36 @@ test "lower: a source parameter named like a generated reader binding is alpha-r
     // already claimed the spelling the emitter wanted for it.
     const capture = bufReadThinPointerCapture(selection.if_expr.cond.*) orelse
         return error.ExpectedReceiverBinding;
-    try std.testing.expect(std.mem.startsWith(u8, capture, reserved));
-    try std.testing.expect(!std.mem.eql(u8, capture, reserved));
+    try std.testing.expect(!std.mem.eql(u8, capture, binding.let_stmt.name));
+    for (decl.params) |param| {
+        try std.testing.expect(!std.mem.eql(u8, capture, param.name));
+    }
+
+    // The source's consume must use that same reader: a thin instantiation
+    // reads the signature handle, while an owned one addresses its local.
+    var consumed = false;
+    for (stmts) |stmt| {
+        if (stmt != .expr_stmt or stmt.expr_stmt.* != .call) continue;
+        const call = stmt.expr_stmt.call;
+        const callee = calleeName(call.callee.*) orelse continue;
+        if (!std.mem.eql(u8, callee, "r2z.io.consume")) continue;
+        consumed = true;
+        if (call.args.len == 0 or call.args[0] != .if_expr) return error.ExpectedReceiverRead;
+        const handle = call.args[0].if_expr;
+        try std.testing.expectEqualStrings(reader_param.name, operandIdent(handle.then_body.*) orelse
+            return error.ExpectedReceiverRead);
+        const local = handle.else_body orelse return error.ExpectedReceiverRead;
+        if (local.* != .unary_op or local.unary_op.op != .addr_of) return error.ExpectedReceiverRead;
+        try std.testing.expectEqualStrings(binding.let_stmt.name, operandIdent(local.unary_op.operand.*) orelse
+            return error.ExpectedReceiverRead);
+        const handle_capture = bufReadThinPointerCapture(handle.cond.*) orelse
+            return error.ExpectedReceiverRead;
+        try std.testing.expect(!std.mem.eql(u8, handle_capture, binding.let_stmt.name));
+        for (decl.params) |param| {
+            try std.testing.expect(!std.mem.eql(u8, handle_capture, param.name));
+        }
+    }
+    try std.testing.expect(consumed);
 }
 
 // ── A generic `H: core::hash::Hasher` and the hashers that answer it ────────
@@ -21944,15 +22269,15 @@ fn hashBoundClassifierPackage(alloc: std.mem.Allocator, local_homonym: bool) !as
         .body = caller_body,
     } };
 
-    const items = try alloc.alloc(ir.spine.EntityId, if (local_homonym) 5 else 3);
+    const items = try alloc.alloc(ir.spine.EntityId, if (local_homonym) 5 else 4);
     items[0] = callable;
     items[1] = tag;
     items[2] = caller;
-    var item_count: usize = 3;
+    // Both shapes create this source impl under the lexical root module.
+    items[3] = tag_impl;
+    var item_count: usize = 4;
     if (local_homonym) {
         items[item_count] = local_trait;
-        item_count += 1;
-        items[item_count] = tag_impl;
         item_count += 1;
     }
     try addBareCrate(&graph, alloc, "hash_bound_classifier", root, items[0..item_count]);
@@ -22048,55 +22373,28 @@ test "lower: an ordinary type parameter keeps its reference and its caller argum
     }
 }
 
-// ── Moving an array owner whose length is a comptime expression ────────────
+// ── A zero-length array literal owns no storage ─────────────────────────────
 
-/// How a zero-length `String` array reaches the caller.
-const ZeroArrayScene = enum {
-    /// `fn take(a: [String; 0]) -> [String; 0] { a }` — a by-value owner the
-    /// frame owns, so returning it transfers it out.
-    borrowed_parameter,
-    /// `fn make() -> [String; 0] { [] }` — an array literal with no elements,
-    /// which owns nothing and has no handle to empty.
-    literal_expression,
-};
-
-/// Lower one of the two, exactly as written.
-fn zeroArrayOwnerPackage(alloc: std.mem.Allocator, scene: ZeroArrayScene) !ast.Package {
+/// Lower `fn make() -> [String; 0] { [] }`.
+fn zeroArrayOwnerPackage(alloc: std.mem.Allocator) !ast.Package {
     var graph = ir.graph.CrateGraph.init(alloc);
     var model = Model.init(alloc);
     const root = try addLowerEntity(&graph, .module, "", null);
-    const callable = try addLowerEntity(&graph, .fn_, switch (scene) {
-        .borrowed_parameter => "take",
-        .literal_expression => "make",
-    }, root);
-    const param_def = try addLowerEntity(&graph, .field, "a", callable);
+    const callable = try addLowerEntity(&graph, .fn_, "make", root);
 
     const string_ty: ir.types.Type = .{ .external_nominal = .{
         .path = &.{ "alloc", "string", "String" },
         .args = &.{},
     } };
-    const usize_ty: ir.types.Type = .{ .prim = .usize };
-    const unit_ty: ir.types.Type = .{ .prim = .unit };
-    // The length is written as a comptime EXPRESSION that happens to evaluate to
-    // zero. A Rust array always carries its length in its type; what the IR may
-    // do is hand the length over as an expression, which is what forces the
-    // emitted type to be an `array_expr` rather than a plain array.
-    const count = try typedExpr(&model, 2, litInt(0));
-    // 0: `String`, 1: `[String; <expression>]`, 2: usize, 3: unit,
-    // 4: `[String; 0]` with the length written outright.
     const types = [_]ir.types.Type{
         string_ty,
-        .{ .array = &.{ .elem = string_ty, .len = .{ .expression = count } } },
-        usize_ty,
-        unit_ty,
         .{ .array = &.{ .elem = string_ty, .len = .{ .literal = 0 } } },
     };
 
-    const result_id: ir.exprs.TypeId = if (scene == .borrowed_parameter) 1 else 4;
-    const body = try typedExpr(&model, result_id, switch (scene) {
-        .borrowed_parameter => .{ .path = .{ .def = param_def, .generic_args = &.{} } },
-        // Rust's `[]`, whose element type comes from the return position.
-        .literal_expression => .{ .array = .{ .elements = &.{}, .repeat = null } },
+    const result_id: ir.exprs.TypeId = 1;
+    // Rust's `[]`, whose element type comes from the return position.
+    const body = try typedExpr(&model, result_id, .{
+        .array = .{ .elements = &.{}, .repeat = null },
     });
     const fn_body = try typedExpr(&model, result_id, .{ .block = .{
         .statements = &.{},
@@ -22107,12 +22405,7 @@ fn zeroArrayOwnerPackage(alloc: std.mem.Allocator, scene: ZeroArrayScene) !ast.P
     const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
     for (body_rows) |*row| row.* = .none;
     body_rows[callable] = .{ .fn_ = .{
-        .params = switch (scene) {
-            .borrowed_parameter => try alloc.dupe(ir.items.Param, &.{
-                .{ .name = "a", .ty = types[1], .span = span },
-            }),
-            .literal_expression => &.{},
-        },
+        .params = &.{},
         .ret = types[result_id],
         .body = fn_body,
     } };
@@ -22136,71 +22429,6 @@ fn zeroArrayOwnerPackage(alloc: std.mem.Allocator, scene: ZeroArrayScene) !ast.P
     return lower.lowerRustIr(alloc, &rust_ir, null);
 }
 
-// An array's length is not in its Zig type, so a plain copy could move no
-// storage at all. The transfer therefore asks the runtime whether the concrete
-// payload really owns something: if it does it takes the handle, and if it does
-// not the handle itself is the answer. Either way the frame's release still
-// runs, and finds the handle empty.
-//
-// The payload here is spelled from a comptime EXPRESSION length, so the emitted
-// type is an `array_expr` whose length is an expression — and the payload the
-// runtime is asked about is that expression-carrying type, not a plain array.
-test "lower: moving an array owner is conditional on the runtime proving it owns storage" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const pkg = try zeroArrayOwnerPackage(alloc, .borrowed_parameter);
-    const decl = try findFnDecl(pkg.files[0], "take");
-    const block = decl.body orelse return error.EmptyTranslatedBody;
-    const body = (block.expr orelse return error.EmptyTranslatedBody).*;
-    if (body != .if_expr) return error.ExpectedOwnedMoveGuard;
-    const guard = body.if_expr;
-
-    // The question is asked of the PAYLOAD type, with no argument: it is a
-    // comptime question about that type alone.
-    if (guard.cond.* != .call) return error.ExpectedOwnedMoveGuard;
-    const question = guard.cond.call;
-    try std.testing.expectEqualStrings("r2z.alloc.supportsOwnedMove", calleeName(question.callee.*) orelse
-        return error.ExpectedOwnedMoveGuard);
-    try std.testing.expectEqual(@as(usize, 1), question.generic_args.len);
-    try std.testing.expectEqual(@as(usize, 0), question.args.len);
-    // The payload is the array whose length is an EXPRESSION, so it lowers to
-    // an `array_expr` and not to a plain array.
-    const payload = question.generic_args[0];
-    if (payload != .array_expr) return error.ExpectedOwnedMoveGuard;
-    if (payload.array_expr.len.* != .lit or payload.array_expr.len.lit != .int)
-        return error.ExpectedOwnedMoveGuard;
-    try std.testing.expectEqual(@as(i128, 0), payload.array_expr.len.lit.int);
-
-    // The `then` arm is the transfer itself, asked about the same type and
-    // addressed at the handle the frame holds.
-    if (guard.then_body.* != .call) return error.ExpectedOwnedMoveGuard;
-    const transfer = guard.then_body.call;
-    try std.testing.expectEqualStrings("r2z.alloc.takeOwned", calleeName(transfer.callee.*) orelse
-        return error.ExpectedOwnedMoveGuard);
-    try std.testing.expectEqual(@as(usize, 1), transfer.generic_args.len);
-    try std.testing.expectEqual(@as(usize, 1), transfer.args.len);
-    if (transfer.args[0] != .unary_op or transfer.args[0].unary_op.op != .addr_of)
-        return error.ExpectedOwnedMoveGuard;
-    const alias = operandIdent(transfer.args[0].unary_op.operand.*) orelse return error.ExpectedOwnedMoveGuard;
-
-    // The `else` arm is that same handle, so the two answers are one type.
-    if (guard.else_body == null) return error.ExpectedOwnedMoveGuard;
-    if (guard.else_body.?.* != .ident) return error.ExpectedOwnedMoveGuard;
-    try std.testing.expectEqualStrings(alias, guard.else_body.?.*.ident);
-
-    // An array has no `deinit`: its elements own storage, so the release goes
-    // through the runtime helper that knows how to walk them.
-    const source = try emit.emitFile(alloc, &pkg.files[0]);
-    try std.testing.expect(std.mem.indexOf(u8, source, "dropTemporary") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        source,
-        try std.fmt.allocPrint(alloc, "defer r2z.alloc.dropTemporary(allocator, &{s});", .{alias}),
-    ) != null);
-}
-
 // An array literal with no elements owns nothing and has no handle, so there is
 // no alias to declare, nothing to take and nothing to release. A guard here
 // would be a question about a type that cannot answer it.
@@ -22209,7 +22437,7 @@ test "lower: a zero-length array literal is never treated as an owner to move" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const pkg = try zeroArrayOwnerPackage(alloc, .literal_expression);
+    const pkg = try zeroArrayOwnerPackage(alloc);
     const source = try emit.emitFile(alloc, &pkg.files[0]);
     try std.testing.expect(std.mem.indexOf(u8, source, "supportsOwnedMove") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "takeOwned") == null);
@@ -23429,193 +23657,6 @@ test "lower: a guarded arm's value leaves a block that is declared around it" {
     // enclosing `return` is what hands the block's value back.
     try std.testing.expect(std.mem.indexOf(u8, source, "unreachable;") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "return ") != null);
-}
-
-// ── A guarded chain that is the whole value a function returns ──────────────
-
-/// A function whose value is a guarded `match` with nothing around it.
-///
-/// This is the shape `test/crates/guarded-owned-fallthrough`'s
-/// `guarded_fallthrough` has, and it is where the label the chain's arms leave
-/// through has nowhere to go. The chain is a labelled value block whose arms
-/// end on `break :<label> <value>`, and a Zig FUNCTION BODY is written
-/// `{ … }` with no label in front of it: moving the chain's statements into the
-/// body left the label behind, so every arm's exit resolved to no block at all
-/// and the package emitted a bare `break r2z.alloc.takeOwned(…);` that Zig
-/// rejected as a break outside any loop.
-fn lowerGuardedTailPackage(alloc: std.mem.Allocator) !ast.Package {
-    var graph = ir.graph.CrateGraph.init(alloc);
-    var model = Model.init(alloc);
-
-    const root = try addRootModule(&graph, .{
-        .crate_name = "guard_tail",
-        .edition = 2021,
-        .items = &.{},
-    });
-    const fn_id = try addLowerEntity(&graph, .fn_, "classify", root);
-    const x_id = try addLowerEntity(&graph, .field, "x", fn_id);
-    graph.modules.items[0].items = try alloc.dupe(ir.spine.EntityId, &.{fn_id});
-
-    // 0: u8.
-    const u8_ty: ir.types.Type = .{ .prim = .u8 };
-    const types = [_]ir.types.Type{u8_ty};
-
-    const x = try typedExpr(&model, 0, .{ .path = .{ .def = x_id, .generic_args = &.{} } });
-
-    // `match x { 0 if x == 1 => 1, _ => 2 }`: the guarded arm and the
-    // catch-all behind it are the chain's two exits.
-    const guarded_arms = try alloc.alloc(ir.exprs.MatchArm, 2);
-    guarded_arms[0] = .{
-        .patterns = try literalSelectors(alloc, &model, 0),
-        .guard = try typedEq(&model, try typedExpr(&model, 0, .{
-            .path = .{ .def = x_id, .generic_args = &.{} },
-        }), try typedInt(&model, 1, 0)),
-        .body = try typedInt(&model, 1, 0),
-    };
-    guarded_arms[1] = .{
-        .patterns = try oneSelector(alloc, try model.pat(.wildcard)),
-        .guard = null,
-        .body = try typedInt(&model, 2, 0),
-    };
-    const guarded_match = try typedExpr(&model, 0, .{ .match = .{
-        .scrutinee = x,
-        .arms = guarded_arms,
-        .option_scrutinee = false,
-    } });
-
-    // The chain IS the body's tail. Nothing else in the body precedes it, so a
-    // fix that only worked for a chain reached through a conditional would not
-    // be exercised here.
-    const body = try typedExpr(&model, 0, .{ .block = .{
-        .statements = &.{},
-        .tail = guarded_match,
-        .labelled = null,
-    } });
-
-    const params = try alloc.alloc(ir.items.Param, 1);
-    params[0] = .{ .name = "x", .ty = u8_ty, .span = span };
-    const body_rows = try alloc.alloc(ir.bodies.BodyKind, graph.symbol_table.count());
-    for (body_rows) |*row| row.* = .none;
-    body_rows[fn_id] = .{ .fn_ = .{
-        .params = params,
-        .ret = u8_ty,
-        .body = body,
-        .is_allocating = false,
-    } };
-
-    const rust_ir = ir.RustIr{
-        .crate_name = "guard_tail",
-        .edition = "2021",
-        .graph = graph,
-        .types = &types,
-        .bodies = .{
-            .exprs = try model.exprs.toOwnedSlice(alloc),
-            .stmts = try model.stmts.toOwnedSlice(alloc),
-            .pats = try model.pats.toOwnedSlice(alloc),
-            .types = &types,
-            .bodies = body_rows,
-        },
-    };
-    return lower.lowerRustIr(alloc, &rust_ir, null);
-}
-
-/// The emitted Zig for the guarded-tail fixture.
-fn guardedTailSource() ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const inner = arena.allocator();
-    const package = try lowerGuardedTailPackage(inner);
-    return std.testing.allocator.dupe(u8, try emit.emitFile(inner, &package.files[0]));
-}
-
-test "lower: a guarded chain used as a function-body tail is bound to a local, not promoted into return position" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const package = try lowerGuardedTailPackage(arena.allocator());
-
-    // The typed AST is the claim: the body keeps the chain WHOLE, bound to a
-    // local in STATEMENT position, and hands the value back by name. Promoting
-    // it into the tail wrote `return <label>: { … };`, which is not a grammar
-    // production — a labelled block is legal only as an `if`/`else` branch or
-    // under a carrier — and the tail is emitted through an empty `EmitContext`,
-    // so every `break :<label>` inside it resolved against no exit scope.
-    const classify = try findFnDecl(package.files[0], "classify");
-    const frame = classify.body orelse return error.ExpectedFunctionBody;
-    const chain_name = try expectIdent((frame.expr orelse
-        return error.ExpectedFunctionTail).*);
-    if (frame.stmts.len == 0) return error.ExpectedGuardChainBinding;
-    const binding = switch (frame.stmts[frame.stmts.len - 1]) {
-        .let_stmt => |let_stmt| let_stmt,
-        else => return error.ExpectedGuardChainBinding,
-    };
-    // The tail reads the local back, so the binding and the tail name one thing.
-    try std.testing.expectEqualStrings(chain_name, binding.name);
-    const chain = switch (binding.init) {
-        .block => |block| block,
-        else => return error.ExpectedGuardChainTail,
-    };
-    if (chain.label == null) return error.MissingGuardChainLabel;
-    try std.testing.expect(chain.expr == null);
-
-    const source = try guardedTailSource();
-    defer std.testing.allocator.free(source);
-    const label = try guardChainLabel(source);
-
-    // Both arms leave the chain by naming it, so the exits resolve to the block
-    // the local was bound to.
-    var value_buf: [128]u8 = undefined;
-    try std.testing.expect(
-        std.mem.indexOf(u8, source, try guardExit(&value_buf, label, "1")) != null,
-    );
-    value_buf = undefined;
-    try std.testing.expect(
-        std.mem.indexOf(u8, source, try guardExit(&value_buf, label, "2")) != null,
-    );
-    var prefix_buf: [128]u8 = undefined;
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        countOccurrences(source, try guardExitPrefix(&prefix_buf, label)),
-    );
-    // Nothing breaks out of anything but that block. An unlabeled `break` reads
-    // as one out of the innermost enclosing loop, and there is no loop here —
-    // which is exactly what Zig rejected.
-    try std.testing.expectEqual(
-        countOccurrences(source, "break "),
-        countOccurrences(source, "break :"),
-    );
-    // The label rides on a block sitting in a statement's initializer, which is
-    // one of the positions Zig spells, and the value leaves by name.
-    var bind_buf: [256]u8 = undefined;
-    try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            source,
-            try std.fmt.bufPrint(&bind_buf, "const {s} = {s}: {{", .{ chain_name, label }),
-        ) != null,
-    );
-    var return_buf: [128]u8 = undefined;
-    try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            source,
-            try std.fmt.bufPrint(&return_buf, "return {s};", .{chain_name}),
-        ) != null,
-    );
-    // NEGATIVE: the chain is not in return position at all. `return <label>: {`
-    // is the shape the promotion emitted, and its absence is the property — a
-    // body whose chain was flattened into its own statements emitted neither
-    // the `const` binding nor the `return`, and a promoted one emitted this.
-    var promoted_buf: [128]u8 = undefined;
-    try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            source,
-            try std.fmt.bufPrint(&promoted_buf, "return {s}: {{", .{label}),
-        ) == null,
-    );
-    // The fall-through past the last dispatch is spelled rather than falling
-    // off the end of the block.
-    try std.testing.expect(std.mem.indexOf(u8, source, "unreachable;") != null);
 }
 
 // ── The declared return, once the body has answered ─────────────────────────

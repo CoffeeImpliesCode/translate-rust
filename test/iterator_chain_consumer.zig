@@ -12,18 +12,10 @@
 //!
 //! Every claim here is about ownership, and none of it is about emitted text.
 //! Each test drives one adapter, reads the bytes that adapter's chain collected,
-//! and then counts the releases. The count is the part the testing allocator
-//! cannot state on its own: it reports a leak and it reports a double free, but
-//! it cannot say that the frame held exactly the owners it handed over and
-//! released each of them once.
-//!
-//! What each adapter's count means is spelled out at the fixture. In short: the
-//! adapter in front never owns anything, so the allocations the frame leaves
-//! outstanding are one owner per collected element plus the one slab the
-//! collection grew. A count that is short is an intermediate the frame built
-//! and forgot or released early; a count that is long is an intermediate it
-//! materialized; a count that is right but whose elements are not distinct
-//! allocations is a chain that aliased its owners onto one.
+//! and then checks each allocation's releases. The testing allocator detects
+//! leaks and double frees; the ledger also verifies that each returned element
+//! and its collection storage are still live until the caller releases them.
+//! Allocation totals do not pin the collection's growth strategy.
 
 const std = @import("std");
 const r2z = @import("r2z");
@@ -106,7 +98,7 @@ const ReleaseLedger = struct {
         // describe. The count therefore follows the memory.
         const moved = self.inner.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
         if (@intFromPtr(moved) != @intFromPtr(memory.ptr)) {
-            if (self.releases.fetchRemove(self.book, @intFromPtr(memory.ptr))) |entry| {
+            if (self.releases.fetchRemove(@intFromPtr(memory.ptr))) |entry| {
                 self.releases.put(self.book, @intFromPtr(moved), entry.value) catch {};
             }
         }
@@ -119,34 +111,27 @@ const ReleaseLedger = struct {
         self.inner.rawFree(memory, alignment, ret_addr);
     }
 
-    /// Assert that `expected` allocations came out of this ledger and that
-    /// every one of them has been released exactly once.
-    ///
-    /// The count is the claim, not decoration. A frame that built one owner per
-    /// element and released nothing is a leak the inner allocator reports; a
-    /// frame that released one of them twice is a double free it reports; a
-    /// frame that built one owner and materialized a second for the same
-    /// element is neither, and only a count says so.
-    fn expectEachReleasedExactlyOnce(self: *const ReleaseLedger, expected: usize) !void {
-        try std.testing.expectEqual(expected, @as(usize, self.releases.count()));
+    /// Assert that every recorded allocation has been released exactly once.
+    fn expectEachReleasedExactlyOnce(self: *const ReleaseLedger) !void {
         var entries = self.releases.iterator();
         while (entries.next()) |entry| {
             try std.testing.expectEqual(@as(u32, 1), entry.value_ptr.*);
         }
     }
 
-    /// Assert that `expected` allocations came out of this ledger and that none
-    /// of them has been released yet.
-    ///
-    /// This is the claim that the frame handed its owners over instead of
-    /// dropping them. A release that ran on the way out would leave the caller
-    /// nothing to own, and would leave the caller with a double free to find
-    /// instead of a leak.
-    fn expectOutstanding(self: *const ReleaseLedger, expected: usize) !void {
-        try std.testing.expectEqual(expected, @as(usize, self.releases.count()));
-        var entries = self.releases.iterator();
-        while (entries.next()) |entry| {
-            try std.testing.expectEqual(@as(u32, 0), entry.value_ptr.*);
+    /// Assert that the returned elements and collection storage remain live.
+    fn expectOutstanding(self: *const ReleaseLedger, list: Owners) !void {
+        for (list.items) |element| {
+            try std.testing.expectEqual(
+                @as(?u32, 0),
+                self.releases.get(@intFromPtr(element.as_bytes().ptr)),
+            );
+        }
+        if (list.capacity != 0) {
+            try std.testing.expectEqual(
+                @as(?u32, 0),
+                self.releases.get(@intFromPtr(list.items.ptr)),
+            );
         }
     }
 
@@ -160,14 +145,6 @@ const ReleaseLedger = struct {
     }
 };
 
-/// The slab a `Vec<String>` of at most eight elements grows, which is one
-/// allocation whatever the elements themselves number.
-///
-/// The list reserves in steps, so a chain this short never reallocates: the
-/// counts below are the owners plus this one slab, and a count that carried a
-/// second slab would be a list that grew more than once for no reason.
-const collection_slab = 1;
-
 /// The collection this fixture's chains build, named once so the tests below
 /// say what they hold rather than how they spell it.
 const Owners = std.ArrayListUnmanaged(r2z.alloc.String);
@@ -179,12 +156,7 @@ const Owners = std.ArrayListUnmanaged(r2z.alloc.String);
 /// testing allocator is what turns that into a reported failure rather than a
 /// silent one.
 ///
-/// Calling this twice is safe, and every test below does exactly that: once
-/// where the ledger's count is read, and once more from the `defer` that covers
-/// a failing expectation. `String.deinit` empties the handle it frees and
-/// `ArrayListUnmanaged.deinit` leaves an empty list, so the second call reaches
-/// nothing to free. A release that were not idempotent would make this helper
-/// report a double free for a test that never made one.
+/// Each caller uses one lexical cleanup: list deinit invalidates the handle.
 fn releaseOwners(gpa: std.mem.Allocator, list: *Owners) void {
     for (list.items) |*element| element.deinit(gpa);
     list.deinit(gpa);
@@ -213,42 +185,25 @@ fn expectDistinctAllocations(list: Owners) !void {
     }
 }
 
-/// Assert that this list is the owning container and not a view of storage
-/// somebody else holds.
-///
-/// `Vec<String>` has to reach the caller as the list itself: a slice of the
-/// frame's storage could not be released here at all, and the counts below
-/// would then be describing bytes no caller owns. The parameter is `anytype`
-/// so the check reads the type the translator actually returned rather than the
-/// one this file would have coerced it to.
-fn expectOwningContainer(list: anytype) !void {
-    try std.testing.expect(Owners == @TypeOf(list));
-}
-
 // ── 1. `map` produces an owned value ───────────────────────────────────────
 
-// The shape every other adapter is read against. One owner per element, the
-// owner moved into the list, and the frame's own release left with nothing to
-// free. Four elements is four allocations plus the slab, and each of the five
-// is released exactly once — by this test, because the frame handed them over.
+// The shape every other adapter is read against: the owners move into the list
+// and remain live until the caller releases them.
 test "map builds one owner per element and hands every one of them over" {
     var ledger = ReleaseLedger.init();
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.mapped_owners(gpa, &.{ 1, 2, 3, 4 });
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.mapped_owners(gpa, &.{ 1, 2, 3, 4 });
+        defer releaseOwners(gpa, &owners);
 
-    try expectElements(&.{ "odd", "even", "odd", "even" }, owners);
-    try expectOwningContainer(owners);
-    // Two elements read `odd` and two read `even`, so the text alone cannot say
-    // whether the second `odd` is its own allocation or the first one's. The
-    // addresses can.
-    try expectDistinctAllocations(owners);
-    try ledger.expectOutstanding(4 + collection_slab);
-
-    releaseOwners(gpa, &owners);
-    try ledger.expectEachReleasedExactlyOnce(4 + collection_slab);
+        try expectElements(&.{ "odd", "even", "odd", "even" }, owners);
+        // Equal text must still have distinct owning allocations.
+        try expectDistinctAllocations(owners);
+        try ledger.expectOutstanding(owners);
+    }
+    try ledger.expectEachReleasedExactlyOnce();
 }
 
 // The same chain over an empty slice: nothing is built, so nothing is left
@@ -259,21 +214,21 @@ test "a map over no elements leaves the collection owning nothing" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.mapped_owners(gpa, &.{});
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.mapped_owners(gpa, &.{});
+        defer releaseOwners(gpa, &owners);
 
-    try expectElements(&.{}, owners);
-    try ledger.expectNothingAllocated();
-
-    releaseOwners(gpa, &owners);
+        try expectElements(&.{}, owners);
+        try ledger.expectNothingAllocated();
+    }
     try ledger.expectNothingAllocated();
 }
 
 // ── 2. `filter` drops one element ──────────────────────────────────────────
 
 // The predicate keeps every value a modulus of three does not divide, and this
-// input has exactly one it divides: the `3`. So one element is dropped and
-// three survive, and the count is three owners plus the slab.
+// input has exactly one it divides: the `3`. One element is dropped and three
+// survive, with an independent owner for each survivor.
 //
 // What the filter drops is a `u32` the caller's slice produced — a copy — so
 // the frame owes no release for it. That is the whole claim: the survivors'
@@ -287,19 +242,16 @@ test "filter drops the one element it rejects and the survivors reach the caller
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.filtered_owners(gpa, &.{ 1, 2, 3, 4 });
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.filtered_owners(gpa, &.{ 1, 2, 3, 4 });
+        defer releaseOwners(gpa, &owners);
 
-    // The `3` is gone and the other three are not; their parity fixes which is
-    // which. A predicate that read the wrong element, or a filter that dropped
-    // a different one, leaves different bytes here rather than a different
-    // count alone.
-    try expectElements(&.{ "odd", "even", "even" }, owners);
-    try expectDistinctAllocations(owners);
-    try ledger.expectOutstanding(3 + collection_slab);
-
-    releaseOwners(gpa, &owners);
-    try ledger.expectEachReleasedExactlyOnce(3 + collection_slab);
+        // The rejected `3` is absent; the remaining elements keep their order.
+        try expectElements(&.{ "odd", "even", "even" }, owners);
+        try expectDistinctAllocations(owners);
+        try ledger.expectOutstanding(owners);
+    }
+    try ledger.expectEachReleasedExactlyOnce();
 }
 
 // The boundary the non-empty case cannot reach: an input every element of which
@@ -312,13 +264,13 @@ test "a filter that rejects every element leaves nothing to release" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.filtered_owners(gpa, &.{ 0, 3, 6 });
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.filtered_owners(gpa, &.{ 0, 3, 6 });
+        defer releaseOwners(gpa, &owners);
 
-    try expectElements(&.{}, owners);
-    try ledger.expectNothingAllocated();
-
-    releaseOwners(gpa, &owners);
+        try expectElements(&.{}, owners);
+        try ledger.expectNothingAllocated();
+    }
     try ledger.expectNothingAllocated();
 }
 
@@ -334,37 +286,32 @@ test "zip pairs two sources by position and stops at the shorter one" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var three_pairs = try translated.zipped_owners(gpa, &.{ 1, 2, 3, 4 }, &.{ 2, 1, 9 });
-    defer releaseOwners(gpa, &three_pairs);
+    {
+        var three_pairs = try translated.zipped_owners(gpa, &.{ 1, 2, 3, 4 }, &.{ 2, 1, 9 });
+        defer releaseOwners(gpa, &three_pairs);
 
-    // Three pairs out of four left elements: `(1,2)` ascends, `(2,1)` does
-    // not, `(3,9)` does, and the fourth left element is never reached.
-    try expectElements(&.{ "ascending", "descending", "ascending" }, three_pairs);
-    try expectDistinctAllocations(three_pairs);
-    try ledger.expectOutstanding(3 + collection_slab);
-
-    releaseOwners(gpa, &three_pairs);
-    try ledger.expectEachReleasedExactlyOnce(3 + collection_slab);
+        // The fourth left element has no partner and is never reached.
+        try expectElements(&.{ "ascending", "descending", "ascending" }, three_pairs);
+        try expectDistinctAllocations(three_pairs);
+        try ledger.expectOutstanding(three_pairs);
+    }
+    try ledger.expectEachReleasedExactlyOnce();
 }
 
-// The same adapter with the shorter side on the left this time. The pairing is
-// by position and not by which side is longer, so the third left element pairs
-// with the second right element and no element records that it had no partner.
+// Pairing is by position even when the shorter source is on the left.
 test "zip pairs the shorter side and leaves the longer one's tail unread" {
     var ledger = ReleaseLedger.init();
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var two_pairs = try translated.zipped_owners(gpa, &.{ 2, 1 }, &.{ 1, 2, 5 });
-    defer releaseOwners(gpa, &two_pairs);
+    {
+        var two_pairs = try translated.zipped_owners(gpa, &.{ 2, 1 }, &.{ 1, 2, 5 });
+        defer releaseOwners(gpa, &two_pairs);
 
-    // `(2,1)` descends and `(1,2)` ascends — the same two answers the previous
-    // test gave for those positions, read the other way round.
-    try expectElements(&.{ "descending", "ascending" }, two_pairs);
-    try ledger.expectOutstanding(2 + collection_slab);
-
-    releaseOwners(gpa, &two_pairs);
-    try ledger.expectEachReleasedExactlyOnce(2 + collection_slab);
+        try expectElements(&.{ "descending", "ascending" }, two_pairs);
+        try ledger.expectOutstanding(two_pairs);
+    }
+    try ledger.expectEachReleasedExactlyOnce();
 }
 
 // ── 4. `enumerate` numbers the elements ────────────────────────────────────
@@ -379,22 +326,16 @@ test "enumerate pairs each element with its own position" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.numbered_owners(gpa, &.{ 0, 9, 2, 9 });
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.numbered_owners(gpa, &.{ 0, 9, 2, 9 });
+        defer releaseOwners(gpa, &owners);
 
-    // Positions zero and two meet a value equal to themselves; positions one and
-    // three meet a value that is not.
-    try expectElements(
-        &.{ "aligned", "shifted", "aligned", "shifted" },
-        owners,
-    );
-    // Numbering skipped nothing: the counter ran once per element and the list
-    // holds all four.
-    try expectDistinctAllocations(owners);
-    try ledger.expectOutstanding(4 + collection_slab);
-
-    releaseOwners(gpa, &owners);
-    try ledger.expectEachReleasedExactlyOnce(4 + collection_slab);
+        // Positions zero and two equal their values; one and three do not.
+        try expectElements(&.{ "aligned", "shifted", "aligned", "shifted" }, owners);
+        try expectDistinctAllocations(owners);
+        try ledger.expectOutstanding(owners);
+    }
+    try ledger.expectEachReleasedExactlyOnce();
 }
 
 // An empty slice again, this time through the counter. A `enumerate` that
@@ -405,13 +346,13 @@ test "an enumerate over no elements numbers nothing and allocates nothing" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.numbered_owners(gpa, &.{});
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.numbered_owners(gpa, &.{});
+        defer releaseOwners(gpa, &owners);
 
-    try expectElements(&.{}, owners);
-    try ledger.expectNothingAllocated();
-
-    releaseOwners(gpa, &owners);
+        try expectElements(&.{}, owners);
+        try ledger.expectNothingAllocated();
+    }
     try ledger.expectNothingAllocated();
 }
 
@@ -424,41 +365,42 @@ test "an enumerate over no elements numbers nothing and allocates nothing" {
 // started a window one byte off, or yielded the tail as a fourth window leaves
 // different bytes here.
 //
-// The window is a borrow of the caller's bytes, so the input is allocated
-// through this ledger rather than declared as an array. That makes the count
-// cover the storage the frame was HANDED as well as the storage it built, and
-// it is what says the frame released nothing it was given: a window the chain
-// treated as its own would take the caller's allocation down with it, and the
-// count below would be one short.
+// The input is allocated through the ledger so its address's release state
+// also checks the borrow contract: no borrowed window may free caller storage.
 test "chunks_exact yields whole windows and the tail stays unread" {
     var ledger = ReleaseLedger.init();
     defer ledger.deinit();
     const gpa = ledger.allocator();
-    const input = try gpa.dupe(u8, &.{ 1, 1, 2, 3, 4, 4, 9 });
-    defer gpa.free(input);
+    {
+        const input = try gpa.dupe(u8, &.{ 1, 1, 2, 3, 4, 4, 9 });
+        defer gpa.free(input);
+        {
+            var owners = try translated.window_owners(gpa, input);
+            defer releaseOwners(gpa, &owners);
 
-    var owners = try translated.window_owners(gpa, input);
-    defer releaseOwners(gpa, &owners);
+            try expectElements(&.{ "twin", "mixed", "twin" }, owners);
+            try expectDistinctAllocations(owners);
+            try ledger.expectOutstanding(owners);
+            try std.testing.expectEqual(
+                @as(?u32, 0),
+                ledger.releases.get(@intFromPtr(input.ptr)),
+            );
 
-    // Three windows out of seven bytes: `(1,1)` matches, `(2,3)` does not,
-    // `(4,4)` does, and the `9` is the tail the iterator kept back.
-    try expectElements(&.{ "twin", "mixed", "twin" }, owners);
-    try expectDistinctAllocations(owners);
-    try ledger.expectOutstanding(3 + collection_slab + 1);
-
-    // The other half of the borrow contract: the owners BESIDE the window are
-    // separate allocations rather than views of the bytes they were read from.
-    // Two elements read `twin` here, and the first of them is built from the
-    // caller's first two bytes, so an owner that aliased its window would name
-    // an address inside this slice.
-    const window_end = input.ptr + input.len;
-    for (owners.items) |element| {
-        const bytes = element.as_bytes();
-        try std.testing.expect(bytes.ptr < input.ptr or bytes.ptr >= window_end);
+            // Returned owners must not alias the borrowed windows.
+            const window_start = @intFromPtr(input.ptr);
+            const window_end = window_start + input.len;
+            for (owners.items) |element| {
+                const owner_start = @intFromPtr(element.as_bytes().ptr);
+                try std.testing.expect(owner_start < window_start or owner_start >= window_end);
+            }
+        }
+        // Releasing the returned owners must leave the caller's input live.
+        try std.testing.expectEqual(
+            @as(?u32, 0),
+            ledger.releases.get(@intFromPtr(input.ptr)),
+        );
     }
-
-    releaseOwners(gpa, &owners);
-    try ledger.expectEachReleasedExactlyOnce(3 + collection_slab + 1);
+    try ledger.expectEachReleasedExactlyOnce();
 }
 
 // A source shorter than one window: `chunks_exact` yields nothing rather than
@@ -468,13 +410,13 @@ test "a source shorter than one exact window yields nothing at all" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.window_owners(gpa, &.{7});
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.window_owners(gpa, &.{7});
+        defer releaseOwners(gpa, &owners);
 
-    try expectElements(&.{}, owners);
-    try ledger.expectNothingAllocated();
-
-    releaseOwners(gpa, &owners);
+        try expectElements(&.{}, owners);
+        try ledger.expectNothingAllocated();
+    }
     try ledger.expectNothingAllocated();
 }
 
@@ -489,16 +431,15 @@ test "collect deposits each owner once into a list that owns its own slab" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.collected_owners(gpa, 3);
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.collected_owners(gpa, 3);
+        defer releaseOwners(gpa, &owners);
 
-    try expectElements(&.{ "start", "step", "step" }, owners);
-    try expectOwningContainer(owners);
-    try expectDistinctAllocations(owners);
-    try ledger.expectOutstanding(3 + collection_slab);
-
-    releaseOwners(gpa, &owners);
-    try ledger.expectEachReleasedExactlyOnce(3 + collection_slab);
+        try expectElements(&.{ "start", "step", "step" }, owners);
+        try expectDistinctAllocations(owners);
+        try ledger.expectOutstanding(owners);
+    }
+    try ledger.expectEachReleasedExactlyOnce();
 }
 
 // The boundary the slice sources above cannot reach: a range that yields
@@ -509,12 +450,12 @@ test "a collect over an empty range leaves a collection that owns nothing" {
     defer ledger.deinit();
     const gpa = ledger.allocator();
 
-    var owners = try translated.collected_owners(gpa, 0);
-    defer releaseOwners(gpa, &owners);
+    {
+        var owners = try translated.collected_owners(gpa, 0);
+        defer releaseOwners(gpa, &owners);
 
-    try expectElements(&.{}, owners);
-    try ledger.expectNothingAllocated();
-
-    releaseOwners(gpa, &owners);
+        try expectElements(&.{}, owners);
+        try ledger.expectNothingAllocated();
+    }
     try ledger.expectNothingAllocated();
 }

@@ -678,6 +678,261 @@ fn main() {
         &hex_list(&differential::array_owner_move()),
     );
 
+    // Pair fields are both bound even when only one moves out of the arm;
+    // refusing the guard leaves both fields available to the following arm.
+    hex_line(
+        &mut out,
+        "owner_pair_second",
+        differential::owner_pair_payload(0, true).as_bytes(),
+    );
+    hex_line(
+        &mut out,
+        "owner_pair_first",
+        differential::owner_pair_payload(0, false).as_bytes(),
+    );
+    hex_line(
+        &mut out,
+        "owner_pair_absent",
+        differential::owner_pair_payload(2, true).as_bytes(),
+    );
+    line(
+        &mut out,
+        "staged_scalar_true",
+        &differential::staged_scalar_owner_call(true).to_string(),
+    );
+    line(
+        &mut out,
+        "staged_scalar_false",
+        &differential::staged_scalar_owner_call(false).to_string(),
+    );
+    line(
+        &mut out,
+        "owner_flat_map",
+        &numbers(&differential::owner_flat_map_consume(3)),
+    );
+    line(
+        &mut out,
+        "owner_flat_map_empty",
+        &numbers(&differential::owner_flat_map_consume(0)),
+    );
+
+    // Read the mutated source only after the vector releases its mutable
+    // references; both a shorter right iterator and an empty left are covered.
+    let mut zip_source = [4u32, 5, 6];
+    {
+        let mut pairs = differential::owner_zip_mut(&mut zip_source, 2);
+        for (_, value) in &mut pairs {
+            **value += 10;
+        }
+        let encoded = pairs
+            .iter()
+            .map(|(text, value)| format!("{}:{}", hex(text.as_bytes()), **value))
+            .collect::<Vec<String>>()
+            .join(",");
+        line(&mut out, "owner_zip_mut", &encoded);
+    }
+    line(&mut out, "owner_zip_source", &numbers(&zip_source));
+    let mut zip_short_source = [8u32];
+    {
+        let mut pairs = differential::owner_zip_mut(&mut zip_short_source, 4);
+        for (_, value) in &mut pairs {
+            **value += 10;
+        }
+        let encoded = pairs
+            .iter()
+            .map(|(text, value)| format!("{}:{}", hex(text.as_bytes()), **value))
+            .collect::<Vec<String>>()
+            .join(",");
+        line(&mut out, "owner_zip_short", &encoded);
+    }
+    line(&mut out, "owner_zip_short_source", &numbers(&zip_short_source));
+    let mut zip_empty_source = [9u32];
+    {
+        let mut pairs = differential::owner_zip_mut(&mut zip_empty_source, 0);
+        for (_, value) in &mut pairs {
+            **value += 10;
+        }
+        let encoded = pairs
+            .iter()
+            .map(|(text, value)| format!("{}:{}", hex(text.as_bytes()), **value))
+            .collect::<Vec<String>>()
+            .join(",");
+        line(&mut out, "owner_zip_empty", &encoded);
+    }
+    line(&mut out, "owner_zip_empty_source", &numbers(&zip_empty_source));
+
+    // A mapping closure discards an owner; the other variant is either scalar
+    // or an owner the caller retains unchanged.
+    for (key, result) in [
+        ("owner_result_map_ok", differential::owner_result_map(true)),
+        ("owner_result_map_err", differential::owner_result_map(false)),
+        ("owner_result_map_err_ok", differential::owner_result_map_err(true)),
+        ("owner_result_map_err_err", differential::owner_result_map_err(false)),
+    ] {
+        match result {
+            Ok(value) => line(&mut out, key, &format!("ok:{}", value)),
+            Err(code) => line(&mut out, key, &format!("err:{}", code)),
+        }
+    }
+    for (key, take) in [
+        ("owner_result_map_kept_ok", true),
+        ("owner_result_map_kept_err", false),
+    ] {
+        match differential::owner_result_map_passthrough(take) {
+            Ok(value) => line(&mut out, key, &format!("ok:{}", value)),
+            Err(text) => line(&mut out, key, &format!("err:{}", hex(text.as_bytes()))),
+        }
+    }
+    string_result_line(
+        &mut out,
+        "owner_result_map_err_kept_ok",
+        differential::owner_result_map_err_passthrough(true),
+    );
+    string_result_line(
+        &mut out,
+        "owner_result_map_err_kept_err",
+        differential::owner_result_map_err_passthrough(false),
+    );
+
+    // These receivers arrive by value, rather than being built in the frame
+    // that consumes their mapped payload or transfers their other variant.
+    for (key, result) in [
+        (
+            "owner_result_parameter_map_ok",
+            differential::owner_result_map_parameter(Ok(String::from("mapped"))),
+        ),
+        (
+            "owner_result_parameter_map_err",
+            differential::owner_result_map_parameter(Err(7u8)),
+        ),
+        (
+            "owner_result_parameter_map_err_ok",
+            differential::owner_result_map_err_parameter(Ok(9u32)),
+        ),
+        (
+            "owner_result_parameter_map_err_err",
+            differential::owner_result_map_err_parameter(Err(String::from("mapped-error"))),
+        ),
+    ] {
+        match result {
+            Ok(value) => line(&mut out, key, &format!("ok:{}", value)),
+            Err(code) => line(&mut out, key, &format!("err:{}", code)),
+        }
+    }
+    for (key, result) in [
+        (
+            "owner_result_parameter_map_kept_ok",
+            differential::owner_result_map_passthrough_parameter(Ok(String::from("mapped"))),
+        ),
+        (
+            "owner_result_parameter_map_kept_err",
+            differential::owner_result_map_passthrough_parameter(Err(String::from("kept-error"))),
+        ),
+    ] {
+        match result {
+            Ok(value) => line(&mut out, key, &format!("ok:{}", value)),
+            Err(text) => line(&mut out, key, &format!("err:{}", hex(text.as_bytes()))),
+        }
+    }
+    string_result_line(
+        &mut out,
+        "owner_result_parameter_map_err_kept_ok",
+        differential::owner_result_map_err_passthrough_parameter(Ok(String::from("kept-ok"))),
+    );
+    string_result_line(
+        &mut out,
+        "owner_result_parameter_map_err_kept_err",
+        differential::owner_result_map_err_passthrough_parameter(Err(String::from("mapped-error"))),
+    );
+
+    line(
+        &mut out,
+        "copy_local_u32",
+        &differential::copy_local_u32(42).to_string(),
+    );
+    line(
+        &mut out,
+        "copy_local_u8",
+        &differential::copy_local_u8(7).to_string(),
+    );
+    line(
+        &mut out,
+        "transitive_copy_local_u32",
+        &differential::transitive_copy_local_u32(43).to_string(),
+    );
+    line(
+        &mut out,
+        "transitive_copy_local_u8",
+        &differential::transitive_copy_local_u8(8).to_string(),
+    );
+
+    for (key, accept) in [
+        ("owner_tuple_try_ok", true),
+        ("owner_tuple_try_err", false),
+    ] {
+        match differential::owner_tuple_try(accept) {
+            Ok((text, value)) => line(
+                &mut out,
+                key,
+                &format!("ok:{},{}", hex(text.as_bytes()), value),
+            ),
+            Err(code) => line(&mut out, key, &format!("err:{}", code)),
+        }
+    }
+
+    let (quotient, remainder, counter) = differential::primitive_compound_order();
+    line(
+        &mut out,
+        "primitive_compound_order",
+        &format!("{},{},{}", quotient, remainder, counter),
+    );
+
+    hex_line(
+        &mut out,
+        "owner_projected_pair_solo",
+        differential::owner_projected_pair(false).as_bytes(),
+    );
+    hex_line(
+        &mut out,
+        "owner_projected_pair_empty",
+        differential::owner_projected_pair(true).as_bytes(),
+    );
+    hex_line(
+        &mut out,
+        "owner_nested_iflet_matched",
+        differential::owner_nested_iflet(0).as_bytes(),
+    );
+    hex_line(
+        &mut out,
+        "owner_nested_iflet_unmatched",
+        differential::owner_nested_iflet(1).as_bytes(),
+    );
+    hex_line(
+        &mut out,
+        "owner_nested_iflet_absent",
+        differential::owner_nested_iflet(2).as_bytes(),
+    );
+    line(
+        &mut out,
+        "owner_projected_option_borrow_twice",
+        &differential::owner_projected_option_borrow_twice().to_string(),
+    );
+    line(
+        &mut out,
+        "owner_projected_option_none_inspection",
+        &differential::owner_projected_option_none_inspection().to_string(),
+    );
+    hex_line(
+        &mut out,
+        "owner_projected_option_move",
+        differential::owner_projected_option_move(String::from("abc")).as_bytes(),
+    );
+    line(
+        &mut out,
+        "source_string_constructor_value",
+        &differential::source_string_constructor_value().to_string(),
+    );
+
     // The comparison is byte for byte, so the bytes are written and flushed
     // here rather than left to whatever the runtime does at exit.
     let mut stdout = std::io::stdout();

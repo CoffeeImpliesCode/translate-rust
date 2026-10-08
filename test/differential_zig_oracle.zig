@@ -221,6 +221,49 @@ fn writeTaggedHexList(
     try writer.writeAll("\n");
 }
 
+fn writeCountResultRecord(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    key: []const u8,
+    result: *r2z.Result(u32, u8),
+) !void {
+    defer r2z.alloc.dropTemporary(gpa, result);
+    switch (result.*) {
+        .Ok => |value| try writeTaggedCount(writer, key, "ok", value),
+        .Err => |code| try writeTaggedCount(writer, key, "err", code),
+    }
+}
+
+fn writeCountStringResultRecord(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    key: []const u8,
+    result: *r2z.Result(u32, r2z.alloc.String),
+) !void {
+    defer r2z.alloc.dropTemporary(gpa, result);
+    switch (result.*) {
+        .Ok => |value| try writeTaggedCount(writer, key, "ok", value),
+        .Err => |text| try writeTaggedHex(writer, key, "err", text.as_bytes()),
+    }
+}
+
+fn writeZipMutableRecord(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    key: []const u8,
+    pairs: anytype,
+) !void {
+    defer r2z.alloc.dropTemporary(gpa, pairs);
+    try writer.print("{s}=", .{key});
+    for (pairs.items, 0..) |*pair, index| {
+        pair[1].* += 10;
+        if (index != 0) try writer.writeAll(",");
+        try writeHexBytes(writer, pair[0].as_bytes());
+        try writer.print(":{d}", .{pair[1].*});
+    }
+    try writer.writeAll("\n");
+}
+
 /// The records, in the order the Rust oracle writes them. Both programs call
 /// the same fixture entry points with the same literals, so the two streams
 /// agree byte for byte or one of the two is wrong.
@@ -473,10 +516,10 @@ pub fn writeRecords(gpa: std.mem.Allocator, writer: *std.Io.Writer) !void {
     // same selector, a constant false guard hands the answer to the arm behind
     // it, and a side-effecting indexed scrutinee is read once however many
     // dispatches read it.
-    try writeCount(writer, "guard_dispatch_true", try translated.guard_dispatch(1, true));
-    try writeCount(writer, "guard_dispatch_false", try translated.guard_dispatch(1, false));
-    try writeCount(writer, "guard_dispatch_other", try translated.guard_dispatch(2, true));
-    try writeCount(writer, "constant_guard", try translated.constant_guard_dispatch());
+    try writeCount(writer, "guard_dispatch_true", translated.guard_dispatch(1, true));
+    try writeCount(writer, "guard_dispatch_false", translated.guard_dispatch(1, false));
+    try writeCount(writer, "guard_dispatch_other", translated.guard_dispatch(2, true));
+    try writeCount(writer, "constant_guard", translated.constant_guard_dispatch());
 
     var guarded_cursor: u32 = 0;
     const guarded_true = translated.guarded_index_dispatch(&.{1}, 0, true, &guarded_cursor);
@@ -603,6 +646,151 @@ pub fn writeRecords(gpa: std.mem.Allocator, writer: *std.Io.Writer) !void {
     var array_owners = try translated.array_owner_move(gpa);
     defer r2z.alloc.dropTemporary(gpa, &array_owners);
     try writeHexList(writer, "array_owner_move", array_owners[0..]);
+
+    // Each enum field is an independent owner, and a rejected guard reaches
+    // the arm that selects the first field rather than the second.
+    var pair_second = try translated.owner_pair_payload(gpa, 0, true);
+    try writeStringRecord(gpa, writer, "owner_pair_second", &pair_second);
+    var pair_first = try translated.owner_pair_payload(gpa, 0, false);
+    try writeStringRecord(gpa, writer, "owner_pair_first", &pair_first);
+    var pair_absent = try translated.owner_pair_payload(gpa, 2, true);
+    try writeStringRecord(gpa, writer, "owner_pair_absent", &pair_absent);
+    try writeCount(writer, "staged_scalar_true", try translated.staged_scalar_owner_call(gpa, true));
+    try writeCount(writer, "staged_scalar_false", try translated.staged_scalar_owner_call(gpa, false));
+
+    {
+        var flat = try translated.owner_flat_map_consume(gpa, 3);
+        defer flat.deinit(gpa);
+        try writeCountList(writer, "owner_flat_map", flat.items);
+    }
+    {
+        var flat_empty = try translated.owner_flat_map_consume(gpa, 0);
+        defer flat_empty.deinit(gpa);
+        try writeCountList(writer, "owner_flat_map_empty", flat_empty.items);
+    }
+
+    var zip_input = [_]u32{ 4, 5, 6 };
+    var zip_pairs = try translated.owner_zip_mut(gpa, &zip_input, 2);
+    try writeZipMutableRecord(gpa, writer, "owner_zip_mut", &zip_pairs);
+    try writeCountList(writer, "owner_zip_source", &zip_input);
+    var zip_short_input = [_]u32{8};
+    var zip_short = try translated.owner_zip_mut(gpa, &zip_short_input, 4);
+    try writeZipMutableRecord(gpa, writer, "owner_zip_short", &zip_short);
+    try writeCountList(writer, "owner_zip_short_source", &zip_short_input);
+    var zip_empty_input = [_]u32{9};
+    var zip_empty = try translated.owner_zip_mut(gpa, &zip_empty_input, 0);
+    try writeZipMutableRecord(gpa, writer, "owner_zip_empty", &zip_empty);
+    try writeCountList(writer, "owner_zip_empty_source", &zip_empty_input);
+
+    var map_ok = try translated.owner_result_map(gpa, true);
+    try writeCountResultRecord(gpa, writer, "owner_result_map_ok", &map_ok);
+    var map_err = try translated.owner_result_map(gpa, false);
+    try writeCountResultRecord(gpa, writer, "owner_result_map_err", &map_err);
+    var map_err_ok = try translated.owner_result_map_err(gpa, true);
+    try writeCountResultRecord(gpa, writer, "owner_result_map_err_ok", &map_err_ok);
+    var map_err_err = try translated.owner_result_map_err(gpa, false);
+    try writeCountResultRecord(gpa, writer, "owner_result_map_err_err", &map_err_err);
+    var map_kept_ok = try translated.owner_result_map_passthrough(gpa, true);
+    try writeCountStringResultRecord(gpa, writer, "owner_result_map_kept_ok", &map_kept_ok);
+    var map_kept_err = try translated.owner_result_map_passthrough(gpa, false);
+    try writeCountStringResultRecord(gpa, writer, "owner_result_map_kept_err", &map_kept_err);
+    var map_err_kept_ok = try translated.owner_result_map_err_passthrough(gpa, true);
+    try writeStringResultRecord(gpa, writer, "owner_result_map_err_kept_ok", &map_err_kept_ok);
+    var map_err_kept_err = try translated.owner_result_map_err_passthrough(gpa, false);
+    try writeStringResultRecord(gpa, writer, "owner_result_map_err_kept_err", &map_err_kept_err);
+
+    var parameter_map_ok = translated.owner_result_map_parameter(gpa, .{
+        .Ok = try translated.owned(gpa, "mapped"),
+    });
+    try writeCountResultRecord(gpa, writer, "owner_result_parameter_map_ok", &parameter_map_ok);
+    var parameter_map_err = translated.owner_result_map_parameter(gpa, .{ .Err = 7 });
+    try writeCountResultRecord(gpa, writer, "owner_result_parameter_map_err", &parameter_map_err);
+    var parameter_map_err_ok = translated.owner_result_map_err_parameter(gpa, .{ .Ok = 9 });
+    try writeCountResultRecord(gpa, writer, "owner_result_parameter_map_err_ok", &parameter_map_err_ok);
+    var parameter_map_err_err = translated.owner_result_map_err_parameter(gpa, .{
+        .Err = try translated.owned(gpa, "mapped-error"),
+    });
+    try writeCountResultRecord(gpa, writer, "owner_result_parameter_map_err_err", &parameter_map_err_err);
+    var parameter_map_kept_ok = translated.owner_result_map_passthrough_parameter(gpa, .{
+        .Ok = try translated.owned(gpa, "mapped"),
+    });
+    try writeCountStringResultRecord(gpa, writer, "owner_result_parameter_map_kept_ok", &parameter_map_kept_ok);
+    var parameter_map_kept_err = translated.owner_result_map_passthrough_parameter(gpa, .{
+        .Err = try translated.owned(gpa, "kept-error"),
+    });
+    try writeCountStringResultRecord(gpa, writer, "owner_result_parameter_map_kept_err", &parameter_map_kept_err);
+    var parameter_map_err_kept_ok = translated.owner_result_map_err_passthrough_parameter(gpa, .{
+        .Ok = try translated.owned(gpa, "kept-ok"),
+    });
+    try writeStringResultRecord(gpa, writer, "owner_result_parameter_map_err_kept_ok", &parameter_map_err_kept_ok);
+    var parameter_map_err_kept_err = translated.owner_result_map_err_passthrough_parameter(gpa, .{
+        .Err = try translated.owned(gpa, "mapped-error"),
+    });
+    try writeStringResultRecord(gpa, writer, "owner_result_parameter_map_err_kept_err", &parameter_map_err_kept_err);
+
+    try writeCount(writer, "copy_local_u32", translated.copy_local_u32(42));
+    try writeCount(writer, "copy_local_u8", translated.copy_local_u8(7));
+    try writeCount(writer, "transitive_copy_local_u32", translated.transitive_copy_local_u32(43));
+    try writeCount(writer, "transitive_copy_local_u8", translated.transitive_copy_local_u8(8));
+
+    // A source Err leaves during the scalar initializer after the tuple's
+    // String exists; only a successful tuple transfers an owner to us.
+    const tuple_try_flags = [_]bool{ true, false };
+    const tuple_try_keys = [_][]const u8{ "owner_tuple_try_ok", "owner_tuple_try_err" };
+    for (tuple_try_flags, tuple_try_keys) |accept, key| {
+        var result = try translated.owner_tuple_try(gpa, accept);
+        defer r2z.alloc.dropTemporary(gpa, &result);
+        switch (result) {
+            .Ok => |pair| {
+                try writer.print("{s}=ok:", .{key});
+                try writeHexBytes(writer, pair[0].as_bytes());
+                try writer.print(",{d}\n", .{pair[1]});
+            },
+            .Err => |code| try writeTaggedCount(writer, key, "err", code),
+        }
+    }
+
+    const compound = translated.primitive_compound_order();
+    try writer.print("primitive_compound_order={d},{d},{d}\n", .{
+        compound[0],
+        compound[1],
+        compound[2],
+    });
+
+    var projected_solo = try translated.owner_projected_pair(gpa, false);
+    try writeStringRecord(gpa, writer, "owner_projected_pair_solo", &projected_solo);
+    var projected_empty = try translated.owner_projected_pair(gpa, true);
+    try writeStringRecord(gpa, writer, "owner_projected_pair_empty", &projected_empty);
+    const nested_iflet_modes = [_]u8{ 0, 1, 2 };
+    const nested_iflet_keys = [_][]const u8{
+        "owner_nested_iflet_matched",
+        "owner_nested_iflet_unmatched",
+        "owner_nested_iflet_absent",
+    };
+    for (nested_iflet_modes, nested_iflet_keys) |mode, key| {
+        var selected = try translated.owner_nested_iflet(gpa, mode);
+        try writeStringRecord(gpa, writer, key, &selected);
+    }
+    try writeCount(
+        writer,
+        "owner_projected_option_borrow_twice",
+        try translated.owner_projected_option_borrow_twice(gpa),
+    );
+    try writeCount(
+        writer,
+        "owner_projected_option_none_inspection",
+        try translated.owner_projected_option_none_inspection(gpa),
+    );
+    var projected_option = try translated.owner_projected_option_move(
+        gpa,
+        try translated.owned(gpa, "abc"),
+    );
+    try writeStringRecord(gpa, writer, "owner_projected_option_move", &projected_option);
+    try writeCount(
+        writer,
+        "source_string_constructor_value",
+        translated.source_string_constructor_value(),
+    );
 }
 
 pub fn main(init: std.process.Init) !void {

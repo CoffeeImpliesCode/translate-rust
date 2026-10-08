@@ -4,5 +4,15 @@ version = "1.1.4"
 edition = "2018"
 publish = false
 
-# Source vendored from https://github.com/jbangelo/fletcher (crates.io fletcher 1.1.4),
-# MIT OR Apache-2.0. Zero dependencies; #![no_std].
+# Fixture provenance: jbangelo/fletcher GitHub snapshot, compared on 2026-10-08.
+# Source: https://github.com/jbangelo/fletcher/tree/2d941b4c26061fd3b057485723d4df92315a757d
+# src/lib.rs matches this upstream tree byte-for-byte. No Rust files are omitted
+# or added. This is not a published fletcher 1.1.4 registry snapshot.
+# https://static.crates.io/crates/fletcher/fletcher-1.1.4.crate returns HTTP 403.
+# https://index.crates.io/fl/et/fletcher lists versions through 1.0.0, not 1.1.4.
+# The upstream source manifest declares 1.0.0 and license = "MIT".
+# This local manifest sets the fixture version to 1.1.4, adds edition = "2018"
+# and publish = false, and removes authors, description, repository, documentation,
+# readme, keywords, categories, license, and byteorder/quickcheck dev-dependencies.
+# Neither Cargo's normalized registry manifest nor Cargo.toml.orig is retained.
+# Omitted upstream files: .github/workflows/build.yml, .gitignore, LICENSE, README.md.

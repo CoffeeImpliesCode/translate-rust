@@ -14,14 +14,8 @@
 //! Nothing here restates the fixture's logic: every expectation is bytes the
 //! package returned, and every release claim is the allocator's.
 //!
-//! Built like the `test/compat_consumer.zig` invocation in `test/e2e_test.zig`,
-//! with the generated package root in place of the compat one. The root module
-//! imports `r2z` itself, so it needs its own `--dep r2z`:
-//!
-//!     zig test --dep translated --dep r2z \
-//!         -Mroot=test/guarded_owned_fallthrough_consumer.zig \
-//!         --dep r2z -Mtranslated=<generated>/src/root.zig \
-//!         -Mr2z=r2z-core/src/root.zig
+//! The end-to-end test stages the generated crate and runs this six-case
+//! consumer in Debug and ReleaseSafe.
 
 const std = @import("std");
 const translated = @import("translated");

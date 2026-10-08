@@ -860,6 +860,332 @@ fn owner_array_identity(owners: [String; 2]) -> [String; 2] {
     owners
 }
 
+/// Both payload fields own a string, so selecting either one leaves the other
+/// field to be released without releasing the field the caller receives.
+pub enum PairPayload {
+    Pair(String, String),
+    Absent,
+}
+
+/// A refused guard must leave both explicitly bound fields available to the
+/// next arm; the absent variant has no fields to release.
+pub fn owner_pair_payload(mode: u8, take_second: bool) -> String {
+    let subject = if mode == 2 {
+        PairPayload::Absent
+    } else {
+        PairPayload::Pair(String::from("first"), String::from("second"))
+    };
+    match subject {
+        PairPayload::Pair(a, b) if take_second => b,
+        PairPayload::Pair(a, b) => a,
+        PairPayload::Absent => String::from("absent"),
+    }
+}
+
+/// An owner is staged before a conditional scalar argument and another owner
+/// is built afterwards, so neither owner belongs to the scalar's branch.
+pub fn staged_scalar_owner_call(flag: bool) -> usize {
+    let first = String::from("first");
+    consume_staged_owners(first, if flag { 1 } else { 2 }, String::from("later"))
+}
+
+fn consume_staged_owners(first: String, n: u32, later: String) -> usize {
+    first.len() + n as usize + later.len()
+}
+
+/// Each outer element moves into a helper before its scalar inner iterator
+/// runs, so the iterator must not retain an owner the helper already consumed.
+pub fn owner_flat_map_consume(count: u32) -> Vec<u32> {
+    (0u32..count)
+        .map(|_| String::from("x"))
+        .flat_map(|s| 0u32..consume_flat_map_string(s))
+        .collect()
+}
+
+fn consume_flat_map_string(s: String) -> u32 {
+    s.len() as u32
+}
+
+/// The left element owns bytes while the right element borrows mutable source
+/// storage; stopping at either iterator must preserve those distinct lifetimes.
+pub fn owner_zip_mut<'a>(input: &'a mut [u32], count: u32) -> Vec<(String, &'a mut u32)> {
+    (0u32..count)
+        .map(|_| String::from("zip"))
+        .zip(input.iter_mut())
+        .collect()
+}
+
+/// Mapping the success arm discards its owned payload, while an error carries
+/// only a scalar through unchanged.
+pub fn owner_result_map(take: bool) -> Result<u32, u8> {
+    let result: Result<String, u8> = if take {
+        Ok(String::from("mapped"))
+    } else {
+        Err(7u8)
+    };
+    result.map(|_| 1u32)
+}
+
+/// Mapping the error arm discards its owned payload, while a success carries
+/// only a scalar through unchanged.
+pub fn owner_result_map_err(take: bool) -> Result<u32, u8> {
+    let result: Result<u32, String> = if take {
+        Ok(9u32)
+    } else {
+        Err(String::from("mapped-error"))
+    };
+    result.map_err(|_| 3u8)
+}
+
+/// The mapped owner is released but the error owner travels to the caller.
+pub fn owner_result_map_passthrough(take: bool) -> Result<u32, String> {
+    let result: Result<String, String> = if take {
+        Ok(String::from("mapped"))
+    } else {
+        Err(String::from("kept-error"))
+    };
+    result.map(|_| 1u32)
+}
+
+/// The mapped error owner is released but the success owner travels onward.
+pub fn owner_result_map_err_passthrough(take: bool) -> Result<String, u8> {
+    let result: Result<String, String> = if take {
+        Ok(String::from("kept-ok"))
+    } else {
+        Err(String::from("mapped-error"))
+    };
+    result.map_err(|_| 3u8)
+}
+
+/// The success owner arrives through a by-value parameter before it is mapped.
+pub fn owner_result_map_parameter(result: Result<String, u8>) -> Result<u32, u8> {
+    result.map(|_| 1u32)
+}
+
+/// The error owner arrives through a by-value parameter before it is mapped.
+pub fn owner_result_map_err_parameter(result: Result<u32, String>) -> Result<u32, u8> {
+    result.map_err(|_| 3u8)
+}
+
+/// A by-value receiver releases its mapped owner and transfers its error owner.
+pub fn owner_result_map_passthrough_parameter(
+    result: Result<String, String>,
+) -> Result<u32, String> {
+    result.map(|_| 1u32)
+}
+
+/// A by-value receiver releases its mapped error and transfers its success.
+pub fn owner_result_map_err_passthrough_parameter(
+    result: Result<String, String>,
+) -> Result<String, u8> {
+    result.map_err(|_| 3u8)
+}
+
+/// Copying a generic scalar through a local must not add an allocator boundary.
+pub fn generic_copy_local<T: Copy>(value: T) -> T {
+    let kept = value;
+    kept
+}
+
+trait CopyRoot: Copy {}
+
+trait CopyLeaf: CopyRoot {}
+
+impl CopyRoot for u32 {}
+impl CopyRoot for u8 {}
+impl CopyLeaf for u32 {}
+impl CopyLeaf for u8 {}
+
+/// The Copy guarantee also reaches this local through two supertrait edges.
+pub fn generic_transitive_copy_local<T: CopyLeaf>(value: T) -> T {
+    let kept = value;
+    kept
+}
+
+pub fn copy_local_u32(value: u32) -> u32 {
+    generic_copy_local(value)
+}
+
+pub fn copy_local_u8(value: u8) -> u8 {
+    generic_copy_local(value)
+}
+
+pub fn transitive_copy_local_u32(value: u32) -> u32 {
+    generic_transitive_copy_local(value)
+}
+
+pub fn transitive_copy_local_u8(value: u8) -> u8 {
+    generic_transitive_copy_local(value)
+}
+
+/// An early source Err releases the String in the partially initialized tuple.
+pub fn owner_tuple_try(accept: bool) -> Result<(String, u32), u8> {
+    Ok((String::from("held"), scalar_result(accept)?))
+}
+
+fn scalar_result(accept: bool) -> Result<u32, u8> {
+    if accept {
+        Ok(7u32)
+    } else {
+        Err(2u8)
+    }
+}
+
+/// Signed division truncates toward zero; the remainder keeps the dividend's sign.
+/// Primitive compound assignment evaluates the RHS before the assignee.
+pub fn primitive_compound_order() -> (isize, isize, u32) {
+    let mut values = [-9isize];
+    let mut counter = 0u32;
+    values[compound_index(&mut counter, 2u32)] /= compound_divisor(&mut counter, 1u32);
+    let quotient = values[0];
+    values[0] = -9isize;
+    values[compound_index(&mut counter, 4u32)] %= compound_divisor(&mut counter, 3u32);
+    (quotient, values[0], counter)
+}
+
+fn compound_index(counter: &mut u32, digit: u32) -> usize {
+    *counter = *counter * 10 + digit;
+    0usize
+}
+
+fn compound_divisor(counter: &mut u32, digit: u32) -> isize {
+    *counter = *counter * 10 + digit;
+    2isize
+}
+
+/// A projected sibling may own a String or carry no payload.
+pub enum ProjectedShape {
+    Solo(String),
+    Empty,
+}
+
+/// The tuple carrier owns both the shape sibling and the selected String.
+pub enum ProjectedCarrier {
+    Payload((ProjectedShape, String)),
+}
+
+/// A nested shape stays in its source carrier until its owned leaf is moved.
+pub enum ProjectedNode {
+    Nested(ProjectedShape),
+    Absent,
+}
+
+/// Moving the selected tuple field still releases its owning shape sibling.
+pub fn owner_projected_pair(empty: bool) -> String {
+    let carrier = if empty {
+        ProjectedCarrier::Payload((ProjectedShape::Empty, String::from("selected-empty")))
+    } else {
+        ProjectedCarrier::Payload((
+            ProjectedShape::Solo(String::from("sibling")),
+            String::from("selected-solo"),
+        ))
+    };
+    match carrier {
+        ProjectedCarrier::Payload(pair) => pair.1,
+    }
+}
+
+/// Only the successful nested if-let transfers an owned leaf from its carrier.
+pub fn owner_nested_iflet(mode: u8) -> String {
+    let node = if mode == 0 {
+        ProjectedNode::Nested(ProjectedShape::Solo(String::from("nested")))
+    } else if mode == 1 {
+        ProjectedNode::Nested(ProjectedShape::Empty)
+    } else {
+        ProjectedNode::Absent
+    };
+    match node {
+        ProjectedNode::Nested(inner) => if let ProjectedShape::Solo(text) = inner {
+            text
+        } else {
+            String::from("fallback")
+        },
+        ProjectedNode::Absent => String::from("absent"),
+    }
+}
+
+/// The sibling stays owned by the fresh outer carrier during Option inspection.
+pub enum ProjectedOptionInner {
+    Hold(String),
+}
+
+pub enum ProjectedOptionOuter {
+    Bundle((Option<String>, ProjectedOptionInner)),
+}
+
+/// Repeated shared leaf borrows leave the Some allocation in its carrier.
+pub fn owner_projected_option_borrow_twice() -> usize {
+    let outer = ProjectedOptionOuter::Bundle((
+        Some(String::from("abc")),
+        ProjectedOptionInner::Hold(String::from("sibling")),
+    ));
+    match outer {
+        ProjectedOptionOuter::Bundle(pair) => {
+            let first = if let Some(text) = &pair.0 {
+                text.len()
+            } else {
+                0
+            };
+            let second = if let Some(text) = &pair.0 {
+                text.len()
+            } else {
+                0
+            };
+            first + second
+        },
+    }
+}
+
+/// A nonmatching None inspector leaves the Some leaf available for a borrow.
+pub fn owner_projected_option_none_inspection() -> usize {
+    let outer = ProjectedOptionOuter::Bundle((
+        Some(String::from("abc")),
+        ProjectedOptionInner::Hold(String::from("sibling")),
+    ));
+    match outer {
+        ProjectedOptionOuter::Bundle(pair) => {
+            if let None = pair.0 {
+                return 0;
+            }
+            if let Some(text) = &pair.0 {
+                text.len()
+            } else {
+                0
+            }
+        },
+    }
+}
+
+/// Moving the Option leaf retains its allocation and releases the inner sibling.
+pub fn owner_projected_option_move(input: String) -> String {
+    let outer = ProjectedOptionOuter::Bundle((
+        Some(input),
+        ProjectedOptionInner::Hold(String::from("sibling")),
+    ));
+    match outer {
+        ProjectedOptionOuter::Bundle(pair) => match pair.0 {
+            Some(text) => text,
+            None => String::new(),
+        },
+    }
+}
+
+mod source_namespace {
+    pub struct String {
+        pub value: u32,
+    }
+
+    impl String {
+        pub fn new() -> Self {
+            Self { value: 41 }
+        }
+    }
+}
+
+pub fn source_string_constructor_value() -> u32 {
+    source_namespace::String::new().value
+}
+
 // ── how the Rust side of every claim above is checked ─────────────────────
 
 // There is no `#[test]` module here and nothing runs `cargo test` on this

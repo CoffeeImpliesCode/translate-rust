@@ -83,7 +83,7 @@ test "a method that takes self by value moves the field out and the dropped self
     try std.testing.expectEqual(@as(usize, 10), bag.label_len());
     try std.testing.expectEqual(@as(u32, 7), bag.count);
 
-    var moved: r2z.alloc.String = bag.into_label();
+    var moved: r2z.alloc.String = bag.into_label(gpa);
 
     try std.testing.expectEqual(allocations_before + 1, tracking.allocations);
     try std.testing.expectEqual(deallocations_before, tracking.deallocations);
@@ -103,7 +103,7 @@ test "the field that leaves keeps the allocation it was built at" {
     var bag = try translated.owned_bag(gpa, "same-bytes", 3);
     const address = @intFromPtr(bag.label.as_bytes().ptr);
 
-    var moved = bag.into_label();
+    var moved = bag.into_label(gpa);
     try std.testing.expectEqual(address, @intFromPtr(moved.as_bytes().ptr));
 
     moved.deinit(gpa);

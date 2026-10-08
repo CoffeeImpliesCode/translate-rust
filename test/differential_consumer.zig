@@ -139,6 +139,51 @@ const expected_records =
     \\utf8_handoff=err:0
     \\utf8_handoff=err:2
     \\array_owner_move=6669727374,7365636f6e64
+    \\owner_pair_second=7365636f6e64
+    \\owner_pair_first=6669727374
+    \\owner_pair_absent=616273656e74
+    \\staged_scalar_true=11
+    \\staged_scalar_false=12
+    \\owner_flat_map=0,0,0
+    \\owner_flat_map_empty=
+    \\owner_zip_mut=7a6970:14,7a6970:15
+    \\owner_zip_source=14,15,6
+    \\owner_zip_short=7a6970:18
+    \\owner_zip_short_source=18
+    \\owner_zip_empty=
+    \\owner_zip_empty_source=9
+    \\owner_result_map_ok=ok:1
+    \\owner_result_map_err=err:7
+    \\owner_result_map_err_ok=ok:9
+    \\owner_result_map_err_err=err:3
+    \\owner_result_map_kept_ok=ok:1
+    \\owner_result_map_kept_err=err:6b6570742d6572726f72
+    \\owner_result_map_err_kept_ok=ok:6b6570742d6f6b
+    \\owner_result_map_err_kept_err=err:3
+    \\owner_result_parameter_map_ok=ok:1
+    \\owner_result_parameter_map_err=err:7
+    \\owner_result_parameter_map_err_ok=ok:9
+    \\owner_result_parameter_map_err_err=err:3
+    \\owner_result_parameter_map_kept_ok=ok:1
+    \\owner_result_parameter_map_kept_err=err:6b6570742d6572726f72
+    \\owner_result_parameter_map_err_kept_ok=ok:6b6570742d6f6b
+    \\owner_result_parameter_map_err_kept_err=err:3
+    \\copy_local_u32=42
+    \\copy_local_u8=7
+    \\transitive_copy_local_u32=43
+    \\transitive_copy_local_u8=8
+    \\owner_tuple_try_ok=ok:68656c64,7
+    \\owner_tuple_try_err=err:2
+    \\primitive_compound_order=-4,-1,1234
+    \\owner_projected_pair_solo=73656c65637465642d736f6c6f
+    \\owner_projected_pair_empty=73656c65637465642d656d707479
+    \\owner_nested_iflet_matched=6e6573746564
+    \\owner_nested_iflet_unmatched=66616c6c6261636b
+    \\owner_nested_iflet_absent=616273656e74
+    \\owner_projected_option_borrow_twice=6
+    \\owner_projected_option_none_inspection=3
+    \\owner_projected_option_move=616263
+    \\source_string_constructor_value=41
     \\
 ;
 
@@ -170,6 +215,13 @@ test "generated records are the bytes the Rust oracle prints" {
     // Every case allocates, so the sweep also covers the release each returned
     // owner needs once the record that read it is written.
     try std.testing.checkAllAllocationFailures(gpa, recordsWithAllocationFailures, .{});
+}
+
+test "the source-local String constructor preserves its value" {
+    try std.testing.expectEqual(
+        @as(u32, 41),
+        translated.source_string_constructor_value(),
+    );
 }
 
 // The bytes below cannot say WHO owns a value after the call. These are the
@@ -980,6 +1032,535 @@ test "an array of owners crosses a call element by element at every failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         arrayOwnerMoveWithAllocationFailures,
+        .{},
+    );
+}
+
+fn pairPayloadWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    const modes = [_]u8{ 0, 0, 2 };
+    const guards = [_]bool{ true, false, true };
+    const expected = [_][]const u8{ "second", "first", "absent" };
+    for (modes, guards, expected) |mode, guard, bytes| {
+        var selected = try translated.owner_pair_payload(gpa, mode, guard);
+        defer selected.deinit(gpa);
+        try std.testing.expectEqualStrings(bytes, selected.as_str());
+        // A retained allocation remains writable after the unreturned field
+        // has been released. A dangling alias cannot satisfy this handoff.
+        try selected.push_str(gpa, "!");
+        var buffer: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&buffer, "{s}!", .{bytes}),
+            selected.as_str(),
+        );
+    }
+}
+
+test "a multi-owner enum transfers the selected field after guard acceptance or rejection" {
+    try pairPayloadWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        pairPayloadWithAllocationFailures,
+        .{},
+    );
+}
+
+fn stagedScalarWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    try std.testing.expectEqual(@as(usize, 11), try translated.staged_scalar_owner_call(gpa, true));
+    try std.testing.expectEqual(@as(usize, 12), try translated.staged_scalar_owner_call(gpa, false));
+}
+
+test "a staged scalar argument keeps its u32 context between owner transfers" {
+    try stagedScalarWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        stagedScalarWithAllocationFailures,
+        .{},
+    );
+}
+
+fn flatMapOwnerWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    var values = try translated.owner_flat_map_consume(gpa, 3);
+    defer values.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0 }, values.items);
+
+    var empty = try translated.owner_flat_map_consume(gpa, 0);
+    defer empty.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, &.{}, empty.items);
+}
+
+test "an owning map item transfers through flat_map into its consuming closure" {
+    try flatMapOwnerWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        flatMapOwnerWithAllocationFailures,
+        .{},
+    );
+}
+
+fn zipMutableOwnerWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    var input = [_]u32{ 4, 5, 6 };
+    var pairs = try translated.owner_zip_mut(gpa, &input, 2);
+    defer r2z.alloc.dropTemporary(gpa, &pairs);
+    try std.testing.expectEqual(@as(usize, 2), pairs.items.len);
+    for (pairs.items, 0..) |*pair, index| {
+        try std.testing.expectEqualStrings("zip", pair[0].as_str());
+        try std.testing.expectEqual(@intFromPtr(&input[index]), @intFromPtr(pair[1]));
+        pair[1].* += 10;
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 14, 15, 6 }, &input);
+    try pairs.items[0][0].push_str(gpa, "!");
+    try std.testing.expectEqualStrings("zip!", pairs.items[0][0].as_str());
+    try std.testing.expectEqualStrings("zip", pairs.items[1][0].as_str());
+
+    // The right side ends first: the left owner fetched for an unmatched
+    // pair must not escape or leak, even when a later allocation fails.
+    var short_input = [_]u32{8};
+    var short = try translated.owner_zip_mut(gpa, &short_input, 4);
+    defer r2z.alloc.dropTemporary(gpa, &short);
+    try std.testing.expectEqual(@as(usize, 1), short.items.len);
+    try std.testing.expectEqualStrings("zip", short.items[0][0].as_str());
+    short.items[0][1].* += 10;
+    try std.testing.expectEqualSlices(u32, &.{18}, &short_input);
+
+    var empty_input = [_]u32{9};
+    var empty = try translated.owner_zip_mut(gpa, &empty_input, 0);
+    defer r2z.alloc.dropTemporary(gpa, &empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+    try std.testing.expectEqualSlices(u32, &.{9}, &empty_input);
+}
+
+test "an owned zip retains strings and mutable references into the caller's right input" {
+    try zipMutableOwnerWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        zipMutableOwnerWithAllocationFailures,
+        .{},
+    );
+}
+
+fn resultMapOwnerWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    const mapped = try translated.owner_result_map(gpa, true);
+    try std.testing.expect(mapped == .Ok);
+    try std.testing.expectEqual(@as(u32, 1), mapped.Ok);
+    const refused = try translated.owner_result_map(gpa, false);
+    try std.testing.expect(refused == .Err);
+    try std.testing.expectEqual(@as(u8, 7), refused.Err);
+
+    var mapped_owner = try translated.owner_result_map_passthrough(gpa, true);
+    defer r2z.alloc.dropTemporary(gpa, &mapped_owner);
+    try std.testing.expect(mapped_owner == .Ok);
+    try std.testing.expectEqual(@as(u32, 1), mapped_owner.Ok);
+    var kept = try translated.owner_result_map_passthrough(gpa, false);
+    defer r2z.alloc.dropTemporary(gpa, &kept);
+    try std.testing.expect(kept == .Err);
+    try std.testing.expectEqualStrings("kept-error", kept.Err.as_str());
+    try kept.Err.push_str(gpa, "!");
+    try std.testing.expectEqualStrings("kept-error!", kept.Err.as_str());
+}
+
+test "Result map releases its consumed owner once and transfers the passthrough owner" {
+    try resultMapOwnerWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        resultMapOwnerWithAllocationFailures,
+        .{},
+    );
+}
+
+fn resultMapErrOwnerWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    const accepted = try translated.owner_result_map_err(gpa, true);
+    try std.testing.expect(accepted == .Ok);
+    try std.testing.expectEqual(@as(u32, 9), accepted.Ok);
+    const mapped = try translated.owner_result_map_err(gpa, false);
+    try std.testing.expect(mapped == .Err);
+    try std.testing.expectEqual(@as(u8, 3), mapped.Err);
+
+    var kept = try translated.owner_result_map_err_passthrough(gpa, true);
+    defer r2z.alloc.dropTemporary(gpa, &kept);
+    try std.testing.expect(kept == .Ok);
+    try std.testing.expectEqualStrings("kept-ok", kept.Ok.as_str());
+    try kept.Ok.push_str(gpa, "!");
+    try std.testing.expectEqualStrings("kept-ok!", kept.Ok.as_str());
+    var mapped_owner = try translated.owner_result_map_err_passthrough(gpa, false);
+    defer r2z.alloc.dropTemporary(gpa, &mapped_owner);
+    try std.testing.expect(mapped_owner == .Err);
+    try std.testing.expectEqual(@as(u8, 3), mapped_owner.Err);
+}
+
+test "Result map_err releases its consumed owner once and transfers the passthrough owner" {
+    try resultMapErrOwnerWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        resultMapErrOwnerWithAllocationFailures,
+        .{},
+    );
+}
+
+test "source Copy bounds keep scalar callers and by-value locals allocator-free" {
+    const direct_u32: *const fn (u32) u32 = &translated.copy_local_u32;
+    const direct_u8: *const fn (u8) u8 = &translated.copy_local_u8;
+    const transitive_u32: *const fn (u32) u32 = &translated.transitive_copy_local_u32;
+    const transitive_u8: *const fn (u8) u8 = &translated.transitive_copy_local_u8;
+    try std.testing.expectEqual(@as(u32, 42), direct_u32(42));
+    try std.testing.expectEqual(@as(u8, 7), direct_u8(7));
+    try std.testing.expectEqual(@as(u32, 43), transitive_u32(43));
+    try std.testing.expectEqual(@as(u8, 8), transitive_u8(8));
+    try std.testing.expectEqual(@as(u32, 44), translated.generic_copy_local(u32, 44));
+    try std.testing.expectEqual(@as(u8, 9), translated.generic_copy_local(u8, 9));
+    try std.testing.expectEqual(@as(u32, 45), translated.generic_transitive_copy_local(u32, 45));
+    try std.testing.expectEqual(@as(u8, 10), translated.generic_transitive_copy_local(u8, 10));
+}
+
+fn resultMapParameterWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    const mapped = translated.owner_result_map_parameter(gpa, .{
+        .Ok = try translated.owned(gpa, "mapped"),
+    });
+    try std.testing.expect(mapped == .Ok);
+    try std.testing.expectEqual(@as(u32, 1), mapped.Ok);
+    const refused = translated.owner_result_map_parameter(gpa, .{ .Err = 7 });
+    try std.testing.expect(refused == .Err);
+    try std.testing.expectEqual(@as(u8, 7), refused.Err);
+
+    var mapped_owner = translated.owner_result_map_passthrough_parameter(gpa, .{
+        .Ok = try translated.owned(gpa, "mapped"),
+    });
+    defer r2z.alloc.dropTemporary(gpa, &mapped_owner);
+    try std.testing.expect(mapped_owner == .Ok);
+    try std.testing.expectEqual(@as(u32, 1), mapped_owner.Ok);
+    const payload = try translated.owned(gpa, "kept-error");
+    const original_address = @intFromPtr(payload.as_bytes().ptr);
+    var kept = translated.owner_result_map_passthrough_parameter(gpa, .{ .Err = payload });
+    defer r2z.alloc.dropTemporary(gpa, &kept);
+    try std.testing.expect(kept == .Err);
+    try std.testing.expectEqualStrings("kept-error", kept.Err.as_str());
+    try std.testing.expectEqual(original_address, @intFromPtr(kept.Err.as_bytes().ptr));
+    try kept.Err.push_str(gpa, "!");
+    try std.testing.expectEqualStrings("kept-error!", kept.Err.as_str());
+}
+
+test "a by-value Result parameter maps or transfers its original error allocation" {
+    try resultMapParameterWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        resultMapParameterWithAllocationFailures,
+        .{},
+    );
+}
+
+fn resultMapErrParameterWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    const accepted = translated.owner_result_map_err_parameter(gpa, .{ .Ok = 9 });
+    try std.testing.expect(accepted == .Ok);
+    try std.testing.expectEqual(@as(u32, 9), accepted.Ok);
+    const mapped = translated.owner_result_map_err_parameter(gpa, .{
+        .Err = try translated.owned(gpa, "mapped-error"),
+    });
+    try std.testing.expect(mapped == .Err);
+    try std.testing.expectEqual(@as(u8, 3), mapped.Err);
+
+    const payload = try translated.owned(gpa, "kept-ok");
+    const original_address = @intFromPtr(payload.as_bytes().ptr);
+    var kept = translated.owner_result_map_err_passthrough_parameter(gpa, .{ .Ok = payload });
+    defer r2z.alloc.dropTemporary(gpa, &kept);
+    try std.testing.expect(kept == .Ok);
+    try std.testing.expectEqualStrings("kept-ok", kept.Ok.as_str());
+    try std.testing.expectEqual(original_address, @intFromPtr(kept.Ok.as_bytes().ptr));
+    try kept.Ok.push_str(gpa, "!");
+    try std.testing.expectEqualStrings("kept-ok!", kept.Ok.as_str());
+    var mapped_owner = translated.owner_result_map_err_passthrough_parameter(gpa, .{
+        .Err = try translated.owned(gpa, "mapped-error"),
+    });
+    defer r2z.alloc.dropTemporary(gpa, &mapped_owner);
+    try std.testing.expect(mapped_owner == .Err);
+    try std.testing.expectEqual(@as(u8, 3), mapped_owner.Err);
+}
+
+test "a by-value Result parameter maps errors or transfers its original success allocation" {
+    try resultMapErrParameterWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        resultMapErrParameterWithAllocationFailures,
+        .{},
+    );
+}
+
+fn tupleTryWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    var accepted = try translated.owner_tuple_try(gpa, true);
+    defer r2z.alloc.dropTemporary(gpa, &accepted);
+    try std.testing.expect(accepted == .Ok);
+    try std.testing.expectEqualStrings("held", accepted.Ok[0].as_str());
+    try std.testing.expectEqual(@as(u32, 7), accepted.Ok[1]);
+    try accepted.Ok[0].push_str(gpa, "!");
+    try std.testing.expectEqualStrings("held!", accepted.Ok[0].as_str());
+    try std.testing.expectEqual(@as(u32, 7), accepted.Ok[1]);
+
+    // The String exists before the scalar's source Result rejects. Only the
+    // frame can release that partial tuple; the Err hands no owner back.
+    var rejected = try translated.owner_tuple_try(gpa, false);
+    defer r2z.alloc.dropTemporary(gpa, &rejected);
+    try std.testing.expect(rejected == .Err);
+    try std.testing.expectEqual(@as(u8, 2), rejected.Err);
+}
+
+test "a source Result early return releases an initialized tuple owner before its scalar rejects" {
+    try tupleTryWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        tupleTryWithAllocationFailures,
+        .{},
+    );
+}
+
+test "signed primitive compound assignment truncates and evaluates the right side before its indexed place" {
+    const result = translated.primitive_compound_order();
+    try std.testing.expectEqual(@as(isize, -4), result[0]);
+    try std.testing.expectEqual(@as(isize, -1), result[1]);
+    // Digits 1 then 2, then 3 then 4 establish RHS-before-assignee order
+    // and one evaluation of each side, independently of the scalar results.
+    try std.testing.expectEqual(@as(u32, 1234), result[2]);
+}
+
+fn projectedPairWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    const empty_cases = [_]bool{ false, true };
+    const expected = [_][]const u8{ "selected-solo", "selected-empty" };
+    for (empty_cases, expected) |empty, bytes| {
+        var selected = try translated.owner_projected_pair(gpa, empty);
+        defer selected.deinit(gpa);
+        try std.testing.expectEqualStrings(bytes, selected.as_str());
+        // The enclosing carrier released its other field, not the String
+        // reached through pair.1. This returned owner remains writable.
+        try selected.push_str(gpa, "!");
+        var buffer: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&buffer, "{s}!", .{bytes}),
+            selected.as_str(),
+        );
+    }
+}
+
+test "a carrier tuple field projection transfers its string and releases its owning sibling" {
+    try projectedPairWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        projectedPairWithAllocationFailures,
+        .{},
+    );
+}
+
+fn nestedIfletWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    const modes = [_]u8{ 0, 1, 2 };
+    const expected = [_][]const u8{ "nested", "fallback", "absent" };
+    for (modes, expected) |mode, bytes| {
+        var selected = try translated.owner_nested_iflet(gpa, mode);
+        defer selected.deinit(gpa);
+        try std.testing.expectEqualStrings(bytes, selected.as_str());
+        // Only the successful leaf transfer empties the original payload;
+        // the unmatched and absent branches return independent allocations.
+        try selected.push_str(gpa, "!");
+        var buffer: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&buffer, "{s}!", .{bytes}),
+            selected.as_str(),
+        );
+    }
+}
+
+test "a nested if-let moves only its matched leaf from the original carrier place" {
+    try nestedIfletWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        nestedIfletWithAllocationFailures,
+        .{},
+    );
+}
+
+/// Like the array-owner consumer's ledger, this records addresses without
+/// allocating bookkeeping storage. Each fresh carrier owns just two strings.
+/// Overflow fails the assertions rather than hiding an unrecorded owner.
+const ProjectedOptionLedger = struct {
+    const capacity = 8;
+
+    child: std.mem.Allocator,
+    handed_out: [capacity]usize = undefined,
+    released: [capacity]usize = undefined,
+    handed_out_count: usize = 0,
+    released_count: usize = 0,
+    overflow: bool = false,
+
+    fn allocator(self: *ProjectedOptionLedger) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn releasesOf(self: *const ProjectedOptionLedger, address: usize) usize {
+        var releases: usize = 0;
+        for (self.released[0..self.released_count]) |entry| {
+            if (entry == address) releases += 1;
+        }
+        return releases;
+    }
+
+    fn recordHandedOut(self: *ProjectedOptionLedger, address: usize) void {
+        if (self.handed_out_count == capacity) {
+            self.overflow = true;
+            return;
+        }
+        self.handed_out[self.handed_out_count] = address;
+        self.handed_out_count += 1;
+    }
+
+    fn recordReleased(self: *ProjectedOptionLedger, address: usize) void {
+        if (self.released_count == capacity) {
+            self.overflow = true;
+            return;
+        }
+        self.released[self.released_count] = address;
+        self.released_count += 1;
+    }
+
+    fn expectBothReleasedOnce(self: *const ProjectedOptionLedger) !void {
+        try std.testing.expect(!self.overflow);
+        try std.testing.expectEqual(@as(usize, 2), self.handed_out_count);
+        try std.testing.expectEqual(@as(usize, 2), self.released_count);
+        try std.testing.expect(self.handed_out[0] != self.handed_out[1]);
+        for (self.handed_out[0..self.handed_out_count]) |address| {
+            try std.testing.expectEqual(@as(usize, 1), self.releasesOf(address));
+        }
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocFn(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *ProjectedOptionLedger = @ptrCast(@alignCast(context));
+        const memory = self.child.rawAlloc(len, alignment, return_address) orelse return null;
+        self.recordHandedOut(@intFromPtr(memory));
+        return memory;
+    }
+
+    fn resizeFn(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *ProjectedOptionLedger = @ptrCast(@alignCast(context));
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remapFn(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *ProjectedOptionLedger = @ptrCast(@alignCast(context));
+        const old_address = @intFromPtr(memory.ptr);
+        const moved = self.child.rawRemap(
+            memory,
+            alignment,
+            new_len,
+            return_address,
+        ) orelse return null;
+        if (@intFromPtr(moved) != old_address) {
+            self.recordReleased(old_address);
+            self.recordHandedOut(@intFromPtr(moved));
+        }
+        return moved;
+    }
+
+    fn freeFn(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *ProjectedOptionLedger = @ptrCast(@alignCast(context));
+        if (memory.len != 0) self.recordReleased(@intFromPtr(memory.ptr));
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
+fn projectedOptionBorrowTwiceWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    var ledger: ProjectedOptionLedger = .{ .child = gpa };
+    try std.testing.expectEqual(
+        @as(usize, 6),
+        try translated.owner_projected_option_borrow_twice(ledger.allocator()),
+    );
+    try ledger.expectBothReleasedOnce();
+}
+
+test "two shared borrows of a projected Some leaf preserve it until its carrier releases it once" {
+    try projectedOptionBorrowTwiceWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        projectedOptionBorrowTwiceWithAllocationFailures,
+        .{},
+    );
+}
+
+fn projectedOptionNoneInspectionWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    var ledger: ProjectedOptionLedger = .{ .child = gpa };
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        try translated.owner_projected_option_none_inspection(ledger.allocator()),
+    );
+    try ledger.expectBothReleasedOnce();
+}
+
+test "a nonmatching projected None inspector does not consume the Some leaf borrowed next" {
+    try projectedOptionNoneInspectionWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        projectedOptionNoneInspectionWithAllocationFailures,
+        .{},
+    );
+}
+
+fn projectedOptionMoveWithAllocationFailures(gpa: std.mem.Allocator) !void {
+    var ledger: ProjectedOptionLedger = .{ .child = gpa };
+    const tracked_gpa = ledger.allocator();
+    const input = try translated.owned(tracked_gpa, "abc");
+    const original_address = @intFromPtr(input.as_bytes().ptr);
+    var selected = try translated.owner_projected_option_move(tracked_gpa, input);
+
+    // Inspect the release ledger before reading or freeing the returned bytes:
+    // a premature release must fail this assertion, not a dangling-pointer read.
+    try std.testing.expectEqual(@as(usize, 0), ledger.releasesOf(original_address));
+    {
+        defer selected.deinit(tracked_gpa);
+        try std.testing.expect(!ledger.overflow);
+        try std.testing.expectEqual(@as(usize, 2), ledger.handed_out_count);
+        try std.testing.expectEqual(@as(usize, 1), ledger.released_count);
+        try std.testing.expectEqual(original_address, ledger.handed_out[0]);
+        try std.testing.expect(original_address != ledger.handed_out[1]);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            ledger.releasesOf(ledger.handed_out[1]),
+        );
+        try std.testing.expectEqual(
+            original_address,
+            @intFromPtr(selected.as_bytes().ptr),
+        );
+        try std.testing.expectEqualStrings("abc", selected.as_str());
+    }
+    try ledger.expectBothReleasedOnce();
+}
+
+test "a projected Option move returns the original allocation and releases only its inner sibling" {
+    try projectedOptionMoveWithAllocationFailures(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        projectedOptionMoveWithAllocationFailures,
         .{},
     );
 }

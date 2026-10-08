@@ -96,7 +96,7 @@ test "relay at String hands back the one owner it was given and frees it once" {
     defer text.deinit(gpa);
     try std.testing.expectEqual(frees_before_handoff, tracking.deallocations);
 
-    var returned = translated.relay(r2z.alloc.String, moved);
+    var returned = translated.relay(r2z.alloc.String, gpa, moved);
     defer returned.deinit(gpa);
     try std.testing.expectEqual(frees_before_handoff, tracking.deallocations);
     try std.testing.expectEqualStrings(expected_text, returned.as_str());
@@ -125,7 +125,7 @@ test "relay at Vec<u8> hands back the one owner it was given and frees it once" 
     try std.testing.expectEqual(frees_before_handoff, tracking.deallocations);
     try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
 
-    var returned = translated.relay(std.ArrayListUnmanaged(u8), moved);
+    var returned = translated.relay(std.ArrayListUnmanaged(u8), gpa, moved);
     defer returned.deinit(gpa);
     try std.testing.expectEqual(frees_before_handoff, tracking.deallocations);
     try std.testing.expectEqualSlices(u8, &expected_bytes, returned.items);
@@ -189,7 +189,7 @@ test "relay_or_release at Vec<u8> releases the owner once on each arm" {
     const dropped_address = @intFromPtr(dropped.items[0].items.ptr);
     const frees_before_dropped_call = tracking.deallocations;
 
-    const dropped_answer = translated.relay_or_release(u8, gpa, false, dropped);
+    const dropped_answer = translated.relay_or_release(std.ArrayListUnmanaged(u8), gpa, false, dropped);
     try std.testing.expect(dropped_answer == null);
     try std.testing.expectEqual(frees_before_dropped_call + 2, tracking.deallocations);
 
@@ -197,7 +197,7 @@ test "relay_or_release at Vec<u8> releases the owner once on each arm" {
     const returned_address = @intFromPtr(returned_source.items[0].items.ptr);
     const frees_before_returned_call = tracking.deallocations;
 
-    var maybe = translated.relay_or_release(u8, gpa, true, returned_source);
+    var maybe = translated.relay_or_release(std.ArrayListUnmanaged(u8), gpa, true, returned_source);
     try std.testing.expectEqual(frees_before_returned_call, tracking.deallocations);
     try std.testing.expect(maybe != null);
     defer r2z.alloc.dropTemporary(gpa, &maybe.?);
@@ -276,11 +276,13 @@ test "the two relay instantiations release their own storage and never each othe
     // One source text, two owners, each moved in through its own instantiation.
     var returned_text = translated.relay(
         r2z.alloc.String,
+        gpa,
         r2z.alloc.takeOwned(r2z.alloc.String, &text),
     );
     defer returned_text.deinit(gpa);
     var returned_bytes = translated.relay(
         std.ArrayListUnmanaged(u8),
+        gpa,
         r2z.alloc.takeOwned(std.ArrayListUnmanaged(u8), &bytes),
     );
     defer returned_bytes.deinit(gpa);

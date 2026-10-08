@@ -13,46 +13,14 @@
 //! Every function returns the label it selected rather than a length or a flag,
 //! so the consumer reads the bytes that had to survive.
 //!
-//! ## A known boundary this fixture pins rather than hides
+//! ## Coverage
 //!
-//! `nested_owned_dispatch` DOES NOT pass, and the failure is named here rather
-//! than left for a reader to discover as a leak report. It is a RUN failure and
-//! not a typed refusal: the crate analyses, lowers and compiles, the generated
-//! package builds, and its own test run is what reports the leak. So the
-//! boundary surfaces as `GeneratedPackageRunFailed` and is pinned by that name
-//! in `rejected_source_specs`.
+//! The generated crate runs its own translated tests. The end-to-end test also
+//! stages the crate and runs its six-case Zig consumer in Debug and ReleaseSafe.
 //!
-//! `Shape::Duo(_, right)` and `Node::Pair(_, right)` drop the FIRST element — a
-//! `String` — and nothing releases it. The obstacle is specific. An arm that
-//! binds a variant field gets that field's capture release armed, and for a
-//! TWO-field variant `matchCapturePayload` still finds the one binding among
-//! the fields and releases it, so `right` is handed out and the caller's
-//! `deinit` stays the only release of it. The WILDCARD field is the gap: it
-//! carries no name, and `emitMatchDestructureBody` emits a binding only for a
-//! field whose pattern is a binding, so `payload.0` is never bound and never
-//! released. That the arm takes an owned payload also suppresses the release
-//! armed over the scrutinee as a whole, so nothing covers it from that side
-//! either.
-//!
-//! The crate's own two translated tests split the same way. The one calling
-//! `nested_owned_dispatch` leaks on both tuple paths, for exactly two leaked
-//! allocations, and the one calling only `guarded_fallthrough` passes — every
-//! variant that function matches carries exactly one field.
-//!
-//! `test/guarded_owned_fallthrough_consumer.zig` is the reproducer for this gap
-//! and is deliberately unwired from `test/e2e_test.zig` while it is open, so its
-//! assertions are written and ready rather than running against a package this
-//! crate cannot publish. It comes back the moment the lowering gap closes.
-//!
-//! This is NOT the same boundary as "a named struct is not an owner type", which
-//! is documented elsewhere and pinned by its own tests. Here the enum carries
-//! its payload in a VARIANT FIELD and the lowering binds and releases only the
-//! fields a pattern names. A correct lowering exists — bind the wildcard field
-//! to a synthetic name, arm `defer` on it in the arm — and it needs the pattern
-//! field-naming contract reworked; it is not a spelling fix.
-//!
-//! Until that lands, this crate's `nested_owned_dispatch` is a RED FIXTURE that
-//! documents a real gap. Do not weaken its consumer to make it green.
+//! The consumer checks that wildcard tuple fields are released once, while the
+//! selected label remains caller-owned. A failed guard keeps its label for the
+//! next arm. Allocation failures release labels already live in the frame.
 
 /// An owned label, and a variant that binds no label at all.
 pub enum Signal {

@@ -2462,21 +2462,9 @@ test "pristine siphasher test bodies preserve canonical string hints" {
         "test/crates/siphasher",
         .{ .include_tests = true },
     );
-    // Deliberately NOT `ir.validateForTranslation`. That call is the boundary
-    // this crate is PINNED to refuse at: `validateInstantiations` raises
-    // `IncompleteGenericMetadata` for an instantiation whose argument list does
-    // not match its declaration's generic arity, and the repository records
-    // that refusal in four places — README's pinned-refusal table,
-    // `test/e2e_test.zig`'s `refused_source_crates` row,
-    // `test/promoted_crates_consumer.zig`, and `build.zig`'s crate matrix.
-    // Gating this test on it asserts a fact the project deliberately records as
-    // false, and it says nothing about the claim this test is named for.
-    //
-    // What is left is the claim itself: the crate analyses with no refusal
-    // marker and no open slot anywhere in its type table, and every string
-    // literal it contains — the `("aa", "bb")` / `("aabb", "")` / `("a", "abb")`
-    // rows of `tests.rs::test_hash_no_concat_alias` among them — keeps the
-    // canonical borrowed `str` identity the tuple rows are built from.
+    try ir.validateForTranslation(&model);
+    // Every string literal, including the no-concatenation-alias tuple rows,
+    // keeps the canonical borrowed `str` identity after full IR validation.
     try expectNothingLeftOpen(&model);
     var strings: usize = 0;
     for (model.bodies.exprs) |expression| {
@@ -3436,6 +3424,61 @@ fn expectNoUnresolvedCalls(model: *const ir.RustIr) !void {
         if (!std.mem.eql(u8, expression.kind.unsupported.reason, "unresolved call")) continue;
         return error.CallStillRefused;
     }
+}
+
+test "String new aliases share the canonical allocation-free constructor classification" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const model = try analyze(arena_state.allocator(),
+        \\extern crate alloc;
+        \\use std::string::String as Text;
+        \\pub fn empty() -> String { String::new() }
+        \\pub fn allocated() -> String { alloc::string::String::new() }
+        \\pub fn rooted() -> String { std::string::String::new() }
+        \\pub fn imported() -> Text { Text::new() }
+        \\pub fn block_imported() -> String {
+        \\    use alloc::string::String as Other;
+        \\    Other::new()
+        \\}
+        \\mod local {
+        \\    pub struct String;
+        \\    impl String { pub fn new() -> Self { String } }
+        \\}
+        \\pub fn source() -> local::String { local::String::new() }
+    );
+    try expectTranslatable(&model);
+    for ([_][]const u8{ "empty", "allocated", "rooted", "imported", "block_imported" }) |name| {
+        const function = fnEntityNamed(&model, name) orelse return error.MissingFunction;
+        const block = try fnBodyBlock(&model, function);
+        const tail = model.bodies.exprs[block].kind.block.tail orelse return error.MissingConstructorReturn;
+        const expression = model.bodies.exprs[tail];
+        const target = associatedDef(&model, tail) orelse return error.ExpectedAssociatedStringNew;
+        try testing.expectEqual(
+            ir.std_model.StdConstructor.string_new,
+            ir.std_model.standardConstructor(&model.graph, &model.bodies, target) orelse
+                return error.UnclassifiedStringNew,
+        );
+        try testing.expectEqual(@as(usize, 0), expression.kind.call.args.len);
+        const result = switch (typeAt(&model, expression.ty orelse return error.UntypedStringNew)) {
+            .external_nominal => |value| value,
+            else => return error.StringNewResultIsNotOwnedNominal,
+        };
+        try testing.expectEqual(@as(usize, 0), result.args.len);
+        try testing.expect(!model.bodies.bodies[target].fn_.is_allocating);
+    }
+    const source = fnEntityNamed(&model, "source") orelse return error.MissingSourceFunction;
+    const source_block = try fnBodyBlock(&model, source);
+    const source_tail = model.bodies.exprs[source_block].kind.block.tail orelse
+        return error.MissingSourceConstructorReturn;
+    const source_call = switch (model.bodies.exprs[source_tail].kind) {
+        .call => |value| value,
+        else => return error.ExpectedSourceConstructor,
+    };
+    const source_target = switch (source_call.call_kind) {
+        .free, .associated => |value| value,
+        else => return error.ExpectedSourceAssociatedFunction,
+    };
+    try testing.expect(ir.std_model.standardConstructor(&model.graph, &model.bodies, source_target) == null);
 }
 
 test "a standard container's constructor lowers with the signature std declares" {

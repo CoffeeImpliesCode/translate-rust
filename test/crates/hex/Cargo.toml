@@ -4,9 +4,18 @@ version = "0.4.3"
 edition = "2018"
 publish = false
 
-# Source vendored from https://crates.io/crates/hex (KokaKiwi/rust-hex), MIT/Apache-2.0.
-# v1-dialect core: lib.rs + error.rs only. The upstream optional `serde` feature
-# (src/serde.rs) and dev-dependencies are trimmed out of the vendored copy.
+# Fixture provenance: hex 0.4.3, compared on 2026-10-08.
+# Source: https://static.crates.io/crates/hex/hex-0.4.3.crate
+# src/lib.rs and src/error.rs match the archive byte-for-byte.
+# Omitted Rust files: src/serde.rs, benches/hex.rs, tests/serde.rs,
+# tests/version-number.rs. No Rust files are added.
+# This local manifest replaces Cargo's normalized registry manifest.
+# It adds publish = false and keeps the package name, version, edition, and
+# default/std/alloc features. It removes the generated header, package metadata,
+# docs.rs settings, bench target, serde dependency, all dev-dependencies, and badge.
+# Cargo.toml.orig is not retained. Other omitted files: .cargo_vcs_info.json,
+# .github/workflows/rust.yml, .gitignore, .gitlab-ci.yml, .travis.yml,
+# LICENSE-APACHE, LICENSE-MIT, README.md.
 [features]
 default = ["std"]
 std = ["alloc"]

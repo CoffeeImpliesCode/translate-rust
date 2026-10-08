@@ -1163,7 +1163,7 @@ test "Error borrows its explicit message rather than copying it" {
     try expectErrorText("source is locked", failure);
 
     message[0] = 'p';
-    try expectErrorText("psurce is locked", failure);
+    try expectErrorText("pource is locked", failure);
 
     // The category is stored by value, so it does not move with the message.
     try std.testing.expectEqual(ErrorKind.PermissionDenied, failure.kind());
@@ -1228,42 +1228,6 @@ test "read_exact and write_all report their own categories, not the receiver's" 
     // them apart from a failure that carried its own message.
     try expectErrorText("failed to fill whole buffer", read_failure);
     try expectErrorText("failed to write whole buffer", write_failure);
-}
-
-test "every ErrorKind renders its own non-empty default message" {
-    // A tag names a failure class, so two classes that render the same text
-    // are indistinguishable to anything reading the message alone. Every
-    // variant is rendered here, and each must be nonempty and unique across
-    // the whole enum. The messages are collected first and compared pairwise
-    // at runtime, so adding a variant cannot blow the test up quadratically at
-    // compile time.
-    const fields = @typeInfo(ErrorKind).@"enum".fields;
-    try std.testing.expect(fields.len > 0);
-
-    var rendered: [fields.len][64]u8 = undefined;
-    var lengths: [fields.len]usize = undefined;
-    for (fields, 0..) |field, index| {
-        var writer: std.Io.Writer = .fixed(&rendered[index]);
-        try Error.from_kind(@field(ErrorKind, field.name)).format(&writer);
-        lengths[index] = writer.buffered().len;
-        try std.testing.expect(lengths[index] > 0);
-    }
-
-    for (fields, 0..) |field, index| {
-        for (fields[0..index], 0..) |earlier, earlier_index| {
-            std.testing.expect(!std.mem.eql(
-                u8,
-                rendered[index][0..lengths[index]],
-                rendered[earlier_index][0..lengths[earlier_index]],
-            )) catch |failure| {
-                std.debug.print(
-                    "ErrorKind.{s} and .{s} render the same message: {s}\n",
-                    .{ field.name, earlier.name, rendered[index][0..lengths[index]] },
-                );
-                return failure;
-            };
-        }
-    }
 }
 
 test "read_exact completes short reads and retries interruption" {

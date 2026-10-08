@@ -436,17 +436,22 @@ fn vecOwnsSlab(comptime T: type) bool {
     return @sizeOf(Element) != 0;
 }
 
-/// True when a value of `T` holds storage that `dropTemporary` releases.
+/// Whether the shape of `T` can hold storage `dropTemporary` releases.
 ///
-/// A vector qualifies when its elements take space, because a slab of them is
-/// storage. Tuples qualify when a non-comptime field qualifies. `Option`,
-/// error unions, and tagged unions qualify when their payload qualifies.
-/// A nonempty array qualifies when its element qualifies. Foreign named structs
-/// and untagged unions do not qualify; no user destructor is discovered.
-fn ownsTemporaryStorage(comptime T: type) bool {
+/// The comptime result is true for `String`, `FromUtf8Error`, and a `Vec` with
+/// nonzero-sized elements; tuples with a qualifying non-comptime field;
+/// nonempty arrays with a qualifying element; and optionals, error unions, or
+/// tagged unions with any qualifying payload. This includes the owned `Cow`
+/// arms. Empty values of these types still answer true.
+///
+/// Borrows, scalars, foreign named structs, and untagged unions answer false;
+/// no user destructor is discovered. False is not a Rust Copy proof, and true
+/// does not imply `supportsOwnedMove`: a user tagged union may be droppable
+/// without having a moved-from state. Allocates nothing and changes no value.
+pub inline fn ownsTemporaryStorage(comptime T: type) bool {
     if (T == String or T == FromUtf8Error) return true;
     if (comptime vecOwnsSlab(T)) return true;
-    return switch (@typeInfo(T)) {
+    return comptime switch (@typeInfo(T)) {
         .@"struct" => |structure| tuple: {
             if (!structure.is_tuple) break :tuple false;
             for (structure.fields) |field| {
@@ -1186,10 +1191,18 @@ fn isOwnedVecResult(comptime T: type) bool {
     return T == Result(union_type.fields[0].type, union_type.fields[1].type);
 }
 
-/// A finite Copy gate, not "owns no known storage": unknown owner structs
-/// must not become bitwise clones merely because cleanup does not inspect them.
-fn isOwnedVecCopy(comptime T: type) bool {
-    return switch (@typeInfo(T)) {
+/// Whether `T` is in the finite bitwise-copy subset used by owned Vec clones.
+///
+/// The comptime result accepts builtin booleans, integers, floats, error sets,
+/// void, vectors, and immutable pointer/slice borrows; arrays, optionals, error
+/// unions, and tuples whose payloads qualify; and this runtime's `Result` when
+/// both arms qualify. Foreign named structs, user unions, untagged unions,
+/// mutable borrows, and other shapes answer false.
+///
+/// This is not a general Rust Copy-trait query. False is not proof of ownership
+/// or permission to drop a value. Allocates nothing and changes no value.
+pub inline fn isOwnedVecCopy(comptime T: type) bool {
+    return comptime switch (@typeInfo(T)) {
         .bool, .int, .float, .error_set, .void, .vector => true,
         .pointer => |pointer| pointer.is_const,
         .array => |array| isOwnedVecCopy(array.child),
@@ -1836,6 +1849,10 @@ fn ownerTestTotal(tuple: anytype) usize {
 }
 
 test "takeOwned accepts the containers and the finite wrappers built over them" {
+    // These finite tables exercise the private walk and the inlined public
+    // gate together, so their reflection work shares this test's comptime quota.
+    @setEvalBranchQuota(10_000);
+
     const Accepted = .{
         String,
         Vec(String),
@@ -3212,7 +3229,18 @@ test "takeOwned empties a moved Cow slice and Cow str in place, and the source t
     const CowMoveWrapper = @Tuple(&.{ CowSlice(OwnedVecTestTuple), CowStr, String });
     var cow_elements = try Vec(OwnedVecTestTuple).initCapacity(gpa, 1);
     errdefer dropTemporary(gpa, &cow_elements);
-    try cow_elements.append(gpa, try makeOwnedVecTestTuple(gpa));
+    var cow_tuple: OwnedVecTestTuple = tuple: {
+        var array: [2]?String = .{ null, null };
+        errdefer dropTemporary(gpa, &array);
+        array[0] = try String.from_str(gpa, "array first");
+        array[1] = try String.from_str(gpa, "array second");
+        var result: Result(String, String) = .{ .Err = try String.from_str(gpa, "result error") };
+        errdefer dropTemporary(gpa, &result);
+        const success: error{Rejected}!String = try String.from_str(gpa, "union success");
+        break :tuple .{ array, result, success };
+    };
+    errdefer dropTemporary(gpa, &cow_tuple);
+    cow_elements.appendAssumeCapacity(takeOwned(OwnedVecTestTuple, &cow_tuple));
     var cow_text = try String.from_str(gpa, "cow wrapper text");
     errdefer dropTemporary(gpa, &cow_text);
     var cow_string = try String.from_str(gpa, "cow wrapper string");
@@ -3262,10 +3290,10 @@ test "takeOwned empties a moved Cow slice and Cow str in place, and the source t
 
     // The payload tuple is still whole on the other side: both array slots, the
     // `Result` arm and the error union's payload, at the bytes the source built.
-    try std.testing.expectEqualStrings("array first", owner[0].as_ref()[0][0].?.as_str());
-    try std.testing.expectEqualStrings("array second", owner[0].as_ref()[0][1].?.as_str());
-    try std.testing.expectEqualStrings("result error", owner[0].as_ref()[1].Err.as_str());
-    try std.testing.expectEqualStrings("union success", (owner[0].as_ref()[2] catch unreachable).as_str());
+    try std.testing.expectEqualStrings("array first", owner[0].as_ref()[0][0][0].?.as_str());
+    try std.testing.expectEqualStrings("array second", owner[0].as_ref()[0][0][1].?.as_str());
+    try std.testing.expectEqualStrings("result error", owner[0].as_ref()[0][1].Err.as_str());
+    try std.testing.expectEqualStrings("union success", (owner[0].as_ref()[0][2] catch unreachable).as_str());
 
     // The payload's four element blocks and the slab that holds them, the Cow
     // text, and the string beside it: seven blocks, released once each.
