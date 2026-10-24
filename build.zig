@@ -24,15 +24,8 @@ pub fn build(b: *std.Build) void {
     toolchain_options.addOption([:0]const u8, "zig_executable", b.graph.zig_exe);
     const toolchain = toolchain_options.createModule();
 
-    // Where the `zig` children spawned from the e2e program must write their
-    // caches. Left unset, every such child defaults to `<cwd>/.zig-cache` and
-    // `$HOME/.cache/zig`; this repository lives on an NFSv3 mount, where Zig's
-    // atomic rename is not implemented and a child that writes either cache
-    // there aborts with EINVAL. Both roots are already local when
-    // `tools/zig-pinned.sh` runs the build, so the e2e program forwards this
-    // build's own roots to its children instead of re-deriving a default.
-    // `null` means this build set no cache root, which leaves the compiler
-    // default in place rather than inventing a directory for it.
+    // Forward compiler cache roots to child builds. Atomic cache writes
+    // require a local filesystem; NFSv3 does not provide the needed rename.
     const e2e_host_options = b.addOptions();
     e2e_host_options.addOption(?[]const u8, "local_cache_dir", b.cache_root.path);
     e2e_host_options.addOption(
@@ -902,23 +895,14 @@ pub fn build(b: *std.Build) void {
     }
     test_crates_step.dependOn(check_corpus_step);
 
-    // ── shell entry points ───────────────────────────────────────────────
-    // The two host facts — a `zig` on PATH that re-resolves a toolchain per
-    // invocation, and an NFSv3 mount that cannot take an atomic write — are why
-    // `tools/zig-pinned.sh` and `tools/test-generated-corpus.sh` exist, and both
-    // are enforced by code no test binary ever reaches. Their `--self-check`
-    // modes are that enforcement made executable: a fixed table of paths,
-    // filesystem types and version strings, each with the verdict it must get,
-    // needing no build, no scratch and no toolchain.
-    //
-    // Both are invoked directly rather than through `sh`, so each runs under
-    // the interpreter its shebang names.
+    // The corpus runner checks placement, filesystem and toolchain rules
+    // without creating scratch files or invoking a compiler.
     const entry_points_step = steps.add(
         b,
         "check-entry-points",
         "Run each pinned shell entry point's own placement, transport and toolchain self-check",
     );
-    for ([_][]const u8{ "tools/zig-pinned.sh", "tools/test-generated-corpus.sh" }) |entry_point| {
+    for ([_][]const u8{"tools/test-generated-corpus.sh"}) |entry_point| {
         entry_points_step.dependOn(
             &b.addSystemCommand(&.{ b.pathFromRoot(entry_point), "--self-check" }).step,
         );

@@ -5,7 +5,7 @@
 # This is a separate entry point from `zig build`: it composes the two stages
 # that cannot be one build step.
 #
-#   1. Host stage. `tools/zig-pinned.sh generated-corpus -- --output <dir>` runs
+#   1. Host stage. `zig build generated-corpus -- --output <dir>` runs
 #      `test/generated_corpus.zig`, which drives the real translator over every
 #      corpus row and publishes each result as a standalone Zig package. Every
 #      package is promoted by the driver, so a row is present only because its
@@ -94,11 +94,7 @@ die() { printf 'test-generated-corpus: %s\n' "$*" >&2; exit 2; }
 note() { printf 'test-generated-corpus: %s\n' "$*" >&2; }
 
 # ── Policy ─────────────────────────────────────────────────────────────────
-# Every decision about whether a path or a toolchain is usable is one function
-# here, and each one is exercised by `--self-check` below. None of them creates
-# or removes anything, so the self-check needs no scratch of its own. These are
-# the same rules `tools/zig-pinned.sh` enforces, for the same reasons: both
-# scripts exist because the same two host facts break the bare form.
+# Path and toolchain checks do not create or remove files.
 
 # The reason `requested`/`resolved` cannot hold a corpus or a cache, printed
 # and returned as 0; nothing printed and 1 when it can.
@@ -353,7 +349,7 @@ self_check() {
     run_case 'an R2Z_ZIG that does not exist' refused \
         toolchain_path_fault /home/tmp/r2z-cache/absent-zig
     run_case 'an executable R2Z_ZIG' accepted \
-        toolchain_path_fault "$repo_root/tools/zig-pinned.sh"
+        toolchain_path_fault "$repo_root/tools/test-generated-corpus.sh"
     run_case 'the silence of a shim with no toolchain' refused version_fault ''
     run_case 'an unparsable answer' refused version_fault unknown
     run_case 'the pinned compiler' accepted \
@@ -570,10 +566,14 @@ if [[ -e "$output" ]]; then
     note "reusing the existing corpus at $output without re-verifying it (R2Z_CORPUS_REUSE=1)"
 else
     note "staging the corpus into $output"
-    # The producer needs a local filesystem for its own caches as well; pinned
-    # moves them next to this script's own scratch root.
-    R2Z_ZIG="$zig_bin" R2Z_SCRATCH="$cache/producer" \
-        "$repo_root/tools/zig-pinned.sh" generated-corpus -- --output "$output"
+    (
+        cd -- "$repo_root"
+        export PATH="$(dirname -- "$zig_bin"):$PATH"
+        export ZIG_LOCAL_CACHE_DIR="$cache/producer/local"
+        export ZIG_GLOBAL_CACHE_DIR="$cache/producer/global"
+        mkdir -p -- "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+        "$zig_bin" build generated-corpus -- --output "$output"
+    )
 fi
 
 aggregate="$output/aggregate"
