@@ -1,5 +1,4 @@
 //! translate_rust.model.monomorphize — generic instantiation collection & suffix mangling.
-//! See notes/design/data-model/items-types.md §3 (Generics & monomorphization).
 //!
 //! P5: walks the bodies' expression/type graphs and the crate-graph item
 //! signatures, deduplicates every concrete `Instantiation` of a generic

@@ -1453,7 +1453,7 @@ fn findUnreachableSources(gpa: std.mem.Allocator, io: std.Io) ![][]const u8 {
 /// The named steps this graph publishes, collected as each one is registered.
 ///
 /// `zig build --help` lists whatever is in the graph, and the prose in
-/// README.md and AGENTS.md is written against that list, so the two have to be
+/// README.md is written against that list, so the two have to be
 /// able to disagree loudly. Registering through `add` is what makes
 /// `check-commands` a complete claim: a step added with a raw `b.step` call
 /// would be absent here, and a documented command naming it would fail the
@@ -1490,22 +1490,14 @@ const UndocumentedCommand = struct { doc: []const u8, command: []const u8 };
 /// Documented commands, computed at configure time.
 var undocumented: []const UndocumentedCommand = &.{};
 
-/// The prose that documents this graph's commands. Every file here is one a
-/// reader is told to copy invocations out of, and every invocation in it is
-/// checked. `README.md` and `AGENTS.md` are the two a newcomer reads first;
-/// the scripts carry their own usage headers, which are documentation a reader
-/// sees in `--help`-adjacent places and just as easy to leave stale.
+/// Files that document this build graph's commands.
 const command_docs = [_][]const u8{
     "README.md",
-    "AGENTS.md",
-    "tools/zig-pinned.sh",
     "tools/test-generated-corpus.sh",
 };
 
-/// The prefix a documented invocation starts with. Only that prefix is scanned:
-/// the README also shows `zig build test` inside a diagram, and that is the
-/// generated package's own build script, not a step of this graph.
-const documented_prefix = "tools/zig-pinned.sh";
+/// Build invocations in the documentation.
+const documented_prefix = "zig build";
 
 const doc_limit = 8 << 20;
 
@@ -1514,10 +1506,8 @@ fn isWordChar(c: u8) bool {
         (c >= '0' and c <= '9');
 }
 
-/// The step name a documented invocation runs, or null when the line names no
-/// step. A bare `tools/zig-pinned.sh` is the default install step, which has no
-/// name of its own, and anything that is not a word — a flag, a path, a line
-/// continuation — is an argument to the step before it rather than a step.
+/// The step following a documented build invocation, or null for flags,
+/// paths and the default install step.
 fn documentedStep(source: []const u8, after: usize) ?[]const u8 {
     var cursor = after;
     while (cursor < source.len and (source[cursor] == ' ' or source[cursor] == '\t')) {

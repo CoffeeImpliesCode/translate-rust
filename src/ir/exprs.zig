@@ -1,5 +1,4 @@
 //! translate_rust.model.exprs — Expr / Pattern / Statement (P3 model layer).
-//! See notes/design/data-model/exprs-patterns.md §0–§5.
 //!
 //! The behavior-bearing core of the lossless semantic IR: every Expr,
 //! Pattern, and Statement carries the shared header (id/span/ty) and

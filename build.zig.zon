@@ -18,7 +18,6 @@
         "build.zig",
         "build.zig.zon",
         "README.md",
-        "notes",
         "r2z-core",
         "src",
         "test",

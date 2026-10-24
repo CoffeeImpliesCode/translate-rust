@@ -1,6 +1,5 @@
 //! translate_rust.model.types — type representation of the lossless semantic IR.
-//! See notes/design/data-model/items-types.md §3 (Generics & monomorphization) and
-//! §4 (Type representation). Consumer: a Zig backend.
+//! Consumer: the Zig backend.
 //!
 //! Self-reference is bounded by `*const Type` / `[]const Type` (known-size), so
 //! `Type` is well-defined as a recursive tagged union.

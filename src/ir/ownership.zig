@@ -1,6 +1,5 @@
 //! translate_rust.model.ownership — Ownership, Borrow, Drop, Allocator,
 //! Unsoundness (P3 model layer).
-//! See notes/design/data-model/ownership-mem.md §1–§5.
 //!
 //! The IR cannot represent Rust borrow-checking; it records enough **usage**
 //! so the backend produces semantically identical Zig and flags points where

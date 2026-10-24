@@ -1,6 +1,6 @@
 //! Rust grammar via tree-sitter: parse Rust source into a lossless syntax
 //! tree. Syntax-only — no name resolution, types, or macro expansion; those
-//! belong to the semantic sidecar (see notes/research/parsing-tooling.md).
+//! are handled by the frontend.
 
 const std = @import("std");
 const ts = @import("tree_sitter");

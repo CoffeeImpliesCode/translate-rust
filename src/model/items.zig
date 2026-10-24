@@ -1,5 +1,4 @@
 //! translate_rust.model.items — item (declaration) layer of the lossless semantic IR.
-//! See notes/design/data-model/items-types.md §1 (items).
 //!
 //! Every `Item` carries the common header from the spine (EntityId, Span,
 //! Visibility, Attribute list) plus an `ItemKind` tagged union. The emitter

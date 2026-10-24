@@ -1,6 +1,5 @@
 //! translate_rust.model.spine — the shared spine of the lossless semantic IR.
-//! Every entity is keyed by a dense EntityId into a SymbolTable. See
-//! notes/design/data-model.md §2 and data-model/crate-graph.md.
+//! Every entity is keyed by a dense EntityId into a SymbolTable.
 
 const std = @import("std");
 
