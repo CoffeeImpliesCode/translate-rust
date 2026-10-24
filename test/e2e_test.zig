@@ -78,14 +78,12 @@ fn runZigTest(
     defer argv.deinit(gpa);
     try argv.append(gpa, zig_executable);
     try argv.append(gpa, "test");
-    if (e2e_host.local_cache_dir) |local_cache_dir| {
-        try argv.append(gpa, "--cache-dir");
-        try argv.append(gpa, local_cache_dir);
-    }
-    if (e2e_host.global_cache_dir) |global_cache_dir| {
-        try argv.append(gpa, "--global-cache-dir");
-        try argv.append(gpa, global_cache_dir);
-    }
+    try argv.appendSlice(gpa, &.{
+        "--cache-dir",
+        e2e_host.local_cache_dir,
+        "--global-cache-dir",
+        e2e_host.global_cache_dir,
+    });
     try argv.appendSlice(gpa, args);
 
     const result = try std.process.run(gpa, io, .{

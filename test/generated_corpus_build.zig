@@ -17,7 +17,7 @@
 //! 2. The target and the optimize mode come from this build and are forwarded
 //!    to every dependency; every module the graph reaches is read back and
 //!    refused unless it carries them. A module reached without them keeps a
-//!    null field and the compiler re-derives one from `b.release_mode`, so a
+//!    null field and the compiler re-derives one from `b.graph.release_mode`, so a
 //!    ReleaseSafe row would be measured in a Debug build and a cross row would
 //!    be compiled for the host. Each staged package forwards them again to the
 //!    `r2z-core` runtime it vendors, which this file also reads back.
@@ -200,12 +200,9 @@ fn resolveRunners(b: *std.Build) ExternalRunner {
         return .compile_only;
     };
     if (std.mem.eql(u8, kind, "native")) return .none;
-    if (!std.mem.eql(u8, kind, "exec")) return .compile_only;
-    // A declared foreign runner. Permitting the families leaves the choice of
-    // interpreter to the build system, which resolves it for this target.
-    b.enable_qemu = true;
-    b.enable_wasmtime = true;
-    b.enable_wine = true;
+    if (!std.mem.eql(u8, kind, "exec") and !std.mem.eql(u8, kind, "qemu_user")) return .compile_only;
+    // The runner enables the corresponding Maker flag (-fqemu, -fwasmtime
+    // or -fwine) before invoking this build.
     return .interpreter;
 }
 

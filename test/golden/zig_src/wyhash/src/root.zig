@@ -71,7 +71,7 @@
 //! Zig consumer contract:
 //! Import the registered `wyhash` module through a build dependency; child
 //! modules are reached through the crate's exported namespaces.
-//! Requires Zig 0.16.0. Target and optimization options belong to the consumer.
+//! Requires Zig 0.17.0. Target and optimization options belong to the consumer.
 //! Rust names are preserved except native protocol hooks and name collisions.
 //! Zig field access and value copying do not enforce Rust privacy or moves.
 //! Pointers, slices and erased interfaces borrow their backing storage.

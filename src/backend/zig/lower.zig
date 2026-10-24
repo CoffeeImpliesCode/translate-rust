@@ -5862,7 +5862,7 @@ const Lowerer = struct {
             \\{s}{s}{s}Zig consumer contract:
             \\Import the registered `{s}` module through a build dependency; child
             \\modules are reached through the crate's exported namespaces.
-            \\Requires Zig 0.16.0. Target and optimization options belong to the consumer.
+            \\Requires Zig 0.17.0. Target and optimization options belong to the consumer.
             \\Rust names are preserved except native protocol hooks and name collisions.
             \\Zig field access and value copying do not enforce Rust privacy or moves.
             \\Pointers, slices and erased interfaces borrow their backing storage.
@@ -21439,20 +21439,19 @@ const Lowerer = struct {
         return .{ .block = .{ .stmts = statements } };
     }
 
-    fn hashStdMetaFields(self: *Lowerer) anyerror!ast.Expr {
-        const callee = try self.allocExpr(.{ .field_access = .{
+    fn hashTupleFieldNames(self: *Lowerer) anyerror!ast.Expr {
+        return .{ .field_access = .{
             .target = try self.allocExpr(.{ .field_access = .{
-                .target = try self.allocExpr(.{ .ident = "std" }),
-                .field_name = "meta",
+                .target = try self.allocExpr(.{ .builtin = .{
+                    .name = "typeInfo",
+                    .args = try self.hashSingleArg(.{ .builtin = .{
+                        .name = "TypeOf",
+                        .args = try self.hashSingleArg(try self.hashDeref("value")),
+                    } }),
+                } }),
+                .field_name = "struct",
             } }),
-            .field_name = "fields",
-        } });
-        return .{ .call = .{
-            .callee = callee,
-            .args = try self.hashSingleArg(.{ .builtin = .{
-                .name = "TypeOf",
-                .args = try self.hashSingleArg(try self.hashDeref("value")),
-            } }),
+            .field_name = "field_names",
         } };
     }
 
@@ -21638,14 +21637,11 @@ const Lowerer = struct {
         binding[0] = .{ .let_stmt = .{
             .name = "Slots",
             .ty = null,
-            .init = try self.hashStdMetaFields(),
+            .init = try self.hashTupleFieldNames(),
             .is_mut = false,
         } };
 
-        const slot_name = ast.Expr{ .field_access = .{
-            .target = try self.allocExpr(.{ .ident = "Slot" }),
-            .field_name = "name",
-        } };
+        const slot_name = ast.Expr{ .ident = "Slot" };
         const field_of_tuple = try self.allocExpr(.{ .builtin = .{
             .name = "field",
             .args = try self.hashTwoArgs(
@@ -33008,8 +33004,8 @@ const Lowerer = struct {
             .optional => if (value) |present| {
                 return astMutatesBinding(present, name, depth + 1);
             },
-            .@"struct" => |structure| inline for (structure.fields) |field| {
-                if (try astMutatesBinding(@field(value, field.name), name, depth + 1)) return true;
+            .@"struct" => |structure| inline for (structure.field_names) |field_name| {
+                if (try astMutatesBinding(@field(value, field_name), name, depth + 1)) return true;
             },
             .@"union" => return switch (value) {
                 inline else => |payload| astMutatesBinding(payload, name, depth + 1),

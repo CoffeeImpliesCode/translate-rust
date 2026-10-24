@@ -1049,10 +1049,7 @@ fn encodePrim(p: ast.Prim) []const u8 {
 }
 
 fn decodePrim(s: []const u8) !ast.Prim {
-    inline for (std.meta.fields(ast.Prim)) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-    }
-    return error.UnknownPrim;
+    return std.meta.stringToEnum(ast.Prim, s) orelse error.UnknownPrim;
 }
 
 fn encodePtrSize(ps: ast.PtrSize) []const u8 {
@@ -1060,10 +1057,7 @@ fn encodePtrSize(ps: ast.PtrSize) []const u8 {
 }
 
 fn decodePtrSize(s: []const u8) !ast.PtrSize {
-    inline for (std.meta.fields(ast.PtrSize)) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-    }
-    return error.UnknownPtrSize;
+    return std.meta.stringToEnum(ast.PtrSize, s) orelse error.UnknownPtrSize;
 }
 
 pub fn encodeType(allocator: std.mem.Allocator, ty: ast.Type) anyerror!Json {
@@ -1639,10 +1633,7 @@ fn encodeBinOpKind(b: ast.BinOpKind) []const u8 {
 }
 
 fn decodeBinOpKind(s: []const u8) !ast.BinOpKind {
-    inline for (std.meta.fields(ast.BinOpKind)) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-    }
-    return error.UnknownBinOpKind;
+    return std.meta.stringToEnum(ast.BinOpKind, s) orelse error.UnknownBinOpKind;
 }
 
 fn encodeUnaryOpKind(u: ast.UnaryOpKind) []const u8 {
@@ -1650,10 +1641,7 @@ fn encodeUnaryOpKind(u: ast.UnaryOpKind) []const u8 {
 }
 
 fn decodeUnaryOpKind(s: []const u8) !ast.UnaryOpKind {
-    inline for (std.meta.fields(ast.UnaryOpKind)) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-    }
-    return error.UnknownUnaryOpKind;
+    return std.meta.stringToEnum(ast.UnaryOpKind, s) orelse error.UnknownUnaryOpKind;
 }
 
 fn encodeAssignOp(a: ast.AssignOp) []const u8 {
@@ -1661,10 +1649,7 @@ fn encodeAssignOp(a: ast.AssignOp) []const u8 {
 }
 
 fn decodeAssignOp(s: []const u8) !ast.AssignOp {
-    inline for (std.meta.fields(ast.AssignOp)) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-    }
-    return error.UnknownAssignOp;
+    return std.meta.stringToEnum(ast.AssignOp, s) orelse error.UnknownAssignOp;
 }
 
 // ---------------------------------------------------------------------------

@@ -474,9 +474,9 @@ pub const ArrayInit = struct {
     elements: []const Expr = &.{},
 };
 
-/// A comptime-repeated array literal: `[_]T{ elem } ** len` (`[e; N]`).
+/// A comptime-repeated array literal: `@as([len]T, @splat(elem))` (`[e; N]`).
 pub const Repeat = struct {
-    /// Element type (`T` in `[_]T{ el } ** len`).
+    /// Element type (`T` in `@as([len]T, @splat(elem))`).
     type_name: ?Type = null,
     elem: *const Expr,
     /// Target-side element count; independent of the translator's pointer width.

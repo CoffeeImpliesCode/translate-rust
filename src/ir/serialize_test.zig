@@ -5109,10 +5109,13 @@ test "serialize: a projection on a head no declaration binds is still unresolved
 }
 
 fn checkGenericProjectionAllocationFailures(allocator: std.mem.Allocator) !void {
+    // Arena growth must allocate at every boundary, independent of backing
+    // allocator resize opportunities between fault-injection runs.
+    var fixed_growth = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
     // The fixture is built over the INJECTED allocator, so the validation
     // scratch and every table of the round trip are fault-injected too
     // rather than served from a pool the test already paid for.
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena = std.heap.ArenaAllocator.init(fixed_growth.allocator());
     defer arena.deinit();
 
     var fixture_ir = try initGenericProjectionIr(
@@ -5122,8 +5125,8 @@ fn checkGenericProjectionAllocationFailures(allocator: std.mem.Allocator) !void 
     defer fixture_ir.graph.deinit();
 
     try root.validateForTranslation(&fixture_ir);
-    const encoded = try serialize.encode(allocator, &fixture_ir);
-    defer allocator.free(encoded);
+    const encoded = try serialize.encode(fixed_growth.allocator(), &fixture_ir);
+    defer fixed_growth.allocator().free(encoded);
     // `decode` has NO whole-value deinitializer. Its contract is a
     // caller-owned arena, and everything it owns — the crate name and
     // edition, every interned type, every element and parameter list, every
@@ -5131,7 +5134,7 @@ fn checkGenericProjectionAllocationFailures(allocator: std.mem.Allocator) !void 
     // alone frees the crate and strands all of it. So the ARENA is what is
     // given back, and it is registered BEFORE the decode: a decode that fails
     // part way still releases what it had already taken.
-    var decoded_arena = std.heap.ArenaAllocator.init(allocator);
+    var decoded_arena = std.heap.ArenaAllocator.init(fixed_growth.allocator());
     defer decoded_arena.deinit();
     var decoded = try serialize.decode(decoded_arena.allocator(), encoded);
     try root.validateForTranslation(&decoded);

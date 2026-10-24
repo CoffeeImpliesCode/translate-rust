@@ -62,7 +62,7 @@ test "fill_bytes_via_next matches rand_core 0.5 byte and state boundaries" {
         .{ .bytes = "\x11\x22\x33\x44\x55\x66\x77\x88\x80\x70\x60\x50\x40\x30\x20", .calls32 = 0, .calls64 = 2, .next64 = 0xd8c7b6a594837261, .next32 = 0xe0cfbead },
         .{ .bytes = "\x11\x22\x33\x44\x55\x66\x77\x88\x80\x70\x60\x50\x40\x30\x20\x10", .calls32 = 0, .calls64 = 2, .next64 = 0xd8c7b6a594837261, .next32 = 0xe0cfbead },
     };
-    const untouched = [_]u8{0xa5} ** 40;
+    const untouched: [40]u8 = @splat(0xa5);
     for (cases) |case| {
         for (0..8) |offset| {
             var rng: ScriptedRng = .{};
@@ -211,7 +211,7 @@ test "the Error constructor rejects a zero code" {
     try std.testing.expectEqual(@as(?NonZeroU32, null), NonZeroU32.init(0));
     try std.testing.expectEqual(
         NonZeroU32,
-        @typeInfo(@TypeOf(Error.from_code)).@"fn".params[0].type.?,
+        @typeInfo(@TypeOf(Error.from_code)).@"fn".param_types[0].?,
     );
 
     // Nor can one be stored, so every value the constructor can produce reads
@@ -320,7 +320,7 @@ test "Error is a value a Result carries and it owns nothing" {
 
     // Nothing to release: the only field is a `NonZeroU32`, which is a `u32`,
     // so a copy costs the code it carries and a cleanup pass has nothing to do.
-    try std.testing.expectEqual(@as(usize, 1), @typeInfo(Error).@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 1), @typeInfo(Error).@"struct".field_names.len);
     try std.testing.expectEqual(@sizeOf(NonZeroU32), @sizeOf(Error));
     try std.testing.expect(!@hasDecl(Error, "deinit"));
 }

@@ -1755,8 +1755,8 @@ fn isValuePayload(comptime Payload: type) bool {
 test "a const generic parameter is reached by index, and no Type carries its value" {
     // The boundary itself: every arm describes a type or points at one, so the
     // value a const generic argument supplies has nowhere in this union to go.
-    inline for (@typeInfo(Type).@"union".fields) |field| {
-        try std.testing.expect(!isValuePayload(field.type));
+    inline for (@typeInfo(Type).@"union".field_types) |field_type| {
+        try std.testing.expect(!isValuePayload(field_type));
     }
 
     // The declaration survives it: `N` is a const parameter, `T` a type one.

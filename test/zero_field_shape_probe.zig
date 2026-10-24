@@ -455,9 +455,9 @@ fn writeJsonString(writer: *Writer, text: []const u8) !void {
 /// fields, so it counts as zero.
 fn fieldCount(comptime T: type) ?usize {
     return switch (@typeInfo(T)) {
-        .@"struct" => |structure| structure.fields.len,
-        .@"union" => |union_type| union_type.fields.len,
-        .@"enum" => |enum_type| enum_type.fields.len,
+        .@"struct" => |structure| structure.field_names.len,
+        .@"union" => |union_type| union_type.field_names.len,
+        .@"enum" => |enum_type| enum_type.field_names.len,
         .@"opaque" => 0,
         else => null,
     };

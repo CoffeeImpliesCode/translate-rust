@@ -3,7 +3,7 @@
 //! Zig consumer contract:
 //! Import the registered `compat` module through a build dependency; child
 //! modules are reached through the crate's exported namespaces.
-//! Requires Zig 0.16.0. Target and optimization options belong to the consumer.
+//! Requires Zig 0.17.0. Target and optimization options belong to the consumer.
 //! Rust names are preserved except native protocol hooks and name collisions.
 //! Zig field access and value copying do not enforce Rust privacy or moves.
 //! Pointers, slices and erased interfaces borrow their backing storage.
@@ -1268,7 +1268,7 @@ const ArrayViewStorage = struct {
 
 /// Runs the translated Rust operation `write_inferred_nested_array`.
 fn write_inferred_nested_array(value: u8) u8 {
-    var rows: [2][2]u8 = [_][2]u8{ [_]u8{ 0 } ** 2 } ** 2;
+    var rows: [2][2]u8 = @as([2][2]u8, @splat(@as([2]u8, @splat(0))));
     const view: []u8 = (&rows[1])[0..];
     view[0] = value;
     return rows[1][0];
@@ -1678,11 +1678,11 @@ test "dereferenced_any_advances_original_cursor" {
 }
 
 test "mutable_array_views_reach_owned_places" {
-    var storage: ArrayViewStorage = ArrayViewStorage{ .bytes = [_]u8{ 0 } ** 2 };
+    var storage: ArrayViewStorage = ArrayViewStorage{ .bytes = @as([2]u8, @splat(0)) };
     const field_view: []u8 = (&storage.bytes)[0..];
     field_view[0] = 37;
     try std.testing.expect(storage.bytes[0] == 37);
-    var rows: [2][2]u8 = [_][2]u8{ [_]u8{ 0 } ** 2 } ** 2;
+    var rows: [2][2]u8 = @as([2][2]u8, @splat(@as([2]u8, @splat(0))));
     const indexed_view: []u8 = (&rows[1])[0..];
     indexed_view[0] = 91;
     try std.testing.expect(rows[1][0] == 91);

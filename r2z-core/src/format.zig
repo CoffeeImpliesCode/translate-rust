@@ -32,9 +32,9 @@
 //! `Debug::fmt` is `formatDebug`, and an inherent method that wanted one of
 //! those names is emitted under a mangled one (`format__Type`) instead, so no
 //! method of the translated crate can take the name a position looks for. The
-//! declaration is public, because `@hasDecl` sees a private one only from the
-//! file that declares it, and a hook another module cannot reach is a hook
-//! `to_string` cannot call. The receiver is a value this module holds by name,
+//! declaration is public, because `@hasDecl` sees only public declarations,
+//! and a hook another module cannot reach is a hook `to_string` cannot call.
+//! The receiver is a value this module holds by name,
 //! so the shared `*const T` the emitter writes and the by-value one the
 //! runtime types declare are answered from the same call.
 //!
@@ -81,7 +81,7 @@ const Mode = enum { display, debug };
 /// no storage of its own; writers and hooks control their own storage.
 pub fn write(writer: *std.Io.Writer, comptime template: []const u8, args: anytype) std.Io.Writer.Error!void {
     const info = @typeInfo(@TypeOf(args));
-    if (info != .@"struct" or (!info.@"struct".is_tuple and info.@"struct".fields.len != 0)) {
+    if (info != .@"struct" or (!info.@"struct".is_tuple and info.@"struct".field_names.len != 0)) {
         @compileError("Rust format arguments must be a tuple");
     }
     comptime var cursor: usize = 0;
@@ -106,12 +106,12 @@ pub fn write(writer: *std.Io.Writer, comptime template: []const u8, args: anytyp
             .debug
         else
             @compileError("unsupported Rust format specification");
-        if (argument >= info.@"struct".fields.len) @compileError("missing Rust format argument");
+        if (argument >= info.@"struct".field_names.len) @compileError("missing Rust format argument");
         try writeValue(writer, args[argument], mode);
         argument += 1;
         cursor = close + 1;
     }
-    if (argument != info.@"struct".fields.len) @compileError("unused Rust format argument");
+    if (argument != info.@"struct".field_names.len) @compileError("unused Rust format argument");
 }
 
 /// Rust `ToString::to_string`: render `value` through its `Display`

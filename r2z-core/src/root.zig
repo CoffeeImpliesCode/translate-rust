@@ -1,7 +1,7 @@
 //! r2z-core (libr2z) — the generic Rust-core → Zig-std compatibility layer.
 //!
 //! DESIGN RULE: r2z-core maps **Rust language core / core::std** concepts onto
-//! Zig 0.16 std and builtins. It knows NOTHING about specific Rust crates
+//! Zig 0.17 std and builtins. It knows NOTHING about specific Rust crates
 //! (fnv, wyhash, ...) — each translated crate generates its OWN functions and
 //! types. The translation is automatic; it must not depend on omniscience
 //! about any particular crate's internals.
@@ -373,7 +373,7 @@ pub inline fn trailingZeros(val: anytype) std.math.Log2IntCeil(@TypeOf(val)) {
 }
 
 /// Rust `a.count_ones()` → `@popCount`.
-pub inline fn countOnes(val: anytype) std.meta.Int(.unsigned, @typeInfo(@TypeOf(val)).int.bits) {
+pub inline fn countOnes(val: anytype) @Int(.unsigned, @typeInfo(@TypeOf(val)).int.bits) {
     return @popCount(val);
 }
 
@@ -1494,7 +1494,7 @@ pub inline fn assert(cond: bool) void {
 /// so it is NOT evaluated in release builds — matches Rust semantics and
 /// avoids the Bun debug_assert-regression (prior-work §4 lesson 4).
 pub inline fn debugAssert(cond: bool) void {
-    if (builtin.mode == .Debug) {
+    if (builtin.mode == .debug) {
         std.debug.assert(cond);
     }
 }

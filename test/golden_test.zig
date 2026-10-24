@@ -41,7 +41,7 @@
 //!     usage sections. `test/golden/zig_src/wyhash/src/traits.zig` is present
 //!     and pinned, so every file this fixture emits is compared; the earlier
 //!     note here recorded that file as absent, which stopped being true once
-//!     `tools/zig-pinned.sh generate-wyhash-golden` had been run. Text shape
+//!     `zig build generate-wyhash-golden` had been run. Text shape
 //!     is what this fixture pins — the module map and the public surface under
 //!     an upstream crate — so it follows the emission and stays `source_only`.
 //!
@@ -105,8 +105,8 @@
 //!   - `compat`, `multimod`, `wyhash` and `adler` stay `source_only`: their
 //!     emitted text IS the contract they exist for. The `compat` and `wyhash`
 //!     re-pins go through the repository's own generators —
-//!     `tools/zig-pinned.sh generate-compat-golden` and
-//!     `tools/zig-pinned.sh generate-wyhash-golden` — and neither golden file
+//!     `zig build generate-compat-golden` and
+//!     `zig build generate-wyhash-golden` — and neither golden file
 //!     is never hand-edited. `test/crates/percent-encoding` is NOT named by any
 //!     fixture here, and that is an omission with a reason rather than a claim
 //!     about the crate: it is a `corpus_rows` POSITIVE row (`build.zig`), and

@@ -206,7 +206,7 @@ fn hasValidTypeTag(ty: types.Type) bool {
         @setRuntimeSafety(false);
         break :blk std.meta.activeTag(ty);
     };
-    return @intFromEnum(tag) < union_info.fields.len;
+    return @backingInt(tag) < union_info.field_names.len;
 }
 
 fn appendMangled(alloc: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), ty: types.Type) std.mem.Allocator.Error!void {

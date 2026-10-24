@@ -2,7 +2,7 @@
 # cross-test profile for translate-rust.
 #
 # No CROSS_MATRIX on purpose: cross-test then runs its own version-pinned table,
-# every Tier 1/2 platform of the Zig 0.16.0 support table, each with automatic
+# every Tier 1/2 platform of the Zig 0.17.0 support table, each with automatic
 # runner detection. On another Zig version it refuses to guess and demands a
 # matrix, which is the right answer for a project pinned to one compiler.
 #
@@ -25,13 +25,9 @@
 # under a foreign runner. The flag is the seam between the two graphs and it
 # belongs to build.zig.
 #
-# Two harnesses read this file, and they agree because the variables mean the
-# same thing to both. `./cross-test.sh` measures this repository's own graph: one
-# `zig build $CROSS_BUILD_STEP -Dtarget=…` per target, with execution inside that
-# build and `--list` reporting, per target, the runner this host has and why. The
-# external `cross-test` tool reads the same settings for the generated-package
-# matrix, which `tools/test-generated-corpus.sh` drives from inside the aggregate
-# with that aggregate's own generated profile, not with this file.
+# `cross-test-0.17 --profile cross-test.profile.sh` measures this repository's
+# test graph. The generated-package matrix uses the aggregate's own generated
+# profile through `tools/test-generated-corpus.sh`.
 #
 # Two steps drive the host toolchain and are therefore compiled but not executed
 # off the host: the CLI contract shell step, and the e2e program, which spawns

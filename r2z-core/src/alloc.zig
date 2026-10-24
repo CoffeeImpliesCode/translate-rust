@@ -82,8 +82,8 @@ pub fn dropTemporary(gpa: std.mem.Allocator, value: anytype) void {
                 // tuple are released exactly when their payloads are.
                 value.* = .empty;
             } else if (comptime structure.is_tuple) {
-                inline for (structure.fields) |field| {
-                    if (!field.is_comptime) dropTemporary(gpa, &@field(value.*, field.name));
+                inline for (structure.field_names, structure.field_attrs) |field_name, field_attrs| {
+                    if (!field_attrs.@"comptime") dropTemporary(gpa, &@field(value.*, field_name));
                 }
             }
         },
@@ -209,9 +209,9 @@ fn carriesUnmovedOwner(comptime T: type) bool {
             // `inline`, because the recursive call takes `comptime T` and this
             // only ever runs at comptime: a runtime loop would have to make the
             // field type a value.
-            inline for (structure.fields) |field| {
-                if (field.is_comptime) continue;
-                if (carriesUnmovedOwner(field.type)) break :fields true;
+            inline for (structure.field_types, structure.field_attrs) |field_type, field_attrs| {
+                if (field_attrs.@"comptime") continue;
+                if (carriesUnmovedOwner(field_type)) break :fields true;
             }
             break :fields false;
         },
@@ -224,8 +224,8 @@ fn carriesUnmovedOwner(comptime T: type) bool {
             // it refuses. The runtime `Result` names a moved-from state for each
             // arm, so its answer comes from the arms themselves.
             if (!isOwnedVecResult(T)) break :arms ownsTemporaryStorage(T);
-            inline for (union_type.fields) |field| {
-                if (carriesUnmovedOwner(field.type)) break :arms true;
+            inline for (union_type.field_types) |field_type| {
+                if (carriesUnmovedOwner(field_type)) break :arms true;
             }
             break :arms false;
         },
@@ -271,9 +271,9 @@ fn isFiniteOwnedShape(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct" => |structure| tuple: {
             if (!structure.is_tuple) break :tuple false;
-            inline for (structure.fields) |field| {
-                if (field.is_comptime) continue;
-                if (isFiniteOwnedShape(field.type)) break :tuple true;
+            inline for (structure.field_types, structure.field_attrs) |field_type, field_attrs| {
+                if (field_attrs.@"comptime") continue;
+                if (isFiniteOwnedShape(field_type)) break :tuple true;
             }
             break :tuple false;
         },
@@ -282,8 +282,8 @@ fn isFiniteOwnedShape(comptime T: type) bool {
         .error_union => |error_union| isFiniteOwnedShape(error_union.payload),
         .@"union" => |union_type| wrapper: {
             if (!isOwnedVecResult(T)) break :wrapper false;
-            inline for (union_type.fields) |field| {
-                if (isFiniteOwnedShape(field.type)) break :wrapper true;
+            inline for (union_type.field_types) |field_type| {
+                if (isFiniteOwnedShape(field_type)) break :wrapper true;
             }
             break :wrapper false;
         },
@@ -343,9 +343,9 @@ fn resetMovedFrom(comptime T: type, source: *T) void {
     switch (@typeInfo(T)) {
         .@"struct" => |structure| {
             if (comptime structure.is_tuple) {
-                inline for (structure.fields) |field| {
-                    if (field.is_comptime) continue;
-                    resetMovedFrom(field.type, &@field(source.*, field.name));
+                inline for (structure.field_names, structure.field_types, structure.field_attrs) |field_name, field_type, field_attrs| {
+                    if (field_attrs.@"comptime") continue;
+                    resetMovedFrom(field_type, &@field(source.*, field_name));
                 }
             }
         },
@@ -397,9 +397,9 @@ fn cowSliceElementType(comptime T: type) ?type {
     };
     // An untagged union reports no active payload, so it holds nothing to move.
     if (union_type.tag_type == null) return null;
-    for (union_type.fields) |field| {
-        if (!std.mem.eql(u8, field.name, "Owned")) continue;
-        const Element = vecElementType(field.type) orelse return null;
+    for (union_type.field_names, union_type.field_types) |field_name, field_type| {
+        if (!std.mem.eql(u8, field_name, "Owned")) continue;
+        const Element = vecElementType(field_type) orelse return null;
         if (T != CowSlice(Element)) return null;
         return Element;
     }
@@ -416,8 +416,8 @@ fn vecElementType(comptime T: type) ?type {
         .@"struct" => |declared| declared,
         else => return null,
     };
-    for (structure.fields) |field| {
-        const pointer = switch (@typeInfo(field.type)) {
+    for (structure.field_types) |field_type| {
+        const pointer = switch (@typeInfo(field_type)) {
             .pointer => |declared| declared,
             else => continue,
         };
@@ -454,8 +454,8 @@ pub inline fn ownsTemporaryStorage(comptime T: type) bool {
     return comptime switch (@typeInfo(T)) {
         .@"struct" => |structure| tuple: {
             if (!structure.is_tuple) break :tuple false;
-            for (structure.fields) |field| {
-                if (!field.is_comptime and ownsTemporaryStorage(field.type)) break :tuple true;
+            for (structure.field_types, structure.field_attrs) |field_type, field_attrs| {
+                if (!field_attrs.@"comptime" and ownsTemporaryStorage(field_type)) break :tuple true;
             }
             break :tuple false;
         },
@@ -464,8 +464,8 @@ pub inline fn ownsTemporaryStorage(comptime T: type) bool {
         .error_union => |error_union| ownsTemporaryStorage(error_union.payload),
         .@"union" => |union_type| variants: {
             if (union_type.tag_type == null) break :variants false;
-            for (union_type.fields) |field| {
-                if (ownsTemporaryStorage(field.type)) break :variants true;
+            for (union_type.field_types) |field_type| {
+                if (ownsTemporaryStorage(field_type)) break :variants true;
             }
             break :variants false;
         },
@@ -1185,10 +1185,10 @@ fn isOwnedVecResult(comptime T: type) bool {
         .@"union" => |declared| declared,
         else => return false,
     };
-    if (union_type.tag_type == null or union_type.fields.len != 2) return false;
-    if (!std.mem.eql(u8, union_type.fields[0].name, "Ok") or
-        !std.mem.eql(u8, union_type.fields[1].name, "Err")) return false;
-    return T == Result(union_type.fields[0].type, union_type.fields[1].type);
+    if (union_type.tag_type == null or union_type.field_names.len != 2) return false;
+    if (!std.mem.eql(u8, union_type.field_names[0], "Ok") or
+        !std.mem.eql(u8, union_type.field_names[1], "Err")) return false;
+    return T == Result(union_type.field_types[0], union_type.field_types[1]);
 }
 
 /// Whether `T` is in the finite bitwise-copy subset used by owned Vec clones.
@@ -1204,21 +1204,21 @@ fn isOwnedVecResult(comptime T: type) bool {
 pub inline fn isOwnedVecCopy(comptime T: type) bool {
     return comptime switch (@typeInfo(T)) {
         .bool, .int, .float, .error_set, .void, .vector => true,
-        .pointer => |pointer| pointer.is_const,
+        .pointer => |pointer| pointer.attrs.@"const",
         .array => |array| isOwnedVecCopy(array.child),
         .optional => |optional| isOwnedVecCopy(optional.child),
         .error_union => |error_union| isOwnedVecCopy(error_union.payload),
         .@"struct" => |structure| tuple: {
             if (!structure.is_tuple) break :tuple false;
-            for (structure.fields) |field| {
-                if (!field.is_comptime and !isOwnedVecCopy(field.type)) break :tuple false;
+            for (structure.field_types, structure.field_attrs) |field_type, field_attrs| {
+                if (!field_attrs.@"comptime" and !isOwnedVecCopy(field_type)) break :tuple false;
             }
             break :tuple true;
         },
         .@"union" => |union_type| wrapper: {
             if (!isOwnedVecResult(T)) break :wrapper false;
-            for (union_type.fields) |field| {
-                if (!isOwnedVecCopy(field.type)) break :wrapper false;
+            for (union_type.field_types) |field_type| {
+                if (!isOwnedVecCopy(field_type)) break :wrapper false;
             }
             break :wrapper true;
         },
@@ -1264,7 +1264,7 @@ fn cloneOwnedVecValue(comptime T: type, gpa: std.mem.Allocator, item: T) std.mem
     switch (@typeInfo(T)) {
         .bool, .int, .float, .error_set, .void, .vector => return item,
         .pointer => |pointer| {
-            if (pointer.is_const) return item;
+            if (pointer.attrs.@"const") return item;
         },
         .optional => |optional| {
             return if (item) |payload| try cloneOwnedVecValue(optional.child, gpa, payload) else null;
@@ -1291,15 +1291,15 @@ fn cloneOwnedVecValue(comptime T: type, gpa: std.mem.Allocator, item: T) std.mem
                 var result: T = undefined;
                 var initialized: usize = 0;
                 errdefer {
-                    inline for (structure.fields, 0..) |field, index| {
-                        if (!field.is_comptime and index < initialized) {
-                            dropTemporary(gpa, &@field(result, field.name));
+                    inline for (structure.field_names, structure.field_attrs, 0..) |field_name, field_attrs, index| {
+                        if (!field_attrs.@"comptime" and index < initialized) {
+                            dropTemporary(gpa, &@field(result, field_name));
                         }
                     }
                 }
-                inline for (structure.fields, 0..) |field, index| {
-                    if (!field.is_comptime) {
-                        @field(result, field.name) = try cloneOwnedVecValue(field.type, gpa, @field(item, field.name));
+                inline for (structure.field_names, structure.field_types, structure.field_attrs, 0..) |field_name, field_type, field_attrs, index| {
+                    if (!field_attrs.@"comptime") {
+                        @field(result, field_name) = try cloneOwnedVecValue(field_type, gpa, @field(item, field_name));
                     }
                     initialized = index + 1;
                 }
@@ -2598,7 +2598,10 @@ test "vector extension allocation failure leaves the prefix in the destination" 
     defer destination.deinit(gpa);
     destination.appendSliceAssumeCapacity("pre");
 
-    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(gpa, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
     try std.testing.expectError(
         error.OutOfMemory,
         vec_extend(u8, failing.allocator(), &destination, ByteIterator{ .items = "fix" }),

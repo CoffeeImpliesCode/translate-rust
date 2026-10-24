@@ -1481,10 +1481,7 @@ fn decodePrim(s: []const u8) !types.Prim {
 }
 
 fn decodeUnsupportedReason(s: []const u8) !spine.UnsupportedReason {
-    inline for (std.meta.fields(spine.UnsupportedReason)) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-    }
-    return error.BadWireFormat;
+    return std.meta.stringToEnum(spine.UnsupportedReason, s) orelse error.BadWireFormat;
 }
 
 fn decodeExternalNominal(
@@ -3947,7 +3944,7 @@ fn hasValidTypeTag(ty: types.Type) bool {
         @setRuntimeSafety(false);
         break :blk std.meta.activeTag(ty);
     };
-    return @intFromEnum(tag) < union_info.fields.len;
+    return @backingInt(tag) < union_info.field_names.len;
 }
 
 fn encodeCorruptType(allocator: std.mem.Allocator) !Json {

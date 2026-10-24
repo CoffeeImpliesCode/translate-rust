@@ -84,8 +84,8 @@ fn hasValidDefaultMethod(comptime T: type) bool {
     if (method_info != .@"fn") return false;
     const function = method_info.@"fn";
     if (function.is_generic) return false;
-    if (function.is_var_args) return false;
-    if (function.params.len != 0) return false;
+    if (function.attrs.varargs) return false;
+    if (function.param_types.len != 0) return false;
     const return_type = function.return_type orelse return false;
     return return_type == T;
 }
@@ -100,9 +100,9 @@ fn hasValidFromMethod(comptime T: type, comptime Source: type) bool {
     if (method_info != .@"fn") return false;
     const function = method_info.@"fn";
     if (function.is_generic) return false;
-    if (function.is_var_args) return false;
-    if (function.params.len != 1) return false;
-    const parameter_type = function.params[0].type orelse return false;
+    if (function.attrs.varargs) return false;
+    if (function.param_types.len != 1) return false;
+    const parameter_type = function.param_types[0] orelse return false;
     if (parameter_type != Source) return false;
     const return_type = function.return_type orelse return false;
     return return_type == T;
@@ -238,7 +238,7 @@ fn hasConversionMethod(comptime T: type, comptime name: []const u8) bool {
 fn conversionError(comptime Converted: type) type {
     return switch (@typeInfo(Converted)) {
         .error_union => |value| value.error_set,
-        .@"union" => std.meta.FieldType(Converted, .Err),
+        .@"union" => @FieldType(Converted, "Err"),
         else => @compileError("Rust TryFrom and TryInto must return Result"),
     };
 }

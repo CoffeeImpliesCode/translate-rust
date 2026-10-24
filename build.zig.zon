@@ -2,12 +2,12 @@
     .name = .translate_rust,
     .version = "0.0.0",
     .fingerprint = 0xc8c692767721f1d9, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Pinned C runtime. Local bindings keep node aggregates inside C.
         .tree_sitter = .{
-            .url = "git+https://github.com/tree-sitter/tree-sitter#24a64db7ccb7dff830789cf44ecfeaacf7fee822",
-            .hash = "tree_sitter-0.27.0-Tw2sR0TDCwBUIKjCd2avkJKfxXvSNZmdynJqiXMUYgAv",
+            .url = "git+https://github.com/CoffeeImpliesCode/tree-sitter?ref=zig-0.17#5c12f6266b86dd9a8f84df497fd4d594bdbd58a6",
+            .hash = "tree_sitter-0.27.0-Tw2sR2vDCwAeRl3MUEFjAqCZVRnduQEYaAtrD5-Nzz6r",
         },
         .serde = .{
             .url = "git+https://github.com/OrlovEvgeny/serde.zig#dd8cc6f97c240c7fb73c69dad2722c806e59a81b",

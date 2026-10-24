@@ -1157,7 +1157,7 @@ test "Error borrows its explicit message rather than copying it" {
     // `Error` owns nothing, so a caller that keeps its own mutable buffer sees
     // the failure render whatever that buffer now says. A runtime that copied
     // the message would keep answering with the stale text.
-    var message = [_]u8{0} ** "source is locked".len;
+    var message: ["source is locked".len]u8 = @splat(0);
     @memcpy(&message, "source is locked");
     const failure = Error.new(.PermissionDenied, &message);
     try expectErrorText("source is locked", failure);
@@ -1215,11 +1215,11 @@ test "every emitted io::ErrorKind variant names a member of the runtime enum" {
 test "read_exact and write_all report their own categories, not the receiver's" {
     const steps = [_]ReadStep{.{ .transfer = 0 }};
     var reader = ScriptedReader.init("abcd", &steps);
-    var destination = [_]u8{0} ** 4;
+    var destination: [4]u8 = @splat(0);
     const read_failure = try expectFailure(read_exact(&reader, &destination));
     try std.testing.expectEqual(ErrorKind.UnexpectedEof, read_failure.kind());
 
-    var destination_buffer = [_]u8{0} ** 2;
+    var destination_buffer: [2]u8 = @splat(0);
     var writer = SliceWriter.init(&destination_buffer);
     const write_failure = try expectFailure(try write_all(std.testing.allocator, &writer, "abcd"));
     try std.testing.expectEqual(ErrorKind.WriteZero, write_failure.kind());
@@ -1248,7 +1248,7 @@ test "read_exact completes short reads and retries interruption" {
 
 test "read_exact reports EOF after preserving consumed bytes" {
     var reader = SliceReader.init("ab");
-    var destination = [_]u8{0xaa} ** 4;
+    var destination: [4]u8 = @splat(0xaa);
 
     const failure = try expectFailure(read_exact(&reader, &destination));
     try std.testing.expectEqual(ErrorKind.UnexpectedEof, failure.kind());
@@ -1264,7 +1264,7 @@ test "read_exact preserves a concrete non-retry error after a short read" {
         .{ .failure = Error.new(.PermissionDenied, "source is locked") },
     };
     var reader = ScriptedReader.init("abcdef", &steps);
-    var destination = [_]u8{0xcc} ** 6;
+    var destination: [6]u8 = @splat(0xcc);
 
     const failure = try expectFailure(read_exact(&reader, &destination));
     try std.testing.expectEqual(ErrorKind.PermissionDenied, failure.kind());
@@ -1307,7 +1307,7 @@ test "write_all preserves a concrete non-retry error after a short write" {
         .{ .transfer = 2 },
         .{ .failure = Error.new(.BrokenPipe, "peer closed") },
     };
-    var destination = [_]u8{0xdd} ** 6;
+    var destination: [6]u8 = @splat(0xdd);
     var writer = ScriptedWriter.init(&destination, &steps);
 
     const failure = try expectFailure(try write_all(std.testing.allocator, &writer, "abcdef"));
@@ -1361,7 +1361,7 @@ test "read_exact advances a concrete slice cursor descriptor" {
 test "read_exact drains a concrete slice cursor before reporting EOF" {
     const backing: []const u8 = "ab";
     var cursor = backing;
-    var destination = [_]u8{0xaa} ** 4;
+    var destination: [4]u8 = @splat(0xaa);
 
     const failure = try expectFailure(read_exact(&cursor, &destination));
     try std.testing.expectEqual(ErrorKind.UnexpectedEof, failure.kind());
@@ -1404,7 +1404,7 @@ test "DynRead delegates every partial read to the original pointee" {
     };
     var reader = ScriptedReader.init("abcdef", &steps);
     var dynamic = DynRead.init(&reader);
-    var destination = [_]u8{0} ** 4;
+    var destination: [4]u8 = @splat(0);
 
     try std.testing.expectEqual(@as(usize, 2), dynamic.read(&destination).unwrap(std.testing.allocator));
     try std.testing.expectEqualStrings("ab", destination[0..2]);
@@ -1438,7 +1438,7 @@ test "DynRead.read_exact reports EOF after preserving transferred bytes" {
     };
     var reader = ScriptedReader.init("ab", &steps);
     var dynamic = DynRead.init(&reader);
-    var destination = [_]u8{0xaa} ** 4;
+    var destination: [4]u8 = @splat(0xaa);
 
     const failure = try expectFailure(dynamic.read_exact(&destination));
     try std.testing.expectEqual(ErrorKind.UnexpectedEof, failure.kind());
@@ -1455,7 +1455,7 @@ test "DynRead.read_exact preserves a concrete error kind after a short read" {
     };
     var reader = ScriptedReader.init("abcdef", &steps);
     var dynamic = DynRead.init(&reader);
-    var destination = [_]u8{0xcc} ** 6;
+    var destination: [6]u8 = @splat(0xcc);
 
     const failure = try expectFailure(dynamic.read_exact(&destination));
     try std.testing.expectEqual(ErrorKind.PermissionDenied, failure.kind());
@@ -1470,7 +1470,7 @@ test "DynWrite delegates every partial write to the original pointee" {
         .{ .transfer = 2 },
         .{ .transfer = 1 },
     };
-    var destination = [_]u8{0xaa} ** 4;
+    var destination: [4]u8 = @splat(0xaa);
     var writer = ScriptedWriter.init(&destination, &steps);
     var dynamic = DynWrite.init(&writer, std.testing.allocator);
 
@@ -1504,7 +1504,7 @@ test "DynWrite.write_all reports WriteZero after preserving transferred bytes" {
         .{ .transfer = 2 },
         .{ .transfer = 0 },
     };
-    var destination = [_]u8{0xdd} ** 4;
+    var destination: [4]u8 = @splat(0xdd);
     var writer = ScriptedWriter.init(&destination, &steps);
     var dynamic = DynWrite.init(&writer, std.testing.allocator);
 
@@ -1522,7 +1522,7 @@ test "DynWrite.write_all preserves a concrete error kind after a short write" {
         .{ .transfer = 2 },
         .{ .failure = Error.new(.BrokenPipe, "peer closed") },
     };
-    var destination = [_]u8{0xdd} ** 6;
+    var destination: [6]u8 = @splat(0xdd);
     var writer = ScriptedWriter.init(&destination, &steps);
     var dynamic = DynWrite.init(&writer, std.testing.allocator);
 
@@ -1654,7 +1654,7 @@ test "a short buffer fails through the Error and DynError hooks" {
 
 test "Cursor over an owned byte array advances its read position" {
     var cursor = Cursor([1]u8).init(.{0});
-    var destination = [_]u8{0xee} ** 2;
+    var destination: [2]u8 = @splat(0xee);
 
     try std.testing.expectEqual(@as(usize, 1), cursor.read(&destination).unwrap(std.testing.allocator));
     try std.testing.expectEqual(@as(u8, 0), destination[0]);
@@ -1677,7 +1677,7 @@ test "Cursor over a borrowed slice leaves the borrow untouched" {
 test "Cursor over a borrowed slice drains before reporting EOF" {
     const backing: []const u8 = "ab";
     var cursor = Cursor([]const u8).init(backing);
-    var destination = [_]u8{0xaa} ** 4;
+    var destination: [4]u8 = @splat(0xaa);
 
     const failure = try expectFailure(read_exact(&cursor, &destination));
     try std.testing.expectEqual(ErrorKind.UnexpectedEof, failure.kind());
@@ -1893,7 +1893,7 @@ test "Cursor past the end of its input reads as EOF and keeps its position" {
 
     try std.testing.expectEqual(@as(u64, 30_000), cursor.position);
     try std.testing.expectEqualStrings("", fill_buf(&cursor).unwrap(std.testing.allocator));
-    var destination = [_]u8{0xaa} ** 4;
+    var destination: [4]u8 = @splat(0xaa);
     try std.testing.expectEqual(@as(usize, 0), cursor.read(&destination).unwrap(std.testing.allocator));
     try std.testing.expectEqual(@as(u64, 30_000), cursor.position);
 

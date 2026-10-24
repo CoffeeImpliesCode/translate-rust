@@ -147,20 +147,23 @@ fn newHasher(comptime Builder: type) BuilderHasher(Builder) {
 }
 
 /// Whether `T` is the unmanaged-list shape `eql` compares by contents:
-/// `std.ArrayList(T)`, which is `{ items: []T, capacity: usize }`.
+/// `std.ArrayList(T)`, which adds a pointer-stability lock to `items` and `capacity`.
 ///
 /// The test is the same field shape `core.ops.equal` walks, so the two can
 /// never disagree about whether a value of this shape is a list. Capacity is
 /// spare storage Rust never compares, so it is hashed never.
 fn isUnmanagedListShape(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
-    const fields = @typeInfo(T).@"struct".fields;
-    if (fields.len != 2) return false;
-    const items = @typeInfo(fields[0].type);
-    const capacity = @typeInfo(fields[1].type);
-    return std.mem.eql(u8, fields[0].name, "items") and
+    const structure = @typeInfo(T).@"struct";
+    if (structure.field_names.len != 2 and structure.field_names.len != 3) return false;
+    if (structure.field_names.len == 3 and
+        (!std.mem.eql(u8, structure.field_names[2], "pointer_stability") or
+            structure.field_types[2] != std.debug.SafetyLock)) return false;
+    const items = @typeInfo(structure.field_types[0]);
+    const capacity = @typeInfo(structure.field_types[1]);
+    return std.mem.eql(u8, structure.field_names[0], "items") and
         items == .pointer and items.pointer.size == .slice and
-        std.mem.eql(u8, fields[1].name, "capacity") and
+        std.mem.eql(u8, structure.field_names[1], "capacity") and
         capacity == .int and capacity.int.bits >= 0;
 }
 /// Whether `T` is one field around the list shape above. `String` is the
@@ -171,9 +174,9 @@ fn isUnmanagedListShape(comptime T: type) bool {
 /// descriptor, whose slice pointer is an address.
 fn isListWrapperShape(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
-    const fields = @typeInfo(T).@"struct".fields;
-    if (fields.len != 1) return false;
-    return isUnmanagedListShape(fields[0].type);
+    const field_types = @typeInfo(T).@"struct".field_types;
+    if (field_types.len != 1) return false;
+    return isUnmanagedListShape(field_types[0]);
 }
 /// Feed a slice's CONTENTS, the bytes Rust's `Hash` would walk.
 fn feedSliceContents(state: anytype, slice: anytype) void {
@@ -221,13 +224,14 @@ fn feed(state: anytype, key: anytype) void {
         return;
     }
     if (comptime @typeInfo(K) == .@"struct" and isListWrapperShape(K)) {
-        feed(state, @field(key, @typeInfo(K).@"struct".fields[0].name));
+        feed(state, @field(key, @typeInfo(K).@"struct".field_names[0]));
         return;
     }
     if (comptime @typeInfo(K) == .@"struct") {
-        inline for (@typeInfo(K).@"struct".fields) |field| {
-            if (comptime !field.is_comptime) {
-                feed(state, @field(key, field.name));
+        const structure = @typeInfo(K).@"struct";
+        inline for (structure.field_names, structure.field_attrs) |field_name, field_attrs| {
+            if (comptime !field_attrs.@"comptime") {
+                feed(state, @field(key, field_name));
             }
         }
         return;
@@ -260,7 +264,7 @@ fn feed(state: anytype, key: anytype) void {
                 " — it is an untagged union, so there is no tag to feed before " ++
                 "the payload. Lower this key to a byte slice or an integer first.");
         }
-        feed(state, @intFromEnum(std.meta.activeTag(key)));
+        feed(state, @backingInt(std.meta.activeTag(key)));
         switch (key) {
             inline else => |payload| feed(state, payload),
         }
@@ -676,7 +680,7 @@ test "collections: a grow path leaves the caller's key storage where it was" {
         );
     }
     try std.testing.expectEqual(address, @intFromPtr(storage.ptr));
-    try std.testing.expectEqualSlices(u8, &([_]u8{'k'} ** (key_count * key_width)), storage);
+    try std.testing.expectEqualSlices(u8, &@as([key_count * key_width]u8, @splat('k')), storage);
 }
 
 test "collections: no read path reallocates while a caller holds a borrowed key or value" {

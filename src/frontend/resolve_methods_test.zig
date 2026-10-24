@@ -1688,7 +1688,7 @@ test "a source call that declares a scalar return is a primitive operand of an o
     const mask = try addEntity(&g, a, .fn_, "mask", root);
 
     // The declaration is the only thing in this crate that types the call.
-    var body_store = [_]bodies.BodyKind{.none} ** 2;
+    var body_store: [2]bodies.BodyKind = @splat(.none);
     body_store[mask] = .{ .fn_ = .{
         .params = &.{},
         .ret = .{ .prim = .u64 },
@@ -1809,7 +1809,7 @@ test "a source call whose declared return is not a scalar still refuses its oper
 
     // Three callees declare a result; the fourth declares nothing this pass
     // can read, so its body slot stays `.none`.
-    var body_store = [_]bodies.BodyKind{.none} ** 7;
+    var body_store: [7]bodies.BodyKind = @splat(.none);
     body_store[nominal_call] = .{ .fn_ = .{
         .params = &.{},
         .ret = .{ .path = .{ .segments = &.{.{ .name = "Box", .id = box }} } },
@@ -4274,7 +4274,7 @@ test "a blanket AsRef<[u8]> impl binds a bounded type parameter receiver's call 
 
     // `bodies` is sparse and indexed by entity id, so each scope is written
     // at its own entity's slot rather than at a counted offset.
-    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 19;
+    var bodies_store: [19]bodies.BodyKind = @splat(.none);
     bodies_store[to_hex_impl] = .{ .impl_ = .{
         .self_ty = self_param,
         .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = to_hex }} },
@@ -4409,7 +4409,7 @@ test "two blanket AsRef<[u8]> impls leave a bounded type parameter receiver's ca
         .type_ = .{ .name = "T", .bounds = &.{as_ref_bytes} },
     }};
 
-    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 10;
+    var bodies_store: [10]bodies.BodyKind = @splat(.none);
     bodies_store[to_hex_impl] = .{ .impl_ = .{
         .self_ty = self_param,
         .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = to_hex }} },
@@ -4542,7 +4542,7 @@ test "a core supertrait carries an operator over a generic parameter" {
         } },
     }};
 
-    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 21;
+    var bodies_store: [21]bodies.BodyKind = @splat(.none);
     bodies_store[eq_hash] = .{
         .fn_ = .{ .params = &.{}, .ret = .{ .prim = .unit }, .body = 0, .generics = .{ .params = &eq_generics, .where_clauses = &.{} } },
     };
@@ -4679,7 +4679,7 @@ test "a carrier around a bounded type parameter keeps the blanket call refused" 
 
     // `bodies` is sparse and indexed by entity id, so each scope is written
     // at its own entity's slot rather than at a counted offset.
-    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 13;
+    var bodies_store: [13]bodies.BodyKind = @splat(.none);
     bodies_store[to_hex_impl] = .{ .impl_ = .{
         .self_ty = self_param,
         .trait_path = .{ .segments = &.{.{ .name = "ToHex", .id = to_hex }} },
@@ -4891,7 +4891,7 @@ test "expect returns the Ok payload and expect_err the error arm of its own Resu
         } } },
     };
 
-    var bodies_store = [_]bodies.BodyKind{.none} ** 10;
+    var bodies_store: [10]bodies.BodyKind = @splat(.none);
     bodies_store[make] = .{ .fn_ = .{ .params = &.{}, .ret = error_set_result, .body = 0 } };
     bodies_store[make_detailed] = .{ .fn_ = .{ .params = &.{}, .ret = value_result, .body = 0 } };
     bodies_store[fault] = .{ .enum_ = .{
@@ -5021,7 +5021,7 @@ test "a constant's own declared type is what types its method receiver" {
         } } },
     };
 
-    var bodies_store = [_]bodies.BodyKind{.none} ** 8;
+    var bodies_store: [8]bodies.BodyKind = @splat(.none);
     bodies_store[control] = .{ .const_ = .{ .ty = .{ .reference = &set_ref }, .init = 7 } };
     bodies_store[table] = .{ .const_ = .{ .ty = table_type, .init = 8 } };
 
@@ -5861,7 +5861,7 @@ test "a crate From impl is what its own into call resolves to" {
         .args = &.{.{ .slice = &.{ .const_ = true, .elem = .{ .prim = .u8 } } }},
     } };
 
-    var bodies_store = [_]bodies.BodyKind{.none} ** 7;
+    var bodies_store: [7]bodies.BodyKind = @splat(.none);
     var types_store = [_]types.Type{ decode_ty, cow_ty };
     var exprs_store = [_]exprs.Expr{
         .{ .id = 0, .span = span, .ty = 0, .kind = .{ .path = .{ .def = decode, .generic_args = &.{} } } },
@@ -6040,7 +6040,7 @@ test "a raw pointer pair comparison is a typed operator" {
         .mut = false,
         .pointee = .{ .prim = .u8 },
     } };
-    var bodies_store = [_]bodies.BodyKind{bodies.BodyKind.none} ** 4;
+    var bodies_store: [4]bodies.BodyKind = @splat(.none);
     bodies_store[less] = .{ .fn_ = .{
         .params = &.{
             .{ .name = "a", .ty = byte_pointer, .span = span },
@@ -6419,7 +6419,7 @@ test "itoa sealed Integer write resolves through the declared supertrait" {
             .{ .name = "private", .id = sealed }, .{ .name = "Sealed", .id = inner },
         } } }},
     }};
-    var body_store = [_]bodies.BodyKind{.none} ** 8;
+    var body_store: [8]bodies.BodyKind = @splat(.none);
     const text: types.Ref = .{ .mut = false, .pointee = types.str_type };
     body_store[inner] = .{ .trait_ = .{ .name = "Sealed", .methods = &.{
         .{ .name = "write", .ret = .{ .reference = &text }, .receiver = .owned },
@@ -6478,7 +6478,7 @@ test "atoi checked arithmetic requires its exact numeric trait bound" {
             .{ .name = "checked", .id = null },    .{ .name = "CheckedMul", .id = null },
         } } },
     } } }};
-    var body_store = [_]bodies.BodyKind{.none} ** 8;
+    var body_store: [8]bodies.BodyKind = @splat(.none);
     body_store[parse] = .{ .fn_ = .{
         .params = &.{},
         .ret = .{ .prim = .unit },
@@ -6569,7 +6569,7 @@ test "generic Hasher primitive write remains deferred rather than taking a nativ
             .{ .name = "Hasher", .id = null },
         } } },
     } } }};
-    var body_store = [_]bodies.BodyKind{.none} ** 5;
+    var body_store: [5]bodies.BodyKind = @splat(.none);
     body_store[function] = .{ .fn_ = .{
         .params = &.{},
         .ret = .{ .prim = .unit },
@@ -6622,7 +6622,7 @@ test "Adler BufRead calls retain mutable dispatch without allocating" {
             .{ .name = "BufRead", .id = null },
         } } },
     } } }};
-    var body_store = [_]bodies.BodyKind{.none} ** 5;
+    var body_store: [5]bodies.BodyKind = @splat(.none);
     body_store[function] = .{ .fn_ = .{
         .params = &.{},
         .ret = .{ .prim = .unit },
@@ -6734,7 +6734,7 @@ test "source trait methods remain available through opaque receiver bounds" {
     const provider = try addEntity(&g, a, .trait_, "Render", root);
     const owner = try addEntity(&g, a, .fn_, "render", root);
     const bounds = [_]types.Bound{.{ .path = .{ .segments = &.{.{ .name = "Render", .id = provider }} } }};
-    var body_store = [_]bodies.BodyKind{.none} ** 3;
+    var body_store: [3]bodies.BodyKind = @splat(.none);
     body_store[provider] = .{ .trait_ = .{ .name = "Render", .methods = &.{
         .{ .name = "render", .ret = .{ .prim = .usize } },
     } } };
@@ -6804,7 +6804,7 @@ test "a little-endian image over a recovered field receiver dispatches and takes
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 5;
+    var body_store: [5]bodies.BodyKind = @splat(.none);
     body_store[finish] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u64 }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
     const stats = try resolve_methods.resolveMethods(&g, &b);
@@ -6841,7 +6841,7 @@ test "a pointer-sized byte image still needs the lowering layer's target width" 
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 4;
+    var body_store: [4]bodies.BodyKind = @splat(.none);
     body_store[finish] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u64 }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
     const stats = try resolve_methods.resolveMethods(&g, &b);
@@ -6871,7 +6871,7 @@ test "a recorded byte image whose width is not the receiver's stays refused" {
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 4;
+    var body_store: [4]bodies.BodyKind = @splat(.none);
     body_store[finish] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u64 }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
     const stats = try resolve_methods.resolveMethods(&g, &b);
@@ -6907,7 +6907,7 @@ test "a pointer-sized byte image whose width is an expression still dispatches" 
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 4;
+    var body_store: [4]bodies.BodyKind = @splat(.none);
     body_store[finish] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u64 }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
     const stats = try resolve_methods.resolveMethods(&g, &b);
@@ -6958,7 +6958,7 @@ test "an untyped field receiver takes its type from the struct declaration" {
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 6;
+    var body_store: [6]bodies.BodyKind = @splat(.none);
     body_store[sea_hasher] = .{ .struct_ = .{ .layout = .named, .fields = &fields } };
     body_store[finish] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u64 }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
@@ -7003,7 +7003,7 @@ test "a tuple struct field receiver projects the position the source wrote" {
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 5;
+    var body_store: [5]bodies.BodyKind = @splat(.none);
     body_store[lane] = .{ .struct_ = .{ .layout = .tuple, .fields = &fields } };
     body_store[finish] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u64 }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
@@ -7045,7 +7045,7 @@ test "a tuple element receiver dispatches from the element's declared type" {
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 4;
+    var body_store: [4]bodies.BodyKind = @splat(.none);
     body_store[scan] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .usize }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
     const stats = try resolve_methods.resolveMethods(&g, &b);
@@ -7083,7 +7083,7 @@ test "a tuple element position outside the tuple stays refused" {
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 4;
+    var body_store: [4]bodies.BodyKind = @splat(.none);
     body_store[scan] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .usize }, .body = 0 } };
     var b: bodies.Bodies = .{ .exprs = &expression_store, .types = &type_store, .bodies = &body_store, .stmts = &.{}, .pats = &.{} };
     const stats = try resolve_methods.resolveMethods(&g, &b);
@@ -7129,7 +7129,7 @@ test "two declarations under one name leave a field projection untyped" {
             .args = &.{},
         } } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 6;
+    var body_store: [6]bodies.BodyKind = @splat(.none);
     body_store[first] = .{ .struct_ = .{ .layout = .named, .fields = &wide } };
     body_store[second] = .{ .struct_ = .{ .layout = .named, .fields = &narrow } };
     body_store[finish] = .{ .fn_ = .{ .params = &.{}, .ret = .{ .prim = .u64 }, .body = 0 } };
@@ -7165,7 +7165,7 @@ test "SipHasher generic Hash and Hasher methods keep source dispatch available" 
             .{ .name = "Hash", .id = null },
         } } }} } },
     };
-    var body_store = [_]bodies.BodyKind{.none} ** 7;
+    var body_store: [7]bodies.BodyKind = @splat(.none);
     body_store[function] = .{ .fn_ = .{
         .params = &.{},
         .ret = .{ .prim = .u64 },

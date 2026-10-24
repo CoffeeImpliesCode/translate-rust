@@ -109,8 +109,8 @@ fn isNativelyComparable(comptime T: type) bool {
             isNativelyComparable(pointer.child),
         .@"struct" => |structure| blk: {
             if (structure.layout == .@"packed") break :blk true;
-            for (structure.fields) |field| {
-                if (!isNativelyComparable(field.type)) break :blk false;
+            for (structure.field_types) |field_type| {
+                if (!isNativelyComparable(field_type)) break :blk false;
             }
             break :blk true;
         },
@@ -118,8 +118,8 @@ fn isNativelyComparable(comptime T: type) bool {
         // whatever the individual members are.
         .@"enum" => true,
         .@"union" => |union_type| blk: {
-            for (union_type.fields) |field| {
-                if (!isNativelyComparable(field.type)) break :blk false;
+            for (union_type.field_types) |field_type| {
+                if (!isNativelyComparable(field_type)) break :blk false;
             }
             break :blk true;
         },
@@ -133,13 +133,16 @@ fn isNativelyComparable(comptime T: type) bool {
 /// do for this shape.
 fn isUnmanagedList(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
-    const fields = @typeInfo(T).@"struct".fields;
-    if (fields.len != 2) return false;
-    const items = @typeInfo(fields[0].type);
-    const capacity = @typeInfo(fields[1].type);
-    return std.mem.eql(u8, fields[0].name, "items") and
+    const structure = @typeInfo(T).@"struct";
+    if (structure.field_names.len != 2 and structure.field_names.len != 3) return false;
+    if (structure.field_names.len == 3 and
+        (!std.mem.eql(u8, structure.field_names[2], "pointer_stability") or
+            structure.field_types[2] != std.debug.SafetyLock)) return false;
+    const items = @typeInfo(structure.field_types[0]);
+    const capacity = @typeInfo(structure.field_types[1]);
+    return std.mem.eql(u8, structure.field_names[0], "items") and
         items == .pointer and items.pointer.size == .slice and
-        std.mem.eql(u8, fields[1].name, "capacity") and
+        std.mem.eql(u8, structure.field_names[1], "capacity") and
         capacity == .int and capacity.int.bits >= 0;
 }
 
@@ -151,16 +154,16 @@ fn isUnmanagedList(comptime T: type) bool {
 fn isListContainer(comptime T: type) bool {
     if (isUnmanagedList(T)) return true;
     if (@typeInfo(T) != .@"struct") return false;
-    const fields = @typeInfo(T).@"struct".fields;
-    if (fields.len != 1) return false;
-    return isUnmanagedList(fields[0].type);
+    const field_types = @typeInfo(T).@"struct".field_types;
+    if (field_types.len != 1) return false;
+    return isUnmanagedList(field_types[0]);
 }
 
 /// The field to descend into for a type `isListContainer` accepted: the list
 /// itself, or the sole field holding it.
 fn listContainerFieldName(comptime T: type) []const u8 {
     if (isUnmanagedList(T)) return "items";
-    return @typeInfo(T).@"struct".fields[0].name;
+    return @typeInfo(T).@"struct".field_names[0];
 }
 
 /// Compare two structs field by field. Only reached when the type is not
@@ -168,8 +171,8 @@ fn listContainerFieldName(comptime T: type) []const u8 {
 /// eventually bottoms out in one.
 fn equalFields(left: anytype, right: anytype) bool {
     const Left = @TypeOf(left);
-    inline for (@typeInfo(Left).@"struct".fields) |field| {
-        if (!equal(@field(left, field.name), @field(right, field.name))) return false;
+    inline for (@typeInfo(Left).@"struct".field_names) |field_name| {
+        if (!equal(@field(left, field_name), @field(right, field_name))) return false;
     }
     return true;
 }

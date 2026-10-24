@@ -562,9 +562,11 @@ test "serialize: nested decoder releases malformed and allocation failures" {
 }
 
 fn checkPackageAllocationFailures(
-    allocator: std.mem.Allocator,
+    backing_allocator: std.mem.Allocator,
     value: std.json.Value,
 ) !void {
+    var stable = testing.FailingAllocator.init(backing_allocator, .{ .resize_fail_index = 0 });
+    const allocator = stable.allocator();
     const decoded = try serialize.decodePackage(allocator, value);
     defer {
         allocator.free(decoded.name);
@@ -681,9 +683,11 @@ fn packageEncodingSweep(
 }
 
 fn checkPackageEncodeAllocations(
-    allocator: std.mem.Allocator,
+    backing_allocator: std.mem.Allocator,
     pkg: *const ast.Package,
 ) !void {
+    var stable = testing.FailingAllocator.init(backing_allocator, .{ .resize_fail_index = 0 });
+    const allocator = stable.allocator();
     allocator.free(try serialize.encode(allocator, pkg));
 }
 

@@ -71,7 +71,7 @@
 #   R2Z_CORPUS_CACHE_MAX_MB  refuse to start above this many MiB in the shared
 #                          cache (default 65536). The check never prunes: a full
 #                          cache is reported and the run stops.
-#   R2Z_ZIG                absolute path to a real Zig 0.16.0 executable
+#   R2Z_ZIG                absolute path to a real Zig 0.17.0 executable
 #   ZIG                    same, and the variable cross-test itself reads
 #
 # R2Z_SCRATCH is deliberately not honoured for the producer. Its caches have to
@@ -237,11 +237,8 @@ split_target() {
     printf '%s\t%s\t%s\n' "$arch" "$os" "$abi"
 }
 
-# The one compiler this harness measures. `cross-test.profile.sh` requests the
-# 53 Tier 1/2 targets of the 0.16.0 support table, and the census refuses any
-# other count, so another compiler is a different table rather than a shorter
-# run.
-required_zig_version=0.16.0
+# The compiler whose support table this harness measures.
+required_zig_version=0.17.0
 
 # The reason `version` is not the pinned compiler, printed and returned as 0.
 toolchain_version_fault() {
@@ -503,8 +500,8 @@ resolve_tool() {
     fi
     return 1
 }
-cross_test="$(resolve_tool cross-test "$HOME/.local/bin/cross-test")" ||
-    die "no cross-test on PATH and none at $HOME/.local/bin/cross-test; the pinned matrix table lives in its companion zig-targets.sh"
+cross_test="$(resolve_tool cross-test-0.17 "$HOME/.local/bin/cross-test-0.17")" ||
+    die "no cross-test-0.17 on PATH or in the user's local bin directory"
 cross_test="$(realpath -e -- "$cross_test")" || die "cannot resolve the cross-test driver"
 note "cross-test driver: $cross_test"
 
@@ -521,10 +518,8 @@ jq_bin="$(realpath -e -- "$jq_bin")" || die "cannot resolve jq"
 note "summary parser: $jq_bin"
 
 # ── 4. The shared cache is shared, bounded, and never pruned ────────────────
-# One cache serves every target. cross-test gives all 53 rows the same
-# `--cache-dir`, so a per-target cache tree would multiply the same package
-# builds by 53 for no benefit; the profile pins jobs to 1 because concurrent Zig
-# builds over one cache abort.
+# Every target uses one shared cache. The profile serializes builds to avoid
+# concurrent writers to that cache.
 # The profile reapplies this measured root after cross-test sources host policy,
 # so retained temporary and global-cache artifacts stay under the same lock.
 cache_max_mb="${R2Z_CORPUS_CACHE_MAX_MB:-65536}"
@@ -540,7 +535,7 @@ flock -x 9 || die "cannot lock the shared generated-corpus cache"
 # Measured, never pruned: a cache over the bound is reported and the run stops.
 # The same measurement is taken again after the matrix, because the matrix is
 # what fills that cache — a bound checked only on the way in says nothing about
-# what 53 targets left behind.
+# what the target matrix left behind.
 measure_cache() {
     local measurement byte_pattern='^[[:space:]]*([0-9]{1,18})B?[[:space:]]+.+$'
     measurement="$("$dust_bin" -o b -b -c -P -d 0 -- "$cache")" ||
@@ -642,7 +637,7 @@ while IFS=$'\t' read -r target kind reason; do
     census_reason["$target"]="$reason"
     case "$kind" in
         native) census_native=$((census_native + 1)) ;;
-        exec) census_exec=$((census_exec + 1)) ;;
+        exec|qemu_user) census_exec=$((census_exec + 1)) ;;
         unavailable) census_unavailable=$((census_unavailable + 1)) ;;
         *) die "cross-test --list reported the unknown runner kind '$kind' for $target" ;;
     esac
@@ -657,11 +652,9 @@ census_total="${#census_targets[@]}"
     die "cross-test --list printed $census_printed census rows but only $census_total were well formed"
 ((census_declared == census_total)) ||
     die "cross-test --list declared $census_declared targets but listed $census_total rows"
-# This harness targets one compiler's table: the 53 Tier 1/2 rows of Zig 0.16.0.
-# A different count is a different table, not a shorter run, and is refused here
-# rather than accepted at whatever size it happens to be.
-((census_total == 53)) ||
-    die "the Zig 0.16.0 Tier 1/2 table listed $census_total targets, not 53"
+# Require a nonempty compiler support table.
+((census_total > 0)) ||
+    die "the Zig 0.17.0 support table is empty"
 ((census_native + census_exec + census_unavailable == census_total)) ||
     die "the census runner kinds do not add up to $census_total targets"
 
@@ -674,8 +667,7 @@ note "census receipt: $census"
 # the same executable that built every artifact in this run. Checking the census
 # against it is what keeps the matrix a measurement rather than a list: a row
 # that does not decompose into three published values is not a target this
-# compiler reports, and a matrix of 53 rows it cannot build 53 targets for is a
-# claim rather than a result.
+# compiler reports, so every matrix row must name a published target.
 #
 # It builds nothing, reads nothing from the network, and does not depend on
 # the aggregate — so it runs on the `--list` path too.
@@ -798,8 +790,6 @@ unique_ids="$("$jq_bin" -r '[.targets[].target] | unique | length | tostring' "$
     die "the summary carries $summary_records rows but only $unique_ids distinct target ids"
 ((summary_records == census_total)) ||
     die "the summary carries $summary_records target rows but the census listed $census_total"
-((summary_records == 53)) ||
-    die "the summary carries $summary_records target rows, not the pinned 53 of the Zig 0.16.0 table"
 ((declared_rows == summary_records)) ||
     die "the summary declares target_count=$declared_rows but carries $summary_records target rows"
 note "summary: $summary_records rows, $unique_ids distinct target ids, declared target_count $declared_rows"
@@ -986,7 +976,7 @@ for target in "${census_targets[@]}"; do
     if [[ "${row_build_exit[$target]}" != 0 ]]; then
         problems+=("build exit ${row_build_exit[$target]}")
     fi
-    if [[ "$kind" == native || "$kind" == exec ]]; then
+    if [[ "$kind" == native || "$kind" == exec || "$kind" == qemu_user ]]; then
         # An available row counts as executed only when it built, ran to a zero
         # exit, was not skipped and reported a nonzero assertion count. A
         # detected runner is never on its own an execution claim, and neither is

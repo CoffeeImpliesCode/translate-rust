@@ -6,16 +6,11 @@ and runs the generated package's tests before publishing it.
 
 ## Requirements
 
-- Zig 0.16.0 and a C-compatible libc target.
+- Zig 0.17.0 and a C-compatible libc target.
 - Network access for the pinned tree-sitter and serde dependencies.
 - A POSIX shell for integration checks. Rust and Cargo are needed for native
   differential tests and the Rust corpus oracle, not for source translation.
 - Local storage with atomic file operations for test scratch and compiler caches.
-
-The Zig 0.17.0 migration is blocked by tree-sitter's upstream build script:
-`findSourceFiles` uses the removed `std.Build.build_root` field. The pinned
-revision and upstream `master` both contain that call. The manifests retain the
-current compiler requirement until a compatible dependency is available.
 
 ## Build and test
 

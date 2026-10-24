@@ -185,11 +185,11 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
             \\        std.builtin.OptimizeMode,
             \\        "optimize",
             \\        "Prioritize performance, safety, or binary size",
-            \\    ) orelse switch (b.release_mode) {{
-            \\        .off, .any => .ReleaseSafe,
-            \\        .fast => .ReleaseFast,
-            \\        .safe => .ReleaseSafe,
-            \\        .small => .ReleaseSmall,
+            \\    ) orelse switch (b.graph.release_mode) {{
+            \\        .off, .any => .safe,
+            \\        .fast => .fast,
+            \\        .safe => .safe,
+            \\        .small => .small,
             \\    }};
             \\
             \\    const pkg_mod = b.addModule("{s}", .{{
@@ -269,11 +269,11 @@ fn generateBuildZig(allocator: std.mem.Allocator, pkg: *const ast.Package) ![]co
         \\        std.builtin.OptimizeMode,
         \\        "optimize",
         \\        "Prioritize performance, safety, or binary size",
-        \\    ) orelse switch (b.release_mode) {{
-        \\        .off, .any => .ReleaseSafe,
-        \\        .fast => .ReleaseFast,
-        \\        .safe => .ReleaseSafe,
-        \\        .small => .ReleaseSmall,
+        \\    ) orelse switch (b.graph.release_mode) {{
+        \\        .off, .any => .safe,
+        \\        .fast => .fast,
+        \\        .safe => .safe,
+        \\        .small => .small,
         \\    }};
         \\
         \\{s}
@@ -343,7 +343,7 @@ fn generateBuildZigZon(
                 \\    .name = .{s},
                 \\    .version = "{s}",
                 \\    .fingerprint = 0x{x:0>16},
-                \\    .minimum_zig_version = "0.16.0",
+                \\    .minimum_zig_version = "0.17.0",
                 \\    .paths = .{{
                 \\        "build.zig",
                 \\        "build.zig.zon",
@@ -360,7 +360,7 @@ fn generateBuildZigZon(
             \\.{{
             \\    .name = .{s},
             \\    .version = "{s}",
-            \\    .minimum_zig_version = "0.16.0",
+            \\    .minimum_zig_version = "0.17.0",
             \\    .paths = .{{
             \\        "build.zig",
             \\        "build.zig.zon",
@@ -391,7 +391,7 @@ fn generateBuildZigZon(
         try buf.appendSlice(allocator, fp_str);
         try buf.appendSlice(allocator, ",\n");
     }
-    try buf.appendSlice(allocator, "    .minimum_zig_version = \"0.16.0\",\n");
+    try buf.appendSlice(allocator, "    .minimum_zig_version = \"0.17.0\",\n");
     try buf.appendSlice(allocator, "    .dependencies = .{\n");
     for (pkg.zon_deps) |dep| {
         const dep_id = try zonIdentName(allocator, dep.name);
@@ -764,8 +764,8 @@ fn validateStagedPackage(
 /// Debug catches compile-time breakage; ReleaseSafe is what a consumer runs,
 /// where the optimizer is on and `std.debug.assert` guards are load-bearing.
 const promotion_optimize_flags = [_][]const u8{
-    "-Doptimize=Debug",
-    "-Doptimize=ReleaseSafe",
+    "-Doptimize=debug",
+    "-Doptimize=safe",
 };
 
 /// The build-system step each gate phase runs. `check` compiles the staged
@@ -1852,10 +1852,10 @@ test "promotion gate compiles and runs the staged package in Debug and ReleaseSa
     // Each mode is compiled and then run, in that order: a package that only
     // compiles must not reach the caller as a promoted package.
     const expected = [_]struct { flag: []const u8, phase: GatePhase }{
-        .{ .flag = "-Doptimize=Debug", .phase = .compile },
-        .{ .flag = "-Doptimize=Debug", .phase = .run },
-        .{ .flag = "-Doptimize=ReleaseSafe", .phase = .compile },
-        .{ .flag = "-Doptimize=ReleaseSafe", .phase = .run },
+        .{ .flag = "-Doptimize=debug", .phase = .compile },
+        .{ .flag = "-Doptimize=debug", .phase = .run },
+        .{ .flag = "-Doptimize=safe", .phase = .compile },
+        .{ .flag = "-Doptimize=safe", .phase = .run },
     };
     try std.testing.expectEqual(expected.len, context.flags.items.len);
     for (expected, 0..) |want, index| {
@@ -1877,7 +1877,7 @@ test "promotion gate returns the first failing mode output without running later
     const test_io = std.testing.io;
     var context: GateModeTestContext = .{
         .allocator = allocator,
-        .fail_flag = "-Doptimize=Debug",
+        .fail_flag = "-Doptimize=debug",
         .fail_stderr = "error: use this value: 0xdeadbeefcafebabe",
     };
     defer context.flags.deinit(allocator);
@@ -1904,7 +1904,7 @@ test "promotion gate fails when the package breaks only under ReleaseSafe" {
     const test_io = std.testing.io;
     var context: GateModeTestContext = .{
         .allocator = allocator,
-        .fail_flag = "-Doptimize=ReleaseSafe",
+        .fail_flag = "-Doptimize=safe",
         .fail_stderr = "error: use of undeclared identifier 'undefined_value'",
     };
     defer context.flags.deinit(allocator);
@@ -1917,7 +1917,7 @@ test "promotion gate fails when the package breaks only under ReleaseSafe" {
     // catches this, and its output carries no fingerprint hint, so promotion
     // must report a build failure rather than patch the manifest and re-run.
     try std.testing.expectEqual(@as(usize, 3), context.flags.items.len);
-    try std.testing.expectEqualStrings("-Doptimize=ReleaseSafe", context.flags.items[2]);
+    try std.testing.expectEqualStrings("-Doptimize=safe", context.flags.items[2]);
     try std.testing.expectEqual(GatePhase.compile, result.phase);
     try std.testing.expectEqual(@as(u8, 1), result.term.exited);
     try std.testing.expectEqual(@as(?u64, null), try resolveFingerprint(
@@ -2533,37 +2533,37 @@ test "the staging check admits the name promotion creates and no other" {
     const short_nonce = try std.fmt.allocPrint(
         allocator,
         "zig-out/staging-audit/.published.staging.{s}",
-        .{"a" ** 31},
+        .{@as([31]u8, @splat('a'))},
     );
     defer allocator.free(short_nonce);
     const long_nonce = try std.fmt.allocPrint(
         allocator,
         "zig-out/staging-audit/.published.staging.{s}",
-        .{"a" ** 33},
+        .{@as([33]u8, @splat('a'))},
     );
     defer allocator.free(long_nonce);
     const non_hex_nonce = try std.fmt.allocPrint(
         allocator,
         "zig-out/staging-audit/.published.staging.{s}",
-        .{"g" ** 32},
+        .{@as([32]u8, @splat('g'))},
     );
     defer allocator.free(non_hex_nonce);
     const upper_hex_nonce = try std.fmt.allocPrint(
         allocator,
         "zig-out/staging-audit/.published.staging.{s}",
-        .{"A" ** 32},
+        .{@as([32]u8, @splat('A'))},
     );
     defer allocator.free(upper_hex_nonce);
     const elsewhere = try std.fmt.allocPrint(
         allocator,
         "zig-out/elsewhere/.published.staging.{s}",
-        .{"a" ** 32},
+        .{@as([32]u8, @splat('a'))},
     );
     defer allocator.free(elsewhere);
     const below_staging = try std.fmt.allocPrint(
         allocator,
         "zig-out/staging-audit/.published.staging.{s}/src",
-        .{"a" ** 32},
+        .{@as([32]u8, @splat('a'))},
     );
     defer allocator.free(below_staging);
 

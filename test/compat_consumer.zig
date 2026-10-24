@@ -348,7 +348,7 @@ fn compareWithAllocationFailures(gpa: std.mem.Allocator) !void {
 // must remain usable where a caller requires a plain bool function.
 test "cleanup-only consuming functions work as infallible predicates" {
     const gpa = std.testing.allocator;
-    const Argument = @typeInfo(@TypeOf(translated.temporary_moved_result_caller)).@"fn".params[1].type.?;
+    const Argument = @typeInfo(@TypeOf(translated.temporary_moved_result_caller)).@"fn".param_types[1].?;
     const predicate: *const fn (std.mem.Allocator, Argument) bool =
         translated.temporary_moved_result_caller;
     const matching = try translated.owned(gpa, "same");

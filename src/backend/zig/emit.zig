@@ -1,7 +1,7 @@
-//! translate_rust.backend.zig.emit — Clean Zig 0.16 source code emitter.
+//! translate_rust.backend.zig.emit — Clean Zig 0.17 source code emitter.
 //!
 //! Formats the target-language AST DOM (ast.File, ast.Package, ast.Decl, etc.)
-//! into idiomatic, compilable Zig 0.16 source code text.
+//! into idiomatic, compilable Zig 0.17 source code text.
 //! Strictly decoupled: zero dependencies on `ir` or `frontend`.
 
 const std = @import("std");
@@ -2419,15 +2419,14 @@ fn emitExprScoped(
         },
         .repeat => |rp| {
             if (rp.type_name) |tn| {
-                try buf.appendSlice(allocator, "[_]");
+                try buf.print(allocator, "@as([{d}]", .{rp.len});
                 try emitType(allocator, buf, tn);
-            } else {
-                try buf.appendSlice(allocator, ".");
+                try buf.appendSlice(allocator, ", ");
             }
-            try buf.appendSlice(allocator, "{ ");
+            try buf.appendSlice(allocator, "@splat(");
             try emitExprScoped(context, allocator, buf, rp.elem.*, depth);
-            try buf.appendSlice(allocator, " } ** ");
-            try buf.print(allocator, "{d}", .{rp.len});
+            try buf.appendSlice(allocator, ")");
+            if (rp.type_name != null) try buf.appendSlice(allocator, ")");
         },
         .builtin => |bi| {
             if (std.mem.eql(u8, bi.name, "index") and bi.args.len == 2) {
@@ -4176,7 +4175,7 @@ test "every labelled-block position has a verdict, and only a bare statement has
         .{ .position = .bare_statement, .legal = false },
     };
     try std.testing.expectEqual(
-        @typeInfo(LabelledBlockPosition).@"enum".fields.len,
+        @typeInfo(LabelledBlockPosition).@"enum".field_names.len,
         verdicts.len,
     );
     for (verdicts) |verdict| {

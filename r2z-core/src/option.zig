@@ -141,7 +141,7 @@ test "the option module publishes every free function the backend emits" {
             if (info != .@"fn") {
                 @compileError("r2z.option." ++ entry.name ++ " is no longer a free function the backend can call");
             }
-            if (info.@"fn".params.len != entry.args) {
+            if (info.@"fn".param_types.len != entry.args) {
                 @compileError("r2z.option." ++ entry.name ++ " no longer takes the argument count the backend emits");
             }
         }

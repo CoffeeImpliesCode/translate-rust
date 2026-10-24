@@ -494,10 +494,10 @@ test "adler adler32_slice matches the crate's own test vectors" {
     // `src/lib.rs` `wiki` and `zeroes`/`mixed`.
     try std.testing.expectEqual(@as(u32, 0x11e60398), adler.adler32_slice("Wikipedia"));
     try std.testing.expectEqual(@as(u32, 1), adler.adler32_slice(""));
-    try std.testing.expectEqual(@as(u32, 0x0064_0001), adler.adler32_slice(&.{0} ** 100));
-    try std.testing.expectEqual(@as(u32, 0x0400_0001), adler.adler32_slice(&.{0} ** 1024));
-    try std.testing.expectEqual(@as(u32, 0x00f0_0001), adler.adler32_slice(&.{0} ** (1024 * 1024)));
-    try std.testing.expectEqual(@as(u32, 0xd500_9ab1), adler.adler32_slice(&.{0xA5} ** (1024 * 1024)));
+    try std.testing.expectEqual(@as(u32, 0x0064_0001), adler.adler32_slice(&@as([100]u8, @splat(0))));
+    try std.testing.expectEqual(@as(u32, 0x0400_0001), adler.adler32_slice(&@as([1024]u8, @splat(0))));
+    try std.testing.expectEqual(@as(u32, 0x00f0_0001), adler.adler32_slice(&@as([1024 * 1024]u8, @splat(0))));
+    try std.testing.expectEqual(@as(u32, 0xd500_9ab1), adler.adler32_slice(&@as([1024 * 1024]u8, @splat(0xA5))));
 }
 
 test "adler Adler32 resumes from a recorded checksum" {
@@ -505,16 +505,16 @@ test "adler Adler32 resumes from a recorded checksum" {
     // the same 1 MiB run produces, and resuming from the partial checksum must
     // reach it too.
     var whole = adler.Adler32.new();
-    whole.write_slice(&.{0xff} ** (1024 * 1024));
+    whole.write_slice(&@as([1024 * 1024]u8, @splat(0xff)));
     const whole_sum = whole.checksum();
 
     var partial_run = adler.Adler32.new();
-    partial_run.write_slice(&.{0xff} ** 1024);
+    partial_run.write_slice(&@as([1024]u8, @splat(0xff)));
     const partial_sum = partial_run.checksum();
     try std.testing.expectEqual(@as(u32, 0x79a6_fc2e), partial_sum);
 
     var resumed = adler.Adler32.from_checksum(partial_sum);
-    resumed.write_slice(&.{0xff} ** (1024 * 1024 - 1024));
+    resumed.write_slice(&@as([1024 * 1024 - 1024]u8, @splat(0xff)));
     try std.testing.expectEqual(whole_sum, resumed.checksum());
 }
 

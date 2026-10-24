@@ -1,12 +1,12 @@
 const std = @import("std");
-fn pointer_info(comptime Ptr: type) std.builtin.Type.Pointer {
+fn pointer_info(comptime Ptr: type) std.lang.Type.Pointer {
     return switch (@typeInfo(Ptr)) {
         .pointer => |info| info,
         else => @compileError("expected a pointer type, found " ++ @typeName(Ptr)),
     };
 }
 
-fn require_many_pointer(comptime Ptr: type, comptime T: type) std.builtin.Type.Pointer {
+fn require_many_pointer(comptime Ptr: type, comptime T: type) std.lang.Type.Pointer {
     const info = pointer_info(Ptr);
     if (info.size != .many) {
         @compileError("expected a many-item pointer, found " ++ @typeName(Ptr));
@@ -17,7 +17,7 @@ fn require_many_pointer(comptime Ptr: type, comptime T: type) std.builtin.Type.P
     return info;
 }
 
-fn require_pointer(comptime Ptr: type, comptime T: type) std.builtin.Type.Pointer {
+fn require_pointer(comptime Ptr: type, comptime T: type) std.lang.Type.Pointer {
     const info = pointer_info(Ptr);
     if (info.child != T) {
         @compileError("pointer child does not match " ++ @typeName(T));
@@ -65,11 +65,11 @@ fn checked_signed_address_offset(address: usize, byte_offset: isize) usize {
 fn raw_pointer_type(comptime Ptr: type) type {
     const info = pointer_info(Ptr);
     return @Pointer(.many, .{
-        .@"const" = info.is_const,
-        .@"volatile" = info.is_volatile,
-        .@"allowzero" = info.is_allowzero,
-        .@"align" = @min(info.alignment orelse @alignOf(info.child), @alignOf(info.child)),
-        .@"addrspace" = info.address_space,
+        .@"const" = info.attrs.@"const",
+        .@"volatile" = info.attrs.@"volatile",
+        .@"allowzero" = info.attrs.@"allowzero",
+        .@"align" = @min(info.attrs.@"align" orelse @alignOf(info.child), @alignOf(info.child)),
+        .@"addrspace" = info.attrs.@"addrspace",
     }, info.child, info.sentinel());
 }
 
@@ -77,10 +77,10 @@ fn unaligned_pointer_type(comptime Ptr: type, comptime T: type) type {
     const info = require_pointer(Ptr, T);
     return @Pointer(.one, .{
         .@"const" = true,
-        .@"volatile" = info.is_volatile,
-        .@"allowzero" = info.is_allowzero,
+        .@"volatile" = info.attrs.@"volatile",
+        .@"allowzero" = info.attrs.@"allowzero",
         .@"align" = 1,
-        .@"addrspace" = info.address_space,
+        .@"addrspace" = info.attrs.@"addrspace",
     }, T, null);
 }
 
@@ -88,24 +88,24 @@ fn immutable_slice_type(comptime Ptr: type, comptime T: type) type {
     const info = require_many_pointer(Ptr, T);
     return @Pointer(.slice, .{
         .@"const" = true,
-        .@"volatile" = info.is_volatile,
-        .@"allowzero" = info.is_allowzero,
-        .@"align" = info.alignment,
-        .@"addrspace" = info.address_space,
+        .@"volatile" = info.attrs.@"volatile",
+        .@"allowzero" = info.attrs.@"allowzero",
+        .@"align" = info.attrs.@"align",
+        .@"addrspace" = info.attrs.@"addrspace",
     }, T, null);
 }
 
 fn mutable_slice_type(comptime Ptr: type, comptime T: type) type {
     const info = require_many_pointer(Ptr, T);
-    if (info.is_const) {
+    if (info.attrs.@"const") {
         @compileError("mutable raw slice requires a mutable pointer");
     }
     return @Pointer(.slice, .{
         .@"const" = false,
-        .@"volatile" = info.is_volatile,
-        .@"allowzero" = info.is_allowzero,
-        .@"align" = info.alignment,
-        .@"addrspace" = info.address_space,
+        .@"volatile" = info.attrs.@"volatile",
+        .@"allowzero" = info.attrs.@"allowzero",
+        .@"align" = info.attrs.@"align",
+        .@"addrspace" = info.attrs.@"addrspace",
     }, T, null);
 }
 
@@ -197,7 +197,7 @@ pub inline fn copy_nonoverlapping(
 ) void {
     const source_info = require_many_pointer(@TypeOf(source), T);
     const destination_info = require_many_pointer(@TypeOf(destination), T);
-    if (destination_info.is_const) {
+    if (destination_info.attrs.@"const") {
         @compileError("copy destination requires a mutable pointer");
     }
     _ = source_info;
@@ -216,7 +216,7 @@ pub inline fn write_bytes(
     element_count: usize,
 ) void {
     const destination_info = require_many_pointer(@TypeOf(destination), T);
-    if (destination_info.is_const) {
+    if (destination_info.attrs.@"const") {
         @compileError("write destination requires a mutable pointer");
     }
     const byte_extent = checked_byte_extent(T, element_count);
@@ -286,7 +286,7 @@ test "add and offset support positive and negative element offsets" {
     const const_base: [*]align(16) const u32 = base;
     const const_result = offset(u32, const_base, 1);
     const result_info = @typeInfo(@TypeOf(const_result)).pointer;
-    try std.testing.expect(result_info.is_const);
+    try std.testing.expect(result_info.attrs.@"const");
     try std.testing.expectEqual(@as(u32, 20), const_result[0]);
 }
 
@@ -294,12 +294,12 @@ test "raw slice constructors preserve length and mutability" {
     var values = [_]u16{ 3, 5, 8, 13 };
     const immutable = from_raw_parts(u16, @as([*]const u16, values[0..].ptr), 3);
     try std.testing.expectEqualSlices(u16, &.{ 3, 5, 8 }, immutable);
-    try std.testing.expect(@typeInfo(@TypeOf(immutable)).pointer.is_const);
+    try std.testing.expect(@typeInfo(@TypeOf(immutable)).pointer.attrs.@"const");
 
     const mutable = from_raw_parts_mut(u16, values[0..].ptr, values.len);
     mutable[1] = 21;
     try std.testing.expectEqual(@as(u16, 21), values[1]);
-    try std.testing.expect(!@typeInfo(@TypeOf(mutable)).pointer.is_const);
+    try std.testing.expect(!@typeInfo(@TypeOf(mutable)).pointer.attrs.@"const");
 
     const empty = from_raw_parts(u16, @as([*]const u16, values[0..].ptr), 0);
     try std.testing.expectEqual(@as(usize, 0), empty.len);

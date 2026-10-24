@@ -72,7 +72,7 @@ const runtime_root_source = "src/root.zig";
 /// The coverage modes the matrix pins. They are separate artifacts in one graph
 /// rather than a `-Doptimize` selection: a flag would let a run quietly compile
 /// only one of them.
-const optimize_modes = [_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe };
+const optimize_modes = [_]std.lang.Optimize{ .debug, .safe };
 
 /// The package `name` a build.zig.zon declares. `zonPackageName` shortens a
 /// longer crate name, so this is read back from the emitted manifest instead of
@@ -1763,7 +1763,7 @@ fn renderManifest(gpa: std.mem.Allocator) ![]u8 {
         \\    .name = .{s},
         \\    .version = "0.0.0",
         \\    .fingerprint = 0x{x:0>16},
-        \\    .minimum_zig_version = "0.16.0",
+        \\    .minimum_zig_version = "0.17.0",
         \\    .dependencies = .{{
         \\
     , .{ aggregate_package_name, fingerprint });
@@ -1839,7 +1839,7 @@ fn emitShellQuoted(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void
 /// The cross-test profile this aggregate is measured with.
 ///
 /// No `CROSS_MATRIX`: cross-test then runs its own version-pinned Tier 1/2 table
-/// for Zig 0.16.0 with automatic runner detection, and a row whose runner is
+/// for Zig 0.17.0 with automatic runner detection, and a row whose runner is
 /// missing is reported build-only rather than as a pass. Jobs are 1 because all
 /// targets share one cache directory and concurrent Zig builds over one cache
 /// abort. The deadlines are the shared gate's.

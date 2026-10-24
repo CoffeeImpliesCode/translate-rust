@@ -21,18 +21,16 @@ pub fn build(b: *std.Build) void {
     // build. A PATH lookup for `zig` can land on the anyzig shim, which has no
     // version to resolve outside this checkout and then fails silently.
     const toolchain_options = b.addOptions();
-    toolchain_options.addOption([:0]const u8, "zig_executable", b.graph.zig_exe);
+    toolchain_options.addOption([:0]const u8, "zig_executable", b.allocator.dupeSentinel(u8, b.graph.zig_exe, 0) catch @panic("OOM"));
     const toolchain = toolchain_options.createModule();
 
     // Forward compiler cache roots to child builds. Atomic cache writes
     // require a local filesystem; NFSv3 does not provide the needed rename.
     const e2e_host_options = b.addOptions();
-    e2e_host_options.addOption(?[]const u8, "local_cache_dir", b.cache_root.path);
-    e2e_host_options.addOption(
-        ?[]const u8,
-        "global_cache_dir",
-        b.graph.global_cache_root.path,
-    );
+    const local_cache = b.graph.path(.local_cache, "");
+    const global_cache = b.graph.path(.global_cache, "");
+    e2e_host_options.addOptionPathUntracked("local_cache_dir", local_cache);
+    e2e_host_options.addOptionPathUntracked("global_cache_dir", global_cache);
     const e2e_host = e2e_host_options.createModule();
 
     // ── tree-sitter C runtime + private pointer-only aggregate boundary ────
@@ -188,7 +186,7 @@ pub fn build(b: *std.Build) void {
     const run_step = steps.add(b, "run", "Run translate-rust");
     const run_cmd = declinedRunArtifact(b, exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
     // `zig build generate-mini-wire` runs the trusted source → validation →
@@ -348,7 +346,7 @@ pub fn build(b: *std.Build) void {
     // `zig build source` translates the complete mini source fixture and
     // checks that staged promotion publishes the generated package.
     const source_step = steps.add(b, "source", "Translate the complete mini source fixture");
-    const corpus_dir = b.pathJoin(&.{ b.cache_root.path orelse ".", "r2z-check" });
+    const corpus_dir = local_cache.path(b, "r2z-check");
     const source_cmd = b.addSystemCommand(&.{
         "sh",
         "-c",
@@ -365,7 +363,7 @@ pub fn build(b: *std.Build) void {
         "verify-mini-source",
     });
     source_cmd.addArtifactArg(exe);
-    source_cmd.addArg(b.pathJoin(&.{ corpus_dir, "source-mini" }));
+    source_cmd.addDirectoryArg(corpus_dir.path(b, "source-mini"));
     source_cmd.addDirectoryArg(b.path("test/crates/mini"));
     source_step.dependOn(&source_cmd.step);
 
@@ -401,7 +399,7 @@ pub fn build(b: *std.Build) void {
     // The producer owns exactly the directory named by `--output`: it creates
     // it, refuses to write into /tmp, /var/tmp or any non-local filesystem,
     // and never erases a path that already exists. This step therefore
-    // forwards `b.args` verbatim and supplies no default, so the required
+    // forwards the run arguments and supplies no default, so the required
     // invocation is
     //     zig build generated-corpus -- --output <abs-local-dir>
     // which is exactly what `tools/test-generated-corpus.sh` runs.
@@ -423,9 +421,9 @@ pub fn build(b: *std.Build) void {
         "generated-corpus",
         "Stage fresh generated packages and the cross-matrix aggregate (`-- --output <abs-local-dir>`)",
     );
+    const run_generated_corpus = declinedRunArtifact(b, generated_corpus_exe);
+    run_generated_corpus.addPassthruArgs();
     if (native_target) {
-        const run_generated_corpus = declinedRunArtifact(b, generated_corpus_exe);
-        if (b.args) |args| run_generated_corpus.addArgs(args);
         generated_corpus_step.dependOn(&run_generated_corpus.step);
     } else {
         // A foreign target publishes nothing here: the producer drives the host
@@ -433,21 +431,14 @@ pub fn build(b: *std.Build) void {
         // and reporting success would be a step that ran nothing, so the row
         // says so instead, the same way `test-differential` reports a foreign
         // target.
-        generated_corpus_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                std.debug.print(
-                    "generated-corpus: the producer publishes packages with the host toolchain; this target stages nothing\n",
-                    .{},
-                );
-            }
-        }.make;
+        generated_corpus_step.dependOn(&b.addSystemCommand(&.{ "printf", "%s\\n", "generated-corpus: the producer publishes packages with the host toolchain; this target stages nothing" }).step);
     }
 
     // ── translate: emit source from a wire-format JSON ──────────────────
     // `zig build translate -- test/mini.json` → parses + emits to stdout.
     const translate_step = steps.add(b, "translate", "Emit Zig source from a JSON dump");
     const translate_cmd = declinedRunArtifact(b, exe);
-    if (b.args) |args| translate_cmd.addArgs(args);
+    translate_cmd.addPassthruArgs();
     translate_step.dependOn(&translate_cmd.step);
 
     // Mini is the one complete positive wire fixture. The other wire fixtures
@@ -461,19 +452,11 @@ pub fn build(b: *std.Build) void {
     );
     {
         // r2z-core runtime library (standalone package, part of the pipeline).
-        const tc = b.addSystemCommand(&.{
-            b.graph.zig_exe,
-            "build",
-            "--build-file",
-            b.pathFromRoot("r2z-core/build.zig"),
-            "--cache-dir",
-            b.pathJoin(&.{ b.cache_root.path orelse ".", "r2z-core-tests" }),
-            "--global-cache-dir",
-            b.graph.global_cache_root.path orelse ".",
-            "test",
-            "--summary",
-            "all",
-        });
+        const tc = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "--build-file" });
+        tc.addFileArg(b.path("r2z-core/build.zig"));
+        tc.addArg("--cache-dir");
+        tc.addDirectoryArg(local_cache.path(b, "r2z-core-tests"));
+        tc.addArgs(&.{ "test", "--summary", "all" });
         test_crates_step.dependOn(&tc.step);
     }
     const mini_wire_cmd = b.addSystemCommand(&.{
@@ -492,7 +475,7 @@ pub fn build(b: *std.Build) void {
         "verify-mini-wire",
     });
     mini_wire_cmd.addArtifactArg(exe);
-    mini_wire_cmd.addArg(b.pathJoin(&.{ corpus_dir, "mini" }));
+    mini_wire_cmd.addDirectoryArg(corpus_dir.path(b, "mini"));
     mini_wire_cmd.addFileArg(b.path("test/mini.json"));
     test_crates_step.dependOn(&mini_wire_cmd.step);
     const rejected_specs = [_][2][]const u8{
@@ -528,7 +511,7 @@ pub fn build(b: *std.Build) void {
             "verify-wire-refusal",
         });
         reject.addArtifactArg(exe);
-        reject.addArg(b.pathJoin(&.{ corpus_dir, spec[1] }));
+        reject.addDirectoryArg(corpus_dir.path(b, spec[1]));
         reject.addFileArg(b.path(spec[0]));
         test_crates_step.dependOn(&reject.step);
     }
@@ -574,7 +557,7 @@ pub fn build(b: *std.Build) void {
             "verify-source-refusal",
         });
         reject.addArtifactArg(exe);
-        reject.addArg(b.pathJoin(&.{ corpus_dir, b.fmt("source-{s}", .{spec[1]}) }));
+        reject.addDirectoryArg(corpus_dir.path(b, b.fmt("source-{s}", .{spec[1]})));
         reject.addDirectoryArg(b.path(spec[0]));
         test_crates_step.dependOn(&reject.step);
     }
@@ -652,20 +635,13 @@ pub fn build(b: *std.Build) void {
             , .{ promotedDepFlags(b), promotedModuleFlags(b) }),
             "verify-promoted-crates",
         });
-        promoted_crates_cmd.addArg(b.pathJoin(&.{ corpus_dir, "promoted-crates" }));
+        promoted_crates_cmd.addDirectoryArg(corpus_dir.path(b, "promoted-crates"));
         promoted_crates_cmd.addArg(b.graph.zig_exe);
         promoted_crates_cmd.addArtifactArg(exe);
         for (promoted_crate_names) |crate_name| promoted_crates_cmd.addArg(crate_name);
         promoted_crates_step.dependOn(&promoted_crates_cmd.step);
     } else {
-        promoted_crates_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                std.debug.print(
-                    "test-promoted-crates: the consumer runs `zig test` over host packages; this target stages and runs nothing\n",
-                    .{},
-                );
-            }
-        }.make;
+        promoted_crates_step.dependOn(&b.addSystemCommand(&.{ "printf", "%s\\n", "test-promoted-crates: the consumer runs zig test over host packages; this target stages and runs nothing" }).step);
     }
     test_crates_step.dependOn(promoted_crates_step);
 
@@ -702,31 +678,14 @@ pub fn build(b: *std.Build) void {
     // not need rustc at all. The lookup is skipped there too: a configuration
     // that invokes no rustc cannot be failed for lacking one.
     //
-    // `findProgram` is an availability probe here and its result is never used
-    // as the program to run. On this host `rustc` is rustup's multicall
-    // binary, which dispatches on argv[0]; handing the shell a resolved path
-    // either canonicalizes the symlink onto rustup itself or gives rustup a
-    // program name that is not the requested tool. The literal name is
-    // threaded through instead, so the shell's own PATH lookup preserves
-    // argv[0] and dispatches to the real compiler. An explicit `-Drustc` is
-    // used verbatim and never requires the probe to succeed, which keeps this
-    // independent of where a host keeps its rustup root and of any PATH
-    // ambiguity between several installed toolchains.
-    const rustc: ?[]const u8 = if (!native_target)
-        null
-    else if (rustc_option) |explicit|
-        explicit
-    else if (b.findProgram(&.{"rustc"}, &.{}) catch null) |_|
-        "rustc"
-    else
-        null;
+    const rustc: ?[]const u8 = if (native_target) rustc_option orelse "rustc" else null;
     const differential_step = steps.add(
         b,
         "test-differential",
         "Compare the Rust and Zig differential oracles in Debug and ReleaseSafe (each run's directory is kept for inspection)",
     );
     if (native_target and rustc != null) {
-        const differential_root = b.pathJoin(&.{ corpus_dir, "differential" });
+        const differential_root = corpus_dir.path(b, "differential");
         const differential_cmd = b.addSystemCommand(&.{
             "sh",
             "-c",
@@ -790,7 +749,7 @@ pub fn build(b: *std.Build) void {
             ,
             "verify-differential-oracles",
         });
-        differential_cmd.addArg(differential_root);
+        differential_cmd.addDirectoryArg(differential_root);
         differential_cmd.addArg(b.graph.zig_exe);
         differential_cmd.addArg(rustc.?);
         differential_cmd.addArtifactArg(exe);
@@ -802,27 +761,12 @@ pub fn build(b: *std.Build) void {
         // not executed rather than as a pass. The branch is chosen on the
         // target alone, so `-Dtarget=<cross>` says this whether or not a rustc
         // happens to be on PATH — and, per the lookup above, without asking.
-        differential_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                std.debug.print(
-                    "test-differential: the oracles drive the host toolchain; this target compiles no differential artifact\n",
-                    .{},
-                );
-            }
-        }.make;
+        differential_step.dependOn(&b.addSystemCommand(&.{ "printf", "%s\\n", "test-differential: the oracles drive the host toolchain; this target compiles no differential artifact" }).step);
     } else {
         // A host without rustc cannot build the Rust oracle, so the comparison
         // has not run. Say so and fail: a silently shorter `test-crates` would
         // report a pass for a contract nobody checked.
-        differential_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                std.debug.print(
-                    "test-differential: no rustc on PATH; pass -Drustc=<path> to build the Rust oracle\n",
-                    .{},
-                );
-                return error.RustToolchainUnavailable;
-            }
-        }.make;
+        differential_step.dependOn(&b.addFail("test-differential: no rustc on PATH; pass -Drustc=<path>").step);
     }
     // `test-crates` depends on the step in every branch: a host with no rustc
     // sees the failure instead of a quietly shorter run, and a foreign target
@@ -838,7 +782,7 @@ pub fn build(b: *std.Build) void {
     // tests do not run, and its type errors stay invisible. The walk runs at
     // configure time; only `check-sources` (and therefore `test`) fails on
     // what it finds.
-    unreachable_sources = findUnreachableSources(b.allocator, b.graph.io) catch |err| {
+    unreachable_sources = findUnreachableSources(b) catch |err| {
         std.log.err("check-sources: {s}", .{@errorName(err)});
         @panic("check-sources: reachability walk failed");
     };
@@ -848,14 +792,9 @@ pub fn build(b: *std.Build) void {
         "Fail when a src/**/*.zig file is reachable from no test root",
     );
     if (unreachable_sources.len != 0) {
-        check_sources_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                for (unreachable_sources) |path| {
-                    std.debug.print("check-sources: unreachable from every test root: {s}\n", .{path});
-                }
-                return error.DeadSources;
-            }
-        }.make;
+        for (unreachable_sources) |path| {
+            check_sources_step.dependOn(&b.addFail(b.fmt("check-sources: unreachable from every test root: {s}", .{path})).step);
+        }
     }
     test_step.dependOn(check_sources_step);
 
@@ -884,14 +823,9 @@ pub fn build(b: *std.Build) void {
         @panic("check-corpus: the corpus coverage scan failed");
     };
     if (corpus_faults.len != 0) {
-        check_corpus_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                for (corpus_faults) |fault| {
-                    std.debug.print("check-corpus: {s}\n", .{fault});
-                }
-                return error.UncoveredCorpusCrate;
-            }
-        }.make;
+        for (corpus_faults) |fault| {
+            check_corpus_step.dependOn(&b.addFail(b.fmt("check-corpus: {s}", .{fault})).step);
+        }
     }
     test_crates_step.dependOn(check_corpus_step);
 
@@ -903,9 +837,9 @@ pub fn build(b: *std.Build) void {
         "Run each pinned shell entry point's own placement, transport and toolchain self-check",
     );
     for ([_][]const u8{"tools/test-generated-corpus.sh"}) |entry_point| {
-        entry_points_step.dependOn(
-            &b.addSystemCommand(&.{ b.pathFromRoot(entry_point), "--self-check" }).step,
-        );
+        const check = b.addRunFile(b.path(entry_point));
+        check.addArg("--self-check");
+        entry_points_step.dependOn(&check.step);
     }
     test_crates_step.dependOn(entry_points_step);
 
@@ -995,14 +929,7 @@ pub fn build(b: *std.Build) void {
     // (`test-promoted-crates`, `test-differential`) keep that report for a
     // direct invocation of either.
     if (!native_target) {
-        test_crates_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                std.debug.print(
-                    "test-crates: every check here translates on the host and runs host tools; this target executes none of them\n",
-                    .{},
-                );
-            }
-        }.make;
+        test_crates_step.dependOn(&b.addSystemCommand(&.{ "printf", "%s\\n", "test-crates: this foreign target executes no host-tool checks" }).step);
     }
 
     // Explicit CLI modes must keep distinct output contracts: `--translate`
@@ -1090,14 +1017,9 @@ pub fn build(b: *std.Build) void {
         @panic("check-cross-target: the declined-run audit failed");
     };
     if (declined_run_faults.len != 0) {
-        check_cross_target_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                for (declined_run_faults) |fault| {
-                    std.debug.print("check-cross-target: {s}\n", .{fault});
-                }
-                return error.ForeignRunNotDeclined;
-            }
-        }.make;
+        for (declined_run_faults) |fault| {
+            check_cross_target_step.dependOn(&b.addFail(b.fmt("check-cross-target: {s}", .{fault})).step);
+        }
     }
 
     // Every step this graph publishes exists by now, so the documented-command
@@ -1107,17 +1029,9 @@ pub fn build(b: *std.Build) void {
         @panic("check-commands: the documented-command scan failed");
     };
     if (undocumented.len != 0) {
-        check_commands_step.makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
-                for (undocumented) |entry| {
-                    std.debug.print(
-                        "check-commands: {s} documents `{s}`, which no step publishes\n",
-                        .{ entry.doc, entry.command },
-                    );
-                }
-                return error.UndocumentedCommand;
-            }
-        }.make;
+        for (undocumented) |entry| {
+            check_commands_step.dependOn(&b.addFail(b.fmt("check-commands: {s} documents `{s}`, which no step publishes", .{ entry.doc, entry.command })).step);
+        }
     }
 }
 
@@ -1282,9 +1196,11 @@ const runtime_license_limit = 256 << 10;
 /// `@embedFile` cannot express a file that is absent, so the optional text
 /// travels as a build option instead of being embedded unconditionally.
 fn runtimeLicense(b: *std.Build) ?[]const u8 {
+    b.dependOnDirectoryContents(b.path(""));
+    b.dependOnDirectoryContents(b.path("r2z-core"));
     const candidates = [_][]const u8{ "r2z-core/LICENSE", "LICENSE" };
     for (candidates) |candidate| {
-        const text = b.build_root.handle.readFileAlloc(
+        const text = std.Io.Dir.cwd().readFileAlloc(
             b.graph.io,
             candidate,
             b.allocator,
@@ -1293,6 +1209,7 @@ fn runtimeLicense(b: *std.Build) ?[]const u8 {
             error.FileNotFound => continue,
             else => @panic("reading the project license failed"),
         };
+        b.dependOnFileContents(b.path(candidate));
         return text;
     }
     return null;
@@ -1385,7 +1302,10 @@ fn byPath(_: void, a: []const u8, b: []const u8) bool {
 }
 
 /// Every `src/**/*.zig` file no build root reaches through `@import`.
-fn findUnreachableSources(gpa: std.mem.Allocator, io: std.Io) ![][]const u8 {
+fn findUnreachableSources(b: *std.Build) ![][]const u8 {
+    const gpa = b.allocator;
+    const io = b.graph.io;
+    b.dependOnDirectoryContents(b.path("src"));
     var present: std.StringHashMapUnmanaged(void) = .empty;
     {
         var dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
@@ -1393,6 +1313,9 @@ fn findUnreachableSources(gpa: std.mem.Allocator, io: std.Io) ![][]const u8 {
         var walker = try dir.walk(gpa);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory) {
+                b.dependOnDirectoryContents(b.path(b.fmt("src/{s}", .{entry.path})));
+            }
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
             try present.put(gpa, try std.fmt.allocPrint(gpa, "src/{s}", .{entry.path}), {});
@@ -1406,6 +1329,7 @@ fn findUnreachableSources(gpa: std.mem.Allocator, io: std.Io) ![][]const u8 {
         try queue.append(gpa, root);
     }
     while (queue.pop()) |path| {
+        b.dependOnFileContents(b.path(path));
         const source = try std.Io.Dir.cwd().readFileAlloc(
             io,
             path,
@@ -1525,6 +1449,7 @@ fn findUndocumentedCommands(
     const cwd = std.Io.Dir.cwd();
     var missing: std.ArrayListUnmanaged(UndocumentedCommand) = .empty;
     for (command_docs) |doc| {
+        b.dependOnFileContents(b.path(doc));
         const source = cwd.readFileAlloc(io, doc, gpa, .limited(doc_limit)) catch |err| switch (err) {
             // A file that documents this graph and is not here is a hole in the
             // check, so it is reported rather than skipped.
@@ -1898,6 +1823,7 @@ fn findCorpusFaults(b: *std.Build) ![]const []const u8 {
 
     var present: std.StringHashMapUnmanaged(void) = .empty;
     {
+        b.dependOnDirectoryContents(b.path(corpus_root_dir));
         var dir = try cwd.openDir(io, corpus_root_dir, .{ .iterate = true });
         defer dir.close(io);
         var walker = try dir.walk(gpa);
@@ -1922,6 +1848,9 @@ fn findCorpusFaults(b: *std.Build) ![]const []const u8 {
         }
     }
 
+    b.dependOnFileContents(b.path(e2e_program));
+    b.dependOnFileContents(b.path("build.zig"));
+    b.dependOnFileContents(b.path("test/generated_corpus.zig"));
     const e2e_source = try cwd.readFileAlloc(io, e2e_program, gpa, .limited(doc_limit));
     const build_source = try cwd.readFileAlloc(io, "build.zig", gpa, .limited(doc_limit));
     const producer_source = try cwd.readFileAlloc(
@@ -1936,6 +1865,7 @@ fn findCorpusFaults(b: *std.Build) ![]const []const u8 {
     const compiled_sources = [_][]const u8{ e2e_source, build_source, producer_source };
 
     {
+        b.dependOnDirectoryContents(b.path(test_dir));
         var dir = try cwd.openDir(io, test_dir, .{ .iterate = true });
         defer dir.close(io);
         var walker = try dir.walk(gpa);

@@ -35,17 +35,17 @@ const Choice = translated.Choice;
 /// The fields of the struct type `T`. The `else` arm names what `T` turned
 /// out to be, so a form that stopped arriving as a struct fails to build here
 /// instead of passing an assertion written for a struct.
-fn structFields(comptime T: type) []const std.builtin.Type.StructField {
+fn structFields(comptime T: type) []const [:0]const u8 {
     return switch (@typeInfo(T)) {
-        .@"struct" => |info| info.fields,
+        .@"struct" => |info| info.field_names,
         else => @compileError("expected a struct type, found " ++ @typeName(T)),
     };
 }
 
 /// The fields of the enum type `T`, failing the same way for the same reason.
-fn enumFields(comptime T: type) []const std.builtin.Type.EnumField {
+fn enumFields(comptime T: type) []const [:0]const u8 {
     return switch (@typeInfo(T)) {
-        .@"enum" => |info| info.fields,
+        .@"enum" => |info| info.field_names,
         else => @compileError("expected an enum type, found " ++ @typeName(T)),
     };
 }
@@ -172,8 +172,8 @@ test "one call accepts all four nominals as arguments" {
 test "the fieldless enum is inhabited and carries both variant names" {
     const fields = enumFields(Choice);
     try std.testing.expectEqual(@as(usize, 2), fields.len);
-    try std.testing.expectEqualStrings("Left", fields[0].name);
-    try std.testing.expectEqualStrings("Right", fields[1].name);
+    try std.testing.expectEqualStrings("Left", fields[0]);
+    try std.testing.expectEqualStrings("Right", fields[1]);
 
     // An enum occupies its tag and nothing else, so its size is the tag's.
     // The tag width is not asserted: a narrower tag would still satisfy this,

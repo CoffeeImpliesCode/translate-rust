@@ -12,7 +12,7 @@
 //! Zig consumer contract:
 //! Import the registered `adler` module through a build dependency; child
 //! modules are reached through the crate's exported namespaces.
-//! Requires Zig 0.16.0. Target and optimization options belong to the consumer.
+//! Requires Zig 0.17.0. Target and optimization options belong to the consumer.
 //! Rust names are preserved except native protocol hooks and name collisions.
 //! Zig field access and value copying do not enforce Rust privacy or moves.
 //! Pointers, slices and erased interfaces borrow their backing storage.
@@ -138,7 +138,7 @@ pub const Adler32 = struct {
         const CHUNK_SIZE: usize = 5552 *% 4;
         var a: u32 = @as(u32, self.a);
         var b: u32 = @as(u32, self.b);
-        var a_vec: algo_1.U32X4 = algo_1.U32X4{ .@"0" = [_]u32{ 0 } ** 4 };
+        var a_vec: algo_1.U32X4 = algo_1.U32X4{ .@"0" = @as([4]u32, @splat(0)) };
         var b_vec: algo_1.U32X4 = a_vec;
         const _tuple = r2z.splitAt(bytes, bytes.len -% @rem(bytes.len, 4));
         const bytes_1 = _tuple[0];

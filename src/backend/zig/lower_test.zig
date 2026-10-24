@@ -2470,7 +2470,9 @@ fn checkLowerUseAllocationFailures(
     alloc: std.mem.Allocator,
     rust_ir: *const ir.RustIr,
 ) !void {
-    var output_arena = std.heap.ArenaAllocator.init(alloc);
+    // Backing allocator resizes must not change the injected allocation count.
+    var fixed_growth = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+    var output_arena = std.heap.ArenaAllocator.init(fixed_growth.allocator());
     defer output_arena.deinit();
     _ = try lower.lowerRustIr(output_arena.allocator(), rust_ir, null);
 }
@@ -2695,7 +2697,7 @@ test "lower: const array + primitive initializers emit real Zig values" {
     for (pkg.files) |*file| {
         const src = try emit.emitFile(alloc, file);
         if (std.mem.indexOf(u8, src, "const A: [2]u16 = [_]u16{ 136, 204 }") != null) found_a = true;
-        if (std.mem.indexOf(u8, src, "const B: [256]u8 = [_]u8{ 0 } ** 256") != null) found_b = true;
+        if (std.mem.indexOf(u8, src, "const B: [256]u8 = @as([256]u8, @splat(0))") != null) found_b = true;
     }
     try std.testing.expect(found_a);
     try std.testing.expect(found_b);
@@ -9605,14 +9607,8 @@ test "lower: a comparison against an unannotated to_string call owns its result"
 fn runGeneratedPackageTests(alloc: std.mem.Allocator, package: ast.Package) !void {
     const test_io = std.testing.io;
 
-    // `std.testing.tmpDir` stages under `.zig-cache/tmp` relative to the working
-    // directory, which is local disk under this repository's documented
-    // workflow: `tools/zig-pinned.sh` moves both cache directories there and the
-    // README asks for a UID-owned local source copy precisely because the
-    // checkout itself is an NFSv3 mount, where Zig's atomic write is
-    // `renameat2(RENAME_EXCHANGE)` and aborts with EINVAL. The CHILD compiler's
-    // caches are redirected into this staging tree as well, so nothing it
-    // writes can land on the checkout.
+    // Staging and child compiler caches stay under the test working directory,
+    // which must be on local storage for Zig's atomic file operations.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var seed: [8]u8 = undefined;
@@ -21300,7 +21296,7 @@ fn genericHashPackage(alloc: std.mem.Allocator, scene: GenericHashScene) !ast.Pa
         bytes_ty,
         .{ .prim = .unit },
         .{ .reference = &.{ .mut = false, .pointee = sea_ty } },
-    } ++ ([_]ir.types.Type{.{ .prim = .u8 }} ** caller_type_count);
+    } ++ @as([caller_type_count]ir.types.Type, @splat(.{ .prim = .u8 }));
 
     const receiver = try typedExpr(&model, 1, .{ .path = .{ .def = value_def, .generic_args = &.{} } });
     const state = try typedExpr(&model, 3, .{ .path = .{ .def = state_def, .generic_args = &.{} } });
@@ -23052,7 +23048,7 @@ test "lower: the Hash slice view carries the element descriptor's own type" {
 }
 
 // The two ends of the recursion borrow the ORIGINAL value, never a copy of it:
-// a tuple field is `&@field(value.*, Slot.name)` and each element is forwarded
+// a tuple field is `&@field(value.*, Slot)` and each element is forwarded
 // as the bare `item` the loop captured. The loop over the fields is inlined, so
 // no runtime iterator is created for a walk the compiler can finish itself.
 test "lower: the Hash walk borrows the original field and each element in place" {
@@ -23062,8 +23058,8 @@ test "lower: the Hash walk borrows the original field and each element in place"
 
     const pair = try hashPairIn((try hashPairPackage(alloc)).files[0]);
 
-    // The tuple arm: a `std.meta.fields` binding, then an inline loop over the
-    // fields and slots, whose body forwards the address of the field itself.
+    // The tuple arm binds field names, then walks descriptors and names in
+    // an inline loop that forwards the original field's address.
     const walk = try tupleWalkArm(pair.value);
     // The arm is a BLOCK: the inline loop's second input is the binding the
     // first statement makes, so the loop is its second statement and not the
@@ -23077,29 +23073,24 @@ test "lower: the Hash walk borrows the original field and each element in place"
     try std.testing.expect(!slots.is_mut);
     // The binding asks for the fields of the ORIGINAL value's own type: the
     // walk never copies the tuple out to learn what is in it.
-    if (slots.init != .call) return error.ExpectedInlineFieldLoop;
-    if (slots.init.call.callee.* != .field_access) return error.ExpectedInlineFieldLoop;
-    const meta_fields = slots.init.call.callee.field_access;
-    try std.testing.expectEqualStrings("fields", meta_fields.field_name);
-    if (meta_fields.target.* != .field_access) return error.ExpectedInlineFieldLoop;
-    try std.testing.expectEqualStrings("meta", meta_fields.target.field_access.field_name);
-    try std.testing.expectEqualStrings("std", operandIdent(meta_fields.target.field_access.target.*) orelse
+    if (slots.init != .field_access) return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("field_names", slots.init.field_access.field_name);
+    const structure = slots.init.field_access.target.*;
+    if (structure != .field_access) return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("struct", structure.field_access.field_name);
+    const info = structure.field_access.target.*;
+    if (info != .builtin) return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("typeInfo", info.builtin.name);
+    try std.testing.expectEqual(@as(usize, 1), info.builtin.args.len);
+    const type_query = info.builtin.args[0];
+    if (type_query != .builtin) return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("TypeOf", type_query.builtin.name);
+    try std.testing.expectEqual(@as(usize, 1), type_query.builtin.args.len);
+    const subject = type_query.builtin.args[0];
+    if (subject != .unary_op or subject.unary_op.op != .deref)
+        return error.ExpectedInlineFieldLoop;
+    try std.testing.expectEqualStrings("value", operandIdent(subject.unary_op.operand.*) orelse
         return error.ExpectedInlineFieldLoop);
-    try std.testing.expectEqual(@as(usize, 1), slots.init.call.args.len);
-    if (slots.init.call.args[0] != .builtin or
-        !std.mem.eql(u8, slots.init.call.args[0].builtin.name, "TypeOf"))
-    {
-        return error.ExpectedInlineFieldLoop;
-    }
-    try std.testing.expectEqual(@as(usize, 1), slots.init.call.args[0].builtin.args.len);
-    if (slots.init.call.args[0].builtin.args[0] != .unary_op or
-        slots.init.call.args[0].builtin.args[0].unary_op.op != .deref)
-    {
-        return error.ExpectedInlineFieldLoop;
-    }
-    try std.testing.expectEqualStrings("value", operandIdent(
-        slots.init.call.args[0].builtin.args[0].unary_op.operand.*,
-    ) orelse return error.ExpectedInlineFieldLoop);
     if (walk.body.block.stmts[1] != .expr_stmt or
         walk.body.block.stmts[1].expr_stmt.* != .for_expr)
     {
@@ -23137,9 +23128,7 @@ test "lower: the Hash walk borrows the original field and each element in place"
         return error.ExpectedInlineFieldLoop;
     try std.testing.expectEqualStrings("value", operandIdent(field_query.args[0].unary_op.operand.*) orelse
         return error.ExpectedInlineFieldLoop);
-    if (field_query.args[1] != .field_access) return error.ExpectedInlineFieldLoop;
-    try std.testing.expectEqualStrings("name", field_query.args[1].field_access.field_name);
-    try std.testing.expectEqualStrings("Slot", operandIdent(field_query.args[1].field_access.target.*) orelse
+    try std.testing.expectEqualStrings("Slot", operandIdent(field_query.args[1]) orelse
         return error.ExpectedInlineFieldLoop);
 
     // The element side: the loop captures each item BY REFERENCE and forwards

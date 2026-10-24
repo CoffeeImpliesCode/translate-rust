@@ -1363,10 +1363,7 @@ fn decodePrim(s: []const u8) !types.Prim {
     return error.BadWireFormat;
 }
 fn decodeUnsupportedReason(s: []const u8) !spine.UnsupportedReason {
-    inline for (std.meta.fields(spine.UnsupportedReason)) |field| {
-        if (std.mem.eql(u8, s, field.name)) return @enumFromInt(field.value);
-    }
-    return error.BadWireFormat;
+    return std.meta.stringToEnum(spine.UnsupportedReason, s) orelse error.BadWireFormat;
 }
 
 fn decodeType(allocator: std.mem.Allocator, v: Json) TypeDecodeError!types.Type {
@@ -1566,10 +1563,7 @@ fn decodeUnsupportedVersion(
 }
 
 fn decodeCoreFunction(s: []const u8) !exprs.CoreFunction {
-    inline for (std.meta.fields(exprs.CoreFunction)) |field| {
-        if (std.mem.eql(u8, s, field.name)) return @enumFromInt(field.value);
-    }
-    return error.BadWireFormat;
+    return std.meta.stringToEnum(exprs.CoreFunction, s) orelse error.BadWireFormat;
 }
 
 /// The conversion syntax, written `as` rather than the tag name `as_` because
@@ -5349,8 +5343,8 @@ fn auditTypeTable(allocator: std.mem.Allocator) ![]const types.Type {
     try table.append(allocator, .{ .path = .{ .segments = segments } });
 
     // Every primitive, so a decoder that hard-codes one cannot pass.
-    inline for (std.meta.fields(types.Prim)) |field| {
-        try table.append(allocator, .{ .prim = @enumFromInt(field.value) });
+    inline for (@typeInfo(types.Prim).@"enum".field_names) |name| {
+        try table.append(allocator, .{ .prim = @field(types.Prim, name) });
     }
 
     const reference = try allocator.create(types.Ref);
@@ -6421,23 +6415,27 @@ fn auditBodyTable(allocator: std.mem.Allocator) ![]const BodyKind {
 /// uncovered arm can be reported by name rather than by index.
 fn Arms(comptime tag_type: type) type {
     return struct {
-        const fields = std.meta.fields(tag_type);
-        seen: [fields.len]bool = @splat(false),
+        const field_names = switch (@typeInfo(tag_type)) {
+            .@"enum" => |info| info.field_names,
+            .@"union" => |info| info.field_names,
+            else => @compileError("expected an enum or tagged union"),
+        };
+        seen: [field_names.len]bool = @splat(false),
 
         /// Mark an arm by its tag. `tag_type` is a tagged union or a plain
         /// enum — both answer `@intFromEnum` on their active tag — so the two
         /// kinds of node tag and of plain discriminator share this helper.
         fn mark(self: *@This(), tag: anytype) void {
-            self.seen[@intFromEnum(tag)] = true;
+            self.seen[@backingInt(tag)] = true;
         }
 
         /// Report, by name, every arm the fixture did not exercise.
         fn expectComplete(self: *const @This(), comptime label: []const u8) !void {
-            inline for (fields, 0..) |field, tag| {
+            inline for (field_names, 0..) |name, tag| {
                 if (!self.seen[tag]) {
                     std.debug.print(
                         "arm `{s}` of {s} is not exercised by the round-trip audit\n",
-                        .{ field.name, label },
+                        .{ name, label },
                     );
                     return error.ArmNotCovered;
                 }

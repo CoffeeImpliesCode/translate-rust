@@ -137,15 +137,15 @@ pub fn errorTagValue(comptime E: type, tag: anyerror) E {
         .@"enum" => |declared| declared,
         else => @compileError("r2z: expect_error_union_err needs the source fieldless error enum"),
     };
-    if (enumeration.fields.len == 0) {
+    if (enumeration.field_names.len == 0) {
         @compileError("r2z: expect_error_union_err needs a nonempty source error enum");
     }
-    inline for (enumeration.fields) |field| {
+    inline for (enumeration.field_names) |field_name| {
         // The field's name is the variant's, and `@field` reads it twice: once
         // out of the error set, where it is the static value a union carrying
         // this member holds, and once out of `E`, where it is the value the
         // caller gets. Both reads happen while the program is compiled.
-        if (tag == @field(anyerror, field.name)) return @field(E, field.name);
+        if (tag == @field(anyerror, field_name)) return @field(E, field_name);
     }
     std.debug.panic(
         "r2z: native error {s} has no value in the source error enum {s}",

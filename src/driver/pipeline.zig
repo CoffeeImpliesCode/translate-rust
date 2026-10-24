@@ -537,7 +537,7 @@ test "fingerprint extraction and patching logic" {
         \\    .name = .sample_pkg,
         \\    .version = "0.1.0",
         \\    .fingerprint = 0x0123456789abcdef,
-        \\    .minimum_zig_version = "0.16.0",
+        \\    .minimum_zig_version = "0.17.0",
         \\    .paths = .{
         \\        "build.zig",
         \\        "build.zig.zon",
