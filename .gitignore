@@ -8,6 +8,14 @@ zig-pkg/
 node_modules/
 *.svg.tmp
 __pycache__/
+.devenv/
+.direnv/
+.envrc
+.opencode/
+.ruff_cache/
+*.pyc
+result*
+/agent-notes
 
 # cargo (fixture crates)
 target/
