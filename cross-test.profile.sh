@@ -37,8 +37,9 @@
 #
 # 900 s is the per-test-binary deadline the shared gate expects and 1800 s
 # covers one whole target. Both jobs are 1 because cross-test shares one cache
-# directory across targets and concurrent Zig builds over one cache abort. The
-# output prefix goes on the approved host scratch volume, never the repository.
+# directory across targets and concurrent Zig builds over one cache abort.
+# Output prefix uses R2Z_SCRATCH_ROOT, then RUNNER_TEMP, TMPDIR or /tmp.
+# It stays outside the repository.
 
 CROSS_BUILD_STEP=test
 CROSS_TIMEOUT=900
@@ -47,6 +48,5 @@ CROSS_JOBS=1
 CROSS_BUILD_JOBS=1
 CROSS_REQUIRE_RUNNERS=0
 
-if [ -n "${HOST_SCRATCH_ROOT:-}" ]; then
-    CROSS_PREFIX="$HOST_SCRATCH_ROOT/scratch/cross-test-out"
-fi
+scratch_base="${R2Z_SCRATCH_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
+CROSS_PREFIX="${scratch_base%/}/scratch/cross-test-out"

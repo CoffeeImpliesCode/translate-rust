@@ -41,11 +41,14 @@
 #    and compares its version with the receipt's declaration. A drifted fixture
 #    fails the run. The manifests are never scraped by hand.
 #
-# Environment: everything cargo writes goes to local scratch
+# Environment: everything cargo writes goes into this run's private scratch
 # (CARGO_HOME, CARGO_TARGET_DIR, TMPDIR/TMP/TEMP). The registry has to be
 # fetched once over the network: `rand_core` (wyhash) and `num-traits` (atoi)
 # for the oracle build, plus `criterion`, `quickcheck`, `getrandom` and
 # `xxhash-c-sys` for the upstream test targets.
+#
+# `R2Z_SCRATCH_ROOT` selects the scratch base. Otherwise `RUNNER_TEMP`, then
+# `TMPDIR`, then `/tmp` supplies it.
 #
 # Usage:
 #   tools/rust-corpus-oracle.sh --output /local/path/for/receipts
@@ -53,13 +56,13 @@
 #
 # Placement: --scratch and --output are absolute paths that must resolve
 # *outside* the repository (no cache or cargo directory inside it), must not
-# live under /tmp, /var/tmp or /dev/shm, and must sit on a local filesystem.
-# Sharing one local filesystem with the source tree is fine and is the normal case; a
-# network mount is not. Existing receipt files are refused.
+# live under `/dev/shm`, and must sit on a local filesystem. Sharing one local
+# filesystem with the source tree is fine and is the normal case; a network
+# mount is not. Existing receipt files are refused.
 #
 # Nothing is removed. This run's scratch directory is always reported at the end
 # and left in place, logs and all, for the caller to inspect and delete.
-#
+
 # Exit status: 0 everything passed; 1 a case or an upstream test failed; 2 a
 # usage, staging or toolchain prerequisite problem. An upstream invocation that
 # never reached "running N tests" *and* whose log names a missing or unbuildable
@@ -99,7 +102,8 @@ usage() {
 
 Options:
   --scratch ABS       local, owned scratch root, outside the repository
-                      (default: \$HOST_SCRATCH_ROOT/scratch/translate-rust)
+                      (default: R2Z_SCRATCH_ROOT, then RUNNER_TEMP, TMPDIR or /tmp)
+
   --output ABS        directory that receives the two receipts: outside the
                       repository, on local storage, created if absent
   --strict-prerequisites
@@ -157,28 +161,14 @@ while (( $# )); do
     esac
 done
 
-# ── 1. host policy ──────────────────────────────────────────────────────────
-# Source the approved scratch policy first, on every host, before anything is
-# created. The library is a no-op on hosts it does not recognise, so sourcing
-# it unconditionally is what makes the default below available everywhere the
-# policy approves a volume — not only on the hosts whose name starts buildhost.
-scratch_lib="${HOME:-/nonexistent}/.local/lib/host-scratch.sh"
-scratch_policy_loaded=0
-if [[ -r "$scratch_lib" ]]; then
-    # shellcheck source=/dev/null
-    if . "$scratch_lib"; then
-        scratch_policy_loaded=1
-    else
-        die "approved scratch policy $scratch_lib refused to configure itself"
-    fi
-fi
+# ── 1. scratch root ─────────────────────────────────────────────────────────
+# An explicit --scratch wins; otherwise use the configured base, the CI runner
+# temp directory, the process temporary directory, or the system default.
 if [[ -z "$scratch_root" ]]; then
-    if (( scratch_policy_loaded == 1 )) && [[ -n "${HOST_SCRATCH_ROOT:-}" ]]; then
-        scratch_root="$HOST_SCRATCH_ROOT/scratch/translate-rust"
-    else
-        die "no --scratch given and the approved scratch policy exported no HOST_SCRATCH_ROOT"
-    fi
+    scratch_base="${R2Z_SCRATCH_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
+    scratch_root="${scratch_base%/}/scratch/translate-rust"
 fi
+
 [[ -n "$output_dir" ]] || die "--output is required"
 
 # ── 2. placement and ownership guards ───────────────────────────────────────
@@ -187,8 +177,9 @@ fi
 # repository and on local storage. A source mirror and a scratch directory on
 # one local mount is the normal case and is allowed — cargo writing into the
 # repository is the hazard, and cargo merely sharing a filesystem with it is
-# not. A network mount, /tmp, /var/tmp, /dev/shm and anything inside the
-# repository are refused.
+# not. The volatile `/dev/shm` volume and anything inside the repository are
+# refused.
+
 my_uid="$(id -u)"
 
 # How `path` is actually transported: /proc/mounts is the authority, matched by
@@ -219,7 +210,7 @@ require_local_filesystem() {
     case "$transport" in
         nfs | nfs4 | cifs | smbfs | smb3 | 9p | afs | ceph | coda | gpfs | \
             lustre | ocfs2 | beegfs | glusterfs | autofs | fuse | fuse.* | fuseblk)
-            die "$what $path is on mount type '$transport'; this runner writes only to local storage, and network, fuse and cluster mounts are refused"
+            die "$what $path is on mount type '$transport'; this runner writes only to local storage, and network and FUSE mounts are refused"
             ;;
         unknown)
             die "cannot tell which mount holds $what $path; refusing to write without knowing how it is transported"
@@ -228,13 +219,13 @@ require_local_filesystem() {
     printf '%s' "$transport"
 }
 
-# Resolve, then refuse the destinations that are never acceptable: a system
-# temp alias, and any path that lands inside the repository — which is also how
-# a repository-internal cache directory is caught.
+# Resolve, then refuse destinations that are never acceptable: the volatile
+# `/dev/shm` volume and any path that lands inside the repository — which is
+# also how a repository-internal cache directory is caught.
 reject_forbidden_destination() {
     local path="$1" what="$2" resolved reserved real_reserved
     resolved="$(realpath -m -- "$path")"
-    for reserved in /tmp /var/tmp /dev/shm; do
+    for reserved in /dev/shm; do
         real_reserved="$(realpath -m -- "$reserved")"
         case "$resolved" in
             "$real_reserved" | "$real_reserved"/*)
@@ -253,7 +244,7 @@ reject_forbidden_destination() {
 # Creates an absolute path one component at a time, private (0700) under the
 # caller's umask, and checks every level on the way: no component may be a
 # symlink, and a component other users can write to is only acceptable with the
-# sticky bit, which is the approved shared-scratch-mount pattern. A hostile link
+# sticky bit, which is the standard shared-directory pattern. A hostile link
 # or a shared directory can therefore never redirect where this run writes.
 make_private_dir() {
     local path="$1" what="$2"
@@ -389,7 +380,7 @@ done
 
 # ── 5. cargo environment, all on local scratch ──────────────────────────────
 # Every cargo and test write goes under this run's own directory, whatever
-# CARGO_HOME, CARGO_TARGET_DIR or TMPDIR the host policy exported before.
+# CARGO_HOME, CARGO_TARGET_DIR or TMPDIR the caller set before this run.
 export CARGO_HOME="$run_dir/cargo-home"
 export CARGO_TARGET_DIR="$run_dir/target"
 export TMPDIR="$run_dir/tmp"

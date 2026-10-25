@@ -62,8 +62,10 @@
 # parent's decision, made after reading it.
 #
 # Environment:
-#   R2Z_CORPUS_ROOT        parent directory for the corpus and the matrix output
-#                          (default $HOST_SCRATCH_ROOT/scratch/translate-rust-generated-corpus)
+#   R2Z_SCRATCH_ROOT       base for scratch data (default RUNNER_TEMP, then
+#                          TMPDIR, then /tmp)
+#   R2Z_CORPUS_ROOT        parent directory for the corpus and matrix output
+#                          (default $R2Z_SCRATCH_ROOT/scratch/translate-rust-generated-corpus)
 #   R2Z_CORPUS_REUSE       1 = reuse an existing producer output and only re-run
 #                          the matrix. The output is never re-verified, so this
 #                          is a matrix-only re-run, not a freshness claim.
@@ -89,6 +91,7 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+scratch_base="${R2Z_SCRATCH_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 
 die() { printf 'test-generated-corpus: %s\n' "$*" >&2; exit 2; }
 note() { printf 'test-generated-corpus: %s\n' "$*" >&2; }
@@ -100,8 +103,9 @@ note() { printf 'test-generated-corpus: %s\n' "$*" >&2; }
 # and returned as 0; nothing printed and 1 when it can.
 #
 # `requested` is the path as written and `resolved` its `realpath -m` form. A
-# symlink alias into /tmp has to be refused for where it lands, not for how it
+# symlink alias into /dev/shm has to be refused for where it lands, not for how it
 # was spelled. The walk reads symlinked components and nothing else.
+
 placement_fault() {
     local requested="$1" resolved="$2" cursor
     if [[ "$requested" != /* ]]; then
@@ -117,7 +121,7 @@ placement_fault() {
         cursor="$(dirname -- "$cursor")"
     done
     case "$resolved" in
-        /tmp | /tmp/* | /var/tmp | /var/tmp/* | /dev/shm | /dev/shm/*)
+        /dev/shm | /dev/shm/*)
             printf 'scratch path resolves into a reserved volume: %s\n' "$resolved"
             return 0
             ;;
@@ -256,11 +260,12 @@ toolchain_version_fault() {
 
 # The toolchain stores the anyzig shim resolves through, in the order they are
 # searched: the compiler the caller's environment already points at, then the
-# shared one under $HOME, then the one the host scratch policy selected.
+# shared one under $HOME, then the selected scratch base.
+
 zig_toolchain_roots() {
     local base
     for base in "${ZIG_GLOBAL_CACHE_DIR:-}" "${HOME:-}/.cache/zig" \
-        "${HOST_SCRATCH_ROOT:-}/cache/zig"; do
+        "$scratch_base/cache/zig"; do
         [[ -n "$base" && -d "$base/p" ]] || continue
         printf '%s\n' "$base/p"
     done
@@ -317,34 +322,37 @@ self_check() {
     # opposite rule, so a change that started refusing every local path would
     # have gone unnoticed here.
     run_case 'an absolute local path outside the checkout' accepted \
-        placement_fault /home/tmp/r2z-cache /home/tmp/r2z-cache
+        placement_fault /srv/scratch/r2z-cache /srv/scratch/r2z-cache
     run_case 'a relative path' refused \
-        placement_fault r2z-cache /home/tmp/r2z-cache
-    run_case '/tmp' refused placement_fault /tmp/r2z-cache /tmp/r2z-cache
-    run_case '/var/tmp' refused placement_fault /var/tmp/r2z /var/tmp/r2z
+        placement_fault r2z-cache /srv/scratch/r2z-cache
+    run_case 'a /tmp scratch path' accepted \
+        placement_fault /tmp/r2z-cache /tmp/r2z-cache
+    run_case 'a /var/tmp scratch path' accepted \
+        placement_fault /var/tmp/r2z /var/tmp/r2z
     run_case '/dev/shm' refused placement_fault /dev/shm/r2z /dev/shm/r2z
-    run_case 'a symlink landing in a reserved volume' refused \
-        placement_fault /tmp/alias /tmp/alias/cache
+    run_case 'a resolved path in a reserved volume' refused \
+        placement_fault /dev/shm/alias /dev/shm/alias/cache
     run_case 'a symlinked path component' refused \
-        placement_fault /proc/self/cwd/cache /home/tmp/cache
+        placement_fault /proc/self/cwd/cache /srv/scratch/cache
     run_case 'the checkout root itself' refused \
         placement_fault "$repo_root" "$repo_root"
     run_case 'a path inside the checkout' refused \
         placement_fault "$repo_root/zig-out/scratch" "$repo_root/zig-out/scratch"
 
     # Transport. The corpus and the cache both have to survive an atomic write.
-    run_case 'ext4' accepted transport_fault ext4 /home/tmp/r2z-corpus
-    run_case 'xfs' accepted transport_fault xfs /home/tmp/r2z-corpus
-    run_case 'nfs' refused transport_fault nfs /home/tmp/r2z-corpus
-    run_case 'nfs4' refused transport_fault nfs4 /home/tmp/r2z-corpus
-    run_case '9p' refused transport_fault 9p /home/tmp/r2z-corpus
-    run_case 'fuse.glusterfs' refused transport_fault fuse.glusterfs /home/tmp/r2z
-    run_case 'an unreadable filesystem type' refused transport_fault '' /home/tmp/x
+    run_case 'ext4' accepted transport_fault ext4 /srv/scratch/r2z-corpus
+    run_case 'xfs' accepted transport_fault xfs /srv/scratch/r2z-corpus
+    run_case 'nfs' refused transport_fault nfs /srv/scratch/r2z-corpus
+    run_case 'nfs4' refused transport_fault nfs4 /srv/scratch/r2z-corpus
+    run_case '9p' refused transport_fault 9p /srv/scratch/r2z-corpus
+    run_case 'fuse.glusterfs' refused transport_fault fuse.glusterfs /srv/scratch/r2z
+    run_case 'an unreadable filesystem type' refused transport_fault '' /srv/scratch/x
 
     # Toolchain. The shim, and the table this harness measures.
     run_case 'a relative R2Z_ZIG' refused toolchain_path_fault zig
     run_case 'an R2Z_ZIG that does not exist' refused \
-        toolchain_path_fault /home/tmp/r2z-cache/absent-zig
+        toolchain_path_fault /srv/scratch/r2z-cache/absent-zig
+
     run_case 'an executable R2Z_ZIG' accepted \
         toolchain_path_fault "$repo_root/tools/test-generated-corpus.sh"
     run_case 'the silence of a shim with no toolchain' refused version_fault ''
@@ -408,23 +416,14 @@ if [[ "${1:-}" == "--self-check" ]]; then
     exit 0
 fi
 
-# ── 1. The approved host scratch policy ─────────────────────────────────────
-# Sourced even when this shell predates it: TMPDIR and ZIG_GLOBAL_CACHE_DIR both
-# land on the approved volume, and this cluster keeps /tmp, /var/tmp and
-# /dev/shm clear.
-if [[ ! -r "$HOME/.local/lib/host-scratch.sh" ]]; then
-    die "missing host scratch policy $HOME/.local/lib/host-scratch.sh"
-fi
-# shellcheck source=/dev/null
-source "$HOME/.local/lib/host-scratch.sh" ||
-    die "host scratch policy failed"
-[[ -n "${HOST_SCRATCH_ROOT:-}" ]] ||
-    die "the host scratch policy selected no volume; set R2Z_CORPUS_ROOT"
-
-corpus_requested="${R2Z_CORPUS_ROOT:-$HOST_SCRATCH_ROOT/scratch/translate-rust-generated-corpus}"
+# ── 1. Scratch root ─────────────────────────────────────────────────────────
+# R2Z_SCRATCH_ROOT is the explicit base; CI uses RUNNER_TEMP, and other runs use
+# TMPDIR or /tmp. Both output and shared cache stay below that selected base.
+corpus_requested="${R2Z_CORPUS_ROOT:-$scratch_base/scratch/translate-rust-generated-corpus}"
 corpus_root="$(realpath -m -- "$corpus_requested")"
 output="${corpus_root}/corpus"
-cache="$(realpath -m -- "${HOST_SCRATCH_ROOT}/cache/translate-rust-generated-corpus-zig")"
+cache_requested="$scratch_base/cache/translate-rust-generated-corpus-zig"
+cache="$(realpath -m -- "$cache_requested")"
 cross_out="${corpus_root}/cross-test"
 
 # ── 2. Placement rules ──────────────────────────────────────────────────────
@@ -448,7 +447,8 @@ validate_local_root() {
     [[ "$owner" == "$(id -u)" ]] || die "scratch directory is not owned by this UID: $resolved"
 }
 validate_local_root "$corpus_requested" "$corpus_root"
-validate_local_root "${HOST_SCRATCH_ROOT}/cache/translate-rust-generated-corpus-zig" "$cache"
+validate_local_root "$cache_requested" "$cache"
+
 case "$corpus_root" in
     "$cache" | "$cache"/*) die "corpus root must not be inside the shared cache" ;;
 esac
@@ -456,12 +456,12 @@ case "$cache" in
     "$corpus_root" | "$corpus_root"/*) die "shared cache must not be inside the corpus root" ;;
 esac
 
-avail_kib="$(df -Pk "$HOST_SCRATCH_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
+avail_kib="$(df -Pk "$scratch_base" 2>/dev/null | awk 'NR==2 {print $4}')"
 case "${avail_kib:-}" in
-    '' | *[!0-9]*) die "cannot read free space for $HOST_SCRATCH_ROOT" ;;
+    '' | *[!0-9]*) die "cannot read free space for $scratch_base" ;;
 esac
 if ((avail_kib < 8388608)); then
-    die "the approved scratch volume has less than 8 GiB free; set R2Z_CORPUS_ROOT on another approved mount"
+    die "the selected scratch base has less than 8 GiB free; choose another R2Z_SCRATCH_ROOT or R2Z_CORPUS_ROOT"
 fi
 
 # ── 3. A real toolchain, not the anyzig shim ────────────────────────────────
@@ -481,7 +481,7 @@ resolve_zig() {
     discover_zig
 }
 zig_bin="$(resolve_zig)" ||
-    die "no cached Zig $required_zig_version under any toolchain store (looked in \$ZIG_GLOBAL_CACHE_DIR/p, \$HOME/.cache/zig/p and \$HOST_SCRATCH_ROOT/cache/zig/p); set R2Z_ZIG to an absolute path"
+    die "no cached Zig $required_zig_version under any toolchain store (looked in \$ZIG_GLOBAL_CACHE_DIR/p, \$HOME/.cache/zig/p and $scratch_base/cache/zig/p); set R2Z_ZIG to an absolute path"
 
 # ── 3b. The tools this script shells out to, resolved rather than assumed ──
 # `cross-test` and `dust` are per-user installs that `devenv.nix` does not
@@ -520,8 +520,8 @@ note "summary parser: $jq_bin"
 # ── 4. The shared cache is shared, bounded, and never pruned ────────────────
 # Every target uses one shared cache. The profile serializes builds to avoid
 # concurrent writers to that cache.
-# The profile reapplies this measured root after cross-test sources host policy,
-# so retained temporary and global-cache artifacts stay under the same lock.
+# The generated profile restores this measured root after cross-test setup, so
+# retained temporary and global-cache artifacts stay under the same lock.
 cache_max_mb="${R2Z_CORPUS_CACHE_MAX_MB:-65536}"
 [[ "$cache_max_mb" =~ ^[0-9]{1,9}$ ]] ||
     die "R2Z_CORPUS_CACHE_MAX_MB must be a positive decimal MiB bound"

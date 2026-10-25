@@ -397,7 +397,7 @@ pub fn build(b: *std.Build) void {
 
     // ── generated corpus: stage fresh packages, then cross-run them ─────
     // The producer owns exactly the directory named by `--output`: it creates
-    // it, refuses to write into /tmp, /var/tmp or any non-local filesystem,
+    // it, refuses to write into /dev/shm or any non-local filesystem,
     // and never erases a path that already exists. This step therefore
     // forwards the run arguments and supplies no default, so the required
     // invocation is

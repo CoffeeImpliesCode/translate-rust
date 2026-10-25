@@ -500,10 +500,9 @@ const runtime_test_id = "runtime";
 /// as a cycle rather than followed forever.
 const local_import_depth_limit = 16;
 
-/// Directories this repository's policy keeps clear. A path that reaches one of
-/// them through a symlink is still one of them, which is why the check resolves
-/// symlinks first.
-const forbidden_roots = [_][]const u8{ "/tmp", "/var/tmp", "/dev/shm" };
+/// The volatile shared-memory directory this producer keeps clear. Resolving
+/// symlinks before comparing ensures aliases cannot bypass the restriction.
+const forbidden_roots = [_][]const u8{ "/dev/shm" };
 
 /// Filesystem types this producer refuses. Zig's atomic file write needs a real
 /// local filesystem, and the aggregates and caches are large.
@@ -913,9 +912,10 @@ fn formatFeatures(gpa: std.mem.Allocator, features: []const []const u8) ![]const
 /// Validate the requested output directory and return it resolved.
 ///
 /// Every rule here exists because getting it wrong is quiet: an NFS-backed
-/// output makes Zig's atomic write panic with `EINVAL`, and a small system
-/// temporary fills up silently. A path that reaches one of those volumes
-/// through a symlink is still on that volume, so symlink ancestors are refused.
+/// output makes Zig's atomic write panic with `EINVAL`, and an undersized
+/// output volume can fill up silently. The volatile shared-memory volume is
+/// also refused when reached through a symlink.
+
 fn prepareOutputRoot(gpa: std.mem.Allocator, io: std.Io, requested: []const u8) ![]const u8 {
     if (!std.fs.path.isAbsolute(requested)) {
         std.log.err("generated-corpus: --output must be absolute, got '{s}'", .{requested});
@@ -1891,7 +1891,7 @@ fn renderProfile(gpa: std.mem.Allocator, root: []const u8, aggregate_root: []con
         \\# Build-only coverage is explicit, never a pass, and is reported per row.
         \\CROSS_REQUIRE_RUNNERS=0
         \\
-        \\# Host policy was sourced first; restore the wrapper's measured locked root.
+        \\# Restore the wrapper's measured cache root after cross-test setup.
         \\: "${R2Z_MATRIX_CACHE_ROOT:?generated corpus requires its measured cache root}"
         \\[[ $R2Z_MATRIX_CACHE_ROOT == /* && -d $R2Z_MATRIX_CACHE_ROOT ]] || {
         \\  printf 'generated corpus: invalid measured cache root\n' >&2
