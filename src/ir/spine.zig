@@ -357,7 +357,9 @@ test "a deferred binder placeholder can never collide with a real EntityId" {
         !isDeferredPlaceholder(deferred_placeholder_base),
     );
     try std.testing.expect(!canMintIdAt(@as(usize, deferred_placeholder_base)));
-    try std.testing.expect(!canMintIdAt(@as(usize, deferred_placeholder_base) + 1));
+    if (@bitSizeOf(usize) > @bitSizeOf(EntityId)) {
+        try std.testing.expect(!canMintIdAt(@as(usize, deferred_placeholder_base) + 1));
+    }
 
     // One ordinal past the band is refused rather than wrapped or clamped. The
     // step down from the last placeholder is what would land on
