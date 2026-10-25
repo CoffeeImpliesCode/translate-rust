@@ -88,5 +88,6 @@ parser. Regenerate that parser through the grammar's own generator.
 
 ## License
 
-No project-wide license file is supplied. Vendored fixtures and grammar sources
-retain their upstream license files and notices.
+MIT, see [LICENSE](LICENSE). The `test/crates/` snapshots and other third-party
+components keep their own licenses: see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
